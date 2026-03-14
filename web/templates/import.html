@@ -1,0 +1,262 @@
+{% extends "base.html" %}
+
+{% block topbar %}
+<div class="topbar">
+  <div>
+    <h2>Import Data</h2>
+    <div class="sub">Migrate existing data files from PyScript or a previous install</div>
+  </div>
+  <div style="display:flex;gap:8px;">
+    <button class="btn btn-secondary" id="btn-backup" onclick="doManualBackup()">💾 Backup Now</button>
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+
+<div id="alert-success" class="alert alert-success"></div>
+<div id="alert-error"   class="alert alert-danger"></div>
+
+<div class="card">
+  <div class="card-title">📥 Import JSON Files</div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:20px;line-height:1.7;">
+    Upload your existing data files from the previous PyScript installation.
+    Each file is optional — only upload what you have.
+    <strong style="color:var(--warning);">Warning:</strong> importing will overwrite any existing data.
+  </p>
+
+  <div id="drop-zone" style="
+    border: 2px dashed var(--border);
+    border-radius: var(--radius);
+    padding: 40px;
+    text-align: center;
+    margin-bottom: 24px;
+    transition: border-color 0.15s;
+    cursor: pointer;
+  " ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)" onclick="document.getElementById('file-input').click()">
+    <div style="font-size:32px;margin-bottom:8px;">📂</div>
+    <div style="color:var(--text);font-size:14px;margin-bottom:4px;">Drop JSON files here or click to browse</div>
+    <div style="color:var(--muted);font-size:12px;">blocks.json · current_block.json · cumulative_totals.json · meters_config.json</div>
+    <input type="file" id="file-input" multiple accept=".json" style="display:none" onchange="onFileSelect(this.files)">
+  </div>
+
+  <!-- Selected files list -->
+  <div id="file-list" style="margin-bottom:20px;display:none;">
+    <div class="card-title">Selected Files</div>
+    <div id="file-items"></div>
+  </div>
+
+  <button class="btn btn-primary" onclick="doImport()" id="import-btn" disabled>
+    📥 Import Selected Files
+  </button>
+</div>
+
+<div class="card">
+  <div class="card-title">ℹ️ File Reference</div>
+  <table style="width:100%;border-collapse:collapse;font-size:13px;">
+    <thead>
+      <tr style="border-bottom:1px solid var(--border);">
+        <th style="text-align:left;padding:8px 0;color:var(--muted);font-weight:500;">File</th>
+        <th style="text-align:left;padding:8px 0;color:var(--muted);font-weight:500;">Contains</th>
+        <th style="text-align:left;padding:8px 0;color:var(--muted);font-weight:500;">PyScript path</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr style="border-bottom:1px solid var(--border);">
+        <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">blocks.json</td>
+        <td style="padding:10px 0;color:var(--text);">All finalised half-hourly blocks (historical data)</td>
+        <td style="padding:10px 0;font-family:var(--mono);font-size:11px;color:var(--muted);">/config/pyscript/energy_meter_trackerv2/</td>
+      </tr>
+      <tr style="border-bottom:1px solid var(--border);">
+        <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">current_block.json</td>
+        <td style="padding:10px 0;color:var(--text);">Rolling buffer for the current half-hour</td>
+        <td style="padding:10px 0;font-family:var(--mono);font-size:11px;color:var(--muted);">/config/pyscript/energy_meter_trackerv2/</td>
+      </tr>
+      <tr style="border-bottom:1px solid var(--border);">
+        <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">cumulative_totals.json</td>
+        <td style="padding:10px 0;color:var(--text);">Running totals for HA sensor values</td>
+        <td style="padding:10px 0;font-family:var(--mono);font-size:11px;color:var(--muted);">/config/pyscript/energy_meter_trackerv2/</td>
+      </tr>
+      <tr>
+        <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">meters_config.json</td>
+        <td style="padding:10px 0;color:var(--text);">Meter and channel configuration</td>
+        <td style="padding:10px 0;font-family:var(--mono);font-size:11px;color:var(--muted);">/config/pyscript/energy_meter_trackerv2/</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card" style="margin-top:20px;">
+  <div class="card-title">💾 Backups</div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;line-height:1.7;">
+    A backup zip is created automatically before every config save. Backups are stored in
+    <code style="font-family:var(--mono);font-size:12px;">/share/energy_meter_tracker_backup/backups/</code>
+    and the 20 most recent are kept.
+  </p>
+  <div id="backup-list" style="margin-bottom:16px;font-size:13px;color:var(--muted);">Loading...</div>
+  <button class="btn btn-secondary" onclick="doManualBackup()" id="btn-backup2">💾 Create Backup Now</button>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const KNOWN_FILES = ['blocks.json','current_block.json','cumulative_totals.json','meters_config.json'];
+let selectedFiles = {};
+
+function onDragOver(e) {
+  e.preventDefault();
+  document.getElementById('drop-zone').style.borderColor = 'var(--accent)';
+}
+function onDragLeave(e) {
+  document.getElementById('drop-zone').style.borderColor = 'var(--border)';
+}
+function onDrop(e) {
+  e.preventDefault();
+  document.getElementById('drop-zone').style.borderColor = 'var(--border)';
+  onFileSelect(e.dataTransfer.files);
+}
+
+function onFileSelect(files) {
+  Array.from(files).forEach(f => {
+    if (f.name.endsWith('.json')) {
+      selectedFiles[f.name] = f;
+    }
+  });
+  renderFileList();
+}
+
+function renderFileList() {
+  const items = document.getElementById('file-items');
+  const list  = document.getElementById('file-list');
+  const btn   = document.getElementById('import-btn');
+
+  if (Object.keys(selectedFiles).length === 0) {
+    list.style.display = 'none';
+    btn.disabled = true;
+    return;
+  }
+
+  list.style.display = 'block';
+  btn.disabled = false;
+
+  items.innerHTML = Object.entries(selectedFiles).map(([name, file]) => {
+    const known   = KNOWN_FILES.includes(name);
+    const sizeKb  = (file.size / 1024).toFixed(1);
+    const color   = known ? 'var(--success)' : 'var(--warning)';
+    const status  = known ? '✓ recognised' : '⚠ unrecognised';
+    return `
+      <div style="display:flex;align-items:center;justify-content:space-between;
+                  padding:10px 12px;background:var(--bg);border-radius:var(--radius);
+                  border:1px solid var(--border);margin-bottom:6px;">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <span style="font-family:var(--mono);font-size:13px;">${name}</span>
+          <span style="font-size:11px;color:${color};">${status}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:12px;">
+          <span style="color:var(--muted);font-size:12px;">${sizeKb} KB</span>
+          <button class="btn btn-danger btn-sm" onclick="removeFile('${name}')">✕</button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function removeFile(name) {
+  delete selectedFiles[name];
+  renderFileList();
+}
+
+async function doImport() {
+  hideAlerts();
+  const form = new FormData();
+
+  const fieldMap = {
+    'blocks.json':            'blocks',
+    'current_block.json':     'current_block',
+    'cumulative_totals.json': 'cumulative_totals',
+    'meters_config.json':     'meters_config',
+  };
+
+  let hasKnown = false;
+  Object.entries(selectedFiles).forEach(([name, file]) => {
+    const field = fieldMap[name];
+    if (field) {
+      form.append(field, file);
+      hasKnown = true;
+    }
+  });
+
+  if (!hasKnown) {
+    showError('No recognised files selected. Expected: ' + Object.keys(fieldMap).join(', '));
+    return;
+  }
+
+  try {
+    const r    = await fetch(apiUrl('/api/import'), { method: 'POST', body: form });
+    const data = await r.json();
+    if (data.ok) {
+      const el = document.getElementById('alert-success');
+      el.textContent = '✓ Imported: ' + data.imported.join(', ') + '. Restart the add-on to apply.';
+      el.classList.add('show');
+      selectedFiles = {};
+      renderFileList();
+    } else {
+      showError(data.error || 'Import failed');
+    }
+  } catch(e) {
+    showError(e.message);
+  }
+}
+
+function show(id) {
+  document.getElementById(id).classList.add('show');
+  setTimeout(() => document.getElementById(id)?.classList.remove('show'), 6000);
+}
+function hideAlerts() {
+  document.getElementById('alert-success').classList.remove('show');
+  document.getElementById('alert-error').classList.remove('show');
+}
+function showError(msg) {
+  const el = document.getElementById('alert-error');
+  el.textContent = '✕ ' + msg;
+  el.classList.add('show');
+}
+
+async function doManualBackup() {
+  var btn = document.getElementById('btn-backup') || document.getElementById('btn-backup2');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Backing up...'; }
+  try {
+    var r = await fetch(apiUrl('/api/backup'), { method: 'POST' });
+    var data = await r.json();
+    if (data.ok) {
+      const el = document.getElementById('alert-success'); el.textContent = '✓ Backup created: ' + data.path; el.classList.add('show'); setTimeout(() => el.classList.remove('show'), 6000);
+      loadBackupList();
+    } else {
+      showError(data.error || 'Backup failed');
+    }
+  } catch(e) {
+    showError(e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '💾 Backup Now'; }
+  }
+}
+
+async function loadBackupList() {
+  try {
+    var r = await fetch(apiUrl('/api/backup/list'));
+    var zips = await r.json();
+    var el = document.getElementById('backup-list');
+    if (!el) return;
+    if (zips.length === 0) {
+      el.textContent = 'No backups yet.';
+    } else {
+      el.innerHTML = zips.slice(0, 10).map(function(z) {
+        return '<div style="font-family:var(--mono);font-size:12px;padding:4px 0;border-bottom:1px solid var(--border);">' + z + '</div>';
+      }).join('') + (zips.length > 10 ? '<div style="color:var(--muted);font-size:12px;margin-top:6px;">…and ' + (zips.length-10) + ' more</div>' : '');
+    }
+  } catch(e) {}
+}
+
+document.addEventListener('DOMContentLoaded', function() { loadBackupList(); });
+</script>
+{% endblock %}

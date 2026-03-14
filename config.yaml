@@ -1,0 +1,53 @@
+name: "Energy Meter Tracker"
+description: "Half-hourly energy metering engine with sub-meter support, gap filling, and billing charts."
+version: "1.0.12"
+slug: "energy_meter_tracker"
+init: false
+startup: application
+boot: auto
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+
+# ── Persistent storage ────────────────────────────────────────────────────────
+# /data  → add-on private storage (blocks.json, current_block.json, etc.)
+# /share → shared with HA so charts are accessible via /local/
+map:
+  - data:rw
+  - share:rw
+
+# ── Network ───────────────────────────────────────────────────────────────────
+# Port 8099 — direct access (optional, can be disabled)
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: "Web UI (direct access)"
+
+# ── Ingress ───────────────────────────────────────────────────────────────────
+# Enables the "Show in sidebar" toggle and embedded UI in HA
+ingress: true
+ingress_port: 8099
+
+# ── HA API access ─────────────────────────────────────────────────────────────
+# Required for WebSocket + REST API calls to HA
+hassio_api: true
+homeassistant_api: true
+auth_api: true
+
+# ── Supervisor token ──────────────────────────────────────────────────────────
+# Injected automatically as SUPERVISOR_TOKEN env var — used by ha_client.py
+hassio_role: default
+
+# ── Panel (optional — adds a sidebar link to the config UI) ──────────────────
+panel_icon: "mdi:speedometer"
+panel_title: "Energy Meter"
+
+# ── Options schema ────────────────────────────────────────────────────────────
+# Minimal top-level options — meter config is managed via the UI, not here
+options:
+  log_level: "info"
+
+schema:
+  log_level: "list(debug|info|warning|error)"

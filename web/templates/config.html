@@ -1,0 +1,966 @@
+{% extends "base.html" %}
+
+{% block topbar %}
+<div class="topbar">
+  <div>
+    <h2>Meter Configuration</h2>
+    <div class="sub">Configure your main meter and sub-meters</div>
+  </div>
+  <div style="display:flex;gap:8px;">
+    <button class="btn btn-secondary" id="btn-wizard">✦ Setup Wizard</button>
+    <button class="btn btn-secondary" id="btn-refresh">↺ Refresh Entities</button>
+    <button class="btn btn-primary" id="btn-save">💾 Save Config</button>
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="alert-success" class="alert alert-success">✓ Configuration saved. The engine will pick up changes within 10 seconds.</div>
+<div id="alert-error" class="alert alert-danger"></div>
+
+<!-- ── Main Meter ─────────────────────────────────────────────────────────── -->
+<div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;">
+  <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);">Main Meter</div>
+</div>
+
+<div id="main-meter-container"></div>
+
+<div id="no-main-meter" style="display:none;">
+  <div class="card" style="border-style:dashed;text-align:center;padding:32px;">
+    <div style="font-size:32px;margin-bottom:12px;">⚡</div>
+    <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No main meter configured</div>
+    <div style="color:var(--muted);font-size:13px;margin-bottom:20px;">Add your electricity meter to get started</div>
+    <div style="display:flex;gap:10px;justify-content:center;">
+      <button class="btn btn-primary" id="btn-wizard-empty">✦ Setup Wizard</button>
+      <button class="btn btn-secondary" id="btn-add-main">+ Add Manually</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Sub-meters ─────────────────────────────────────────────────────────── -->
+<div style="margin:28px 0 8px;display:flex;align-items:center;justify-content:space-between;">
+  <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);">Sub-meters</div>
+  <button class="btn btn-secondary btn-sm" id="btn-add-sub">+ Add Sub-meter</button>
+</div>
+
+<div id="sub-meter-container"></div>
+<div id="no-sub-meters" style="color:var(--muted);font-size:13px;padding:12px 0;display:none;">
+  No sub-meters configured. Add a sub-meter to track individual devices like EV chargers or batteries.
+</div>
+
+<!-- ── Wizard Modal ───────────────────────────────────────────────────────── -->
+<div id="wizard-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;overflow-y:auto;">
+  <div style="max-width:600px;margin:40px auto;padding:0 16px 60px;">
+    <div id="wizard-card" class="card" style="padding:32px;">
+
+      <!-- Progress bar -->
+      <div style="margin-bottom:28px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <span style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);" id="wiz-step-label">Step 1 of 4</span>
+          <button onclick="closeWizard()" style="background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;padding:0;">✕</button>
+        </div>
+        <div style="background:var(--bg);border-radius:4px;height:4px;overflow:hidden;">
+          <div id="wiz-progress" style="background:var(--accent);height:100%;transition:width 0.3s;width:25%;"></div>
+        </div>
+      </div>
+
+      <div id="wizard-body"></div>
+
+      <div style="display:flex;justify-content:space-between;margin-top:28px;gap:12px;">
+        <button class="btn btn-secondary" id="wiz-btn-back" onclick="wizBack()">← Back</button>
+        <button class="btn btn-primary" id="wiz-btn-next" onclick="wizNext()">Next →</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<style>
+.info-box {
+  background: rgba(0,212,170,0.06);
+  border: 1px solid rgba(0,212,170,0.25);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 20px;
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.7;
+}
+.info-box strong { color: var(--accent); }
+.info-box ul { margin: 6px 0 0 16px; }
+.info-box li { margin-bottom: 3px; }
+
+.section-divider {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin: 20px 0 10px;
+}
+
+.channel-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 10px;
+}
+
+.channel-label {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 3px 8px;
+  border-radius: 4px;
+  margin-bottom: 12px;
+  display: inline-block;
+}
+.label-import { background: rgba(0,212,170,0.15); color: var(--accent); }
+.label-export { background: rgba(124,106,247,0.15); color: var(--accent2); }
+
+.advanced-toggle {
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+  user-select: none;
+}
+.advanced-toggle:hover { color: var(--text); }
+.advanced-section { display: none; margin-top: 12px; }
+.advanced-section.open { display: block; }
+
+/* Entity dropdown */
+.entity-wrap { position: relative; flex: 1; }
+.entity-drop {
+  display: none;
+  position: absolute;
+  top: 100%; left: 0; right: 0;
+  z-index: 200;
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-top: none;
+  border-radius: 0 0 var(--radius) var(--radius);
+  max-height: 200px;
+  overflow-y: auto;
+}
+.entity-drop div {
+  padding: 7px 12px;
+  font-size: 12px;
+  font-family: var(--mono);
+  cursor: pointer;
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+}
+.entity-drop div:hover { background: rgba(0,212,170,0.15); color: var(--accent); }
+
+/* Wizard device cards */
+.wiz-device-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 16px;
+}
+.wiz-device-card {
+  border: 2px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  cursor: pointer;
+  text-align: center;
+  transition: border-color 0.15s, background 0.15s;
+  user-select: none;
+}
+.wiz-device-card:hover { border-color: var(--accent); background: rgba(0,212,170,0.04); }
+.wiz-device-card.selected { border-color: var(--accent); background: rgba(0,212,170,0.10); }
+.wiz-device-card .icon { font-size: 28px; margin-bottom: 8px; }
+.wiz-device-card .label { font-size: 13px; font-weight: 600; }
+.wiz-device-card .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+</style>
+
+<script>
+let config   = {{ config | tojson }};
+let entities = [];
+const existingMeterIds = new Set(Object.keys(config.meters || {}));
+
+document.addEventListener('DOMContentLoaded', function() {
+  document.getElementById('btn-save').addEventListener('click', saveConfig);
+  document.getElementById('btn-refresh').addEventListener('click', function() { loadEntities().then(renderAll); });
+  document.getElementById('btn-add-main').addEventListener('click', addMainMeter);
+  document.getElementById('btn-add-sub').addEventListener('click', addSubMeter);
+  document.getElementById('btn-wizard').addEventListener('click', startWizard);
+  document.getElementById('btn-wizard-empty').addEventListener('click', startWizard);
+  loadEntities().then(function() {
+    renderAll();
+    // Auto-launch wizard if no meters configured
+    if (Object.keys(config.meters || {}).length === 0) {
+      startWizard();
+    }
+  });
+});
+
+// Field type → acceptable units/device_class
+var FIELD_FILTERS = {
+  read:                  { units: ['kWh'], device_class: ['energy'] },
+  rate:                  { units: ['GBP/kWh', '£/kWh', 'p/kWh', 'GBP/MWh'], device_class: ['monetary', 'currency'] },
+  standing_charge_sensor:{ units: ['GBP/day', '£/day', 'p/day', 'GBP', '£'], device_class: ['monetary', 'currency'] },
+};
+
+async function loadEntities() {
+  try {
+    var r = await fetch(apiUrl('/api/entities'));
+    entities = await r.json();  // [{id, unit, device_class}, ...]
+  } catch(e) { console.warn('Could not load entities', e); }
+}
+
+function filterEntities(field, query) {
+  var filter = FIELD_FILTERS[field];
+  var q = (query||'').toLowerCase();
+  var candidates = entities;
+
+  if (filter) {
+    var matched = candidates.filter(function(e) {
+      var unitOk  = filter.units.some(function(u) { return (e.unit||'').toLowerCase() === u.toLowerCase(); });
+      var classOk = filter.device_class.some(function(dc) { return (e.device_class||'').toLowerCase() === dc.toLowerCase(); });
+      return unitOk || classOk;
+    });
+    // If filter produces results use them, otherwise fall back to all entities
+    if (matched.length > 0) candidates = matched;
+  }
+
+  if (q.length < 2) return [];
+  return candidates.filter(function(e) { return e.id.toLowerCase().indexOf(q) !== -1; }).slice(0, 50);
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function renderAll() {
+  var meters  = config.meters || {};
+  var mainIds = Object.keys(meters).filter(function(id) { return !meters[id].meta.sub_meter; });
+  var subIds  = Object.keys(meters).filter(function(id) { return !!meters[id].meta.sub_meter; });
+
+  // Main meter
+  var mc = document.getElementById('main-meter-container');
+  var nm = document.getElementById('no-main-meter');
+  mc.innerHTML = '';
+  if (mainIds.length === 0) {
+    nm.style.display = 'block';
+  } else {
+    nm.style.display = 'none';
+    mainIds.forEach(function(id) { mc.appendChild(buildMainCard(id, meters[id])); });
+  }
+
+  // Sub-meters
+  var sc  = document.getElementById('sub-meter-container');
+  var nsm = document.getElementById('no-sub-meters');
+  sc.innerHTML = '';
+  if (subIds.length === 0) {
+    nsm.style.display = 'block';
+  } else {
+    nsm.style.display = 'none';
+    subIds.forEach(function(id) { sc.appendChild(buildSubCard(id, meters[id])); });
+  }
+
+  attachListeners();
+}
+
+// ── Main meter card ───────────────────────────────────────────────────────────
+function buildMainCard(meterId, meter) {
+  var meta     = meter.meta || {};
+  var channels = meter.channels || {};
+  var imp      = channels.import || {};
+  var exp      = channels.export || {};
+
+  var div = document.createElement('div');
+  div.className = 'card';
+  div.dataset.meter = meterId;
+
+  div.innerHTML =
+    '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">' +
+      '<div style="display:flex;align-items:center;gap:10px;">' +
+        '<span class="badge badge-main">MAIN METER</span>' +
+        '<span style="font-family:var(--mono);font-size:13px;">' + meterId + '</span>' +
+      '</div>' +
+      '<button class="btn btn-danger btn-sm js-remove-meter" data-meter="' + meterId + '">✕ Remove</button>' +
+    '</div>' +
+
+    '<div class="info-box">' +
+      '<strong>Required sensors</strong>' +
+      '<ul>' +
+        '<li><strong>Import/Export read</strong> — cumulative kWh, high-frequency updates (every 10–30s)</li>' +
+        '<li><strong>Rate sensors</strong> — current £/kWh (e.g. Octopus Energy rate sensors)</li>' +
+        '<li><strong>Standing charge</strong> — £/day sensor (can be a fixed-value helper)</li>' +
+      '</ul>' +
+    '</div>' +
+
+    '<div class="grid-2">' +
+      '<div class="form-group"><label>Meter ID</label>' +
+        (existingMeterIds.has(meterId)
+          ? '<input type="text" class="js-meter-id" data-meter="' + meterId + '" value="' + esc(meterId) + '" style="font-family:var(--mono);" readonly title="Meter ID cannot be changed after data has been collected"><small style="color:var(--warning-color,#b45309);">⚠ ID is locked — changing it would orphan historical data</small>'
+          : '<input type="text" class="js-meter-id" data-meter="' + meterId + '" value="' + esc(meterId) + '" style="font-family:var(--mono);">') +
+        '</div>' +
+      '<div class="form-group"><label>Site Name</label>' +
+        '<input type="text" class="js-meta" data-meter="' + meterId + '" data-key="site" value="' + esc(meta.site||'') + '"></div>' +
+      '<div class="form-group"><label>Supplier</label>' +
+        '<input type="text" class="js-meta" data-meter="' + meterId + '" data-key="supplier" value="' + esc(meta.supplier||'') + '"></div>' +
+      '<div class="form-group"><label>First day of your billing period</label>' +
+        '<input type="number" min="1" max="28" class="js-meta js-meta-int" data-meter="' + meterId + '" data-key="billing_day" value="' + (meta.billing_day||1) + '"></div>' +
+    '</div>' +
+
+    '<hr>' +
+    '<div class="section-divider">Import Channel</div>' +
+    '<div class="channel-card">' +
+      '<span class="channel-label label-import">Import</span>' +
+      '<div class="form-group"><label>Read Sensor — cumulative kWh from grid</label>' +
+        buildEntityInput(meterId+'__import__read', imp.read||'', meterId, 'import', 'read') + '</div>' +
+      '<div class="form-group"><label>Rate Sensor — £/kWh import tariff</label>' +
+        buildEntityInput(meterId+'__import__rate', imp.rate||'', meterId, 'import', 'rate') + '</div>' +
+      '<div class="form-group"><label>Standing Charge Sensor — £/day</label>' +
+        buildEntityInput(meterId+'__import__sc', imp.standing_charge_sensor||'', meterId, 'import', 'standing_charge_sensor', true) + '</div>' +
+      buildAdvanced(meterId, 'import', imp) +
+    '</div>' +
+
+    '<div class="section-divider">Export Channel</div>' +
+    '<div class="channel-card">' +
+      '<span class="channel-label label-export">Export</span>' +
+      '<div class="form-group"><label>Read Sensor — cumulative kWh exported to grid</label>' +
+        buildEntityInput(meterId+'__export__read', exp.read||'', meterId, 'export', 'read') + '</div>' +
+      '<div class="form-group"><label>Rate Sensor — £/kWh export tariff</label>' +
+        buildEntityInput(meterId+'__export__rate', exp.rate||'', meterId, 'export', 'rate') + '</div>' +
+      buildAdvanced(meterId, 'export', exp) +
+    '</div>';
+
+  return div;
+}
+
+// ── Sub-meter card ────────────────────────────────────────────────────────────
+function buildSubCard(meterId, meter) {
+  var meta     = meter.meta || {};
+  var channels = meter.channels || {};
+  var imp      = channels.import || {};
+
+  var mainMeters = Object.keys(config.meters||{}).filter(function(id) { return !config.meters[id].meta.sub_meter; });
+  var mainImportRate = '';
+  if (mainMeters.length > 0) {
+    var mainCh = (config.meters[mainMeters[0]].channels||{}).import || {};
+    mainImportRate = mainCh.rate || '';
+  }
+  var rateVal = imp.rate || mainImportRate;
+
+  var parentOpts = mainMeters.map(function(m) {
+    return '<option value="' + m + '" ' + (meta.parent_meter===m?'selected':'') + '>' + m + '</option>';
+  }).join('');
+
+  var div = document.createElement('div');
+  div.className = 'card';
+  div.dataset.meter = meterId;
+
+  div.innerHTML =
+    '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">' +
+      '<div style="display:flex;align-items:center;gap:10px;">' +
+        '<span class="badge badge-sub">SUB-METER</span>' +
+        '<span style="font-family:var(--mono);font-size:13px;">' + meterId + '</span>' +
+      '</div>' +
+      '<button class="btn btn-danger btn-sm js-remove-meter" data-meter="' + meterId + '">✕ Remove</button>' +
+    '</div>' +
+
+    '<div class="info-box">' +
+      '<strong>Sub-meter sensor options</strong>' +
+      '<ul>' +
+        '<li><strong>CT clamp via PowerCalc</strong> — aggregated kWh, update every 60s minimum</li>' +
+        '<li><strong>Device integration</strong> — if your device reports kWh directly (e.g. Zappi, Solax)</li>' +
+      '</ul>' +
+      'Rate sensor is pre-filled from your main import rate but can be overridden if billed differently.' +
+    '</div>' +
+
+    '<div class="grid-2">' +
+      '<div class="form-group"><label>Meter ID</label>' +
+        (existingMeterIds.has(meterId)
+          ? '<input type="text" class="js-meter-id" data-meter="' + meterId + '" value="' + esc(meterId) + '" style="font-family:var(--mono);" readonly title="Meter ID cannot be changed after data has been collected"><small style="color:var(--warning-color,#b45309);">⚠ ID is locked — changing it would orphan historical data</small>'
+          : '<input type="text" class="js-meter-id" data-meter="' + meterId + '" value="' + esc(meterId) + '" style="font-family:var(--mono);">') +
+        '</div>' +
+      '<div class="form-group"><label>Device Name</label>' +
+        '<input type="text" class="js-meta" data-meter="' + meterId + '" data-key="device" value="' + esc(meta.device||'') + '"></div>' +
+      '<div class="form-group"><label>Parent Meter</label>' +
+        '<select class="js-meta" data-meter="' + meterId + '" data-key="parent_meter">' +
+          '<option value="">— select —</option>' + parentOpts +
+        '</select></div>' +
+    '</div>' +
+
+    '<div style="display:flex;gap:24px;margin-bottom:16px;">' +
+      '<div class="checkbox-row">' +
+        '<input type="checkbox" id="inv-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="inverter_possible" ' + (meta.inverter_possible?'checked':'') + '>' +
+        '<label for="inv-' + meterId + '">Inverter possible (battery/solar)</label>' +
+      '</div>' +
+      '<div class="checkbox-row">' +
+        '<input type="checkbox" id="v2x-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="v2x_capable" ' + (meta.v2x_capable?'checked':'') + '>' +
+        '<label for="v2x-' + meterId + '">V2X capable (vehicle-to-grid)</label>' +
+      '</div>' +
+    '</div>' +
+
+    '<hr>' +
+    '<div class="section-divider">Import Channel</div>' +
+    '<div class="channel-card">' +
+      '<span class="channel-label label-import">Import</span>' +
+      '<div class="form-group"><label>Read Sensor — cumulative kWh</label>' +
+        buildEntityInput(meterId+'__import__read', imp.read||'', meterId, 'import', 'read') + '</div>' +
+      '<div class="form-group"><label>Rate Sensor — £/kWh ' + (mainImportRate ? '(pre-filled from main meter)' : '') + '</label>' +
+        buildEntityInput(meterId+'__import__rate', rateVal, meterId, 'import', 'rate') + '</div>' +
+    '</div>';
+
+  return div;
+}
+
+// ── Advanced meta section ─────────────────────────────────────────────────────
+function buildAdvanced(meterId, chId, ch) {
+  var meta = ch.meta || {};
+  var uid  = meterId + '__' + chId;
+  return '<div class="advanced-toggle" onclick="toggleAdvanced(\'' + uid + '\')">' +
+    '<span id="adv-arrow-' + uid + '">▶</span> Advanced (MPAN, tariff, source)' +
+  '</div>' +
+  '<div class="advanced-section" id="adv-' + uid + '">' +
+    '<div class="grid-2">' +
+      '<div class="form-group"><label>MPAN</label>' +
+        '<input type="text" class="js-ch-meta" data-meter="' + meterId + '" data-channel="' + chId + '" data-key="mpan" value="' + esc(meta.mpan||'') + '" style="font-family:var(--mono);"></div>' +
+      '<div class="form-group"><label>Tariff</label>' +
+        '<input type="text" class="js-ch-meta" data-meter="' + meterId + '" data-channel="' + chId + '" data-key="tariff" value="' + esc(meta.tariff||'') + '"></div>' +
+      '<div class="form-group"><label>Source</label>' +
+        '<input type="text" class="js-ch-meta" data-meter="' + meterId + '" data-channel="' + chId + '" data-key="source" value="' + esc(meta.source||'supplier_meter') + '"></div>' +
+    '</div>' +
+  '</div>';
+}
+
+function toggleAdvanced(uid) {
+  var sec   = document.getElementById('adv-' + uid);
+  var arrow = document.getElementById('adv-arrow-' + uid);
+  if (sec.classList.contains('open')) {
+    sec.classList.remove('open');
+    arrow.textContent = '▶';
+  } else {
+    sec.classList.add('open');
+    arrow.textContent = '▼';
+  }
+}
+
+// ── Entity input ──────────────────────────────────────────────────────────────
+function buildEntityInput(id, currentVal, meterId, chId, field, allowClear) {
+  return '<div style="display:flex;gap:6px;align-items:flex-start;">' +
+    '<div class="entity-wrap">' +
+    '<input type="text" id="' + id + '"' +
+    ' class="js-ch-field entity-input" data-meter="' + meterId + '" data-channel="' + chId + '" data-field="' + field + '"' +
+    ' value="' + esc(currentVal) + '" placeholder="Search or type entity ID..." autocomplete="off"' +
+    ' style="font-family:var(--mono);font-size:12px;">' +
+    '<div id="' + id + '_drop" class="entity-drop"></div>' +
+    '</div>' +
+    (allowClear ? '<button class="btn btn-secondary btn-sm js-clear-entity" data-target="' + id + '" title="Clear">✕</button>' : '') +
+    '</div>';
+}
+
+// ── Event delegation ──────────────────────────────────────────────────────────
+function attachListeners() {
+  ['main-meter-container','sub-meter-container'].forEach(function(cid) {
+    var c = document.getElementById(cid);
+    c.removeEventListener('change', onContainerChange);
+    c.removeEventListener('click',  onContainerClick);
+    c.addEventListener('change', onContainerChange);
+    c.addEventListener('click',  onContainerClick);
+  });
+  setupEntityDropdowns();
+}
+
+function onContainerChange(e) {
+  var el = e.target;
+  var m  = el.dataset.meter;
+  var k  = el.dataset.key;
+  if (!m) return;
+  if (el.classList.contains('js-meta'))         { config.meters[m].meta[k] = el.value; }
+  else if (el.classList.contains('js-meta-int'))  { config.meters[m].meta[k] = parseInt(el.value)||1; }
+  else if (el.classList.contains('js-meta-bool')) { config.meters[m].meta[k] = el.checked; }
+  else if (el.classList.contains('js-meter-id'))  { renameMeter(m, el.value); }
+  else if (el.classList.contains('js-ch-field')) {
+    var ch = el.dataset.channel, f = el.dataset.field;
+    if (!config.meters[m].channels[ch]) config.meters[m].channels[ch] = {};
+    if (el.value) config.meters[m].channels[ch][f] = el.value;
+    else delete config.meters[m].channels[ch][f];
+  }
+  else if (el.classList.contains('js-ch-meta')) {
+    var ch2 = el.dataset.channel;
+    if (!config.meters[m].channels[ch2].meta) config.meters[m].channels[ch2].meta = {};
+    config.meters[m].channels[ch2].meta[k] = el.value;
+  }
+}
+
+function onContainerClick(e) {
+  var el = e.target.closest('button');
+  if (!el) return;
+  if (el.classList.contains('js-remove-meter')) {
+    if (confirm('Remove meter "' + el.dataset.meter + '"?')) {
+      delete config.meters[el.dataset.meter];
+      renderAll();
+    }
+  } else if (el.classList.contains('js-clear-entity')) {
+    var t = document.getElementById(el.dataset.target);
+    if (t) { t.value = ''; t.dispatchEvent(new Event('change')); }
+  }
+}
+
+// ── Add meters ────────────────────────────────────────────────────────────────
+function addMainMeter() {
+  var id = 'electricity_main';
+  if (config.meters[id]) id = 'electricity_main_' + Date.now();
+  config.meters[id] = {
+    meta: { type: 'electricity', site: '', supplier: '', billing_day: 1 },
+    channels: {
+      import: { read: '', rate: '' },
+      export: { read: '', rate: '' }
+    }
+  };
+  renderAll();
+}
+
+function addSubMeter() {
+  var id = 'sub_meter_' + Date.now();
+  var mainMeters = Object.keys(config.meters||{}).filter(function(k) { return !config.meters[k].meta.sub_meter; });
+  var mainImportRate = '';
+  if (mainMeters.length > 0) {
+    var mainCh = (config.meters[mainMeters[0]].channels||{}).import || {};
+    mainImportRate = mainCh.rate || '';
+  }
+  config.meters[id] = {
+    meta: {
+      sub_meter: true,
+      device: '',
+      parent_meter: mainMeters.length === 1 ? mainMeters[0] : '',
+      inverter_possible: false,
+      v2x_capable: false
+    },
+    channels: {
+      import: { read: '', rate: mainImportRate }
+    }
+  };
+  renderAll();
+  var el = document.querySelector('[data-meter="' + id + '"]');
+  if (el) el.scrollIntoView({ behavior: 'smooth' });
+}
+
+function renameMeter(oldId, newId) {
+  newId = newId.trim().replace(/\s+/g, '_');
+  if (!newId || newId === oldId || config.meters[newId]) return;
+  config.meters[newId] = config.meters[oldId];
+  delete config.meters[oldId];
+  renderAll();
+}
+
+// ── Entity dropdown ───────────────────────────────────────────────────────────
+function setupEntityDropdowns() {
+  document.querySelectorAll('.entity-input').forEach(function(inp) {
+    inp.addEventListener('input', function() { showDrop(inp); });
+    inp.addEventListener('focus', function() { if (inp.value.length >= 2) showDrop(inp); });
+    inp.addEventListener('blur',  function() { setTimeout(function() { hideDrop(inp); }, 200); });
+  });
+}
+
+function showDrop(inp) {
+  var drop = document.getElementById(inp.id + '_drop');
+  if (!drop) return;
+  var field   = inp.dataset.field || '';
+  var matches = filterEntities(field, inp.value);
+  if (matches.length === 0) { drop.style.display = 'none'; return; }
+  drop.innerHTML = matches.map(function(e) {
+    var hint = e.unit ? '<span style="float:right;color:var(--muted);font-size:10px;">' + esc(e.unit) + '</span>' : '';
+    return '<div data-val="' + esc(e.id) + '">' + esc(e.id) + hint + '</div>';
+  }).join('');
+  drop.style.display = 'block';
+  drop.querySelectorAll('div').forEach(function(item) {
+    item.addEventListener('mousedown', function(ev) {
+      ev.preventDefault();
+      inp.value = item.dataset.val;
+      drop.style.display = 'none';
+      inp.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  });
+}
+
+function hideDrop(inp) {
+  var drop = document.getElementById(inp.id + '_drop');
+  if (drop) drop.style.display = 'none';
+}
+
+// ── Save ──────────────────────────────────────────────────────────────────────
+async function saveConfig() {
+  hideAlerts();
+  try {
+    var r = await fetch(apiUrl('/api/config'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config)
+    });
+    var data = await r.json();
+    if (data.ok) show('alert-success');
+    else showError(data.error || 'Save failed');
+  } catch(e) { showError(e.message); }
+}
+
+// ── Wizard ────────────────────────────────────────────────────────────────────
+var wiz = {
+  step: 0,
+  mainId: 'electricity_main',
+  devices: [],   // selected device types
+  data: {}       // collected field values
+};
+
+var WIZ_STEPS = ['main', 'sensors', 'devices', 'sub_sensors', 'done'];
+
+function startWizard() {
+  wiz.step = 0;
+  wiz.devices = [];
+
+  // Pre-populate from existing config
+  var meters   = config.meters || {};
+  var mainIds  = Object.keys(meters).filter(function(id) { return !meters[id].meta.sub_meter; });
+  var mainId   = mainIds.length > 0 ? mainIds[0] : 'electricity_main';
+  var mainMeter = meters[mainId] || {};
+  var mainMeta  = mainMeter.meta || {};
+  var mainCh    = mainMeter.channels || {};
+  var imp       = mainCh.import || {};
+  var exp       = mainCh.export || {};
+
+  // Detect existing sub-meters and which device types they are
+  var devIdMap = { ev_charger: 'ev', house_battery: 'battery', solar: 'solar', heat_pump: 'heat' };
+  var subMeters = {};
+  Object.keys(meters).forEach(function(id) {
+    var m = meters[id];
+    if (!m.meta.sub_meter) return;
+    // Match to a device type by ID prefix or inverter_possible flag
+    var devType = null;
+    if (id.indexOf('ev') !== -1 || id.indexOf('charger') !== -1)       devType = 'ev';
+    else if (id.indexOf('battery') !== -1 || id.indexOf('batt') !== -1) devType = 'battery';
+    else if (id.indexOf('solar') !== -1 || id.indexOf('pv') !== -1)     devType = 'solar';
+    else if (id.indexOf('heat') !== -1 || id.indexOf('pump') !== -1)    devType = 'heat';
+    if (!devType) return;
+    if (wiz.devices.indexOf(devType) === -1) wiz.devices.push(devType);
+    var subCh = (m.channels || {}).import || {};
+    subMeters[devType] = {
+      name: m.meta.device || '',
+      read: subCh.read || '',
+      rate: subCh.rate || ''
+    };
+  });
+
+  wiz.data = {
+    mainId:        mainId,
+    site:          mainMeta.site       || '',
+    supplier:      mainMeta.supplier   || '',
+    billing_day:   mainMeta.billing_day || 1,
+    importRead:    imp.read                      || '',
+    importRate:    imp.rate                      || '',
+    standingCharge: imp.standing_charge_sensor   || '',
+    exportRead:    exp.read                      || '',
+    exportRate:    exp.rate                      || '',
+    subMeters:     subMeters
+  };
+
+  // Update step list based on detected devices
+  WIZ_STEPS = wiz.devices.length > 0
+    ? ['main', 'sensors', 'devices', 'sub_sensors', 'done']
+    : ['main', 'sensors', 'devices', 'done'];
+
+  document.getElementById('wizard-overlay').style.display = 'block';
+  renderWizStep();
+}
+
+function closeWizard() {
+  document.getElementById('wizard-overlay').style.display = 'none';
+}
+
+function wizUpdateProgress() {
+  var total = wiz.devices.length > 0 ? 5 : 4;
+  var pct   = Math.round(((wiz.step + 1) / total) * 100);
+  document.getElementById('wiz-progress').style.width = pct + '%';
+  document.getElementById('wiz-step-label').textContent = 'Step ' + (wiz.step + 1) + ' of ' + total;
+  document.getElementById('wiz-btn-back').style.visibility = wiz.step === 0 ? 'hidden' : 'visible';
+  document.getElementById('wiz-btn-next').textContent = (wiz.step >= total - 2) ? 'Finish ✓' : 'Next →';
+}
+
+function renderWizStep() {
+  wizUpdateProgress();
+  var body = document.getElementById('wizard-body');
+  var step = WIZ_STEPS[wiz.step];
+
+  if (step === 'main')        body.innerHTML = wizStepMain();
+  else if (step === 'sensors') body.innerHTML = wizStepSensors();
+  else if (step === 'devices') body.innerHTML = wizStepDevices();
+  else if (step === 'sub_sensors') body.innerHTML = wizStepSubSensors();
+  else if (step === 'done')   { wizApplyAndClose(); return; }
+
+  setupWizEntityDropdowns();
+}
+
+function wizStepMain() {
+  return '<h3 style="margin:0 0 6px;">Main Meter</h3>' +
+    '<p style="color:var(--muted);font-size:13px;margin:0 0 20px;">Tell us about your electricity meter and billing.</p>' +
+    '<div class="form-group"><label>Meter ID</label>' +
+      '<input id="wiz-mainId" type="text" value="' + esc(wiz.data.mainId) + '" style="font-family:var(--mono);" placeholder="electricity_main">' +
+      '<small style="color:var(--muted);">Used internally — cannot be changed later</small></div>' +
+    '<div class="grid-2">' +
+      '<div class="form-group"><label>Site Name <span style="color:var(--muted);font-weight:400;">(optional)</span></label>' +
+        '<input id="wiz-site" type="text" value="' + esc(wiz.data.site) + '" placeholder="My Home"></div>' +
+      '<div class="form-group"><label>Supplier <span style="color:var(--muted);font-weight:400;">(optional)</span></label>' +
+        '<input id="wiz-supplier" type="text" value="' + esc(wiz.data.supplier) + '" placeholder="Octopus Energy"></div>' +
+      '<div class="form-group"><label>First day of your billing period</label>' +
+        '<input id="wiz-billing-day" type="number" min="1" max="28" value="' + wiz.data.billing_day + '"></div>' +
+    '</div>';
+}
+
+function wizStepSensors() {
+  return '<h3 style="margin:0 0 6px;">Meter Sensors</h3>' +
+    '<p style="color:var(--muted);font-size:13px;margin:0 0 20px;">Map your HA sensors to import, export and rate readings.</p>' +
+
+    '<div class="section-divider">Import</div>' +
+    '<div class="form-group"><label>Import Read Sensor — cumulative kWh from grid</label>' +
+      buildWizEntity('wiz-imp-read', wiz.data.importRead) + '</div>' +
+    '<div class="form-group"><label>Import Rate Sensor — £/kWh</label>' +
+      buildWizEntity('wiz-imp-rate', wiz.data.importRate) + '</div>' +
+    '<div class="form-group"><label>Standing Charge Sensor — £/day <span style="color:var(--muted);font-weight:400;">(optional)</span></label>' +
+      buildWizEntity('wiz-imp-sc', wiz.data.standingCharge) + '</div>' +
+
+    '<div class="section-divider" style="margin-top:20px;">Export</div>' +
+    '<div class="form-group"><label>Export Read Sensor — cumulative kWh to grid</label>' +
+      buildWizEntity('wiz-exp-read', wiz.data.exportRead) + '</div>' +
+    '<div class="form-group"><label>Export Rate Sensor — £/kWh <span style="color:var(--muted);font-weight:400;">(optional)</span></label>' +
+      buildWizEntity('wiz-exp-rate', wiz.data.exportRate) + '</div>';
+}
+
+function wizStepDevices() {
+  var devices = [
+    { id: 'ev',      icon: '🚗', label: 'EV Charger',    hint: 'Zappi, Ohme, etc.' },
+    { id: 'battery', icon: '🔋', label: 'Battery',       hint: 'Solax, Givenergy, etc.' },
+    { id: 'heat',    icon: '🌡️', label: 'Heat Pump',     hint: 'ASHP, GSHP' },
+  ];
+
+  var cards = devices.map(function(d) {
+    var sel = wiz.devices.indexOf(d.id) !== -1 ? ' selected' : '';
+    return '<div class="wiz-device-card' + sel + '" onclick="wizToggleDevice(\'' + d.id + '\', this)">' +
+      '<div class="icon">' + d.icon + '</div>' +
+      '<div class="label">' + d.label + '</div>' +
+      '<div class="hint">' + d.hint + '</div>' +
+    '</div>';
+  }).join('');
+
+  return '<h3 style="margin:0 0 6px;">Sub-meters</h3>' +
+    '<p style="color:var(--muted);font-size:13px;margin:0 0 4px;">Which devices do you want to sub-meter? Select all that apply.</p>' +
+    '<p style="color:var(--muted);font-size:12px;margin:0 0 4px;">You can skip this and add sub-meters manually later.</p>' +
+    '<div class="wiz-device-grid">' + cards + '</div>';
+}
+
+function wizToggleDevice(id, el) {
+  var idx = wiz.devices.indexOf(id);
+  if (idx === -1) { wiz.devices.push(id); el.classList.add('selected'); }
+  else { wiz.devices.splice(idx, 1); el.classList.remove('selected'); }
+  // Update step count
+  WIZ_STEPS = wiz.devices.length > 0
+    ? ['main', 'sensors', 'devices', 'sub_sensors', 'done']
+    : ['main', 'sensors', 'devices', 'done'];
+  wizUpdateProgress();
+}
+
+function wizStepSubSensors() {
+  var deviceLabels = { ev: 'EV Charger', battery: 'Battery', solar: 'Solar', heat: 'Heat Pump' };
+  var deviceHints  = {
+    ev:      'Cumulative kWh charged — from your charger integration (e.g. Zappi, Ohme)',
+    battery: 'Cumulative kWh imported to battery — from inverter integration',
+    heat:    'Cumulative kWh consumed — from your heat pump integration',
+  };
+  var mainId  = wiz.data.mainId || 'electricity_main';
+  var impRate = wiz.data.importRate || '';
+
+  var html = '<h3 style="margin:0 0 6px;">Sub-meter Sensors</h3>' +
+    '<p style="color:var(--muted);font-size:13px;margin:0 0 20px;">Map sensors for each device. Rate is pre-filled from your main import meter.</p>';
+
+  wiz.devices.forEach(function(devId) {
+    if (!wiz.data.subMeters[devId]) wiz.data.subMeters[devId] = { read: '', rate: impRate, name: '' };
+    var sd = wiz.data.subMeters[devId];
+
+    html += '<div style="border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:16px;">' +
+      '<div style="font-weight:600;margin-bottom:12px;">' + deviceLabels[devId] + '</div>' +
+      '<p style="color:var(--muted);font-size:12px;margin:0 0 12px;">' + deviceHints[devId] + '</p>' +
+      '<div class="form-group"><label>Device Name <span style="color:var(--muted);font-weight:400;">(optional)</span></label>' +
+        '<input id="wiz-sub-' + devId + '-name" type="text" value="' + esc(sd.name) + '" placeholder="e.g. Tesla Charger"></div>' +
+      '<div class="form-group"><label>Read Sensor — cumulative kWh</label>' +
+        buildWizEntity('wiz-sub-' + devId + '-read', sd.read) + '</div>' +
+      '<div class="form-group"><label>Rate Sensor — £/kWh ' + (impRate ? '(pre-filled from main meter)' : '') + '</label>' +
+        buildWizEntity('wiz-sub-' + devId + '-rate', sd.rate || impRate) + '</div>' +
+    '</div>';
+  });
+
+  return html;
+}
+
+function buildWizEntity(id, currentVal) {
+  return '<div class="entity-wrap">' +
+    '<input type="text" id="' + id + '" class="wiz-entity-input"' +
+    ' value="' + esc(currentVal||'') + '" placeholder="Search or type entity ID..." autocomplete="off"' +
+    ' style="font-family:var(--mono);font-size:12px;">' +
+    '<div id="' + id + '_drop" class="entity-drop"></div>' +
+    '</div>';
+}
+
+function setupWizEntityDropdowns() {
+  document.querySelectorAll('.wiz-entity-input').forEach(function(inp) {
+    inp.addEventListener('input', function() { showDropById(inp.id, inp); });
+    inp.addEventListener('focus', function() { if (inp.value.length >= 2) showDropById(inp.id, inp); });
+    inp.addEventListener('blur',  function() { setTimeout(function() { hideDrop(inp); }, 200); });
+  });
+}
+
+function showDropById(id, inp) {
+  var drop = document.getElementById(id + '_drop');
+  if (!drop) return;
+  // Infer field type from element ID
+  var field = '';
+  if (id.indexOf('-read') !== -1)  field = 'read';
+  else if (id.indexOf('-rate') !== -1) field = 'rate';
+  else if (id.indexOf('-sc') !== -1)   field = 'standing_charge_sensor';
+  var matches = filterEntities(field, inp.value);
+  if (matches.length === 0) { drop.style.display = 'none'; return; }
+  drop.innerHTML = matches.map(function(e) {
+    var hint = e.unit ? '<span style="float:right;color:var(--muted);font-size:10px;">' + esc(e.unit) + '</span>' : '';
+    return '<div data-val="' + esc(e.id) + '">' + esc(e.id) + hint + '</div>';
+  }).join('');
+  drop.style.display = 'block';
+  drop.querySelectorAll('div').forEach(function(item) {
+    item.addEventListener('mousedown', function(ev) {
+      ev.preventDefault();
+      inp.value = item.dataset.val;
+      drop.style.display = 'none';
+    });
+  });
+}
+
+function wizCollectStep() {
+  var step = WIZ_STEPS[wiz.step];
+  if (step === 'main') {
+    wiz.data.mainId     = (document.getElementById('wiz-mainId').value||'electricity_main').trim().replace(/\s+/g,'_');
+    wiz.data.site       = document.getElementById('wiz-site').value;
+    wiz.data.supplier   = document.getElementById('wiz-supplier').value;
+    wiz.data.billing_day = parseInt(document.getElementById('wiz-billing-day').value)||1;
+  } else if (step === 'sensors') {
+    wiz.data.importRead     = document.getElementById('wiz-imp-read').value;
+    wiz.data.importRate     = document.getElementById('wiz-imp-rate').value;
+    wiz.data.standingCharge = document.getElementById('wiz-imp-sc').value;
+    wiz.data.exportRead     = document.getElementById('wiz-exp-read').value;
+    wiz.data.exportRate     = document.getElementById('wiz-exp-rate').value;
+  } else if (step === 'sub_sensors') {
+    wiz.devices.forEach(function(devId) {
+      if (!wiz.data.subMeters[devId]) wiz.data.subMeters[devId] = {};
+      var nameEl = document.getElementById('wiz-sub-' + devId + '-name');
+      var readEl = document.getElementById('wiz-sub-' + devId + '-read');
+      var rateEl = document.getElementById('wiz-sub-' + devId + '-rate');
+      if (nameEl) wiz.data.subMeters[devId].name = nameEl.value;
+      if (readEl) wiz.data.subMeters[devId].read = readEl.value;
+      if (rateEl) wiz.data.subMeters[devId].rate = rateEl.value;
+    });
+  }
+}
+
+function wizNext() {
+  wizCollectStep();
+  // Skip sub_sensors if no devices selected
+  WIZ_STEPS = wiz.devices.length > 0
+    ? ['main', 'sensors', 'devices', 'sub_sensors', 'done']
+    : ['main', 'sensors', 'devices', 'done'];
+  wiz.step++;
+  renderWizStep();
+}
+
+function wizBack() {
+  wizCollectStep();
+  wiz.step = Math.max(0, wiz.step - 1);
+  renderWizStep();
+}
+
+function wizApplyAndClose() {
+  var d      = wiz.data;
+  var mainId = d.mainId || 'electricity_main';
+
+  // Build main meter
+  var mainMeter = {
+    meta: {
+      type: 'electricity',
+      site: d.site,
+      supplier: d.supplier,
+      billing_day: d.billing_day
+    },
+    channels: {
+      import: { read: d.importRead, rate: d.importRate },
+      export: { read: d.exportRead, rate: d.exportRate }
+    }
+  };
+  if (d.standingCharge) mainMeter.channels.import.standing_charge_sensor = d.standingCharge;
+
+  if (!config.meters[mainId]) config.meters[mainId] = mainMeter;
+  else Object.assign(config.meters[mainId], mainMeter);
+
+  // Build sub-meters
+  var devDefaults = {
+    ev:      { id: 'ev_charger',    inverter_possible: false, v2x_capable: false },
+    battery: { id: 'house_battery', inverter_possible: true,  v2x_capable: false },
+    heat:    { id: 'heat_pump',     inverter_possible: false, v2x_capable: false },
+  };
+
+  // Find existing sub-meter IDs that match each device type
+  function findExistingSubId(devId) {
+    var keywords = { ev: ['ev','charger'], battery: ['battery','batt'], heat: ['heat','pump'] };
+    var kws = keywords[devId];
+    return Object.keys(config.meters).find(function(id) {
+      if (!config.meters[id].meta.sub_meter) return false;
+      return kws.some(function(kw) { return id.toLowerCase().indexOf(kw) !== -1; });
+    });
+  }
+
+  wiz.devices.forEach(function(devId) {
+    var sd      = d.subMeters[devId] || {};
+    var def     = devDefaults[devId];
+    var subId   = findExistingSubId(devId) || def.id;
+
+    config.meters[subId] = {
+      meta: {
+        sub_meter:         true,
+        device:            sd.name || def.id,
+        parent_meter:      mainId,
+        inverter_possible: def.inverter_possible,
+        v2x_capable:       def.v2x_capable
+      },
+      channels: {
+        import: { read: sd.read || '', rate: sd.rate || d.importRate || '' }
+      }
+    };
+  });
+
+  closeWizard();
+  renderAll();
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function esc(str) {
+  return String(str).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function show(id) {
+  document.getElementById(id).classList.add('show');
+  setTimeout(function() { document.getElementById(id).classList.remove('show'); }, 4000);
+}
+function hideAlerts() {
+  ['alert-success','alert-error'].forEach(function(id) { document.getElementById(id).classList.remove('show'); });
+}
+function showError(msg) {
+  var el = document.getElementById('alert-error');
+  el.textContent = '✕ ' + msg;
+  el.classList.add('show');
+}
+</script>
+{% endblock %}
