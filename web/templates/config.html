@@ -142,7 +142,10 @@
 .entity-drop {
   display: none;
   position: absolute;
-  top: 100%; left: 0; right: 0;
+  top: 100%; left: 0;
+  min-width: 100%;
+  width: max-content;
+  max-width: 600px;
   z-index: 200;
   background: var(--surface);
   border: 1px solid var(--accent);
@@ -158,8 +161,11 @@
   cursor: pointer;
   color: var(--text);
   border-bottom: 1px solid var(--border);
+  white-space: nowrap;
 }
 .entity-drop div:hover { background: rgba(0,212,170,0.15); color: var(--accent); }
+.entity-input { text-overflow: ellipsis; }
+.entity-input:focus { text-overflow: clip; }
 
 /* Wizard device cards */
 .wiz-device-grid {
