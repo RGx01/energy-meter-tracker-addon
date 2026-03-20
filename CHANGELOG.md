@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.3.0] — 2026-03-21
+
+### Added
+- **Timezone support** — charts now assign blocks to the correct local day based on the user's timezone; configurable per meter in Meter Config and the setup wizard; defaults to UTC for backward compatibility (credit: KShips for the original implementation)
+- **Standing charge rate split** — billing summary now shows separate rows for each standing charge rate when a tariff change occurs mid-period, rather than averaging across all days
+
+### Changed
+- Billing summary standing charge display groups days by rate, showing count and subtotal per rate
+- Meter Config and wizard timezone field uses a curated dropdown of 30 common IANA timezones
+- UK users should set `Europe/London` to correctly handle BST/GMT transitions
+
+---
+
 ## [1.2.0] — 2026-03-20
 
 ### Added
