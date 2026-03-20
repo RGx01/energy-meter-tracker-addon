@@ -376,12 +376,13 @@ function buildSubCard(meterId, meter) {
     '</div>' +
 
     '<div class="info-box">' +
-      '<strong>Sub-meter sensor options</strong>' +
+      '<strong>Sub-meter sensor requirements</strong>' +
       '<ul>' +
-        '<li><strong>CT clamp via PowerCalc</strong> — aggregated kWh, update every 60s minimum</li>' +
+        '<li>Must be <strong>cumulative kWh consumed (import only)</strong> — not net usage, not export, not power in watts</li>' +
+        '<li><strong>CT clamp via PowerCalc</strong> — aggregated kWh, updates every 60s minimum</li>' +
         '<li><strong>Device integration</strong> — if your device reports kWh directly (e.g. Zappi, Solax)</li>' +
       '</ul>' +
-      'Rate sensor is pre-filled from your main import rate but can be overridden if billed differently.' +
+      'If no rate sensor is provided the main meter import rate is used automatically.' +
     '</div>' +
 
     '<div class="grid-2">' +
@@ -778,9 +779,9 @@ function wizToggleDevice(id, el) {
 function wizStepSubSensors() {
   var deviceLabels = { ev: 'EV Charger', battery: 'Battery', solar: 'Solar', heat: 'Heat Pump' };
   var deviceHints  = {
-    ev:      'Cumulative kWh charged — from your charger integration (e.g. Zappi, Ohme)',
-    battery: 'Cumulative kWh imported to battery — from inverter integration',
-    heat:    'Cumulative kWh consumed — from your heat pump integration',
+    ev:      'Cumulative kWh consumed (import only, not net) — from your charger integration (e.g. Zappi, Ohme)',
+    battery: 'Cumulative kWh imported to battery (import only, not net) — from inverter integration',
+    heat:    'Cumulative kWh consumed (import only, not net) — from your heat pump integration',
   };
   var mainId  = wiz.data.mainId || 'electricity_main';
   var impRate = wiz.data.importRate || '';
@@ -890,7 +891,7 @@ function wizBack() {
   renderWizStep();
 }
 
-function wizApplyAndClose() {
+async function wizApplyAndClose() {
   var d      = wiz.data;
   var mainId = d.mainId || 'electricity_main';
 
@@ -950,6 +951,19 @@ function wizApplyAndClose() {
 
   closeWizard();
   renderAll();
+  // Auto-save after wizard completes
+  try {
+    var r = await fetch(apiUrl('/api/config'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config)
+    });
+    var data = await r.json();
+    if (data.ok) show('alert-success');
+    else showError(data.error || 'Save failed — please press Save Config manually');
+  } catch(e) {
+    showError('Auto-save failed — please press Save Config manually');
+  }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

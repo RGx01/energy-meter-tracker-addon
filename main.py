@@ -35,6 +35,12 @@ async def main():
     setup()
 
     # 2 — Connect to HA
+    # In supervised mode, check if ha_url/ha_token are set in add-on options
+    # (allows supervised users to override the default Supervisor endpoints)
+    import os
+    if not os.environ.get("EMT_MODE"):
+        os.environ["EMT_MODE"] = "supervised"
+
     ha = HAClient()
     try:
         await ha.connect()
