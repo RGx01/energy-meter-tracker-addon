@@ -1,7 +1,24 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 from collections import defaultdict
 import json
 
+
+# ─────────────────────────────────────────────────────────────
+# Timezone helpers (credit: KShips)
+# ─────────────────────────────────────────────────────────────
+
+def _utc_to_local(dt_naive: datetime, tz: "ZoneInfo") -> datetime:
+    """Attach UTC, then convert to local timezone."""
+    return dt_naive.replace(tzinfo=timezone.utc).astimezone(tz)
+
+
+def _parse_block_start(iso_str: str, tz: "ZoneInfo") -> datetime:
+    """Parse a UTC ISO block-start string and return it in local time."""
+    return _utc_to_local(datetime.fromisoformat(iso_str), tz)
 
 # ─────────────────────────────────────────────────────────────
 # Colour helpers
@@ -57,12 +74,13 @@ def build_meter_colors(blocks):
 # Billing period helpers
 # ─────────────────────────────────────────────────────────────
 
-def get_all_billing_periods(blocks, billing_day):
+def get_all_billing_periods(blocks, billing_day, tz=None):
     if not blocks:
         return []
+    _tz = tz or ZoneInfo("UTC")
     sorted_blocks = sorted([b for b in blocks if b and b.get("start")], key=lambda b: b["start"])
-    first = datetime.fromisoformat(sorted_blocks[0]["start"])
-    last  = datetime.fromisoformat(sorted_blocks[-1]["start"])
+    first = _parse_block_start(sorted_blocks[0]["start"], _tz).replace(tzinfo=None)
+    last  = _parse_block_start(sorted_blocks[-1]["start"], _tz).replace(tzinfo=None)
 
     year, month = first.year, first.month
     if first.day < billing_day:
@@ -74,51 +92,54 @@ def get_all_billing_periods(blocks, billing_day):
     periods = []
     while True:
         period_start = first.replace(year=year, month=month, day=billing_day,
-                                     hour=0, minute=0, second=0, microsecond=0)
+                                     hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
         n_year, n_month = year, month + 1
         if n_month == 13:
             n_month = 1
             n_year += 1
         period_end = period_start.replace(year=n_year, month=n_month)
         periods.append((period_start, period_end))
-        if period_end > last:
+        if period_end > last.replace(tzinfo=None):
             break
         year, month = n_year, n_month
 
     return periods
 
 
-def get_all_calmonth_periods(blocks):
+def get_all_calmonth_periods(blocks, tz=None):
     """Calendar months: Jan 1 to Feb 1, Feb 1 to Mar 1, etc."""
     if not blocks:
         return []
+    _tz = tz or ZoneInfo("UTC")
     sorted_blocks = sorted([b for b in blocks if b and b.get("start")], key=lambda b: b["start"])
-    first = datetime.fromisoformat(sorted_blocks[0]["start"])
-    last  = datetime.fromisoformat(sorted_blocks[-1]["start"])
+    first = _parse_block_start(sorted_blocks[0]["start"], _tz).replace(tzinfo=None)
+    last  = _parse_block_start(sorted_blocks[-1]["start"], _tz).replace(tzinfo=None)
     periods = []
-    cur = first.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    cur = first.replace(day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    last_naive = last.replace(tzinfo=None)
     while True:
         nm = cur.month + 1
         ny = cur.year + (1 if nm > 12 else 0)
         nm = nm - 12 if nm > 12 else nm
         nxt = cur.replace(year=ny, month=nm, day=1)
         periods.append((cur, nxt))
-        if nxt > last:
+        if nxt > last_naive:
             break
         cur = nxt
     return periods
 
 
-def get_all_quarter_periods(blocks):
+def get_all_quarter_periods(blocks, tz=None):
     """Calendar quarters: Q1=Jan-Apr, Q2=Apr-Jul, Q3=Jul-Oct, Q4=Oct-Jan."""
     if not blocks:
         return []
+    _tz = tz or ZoneInfo("UTC")
     sorted_blocks = sorted([b for b in blocks if b and b.get("start")], key=lambda b: b["start"])
-    first = datetime.fromisoformat(sorted_blocks[0]["start"])
-    last  = datetime.fromisoformat(sorted_blocks[-1]["start"])
+    first = _parse_block_start(sorted_blocks[0]["start"], _tz).replace(tzinfo=None)
+    last  = _parse_block_start(sorted_blocks[-1]["start"], _tz).replace(tzinfo=None)
     def quarter_start(dt):
         qm = ((dt.month - 1) // 3) * 3 + 1
-        return dt.replace(month=qm, day=1, hour=0, minute=0, second=0, microsecond=0)
+        return dt.replace(month=qm, day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
     periods = []
     cur = quarter_start(first)
     while True:
@@ -133,15 +154,16 @@ def get_all_quarter_periods(blocks):
     return periods
 
 
-def get_all_year_periods(blocks):
+def get_all_year_periods(blocks, tz=None):
     """Calendar years: Jan 1 to Jan 1."""
     if not blocks:
         return []
+    _tz = tz or ZoneInfo("UTC")
     sorted_blocks = sorted([b for b in blocks if b and b.get("start")], key=lambda b: b["start"])
-    first = datetime.fromisoformat(sorted_blocks[0]["start"])
-    last  = datetime.fromisoformat(sorted_blocks[-1]["start"])
+    first = _parse_block_start(sorted_blocks[0]["start"], _tz).replace(tzinfo=None)
+    last  = _parse_block_start(sorted_blocks[-1]["start"], _tz).replace(tzinfo=None)
     periods = []
-    cur = first.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    cur = first.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
     while True:
         nxt = cur.replace(year=cur.year + 1)
         periods.append((cur, nxt))
@@ -345,13 +367,17 @@ def render_billing_summary(summary):
           <td>{totals['kwh']:.3f}</td><td>{total_cost_str}</td>
         </tr>"""
 
-    days = len(summary["standing"])
-    if days > 0:
-        avg = summary["total_standing"] / days
-        html += f"""
+    if summary["standing"]:
+        # Group days by rate to handle mid-period tariff changes
+        rate_groups = {}
+        for day_date, amount in sorted(summary["standing"].items()):
+            rate = round(amount, 4)
+            rate_groups[rate] = rate_groups.get(rate, 0) + 1
+        for rate, count in sorted(rate_groups.items()):
+            html += f"""
         <tr class="standing">
-          <td colspan="3">Standing Charge: {days} days @ £{avg:.4f}/day</td>
-          <td>{summary['total_standing']:.2f}</td>
+          <td colspan="3">Standing Charge: {count} days @ £{rate:.4f}/day</td>
+          <td>{rate * count:.2f}</td>
         </tr>"""
 
     html += f"""
@@ -673,12 +699,17 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix=''):
 # Main entry point
 # ─────────────────────────────────────────────────────────────
 
-def generate_daily_import_export_charts(blocks):
+def generate_daily_import_export_charts(blocks, timezone_name="UTC"):
 
     if not blocks:
         return "<html><body><p>No data available.</p></body></html>"
 
-    today = datetime.now().date()
+    try:
+        _tz = ZoneInfo(timezone_name)
+    except Exception:
+        _tz = ZoneInfo("UTC")
+
+    today = datetime.now(tz=_tz).date()
 
     # ── Group blocks by day ──
     days_map = defaultdict(list)
@@ -686,7 +717,7 @@ def generate_daily_import_export_charts(blocks):
         try:
             if not block or not block.get("start"):
                 continue
-            start = datetime.fromisoformat(block["start"])
+            start = _parse_block_start(block["start"], _tz)
             day   = start.date().isoformat()
             hh    = start.hour * 2 + (1 if start.minute >= 30 else 0)
             days_map[day].append((hh, block))
@@ -706,7 +737,7 @@ def generate_daily_import_export_charts(blocks):
     except (StopIteration, KeyError, TypeError, ValueError):
         billing_day = 1
 
-    periods = get_all_billing_periods(blocks, billing_day)
+    periods = get_all_billing_periods(blocks, billing_day, tz=_tz)
 
     # ── Build per-period data ──
     period_sections = []   # list of dicts
@@ -737,7 +768,7 @@ def generate_daily_import_export_charts(blocks):
 
     # ── Quarter periods ──
     quarter_sections = []
-    for i, (q_start, q_end) in enumerate(get_all_quarter_periods(blocks)):
+    for i, (q_start, q_end) in enumerate(get_all_quarter_periods(blocks, tz=_tz)):
         summary    = calculate_billing_summary_for_period(blocks, q_start, q_end)
         is_current = q_start.date() <= today < q_end.date()
         q_num      = (q_start.month - 1) // 3 + 1
@@ -757,7 +788,7 @@ def generate_daily_import_export_charts(blocks):
 
     # ── Year periods ──
     year_sections = []
-    for i, (y_start, y_end) in enumerate(get_all_year_periods(blocks)):
+    for i, (y_start, y_end) in enumerate(get_all_year_periods(blocks, tz=_tz)):
         summary    = calculate_billing_summary_for_period(blocks, y_start, y_end)
         is_current = y_start.date() <= today < y_end.date()
         year_sections.append({
@@ -776,7 +807,7 @@ def generate_daily_import_export_charts(blocks):
 
     # ── Calendar month periods ──
     calmonth_sections = []
-    for i, (cm_start, cm_end) in enumerate(get_all_calmonth_periods(blocks)):
+    for i, (cm_start, cm_end) in enumerate(get_all_calmonth_periods(blocks, tz=_tz)):
         summary    = calculate_billing_summary_for_period(blocks, cm_start, cm_end)
         is_current = cm_start.date() <= today < cm_end.date()
         calmonth_sections.append({
@@ -854,13 +885,13 @@ def generate_daily_import_export_charts(blocks):
       </select>
     </div>
     <div class="period-select-wrap" id="select-quarter" style="display:none;">
-      <label for="period-select-quarter"> style="font-size:11px;"Quarter:</label>
+      <label for="period-select-quarter" style="font-size:11px;">Quarter:</label>
       <select id="period-select-quarter" onchange="showPeriod(this.value, 'quarter')">
         {chr(39)+chr(39).join(quarter_options)}
       </select>
     </div>
     <div class="period-select-wrap" id="select-year" style="display:none;">
-      <label for="period-select-year"> style="font-size:11px;"Year:</label>
+      <label for="period-select-year" style="font-size:11px;">Year:</label>
       <select id="period-select-year" onchange="showPeriod(this.value, 'year')">
         {chr(39)+chr(39).join(year_options)}
       </select>
@@ -1854,7 +1885,7 @@ function showView(view) {{
 # Net heatmap (unchanged stub — keep your existing implementation)
 # ─────────────────────────────────────────────────────────────
 
-def generate_net_heatmap(blocks):
+def generate_net_heatmap(blocks, timezone_name="UTC"):
     if not blocks:
         return "<html><body><p>No data available</p></body></html>"
 
@@ -1864,11 +1895,16 @@ def generate_net_heatmap(blocks):
         except (TypeError, ValueError):
             return 0.0
 
+    try:
+        _tz = ZoneInfo(timezone_name)
+    except Exception:
+        _tz = ZoneInfo("UTC")
+
     # ───── Build day → 48 half-hour slots ─────
     days = defaultdict(lambda: [0.0] * 48)
     for block in sorted([b for b in blocks if b and b.get("start")], key=lambda b: b["start"]):
         try:
-            start = datetime.fromisoformat(block["start"])
+            start = _parse_block_start(block["start"], _tz)
             day = start.date().isoformat()
             hh_index = start.hour * 2 + (1 if start.minute >= 30 else 0)
             totals = block.get("totals", {}) or {}

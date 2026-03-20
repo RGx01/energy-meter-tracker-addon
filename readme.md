@@ -17,6 +17,7 @@ A Home Assistant add-on that records your electricity usage in precise half-hour
 - Cumulative kWh sensors for import and export
 - Live rate sensors (£/kWh) for import and export tariffs
 - Home Assistant OS, Supervised, or standalone Docker
+- For correct local day assignment, configure your timezone in Meter Config (e.g. `Europe/London` for UK users)
 
 ## Installation
 
