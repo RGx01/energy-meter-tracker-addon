@@ -46,7 +46,12 @@ app.secret_key = os.urandom(24)
 # ── Paths (injected from main.py before server starts) ────────────────────────
 DATA_DIR         = None
 CHART_DIR        = None
-SHARE_BACKUP_DIR = "/share/energy_meter_tracker_backup"
+import os as _os
+SHARE_BACKUP_DIR = (
+    _os.path.join("/data/energy_meter_tracker", "backup")
+    if _os.environ.get("EMT_MODE") == "standalone"
+    else "/share/energy_meter_tracker_backup"
+)
 _ha_client = None   # reference to the running HAClient instance
 _event_loop = None  # asyncio event loop — captured at init time
 
@@ -157,22 +162,39 @@ def logs_page():
 
 @app.route("/api/logs")
 def api_logs():
-    """Fetch add-on logs via Supervisor API."""
+    """Fetch add-on logs — via Supervisor API in supervised mode, log file in standalone."""
     import urllib.request
-    token = os.environ.get("SUPERVISOR_TOKEN", "")
     lines = min(int(request.args.get("lines", 100)), 1000)
-    try:
-        req = urllib.request.Request(
-            "http://supervisor/addons/self/logs",
-            headers={"Authorization": "Bearer " + token}
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-        all_lines = raw.splitlines()
-        return jsonify({"lines": all_lines[-lines:]})
-    except Exception as e:
-        logger.error("api_logs: %s", e)
-        return jsonify({"error": str(e), "lines": []})
+    emt_mode = os.environ.get("EMT_MODE", "supervised")
+
+    if emt_mode == "standalone":
+        # In standalone mode read from log file if available, otherwise return empty
+        log_path = "/data/energy_meter_tracker/addon.log"
+        try:
+            if os.path.exists(log_path):
+                with open(log_path, "r", errors="replace") as f:
+                    all_lines = f.read().splitlines()
+                return jsonify({"lines": all_lines[-lines:]})
+            else:
+                return jsonify({"lines": ["[Logs not available in standalone Docker mode]",
+                                          "Run with -v /path/to/logs:/data/energy_meter_tracker",
+                                          "or check docker logs <container_name>"]})
+        except Exception as e:
+            return jsonify({"error": str(e), "lines": []})
+    else:
+        token = os.environ.get("SUPERVISOR_TOKEN", "")
+        try:
+            req = urllib.request.Request(
+                "http://supervisor/addons/self/logs",
+                headers={"Authorization": "Bearer " + token}
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            all_lines = raw.splitlines()
+            return jsonify({"lines": all_lines[-lines:]})
+        except Exception as e:
+            logger.error("api_logs: %s", e)
+            return jsonify({"error": str(e), "lines": []})
 
 
 @app.route("/charts")
@@ -243,10 +265,12 @@ def api_chart_daily():
 def api_entities():
     """Return all HA entity IDs with unit_of_measurement and device_class for UI filtering."""
     import urllib.request
-    token = os.environ.get("SUPERVISOR_TOKEN", "")
+    token    = os.environ.get("HA_TOKEN") or os.environ.get("SUPERVISOR_TOKEN", "")
+    ha_url   = os.environ.get("HA_URL", "").rstrip("/")
+    base_url = (ha_url + "/api") if ha_url else "http://supervisor/core/api"
     try:
         req = urllib.request.Request(
-            "http://supervisor/core/api/states",
+            base_url + "/states",
             headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"}
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -310,15 +334,163 @@ def api_backup():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/backup/info", methods=["GET"])
+def api_backup_info():
+    """Return backup configuration info."""
+    return jsonify({
+        "backup_dir": SHARE_BACKUP_DIR,
+        "mode": os.environ.get("EMT_MODE", "supervised")
+    })
+
+
 @app.route("/api/backup/list", methods=["GET"])
 def api_backup_list():
-    """List available backup zips."""
+    """List available backup zips and last-finalise flat files."""
     import glob
     try:
         zips = sorted(glob.glob(f"{SHARE_BACKUP_DIR}/backups/*.zip"), reverse=True)
-        return jsonify([os.path.basename(z) for z in zips])
+        # Check for flat files from last finalise
+        known = ["blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"]
+        flat_files = []
+        for fname in known:
+            fpath = f"{SHARE_BACKUP_DIR}/{fname}"
+            if os.path.exists(fpath):
+                mtime = os.path.getmtime(fpath)
+                from datetime import datetime as _dt
+                flat_files.append({
+                    "name": fname,
+                    "modified": _dt.utcfromtimestamp(mtime).strftime("%Y-%m-%dT%H:%M:%S")
+                })
+        return jsonify({
+            "zips": [os.path.basename(z) for z in zips],
+            "flat": flat_files
+        })
     except Exception as e:
-        return jsonify([])
+        return jsonify({"zips": [], "flat": []})
+
+
+@app.route("/api/backup/restore", methods=["POST"])
+def api_backup_restore():
+    """Restore selected data files from a named backup zip or from last-finalise flat files."""
+    import zipfile, shutil
+    try:
+        data      = request.get_json(force=True)
+        zipname   = data.get("zip", "")
+        selected  = data.get("files", None)  # list of filenames, or None for all
+        from_flat = data.get("from_flat", False)  # restore from flat share files
+        known     = {"blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"}
+
+        # Validate zip name only when restoring from a zip (not flat files)
+        if not from_flat:
+            if not zipname or "/" in zipname or "\\" in zipname:
+                return jsonify({"error": "Invalid zip name"}), 400
+
+        _create_backup_zip(label="pre_restore")
+
+        if from_flat:
+            # Restore from flat files in SHARE_BACKUP_DIR
+            restored = []
+            for fname in (selected or list(known)):
+                if fname not in known:
+                    continue
+                src = f"{SHARE_BACKUP_DIR}/{fname}"
+                dst = os.path.join(DATA_DIR, fname)
+                if os.path.exists(src):
+                    shutil.copy2(src, dst)
+                    restored.append(fname)
+            logger.info("api_backup_restore: restored flat files %s", restored)
+            return jsonify({"ok": True, "restored": restored})
+        else:
+            if not zipname or "/" in zipname or "\\" in zipname:
+                return jsonify({"error": "Invalid zip name"}), 400
+            zip_path = f"{SHARE_BACKUP_DIR}/backups/{zipname}"
+            if not os.path.exists(zip_path):
+                return jsonify({"error": "Backup not found"}), 404
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                for name in zf.namelist():
+                    basename = os.path.basename(name)
+                    if basename not in known:
+                        continue
+                    if selected is not None and basename not in selected:
+                        continue
+                    dest = os.path.join(DATA_DIR, basename)
+                    with zf.open(name) as src, open(dest, "wb") as dst:
+                        dst.write(src.read())
+            restored = selected or list(known)
+            logger.info("api_backup_restore: restored %s from %s", restored, zipname)
+            return jsonify({"ok": True, "restored": restored})
+    except Exception as e:
+        logger.error("api_backup_restore: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/import/extract-zip", methods=["POST"])
+def api_import_extract_zip():
+    """Extract JSON files from an uploaded zip and return them as base64."""
+    import zipfile, base64
+    try:
+        zf_file = request.files.get("zipfile")
+        if not zf_file:
+            return jsonify({"error": "No zip file provided"}), 400
+        known = {"blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"}
+        files = {}
+        with zipfile.ZipFile(zf_file.stream, "r") as zf:
+            for name in zf.namelist():
+                basename = os.path.basename(name)
+                if basename in known:
+                    files[basename] = base64.b64encode(zf.read(name)).decode("utf-8")
+        if not files:
+            return jsonify({"error": "No recognised JSON files found in zip"}), 400
+        logger.info("api_import_extract_zip: extracted %s", list(files.keys()))
+        return jsonify({"files": files})
+    except Exception as e:
+        logger.error("api_import_extract_zip: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/backup/flat-info", methods=["GET"])
+def api_backup_flat_info():
+    """Return metadata about the last-finalise flat backup files."""
+    known = ["blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"]
+    from datetime import datetime as _dt
+    files = {}
+    for fname in known:
+        fpath = f"{SHARE_BACKUP_DIR}/{fname}"
+        if os.path.exists(fpath):
+            mtime = os.path.getmtime(fpath)
+            size  = os.path.getsize(fpath)
+            files[fname] = {
+                "modified": _dt.utcfromtimestamp(mtime).strftime("%Y-%m-%dT%H:%M:%S UTC"),
+                "size_kb":  round(size / 1024, 1)
+            }
+    return jsonify(files)
+
+
+@app.route("/api/import/extract-zip-by-name", methods=["POST"])
+def api_import_extract_zip_by_name():
+    """Extract JSON files from a named backup zip (server-side) and return as base64."""
+    import zipfile, base64
+    try:
+        data    = request.get_json(force=True)
+        zipname = data.get("zip", "")
+        if not zipname or "/" in zipname or "\\" in zipname:
+            return jsonify({"error": "Invalid zip name"}), 400
+        zip_path = f"{SHARE_BACKUP_DIR}/backups/{zipname}"
+        if not os.path.exists(zip_path):
+            return jsonify({"error": "Backup not found"}), 404
+        known = {"blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"}
+        files = {}
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for name in zf.namelist():
+                basename = os.path.basename(name)
+                if basename in known:
+                    files[basename] = base64.b64encode(zf.read(name)).decode("utf-8")
+        if not files:
+            return jsonify({"error": "No recognised JSON files found in backup"}), 400
+        return jsonify({"files": files})
+    except Exception as e:
+        logger.error("api_import_extract_zip_by_name: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 
 def _create_backup_zip(label="backup"):

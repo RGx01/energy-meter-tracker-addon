@@ -293,11 +293,41 @@
     hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 
     /* ── Responsive ── */
-    @media (max-width: 768px) {
-      .sidebar { width: 100%; position: relative; height: auto; }
+    /* ── Mobile — hamburger sidebar ── */
+    .hamburger {
+      display: none;
+      background: none;
+      border: none;
+      cursor: pointer;
+      padding: 4px 8px;
+      color: var(--text);
+      font-size: 22px;
+      line-height: 1;
+    }
+    .sidebar-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.5);
+      z-index: 9;
+    }
+    .sidebar-overlay.open { display: block; }
+
+    @media (max-width: 768px), (max-height: 500px) and (orientation: landscape) {
+      .hamburger { display: block; }
+      .sidebar {
+        position: fixed;
+        top: 0; left: 0; bottom: 0;
+        width: 240px;
+        transform: translateX(-100%);
+        transition: transform 0.25s ease;
+        z-index: 10;
+      }
+      .sidebar.open { transform: translateX(0); }
       .main { margin-left: 0; }
       .grid-2, .grid-3 { grid-template-columns: 1fr; }
       .content { padding: 16px; }
+      .topbar { padding: 12px 16px; }
     }
   </style>
   {% block head %}{% endblock %}
@@ -308,9 +338,10 @@
   </script>
 </head>
 <body>
+<div class="sidebar-overlay" id="sidebar-overlay" onclick="closeSidebar()"></div>
 <div class="layout">
 
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar">
     <div class="sidebar-brand">
       <img class="logo" src="{{ url_for('serve_logo') }}" alt="Energy Meter Tracker" onerror="this.style.display='none';this.nextElementSibling.style.display='block'">
       <span style="display:none;font-family:var(--mono);font-size:12px;font-weight:600;color:var(--accent);letter-spacing:0.08em;text-transform:uppercase;">Energy Meter<br>Tracker</span>
@@ -339,6 +370,9 @@
   </aside>
 
   <div class="main">
+    <div id="mobile-topbar" style="display:none;background:var(--surface);border-bottom:1px solid var(--border);padding:10px 16px;">
+      <button class="hamburger" onclick="toggleSidebar()">&#9776;</button>
+    </div>
     {% block topbar %}{% endblock %}
     <div class="content">
       {% block content %}{% endblock %}
@@ -347,5 +381,28 @@
 
 </div>
 {% block scripts %}{% endblock %}
+<script>
+function toggleSidebar() {
+  document.getElementById('sidebar').classList.toggle('open');
+  document.getElementById('sidebar-overlay').classList.toggle('open');
+}
+function closeSidebar() {
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebar-overlay').classList.remove('open');
+}
+// Close sidebar when a nav link is tapped on mobile
+document.querySelectorAll('.sidebar nav a').forEach(function(a) {
+  a.addEventListener('click', closeSidebar);
+});
+// Show mobile topbar only on small screens
+function checkMobile() {
+  var mt = document.getElementById('mobile-topbar');
+  var isMobile = window.innerWidth <= 768 || (window.innerHeight <= 500 && window.innerWidth > window.innerHeight);
+  if (mt) mt.style.display = isMobile ? 'block' : 'none';
+  if (!isMobile) closeSidebar();
+}
+checkMobile();
+window.addEventListener('resize', checkMobile);
+</script>
 </body>
 </html>

@@ -23,13 +23,26 @@ import aiohttp
 
 logger = logging.getLogger("ha_client")
 
-# ── HA Supervisor endpoints (available inside any add-on) ──────────────────
-SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
-HA_WS_URL        = "ws://supervisor/core/websocket"
-HA_REST_URL      = "http://supervisor/core/api"
+# ── Detect mode: HA Supervised vs standalone Docker ──────────────────────────
+_SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
+_HA_TOKEN         = os.environ.get("HA_TOKEN", "")
+_HA_URL           = os.environ.get("HA_URL", "").rstrip("/")
+_EMT_MODE         = os.environ.get("EMT_MODE", "supervised")
 
+if _EMT_MODE == "standalone" and _HA_URL:
+    # Standalone Docker — use user-provided HA URL and long-lived access token
+    _TOKEN      = _HA_TOKEN
+    HA_WS_URL   = _HA_URL.replace("http://", "ws://").replace("https://", "wss://") + "/api/websocket"
+    HA_REST_URL = _HA_URL + "/api"
+else:
+    # HA OS / Supervised — use Supervisor endpoints
+    _TOKEN      = _SUPERVISOR_TOKEN
+    HA_WS_URL   = "ws://supervisor/core/websocket"
+    HA_REST_URL = "http://supervisor/core/api"
+
+SUPERVISOR_TOKEN = _TOKEN   # keep name for backward compat
 HEADERS = {
-    "Authorization": f"Bearer {SUPERVISOR_TOKEN}",
+    "Authorization": f"Bearer {_TOKEN}",
     "Content-Type":  "application/json",
 }
 

@@ -1,6 +1,6 @@
 name: "Energy Meter Tracker"
 description: "Half-hourly energy metering engine with sub-meter support, gap filling, and billing charts."
-version: "1.1.0"
+version: "1.2.0"
 slug: "energy_meter_tracker"
 init: false
 startup: application
@@ -48,6 +48,10 @@ panel_title: "Energy Meter"
 # Minimal top-level options — meter config is managed via the UI, not here
 options:
   log_level: "info"
+  ha_url: ""
+  ha_token: ""
 
 schema:
   log_level: "list(debug|info|warning|error)"
+  ha_url: "str?"
+  ha_token: "str?"
