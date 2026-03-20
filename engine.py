@@ -626,16 +626,18 @@ def generate_charts(blocks: list):
     if not blocks:
         logger.info("generate_charts: no blocks, skipping")
         return
+    config = load_config()
+    timezone_name = config.get("timezone", "UTC")
     try:
-        html = energy_charts.generate_net_heatmap(blocks)
+        html = energy_charts.generate_net_heatmap(blocks, timezone_name=timezone_name)
         io_save_file(f"{CHART_DIR}/net_heatmap.html", html)
-        logger.info("generate_charts: net heatmap written")
+        logger.info("generate_charts: net heatmap written (tz=%s)", timezone_name)
     except Exception as e:
         logger.error("generate_charts: heatmap error: %s", e)
     try:
-        html = energy_charts.generate_daily_import_export_charts(blocks)
+        html = energy_charts.generate_daily_import_export_charts(blocks, timezone_name=timezone_name)
         io_save_file(f"{CHART_DIR}/daily_usage.html", html)
-        logger.info("generate_charts: daily usage chart written")
+        logger.info("generate_charts: daily usage chart written (tz=%s)", timezone_name)
     except Exception as e:
         logger.error("generate_charts: daily chart error: %s", e)
 

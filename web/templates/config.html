@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 
+
 {% block topbar %}
 <div class="topbar">
   <div>
@@ -193,6 +194,25 @@
 <script>
 let config   = {{ config | tojson }};
 let entities = [];
+// Timezone select HTML — rendered server-side to avoid JS string escaping issues
+var TZ_SELECT_HTML = {{ tz_select_html | tojson }};
+function buildTzSelect(id, currentTz) {
+  // Build select with correct option pre-selected
+  var html = TZ_SELECT_HTML
+    .replace('class="js-meta" data-key="timezone"',
+             'id="' + id + '" class="js-meta" data-key="timezone"')
+    .replace('value="' + (currentTz||'UTC') + '"',
+             'value="' + (currentTz||'UTC') + '" selected');
+  return html;
+}
+function buildTzSelectForMeter(meterId, currentTz) {
+  var html = TZ_SELECT_HTML
+    .replace('class="js-meta" data-key="timezone"',
+             'class="js-meta" data-meter="' + meterId + '" data-key="timezone"')
+    .replace('value="' + (currentTz||'UTC') + '"',
+             'value="' + (currentTz||'UTC') + '" selected');
+  return html;
+}
 const existingMeterIds = new Set(Object.keys(config.meters || {}));
 
 document.addEventListener('DOMContentLoaded', function() {
@@ -316,6 +336,10 @@ function buildMainCard(meterId, meter) {
         '<input type="text" class="js-meta" data-meter="' + meterId + '" data-key="supplier" value="' + esc(meta.supplier||'') + '"></div>' +
       '<div class="form-group"><label>First day of your billing period</label>' +
         '<input type="number" min="1" max="28" class="js-meta js-meta-int" data-meter="' + meterId + '" data-key="billing_day" value="' + (meta.billing_day||1) + '"></div>' +
+      '<div class="form-group"><label>Timezone</label>' +
+        buildTzSelectForMeter(meterId, meta.timezone||'UTC') + '</div>' +
+      '<div style="font-size:11px;color:var(--muted);margin-top:-8px;margin-bottom:8px;">Used to assign blocks to the correct local day. UK: Europe/London</div>' +
+
     '</div>' +
 
     '<hr>' +
@@ -664,6 +688,7 @@ function startWizard() {
     site:          mainMeta.site       || '',
     supplier:      mainMeta.supplier   || '',
     billing_day:   mainMeta.billing_day || 1,
+    timezone:      mainMeta.timezone || 'UTC',
     importRead:    imp.read                      || '',
     importRate:    imp.rate                      || '',
     standingCharge: imp.standing_charge_sensor   || '',
@@ -706,6 +731,7 @@ function renderWizStep() {
   else if (step === 'done')   { wizApplyAndClose(); return; }
 
   setupWizEntityDropdowns();
+
 }
 
 function wizStepMain() {
@@ -721,6 +747,10 @@ function wizStepMain() {
         '<input id="wiz-supplier" type="text" value="' + esc(wiz.data.supplier) + '" placeholder="Octopus Energy"></div>' +
       '<div class="form-group"><label>First day of your billing period</label>' +
         '<input id="wiz-billing-day" type="number" min="1" max="28" value="' + wiz.data.billing_day + '"></div>' +
+      '<div class="form-group"><label>Timezone</label>' +
+        buildTzSelect('wiz-tz-select', wiz.data.timezone||'UTC') + '</div>' +
+      '<div style="font-size:11px;color:var(--muted);margin-top:-8px;margin-bottom:8px;">UK users: Europe/London (handles BST automatically)</div>' +
+
     '</div>';
 }
 
@@ -856,6 +886,8 @@ function wizCollectStep() {
     wiz.data.site       = document.getElementById('wiz-site').value;
     wiz.data.supplier   = document.getElementById('wiz-supplier').value;
     wiz.data.billing_day = parseInt(document.getElementById('wiz-billing-day').value)||1;
+  var tzEl = document.getElementById('wiz-tz-select');
+  wiz.data.timezone = tzEl ? tzEl.value : (wiz.data.timezone || 'UTC');
   } else if (step === 'sensors') {
     wiz.data.importRead     = document.getElementById('wiz-imp-read').value;
     wiz.data.importRate     = document.getElementById('wiz-imp-rate').value;
@@ -901,7 +933,8 @@ async function wizApplyAndClose() {
       type: 'electricity',
       site: d.site,
       supplier: d.supplier,
-      billing_day: d.billing_day
+      billing_day: d.billing_day,
+      timezone:    d.timezone || 'UTC' 
     },
     channels: {
       import: { read: d.importRead, rate: d.importRate },
