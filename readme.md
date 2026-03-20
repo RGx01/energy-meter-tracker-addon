@@ -30,24 +30,68 @@ A Home Assistant add-on that records your electricity usage in precise half-hour
 
 ### Standalone Docker
 
-If you run Home Assistant Container (plain Docker) without the Supervisor:
+If you run Home Assistant Container (plain Docker) without the Supervisor, clone the repo and build locally using the provided `Dockerfile.standalone`:
 
+**Step 1 — Clone the repo**
 ```bash
-docker run -d \
-  --name energy-meter-tracker \
-  --restart unless-stopped \
-  -p 8099:8099 \
-  -e EMT_MODE=standalone \
-  -e HA_URL=http://192.168.1.10:8123 \
-  -e HA_TOKEN=your_long_lived_access_token \
-  -e LOG_LEVEL=info \
-  -v /path/to/data:/data/energy_meter_tracker \
-  ghcr.io/rgx01/energy-meter-tracker-addon:latest
+git clone https://github.com/RGx01/energy-meter-tracker-addon.git
+cd energy-meter-tracker-addon
 ```
 
-Create a Long-Lived Access Token in your HA profile under **Security → Long-Lived Access Tokens**.
+**Step 2 — Create a data directory**
+```bash
+mkdir -p ~/emt-data
+```
+
+**Step 3 — Create a Long-Lived Access Token**
+
+In your HA instance go to your profile → **Security → Long-Lived Access Tokens → Create Token**.
+
+**Step 4 — Add to your docker-compose.yml**
+```yaml
+  energy-meter-tracker:
+    build:
+      context: ./energy-meter-tracker-addon
+      dockerfile: Dockerfile.standalone
+    container_name: energy-meter-tracker
+    restart: unless-stopped
+    ports:
+      - "8099:8099"
+    environment:
+      - EMT_MODE=standalone
+      - HA_URL=http://homeassistant:8123
+      - LOG_LEVEL=info
+      - HA_TOKEN=your_long_lived_access_token
+    volumes:
+      - ~/emt-data:/data/energy_meter_tracker
+```
+
+Replace `homeassistant` in `HA_URL` with your HA container service name, or use the host IP address if they are on different networks.
+
+**Step 5 — Build and start**
+```bash
+docker-compose up -d --build energy-meter-tracker
+```
+
+Access the UI at `http://<host>:8099`.
 
 > ⚠️ Ingress (sidebar embedding) is only available in HA OS/Supervised. In standalone mode access the UI directly at `http://<host>:8099`.
+
+> ℹ️ Logs are written to `/data/energy_meter_tracker/addon.log` in standalone mode and are viewable from the **Logs** page in the UI.
+
+**Optional — add to HA sidebar**
+
+You can embed the UI in your HA sidebar using `panel_iframe` in your `configuration.yaml`:
+
+```yaml
+panel_iframe:
+  energy_meter:
+    title: "Energy Meter"
+    icon: mdi:speedometer
+    url: "http://192.168.1.x:8099"
+```
+
+Replace `192.168.1.x` with your Docker host IP. Restart HA after adding this. The Energy Meter will appear as a sidebar entry that opens the UI embedded within HA — similar to the supervised experience.
 
 ## Web UI
 

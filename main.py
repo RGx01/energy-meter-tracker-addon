@@ -34,6 +34,16 @@ async def main():
     # 1 — Initialise engine (dirs, locks)
     setup()
 
+    # In standalone mode, also log to file so the UI logs page can read it
+    import os
+    if os.environ.get("EMT_MODE") == "standalone":
+        file_handler = logging.FileHandler(f"{DATA_DIR}/addon.log")
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S"
+        ))
+        logging.getLogger().addHandler(file_handler)
+
     # 2 — Connect to HA
     # In supervised mode, check if ha_url/ha_token are set in add-on options
     # (allows supervised users to override the default Supervisor endpoints)

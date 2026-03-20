@@ -384,6 +384,10 @@ async function confirmRestore() {
   const checked = Array.from(document.querySelectorAll('.restore-cb:checked')).map(function(cb) { return cb.dataset.file; });
   if (checked.length === 0) return;
 
+  // Capture values before closeRestoreModal resets them
+  const zipToRestore  = _restoreZip;
+  const flatToRestore = _restoreFlat;
+
   hideAlerts();
   closeRestoreModal();
 
@@ -391,7 +395,7 @@ async function confirmRestore() {
     const r    = await fetch(apiUrl('/api/backup/restore'), {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ zip: _restoreZip || '', files: checked, from_flat: _restoreFlat })
+      body:    JSON.stringify({ zip: zipToRestore || '', files: checked, from_flat: flatToRestore })
     });
     const data = await r.json();
     if (data.ok) {

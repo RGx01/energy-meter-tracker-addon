@@ -46,7 +46,12 @@ app.secret_key = os.urandom(24)
 # ── Paths (injected from main.py before server starts) ────────────────────────
 DATA_DIR         = None
 CHART_DIR        = None
-SHARE_BACKUP_DIR = "/share/energy_meter_tracker_backup"
+import os as _os
+SHARE_BACKUP_DIR = (
+    _os.path.join("/data/energy_meter_tracker", "backup")
+    if _os.environ.get("EMT_MODE") == "standalone"
+    else "/share/energy_meter_tracker_backup"
+)
 _ha_client = None   # reference to the running HAClient instance
 _event_loop = None  # asyncio event loop — captured at init time
 
@@ -365,6 +370,11 @@ def api_backup_restore():
         selected  = data.get("files", None)  # list of filenames, or None for all
         from_flat = data.get("from_flat", False)  # restore from flat share files
         known     = {"blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"}
+
+        # Validate zip name only when restoring from a zip (not flat files)
+        if not from_flat:
+            if not zipname or "/" in zipname or "\\" in zipname:
+                return jsonify({"error": "Invalid zip name"}), 400
 
         _create_backup_zip(label="pre_restore")
 

@@ -244,6 +244,35 @@
   </div>
 </div>
 
+<!-- ── Standalone Docker ─────────────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">🐳 Standalone Docker</div>
+  <p>
+    When running in standalone Docker mode, the add-on connects to your HA instance using a
+    Long-Lived Access Token rather than the Supervisor. The UI is accessible directly at
+    <code>http://&lt;host&gt;:8099</code>.
+  </p>
+  <p style="margin-top:8px;">
+    <strong>Adding to the HA sidebar</strong> — add a <code>panel_iframe</code> entry to your
+    <code>configuration.yaml</code>:
+  </p>
+  <pre style="background:var(--bg);padding:12px;border-radius:6px;font-size:12px;overflow-x:auto;">panel_iframe:
+  energy_meter:
+    title: "Energy Meter"
+    icon: mdi:speedometer
+    url: "http://192.168.1.x:8099"</pre>
+  <p style="margin-top:8px;">
+    Replace <code>192.168.1.x</code> with your Docker host IP and restart HA. This adds a sidebar
+    entry that embeds the UI within HA — similar to the supervised experience.
+  </p>
+  <div class="warn-box">
+    ⚠️ <strong>The volume mount is essential.</strong> Always run with
+    <code>-v /path/to/data:/data/energy_meter_tracker</code> — without it all data is lost
+    when the container is recreated. The <code>/share</code> backup path is not available
+    in standalone mode so use the Backup Now button regularly.
+  </div>
+</div>
+
 <!-- ── HA sensors ────────────────────────────────────────────────────────── -->
 <div class="card help-section">
   <div class="card-title">🏠 Home Assistant Sensors</div>

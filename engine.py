@@ -41,7 +41,12 @@ CURRENT_BLOCK_PATH = f"{DATA_DIR}/current_block.json"
 BLOCKS_PATH        = f"{DATA_DIR}/blocks.json"
 TOTALS_PATH        = f"{DATA_DIR}/cumulative_totals.json"
 
-SHARE_BACKUP_DIR   = "/share/energy_meter_tracker_backup"
+import os as _os_engine
+SHARE_BACKUP_DIR   = (
+    _os_engine.path.join(DATA_DIR, "backup")
+    if _os_engine.environ.get("EMT_MODE") == "standalone"
+    else "/share/energy_meter_tracker_backup"
+)
 
 CHART_DIR          = "/data/energy_meter_tracker"   # accessible from HA /local/
 BLOCK_MINUTES      = 30
