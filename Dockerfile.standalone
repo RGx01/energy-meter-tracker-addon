@@ -14,4 +14,4 @@ COPY . /app/
 RUN sed -i 's/\r//' /app/run.sh && \
     chmod +x /app/run.sh
 
-CMD ["/app/run.sh"]
+CMD ["/bin/sh", "/app/run.sh"]
