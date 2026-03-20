@@ -81,7 +81,7 @@
 <!-- Daily usage chart -->
 <div id="chart-daily" class="chart-frame-wrap">
   {% if daily_exists %}
-    <div id="chart-daily-content" style="width:100%;height:calc(100vh - 220px);overflow:auto;">
+    <div id="chart-daily-content" class="chart-content-wrap" style="width:100%;overflow:auto;">
       <div style="padding:40px;text-align:center;color:var(--muted);">Loading chart...</div>
     </div>
   {% else %}
@@ -96,7 +96,7 @@
 <!-- Heatmap chart -->
 <div id="chart-heatmap" class="chart-frame-wrap" style="display:none;">
   {% if heatmap_exists %}
-    <div id="chart-heatmap-content" style="width:100%;height:calc(100vh - 220px);overflow:auto;">
+    <div id="chart-heatmap-content" class="chart-content-wrap" style="width:100%;overflow:auto;">
       <div style="padding:40px;text-align:center;color:var(--muted);">Loading chart...</div>
     </div>
   {% else %}
@@ -112,25 +112,63 @@
 {% block scripts %}
 <script>
 var chartsLoaded = {};
+function getChartHeight() {
+  var isMobile = window.innerWidth <= 768 || (window.innerHeight <= 500 && window.innerWidth > window.innerHeight);
+  return Math.max(window.innerHeight - (isMobile ? 80 : 220), 350) + 'px';
+}
 
-async function loadChartContent(name) {
-  if (chartsLoaded[name]) return;
+var _resizeTimer = null;
+var _suppressResize = false;
+
+function resizeChartIframes() {
+  if (_suppressResize) return;
+  // Update container heights immediately
+  var h = getChartHeight();
+  document.querySelectorAll('.chart-content-wrap').forEach(function(el) {
+    el.style.height = h;
+    var iframe = el.querySelector('iframe');
+    if (iframe) iframe.style.height = h;
+  });
+  // Only reload if the window size actually changed (real zoom/resize)
+  clearTimeout(_resizeTimer);
+  _resizeTimer = setTimeout(function() {
+    var activeTab  = document.querySelector('.chart-tab.active');
+    var activeName = activeTab && activeTab.textContent.indexOf('Daily') !== -1 ? 'daily' : 'heatmap';
+    chartsLoaded[activeName] = false;
+    loadChartContent(activeName, true);
+  }, 600);
+}
+
+window.addEventListener('resize', resizeChartIframes, { passive: true });
+
+// Suppress resize reload when iframe content triggers layout changes
+window.addEventListener('message', function(e) {
+  if (e.data && e.data.type === 'suppressResize') {
+    _suppressResize = true;
+    clearTimeout(_resizeTimer);
+    setTimeout(function() { _suppressResize = false; }, 800);
+  }
+});
+
+async function loadChartContent(name, force) {
+  if (chartsLoaded[name] && !force) return;
   var endpoint = name === 'daily' ? '/api/charts/daily' : '/api/charts/heatmap';
   var containerId = name === 'daily' ? 'chart-daily-content' : 'chart-heatmap-content';
   var el = document.getElementById(containerId);
   if (!el) return;
   try {
-    var r = await fetch(apiUrl(endpoint));
+    var h = getChartHeight();
+    var r = await fetch(apiUrl(endpoint) + '?t=' + Date.now());
     var data = await r.json();
     if (data.html) {
-      // Use blob URL so the chart HTML gets its own document context
-      // (required for Plotly scripts to execute correctly)
       var blob = new Blob([data.html], { type: 'text/html' });
       var blobUrl = URL.createObjectURL(blob);
       var iframe = document.createElement('iframe');
-      iframe.style.cssText = 'width:100%;height:calc(100vh - 220px);border:none;display:block;';
+      iframe.className = 'chart-iframe';
+      iframe.style.cssText = 'width:100%;height:' + h + ';border:none;display:block;';
       iframe.src = blobUrl;
       iframe.onload = function() { URL.revokeObjectURL(blobUrl); };
+      el.style.height = h;
       el.innerHTML = '';
       el.appendChild(iframe);
       chartsLoaded[name] = true;
@@ -140,12 +178,22 @@ async function loadChartContent(name) {
   }
 }
 
+// Auto-refresh charts every 2 minutes — clears cache so new blocks appear
+setInterval(function() {
+  var activeTab = document.querySelector('.chart-tab.active');
+  var activeName = activeTab && activeTab.textContent.indexOf('Daily') !== -1 ? 'daily' : 'heatmap';
+  chartsLoaded[activeName] = false;
+  loadChartContent(activeName, true);
+}, 120000);
+
 function showChart(name, btn) {
+  _suppressResize = true;
   document.querySelectorAll('.chart-tab').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
   document.getElementById('chart-daily').style.display   = name === 'daily'   ? 'block' : 'none';
   document.getElementById('chart-heatmap').style.display = name === 'heatmap' ? 'block' : 'none';
   loadChartContent(name);
+  setTimeout(function() { _suppressResize = false; }, 200);
 }
 
 async function regenerate() {

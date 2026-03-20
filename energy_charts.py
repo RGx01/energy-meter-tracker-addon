@@ -477,17 +477,16 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix=''):
     main_color   = meter_colors.get("electricity_main", "#1f77b4")
     export_color = meter_colors.get("electricity_main_export", "#ff7f0e")
 
-    def cs(text, color, size="12px", bold=False):
-        """Inline-coloured span matching legend colour."""
+    def cs(text, color, size="0.9em", bold=False):
         w = "font-weight:600;" if bold else ""
-        return f'<span style="color:{color};font-size:{size};line-height:1.6;{w}">{text}</span>'
+        return f'<span style="color:{color};font-size:{size};line-height:1.6;white-space:nowrap;{w}">{text}</span>'
 
     def rate_rows_colored(meter_key, color):
         out = ""
         for rate in sorted(summary_rates[meter_key]):
             kwh = summary_rates[meter_key][rate]
             if kwh > 0.0001:
-                out += cs(f'{kwh:.3f} kWh @ £{rate:.4f}', color, size="10px")
+                out += cs(f'{kwh:.3f} kWh @ £{rate:.4f}', color, size="0.8em")
         return out
 
     # Top totals — colours match import/export bars
@@ -507,9 +506,9 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix=''):
         if house_kwh > 0.0001:
             label = meter_display_name.get("electricity_main", "House")
             col   = '<div class="scol">'
-            col  += cs(f'↳ <span class="censored">{label}</span>', main_color, size="10px", bold=True)
-            col  += cs(f'{house_kwh:.3f} kWh', main_color, size="11px")
-            col  += cs(f'£{house_cost:.2f}', main_color, size="11px")
+            col  += cs(f'↳ <span class="censored">{label}</span>', main_color, size="1em", bold=True)
+            col  += cs(f'{house_kwh:.3f} kWh', main_color, size="1em")
+            col  += cs(f'£{house_cost:.2f}', main_color, size="1em")
             col  += rate_rows_colored("electricity_main", adjust_color(main_color, 0.75))
             col  += '</div>'
             breakdown_cols.append(col)
@@ -521,9 +520,9 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix=''):
                 sub_color = meter_colors.get(meter_name, "#e377c2")
                 label     = meter_display_name.get(meter_name, meter_name.replace("_", " ").title())
                 col  = '<div class="scol">'
-                col += cs(f'↳ {label}', sub_color, size="10px", bold=True)
-                col += cs(f'{sub_kwh:.3f} kWh', sub_color, size="11px")
-                col += cs(f'£{sub_cost:.2f}', sub_color, size="11px")
+                col += cs(f'↳ {label}', sub_color, size="1em", bold=True)
+                col += cs(f'{sub_kwh:.3f} kWh', sub_color, size="1em")
+                col += cs(f'£{sub_cost:.2f}', sub_color, size="1em")
                 col += rate_rows_colored(meter_name, adjust_color(sub_color, 0.75))
                 col += '</div>'
                 breakdown_cols.append(col)
@@ -549,6 +548,16 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix=''):
         customdata = [[x_ranges[i], total_hh_kwh[i], abs(_ys[i])] for i in range(48)]
 
         nice_name = meter.replace("_", " ").replace("electricity main", "House").replace("export", "Grid Export").title()
+        # Truncate rate line at last non-zero slot — prevents rate dropping
+        # to zero on current in-progress day where future slots are unfilled
+        raw_rates = meter_rate[meter]
+        last_nonzero = max((i for i, v in enumerate(raw_rates) if v != 0.0), default=None)
+        if last_nonzero is not None:
+            truncated_rates = raw_rates[:last_nonzero + 1] + [raw_rates[last_nonzero]]
+            trunc_x_line = [i - 0.5 for i in range(last_nonzero + 2)]
+        else:
+            truncated_rates = raw_rates + [raw_rates[-1]]
+            trunc_x_line = [i - 0.5 for i in range(49)]
 
         # Build hover suffix before the f-string so braces aren't mangled
         hover_total = "" if meter.endswith("_export") else " (%{customdata[1]:.3f} total)"
@@ -561,8 +570,8 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix=''):
   customdata: {json.dumps(customdata)},
   hovertemplate: '{nice_name}<br>%{{customdata[0]}}<br>%{{customdata[2]:.3f}} kWh{hover_total}<extra></extra>'
 }},{{
-  x: xLine,
-  y: {json.dumps(meter_rate[meter] + [meter_rate[meter][-1]])},
+  x: {json.dumps(trunc_x_line)},
+  y: {json.dumps(truncated_rates)},
   type: 'scatter', mode: 'lines',
   line: {{shape:'hv', width:2, color:'{line_color}', dash:'{dash_style}'}},
   name: '{nice_name} rate',
@@ -602,14 +611,15 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix=''):
       orientation: 'h',
       x: 0.5, xanchor: 'center',
       y: -0.28, yanchor: 'top',
-      font: {{size: 11}}
+      font: {{size: 11}},
     }}
   }};
   function _doRender_{chart_id_safe}() {{
-    var el = document.getElementById('{chart_id}');
-    if (!el) return;
-    var wrap = el.closest('.day-chart-wrap');
-    if (wrap && wrap.offsetHeight > 0) layout.height = wrap.offsetHeight;
+      var el = document.getElementById('{chart_id}');
+      if (!el) return;
+      var wrap = el.closest('.day-chart-wrap');
+      var wrapH = wrap ? wrap.offsetHeight : 0;
+      layout.height = Math.max(wrapH > 0 ? wrapH : 0, 320);
     function _alignY2() {{
       var y1range = el._fullLayout.yaxis.range;
       var y2range = el._fullLayout.yaxis2.range;
@@ -654,6 +664,7 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix=''):
   if (!window._pendingCharts) window._pendingCharts = {{}};
   window._pendingCharts['{chart_id}'] = _doRender_{chart_id_safe};
 }})();
+
 </script>
 """
 
@@ -831,25 +842,25 @@ def generate_daily_import_export_charts(blocks):
       <button class="pmode-btn"        data-mode="year"     onclick="setPeriodMode('year')">Year</button>
     </div>
     <div class="period-select-wrap" id="select-month">
-      <label for="period-select-month"><strong>Billing Period:</strong></label>
+      <label for="period-select-month" style="font-size:11px;">Billing Period:</label>
       <select id="period-select-month" onchange="showPeriod(this.value, 'month')">
         {chr(39)+chr(39).join(dropdown_options)}
       </select>
     </div>
     <div class="period-select-wrap" id="select-calmonth" style="display:none;">
-      <label for="period-select-calmonth"><strong>Month:</strong></label>
+      <label for="period-select-calmonth" style="font-size:11px;">Month:</label>
       <select id="period-select-calmonth" onchange="showPeriod(this.value, 'calmonth')">
         {chr(39)+chr(39).join(calmonth_options)}
       </select>
     </div>
     <div class="period-select-wrap" id="select-quarter" style="display:none;">
-      <label for="period-select-quarter"><strong>Quarter:</strong></label>
+      <label for="period-select-quarter"> style="font-size:11px;"Quarter:</label>
       <select id="period-select-quarter" onchange="showPeriod(this.value, 'quarter')">
         {chr(39)+chr(39).join(quarter_options)}
       </select>
     </div>
     <div class="period-select-wrap" id="select-year" style="display:none;">
-      <label for="period-select-year"><strong>Year:</strong></label>
+      <label for="period-select-year"> style="font-size:11px;"Year:</label>
       <select id="period-select-year" onchange="showPeriod(this.value, 'year')">
         {chr(39)+chr(39).join(year_options)}
       </select>
@@ -941,7 +952,7 @@ def generate_daily_import_export_charts(blocks):
         toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; £{bill_total:.2f}"
 
         sections_html_parts.append(f"""
-<div class="period-section month-section" id="{pid}" style="display:none;">
+<div class="period-section month-section" id="{pid}" style="visibility:hidden;position:absolute;">
   <details class="bill-toggle" open>
     <summary class="bill-toggle-summary">Bill Summary &mdash; {ph} &nbsp;|&nbsp; £{bill_total:.2f}</summary>
     <div class="bill-toggle-body">
@@ -1003,7 +1014,7 @@ def generate_daily_import_export_charts(blocks):
         toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; £{bill_total:.2f}"
         open_attr    = "open" if gs["is_current"] else ""
         return (
-            f'<div class="period-section {pid_prefix}-section" id="{pid}" style="display:none;">'
+            f'<div class="period-section {pid_prefix}-section" id="{pid}" style="visibility:hidden;position:absolute;">'
             f'<details class="bill-toggle" open>'
             f'<summary class="bill-toggle-summary">Bill Summary &mdash; {ph} &nbsp;|&nbsp; £{bill_total:.2f}</summary>'
             f'<div class="bill-toggle-body">'
@@ -1114,8 +1125,9 @@ body {{
 }}
 
 .page-wrap {{
-  max-width: 1280px;
-  margin: 0 auto;
+  max-width: 100%;
+  margin: 0;
+  padding: 0 8px;
 }}
 
 /* ── Period nav ───────────────────────────────── */
@@ -1123,12 +1135,12 @@ body {{
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 8px;
   background: white;
-  padding: 14px 20px;
+  padding: 8px 12px;
   border-radius: 0 0 8px 8px;
   box-shadow: 0 2px 8px rgba(0,0,0,0.12);
-  margin-bottom: 20px;
+  margin-bottom: 12px;
   flex-wrap: wrap;
   position: sticky;
   top: 0;
@@ -1138,7 +1150,7 @@ body {{
 .nav-left {{
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
 }}
 .nav-right {{
   display: flex;
@@ -1146,17 +1158,17 @@ body {{
   gap: 6px;
 }}
 .period-nav select {{
-  font-size: 14px;
-  padding: 6px 10px;
+  font-size: 11px;
+  padding: 2px 7px;
   border: 1px solid #ccc;
   border-radius: 5px;
   background: #fafafa;
   cursor: pointer;
-  min-width: 340px;
+  min-width: 280px;
 }}
 .view-btn {{
-  font-size: 13px;
-  padding: 6px 14px;
+  font-size: 11px;
+  padding: 4px 10px;
   border: 1px solid #ccc;
   border-radius: 5px;
   background: #f4f4f4;
@@ -1207,8 +1219,8 @@ body {{
 /* ── Billing card ─────────────────────────────── */
 .billing-summary {{
   background: white;
-  padding: 24px 28px;
-  margin-bottom: 16px;
+  padding: 16px 20px;
+  margin-bottom: 12px;
   border-radius: 8px;
   box-shadow: 0 1px 4px rgba(0,0,0,0.08);
   position: relative;
@@ -1224,7 +1236,6 @@ body {{
   font-size: 22px;
   font-weight: 700;
   color: rgba(0,0,0,0.12);
-  white-space: nowrap;
   pointer-events: none;
   user-select: none;
   letter-spacing: 0.05em;
@@ -1236,6 +1247,7 @@ body {{
   background: #faf5ff;
 }}
 .bill-site-header td {{
+  text-align: left;
   font-size: 15px;
   font-weight: 700;
   color: #333;
@@ -1259,28 +1271,27 @@ body {{
 .billing-table {{
   border-collapse: collapse;
   width: 100%;
-  font-size: 13px;
+  font-size: 12px;
 }}
 .billing-table td {{
-  padding: 5px 0;
+  padding: 3px 0;
   text-align: right;
 }}
-.billing-table td:first-child {{ text-align: left; }}
-
 .channel-title td {{
-  padding-top: 18px;
-  padding-bottom: 4px;
+  text-align: left;
+  padding-top: 10px;
+  padding-bottom: 2px;
   font-weight: 600;
-  font-size: 14px;
+  font-size: 13px;
   color: #111;
   border-top: 1px solid #eee;
 }}
-.channel-header td {{ font-size: 12px; color: #888; padding-bottom: 4px; }}
-.channel-total td  {{ padding-top: 4px; font-weight: 600; }}
-.standing td       {{ padding-top: 14px; }}
+.channel-header td {{ font-size: 11px; color: #888; padding-bottom: 2px; }}
+.channel-total td  {{ padding-top: 2px; font-weight: 600; }}
+.standing td       {{ padding-top: 8px; }}
 .grand-total td    {{
-  padding-top: 14px;
-  font-size: 16px;
+  padding-top: 8px;
+  font-size: 14px;
   font-weight: 700;
   color: #2f0057;
   border-top: 2px solid #2f0057;
@@ -1335,18 +1346,22 @@ body {{
 
 /* ── Summary panel ────────────────────────────── */
 .chart-summary {{
-  flex: 0 0 170px;
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 120px;
+  max-width: 220px;
   padding: 12px 10px;
   border-right: 1px solid #ebebeb;
   display: flex;
   flex-direction: column;
   gap: 0;
   overflow: hidden;
+  font-size: clamp(10px, 1vw, 13px);
 }}
 
 .day-label {{
   font-weight: 700;
-  font-size: 13px;
+  font-size: 1em;
   color: #2f0057;
   margin-bottom: 8px;
 }}
@@ -1392,9 +1407,10 @@ body {{
 }}
 
 .rate-row {{
-  font-size: 10px;
+  font-size: 0.8em;
   color: #bbb;
   line-height: 1.4;
+  white-space: nowrap;
 }}
 .rate-row.export {{ color: #d4913a; }}
 .rate-row.sub    {{ color: #ccc; }}
@@ -1404,7 +1420,7 @@ body {{
   display: flex;
   align-items: center;
   gap: 4px;
-  margin-bottom: 6px;
+  margin-bottom: 0px;
 }}
 .period-mode-label {{
   font-size: 12px;
@@ -1412,8 +1428,8 @@ body {{
   margin-right: 4px;
 }}
 .pmode-btn {{
-  padding: 3px 10px;
-  font-size: 12px;
+  padding: 2px 7px;
+  font-size: 11px;
   border: 1px solid #ccc;
   border-radius: 4px;
   background: #f5f5f5;
@@ -1504,24 +1520,39 @@ body {{
 
 /* ── Chart container ──────────────────────────── */
 .chart-container {{
-  flex: 1;
+  flex: 1 1 0;
   min-width: 0;
 }}
-
 /* ── Mobile responsive ────────────────────────── */
 @media (max-width: 600px) {{
   .period-nav {{
-    padding: 10px 12px;
-    gap: 8px;
+    padding: 6px 10px;
+    gap: 4px;
   }}
   .nav-left {{
     flex-wrap: wrap;
-    gap: 6px;
+    gap: 4px;
+  }}
+  .period-mode-toggle {{
+    margin-bottom: 0;
   }}
   .period-nav select {{
+    font-size: 11px;
+    padding: 2px 6px;
+    border: 1px solid #ccc;
+    border-radius: 5px;
+    background: #fafafa;
+    cursor: pointer;
     min-width: 0;
     width: 100%;
-    font-size: 13px;
+  }}
+  .pmode-btn {{
+    padding: 2px 6px;
+    font-size: 11px;
+  }}
+  .view-btn {{
+    padding: 2px 6px;
+    font-size: 11px;
   }}
   .period-select-wrap {{
     flex-direction: column;
@@ -1631,6 +1662,7 @@ function _renderSection(section) {{
 var _currentMode = 'month';
 
 function setPeriodMode(mode) {{
+  if (window.parent) window.parent.postMessage({{ type: 'suppressResize' }}, '*');
   _currentMode = mode;
   sessionStorage.setItem('energyPeriodMode', mode);
   // Toggle dropdowns
@@ -1651,7 +1683,10 @@ function setPeriodMode(mode) {{
     if (sv==='vs-year') showView('vanilla');
   }}
   // Hide all sections, show correct one for mode
-  document.querySelectorAll('.period-section').forEach(function(el) {{ el.style.display='none'; }});
+  document.querySelectorAll('.period-section').forEach(function(el) {{ 
+      el.style.visibility='hidden'; 
+      el.style.position='absolute'; 
+  }});
   var defaults = {{ month: '{default_period}', quarter: '{default_quarter}', year: '{default_year}' }};
   var savedId  = sessionStorage.getItem('energyPeriod_' + mode);
   // Validate saved ID still exists in DOM (blocks update may have changed period count)
@@ -1669,9 +1704,10 @@ function setPeriodMode(mode) {{
 }}
 
 function _revealSection(id) {{
-  var section = document.getElementById(id);
-  if (section) {{
-    section.style.display = 'block';
+    var section = document.getElementById(id);
+    if (section) {{
+      section.style.visibility = 'visible';
+      section.style.position = 'relative';
     // Re-apply current view so bill-view divs inside this section are correct
     var currentView = sessionStorage.getItem('energyView') || 'vanilla';
     section.querySelectorAll('.bill-view').forEach(function(el) {{
@@ -1688,11 +1724,15 @@ function _revealSection(id) {{
 }}
 
 function showPeriod(id, mode) {{
+  if (window.parent) window.parent.postMessage({{ type: 'suppressResize' }}, '*');
   if (!mode) mode = _currentMode;
   sessionStorage.setItem('energyPeriod_' + mode, id);
   // Hide all sections belonging to this mode, show only the selected one
   var clsMap = {{ month:'month-section', calmonth:'calmonth-section', quarter:'quarter-section', year:'year-section' }};
-  document.querySelectorAll('.' + clsMap[mode]).forEach(function(el) {{ el.style.display='none'; }});
+  document.querySelectorAll('.' + clsMap[mode]).forEach(function(el) {{ 
+    el.style.visibility='hidden'; 
+    el.style.position='absolute'; 
+  }});
   document.getElementById('sticky-bill-strip').style.visibility = 'hidden';
   _revealSection(id);
 }}
@@ -1952,11 +1992,12 @@ def generate_net_heatmap(blocks):
 
     # ───── Sizing ─────
     visible_rows   = 31
+    scroll_padding = 40
     row_height     = 20
     col_width      = row_height          # square cells
     n_cols         = 48
     n_rows         = len(sorted_days)
-    margin_l, margin_r, margin_t, margin_b = 80, 20, 120, 50
+    margin_l, margin_r, margin_t, margin_b = 80, 60, 120, 50
     # heatmap domain is [0, 0.85] of plot area (excl. margins)
     # plot_area_w * 0.85 = n_cols * col_width
     plot_area_w    = int(n_cols * col_width / 0.85)
@@ -1987,24 +2028,35 @@ def generate_net_heatmap(blocks):
 </head>
 <style>
   html {{ scroll-padding-top: 80px; }}
-html, body {{ margin:0; padding:0; }}
+html, body {{ margin:0; padding:0; overflow:hidden; }}
   #outer {{ width:{heatmap_width}px; transform-origin: top left; }}
-  #scroll {{ width:{heatmap_width}px; height:{div_height}px; overflow-y:auto; border:1px solid #aaa; }}
+  #scroll {{ width:{heatmap_width}px; height:100vh; overflow-y:scroll; overflow-x:hidden; border:1px solid #aaa; position:relative; scrollbar-width:thin; }}
+    #scroll-guard {{
+      position: fixed;
+      top: 0; right: 0;
+      width: 20px;
+      height: 100%;
+      z-index: 100;
+      touch-action: pan-y;
+    }}
 </style>
 <body>
 <div id="outer">
   <div id="scroll">
-    <div id="heatmap" style="width:{heatmap_width}px;height:{heatmap_height}px;"></div>
+      <div id="heatmap" style="width:{heatmap_width}px;height:{heatmap_height}px;"></div>
   </div>
+  <div id="scroll-guard"></div>
 </div>
 <script>
 function scaleChart() {{
   var vw = window.innerWidth;
   var cw = {heatmap_width};
-  var scale = vw < cw ? vw / cw : 1.0;
-  document.getElementById('outer').style.transform = 'scale(' + scale + ')';
-  document.getElementById('outer').style.width = cw + 'px';
-  document.body.style.height = (document.getElementById('scroll').offsetHeight * scale) + 'px';
+  if (vw < cw) {{
+    var scale = vw / cw;
+    document.getElementById('outer').style.zoom = scale;
+  }} else {{
+    document.getElementById('outer').style.zoom = 1;
+  }}
 }}
 window.addEventListener('resize', scaleChart);
 scaleChart();
@@ -2047,7 +2099,7 @@ var data = [
 var layout = {{
   title: {{text: 'Net Energy Flow', x: 0.5}},
   xaxis:  {{tickangle: -45, side: 'top', domain: [0, 0.85]}},
-  xaxis2: {{title: {{text: 'Daily Total', standoff: 10}}, side: 'top', domain: [0.86, 1.0]}},
+  xaxis2: {{title: {{text: 'Daily Total', standoff: 10}}, side: 'top', domain: [0.86, 1]}},
   yaxis:  {{type: 'category', tickmode: 'array', tickvals: {y_json}, ticktext: {y_ticktext_json}, fixedrange: true}},
   shapes: {shapes_json},
   annotations: {annotations_json},
@@ -2057,7 +2109,7 @@ var layout = {{
   plot_bgcolor: '#f5f5f5',
   paper_bgcolor: '#ffffff'
 }};
-Plotly.newPlot('heatmap', data, layout, {{responsive: false}}).then(scaleChart);
+Plotly.newPlot('heatmap', data, layout, {{responsive: false, scrollZoom: false, touchZoom: false, displayModeBar: false}}).then(scaleChart);
 </script>
 </body>
 </html>"""

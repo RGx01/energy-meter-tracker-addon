@@ -173,7 +173,7 @@
       <ul>
         <li>Must be <strong>cumulative kWh</strong> — ever-increasing total, never resets</li>
         <li>High-frequency updates preferred (10–60s) for better boundary interpolation</li>
-        <li>Typically from your supplier integration (e.g. Octopus Energy, DCC)</li>
+        <li>Typically from your CAD via MQTT integration</li>
         <li>Example: <code>sensor.smart_meter_electricity_import</code></li>
       </ul>
     </div>
@@ -189,9 +189,10 @@
     <div>
       <p><strong>Sub-meter — Read sensors</strong></p>
       <ul>
-        <li>Must be <strong>cumulative kWh</strong> — same requirement as main meter</li>
+        <li>Must be <strong>cumulative kWh consumed (import only)</strong> — not net usage, not export, not power in watts</li>
         <li>Can update less frequently (60s+) — interpolation still works</li>
         <li>CT clamp via PowerCalc, or native device integration (Zappi, Solax, etc.)</li>
+        <li>If no rate sensor is configured the main meter import rate is used automatically</li>
       </ul>
     </div>
     <div>
@@ -234,12 +235,41 @@
     Data is stored in the add-on's private <code>/data/</code> directory. After every block finalise,
     all four files are copied to <code>/share/energy_meter_tracker_backup/</code>. A zip snapshot
     is also created automatically before every config save, and manually on demand from the
-    <a href="/import" style="color:var(--accent);">Import &amp; Backup page</a>.
+    <a href="{{ url_for('import_page') }}" style="color:var(--accent);">Import &amp; Backup page</a>.
   </p>
   <div class="warn-box">
     ⚠️ <strong>Uninstalling the add-on will wipe <code>/data/</code>.</strong> Always ensure you
     have a recent backup in <code>/share/</code> before uninstalling. Updating the add-on
     (without uninstalling) preserves your data.
+  </div>
+</div>
+
+<!-- ── Standalone Docker ─────────────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">🐳 Standalone Docker</div>
+  <p>
+    When running in standalone Docker mode, the add-on connects to your HA instance using a
+    Long-Lived Access Token rather than the Supervisor. The UI is accessible directly at
+    <code>http://&lt;host&gt;:8099</code>.
+  </p>
+  <p style="margin-top:8px;">
+    <strong>Adding to the HA sidebar</strong> — add a <code>panel_iframe</code> entry to your
+    <code>configuration.yaml</code>:
+  </p>
+  <pre style="background:var(--bg);padding:12px;border-radius:6px;font-size:12px;overflow-x:auto;">panel_iframe:
+  energy_meter:
+    title: "Energy Meter"
+    icon: mdi:speedometer
+    url: "http://192.168.1.x:8099"</pre>
+  <p style="margin-top:8px;">
+    Replace <code>192.168.1.x</code> with your Docker host IP and restart HA. This adds a sidebar
+    entry that embeds the UI within HA — similar to the supervised experience.
+  </p>
+  <div class="warn-box">
+    ⚠️ <strong>The volume mount is essential.</strong> Always run with
+    <code>-v /path/to/data:/data/energy_meter_tracker</code> — without it all data is lost
+    when the container is recreated. The <code>/share</code> backup path is not available
+    in standalone mode so use the Backup Now button regularly.
   </div>
 </div>
 

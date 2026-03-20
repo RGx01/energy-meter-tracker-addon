@@ -1,5 +1,51 @@
 # Changelog
 
+## [1.2.0] — 2026-03-20
+
+### Added
+- **Standalone Docker support** — run without HA Supervisor by providing `HA_URL` and `HA_TOKEN` environment variables; `run.sh` auto-detects mode based on `SUPERVISOR_TOKEN` presence; `Dockerfile.standalone` uses `python:3.12-slim` and works on any platform including Apple Silicon
+- **Logs in standalone mode** — Python logging writes to `/data/energy_meter_tracker/addon.log` in standalone mode so the Logs page works without the Supervisor API
+- **`Dockerfile.standalone`** — separate Dockerfile for standalone Docker users; original `Dockerfile` unchanged for supervised HA
+- **Zip import** — drag a backup zip directly onto the import page; JSON files are extracted server-side and presented for preview before importing
+- **Selective restore modal** — clicking Restore on a backup opens a modal showing all files with checkboxes; user selects which files to restore with mismatch warning if `blocks.json` and `meters_config.json` are not restored together; auto-backup created before restoring
+- **Last-finalise backup restore** — the flat file backup copied to `/share` after every block finalise is now visible and restorable from the Import & Backup page
+- **Wizard auto-save** — pressing Finish in the setup wizard now saves config automatically without needing to find the Save button
+- **Mobile hamburger menu** — sidebar collapses to a hamburger button on mobile portrait and landscape; sidebar slides in as an overlay
+- **Chart auto-refresh** — charts reload automatically every 2 minutes without manual page refresh
+- **Minimum chart height** — daily charts enforce a 320px minimum height to prevent collapse when secondary axis is absent
+- **DEVELOPMENT.md** — architecture guide covering block lifecycle, interpolation, gap filling, file structure, running tests and local dev setup
+- **CONTRIBUTING.md** — contribution guidelines covering bug reporting, feature requests, branch naming, PR workflow and code style
+
+### Fixed
+- Rate line no longer drops to zero on the current in-progress day — truncated at last known reading
+- Chart height instability (runaway height) resolved with fixed minimum and improved sizing logic
+- Heatmap scroll now uses `100vh` so all rows are reachable regardless of screen height
+- Heatmap right-edge scroll conflict on mobile — touch guard overlay allows page scroll without triggering chart zoom
+- Weekend shading in heatmap now correctly fills to the right edge of the totals chart
+- Charts not updating after HA session timeout — blob URL cache cleared on auto-refresh cycle
+- Period mode switching (Bill/Month/Quarter/Year) no longer triggers a chart reload delay — resize suppressed during DOM changes via `postMessage`
+- Billing table right-justification fixed — channel title and site header rows now correctly left-aligned
+- Daily chart summary panel font sizes now consistent across all meter types at all zoom levels
+
+### Changed
+- Import & Backup page restructured — backups section moved to top, Create Backup button prominent, PyScript path column removed, Restore risk column added to file reference
+- Backup list shows top 5 with scroll for more, restore button per entry
+- Period nav bar tightened — consistent `11px` font and reduced padding across all buttons, labels and selectors so bar fits on one row
+- Billing table row padding and font sizes reduced — more bill visible without scrolling
+- Daily chart summary panel uses `clamp(10px, 1vw, 13px)` font scaling and `white-space: nowrap` to prevent wrapping at any zoom level
+- Chart page `max-width` constraint removed — charts fill full iframe width at any zoom level
+- Sub-meter card and wizard device hints now explicitly state sensors must be **cumulative kWh consumed (import only)** — not net, not export, not watts
+- Sub-meter info box now states that if no rate sensor is provided the main meter import rate is used automatically
+- Help page sensor requirements updated to match
+- Mobile chart height uses more available vertical space in both portrait and landscape
+- Panel icon changed to `mdi:speedometer`
+- README data & backup section expanded with survival table, pre-upgrade advice and standalone Docker volume mount guidance
+
+### Known Issues
+- Plotly legend occasionally renders with a spurious scrollbar on mobile portrait — self-corrects on first user interaction with the chart
+
+---
+
 ## [1.1.0] — 2026-03-14
 
 ### Added
