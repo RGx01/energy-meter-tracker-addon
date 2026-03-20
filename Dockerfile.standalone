@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+# Install Python dependencies
+RUN pip install --no-cache-dir \
+    aiohttp \
+    flask \
+    waitress
+
+# Copy source files into /app/
+WORKDIR /app
+COPY . /app/
+
+# Ensure run.sh is executable and has Unix line endings
+RUN sed -i 's/\r//' /app/run.sh && \
+    chmod +x /app/run.sh
+
+CMD ["/app/run.sh"]
