@@ -334,6 +334,15 @@ def api_backup():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/backup/info", methods=["GET"])
+def api_backup_info():
+    """Return backup configuration info."""
+    return jsonify({
+        "backup_dir": SHARE_BACKUP_DIR,
+        "mode": os.environ.get("EMT_MODE", "supervised")
+    })
+
+
 @app.route("/api/backup/list", methods=["GET"])
 def api_backup_list():
     """List available backup zips and last-finalise flat files."""

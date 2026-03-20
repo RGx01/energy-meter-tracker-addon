@@ -51,7 +51,7 @@
   <div class="card-title">💾 Backups</div>
   <p style="color:var(--muted);font-size:13px;margin-bottom:16px;line-height:1.7;">
     A backup zip is created automatically before every config save. Backups are stored in
-    <code style="font-family:var(--mono);font-size:12px;">/share/energy_meter_tracker_backup/backups/</code>
+    <code id="backup-path-display" style="font-family:var(--mono);font-size:12px;">/share/energy_meter_tracker_backup/backups/</code>
     and the 20 most recent are kept.
   </p>
   <button class="btn btn-secondary" onclick="doManualBackup()" id="btn-backup2" style="margin-bottom:16px;">💾 Create Backup Now</button>
@@ -499,6 +499,16 @@ function showError(msg) {
   el.classList.add('show');
 }
 
-document.addEventListener('DOMContentLoaded', function() { loadBackupList(); });
+document.addEventListener('DOMContentLoaded', function() {
+  loadBackupList();
+  // Update backup path display to reflect actual path (supervised vs standalone)
+  fetch(apiUrl('/api/backup/info'))
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var el = document.getElementById('backup-path-display');
+      if (el && data.backup_dir) el.textContent = data.backup_dir + '/backups/';
+    })
+    .catch(function() {});
+});
 </script>
 {% endblock %}
