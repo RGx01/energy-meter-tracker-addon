@@ -665,17 +665,16 @@ def generate_charts(blocks: list):
             main_meta = meter_data.get("meta") or {}
             break
     timezone_name = main_meta.get("timezone", "UTC")
-    block_minutes = int(main_meta.get("block_minutes") or 30)
     try:
-        html = energy_charts.generate_net_heatmap(blocks, timezone_name=timezone_name, block_minutes=block_minutes)
+        html = energy_charts.generate_net_heatmap(blocks, timezone_name=timezone_name)
         io_save_file(f"{CHART_DIR}/net_heatmap.html", html)
-        logger.info("generate_charts: net heatmap written (tz=%s, bm=%s)", timezone_name, block_minutes)
+        logger.info("generate_charts: net heatmap written (tz=%s)", timezone_name)
     except Exception as e:
         logger.error("generate_charts: heatmap error: %s", e)
     try:
-        html = energy_charts.generate_daily_import_export_charts(blocks, timezone_name=timezone_name, block_minutes=block_minutes)
+        html = energy_charts.generate_daily_import_export_charts(blocks, timezone_name=timezone_name)
         io_save_file(f"{CHART_DIR}/daily_usage.html", html)
-        logger.info("generate_charts: daily usage chart written (tz=%s, bm=%s)", timezone_name, block_minutes)
+        logger.info("generate_charts: daily usage chart written (tz=%s)", timezone_name)
     except Exception as e:
         logger.error("generate_charts: daily chart error: %s", e)
 
