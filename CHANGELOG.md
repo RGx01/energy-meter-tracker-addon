@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.3.1] — 2026-03-22
+
+### Fixed
+- **UTC time bug** — replaced deprecated `datetime.utcnow()` with `datetime.now(timezone.utc)` throughout the engine; on systems where the OS clock is not set to UTC this was causing incorrect block timestamps and rapid catch-up finalisation on restart
+- **Engine crash on data reset** — `capture_samples` now guards against a missing `meters` key in `current_block.json`; previously clearing the file to `{}` caused repeated `KeyError: 'meters'` crashes
+- **Charts always using UTC timezone** — `generate_charts` was reading timezone from the wrong location in config (top-level key that doesn't exist) instead of the meter meta; charts now correctly use the configured timezone (e.g. `Europe/London`)
+- **Standing charge averaging** — billing summary now shows separate rows per rate when a tariff change occurs mid-period rather than showing a misleading average across all days
+- **Heatmap hover offset** — replaced CSS `zoom` scaling with `transform: scale()` so hover tooltips register on the correct cell when the heatmap is scaled to fit smaller screens
+
+---
+
 ## [1.3.0] — 2026-03-21
 
 ### Added
