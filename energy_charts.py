@@ -2087,11 +2087,19 @@ html, body {{ margin:0; padding:0; overflow:hidden; }}
 function scaleChart() {{
   var vw = window.innerWidth;
   var cw = {heatmap_width};
+  var outer = document.getElementById('outer');
   if (vw < cw) {{
     var scale = vw / cw;
-    document.getElementById('outer').style.zoom = scale;
+    outer.style.transform = 'scale(' + scale + ')';
+    outer.style.transformOrigin = 'top left';
+    outer.style.width = cw + 'px';
+    // Compensate height so page doesn't scroll outside the scaled content
+    outer.style.height = Math.ceil(document.getElementById('scroll').offsetHeight * scale) + 'px';
   }} else {{
-    document.getElementById('outer').style.zoom = 1;
+    outer.style.transform = '';
+    outer.style.transformOrigin = '';
+    outer.style.width = '';
+    outer.style.height = '';
   }}
 }}
 window.addEventListener('resize', scaleChart);

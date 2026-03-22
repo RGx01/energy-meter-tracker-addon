@@ -18,7 +18,7 @@ import asyncio
 import logging
 import os
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from energy_engine_io import (
     ensure_dir,
@@ -227,7 +227,7 @@ def extract_last_reads(block: dict):
 
 def set_gap_marker(block: dict, pre_reads: dict, last_known_rates: dict):
     block["_gap_marker"] = {
-        "detected_at":      datetime.utcnow().isoformat(),
+        "detected_at":      datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         "pre_reads":        pre_reads,
         "last_known_rates": last_known_rates,
     }
@@ -336,8 +336,11 @@ def capture_samples(ha: HAClient, block: dict, now: datetime):
         logger.error("capture_samples: meters_config missing")
         return
 
-    for meter_id, meter_cfg in config.get("meters", {}).items():
-        meter_block = block["meters"].setdefault(
+        if "meters" not in block:
+                block["meters"] = {}
+
+        for meter_id, meter_cfg in config.get("meters", {}).items():
+            meter_block = block["meters"].setdefault(
             meter_id, {"meta": {}, "channels": {}, "interpolated": False}
         )
         meter_block["meta"] = meter_cfg.get("meta", {})
@@ -626,8 +629,13 @@ def generate_charts(blocks: list):
     if not blocks:
         logger.info("generate_charts: no blocks, skipping")
         return
-    config = load_config()
-    timezone_name = config.get("timezone", "UTC")
+    config    = load_config()
+    main_meta = {}
+    for meter_data in config.get("meters", {}).values():
+        if not (meter_data.get("meta") or {}).get("sub_meter"):
+            main_meta = meter_data.get("meta") or {}
+            break
+    timezone_name = main_meta.get("timezone", "UTC")
     try:
         html = energy_charts.generate_net_heatmap(blocks, timezone_name=timezone_name)
         io_save_file(f"{CHART_DIR}/net_heatmap.html", html)
@@ -938,7 +946,7 @@ async def _deferred_sensor_update(ha: HAClient, engine_totals: dict):
 async def on_import_meter_update(entity_id: str, new_val: str, full_state: dict):
     """Fired by ha_client when the main import sensor changes state."""
     try:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         _read_queue.append(now)
         logger.info("on_import_meter_update: read queued at %s", now.isoformat())
     except Exception as e:
@@ -948,7 +956,7 @@ async def on_import_meter_update(entity_id: str, new_val: str, full_state: dict)
 async def on_export_meter_update(entity_id: str, new_val: str, full_state: dict):
     """Fired by ha_client when the main export sensor changes state."""
     try:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         _read_queue.append(now)
         logger.info("on_export_meter_update: read queued at %s", now.isoformat())
     except Exception as e:
@@ -980,7 +988,7 @@ async def engine_loop_task(ha: HAClient):
 async def _engine_tick(ha: HAClient):
     if _engine_paused:
         return
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
 
     current_block = load_json(CURRENT_BLOCK_PATH, {})
 
@@ -1131,7 +1139,7 @@ async def engine_startup(ha: HAClient):
         last_block     = blocks[-1]
         last_block_end = last_block.get("end")
         if last_block_end:
-            missing_windows = detect_gap(last_block_end, datetime.utcnow())
+            missing_windows = detect_gap(last_block_end, datetime.now(timezone.utc).replace(tzinfo=None))
             if missing_windows:
                 logger.warning(
                     "engine_startup: session gap detected — %d missing blocks", len(missing_windows)
