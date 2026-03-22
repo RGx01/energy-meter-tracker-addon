@@ -1,0 +1,514 @@
+{% extends "base.html" %}
+
+{% block topbar %}
+<div class="topbar">
+  <div>
+    <h2>Import &amp; Backup</h2>
+    <div class="sub">Restore from a backup or migrate data from a previous install</div>
+  </div>
+  <div style="display:flex;gap:8px;">
+    <button class="btn btn-secondary" id="btn-backup" onclick="doManualBackup()">💾 Backup Now</button>
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+
+<div id="alert-success" class="alert alert-success"></div>
+<div id="alert-error"   class="alert alert-danger"></div>
+
+<!-- ── Restore modal ─────────────────────────────────────────────────────── -->
+<div id="restore-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;overflow-y:auto;">
+  <div style="max-width:520px;margin:60px auto;padding:0 16px 60px;">
+    <div class="card" style="padding:28px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+        <h3 style="margin:0;font-size:15px;font-weight:600;">Restore from Backup</h3>
+        <button onclick="closeRestoreModal()" style="background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;">✕</button>
+      </div>
+
+      <div style="background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.3);border-radius:var(--radius);padding:12px 14px;margin-bottom:20px;font-size:13px;line-height:1.7;">
+        ⚠️ Select which files to restore. Deselect any you want to keep as-is.
+        A backup of your current data will be created automatically before restoring.
+      </div>
+
+      <div id="restore-file-list" style="margin-bottom:16px;"></div>
+
+      <div id="restore-mismatch-warn" style="display:none;background:rgba(240,82,82,0.08);border:1px solid var(--danger);border-radius:var(--radius);padding:12px 14px;margin-bottom:16px;font-size:13px;line-height:1.7;color:var(--danger);">
+        ⚠️ <strong>Mismatch risk:</strong> restoring <code>blocks.json</code> without <code>meters_config.json</code>
+        (or vice versa) may cause calculation errors if meter IDs have changed between backups.
+      </div>
+
+      <div style="display:flex;gap:10px;justify-content:flex-end;">
+        <button class="btn btn-secondary" onclick="closeRestoreModal()">Cancel</button>
+        <button class="btn btn-primary" id="restore-confirm-btn" onclick="confirmRestore()">↩ Restore Selected</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Backups ──────────────────────────────────────────────────────────────── -->
+<div class="card">
+  <div class="card-title">💾 Backups</div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;line-height:1.7;">
+    A backup zip is created automatically before every config save. Backups are stored in
+    <code id="backup-path-display" style="font-family:var(--mono);font-size:12px;">/share/energy_meter_tracker_backup/backups/</code>
+    and the 20 most recent are kept.
+  </p>
+  <button class="btn btn-secondary" onclick="doManualBackup()" id="btn-backup2" style="margin-bottom:16px;">💾 Create Backup Now</button>
+  <div id="backup-list" style="font-size:13px;color:var(--muted);">Loading...</div>
+</div>
+
+<!-- ── Import ───────────────────────────────────────────────────────────────── -->
+<div class="card">
+  <div class="card-title">📥 Import Data Files</div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:20px;line-height:1.7;">
+    Drag in a <strong>backup zip</strong> or individual <strong>JSON files</strong> to restore data.
+    You can remove files you don't want to import before confirming.
+    <strong style="color:var(--warning);">Warning:</strong> importing will overwrite existing data.
+  </p>
+
+  <div id="drop-zone" style="
+    border: 2px dashed var(--border);
+    border-radius: var(--radius);
+    padding: 40px;
+    text-align: center;
+    margin-bottom: 24px;
+    transition: border-color 0.15s;
+    cursor: pointer;
+  " ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)" onclick="document.getElementById('file-input').click()">
+    <div style="font-size:32px;margin-bottom:8px;">📂</div>
+    <div style="color:var(--text);font-size:14px;margin-bottom:4px;">Drop a backup zip or JSON files here, or click to browse</div>
+    <div style="color:var(--muted);font-size:12px;">Accepts .zip backup archives or individual .json files</div>
+    <input type="file" id="file-input" multiple accept=".json,.zip" style="display:none" onchange="onFileSelect(this.files)">
+  </div>
+
+  <div id="file-list" style="margin-bottom:20px;display:none;">
+    <div class="card-title">Files to import</div>
+    <div id="file-items"></div>
+  </div>
+
+  <button class="btn btn-primary" onclick="doImport()" id="import-btn" disabled>
+    📥 Import Selected Files
+  </button>
+</div>
+
+<!-- ── File reference ───────────────────────────────────────────────────────── -->
+<div class="card">
+  <div class="card-title">ℹ️ File Reference</div>
+  <table style="width:100%;border-collapse:collapse;font-size:13px;">
+    <thead>
+      <tr style="border-bottom:1px solid var(--border);">
+        <th style="text-align:left;padding:8px 0;color:var(--muted);font-weight:500;">File</th>
+        <th style="text-align:left;padding:8px 0;color:var(--muted);font-weight:500;">Contains</th>
+        <th style="text-align:left;padding:8px 0;color:var(--muted);font-weight:500;">Restore risk</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr style="border-bottom:1px solid var(--border);">
+        <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">blocks.json</td>
+        <td style="padding:10px 0;color:var(--text);">All finalised half-hourly blocks</td>
+        <td style="padding:10px 0;color:var(--warning);font-size:12px;">Restore with config together</td>
+      </tr>
+      <tr style="border-bottom:1px solid var(--border);">
+        <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">current_block.json</td>
+        <td style="padding:10px 0;color:var(--text);">Rolling buffer for current half-hour</td>
+        <td style="padding:10px 0;color:var(--success);font-size:12px;">Safe alone</td>
+      </tr>
+      <tr style="border-bottom:1px solid var(--border);">
+        <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">cumulative_totals.json</td>
+        <td style="padding:10px 0;color:var(--text);">Running totals for HA sensors</td>
+        <td style="padding:10px 0;color:var(--success);font-size:12px;">Safe alone</td>
+      </tr>
+      <tr>
+        <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">meters_config.json</td>
+        <td style="padding:10px 0;color:var(--text);">Meter and channel configuration</td>
+        <td style="padding:10px 0;color:var(--warning);font-size:12px;">Restore with blocks together</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const KNOWN_FILES = ['blocks.json','current_block.json','cumulative_totals.json','meters_config.json'];
+let selectedFiles = {};
+let _restoreZip   = null;
+let _restoreFlat  = false;
+let _restoreFiles = {};
+
+// ── Drag & drop ───────────────────────────────────────────────────────────────
+function onDragOver(e) {
+  e.preventDefault();
+  document.getElementById('drop-zone').style.borderColor = 'var(--accent)';
+}
+function onDragLeave(e) {
+  document.getElementById('drop-zone').style.borderColor = 'var(--border)';
+}
+function onDrop(e) {
+  e.preventDefault();
+  document.getElementById('drop-zone').style.borderColor = 'var(--border)';
+  onFileSelect(e.dataTransfer.files);
+}
+
+async function onFileSelect(files) {
+  for (const f of Array.from(files)) {
+    if (f.name.endsWith('.zip')) {
+      await extractZipToSelected(f);
+    } else if (f.name.endsWith('.json')) {
+      selectedFiles[f.name] = f;
+    }
+  }
+  renderFileList();
+}
+
+async function extractZipToSelected(zipFile) {
+  try {
+    const form = new FormData();
+    form.append('zipfile', zipFile);
+    const r    = await fetch(apiUrl('/api/import/extract-zip'), { method: 'POST', body: form });
+    const data = await r.json();
+    if (data.files) {
+      for (const [name, b64] of Object.entries(data.files)) {
+        const bytes = atob(b64);
+        const arr   = new Uint8Array(bytes.length);
+        for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+        const blob  = new Blob([arr], { type: 'application/json' });
+        selectedFiles[name] = new File([blob], name, { type: 'application/json' });
+      }
+    } else {
+      showError(data.error || 'Could not extract zip');
+    }
+  } catch(e) {
+    showError('Zip extraction failed: ' + e.message);
+  }
+}
+
+function renderFileList() {
+  const items = document.getElementById('file-items');
+  const list  = document.getElementById('file-list');
+  const btn   = document.getElementById('import-btn');
+
+  if (Object.keys(selectedFiles).length === 0) {
+    list.style.display = 'none';
+    btn.disabled = true;
+    return;
+  }
+
+  list.style.display = 'block';
+  btn.disabled = false;
+
+  items.innerHTML = Object.entries(selectedFiles).map(([name, file]) => {
+    const known  = KNOWN_FILES.includes(name);
+    const sizeKb = (file.size / 1024).toFixed(1);
+    const color  = known ? 'var(--success)' : 'var(--warning)';
+    const status = known ? '✓ recognised' : '⚠ unrecognised';
+    return `
+      <div style="display:flex;align-items:center;justify-content:space-between;
+                  padding:10px 12px;background:var(--bg);border-radius:var(--radius);
+                  border:1px solid var(--border);margin-bottom:6px;">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <span style="font-family:var(--mono);font-size:13px;">${name}</span>
+          <span style="font-size:11px;color:${color};">${status}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:12px;">
+          <span style="color:var(--muted);font-size:12px;">${sizeKb} KB</span>
+          <button class="btn btn-danger btn-sm" onclick="removeFile('${name}')">✕</button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function removeFile(name) {
+  delete selectedFiles[name];
+  renderFileList();
+}
+
+async function doImport() {
+  hideAlerts();
+  const form = new FormData();
+  const fieldMap = {
+    'blocks.json':            'blocks',
+    'current_block.json':     'current_block',
+    'cumulative_totals.json': 'cumulative_totals',
+    'meters_config.json':     'meters_config',
+  };
+
+  let hasKnown = false;
+  Object.entries(selectedFiles).forEach(([name, file]) => {
+    const field = fieldMap[name];
+    if (field) { form.append(field, file); hasKnown = true; }
+  });
+
+  if (!hasKnown) {
+    showError('No recognised files selected. Expected: ' + Object.keys(fieldMap).join(', '));
+    return;
+  }
+
+  try {
+    const r    = await fetch(apiUrl('/api/import'), { method: 'POST', body: form });
+    const data = await r.json();
+    if (data.ok) {
+      const el = document.getElementById('alert-success');
+      el.textContent = '✓ Imported: ' + data.imported.join(', ') + '. Restart the add-on to apply.';
+      el.classList.add('show');
+      selectedFiles = {};
+      renderFileList();
+    } else {
+      showError(data.error || 'Import failed');
+    }
+  } catch(e) {
+    showError(e.message);
+  }
+}
+
+// ── Restore modal ─────────────────────────────────────────────────────────────
+async function restoreFromFlat() {
+  // Load flat file info then open modal
+  try {
+    var r    = await fetch(apiUrl('/api/backup/flat-info'));
+    var info = await r.json();
+    if (!info || Object.keys(info).length === 0) {
+      showError('No last-finalise backup files found');
+      return;
+    }
+    _restoreZip   = null;
+    _restoreFlat  = true;
+    _restoreFiles = {};
+    Object.keys(info).forEach(function(name) {
+      _restoreFiles[name] = info[name];  // { modified, size_kb }
+    });
+
+    var riskMap = {
+      'blocks.json':            { risk: 'warning', note: 'Restore with meters_config.json for safety' },
+      'current_block.json':     { risk: 'success', note: 'Safe to restore alone' },
+      'cumulative_totals.json': { risk: 'success', note: 'Safe to restore alone' },
+      'meters_config.json':     { risk: 'warning', note: 'Restore with blocks.json for safety' },
+    };
+
+    var listEl = document.getElementById('restore-file-list');
+    listEl.innerHTML = Object.keys(_restoreFiles).map(function(name) {
+      var inf  = _restoreFiles[name];
+      var risk = riskMap[name] || { risk: 'muted', note: '' };
+      return '<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;' +
+             'background:var(--bg);border-radius:var(--radius);border:1px solid var(--border);margin-bottom:6px;cursor:pointer;">' +
+        '<input type="checkbox" class="restore-cb" data-file="' + name + '" checked ' +
+               'style="margin-top:2px;width:15px;height:15px;accent-color:var(--accent);" ' +
+               'onchange="checkRestoreMismatch()">' +
+        '<div>' +
+          '<div style="font-family:var(--mono);font-size:13px;">' + name + '</div>' +
+          '<div style="font-size:11px;color:var(--muted);margin-top:1px;">Last updated: ' + inf.modified + ' · ' + inf.size_kb + ' KB</div>' +
+          '<div style="font-size:11px;color:var(--' + risk.risk + ');margin-top:1px;">' + risk.note + '</div>' +
+        '</div>' +
+      '</label>';
+    }).join('');
+
+    checkRestoreMismatch();
+    document.getElementById('restore-overlay').style.display = 'block';
+  } catch(e) {
+    showError('Failed to load backup info: ' + e.message);
+  }
+}
+
+async function restoreFromZip(zipName) {
+  _restoreZip   = zipName;
+  _restoreFiles = {};
+
+  // Extract zip contents via server
+  try {
+    const form = new FormData();
+    const r    = await fetch(apiUrl('/api/import/extract-zip-by-name'), {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ zip: zipName })
+    });
+    const data = await r.json();
+    if (data.files) {
+      _restoreFiles = data.files;  // { filename: base64 }
+    } else {
+      showError(data.error || 'Could not read backup');
+      return;
+    }
+  } catch(e) {
+    showError('Failed to read backup: ' + e.message);
+    return;
+  }
+
+  // Build checkbox list
+  const riskMap = {
+    'blocks.json':            { risk: 'warning', note: 'Restore with meters_config.json for safety' },
+    'current_block.json':     { risk: 'success', note: 'Safe to restore alone' },
+    'cumulative_totals.json': { risk: 'success', note: 'Safe to restore alone' },
+    'meters_config.json':     { risk: 'warning', note: 'Restore with blocks.json for safety' },
+  };
+
+  const listEl = document.getElementById('restore-file-list');
+  listEl.innerHTML = Object.keys(_restoreFiles).map(function(name) {
+    const info = riskMap[name] || { risk: 'muted', note: '' };
+    return `<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;
+                           background:var(--bg);border-radius:var(--radius);
+                           border:1px solid var(--border);margin-bottom:6px;cursor:pointer;">
+      <input type="checkbox" class="restore-cb" data-file="${name}" checked
+             style="margin-top:2px;width:15px;height:15px;accent-color:var(--accent);"
+             onchange="checkRestoreMismatch()">
+      <div>
+        <div style="font-family:var(--mono);font-size:13px;">${name}</div>
+        <div style="font-size:11px;color:var(--${info.risk});margin-top:2px;">${info.note}</div>
+      </div>
+    </label>`;
+  }).join('');
+
+  checkRestoreMismatch();
+  document.getElementById('restore-overlay').style.display = 'block';
+}
+
+function checkRestoreMismatch() {
+  const checked = Array.from(document.querySelectorAll('.restore-cb:checked')).map(function(cb) { return cb.dataset.file; });
+  const hasBlocks = checked.includes('blocks.json');
+  const hasConfig = checked.includes('meters_config.json');
+  const warn = document.getElementById('restore-mismatch-warn');
+  // Show warning if one is selected without the other
+  warn.style.display = (hasBlocks !== hasConfig) ? 'block' : 'none';
+  document.getElementById('restore-confirm-btn').disabled = checked.length === 0;
+}
+
+function closeRestoreModal() {
+  document.getElementById('restore-overlay').style.display = 'none';
+  _restoreZip   = null;
+  _restoreFlat  = false;
+  _restoreFiles = {};
+}
+
+async function confirmRestore() {
+  const checked = Array.from(document.querySelectorAll('.restore-cb:checked')).map(function(cb) { return cb.dataset.file; });
+  if (checked.length === 0) return;
+
+  // Capture values before closeRestoreModal resets them
+  const zipToRestore  = _restoreZip;
+  const flatToRestore = _restoreFlat;
+
+  hideAlerts();
+  closeRestoreModal();
+
+  try {
+    const r    = await fetch(apiUrl('/api/backup/restore'), {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ zip: zipToRestore || '', files: checked, from_flat: flatToRestore })
+    });
+    const data = await r.json();
+    if (data.ok) {
+      const el = document.getElementById('alert-success');
+      el.textContent = '✓ Restored: ' + checked.join(', ') + '. Restart the add-on to apply.';
+      el.classList.add('show');
+    } else {
+      showError(data.error || 'Restore failed');
+    }
+  } catch(e) {
+    showError(e.message);
+  }
+}
+
+// ── Backup ────────────────────────────────────────────────────────────────────
+async function doManualBackup() {
+  var btn = document.getElementById('btn-backup') || document.getElementById('btn-backup2');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Backing up...'; }
+  try {
+    var r    = await fetch(apiUrl('/api/backup'), { method: 'POST' });
+    var data = await r.json();
+    if (data.ok) {
+      const el = document.getElementById('alert-success');
+      el.textContent = '✓ Backup created: ' + data.path;
+      el.classList.add('show');
+      setTimeout(function() { el.classList.remove('show'); }, 6000);
+      loadBackupList();
+    } else {
+      showError(data.error || 'Backup failed');
+    }
+  } catch(e) {
+    showError(e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '💾 Backup Now'; }
+  }
+}
+
+async function loadBackupList() {
+  try {
+    var r    = await fetch(apiUrl('/api/backup/list'));
+    var data = await r.json();
+    var el   = document.getElementById('backup-list');
+    if (!el) return;
+
+    var html = '';
+
+    // ── Last finalise flat files ──
+    var flat = data.flat || [];
+    if (flat.length > 0) {
+      // Find the most recent modified timestamp
+      var latestMod = flat.reduce(function(latest, f) {
+        return f.modified > latest ? f.modified : latest;
+      }, '');
+      html += '<div style="margin-bottom:16px;">' +
+        '<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;' +
+        'color:var(--muted);margin-bottom:8px;">Last Finalise Backup</div>' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;' +
+        'padding:10px 12px;background:var(--bg);border-radius:var(--radius);border:1px solid var(--border);">' +
+        '<div>' +
+          '<div style="font-size:13px;font-weight:500;">Block finalise snapshot</div>' +
+          '<div style="font-size:11px;color:var(--muted);margin-top:2px;">Last updated: ' + latestMod + '</div>' +
+          '<div style="font-size:11px;color:var(--muted);">Contains: ' + flat.map(function(f){return f.name;}).join(', ') + '</div>' +
+        '</div>' +
+        '<button class="btn btn-secondary btn-sm" onclick="restoreFromFlat()">↩ Restore</button>' +
+        '</div></div>';
+    }
+
+    // ── Zip backups ──
+    var zips = data.zips || [];
+    html += '<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);margin-bottom:8px;">Zip Backups</div>';
+    if (zips.length === 0) {
+      html += '<div style="color:var(--muted);font-size:13px;">No zip backups yet.</div>';
+    } else {
+      var rows = zips.map(function(z) {
+        return '<div style="display:flex;align-items:center;justify-content:space-between;font-family:var(--mono);font-size:12px;padding:6px 0;border-bottom:1px solid var(--border);"><span>' + z + '</span><button class="btn btn-secondary btn-sm" onclick="restoreFromZip(\'' + z + '\')">↩ Restore</button></div>';
+      }).join('');
+      var needsScroll = zips.length > 5;
+      html += '<div style="' + (needsScroll ? 'max-height:196px;overflow-y:auto;' : '') + '">' + rows + '</div>' +
+        (needsScroll ? '<div style="color:var(--muted);font-size:11px;margin-top:6px;">' + zips.length + ' backups — scroll to see all</div>' : '');
+    }
+
+    el.innerHTML = html;
+  } catch(e) {
+    var el = document.getElementById('backup-list');
+    if (el) el.innerHTML = '<div style="color:var(--danger);font-size:13px;">Failed to load backups: ' + e.message + '</div>';
+  }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function show(id) {
+  document.getElementById(id).classList.add('show');
+  setTimeout(function() { document.getElementById(id).classList.remove('show'); }, 6000);
+}
+function hideAlerts() {
+  document.getElementById('alert-success').classList.remove('show');
+  document.getElementById('alert-error').classList.remove('show');
+}
+function showError(msg) {
+  const el = document.getElementById('alert-error');
+  el.textContent = '✕ ' + msg;
+  el.classList.add('show');
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+  loadBackupList();
+  // Update backup path display to reflect actual path (supervised vs standalone)
+  fetch(apiUrl('/api/backup/info'))
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var el = document.getElementById('backup-path-display');
+      if (el && data.backup_dir) el.textContent = data.backup_dir + '/backups/';
+    })
+    .catch(function() {});
+});
+</script>
+{% endblock %}

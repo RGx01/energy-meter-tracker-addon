@@ -1,0 +1,232 @@
+{% extends "base.html" %}
+
+{% block head %}
+<style>
+  .chart-tabs {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 20px;
+  }
+  .chart-tab {
+    padding: 8px 20px;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: var(--sans);
+    transition: all 0.15s;
+  }
+  .chart-tab:hover { background: rgba(255,255,255,0.05); color: var(--text); }
+  .chart-tab.active { background: rgba(0,212,170,0.1); color: var(--accent); border-color: var(--accent); }
+
+  .chart-frame-wrap {
+    background: white;
+    border-radius: var(--radius);
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+  .chart-frame-wrap iframe {
+    width: 100%;
+    height: calc(100vh - 220px);
+    border: none;
+    display: block;
+  }
+  .chart-placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 300px;
+    color: var(--muted);
+    font-size: 14px;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .chart-placeholder .icon { font-size: 40px; }
+</style>
+{% endblock %}
+
+{% block topbar %}
+<div class="topbar">
+  <div>
+    <h2>Charts</h2>
+    <div class="sub">Net energy heatmap and daily import/export</div>
+  </div>
+  <button class="btn btn-secondary" onclick="regenerate()">↺ Regenerate Charts</button>
+</div>
+{% endblock %}
+
+{% block content %}
+
+<div id="alert-success" class="alert alert-success">✓ Charts regenerated successfully.</div>
+<div id="alert-error"   class="alert alert-danger"></div>
+
+{% if block_count == 0 %}
+<div style="background:rgba(180,83,9,0.1);border:1px solid rgba(180,83,9,0.4);border-radius:var(--radius);padding:16px 20px;margin-bottom:20px;display:flex;align-items:center;gap:14px;">
+  <span style="font-size:24px;">⚠️</span>
+  <div>
+    <div style="font-weight:600;margin-bottom:4px;">No data blocks loaded</div>
+    <div style="font-size:13px;color:var(--muted);">No blocks recorded yet. If you have existing data, use the <a href="{{ url_for('import_page') }}" style="color:var(--accent);">Import page</a> to load it. Otherwise data will appear after the first block boundary.</div>
+  </div>
+</div>
+{% endif %}
+
+<div class="chart-tabs">
+  <button class="chart-tab active" onclick="showChart('daily', this)">📊 Daily Usage</button>
+  <button class="chart-tab"        onclick="showChart('heatmap', this)">🔥 Net Heatmap</button>
+</div>
+
+<!-- Daily usage chart -->
+<div id="chart-daily" class="chart-frame-wrap">
+  {% if daily_exists %}
+    <div id="chart-daily-content" class="chart-content-wrap" style="width:100%;overflow:auto;">
+      <div style="padding:40px;text-align:center;color:var(--muted);">Loading chart...</div>
+    </div>
+  {% else %}
+    <div class="chart-placeholder">
+      <span class="icon">📊</span>
+      <span>No chart data yet — charts generate after the first block finalises.</span>
+      <button class="btn btn-secondary" onclick="regenerate()">Try Regenerate</button>
+    </div>
+  {% endif %}
+</div>
+
+<!-- Heatmap chart -->
+<div id="chart-heatmap" class="chart-frame-wrap" style="display:none;">
+  {% if heatmap_exists %}
+    <div id="chart-heatmap-content" class="chart-content-wrap" style="width:100%;overflow:auto;">
+      <div style="padding:40px;text-align:center;color:var(--muted);">Loading chart...</div>
+    </div>
+  {% else %}
+    <div class="chart-placeholder">
+      <span class="icon">🔥</span>
+      <span>No heatmap data yet.</span>
+    </div>
+  {% endif %}
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+var chartsLoaded = {};
+function getChartHeight() {
+  var isMobile = window.innerWidth <= 768 || (window.innerHeight <= 500 && window.innerWidth > window.innerHeight);
+  return Math.max(window.innerHeight - (isMobile ? 80 : 220), 350) + 'px';
+}
+
+var _resizeTimer = null;
+var _suppressResize = false;
+
+function resizeChartIframes() {
+  if (_suppressResize) return;
+  // Update container heights immediately
+  var h = getChartHeight();
+  document.querySelectorAll('.chart-content-wrap').forEach(function(el) {
+    el.style.height = h;
+    var iframe = el.querySelector('iframe');
+    if (iframe) iframe.style.height = h;
+  });
+  // Only reload if the window size actually changed (real zoom/resize)
+  clearTimeout(_resizeTimer);
+  _resizeTimer = setTimeout(function() {
+    var activeTab  = document.querySelector('.chart-tab.active');
+    var activeName = activeTab && activeTab.textContent.indexOf('Daily') !== -1 ? 'daily' : 'heatmap';
+    chartsLoaded[activeName] = false;
+    loadChartContent(activeName, true);
+  }, 600);
+}
+
+window.addEventListener('resize', resizeChartIframes, { passive: true });
+
+// Suppress resize reload when iframe content triggers layout changes
+window.addEventListener('message', function(e) {
+  if (e.data && e.data.type === 'suppressResize') {
+    _suppressResize = true;
+    clearTimeout(_resizeTimer);
+    setTimeout(function() { _suppressResize = false; }, 800);
+  }
+});
+
+async function loadChartContent(name, force) {
+  if (chartsLoaded[name] && !force) return;
+  var endpoint = name === 'daily' ? '/api/charts/daily' : '/api/charts/heatmap';
+  var containerId = name === 'daily' ? 'chart-daily-content' : 'chart-heatmap-content';
+  var el = document.getElementById(containerId);
+  if (!el) return;
+  try {
+    var h = getChartHeight();
+    var r = await fetch(apiUrl(endpoint) + '?t=' + Date.now());
+    var data = await r.json();
+    if (data.html) {
+      var blob = new Blob([data.html], { type: 'text/html' });
+      var blobUrl = URL.createObjectURL(blob);
+      var iframe = document.createElement('iframe');
+      iframe.className = 'chart-iframe';
+      iframe.style.cssText = 'width:100%;height:' + h + ';border:none;display:block;';
+      iframe.src = blobUrl;
+      iframe.onload = function() { URL.revokeObjectURL(blobUrl); };
+      el.style.height = h;
+      el.innerHTML = '';
+      el.appendChild(iframe);
+      chartsLoaded[name] = true;
+    }
+  } catch(e) {
+    el.innerHTML = '<div style="padding:40px;text-align:center;color:var(--danger);">Failed to load chart: ' + e.message + '</div>';
+  }
+}
+
+// Auto-refresh charts every 2 minutes — clears cache so new blocks appear
+setInterval(function() {
+  var activeTab = document.querySelector('.chart-tab.active');
+  var activeName = activeTab && activeTab.textContent.indexOf('Daily') !== -1 ? 'daily' : 'heatmap';
+  chartsLoaded[activeName] = false;
+  loadChartContent(activeName, true);
+}, 120000);
+
+function showChart(name, btn) {
+  _suppressResize = true;
+  document.querySelectorAll('.chart-tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('chart-daily').style.display   = name === 'daily'   ? 'block' : 'none';
+  document.getElementById('chart-heatmap').style.display = name === 'heatmap' ? 'block' : 'none';
+  loadChartContent(name);
+  setTimeout(function() { _suppressResize = false; }, 200);
+}
+
+async function regenerate() {
+  hideAlerts();
+  try {
+    const r    = await fetch(apiUrl('/api/charts/regenerate'), { method: 'POST' });
+    const data = await r.json();
+    if (data.ok) {
+      show('alert-success');
+      chartsLoaded = {};
+      loadChartContent('daily');
+    } else {
+      showError(data.error || 'Regeneration failed');
+    }
+  } catch(e) {
+    showError(e.message);
+  }
+}
+
+document.addEventListener('DOMContentLoaded', function() { loadChartContent('daily'); });
+
+function show(id) {
+  document.getElementById(id).classList.add('show');
+  setTimeout(() => document.getElementById(id)?.classList.remove('show'), 4000);
+}
+function hideAlerts() {
+  document.getElementById('alert-success').classList.remove('show');
+  document.getElementById('alert-error').classList.remove('show');
+}
+function showError(msg) {
+  const el = document.getElementById('alert-error');
+  el.textContent = '✕ ' + msg;
+  el.classList.add('show');
+}
+</script>
+{% endblock %}

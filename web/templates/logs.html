@@ -1,0 +1,163 @@
+{% extends "base.html" %}
+
+{% block topbar %}
+<div class="topbar">
+  <div>
+    <h2>Logs</h2>
+    <div class="sub">Live add-on log output</div>
+  </div>
+  <div style="display:flex;gap:8px;align-items:center;">
+    <label style="display:flex;align-items:center;gap:6px;text-transform:none;letter-spacing:0;font-size:13px;color:var(--text);margin:0;cursor:pointer;">
+      <input type="checkbox" id="chk-follow" checked style="width:14px;height:14px;"> Follow
+    </label>
+    <select id="sel-lines" style="width:auto;padding:6px 10px;font-size:12px;">
+      <option value="100">Last 100 lines</option>
+      <option value="250">Last 250 lines</option>
+      <option value="500">Last 500 lines</option>
+      <option value="1000">Last 1000 lines</option>
+    </select>
+    <button class="btn btn-secondary btn-sm" id="btn-refresh" onclick="loadLogs()">↺ Refresh</button>
+    <button class="btn btn-secondary btn-sm" id="btn-clear" onclick="clearDisplay()">✕ Clear</button>
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+<style>
+#log-output {
+  background: #0a0c10;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  height: calc(100vh - 180px);
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.log-info    { color: #e8eaf0; }
+.log-warning { color: #f59e0b; }
+.log-error   { color: #f05252; }
+.log-critical{ color: #f05252; font-weight: 600; }
+.log-debug   { color: #6b7080; }
+.log-system  { color: #6b7080; font-style: italic; }
+.log-line { display: block; padding: 1px 0; }
+.log-line:hover { background: rgba(255,255,255,0.03); }
+
+#status-bar {
+  display: flex;
+  align-items: center;
+  gap:10px;
+  padding: 6px 0;
+  font-size: 11px;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+.status-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  display: inline-block;
+}
+.status-dot.live { background: var(--accent); animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+</style>
+
+<div id="status-bar">
+  <span class="status-dot" id="status-dot"></span>
+  <span id="status-text">Loading...</span>
+</div>
+
+<div id="log-output"></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+var autoRefresh = null;
+var lastLineCount = 0;
+
+document.addEventListener('DOMContentLoaded', function() {
+  document.getElementById('sel-lines').addEventListener('change', loadLogs);
+  document.getElementById('chk-follow').addEventListener('change', function() {
+    if (this.checked) startAutoRefresh();
+    else stopAutoRefresh();
+  });
+  loadLogs();
+  startAutoRefresh();
+});
+
+async function loadLogs() {
+  var lines = parseInt(document.getElementById('sel-lines').value) || 100;
+  setStatus('loading');
+  try {
+    var r = await fetch(apiUrl('/api/logs') + '?lines=' + lines);
+    var data = await r.json();
+    if (data.error) {
+      setStatus('error', data.error);
+      return;
+    }
+    renderLogs(data.lines);
+    setStatus('live', data.lines.length + ' lines');
+  } catch(e) {
+    setStatus('error', e.message);
+  }
+}
+
+function renderLogs(lines) {
+  var el = document.getElementById('log-output');
+  var follow = document.getElementById('chk-follow').checked;
+  var wasAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+
+  el.innerHTML = lines.map(function(line) {
+    var cls = classifyLine(line);
+    return '<span class="log-line ' + cls + '">' + esc(line) + '</span>';
+  }).join('');
+
+  if (follow && (wasAtBottom || lastLineCount === 0)) {
+    el.scrollTop = el.scrollHeight;
+  }
+  lastLineCount = lines.length;
+}
+
+function classifyLine(line) {
+  var l = line.toLowerCase();
+  if (l.indexOf('critical') !== -1) return 'log-critical';
+  if (l.indexOf('error') !== -1)    return 'log-error';
+  if (l.indexOf('warning') !== -1)  return 'log-warning';
+  if (l.indexOf('debug') !== -1)    return 'log-debug';
+  if (l.indexOf('info') !== -1)     return 'log-info';
+  if (line.startsWith('s6-rc') || line.startsWith('['))  return 'log-system';
+  return 'log-info';
+}
+
+function startAutoRefresh() {
+  stopAutoRefresh();
+  autoRefresh = setInterval(loadLogs, 5000);
+  document.getElementById('status-dot').classList.add('live');
+}
+
+function stopAutoRefresh() {
+  if (autoRefresh) { clearInterval(autoRefresh); autoRefresh = null; }
+  document.getElementById('status-dot').classList.remove('live');
+}
+
+function clearDisplay() {
+  document.getElementById('log-output').innerHTML = '';
+  lastLineCount = 0;
+}
+
+function setStatus(state, msg) {
+  var dot  = document.getElementById('status-dot');
+  var text = document.getElementById('status-text');
+  if (state === 'live')    { dot.classList.add('live');    text.textContent = msg || 'Live'; }
+  else if (state === 'loading') { dot.classList.remove('live'); text.textContent = 'Loading...'; }
+  else if (state === 'error')   { dot.classList.remove('live'); text.textContent = '✕ ' + (msg||'Error'); }
+}
+
+function esc(str) {
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+</script>
+{% endblock %}
