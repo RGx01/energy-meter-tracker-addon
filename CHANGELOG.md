@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.2] — 2026-03-22
+
+### Fixed
+- **Block stuck at boundary with silent sensor** — if a sensor stops firing at a block boundary (e.g. zero consumption overnight, or export-only period), the engine would wait indefinitely for a post-boundary read and never finalise the block; now times out after 2 minutes and finalises anyway; affects users with multiple meters/sub-meters where all sensors can go quiet simultaneously
+
+---
+
 ## [1.3.1] — 2026-03-22
 
 ### Fixed
@@ -7,7 +14,6 @@
 - **Engine crash on data reset** — `capture_samples` now guards against a missing `meters` key in `current_block.json`; previously clearing the file to `{}` caused repeated `KeyError: 'meters'` crashes
 - **Charts always using UTC timezone** — `generate_charts` was reading timezone from the wrong location in config (top-level key that doesn't exist) instead of the meter meta; charts now correctly use the configured timezone (e.g. `Europe/London`)
 - **Standing charge averaging** — billing summary now shows separate rows per rate when a tariff change occurs mid-period rather than showing a misleading average across all days
-- **Heatmap hover offset** — replaced CSS `zoom` scaling with `transform: scale()` so hover tooltips register on the correct cell when the heatmap is scaled to fit smaller screens
 
 ---
 

@@ -49,7 +49,7 @@ SHARE_BACKUP_DIR   = (
 )
 
 CHART_DIR          = "/data/energy_meter_tracker"   # accessible from HA /local/
-BLOCK_MINUTES      = 30
+BLOCK_MINUTES      = 30  # default — overridden at runtime from config
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Module-level state
@@ -123,9 +123,14 @@ def _backup_to_share():
 # Time helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def floor_to_hh(dt: datetime) -> datetime:
-    minute = 0 if dt.minute < 30 else 30
+def floor_to_block(dt: datetime, block_minutes: int = BLOCK_MINUTES) -> datetime:
+    minute = (dt.minute // block_minutes) * block_minutes
     return dt.replace(minute=minute, second=0, microsecond=0)
+
+
+def floor_to_hh(dt: datetime) -> datetime:
+    """Deprecated alias — use floor_to_block."""
+    return floor_to_block(dt, BLOCK_MINUTES)
 
 
 def iso(dt: datetime) -> str:
@@ -140,21 +145,32 @@ def load_config() -> dict:
     return load_json(CONFIG_PATH, {"meters": {}})
 
 
+def get_block_minutes() -> int:
+    """Read block_minutes from the main meter meta — defaults to 30."""
+    cfg = load_config()
+    for meter_id, meter in (cfg.get("meters") or {}).items():
+        bm = (meter.get("meta") or {}).get("block_minutes")
+        if bm:
+            return int(bm)
+    return BLOCK_MINUTES
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Block lifecycle helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_block_window(now: datetime):
-    start = floor_to_hh(now)
-    return start, start + timedelta(minutes=BLOCK_MINUTES)
+def get_block_window(now: datetime, block_minutes: int = BLOCK_MINUTES):
+    start = floor_to_block(now, block_minutes)
+    return start, start + timedelta(minutes=block_minutes)
 
 
-def create_block(start: datetime, end: datetime) -> dict:
+def create_block(start: datetime, end: datetime, block_minutes: int = BLOCK_MINUTES) -> dict:
     return {
-        "start":        iso(start),
-        "end":          iso(end),
-        "meters":       {},
-        "interpolated": False,
+        "start":         iso(start),
+        "end":           iso(end),
+        "block_minutes": block_minutes,
+        "meters":        {},
+        "interpolated":  False,
     }
 
 
@@ -178,18 +194,18 @@ def interpolate_value(pre_read: dict, post_read: dict, target_dt: datetime) -> d
     return {"value": result, "ts": target_dt.isoformat(), "interpolated": True}
 
 
-def detect_gap(last_read_ts: str | None, now: datetime) -> list:
+def detect_gap(last_read_ts: str | None, now: datetime, block_minutes: int = BLOCK_MINUTES) -> list:
     if not last_read_ts:
         return []
 
     last_dt        = datetime.fromisoformat(last_read_ts)
-    last_block_end = floor_to_hh(last_dt) + timedelta(minutes=BLOCK_MINUTES)
-    current_start  = floor_to_hh(now)
+    last_block_end = floor_to_block(last_dt, block_minutes) + timedelta(minutes=block_minutes)
+    current_start  = floor_to_block(now, block_minutes)
 
     missing      = []
     window_start = last_block_end
     while window_start < current_start:
-        window_end = window_start + timedelta(minutes=BLOCK_MINUTES)
+        window_end = window_start + timedelta(minutes=block_minutes)
         missing.append((window_start, window_end))
         window_start = window_end
 
@@ -271,11 +287,11 @@ def read_sensor(ha: HAClient, entity_id: str, use_cache: bool = True) -> float |
 # ─────────────────────────────────────────────────────────────────────────────
 
 def ensure_correct_block(ha: HAClient, current_block: dict, now: datetime) -> dict:
-    start, end = get_block_window(now)
+    start, end = get_block_window(now, block_minutes=int(get_block_minutes()))
 
     if not current_block or not current_block.get("start"):
         logger.info("Creating first block %s", iso(start))
-        return create_block(start, end)
+        return create_block(start, end, block_minutes=int(get_block_minutes()))
 
     existing_start = datetime.fromisoformat(current_block["start"])
     if existing_start == start:
@@ -294,8 +310,16 @@ def ensure_correct_block(ha: HAClient, current_block: dict, now: datetime) -> di
                     break
 
     if not has_post_boundary_read:
-        logger.info("ensure_correct_block: waiting for post-boundary read")
-        return current_block
+        # Timeout — if boundary was crossed more than 2 minutes ago, finalise anyway
+        # This handles sensors that stop firing (e.g. zero consumption overnight)
+        seconds_since_boundary = (now - start).total_seconds()
+        if seconds_since_boundary < 120:
+            logger.info("ensure_correct_block: waiting for post-boundary read")
+            return current_block
+        logger.warning(
+            "ensure_correct_block: no post-boundary read after %.0fs, finalising anyway",
+            seconds_since_boundary
+        )
 
     # Gap detection before finalise
     last_read_ts = None
@@ -307,7 +331,8 @@ def ensure_correct_block(ha: HAClient, current_block: dict, now: datetime) -> di
                 if not last_read_ts or ts > last_read_ts:
                     last_read_ts = ts
 
-    missing_windows = detect_gap(last_read_ts, now)
+    _ecb_bm = int(get_block_minutes())
+    missing_windows = detect_gap(last_read_ts, now, block_minutes=_ecb_bm)
     if missing_windows:
         logger.warning(
             "ensure_correct_block: %d missing blocks, setting gap marker", len(missing_windows)
@@ -320,7 +345,7 @@ def ensure_correct_block(ha: HAClient, current_block: dict, now: datetime) -> di
     new_block = load_json(CURRENT_BLOCK_PATH, {})
     if not new_block or not new_block.get("start"):
         logger.warning("ensure_correct_block: pruned buffer missing, creating fresh")
-        return create_block(start, end)
+        return create_block(start, end, block_minutes=int(get_block_minutes()))
     return new_block
 
 
@@ -336,11 +361,12 @@ def capture_samples(ha: HAClient, block: dict, now: datetime):
         logger.error("capture_samples: meters_config missing")
         return
 
-        if "meters" not in block:
-                block["meters"] = {}
+    # Ensure block has meters key — may be missing if block was reset to {}
+    if "meters" not in block:
+        block["meters"] = {}
 
-        for meter_id, meter_cfg in config.get("meters", {}).items():
-            meter_block = block["meters"].setdefault(
+    for meter_id, meter_cfg in config.get("meters", {}).items():
+        meter_block = block["meters"].setdefault(
             meter_id, {"meta": {}, "channels": {}, "interpolated": False}
         )
         meter_block["meta"] = meter_cfg.get("meta", {})
@@ -470,10 +496,12 @@ def build_gap_blocks(
 ) -> list:
     gap_blocks = []
 
+    cfg_bm = int((next(iter(config.get("meters", {}).values()), {}).get("meta") or {}).get("block_minutes") or BLOCK_MINUTES)
     for window_start, window_end in missing_windows:
         block = {
-            "start":  iso(window_start),
-            "end":    iso(window_end),
+            "start":         iso(window_start),
+            "end":           iso(window_end),
+            "block_minutes": cfg_bm,
             "meters": {},
             "totals": {
                 "import_kwh": 0.0, "import_cost": 0.0,
@@ -629,23 +657,25 @@ def generate_charts(blocks: list):
     if not blocks:
         logger.info("generate_charts: no blocks, skipping")
         return
-    config    = load_config()
-    main_meta = {}
+    # Read timezone and block_minutes from meter meta (not top-level config)
+    config        = load_config()
+    main_meta     = {}
     for meter_data in config.get("meters", {}).values():
         if not (meter_data.get("meta") or {}).get("sub_meter"):
             main_meta = meter_data.get("meta") or {}
             break
     timezone_name = main_meta.get("timezone", "UTC")
+    block_minutes = int(main_meta.get("block_minutes") or 30)
     try:
-        html = energy_charts.generate_net_heatmap(blocks, timezone_name=timezone_name)
+        html = energy_charts.generate_net_heatmap(blocks, timezone_name=timezone_name, block_minutes=block_minutes)
         io_save_file(f"{CHART_DIR}/net_heatmap.html", html)
-        logger.info("generate_charts: net heatmap written (tz=%s)", timezone_name)
+        logger.info("generate_charts: net heatmap written (tz=%s, bm=%s)", timezone_name, block_minutes)
     except Exception as e:
         logger.error("generate_charts: heatmap error: %s", e)
     try:
-        html = energy_charts.generate_daily_import_export_charts(blocks, timezone_name=timezone_name)
+        html = energy_charts.generate_daily_import_export_charts(blocks, timezone_name=timezone_name, block_minutes=block_minutes)
         io_save_file(f"{CHART_DIR}/daily_usage.html", html)
-        logger.info("generate_charts: daily usage chart written (tz=%s)", timezone_name)
+        logger.info("generate_charts: daily usage chart written (tz=%s, bm=%s)", timezone_name, block_minutes)
     except Exception as e:
         logger.error("generate_charts: daily chart error: %s", e)
 
@@ -877,7 +907,7 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
     # ── Prune rolling buffer ───────────────────────────────────────────────
     pruned_block = {
         "start":  iso(block_end_dt),
-        "end":    iso(block_end_dt + timedelta(minutes=BLOCK_MINUTES)),
+        "end":    iso(block_end_dt + timedelta(minutes=int(get_block_minutes()))),
         "meters": {},
         "interpolated": False,
     }
@@ -992,6 +1022,9 @@ async def _engine_tick(ha: HAClient):
 
     current_block = load_json(CURRENT_BLOCK_PATH, {})
 
+    # Load block size from config (may have changed since startup)
+    block_minutes = get_block_minutes()
+
     # Periodic checkpoint
     last_checkpoint = current_block.get("_last_checkpoint")
     if last_checkpoint:
@@ -1000,8 +1033,8 @@ async def _engine_tick(ha: HAClient):
     else:
         periodic_checkpoint = True
 
-    seconds_into_block = (now.minute % BLOCK_MINUTES) * 60 + now.second
-    near_boundary      = (BLOCK_MINUTES * 60 - seconds_into_block) <= 15
+    seconds_into_block = (now.minute % block_minutes) * 60 + now.second
+    near_boundary      = (block_minutes * 60 - seconds_into_block) <= 15
 
     # Drain read queue
     if _read_queue:
@@ -1043,7 +1076,7 @@ async def _engine_tick(ha: HAClient):
                         if not pre_ts or read["ts"] > pre_ts:
                             pre_ts = read["ts"]
 
-            missing_windows = detect_gap(pre_ts, now)
+            missing_windows = detect_gap(pre_ts, now, block_minutes=block_minutes)
 
             if missing_windows:
                 config     = load_config()
