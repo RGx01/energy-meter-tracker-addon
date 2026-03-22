@@ -1928,7 +1928,7 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None):
     except Exception:
         _tz = ZoneInfo("UTC")
 
-# Use passed block_minutes, or derive from block meter meta, or default to 30
+    # Use passed block_minutes, or derive from block meter meta, or default to 30
     if block_minutes is None:
         block_minutes = 30
         for b in blocks:
@@ -1940,7 +1940,7 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None):
                 break
     slots = 1440 // block_minutes
 
-    # ───── Build day → 48 half-hour slots ─────
+    # ───── Build day → slots ─────
     days = defaultdict(lambda: [0.0] * slots)
     for block in sorted([b for b in blocks if b and b.get("start")], key=lambda b: b["start"]):
         try:
@@ -1967,13 +1967,13 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None):
         h_e, m_e = divmod(minutes_end % 1440, 60)
         x_labels.append(f"{h_s:02d}:{m_s:02d}")
         x_ranges.append(f"{h_s:02d}:{m_s:02d}–{h_e:02d}:{m_e:02d}")
-# Only show tick labels every 30 minutes
-    tick_step = max(1, 30 // block_minutes)
+
+    # Only show tick labels every 30 minutes
+    tick_step  = max(1, 30 // block_minutes)
     x_tickvals = [x_labels[i] for i in range(0, slots, tick_step)]
-    x_ticktext_json = json.dumps(x_tickvals)
+
     # ───── Y axis & customdata ─────
-    # Full ISO date as category label — unique across months, day number shown via ticktext
-    y_labels     = sorted_days  # e.g. "2026-03-11" — unique, no cross-month collisions
+    y_labels     = sorted_days
     y_ticktext   = [str(int(d[8:10])) for d in sorted_days]
     customdata_2d = [[{"date": sorted_days[i], "time": x_ranges[j]}
                       for j in range(slots)] for i in range(len(sorted_days))]
@@ -1989,10 +1989,8 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None):
         """Return a valid 7-stop colorscale with white at zero, handling all-positive or all-negative ranges."""
         wp = max(0.0, min(1.0, (0 - mn) / (mx - mn)))
         if wp <= 0.01:
-            # All positive (import only) — blue-white-orange/red ramp from min to max
             return [[0.0, "white"], [0.33, "#ffcc99"], [0.66, "#ff6600"], [1.0, "#cc0000"]]
         elif wp >= 0.99:
-            # All negative (export only) — blue ramp
             return [[0.0, "#003366"], [0.33, "#0066cc"], [0.66, "#00aa66"], [1.0, "white"]]
         else:
             c1 = round(wp * 0.33, 4)
@@ -2016,14 +2014,12 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None):
     totals_colorscale = make_colorscale(tot_min, tot_max)
 
     # ───── Weekend overlay data ─────
-    shapes = []  # accumulates weekend rects + month separator lines
-    # Heatmap overlay z-matrix — 1.0 on weekends, None elsewhere
+    shapes = []
     weekend_z = []
     for day_str in sorted_days:
-        dow = datetime.fromisoformat(day_str).weekday()  # 5=Sat, 6=Sun
+        dow = datetime.fromisoformat(day_str).weekday()
         weekend_z.append([1.0] * slots if dow >= 5 else [None] * slots)
 
-    # Shapes for bar panel weekend shading (xref: x2)
     for idx, day_str in enumerate(sorted_days):
         dow = datetime.fromisoformat(day_str).weekday()
         if dow >= 5:
@@ -2073,33 +2069,29 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None):
 
     # ───── Sizing ─────
     visible_rows   = 31
-    scroll_padding = 40
     row_height     = 20
-    col_width = 20 * block_minutes // 30   # 20px at 30min, 10px at 15min, 3px at 5min
+    col_width      = 20 * block_minutes // 30   # 20px@30min, 10px@15min, 3px@5min
     n_cols         = slots
     n_rows         = len(sorted_days)
     margin_l, margin_r, margin_t, margin_b = 80, 60, 120, 50
-    # heatmap domain is [0, 0.85] of plot area (excl. margins)
-    # plot_area_w * 0.85 = n_cols * col_width
     plot_area_w    = int(n_cols * col_width / 0.85)
     heatmap_width  = margin_l + plot_area_w + margin_r
-    # plot height must be exact so rows are square: n_rows * row_height + margins
     heatmap_height = n_rows * row_height + margin_t + margin_b
-    # outer div clips to visible_rows, plot scrolls inside it
     div_height     = min(n_rows, visible_rows) * row_height + margin_t + margin_b
 
     # ───── JSON ─────
-    z_json               = json.dumps(heatmap_data)
-    x_json               = json.dumps(x_labels)
-    y_json               = json.dumps(y_labels)
-    y_ticktext_json      = json.dumps(y_ticktext)
-    totals_json          = json.dumps(daily_totals)
-    shapes_json          = json.dumps(shapes)
-    annotations_json     = json.dumps(annotations)
-    customdata_json      = json.dumps(customdata_2d)
-    heatmap_cs_json      = json.dumps(heatmap_colorscale)
-    totals_cs_json       = json.dumps(totals_colorscale)
-    weekend_z_json       = json.dumps(weekend_z)
+    z_json           = json.dumps(heatmap_data)
+    x_json           = json.dumps(x_labels)
+    y_json           = json.dumps(y_labels)
+    y_ticktext_json  = json.dumps(y_ticktext)
+    totals_json      = json.dumps(daily_totals)
+    shapes_json      = json.dumps(shapes)
+    annotations_json = json.dumps(annotations)
+    customdata_json  = json.dumps(customdata_2d)
+    heatmap_cs_json  = json.dumps(heatmap_colorscale)
+    totals_cs_json   = json.dumps(totals_colorscale)
+    weekend_z_json   = json.dumps(weekend_z)
+    x_tickvals_json  = json.dumps(x_tickvals)
 
     return f"""<html>
 <head>
@@ -2138,7 +2130,6 @@ function scaleChart() {{
     outer.style.transform = 'scale(' + scale + ')';
     outer.style.transformOrigin = 'top left';
     outer.style.width = cw + 'px';
-    // Compensate height so page doesn't scroll outside the scaled content
     outer.style.height = Math.ceil(document.getElementById('scroll').offsetHeight * scale) + 'px';
   }} else {{
     outer.style.transform = '';
@@ -2187,7 +2178,7 @@ var data = [
 ];
 var layout = {{
   title: {{text: 'Net Energy Flow', x: 0.5}},
-  xaxis:  {{tickangle: -45, side: 'top', domain: [0, 0.85], tickmode: 'array', tickvals: {json.dumps(x_tickvals)}, ticktext: {json.dumps(x_tickvals)}}},
+  xaxis:  {{tickangle: -45, side: 'top', domain: [0, 0.85], tickmode: 'array', tickvals: {x_tickvals_json}, ticktext: {x_tickvals_json}}},
   xaxis2: {{title: {{text: 'Daily Total', standoff: 10}}, side: 'top', domain: [0.86, 1]}},
   yaxis:  {{type: 'category', tickmode: 'array', tickvals: {y_json}, ticktext: {y_ticktext_json}, fixedrange: true}},
   shapes: {shapes_json},
@@ -2202,4 +2193,3 @@ Plotly.newPlot('heatmap', data, layout, {{responsive: false, scrollZoom: false, 
 </script>
 </body>
 </html>"""
-
