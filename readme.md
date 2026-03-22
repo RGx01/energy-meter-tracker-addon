@@ -4,7 +4,7 @@ A Home Assistant add-on that records your electricity usage in precise half-hour
 
 ## What it does
 
-- Records import and export meter readings at every :00 and :30 boundary
+- Records import and export meter readings at configurable block boundaries — 5, 15 or 30 minutes — matching the resolution you need
 - Interpolates precisely to the boundary timestamp so block deltas are billing-accurate
 - Tracks sub-meters (EV charger, home battery, heat pump) and distributes grid consumption across them
 - Fills gaps automatically if the add-on restarts mid-session
@@ -101,7 +101,7 @@ Access the UI at `http://<your-ha-ip>:8099`
 | Page | Description |
 |------|-------------|
 | Meter Config | Configure main meter, sub-meters, sensors and rates |
-| Charts | Half-hour heatmap and daily import/export chart |
+| Charts | Net energy heatmap and daily import/export chart (auto-scales to block size) |
 | Import Data | Migrate data from a previous installation |
 | Logs | Live add-on log viewer |
 | Help | Full reference documentation |

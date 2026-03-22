@@ -1,5 +1,48 @@
 # Changelog
 
+## [1.4.0] — 2026-03-22
+
+### Added
+- **Configurable block size** — choose 5, 15 or 30 minute recording intervals at setup time via the wizard or Meter Config; block size is locked after first data is collected to prevent mixing intervals in the same dataset; changing block size requires clearing all data
+- **International currency support** — rate and standing charge sensor filters now use unit suffixes (`/kWh`, `/MWh` for rates; `/day` for standing charges) instead of currency-specific prefixes, making the add-on currency-agnostic
+- **Area charts for high-resolution data** — daily usage charts automatically switch from bar to area/step chart style when block size is less than 15 minutes, giving a cleaner view of high-density data
+- **Heatmap scaled for block size** — net energy heatmap column width and x-axis tick density automatically adjust for the configured block size; tick labels shown every 30 minutes regardless of block size
+
+### Changed
+- Block size is stored in each block's meter meta and in `meters_config.json`; existing users automatically continue with 30-minute blocks with no action required
+- Chart functions now accept `block_minutes` parameter passed from `generate_charts` via `meters_config.json` meter meta, so charts reflect the correct block size even for data recorded before `block_minutes` was stamped into individual blocks
+
+### Notes for upgrading users
+- **Existing installations** — block size defaults to 30 minutes and is locked in the UI; no action required; all historical data and billing summaries are fully preserved
+- **New installations** — select your preferred block size in the setup wizard before data collection begins
+- **Changing block size** — not possible through the UI once data exists; requires manual data reset via terminal (see Help page)
+
+---
+
+## [1.3.3] — 2026-03-22
+
+### Fixed
+- **Chart generation error after 1.3.2** — `engine.py` was incorrectly including a 1.4.0 change that passed `block_minutes` to chart functions; `energy_charts.py` in 1.3.x does not accept this parameter, causing both charts to fail to generate after every block finalise
+
+---
+
+## [1.3.2] — 2026-03-22
+
+### Fixed
+- **Block stuck at boundary with silent sensor** — if a sensor stops firing at a block boundary (e.g. zero consumption overnight, or export-only period), the engine would wait indefinitely for a post-boundary read and never finalise the block; now times out after 2 minutes and finalises anyway; affects users with multiple meters/sub-meters where all sensors can go quiet simultaneously
+
+---
+
+## [1.3.1] — 2026-03-22
+
+### Fixed
+- **UTC time bug** — replaced deprecated `datetime.utcnow()` with `datetime.now(timezone.utc)` throughout the engine; on systems where the OS clock is not set to UTC this was causing incorrect block timestamps and rapid catch-up finalisation on restart
+- **Engine crash on data reset** — `capture_samples` now guards against a missing `meters` key in `current_block.json`; previously clearing the file to `{}` caused repeated `KeyError: 'meters'` crashes
+- **Charts always using UTC timezone** — `generate_charts` was reading timezone from the wrong location in config (top-level key that doesn't exist) instead of the meter meta; charts now correctly use the configured timezone (e.g. `Europe/London`)
+- **Standing charge averaging** — billing summary now shows separate rows per rate when a tariff change occurs mid-period rather than showing a misleading average across all days
+
+---
+
 ## [1.3.0] — 2026-03-21
 
 ### Added
