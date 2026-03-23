@@ -1,5 +1,5 @@
 name: "Energy Meter Tracker"
-description: "Half-hourly energy metering engine with sub-meter support, gap filling, and billing charts."
+description: "Half-hourly energy metering engine with sub-meter support, gap filling, and billing charts"
 version: "1.4.0"
 slug: "energy_meter_tracker"
 init: false
