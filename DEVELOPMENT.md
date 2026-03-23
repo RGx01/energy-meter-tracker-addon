@@ -1,322 +1,154 @@
-#!/usr/bin/env python3
-"""
-Energy Meter Tracker — Chart Test Harness
-Cycles through test scenarios, uploading each dataset and opening
-the charts page for visual inspection.
+# Development Guide
 
-Usage:
-    python3 test_harness.py --url http://192.168.x.x:8099
+## Architecture Overview
 
-Requirements:
-    pip install requests
-"""
+Energy Meter Tracker is a Home Assistant add-on built around a Python asyncio engine. The key components are:
 
-import argparse
-import json
-import os
-import subprocess
-import sys
-import tempfile
-import time
-import traceback
-import requests
-from test_data_generator import generate
+```
+main.py              — Entry point. Wires together HAClient, engine and Flask server.
+engine.py            — Core half-hour block engine. All metering logic lives here.
+ha_client.py         — WebSocket + REST client. Replaces PyScript primitives.
+energy_engine_io.py  — Atomic file I/O helpers.
+energy_charts.py     — Plotly chart generation (daily usage + net heatmap).
+web/server.py        — Flask web UI and API endpoints.
+web/templates/       — Jinja2 HTML templates.
+```
 
-LOG_PATH = "test_harness.log"
-_log_file = None
+### Runtime modes
 
-def log(msg=""):
-    """Print to stdout and write to log file."""
-    print(msg)
-    if _log_file:
-        _log_file.write(str(msg) + "\n")
-        _log_file.flush()
+| Mode | Detection | HA connection |
+|------|-----------|---------------|
+| Supervised | `SUPERVISOR_TOKEN` env var present | `ws://supervisor/core/websocket` |
+| Standalone Docker | No `SUPERVISOR_TOKEN` | `ws://<HA_URL>/api/websocket` |
 
-# ─────────────────────────────────────────────────────────────
-# Test scenarios
-# ─────────────────────────────────────────────────────────────
+`run.sh` detects the mode and sets `EMT_MODE` before starting Python.
 
-SCENARIOS = [
-    {
-        "name":           "30min / 90 days / solar / sub-meters",
-        "days":           90,
-        "block_minutes":  30,
-        "scenario":       "solar",
-        "sub_meters":     True,
-        "gap_day":        None,
-    },
-    {
-        "name":           "30min / 7 days / import only",
-        "days":           7,
-        "block_minutes":  30,
-        "scenario":       "import_only",
-        "sub_meters":     False,
-        "gap_day":        None,
-    },
-    {
-        "name":           "30min / 1 day / solar",
-        "days":           1,
-        "block_minutes":  30,
-        "scenario":       "solar",
-        "sub_meters":     False,
-        "gap_day":        None,
-    },
-    {
-        "name":           "30min / 31 days / export only",
-        "days":           31,
-        "block_minutes":  30,
-        "scenario":       "export_only",
-        "sub_meters":     False,
-        "gap_day":        None,
-    },
-    {
-        "name":           "30min / 14 days / mixed / with gap",
-        "days":           14,
-        "block_minutes":  30,
-        "scenario":       "mixed",
-        "sub_meters":     False,
-        "gap_day":        5,
-    },
-    {
-        "name":           "15min / 7 days / solar",
-        "days":           7,
-        "block_minutes":  15,
-        "scenario":       "solar",
-        "sub_meters":     False,
-        "gap_day":        None,
-    },
-    {
-        "name":           "15min / 31 days / mixed / sub-meters",
-        "days":           31,
-        "block_minutes":  15,
-        "scenario":       "mixed",
-        "sub_meters":     True,
-        "gap_day":        None,
-    },
-    {
-        "name":           "5min / 2 days / solar",
-        "days":           2,
-        "block_minutes":  5,
-        "scenario":       "solar",
-        "sub_meters":     False,
-        "gap_day":        None,
-    },
-    {
-        "name":           "5min / 7 days / import only",
-        "days":           7,
-        "block_minutes":  5,
-        "scenario":       "import_only",
-        "sub_meters":     False,
-        "gap_day":        None,
-    },
-    {
-        "name":           "5min / 7 days / mixed / sub-meters",
-        "days":           7,
-        "block_minutes":  5,
-        "scenario":       "mixed",
-        "sub_meters":     True,
-        "gap_day":        None,
-    },
-    {
-        "name":           "5min / 2 days / export only",
-        "days":           2,
-        "block_minutes":  5,
-        "scenario":       "export_only",
-        "sub_meters":     False,
-        "gap_day":        None,
-    },
-]
+---
 
-# ─────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────
+## Block Lifecycle
 
-def upload_blocks(base_url, blocks_path):
-    url = f"{base_url}/api/import"
-    with open(blocks_path, "rb") as f:
-        resp = requests.post(url, files={"blocks": ("blocks.json", f, "application/json")}, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+The engine runs on a 10-second tick loop. Each tick:
 
+1. **Drain read queue** — sensor state change callbacks push timestamps onto `_read_queue`. The tick drains all queued reads and calls `capture_samples()` for each.
+2. **Periodic checkpoint** — if 60 seconds have elapsed since last checkpoint, capture a sample regardless of sensor updates.
+3. **Near-boundary capture** — within 15 seconds of a :00 or :30 boundary, capture on every tick.
+4. **Gap fill** — if a `_gap_marker` is present on the current block (set after an outage), attempt to fill missing blocks using interpolation.
+5. **Block rollover** — if the current time has passed the block's end boundary and a post-boundary read is available, `finalise_block()` is called.
 
-def regenerate_charts(base_url):
-    url = f"{base_url}/api/charts/regenerate"
-    resp = requests.post(url, timeout=60)
-    resp.raise_for_status()
-    return resp.json()
+### Block finalisation (finalise_block)
 
+Finalisation runs four passes:
 
-def open_browser(url):
-    """Open URL in default browser if possible, otherwise just print it."""
-    try:
-        if sys.platform == "darwin":
-            subprocess.run(["open", url], check=True)
-        elif sys.platform.startswith("linux"):
-            subprocess.run(["xdg-open", url], check=True)
-        elif sys.platform == "win32":
-            subprocess.run(["start", url], shell=True, check=True)
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        log(f"  → Open in browser: {url}")
+- **PASS 1** — compute kWh and cost for all meters, using boundary-interpolated opening and closing reads
+- **PASS 2** — grid-authoritative sub-meter distribution: subtract sub-meter consumption from main meter remainder; allocate grid kWh to protected loads first (EV, heat pump), then inverter-possible devices (battery)
+- **PASS 3** — compute block totals
+- **PASS 4** — update cumulative totals and push to HA sensors
 
+After finalisation:
+- Rolling buffer is pruned to post-boundary reads only
+- Charts are regenerated
+- Data files are backed up to `/share/energy_meter_tracker_backup/`
 
-def print_banner(text, char="─"):
-    width = 60
-    log(f"\n{char * width}")
-    log(f"  {text}")
-    log(f"{char * width}")
+### Interpolation
 
+`interpolate_value(pre_read, post_read, target_dt)` performs linear interpolation between two timestamped meter readings. Fraction is clamped to [0, 1].
 
-# ─────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────
+Used at block boundaries to compute precise opening and closing values regardless of when sensor updates actually arrive.
 
-def run(base_url, start_from, heatmap_only, daily_only):
-    base_url = base_url.rstrip("/")
+### Gap detection and filling
 
-    global _log_file
-    _log_file = open(LOG_PATH, "w")
-    log(f"Test harness started — target: {base_url}")
-    log(f"Log: {os.path.abspath(LOG_PATH)}")
+If the engine restarts after an outage, `detect_gap()` counts missing half-hour windows between the last known block end and now. A `_gap_marker` is written to `current_block.json` containing the last known reads and rates. On the next tick after a real sensor read arrives, `build_gap_blocks()` interpolates all missing windows and inserts them into `blocks.json`.
 
-    # Safety warning
-    log(f"""
-⚠️  WARNING
-This harness will OVERWRITE blocks.json on the target instance.
-ALL EXISTING DATA WILL BE LOST.
+Gaps longer than 12 hours produce zero blocks rather than interpolated ones to avoid misleading data.
 
-Target: {base_url}
+---
 
-Only run this against a development or test instance.
-NEVER run against a production installation.
-""")
-    confirm = input("Type YES to continue: ").strip()
-    if confirm != "YES":
-        log("Aborted.")
-        sys.exit(0)
+## File Structure
 
-    # Check connectivity
-    try:
-        requests.get(f"{base_url}/", timeout=5)
-    except Exception as e:
-        log(f"❌ Cannot reach {base_url}: {e}")
-        sys.exit(1)
+```
+/data/energy_meter_tracker/
+    blocks.json              — all finalised blocks (primary dataset)
+    current_block.json       — in-progress block with live reads
+    cumulative_totals.json   — running totals for HA sensors
+    meters_config.json       — meter and channel configuration
 
-    results = []
-    total   = len(SCENARIOS)
+/share/energy_meter_tracker_backup/
+    blocks.json              — copied after every finalise
+    current_block.json       — copied after every finalise
+    cumulative_totals.json   — copied after every finalise
+    meters_config.json       — copied after every finalise
+    backups/
+        YYYYMMDDTHHMMSS_label.zip   — zip snapshots (20 max)
+```
 
-    for i, scenario in enumerate(SCENARIOS):
-        if i < start_from:
-            continue
+---
 
-        print_banner(f"Test {i+1}/{total}: {scenario['name']}", "═")
+## Running Unit Tests
 
-        # Generate dataset
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
-            tmp_path = tmp.name
+Tests use Python's built-in `unittest` — no external dependencies needed.
 
-        log(f"  Generating {scenario['days']} days × {scenario['block_minutes']}min blocks...")
-        generate(
-            days=scenario["days"],
-            block_minutes=scenario["block_minutes"],
-            scenario=scenario["scenario"],
-            include_sub_meters=scenario["sub_meters"],
-            billing_day=1,
-            output_path=tmp_path,
-            rate=0.2450,
-            export_rate=0.1500,
-            standing_charge=0.5046,
-            gap_day=scenario["gap_day"],
-        )
+```bash
+cd /addons/energy_meter_tracker
+python3 -m unittest test_engine -v
+```
 
-        # Upload
-        log("  Uploading blocks.json...")
-        try:
-            upload_blocks(base_url, tmp_path)
-            log("  ✅ Upload OK")
-        except Exception as e:
-            log(f"  ❌ Upload failed: {e}")
-            log(traceback.format_exc())
-            results.append({"name": scenario["name"], "result": "ERROR", "note": str(e)})
-            continue
-        finally:
-            os.unlink(tmp_path)
+Tests cover: `floor_to_hh`, `interpolate_value`, `detect_gap`, `compute_channel` (main and sub-meter), `select_opening_read`, `select_closing_read`, gap marker helpers, `build_gap_blocks`, `extract_last_reads`.
 
-        # Regenerate charts
-        log("  Regenerating charts...")
-        try:
-            regenerate_charts(base_url)
-            log("  ✅ Charts regenerated")
-        except Exception as e:
-            log(f"  ❌ Regeneration failed: {e}")
-            log(traceback.format_exc())
-            results.append({"name": scenario["name"], "result": "ERROR", "note": str(e)})
-            continue
+When adding new engine logic, add corresponding tests to `test_engine.py`. The test file uses module stubs so it runs without HA, Flask or filesystem access.
 
-        # Open browser
-        if heatmap_only:
-            url = f"{base_url}/charts/net_heatmap.html"
-        elif daily_only:
-            url = f"{base_url}/charts/daily_usage.html"
-        else:
-            url = f"{base_url}/charts"
+---
 
-        log(f"  Opening: {url}")
-        open_browser(url)
-        time.sleep(1)
+## Local Development
 
-        # Wait for human judgement
-        log()
-        while True:
-            choice = input("  Result? [p]ass / [f]ail / [s]kip / [q]uit: ").strip().lower()
-            if choice in ("p", "f", "s", "q"):
-                break
+### Supervised (HA OS)
 
-        if choice == "q":
-            log("\nAborted.")
-            break
-        elif choice == "p":
-            note = input("  Note (optional, press Enter to skip): ").strip()
-            results.append({"name": scenario["name"], "result": "PASS", "note": note})
-        elif choice == "f":
-            note = input("  Describe the issue: ").strip()
-            results.append({"name": scenario["name"], "result": "FAIL", "note": note})
-        elif choice == "s":
-            results.append({"name": scenario["name"], "result": "SKIP", "note": ""})
+The add-on is loaded from `/addons/energy_meter_tracker/`. Changes to Python files require a rebuild via the HA add-on UI. Template changes (`web/templates/`) also require a rebuild since files are copied into the container at build time.
 
-    # Summary
-    print_banner("Test Summary", "═")
-    passed  = sum(1 for r in results if r["result"] == "PASS")
-    failed  = sum(1 for r in results if r["result"] == "FAIL")
-    skipped = sum(1 for r in results if r["result"] == "SKIP")
-    errors  = sum(1 for r in results if r["result"] == "ERROR")
+After rebuilding, if `config.yaml` changed run:
+```bash
+ha supervisor restart
+```
 
-    for r in results:
-        icon = {"PASS": "✅", "FAIL": "❌", "SKIP": "⏭", "ERROR": "💥"}.get(r["result"], "?")
-        note = f" — {r['note']}" if r["note"] else ""
-        log(f"  {icon} {r['result']:5}  {r['name']}{note}")
+### Standalone Docker
 
-    log(f"\n  Passed: {passed}  Failed: {failed}  Skipped: {skipped}  Errors: {errors}")
+```bash
+docker build -t emt-dev .
+docker run -d \
+  --name emt-dev \
+  -p 8099:8099 \
+  -e EMT_MODE=standalone \
+  -e HA_URL=http://192.168.1.10:8123 \
+  -e HA_TOKEN=your_token \
+  -e LOG_LEVEL=debug \
+  -v /tmp/emt-data:/data/energy_meter_tracker \
+  emt-dev
+docker logs -f emt-dev
+```
 
-    # Save results
-    results_path = "test_results.json"
-    with open(results_path, "w") as f:
-        json.dump(results, f, indent=2)
-    log(f"\n  Results saved to {results_path}")
-    log(f"  Log saved to {os.path.abspath(LOG_PATH)}")
-    if _log_file:
-        _log_file.close()
+---
 
+## Key Design Decisions
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Energy Meter Tracker chart test harness")
-    parser.add_argument("--url",         type=str, default="http://localhost:8099",
-                        help="Base URL of the add-on (default: http://localhost:8099)")
-    parser.add_argument("--start-from",  type=int, default=0,
-                        help="Start from scenario index (default: 0)")
-    parser.add_argument("--heatmap-only", action="store_true",
-                        help="Open heatmap chart directly instead of charts page")
-    parser.add_argument("--daily-only",   action="store_true",
-                        help="Open daily usage chart directly instead of charts page")
-    args = parser.parse_args()
+**Why asyncio?**
+The engine needs to handle WebSocket events, a 10-second tick loop, and Flask serving concurrently. Flask runs in a background thread via `threading.Thread`; everything else runs in the main asyncio event loop.
 
-    run(args.url, args.start_from, args.heatmap_only, args.daily_only)
+**Why not HACS?**
+HACS is for integrations, Lovelace cards and themes — not add-ons. Add-ons run as Docker containers alongside HA and are distributed via add-on repositories.
+
+**Why is the main meter authoritative?**
+Sub-meter sensors (CT clamps, device integrations) are less accurate than the DCC smart meter CAD feed. Treating the main meter as authoritative and distributing its reading across sub-meters ensures billing totals are always grounded in the actual grid reading.
+
+**Why interpolation at boundaries?**
+Without it, a sensor update that arrives at 09:28 would either be assigned entirely to the 09:00-09:30 block or entirely to the 09:30-10:00 block depending on which side of the boundary it falls. Interpolation splits the delta proportionally so each block gets the fraction that actually occurred within it.
+
+---
+
+## Known Limitations & Future Work
+
+- **Solar generation** — not supported as a sub-meter type. Export sub-metering requires design work around the export channel.
+- **Gas meters** — not designed. Would require a separate meter type with different unit handling.
+- **Multiple batteries/inverters** — only one inverter-possible sub-meter per parent is well tested.
+- **V2G export** — V2X-capable EV export to grid is flagged but not broken down by sub-meter.
+- **Ingress** — currently supported via a WSGI middleware. Full Ingress with sidebar toggle works; the approach could be refined.
+- **Config reload** — sensor subscriptions re-register on config save but the engine does not watch the config file for changes.
+- **Werkzeug** — replaced with Waitress for production. Consider gunicorn for higher concurrency if the UI becomes more complex.
