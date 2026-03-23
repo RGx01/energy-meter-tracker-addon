@@ -286,7 +286,7 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
 # Billing summary renderer
 # ─────────────────────────────────────────────────────────────
 
-def render_billing_summary(summary):
+def render_billing_summary(summary, currency='£'):
     if not summary:
         return ""
 
@@ -344,9 +344,9 @@ def render_billing_summary(summary):
           <td colspan="4">{title_line}{reads_html}</td>
         </tr>"""
 
-        html += '''
+        html += f'''
         <tr class="channel-header">
-          <td></td><td>Rate (£/kWh)</td><td>kWh</td><td>Cost (£)</td>
+          <td></td><td>Rate ({currency}/kWh)</td><td>kWh</td><td>Cost ({currency})</td>
         </tr>'''
 
         for rate in sorted(channels):
@@ -376,14 +376,14 @@ def render_billing_summary(summary):
         for rate, count in sorted(rate_groups.items()):
             html += f"""
         <tr class="standing">
-          <td colspan="3">Standing Charge: {count} days @ £{rate:.4f}/day</td>
+          <td colspan="3">Standing Charge: {count} days @ {currency}{rate:.4f}/day</td>
           <td>{rate * count:.2f}</td>
         </tr>"""
 
     html += f"""
         <tr class="grand-total">
           <td colspan="3">Total Bill</td>
-          <td>£{summary['total_cost']:.2f}</td>
+          <td>{currency}{summary['total_cost']:.2f}</td>
         </tr>
       </table>
     </div>"""
@@ -395,7 +395,7 @@ def render_billing_summary(summary):
 # Daily chart builder (returns HTML string for one day)
 # ─────────────────────────────────────────────────────────────
 
-def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_minutes=30):
+def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_minutes=30, currency='£'):
     slots = 1440 // block_minutes
     meter_kwh    = defaultdict(lambda: [0.0] * slots)
     meter_rate   = defaultdict(lambda: [0.0] * slots)
@@ -494,7 +494,7 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
             kwh = summary_rates[meter_key][rate]
             if kwh > 0.0001:
                 out += (f'<span class="rate-row {css_extra}">'
-                        f'{kwh:.3f} kWh @ £{rate:.4f}</span>')
+                        f'{kwh:.3f} kWh @ {currency}{rate:.4f}</span>')
         return out
 
     house_kwh  = summary_kwh.get("electricity_main", 0.0)
@@ -514,16 +514,16 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
         for rate in sorted(summary_rates[meter_key]):
             kwh = summary_rates[meter_key][rate]
             if kwh > 0.0001:
-                out += cs(f'{kwh:.3f} kWh @ £{rate:.4f}', color, size="0.8em")
+                out += cs(f'{kwh:.3f} kWh @ {currency}{rate:.4f}', color, size="0.8em")
         return out
 
     totals_html = ''
     if total_import > 0:
         totals_html += cs(f'Total import: {total_import:.3f} kWh', main_color)
-        totals_html += cs(f'Import cost: £{total_import_cost:.2f}', main_color)
+        totals_html += cs(f'Import cost: {currency}{total_import_cost:.2f}', main_color)
     if exp_kwh > 0:
         totals_html += cs(f'Total export: {exp_kwh:.3f} kWh', export_color)
-        totals_html += cs(f'Export credit: £{exp_cost:.2f}', export_color)
+        totals_html += cs(f'Export credit: {currency}{exp_cost:.2f}', export_color)
         totals_html += rate_rows_colored("electricity_main_export", export_color)
 
     breakdown_cols = []
@@ -534,7 +534,7 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
             col   = '<div class="scol">'
             col  += cs(f'↳ <span class="censored">{label}</span>', main_color, size="1em", bold=True)
             col  += cs(f'{house_kwh:.3f} kWh', main_color, size="1em")
-            col  += cs(f'£{house_cost:.2f}', main_color, size="1em")
+            col  += cs(f'{currency}{house_cost:.2f}', main_color, size="1em")
             col  += rate_rows_colored("electricity_main", adjust_color(main_color, 0.75))
             col  += '</div>'
             breakdown_cols.append(col)
@@ -548,7 +548,7 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                 col  = '<div class="scol">'
                 col += cs(f'↳ {label}', sub_color, size="1em", bold=True)
                 col += cs(f'{sub_kwh:.3f} kWh', sub_color, size="1em")
-                col += cs(f'£{sub_cost:.2f}', sub_color, size="1em")
+                col += cs(f'{currency}{sub_cost:.2f}', sub_color, size="1em")
                 col += rate_rows_colored(meter_name, adjust_color(sub_color, 0.75))
                 col += '</div>'
                 breakdown_cols.append(col)
@@ -604,7 +604,7 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
             + f"\n  name: '{nice_name} rate',"
             + "\n  yaxis: 'y2',"
             + "\n  customdata: xRanges.concat([xRanges[xRanges.length-1]]),"
-            + f"\n  hovertemplate: '{nice_name} rate<br>%{{customdata}}<br>£%{{y:.4f}}<extra></extra>'"
+            + f"\n  hovertemplate: '{nice_name} rate<br>%{{customdata}}<br>{currency}%{{y:.4f}}<extra></extra>'"
             + "\n}"
         ) if has_rate_data else ""
 
@@ -650,7 +650,7 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
       showgrid: false
     }},
     yaxis:  {{title:'kWh',   showgrid:true,  gridcolor:'#e5e5e5', titlefont:{{size:11}}}},
-    yaxis2: {{title:'£/kWh', overlaying:'y', side:'right', rangemode:'tozero', showgrid:false, titlefont:{{size:11}}}},
+    yaxis2: {{title:'{currency}/kWh', overlaying:'y', side:'right', showgrid:false, titlefont:{{size:11}}}},
     legend: {{
       orientation: 'h',
       x: 0.5, xanchor: 'center',
@@ -671,23 +671,36 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                   ? el._fullLayout.yaxis2._range[1]
                   : y2range[1];
       if (y2max <= 0) return;
-      var y2min, ticks;
+      var hasImport = data.some(function(t) {{ return t.yaxis !== 'y2' && t.y && t.y.some(function(v) {{ return v > 0.001; }}); }});
+      var hasExport = data.some(function(t) {{ return t.yaxis !== 'y2' && t.y && t.y.some(function(v) {{ return v < -0.001; }}); }});
+      var y1min = y1range[0];
+      var y1top, y2min;
       var rawStep = y2max / 4;
-      var mag     = Math.pow(10, Math.floor(Math.log10(rawStep)));
-      var step    = [1, 2, 2.5, 5, 10].map(function(f) {{ return f * mag; }})
-                      .find(function(s) {{ return s >= rawStep; }}) || mag;
-      ticks = [];
+      var mag  = Math.pow(10, Math.floor(Math.log10(rawStep)));
+      var step = [1, 2, 2.5, 5, 10].map(function(f) {{ return f * mag; }})
+                   .find(function(s) {{ return s >= rawStep; }}) || mag;
+      var ticks = [];
       for (var t = 0; t <= y2max + step * 0.01; t += step) ticks.push(parseFloat(t.toFixed(10)));
-      if (y1range[0] < 0 && y1range[1] > 0) {{
-        // Mixed import and export — offset y2 down so zeros align
-        var negFrac = -y1range[0] / (y1range[1] - y1range[0]);
+      if (hasExport && !hasImport) {{
+        // Export only — add headroom above 0 on y1, align y2 accordingly
+        var exportDepth = -y1min;
+        y1top  = exportDepth * 0.5;
+        var frac  = exportDepth / (exportDepth + y1top);
+        var y2span = y2max / (1 - frac);
+        y2min  = -frac * y2span;
+      }} else if (hasImport && hasExport) {{
+        // Mixed — keep y1 as-is, offset y2 down
+        y1top  = y1range[1];
+        var negFrac = -y1min / (y1range[1] - y1min);
         var y2span  = y2max / (1 - negFrac);
-        y2min = -negFrac * y2span;
+        y2min  = -negFrac * y2span;
       }} else {{
-        // Export only or import only — y2 starts at zero
+        // Import only
+        y1top = y1range[1];
         y2min = 0;
       }}
       Plotly.relayout(el, {{
+        'yaxis.range':     [y1min, y1top],
         'yaxis2.range':    [y2min, y2max],
         'yaxis2.tickmode': 'array',
         'yaxis2.tickvals': ticks,
@@ -716,7 +729,7 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
 # Main entry point
 # ─────────────────────────────────────────────────────────────
 
-def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minutes=None):
+def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minutes=None, currency='£'):
 
     if not blocks:
         return "<html><body><p>No data available.</p></body></html>"
@@ -755,8 +768,18 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     meter_colors = build_meter_colors(blocks)
 
     # ── Billing periods ──
+    # Read billing_day from meters_config.json first (reflects latest user setting),
+    # fall back to block meta for backward compatibility
     try:
-        billing_day = int(next(
+        from energy_engine_io import load_json as _load_json
+        import os as _os
+        _cfg = _load_json("/data/energy_meter_tracker/meters_config.json", {})
+        _main_meta = {}
+        for _md in _cfg.get("meters", {}).values():
+            if not (_md.get("meta") or {}).get("sub_meter"):
+                _main_meta = _md.get("meta") or {}
+                break
+        billing_day = int(_main_meta.get("billing_day") or 0) or int(next(
             b["meters"]["electricity_main"]["meta"]["billing_day"]
             for b in blocks
             if b and b.get("meters", {}) and b["meters"].get("electricity_main", {})
@@ -858,7 +881,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         s_str = ps["start"].strftime("%d %b %Y")
         e_str = (ps["end"] - timedelta(seconds=1)).strftime("%d %b %Y")
         cost  = ps["summary"]["total_cost"]
-        label = f"{s_str} → {e_str}  |  £{cost:.2f}"
+        label = f"{s_str} → {e_str}  |  {currency}{cost:.2f}"
         if ps["is_current"]:
             label = "★ Current  " + label
         dropdown_options.append(f'<option value="period_{ps["index"]}">{label}</option>')
@@ -867,7 +890,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     calmonth_options = []
     for cs in calmonth_sections_display:
         cost  = cs["summary"]["total_cost"]
-        label = f"{cs['label']}  |  £{cost:.2f}"
+        label = f"{cs['label']}  |  {currency}{cost:.2f}"
         if cs["is_current"]:
             label = "★ Current  " + label
         calmonth_options.append(f'<option value="calmonth_{cs['index']}">{label}</option>')
@@ -876,7 +899,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     quarter_options = []
     for qs in quarter_sections_display:
         cost  = qs["summary"]["total_cost"]
-        label = f"{qs['label']}  |  £{cost:.2f}"
+        label = f"{qs['label']}  |  {currency}{cost:.2f}"
         if qs["is_current"]:
             label = "★ Current  " + label
         quarter_options.append(f'<option value="quarter_{qs['index']}">{label}</option>')
@@ -885,7 +908,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     year_options = []
     for ys in year_sections_display:
         cost  = ys["summary"]["total_cost"]
-        label = f"{ys['label']}  |  £{cost:.2f}"
+        label = f"{ys['label']}  |  {currency}{cost:.2f}"
         if ys["is_current"]:
             label = "★ Current  " + label
         year_options.append(f'<option value="year_{ys['index']}">{label}</option>')
@@ -969,7 +992,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         ph         = f"{s_str} &rarr; {e_str}"   # period heading shorthand
 
         # Current period bill HTML (with optional current-period highlight class)
-        cur_bill = render_billing_summary(ps["summary"])
+        cur_bill = render_billing_summary(ps["summary"], currency=currency)
         extra    = " current-period" if is_current else ""
         cur_bill = cur_bill.replace('<div class="billing-summary">',
                                     f'<div class="billing-summary{extra}">', 1)
@@ -988,7 +1011,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         prev_ps = find_prev_period(ps)
         if prev_ps:
             prev_h    = f"{prev_ps['start'].strftime('%d %b %Y')} &rarr; {(prev_ps['end'] - timedelta(seconds=1)).strftime('%d %b %Y')}"
-            prev_bill = render_billing_summary(prev_ps["summary"])
+            prev_bill = render_billing_summary(prev_ps["summary"], currency=currency)
             vs_prev_html = f'<div class="bill-compare-wrap">{col(ph, cur_bill)}{col(prev_h, prev_bill, True)}</div>'
         else:
             vs_prev_html = f'<div class="bill-compare-wrap">{col(ph, cur_bill)}{empty_col("No previous period available.")}</div>'
@@ -997,7 +1020,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         year_ps = find_year_period(ps)
         if year_ps:
             year_h    = f"{year_ps['start'].strftime('%d %b %Y')} &rarr; {(year_ps['end'] - timedelta(seconds=1)).strftime('%d %b %Y')}"
-            year_bill = render_billing_summary(year_ps["summary"])
+            year_bill = render_billing_summary(year_ps["summary"], currency=currency)
             vs_year_html = f'<div class="bill-compare-wrap">{col(ph, cur_bill)}{col(year_h, year_bill, True)}</div>'
         else:
             vs_year_html = f'<div class="bill-compare-wrap">{col(ph, cur_bill)}{empty_col("No data for same period last year.")}</div>'
@@ -1005,15 +1028,15 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         # Daily charts
         day_charts_html = ""
         for day in ps["days"]:
-            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, block_minutes=block_minutes)
+            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, block_minutes=block_minutes, currency=currency)
 
         open_attr    = "open" if charts_open else ""
-        toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; £{bill_total:.2f}"
+        toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}"
 
         sections_html_parts.append(f"""
 <div class="period-section month-section" id="{pid}" style="visibility:hidden;position:absolute;">
   <details class="bill-toggle" open>
-    <summary class="bill-toggle-summary">Bill Summary &mdash; {ph} &nbsp;|&nbsp; £{bill_total:.2f}</summary>
+    <summary class="bill-toggle-summary">Bill Summary &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}</summary>
     <div class="bill-toggle-body">
       <div class="bill-view" data-view="vanilla">{vanilla_html}</div>
       <div class="bill-view" data-view="vs-prev" style="display:none;">{vs_prev_html}</div>
@@ -1035,7 +1058,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         ph         = gs["label"]
         bill_total = gs["summary"]["total_cost"]
 
-        cur_bill = render_billing_summary(gs["summary"])
+        cur_bill = render_billing_summary(gs["summary"], currency=currency)
         extra    = " current-period" if gs["is_current"] else ""
         cur_bill = cur_bill.replace('<div class="billing-summary">',
                                     f'<div class="billing-summary{extra}">', 1)
@@ -1051,7 +1074,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
 
         prev_gs = find_prev_fn(gs)
         if prev_gs:
-            prev_bill    = render_billing_summary(prev_gs["summary"])
+            prev_bill    = render_billing_summary(prev_gs["summary"], currency=currency)
             vs_prev_html = f'<div class="bill-compare-wrap">{col(ph, cur_bill)}{col(prev_gs["label"], prev_bill, True)}</div>'
         else:
             vs_prev_html = f'<div class="bill-compare-wrap">{col(ph, cur_bill)}{empty_col("No previous period available.")}</div>'
@@ -1059,7 +1082,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         if show_year_btn:
             year_gs = find_year_fn(gs)
             if year_gs:
-                year_bill    = render_billing_summary(year_gs["summary"])
+                year_bill    = render_billing_summary(year_gs["summary"], currency=currency)
                 vs_year_html = f'<div class="bill-compare-wrap">{col(ph, cur_bill)}{col(year_gs["label"], year_bill, True)}</div>'
             else:
                 vs_year_html = f'<div class="bill-compare-wrap">{col(ph, cur_bill)}{empty_col("No data for same period last year.")}</div>'
@@ -1068,14 +1091,14 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
 
         day_charts_html = ""
         for day in gs["days"]:
-            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, chart_prefix=f"{pid_prefix}_", block_minutes=block_minutes)
+            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, chart_prefix=f"{pid_prefix}_", block_minutes=block_minutes, currency=currency)
 
-        toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; £{bill_total:.2f}"
+        toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}"
         open_attr    = "open" if gs["is_current"] else ""
         return (
             f'<div class="period-section {pid_prefix}-section" id="{pid}" style="visibility:hidden;position:absolute;">'
             f'<details class="bill-toggle" open>'
-            f'<summary class="bill-toggle-summary">Bill Summary &mdash; {ph} &nbsp;|&nbsp; £{bill_total:.2f}</summary>'
+            f'<summary class="bill-toggle-summary">Bill Summary &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}</summary>'
             f'<div class="bill-toggle-body">'
             f'<div class="bill-view" data-view="vanilla">{vanilla_html}</div>'
             f'<div class="bill-view" data-view="vs-prev" style="display:none;">{vs_prev_html}</div>'
@@ -1913,7 +1936,7 @@ function showView(view) {{
 # Net heatmap
 # ─────────────────────────────────────────────────────────────
 
-def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None):
+def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None, currency='£'):
     if not blocks:
         return "<html><body><p>No data available</p></body></html>"
 

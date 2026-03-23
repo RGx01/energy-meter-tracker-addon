@@ -256,6 +256,24 @@ class HAClient:
             all_states = await resp.json()
         return sorted(s.get("entity_id", "") for s in all_states)
 
+    async def get_entity_attributes(self, entity_id: str) -> dict:
+        """
+        Fetch the full state object for entity_id via REST and return its
+        attributes dict. Returns {} if the entity is not found or the
+        request fails.
+        """
+        url = f"{HA_REST_URL}/states/{entity_id}"
+        try:
+            async with self._session.get(url) as resp:
+                if resp.status != 200:
+                    logger.warning("ha_client: get_entity_attributes %s failed (%d)", entity_id, resp.status)
+                    return {}
+                data = await resp.json()
+                return data.get("attributes", {})
+        except Exception as e:
+            logger.warning("ha_client: get_entity_attributes %s error: %s", entity_id, e)
+            return {}
+
     # ──────────────────────────────────────────────────────────────────────
     # State — set (async, REST API)
     # ──────────────────────────────────────────────────────────────────────

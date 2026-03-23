@@ -1,10 +1,10 @@
 # Energy Meter Tracker
 
-A Home Assistant add-on that records your electricity usage in precise half-hour blocks — the same intervals used by your energy supplier for billing.
+A Home Assistant add-on that records your electricity usage in precise configurable intervals — matching your energy supplier's meter reconciliation period for accurate billing.
 
 ## What it does
 
-- Records import and export meter readings at configurable block boundaries — 5, 15 or 30 minutes — matching the resolution you need
+- Records import and export meter readings at configurable reconciliation period boundaries — 5, 15 or 30 minutes — matching your supplier's billing resolution
 - Interpolates precisely to the boundary timestamp so block deltas are billing-accurate
 - Tracks sub-meters (EV charger, home battery, heat pump) and distributes grid consumption across them
 - Fills gaps automatically if the add-on restarts mid-session
@@ -101,7 +101,7 @@ Access the UI at `http://<your-ha-ip>:8099`
 | Page | Description |
 |------|-------------|
 | Meter Config | Configure main meter, sub-meters, sensors and rates |
-| Charts | Net energy heatmap and daily import/export chart (auto-scales to block size) |
+| Charts | Net energy heatmap and daily import/export chart (auto-scales to reconciliation period) |
 | Import Data | Migrate data from a previous installation |
 | Logs | Live add-on log viewer |
 | Help | Full reference documentation |

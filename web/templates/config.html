@@ -322,8 +322,8 @@ function buildMainCard(meterId, meter) {
       '<strong>Required sensors</strong>' +
       '<ul>' +
         '<li><strong>Import/Export read</strong> — cumulative kWh, high-frequency updates (every 10–30s)</li>' +
-        '<li><strong>Rate sensors</strong> — current £/kWh (e.g. Octopus Energy rate sensors)</li>' +
-        '<li><strong>Standing charge</strong> — £/day sensor (can be a fixed-value helper)</li>' +
+        '<li><strong>Rate sensors</strong> — current rate per kWh (e.g. Octopus Energy rate sensors)</li>' +
+        '<li><strong>Standing charge</strong> — daily standing charge sensor (can be a fixed-value helper)</li>' +
       '</ul>' +
     '</div>' +
 
@@ -341,7 +341,7 @@ function buildMainCard(meterId, meter) {
         '<input type="number" min="1" max="28" class="js-meta js-meta-int" data-meter="' + meterId + '" data-key="billing_day" value="' + (meta.billing_day||1) + '"></div>' +
       '<div class="form-group"><label>Block Size (minutes)</label>' +
         (hasData
-          ? '<select class="js-meta js-meta-int" data-meter="' + meterId + '" data-key="block_minutes" disabled title="Block size is locked once data has been collected"><option value="5"' + (meta.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (meta.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((meta.block_minutes||30)===30?' selected':'') + '>30 min</option></select><small style="color:var(--warning-color,#b45309);">⚠ Locked — changing block size requires clearing all data</small>'
+          ? '<select class="js-meta js-meta-int" data-meter="' + meterId + '" data-key="block_minutes" disabled title="Meter Reconciliation Period is locked once data has been collected"><option value="5"' + (meta.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (meta.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((meta.block_minutes||30)===30?' selected':'') + '>30 min</option></select><small style="color:var(--warning-color,#b45309);">⚠ Locked — changing the reconciliation period requires clearing all data</small>'
           : '<select class="js-meta js-meta-int" data-meter="' + meterId + '" data-key="block_minutes"><option value="5"' + (meta.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (meta.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((meta.block_minutes||30)===30?' selected':'') + '>30 min</option></select>') +
       '</div>' +
       '<div class="form-group"><label>Timezone</label>' +
@@ -356,9 +356,9 @@ function buildMainCard(meterId, meter) {
       '<span class="channel-label label-import">Import</span>' +
       '<div class="form-group"><label>Read Sensor — cumulative kWh from grid</label>' +
         buildEntityInput(meterId+'__import__read', imp.read||'', meterId, 'import', 'read') + '</div>' +
-      '<div class="form-group"><label>Rate Sensor — £/kWh import tariff</label>' +
+      '<div class="form-group"><label>Import Rate Sensor</label>' +
         buildEntityInput(meterId+'__import__rate', imp.rate||'', meterId, 'import', 'rate') + '</div>' +
-      '<div class="form-group"><label>Standing Charge Sensor — £/day</label>' +
+      '<div class="form-group"><label>Standing Charge Sensor (per day)</label>' +
         buildEntityInput(meterId+'__import__sc', imp.standing_charge_sensor||'', meterId, 'import', 'standing_charge_sensor', true) + '</div>' +
       buildAdvanced(meterId, 'import', imp) +
     '</div>' +
@@ -368,7 +368,7 @@ function buildMainCard(meterId, meter) {
       '<span class="channel-label label-export">Export</span>' +
       '<div class="form-group"><label>Read Sensor — cumulative kWh exported to grid</label>' +
         buildEntityInput(meterId+'__export__read', exp.read||'', meterId, 'export', 'read') + '</div>' +
-      '<div class="form-group"><label>Rate Sensor — £/kWh export tariff</label>' +
+      '<div class="form-group"><label>Export Rate Sensor</label>' +
         buildEntityInput(meterId+'__export__rate', exp.rate||'', meterId, 'export', 'rate') + '</div>' +
       buildAdvanced(meterId, 'export', exp) +
     '</div>';
@@ -448,7 +448,7 @@ function buildSubCard(meterId, meter) {
       '<span class="channel-label label-import">Import</span>' +
       '<div class="form-group"><label>Read Sensor — cumulative kWh</label>' +
         buildEntityInput(meterId+'__import__read', imp.read||'', meterId, 'import', 'read') + '</div>' +
-      '<div class="form-group"><label>Rate Sensor — £/kWh ' + (mainImportRate ? '(pre-filled from main meter)' : '') + '</label>' +
+      '<div class="form-group"><label>Rate Sensor ' + (mainImportRate ? '(pre-filled from main meter)' : '') + '</label>' +
         buildEntityInput(meterId+'__import__rate', rateVal, meterId, 'import', 'rate') + '</div>' +
     '</div>';
 
@@ -758,7 +758,7 @@ function wizStepMain() {
         '<input id="wiz-billing-day" type="number" min="1" max="28" value="' + wiz.data.billing_day + '"></div>' +
       '<div class="form-group"><label>Block Size (minutes)</label>' +
         (hasData
-          ? '<select id="wiz-block-minutes" disabled><option value="5"' + (wiz.data.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (wiz.data.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((wiz.data.block_minutes||30)===30?' selected':'') + '>30 min</option></select><small style="color:var(--warning-color,#b45309);">⚠ Locked — changing block size requires clearing all data</small>'
+          ? '<select id="wiz-block-minutes" disabled><option value="5"' + (wiz.data.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (wiz.data.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((wiz.data.block_minutes||30)===30?' selected':'') + '>30 min</option></select><small style="color:var(--warning-color,#b45309);">⚠ Locked — changing the reconciliation period requires clearing all data</small>'
           : '<select id="wiz-block-minutes"><option value="5"' + (wiz.data.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (wiz.data.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((wiz.data.block_minutes||30)===30?' selected':'') + '>30 min</option></select><small style="color:var(--muted);">Set once — cannot be changed after data collection begins</small>') +
       '</div>' +
       '<div class="form-group"><label>Timezone</label>' +
@@ -775,15 +775,15 @@ function wizStepSensors() {
     '<div class="section-divider">Import</div>' +
     '<div class="form-group"><label>Import Read Sensor — cumulative kWh from grid</label>' +
       buildWizEntity('wiz-imp-read', wiz.data.importRead) + '</div>' +
-    '<div class="form-group"><label>Import Rate Sensor — £/kWh</label>' +
+    '<div class="form-group"><label>Import Rate Sensor</label>' +
       buildWizEntity('wiz-imp-rate', wiz.data.importRate) + '</div>' +
-    '<div class="form-group"><label>Standing Charge Sensor — £/day <span style="color:var(--muted);font-weight:400;">(optional)</span></label>' +
+    '<div class="form-group"><label>Standing Charge Sensor <span style="color:var(--muted);font-weight:400;">(optional, per day)</span></label>' +
       buildWizEntity('wiz-imp-sc', wiz.data.standingCharge) + '</div>' +
 
     '<div class="section-divider" style="margin-top:20px;">Export</div>' +
     '<div class="form-group"><label>Export Read Sensor — cumulative kWh to grid</label>' +
       buildWizEntity('wiz-exp-read', wiz.data.exportRead) + '</div>' +
-    '<div class="form-group"><label>Export Rate Sensor — £/kWh <span style="color:var(--muted);font-weight:400;">(optional)</span></label>' +
+    '<div class="form-group"><label>Export Rate Sensor <span style="color:var(--muted);font-weight:400;">(optional)</span></label>' +
       buildWizEntity('wiz-exp-rate', wiz.data.exportRate) + '</div>';
 }
 
@@ -844,7 +844,7 @@ function wizStepSubSensors() {
         '<input id="wiz-sub-' + devId + '-name" type="text" value="' + esc(sd.name) + '" placeholder="e.g. Tesla Charger"></div>' +
       '<div class="form-group"><label>Read Sensor — cumulative kWh</label>' +
         buildWizEntity('wiz-sub-' + devId + '-read', sd.read) + '</div>' +
-      '<div class="form-group"><label>Rate Sensor — £/kWh ' + (impRate ? '(pre-filled from main meter)' : '') + '</label>' +
+      '<div class="form-group"><label>Rate Sensor ' + (impRate ? '(pre-filled from main meter)' : '') + '</label>' +
         buildWizEntity('wiz-sub-' + devId + '-rate', sd.rate || impRate) + '</div>' +
     '</div>';
   });
