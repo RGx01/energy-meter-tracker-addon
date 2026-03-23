@@ -339,7 +339,7 @@ function buildMainCard(meterId, meter) {
         '<input type="text" class="js-meta" data-meter="' + meterId + '" data-key="supplier" value="' + esc(meta.supplier||'') + '"></div>' +
       '<div class="form-group"><label>First day of your billing period</label>' +
         '<input type="number" min="1" max="28" class="js-meta js-meta-int" data-meter="' + meterId + '" data-key="billing_day" value="' + (meta.billing_day||1) + '"></div>' +
-      '<div class="form-group"><label>Block Size (minutes)</label>' +
+      '<div class="form-group"><label>Meter Reconciliation Period (Block Size)</label>' +
         (hasData
           ? '<select class="js-meta js-meta-int" data-meter="' + meterId + '" data-key="block_minutes" disabled title="Meter Reconciliation Period is locked once data has been collected"><option value="5"' + (meta.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (meta.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((meta.block_minutes||30)===30?' selected':'') + '>30 min</option></select><small style="color:var(--warning-color,#b45309);">⚠ Locked — changing the reconciliation period requires clearing all data</small>'
           : '<select class="js-meta js-meta-int" data-meter="' + meterId + '" data-key="block_minutes"><option value="5"' + (meta.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (meta.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((meta.block_minutes||30)===30?' selected':'') + '>30 min</option></select>') +
@@ -756,7 +756,11 @@ function wizStepMain() {
         '<input id="wiz-supplier" type="text" value="' + esc(wiz.data.supplier) + '" placeholder="Octopus Energy"></div>' +
       '<div class="form-group"><label>First day of your billing period</label>' +
         '<input id="wiz-billing-day" type="number" min="1" max="28" value="' + wiz.data.billing_day + '"></div>' +
-      '<div class="form-group"><label>Block Size (minutes)</label>' +
+      '<div class="form-group">' +
+        '<label>Meter Reconciliation Period (Block Size)</label>' +
+        '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">Match this to your energy supplier\'s billing interval / block size — 30 minutes in the UK, other intervals may apply elsewhere. <strong style="color:var(--warning-color,#b45309);">This cannot be changed without deleting all recorded data via terminal.</strong> If in doubt, leave at 30 min.</div>' +
+        '<label>Meter Reconciliation Period</label>' +
+        '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">Match this to your energy supplier\'s billing interval — 30 minutes in the UK, other intervals may apply elsewhere. <strong style="color:var(--warning-color,#b45309);">This cannot be changed without deleting all recorded data via terminal.</strong> If in doubt, leave at 30 min.</div>' +
         (hasData
           ? '<select id="wiz-block-minutes" disabled><option value="5"' + (wiz.data.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (wiz.data.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((wiz.data.block_minutes||30)===30?' selected':'') + '>30 min</option></select><small style="color:var(--warning-color,#b45309);">⚠ Locked — changing the reconciliation period requires clearing all data</small>'
           : '<select id="wiz-block-minutes"><option value="5"' + (wiz.data.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (wiz.data.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((wiz.data.block_minutes||30)===30?' selected':'') + '>30 min</option></select><small style="color:var(--muted);">Set once — cannot be changed after data collection begins</small>') +
