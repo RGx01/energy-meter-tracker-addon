@@ -5,7 +5,7 @@
 ### Added
 - **Configurable meter reconciliation period** — choose 5, 15 or 30 minute recording intervals at setup time via the wizard or Meter Config; the reconciliation period is locked after first data is collected to prevent mixing intervals in the same dataset
 - **Automatic currency detection** — the add-on reads the `unit_of_measurement` from your rate sensor (e.g. `GBP/kWh`, `USD/kWh`, `EUR/kWh`) and automatically applies the correct currency symbol throughout all charts, billing summaries, and HA sensors; no manual configuration required
-- **International sensor compatibility** — rate and standing charge sensor filters now use unit suffixes (`/kWh`, `/MWh` for rates; `/day` for standing charges) instead of currency-specific prefixes, making the add-on currency-agnostic
+- **International sensor compatibility** — rate and standing charge sensor filters now match on unit suffixes (`/kWh` for rates; `/day` for standing charges) instead of currency-specific prefixes, making the add-on currency-agnostic
 - **Area charts for high-resolution data** — daily usage charts automatically switch from bar to area/step chart style when reconciliation period is less than 15 minutes, giving a cleaner view of high-density data
 - **Heatmap scaled for reconciliation period** — net energy heatmap column width and x-axis tick density automatically adjust; tick labels shown every 30 minutes regardless of interval
 - **Export-only chart fix** — daily charts with export-only data now correctly align the rate axis (y2) so rate lines appear above zero rather than in the negative space
