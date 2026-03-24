@@ -337,8 +337,14 @@ def ensure_correct_block(ha: HAClient, current_block: dict, now: datetime) -> di
                     break
 
     if not has_post_boundary_read:
-        logger.info("ensure_correct_block: waiting for post-boundary read")
-        return current_block
+        seconds_since_boundary = (now - start).total_seconds()
+        if seconds_since_boundary < 120:
+            logger.info("ensure_correct_block: waiting for post-boundary read")
+            return current_block
+        logger.warning(
+            "ensure_correct_block: no post-boundary read after %.0fs, finalising anyway",
+            seconds_since_boundary
+        )
 
     # Gap detection before finalise
     last_read_ts = None
