@@ -633,6 +633,13 @@ function hideDrop(inp) {
 // ── Save ──────────────────────────────────────────────────────────────────────
 async function saveConfig() {
   hideAlerts();
+  // Explicitly read disabled selectors — disabled elements don't fire change events
+  document.querySelectorAll('select.js-meta-int[data-key="block_minutes"]').forEach(function(el) {
+    var m = el.dataset.meter;
+    if (m && config.meters[m]) {
+      config.meters[m].meta['block_minutes'] = parseInt(el.value) || 30;
+    }
+  });
   try {
     var r = await fetch(apiUrl('/api/config'), {
       method: 'POST',

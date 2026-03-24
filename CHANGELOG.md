@@ -1,6 +1,20 @@
 # Changelog
 
+## [1.4.3] — 2026-03-24
+
+### Fixed
+- **Block size not saved when selector is locked** — the Meter Reconciliation Period (Block Size) selector is disabled once data has been collected, but disabled HTML elements are not read by the change event handler; `saveConfig` now explicitly reads the value from disabled selectors before saving, ensuring `block_minutes` is always persisted correctly in `meters_config.json`
+
+---
+
 ## [1.4.2] — 2026-03-24
+
+### Fixed
+- **Charts not using block size or currency (regression)** — `generate_charts` in the released 1.4.1 build was still missing the `block_minutes` and `currency_symbol` parameters due to a merge conflict resolution error; correctly restored in this release
+
+---
+
+## [1.4.1] — 2026-03-24
 
 ### Fixed
 - **Block finalisation stuck waiting indefinitely** — `ensure_correct_block` was missing the 2-minute timeout introduced in 1.3.2; if no post-boundary sensor read arrived (e.g. export-only period with a slow-updating sensor), the block would never finalise; timeout restored — after 2 minutes without a post-boundary read the engine finalises anyway
