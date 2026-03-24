@@ -194,6 +194,7 @@
 <script>
 let config   = {{ config | tojson }};
 let entities = [];
+var hasData  = {{ has_data | tojson }};
 // Timezone select HTML — rendered server-side to avoid JS string escaping issues
 var TZ_SELECT_HTML = {{ tz_select_html | tojson }};
 function buildTzSelect(id, currentTz) {
@@ -233,9 +234,9 @@ document.addEventListener('DOMContentLoaded', function() {
 
 // Field type → acceptable units/device_class
 var FIELD_FILTERS = {
-  read:                  { units: ['kWh'], device_class: ['energy'] },
-  rate:                  { units: ['GBP/kWh', '£/kWh', 'p/kWh', 'GBP/MWh'], device_class: ['monetary', 'currency'] },
-  standing_charge_sensor:{ units: ['GBP/day', '£/day', 'p/day', 'GBP', '£'], device_class: ['monetary', 'currency'] },
+  read:                  { units: ['kWh'], unitSuffixes: [], device_class: ['energy'] },
+  rate:                  { units: [], unitSuffixes: ['/kwh'], device_class: ['monetary', 'currency'] },
+  standing_charge_sensor:{ units: [], unitSuffixes: ['/day'], device_class: ['monetary', 'currency'] },
 };
 
 async function loadEntities() {
@@ -252,9 +253,11 @@ function filterEntities(field, query) {
 
   if (filter) {
     var matched = candidates.filter(function(e) {
-      var unitOk  = filter.units.some(function(u) { return (e.unit||'').toLowerCase() === u.toLowerCase(); });
+      var unit    = (e.unit||'').toLowerCase();
+      var unitOk  = filter.units.some(function(u) { return unit === u.toLowerCase(); });
+      var suffixOk = (filter.unitSuffixes||[]).some(function(s) { return unit.endsWith(s); });
       var classOk = filter.device_class.some(function(dc) { return (e.device_class||'').toLowerCase() === dc.toLowerCase(); });
-      return unitOk || classOk;
+      return unitOk || suffixOk || classOk;
     });
     // If filter produces results use them, otherwise fall back to all entities
     if (matched.length > 0) candidates = matched;
@@ -319,8 +322,8 @@ function buildMainCard(meterId, meter) {
       '<strong>Required sensors</strong>' +
       '<ul>' +
         '<li><strong>Import/Export read</strong> — cumulative kWh, high-frequency updates (every 10–30s)</li>' +
-        '<li><strong>Rate sensors</strong> — current £/kWh (e.g. Octopus Energy rate sensors)</li>' +
-        '<li><strong>Standing charge</strong> — £/day sensor (can be a fixed-value helper)</li>' +
+        '<li><strong>Rate sensors</strong> — current rate per kWh (e.g. Octopus Energy rate sensors)</li>' +
+        '<li><strong>Standing charge</strong> — daily standing charge sensor (can be a fixed-value helper)</li>' +
       '</ul>' +
     '</div>' +
 
@@ -336,6 +339,11 @@ function buildMainCard(meterId, meter) {
         '<input type="text" class="js-meta" data-meter="' + meterId + '" data-key="supplier" value="' + esc(meta.supplier||'') + '"></div>' +
       '<div class="form-group"><label>First day of your billing period</label>' +
         '<input type="number" min="1" max="28" class="js-meta js-meta-int" data-meter="' + meterId + '" data-key="billing_day" value="' + (meta.billing_day||1) + '"></div>' +
+      '<div class="form-group"><label>Meter Reconciliation Period (Block Size)</label>' +
+        (hasData
+          ? '<select class="js-meta js-meta-int" data-meter="' + meterId + '" data-key="block_minutes" disabled title="Meter Reconciliation Period is locked once data has been collected"><option value="5"' + (meta.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (meta.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((meta.block_minutes||30)===30?' selected':'') + '>30 min</option></select><small style="color:var(--warning-color,#b45309);">⚠ Locked — changing the reconciliation period requires clearing all data</small>'
+          : '<select class="js-meta js-meta-int" data-meter="' + meterId + '" data-key="block_minutes"><option value="5"' + (meta.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (meta.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((meta.block_minutes||30)===30?' selected':'') + '>30 min</option></select>') +
+      '</div>' +
       '<div class="form-group"><label>Timezone</label>' +
         buildTzSelectForMeter(meterId, meta.timezone||'UTC') + '</div>' +
       '<div style="font-size:11px;color:var(--muted);margin-top:-8px;margin-bottom:8px;">Used to assign blocks to the correct local day. UK: Europe/London</div>' +
@@ -348,9 +356,9 @@ function buildMainCard(meterId, meter) {
       '<span class="channel-label label-import">Import</span>' +
       '<div class="form-group"><label>Read Sensor — cumulative kWh from grid</label>' +
         buildEntityInput(meterId+'__import__read', imp.read||'', meterId, 'import', 'read') + '</div>' +
-      '<div class="form-group"><label>Rate Sensor — £/kWh import tariff</label>' +
+      '<div class="form-group"><label>Import Rate Sensor</label>' +
         buildEntityInput(meterId+'__import__rate', imp.rate||'', meterId, 'import', 'rate') + '</div>' +
-      '<div class="form-group"><label>Standing Charge Sensor — £/day</label>' +
+      '<div class="form-group"><label>Standing Charge Sensor (per day)</label>' +
         buildEntityInput(meterId+'__import__sc', imp.standing_charge_sensor||'', meterId, 'import', 'standing_charge_sensor', true) + '</div>' +
       buildAdvanced(meterId, 'import', imp) +
     '</div>' +
@@ -360,7 +368,7 @@ function buildMainCard(meterId, meter) {
       '<span class="channel-label label-export">Export</span>' +
       '<div class="form-group"><label>Read Sensor — cumulative kWh exported to grid</label>' +
         buildEntityInput(meterId+'__export__read', exp.read||'', meterId, 'export', 'read') + '</div>' +
-      '<div class="form-group"><label>Rate Sensor — £/kWh export tariff</label>' +
+      '<div class="form-group"><label>Export Rate Sensor</label>' +
         buildEntityInput(meterId+'__export__rate', exp.rate||'', meterId, 'export', 'rate') + '</div>' +
       buildAdvanced(meterId, 'export', exp) +
     '</div>';
@@ -440,7 +448,7 @@ function buildSubCard(meterId, meter) {
       '<span class="channel-label label-import">Import</span>' +
       '<div class="form-group"><label>Read Sensor — cumulative kWh</label>' +
         buildEntityInput(meterId+'__import__read', imp.read||'', meterId, 'import', 'read') + '</div>' +
-      '<div class="form-group"><label>Rate Sensor — £/kWh ' + (mainImportRate ? '(pre-filled from main meter)' : '') + '</label>' +
+      '<div class="form-group"><label>Rate Sensor ' + (mainImportRate ? '(pre-filled from main meter)' : '') + '</label>' +
         buildEntityInput(meterId+'__import__rate', rateVal, meterId, 'import', 'rate') + '</div>' +
     '</div>';
 
@@ -688,6 +696,7 @@ function startWizard() {
     site:          mainMeta.site       || '',
     supplier:      mainMeta.supplier   || '',
     billing_day:   mainMeta.billing_day || 1,
+    block_minutes: mainMeta.block_minutes || 30,
     timezone:      mainMeta.timezone || 'UTC',
     importRead:    imp.read                      || '',
     importRate:    imp.rate                      || '',
@@ -747,6 +756,15 @@ function wizStepMain() {
         '<input id="wiz-supplier" type="text" value="' + esc(wiz.data.supplier) + '" placeholder="Octopus Energy"></div>' +
       '<div class="form-group"><label>First day of your billing period</label>' +
         '<input id="wiz-billing-day" type="number" min="1" max="28" value="' + wiz.data.billing_day + '"></div>' +
+      '<div class="form-group">' +
+        '<label>Meter Reconciliation Period (Block Size)</label>' +
+        '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">Match this to your energy supplier\'s billing interval / block size — 30 minutes in the UK, other intervals may apply elsewhere. <strong style="color:var(--warning-color,#b45309);">This cannot be changed without deleting all recorded data via terminal.</strong> If in doubt, leave at 30 min.</div>' +
+        '<label>Meter Reconciliation Period</label>' +
+        '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">Match this to your energy supplier\'s billing interval — 30 minutes in the UK, other intervals may apply elsewhere. <strong style="color:var(--warning-color,#b45309);">This cannot be changed without deleting all recorded data via terminal.</strong> If in doubt, leave at 30 min.</div>' +
+        (hasData
+          ? '<select id="wiz-block-minutes" disabled><option value="5"' + (wiz.data.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (wiz.data.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((wiz.data.block_minutes||30)===30?' selected':'') + '>30 min</option></select><small style="color:var(--warning-color,#b45309);">⚠ Locked — changing the reconciliation period requires clearing all data</small>'
+          : '<select id="wiz-block-minutes"><option value="5"' + (wiz.data.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (wiz.data.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((wiz.data.block_minutes||30)===30?' selected':'') + '>30 min</option></select><small style="color:var(--muted);">Set once — cannot be changed after data collection begins</small>') +
+      '</div>' +
       '<div class="form-group"><label>Timezone</label>' +
         buildTzSelect('wiz-tz-select', wiz.data.timezone||'UTC') + '</div>' +
       '<div style="font-size:11px;color:var(--muted);margin-top:-8px;margin-bottom:8px;">UK users: Europe/London (handles BST automatically)</div>' +
@@ -761,15 +779,15 @@ function wizStepSensors() {
     '<div class="section-divider">Import</div>' +
     '<div class="form-group"><label>Import Read Sensor — cumulative kWh from grid</label>' +
       buildWizEntity('wiz-imp-read', wiz.data.importRead) + '</div>' +
-    '<div class="form-group"><label>Import Rate Sensor — £/kWh</label>' +
+    '<div class="form-group"><label>Import Rate Sensor</label>' +
       buildWizEntity('wiz-imp-rate', wiz.data.importRate) + '</div>' +
-    '<div class="form-group"><label>Standing Charge Sensor — £/day <span style="color:var(--muted);font-weight:400;">(optional)</span></label>' +
+    '<div class="form-group"><label>Standing Charge Sensor <span style="color:var(--muted);font-weight:400;">(optional, per day)</span></label>' +
       buildWizEntity('wiz-imp-sc', wiz.data.standingCharge) + '</div>' +
 
     '<div class="section-divider" style="margin-top:20px;">Export</div>' +
     '<div class="form-group"><label>Export Read Sensor — cumulative kWh to grid</label>' +
       buildWizEntity('wiz-exp-read', wiz.data.exportRead) + '</div>' +
-    '<div class="form-group"><label>Export Rate Sensor — £/kWh <span style="color:var(--muted);font-weight:400;">(optional)</span></label>' +
+    '<div class="form-group"><label>Export Rate Sensor <span style="color:var(--muted);font-weight:400;">(optional)</span></label>' +
       buildWizEntity('wiz-exp-rate', wiz.data.exportRate) + '</div>';
 }
 
@@ -830,7 +848,7 @@ function wizStepSubSensors() {
         '<input id="wiz-sub-' + devId + '-name" type="text" value="' + esc(sd.name) + '" placeholder="e.g. Tesla Charger"></div>' +
       '<div class="form-group"><label>Read Sensor — cumulative kWh</label>' +
         buildWizEntity('wiz-sub-' + devId + '-read', sd.read) + '</div>' +
-      '<div class="form-group"><label>Rate Sensor — £/kWh ' + (impRate ? '(pre-filled from main meter)' : '') + '</label>' +
+      '<div class="form-group"><label>Rate Sensor ' + (impRate ? '(pre-filled from main meter)' : '') + '</label>' +
         buildWizEntity('wiz-sub-' + devId + '-rate', sd.rate || impRate) + '</div>' +
     '</div>';
   });
@@ -885,7 +903,9 @@ function wizCollectStep() {
     wiz.data.mainId     = (document.getElementById('wiz-mainId').value||'electricity_main').trim().replace(/\s+/g,'_');
     wiz.data.site       = document.getElementById('wiz-site').value;
     wiz.data.supplier   = document.getElementById('wiz-supplier').value;
-    wiz.data.billing_day = parseInt(document.getElementById('wiz-billing-day').value)||1;
+    wiz.data.billing_day   = parseInt(document.getElementById('wiz-billing-day').value)||1;
+  var bmEl = document.getElementById('wiz-block-minutes');
+  wiz.data.block_minutes = bmEl ? parseInt(bmEl.value)||30 : (wiz.data.block_minutes||30);
   var tzEl = document.getElementById('wiz-tz-select');
   wiz.data.timezone = tzEl ? tzEl.value : (wiz.data.timezone || 'UTC');
   } else if (step === 'sensors') {
@@ -933,8 +953,9 @@ async function wizApplyAndClose() {
       type: 'electricity',
       site: d.site,
       supplier: d.supplier,
-      billing_day: d.billing_day,
-      timezone:    d.timezone || 'UTC' 
+      billing_day:    d.billing_day,
+      block_minutes: d.block_minutes || 30,
+      timezone:      d.timezone || 'UTC' 
     },
     channels: {
       import: { read: d.importRead, rate: d.importRate },

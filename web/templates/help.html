@@ -82,9 +82,9 @@
   <div class="card-title">⚡ What is Energy Meter Tracker?</div>
   <div class="warn-box" style="margin-bottom:16px;">
     ⚠️ <strong>Informational use only.</strong> Energy Meter Tracker provides a close approximation
-    of your half-hour consumption based on local sensor readings. It cannot replicate your
-    supplier's authoritative Half-Hourly (HH) reconciliation, which is derived from your smart
-    meter's secure DCC data stream and subject to settlement adjustments. Do not use this data
+    of your consumption based on local sensor readings. It cannot replicate your
+    supplier's authoritative meter reconciliation, which is derived from your smart
+    meter's secure data stream and subject to settlement adjustments. Do not use this data
     for billing disputes or formal energy accounting.
   </div>
   <p>
@@ -93,24 +93,27 @@
   </p>
   <p>
     <strong>Energy Meter Tracker</strong> is a Home Assistant add-on that records your electricity usage in 
-    half-hour blocks — the same intervals used by your energy supplier for billing. The add-on stores meter readings
-    at each boundary so you can see what happened in any given half-hour period, including
+    configurable reconciliation periods — matching the intervals used by your energy supplier for billing. The add-on stores meter readings
+    at each boundary so you can see what happened in any given period, including
     how much of your usage was from the grid versus your battery, EV or other device.
   </p>
   <p>
     It works by subscribing to your smart meter sensors in Home Assistant and taking timestamped
-    readings continuously. At each :00 and :30 boundary it interpolates precisely to the boundary
-    timestamp, finalises the block, and moves on — giving you reasonably accurate half-hour data
+    readings continuously. At each reconciliation period boundary it interpolates precisely to the boundary
+    timestamp, finalises the block, and moves on — giving you accurate data
     even when sensor updates don't land exactly on the boundary.
   </p>
 </div>
 
 <!-- ── The half-hour block ───────────────────────────────────────────────── -->
 <div class="card help-section">
-  <div class="card-title">🕐 Half-Hour Blocks</div>
+  <div class="card-title">🕐 Meter Reconciliation Period</div>
   <p>
-    Every block covers exactly 30 minutes: <code>09:00 → 09:30</code>, <code>09:30 → 10:00</code>, and so on.
-    This matches how electricity suppliers measure and bill consumption in the UK.
+    Each block covers exactly one reconciliation period: for example <code>09:00 → 09:30</code> at 30 minutes,
+    or <code>09:00 → 09:05</code> at 5 minutes. In the UK, energy suppliers use 30-minute half-hourly (HH)
+    settlement periods. Other countries may use different resolutions — some markets are moving to
+    15-minute or even 5-minute intervals. Configure the reconciliation period to match your supplier
+    before data collection begins. <strong>It cannot be changed without clearing all historical data.</strong>
   </p>
   <p>
     Within each block the engine collects multiple readings from your sensors. When the block
@@ -180,9 +183,9 @@
     <div>
       <p><strong>Rate sensors</strong></p>
       <ul>
-        <li>Must be <strong>current £/kWh</strong> — the live tariff rate</li>
+        <li>Must be the <strong>current rate per kWh</strong> — the live tariff rate</li>
         <li>Used to calculate cost per block</li>
-        <li>For Agile/flexible tariffs these change every 30 minutes — the engine captures the rate in effect during each block</li>
+        <li>For Agile/flexible tariffs these change each reconciliation period — the engine captures the rate in effect during each block</li>
         <li>Example: <code>sensor.octopus_energy_electricity_current_rate</code></li>
       </ul>
     </div>
@@ -198,7 +201,7 @@
     <div>
       <p><strong>Standing charge sensor</strong></p>
       <ul>
-        <li>Must be <strong>£/day</strong></li>
+        <li>Must be a <strong>daily standing charge</strong> value</li>
         <li>Can be a fixed <a href="https://www.home-assistant.io/integrations/input_number/" style="color:var(--accent);" target="_blank">input_number</a> helper if your supplier doesn't expose it</li>
         <li>Only needed on the main import channel</li>
       </ul>
@@ -212,7 +215,7 @@
   <p>
     If the add-on is stopped or Home Assistant restarts, the engine detects any missing blocks
     when it comes back online. It uses the last known reading before the outage and the first
-    reading after to <strong>interpolate the missing half-hour blocks</strong>, marking them as
+    reading after to <strong>interpolate the missing blocks</strong>, marking them as
     <code>interpolated: true</code> in the data.
   </p>
   <p>
@@ -226,7 +229,7 @@
 <div class="card help-section">
   <div class="card-title">💾 Data Storage &amp; Backup</div>
   <ul>
-    <li><code>blocks.json</code> — all finalised half-hour blocks (the primary dataset)</li>
+    <li><code>blocks.json</code> — all finalised reconciliation period blocks (the primary dataset)</li>
     <li><code>current_block.json</code> — the in-progress block with live sensor readings</li>
     <li><code>cumulative_totals.json</code> — running totals for the four HA sensors</li>
     <li><code>meters_config.json</code> — your meter and channel configuration</li>
