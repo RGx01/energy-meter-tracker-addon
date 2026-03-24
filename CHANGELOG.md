@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.4.2] — 2026-03-24
+
+### Fixed
+- **Block finalisation stuck waiting indefinitely** — `ensure_correct_block` was missing the 2-minute timeout introduced in 1.3.2; if no post-boundary sensor read arrived (e.g. export-only period with a slow-updating sensor), the block would never finalise; timeout restored — after 2 minutes without a post-boundary read the engine finalises anyway
+- **Charts not using block size or currency** — `generate_charts` in the released 1.4.0 build was missing the `block_minutes` and `currency_symbol` parameters due to a merge conflict resolution error; charts were rendering correctly for 30-minute blocks but would fail for 5 or 15 minute blocks, and currency symbol always defaulted to `£` regardless of detected currency
+
+---
+
 ## [1.4.0] — 2026-03-23
 
 ### Added
