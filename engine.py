@@ -138,6 +138,33 @@ def iso(dt: datetime) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Currency detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Map ISO 4217 currency codes to symbols
+_CURRENCY_SYMBOLS = {
+    "GBP": "£", "USD": "$", "EUR": "€", "AUD": "A$", "CAD": "C$",
+    "NZD": "NZ$", "SGD": "S$", "HKD": "HK$", "JPY": "¥", "CNY": "¥",
+    "SEK": "kr", "NOK": "kr", "DKK": "kr", "CHF": "Fr", "INR": "₹",
+    "ZAR": "R", "BRL": "R$", "MXN": "$", "TRY": "₺", "KRW": "₩",
+}
+
+
+def detect_currency_symbol(unit_of_measurement: str) -> str:
+    """
+    Extract a currency symbol from a HA sensor unit string.
+    Examples: "GBP/kWh" → "£", "USD/kWh" → "$", "EUR/day" → "€"
+    Falls back to the raw currency code if not in the lookup table,
+    or "¤" (generic currency sign) if nothing can be parsed.
+    """
+    if not unit_of_measurement:
+        return "¤"
+    # Strip trailing unit suffix e.g. "/kWh", "/MWh", "/day"
+    code = unit_of_measurement.split("/")[0].strip().upper()
+    return _CURRENCY_SYMBOLS.get(code, code) if code else "¤"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -310,16 +337,8 @@ def ensure_correct_block(ha: HAClient, current_block: dict, now: datetime) -> di
                     break
 
     if not has_post_boundary_read:
-        # Timeout — if boundary was crossed more than 2 minutes ago, finalise anyway
-        # This handles sensors that stop firing (e.g. zero consumption overnight)
-        seconds_since_boundary = (now - start).total_seconds()
-        if seconds_since_boundary < 120:
-            logger.info("ensure_correct_block: waiting for post-boundary read")
-            return current_block
-        logger.warning(
-            "ensure_correct_block: no post-boundary read after %.0fs, finalising anyway",
-            seconds_since_boundary
-        )
+        logger.info("ensure_correct_block: waiting for post-boundary read")
+        return current_block
 
     # Gap detection before finalise
     last_read_ts = None
@@ -627,11 +646,19 @@ async def update_ha_sensors(ha: HAClient, engine_totals: dict):
             "friendly_name":       "Energy Engine Export",
         },
     )
+    config          = load_config()
+    main_meta       = {}
+    for meter_data in config.get("meters", {}).values():
+        if not (meter_data.get("meta") or {}).get("sub_meter"):
+            main_meta = meter_data.get("meta") or {}
+            break
+    currency_code = main_meta.get("currency_code", "GBP")
+
     await ha.set_state(
         "sensor.energy_meter_import_cost",
         round(engine_totals["import_cost"], 6),
         {
-            "unit_of_measurement": "GBP",
+            "unit_of_measurement": currency_code,
             "device_class":        "monetary",
             "state_class":         "total_increasing",
             "friendly_name":       "Energy Engine Import Cost",
@@ -641,7 +668,7 @@ async def update_ha_sensors(ha: HAClient, engine_totals: dict):
         "sensor.energy_meter_export_credit",
         round(engine_totals["export_cost"], 6),
         {
-            "unit_of_measurement": "GBP",
+            "unit_of_measurement": currency_code,
             "device_class":        "monetary",
             "state_class":         "total_increasing",
             "friendly_name":       "Energy Engine Export Credit",
@@ -657,7 +684,7 @@ def generate_charts(blocks: list):
     if not blocks:
         logger.info("generate_charts: no blocks, skipping")
         return
-    # Read timezone and block_minutes from meter meta (not top-level config)
+    # Read timezone, block_minutes and currency_symbol from meter meta
     config        = load_config()
     main_meta     = {}
     for meter_data in config.get("meters", {}).values():
@@ -1157,6 +1184,29 @@ async def engine_startup(ha: HAClient):
                     sensors_to_preload.append(eid)
     if sensors_to_preload:
         await ha.preload_states(sensors_to_preload)
+
+    # ── Detect and store currency symbol ────────────────────────────────
+    for mid, mcfg in config.get("meters", {}).items():
+        if not mcfg.get("meta", {}).get("sub_meter", False):
+            rate_sensor = mcfg.get("channels", {}).get("import", {}).get("rate")
+            if rate_sensor:
+                try:
+                    attrs = await ha.get_entity_attributes(rate_sensor)
+                    unit  = attrs.get("unit_of_measurement", "")
+                    symbol = detect_currency_symbol(unit)
+                    # Derive ISO code — strip "/kWh" etc
+                    code = unit.split("/")[0].strip().upper() if unit else "GBP"
+                    mcfg.setdefault("meta", {})["currency_symbol"] = symbol
+                    mcfg["meta"]["currency_code"]   = code
+                    logger.info(
+                        "engine_startup: currency detected from %s unit='%s' symbol='%s' code='%s'",
+                        rate_sensor, unit, symbol, code,
+                    )
+                except Exception as e:
+                    logger.warning("engine_startup: currency detection failed: %s", e)
+            break
+    # Persist currency to meters_config so charts can read it
+    save_json_atomic(CONFIG_PATH, config)
 
     # ── Validate blocks store ────────────────────────────────────────────
     blocks = load_json(BLOCKS_PATH, [])

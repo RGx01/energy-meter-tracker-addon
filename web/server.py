@@ -23,6 +23,32 @@ logger = logging.getLogger("server")
 
 app = Flask(__name__, template_folder="templates")
 
+
+def _read_version() -> str:
+    """Read version from config.yaml — works in both supervised and standalone modes."""
+    # config.yaml sits one directory above server.py (web/../config.yaml)
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "..", "config.yaml"),
+        "/addons/energy_meter_tracker/config.yaml",
+    ]
+    for path in candidates:
+        try:
+            with open(os.path.normpath(path)) as f:
+                for line in f:
+                    if line.startswith("version:"):
+                        return line.split(":", 1)[1].strip().strip('"').strip("'")
+        except Exception:
+            pass
+    return ""
+
+APP_VERSION = _read_version()
+
+
+@app.context_processor
+def inject_version():
+    return {"app_version": APP_VERSION}
+
+
 class IngressMiddleware:
     """
     WSGI middleware that rewrites the PATH_INFO to strip the ingress prefix
@@ -129,8 +155,15 @@ def index():
 @app.route("/config")
 def config_page():
     cfg = load_config()
+    try:
+        from energy_engine_io import load_json as _lj
+        import os as _os
+        _blocks = _lj(_os.path.join(DATA_DIR, "blocks.json"), [])
+        has_data = len(_blocks) > 0
+    except Exception:
+        has_data = False
     tz_select_html = '<select class="js-meta" data-key="timezone"><option value="UTC">UTC</option><option value="Europe/London">Europe/London (UK)</option><option value="Europe/Dublin">Europe/Dublin (Ireland)</option><option value="Europe/Lisbon">Europe/Lisbon (Portugal)</option><option value="Europe/Paris">Europe/Paris (France, Belgium, Netherlands)</option><option value="Europe/Berlin">Europe/Berlin (Germany, Austria)</option><option value="Europe/Amsterdam">Europe/Amsterdam</option><option value="Europe/Rome">Europe/Rome (Italy)</option><option value="Europe/Madrid">Europe/Madrid (Spain)</option><option value="Europe/Stockholm">Europe/Stockholm (Sweden, Norway, Denmark)</option><option value="Europe/Helsinki">Europe/Helsinki (Finland)</option><option value="Europe/Warsaw">Europe/Warsaw (Poland)</option><option value="Europe/Athens">Europe/Athens (Greece)</option><option value="Europe/Istanbul">Europe/Istanbul (Turkey)</option><option value="Europe/Moscow">Europe/Moscow (Russia)</option><option value="America/New_York">America/New_York (US Eastern)</option><option value="America/Chicago">America/Chicago (US Central)</option><option value="America/Denver">America/Denver (US Mountain)</option><option value="America/Los_Angeles">America/Los_Angeles (US Pacific)</option><option value="America/Toronto">America/Toronto (Canada Eastern)</option><option value="America/Vancouver">America/Vancouver (Canada Pacific)</option><option value="America/Sao_Paulo">America/Sao_Paulo (Brazil)</option><option value="Asia/Dubai">Asia/Dubai (UAE)</option><option value="Asia/Kolkata">Asia/Kolkata (India)</option><option value="Asia/Singapore">Asia/Singapore</option><option value="Asia/Tokyo">Asia/Tokyo (Japan)</option><option value="Asia/Shanghai">Asia/Shanghai (China)</option><option value="Australia/Sydney">Australia/Sydney</option><option value="Australia/Perth">Australia/Perth</option><option value="Pacific/Auckland">Pacific/Auckland (New Zealand)</option></select>'
-    return render_template("config.html", config=cfg, active="config", tz_select_html=tz_select_html)
+    return render_template("config.html", config=cfg, active="config", tz_select_html=tz_select_html, has_data=has_data)
 
 
 @app.route("/static/logo.png")

@@ -1,5 +1,36 @@
 # Changelog
 
+## [1.4.0] — 2026-03-23
+
+### Added
+- **Configurable meter reconciliation period** — choose 5, 15 or 30 minute recording intervals at setup time via the wizard or Meter Config; the reconciliation period is locked after first data is collected to prevent mixing intervals in the same dataset
+- **Automatic currency detection** — the add-on reads the `unit_of_measurement` from your rate sensor (e.g. `GBP/kWh`, `USD/kWh`, `EUR/kWh`) and automatically applies the correct currency symbol throughout all charts, billing summaries, and HA sensors; no manual configuration required
+- **International sensor compatibility** — rate and standing charge sensor filters now match on unit suffixes (`/kWh` for rates; `/day` for standing charges) instead of currency-specific prefixes, making the add-on currency-agnostic
+- **Area charts for high-resolution data** — daily usage charts automatically switch from bar to area/step chart style when reconciliation period is less than 15 minutes, giving a cleaner view of high-density data
+- **Heatmap scaled for reconciliation period** — net energy heatmap column width and x-axis tick density automatically adjust; tick labels shown every 30 minutes regardless of interval
+- **Export-only chart fix** — daily charts with export-only data now correctly align the rate axis (y2) so rate lines appear above zero rather than in the negative space
+
+### Changed
+- Reconciliation period is stored in meter meta and in `meters_config.json`; existing users automatically continue with 30-minute blocks with no action required
+- Billing day is now always read from `meters_config.json` at chart render time rather than from individual block meta; changing the billing day in Meter Config takes effect immediately on the next chart render
+- HA cost sensors (`sensor.energy_meter_import_cost`, `sensor.energy_meter_export_credit`) now use the detected currency code (e.g. `GBP`, `USD`) as their `unit_of_measurement` instead of hardcoded `GBP`
+- Help page updated with international context; "Half-Hour Blocks" section renamed to "Meter Reconciliation Period" with guidance on UK 30-minute standard and global variations
+
+### Notes for upgrading users
+- **Existing installations** — reconciliation period defaults to 30 minutes and is locked in the UI; no action required; all historical data and billing summaries are fully preserved
+- **Currency** — detected automatically at startup from your rate sensor unit; no action required for UK users; other currencies detected and applied on first engine start after upgrade
+- **New installations** — select your preferred reconciliation period in the setup wizard before data collection begins
+- **Changing reconciliation period** — not possible through the UI once data exists; requires manual data reset via terminal (see Help page)
+
+---
+
+## [1.3.3] — 2026-03-22
+
+### Fixed
+- **Chart generation error after 1.3.2** — `engine.py` was incorrectly including a 1.4.0 change that passed `block_minutes` to chart functions; `energy_charts.py` in 1.3.x does not accept this parameter, causing both charts to fail to generate after every block finalise
+
+---
+
 ## [1.3.2] — 2026-03-22
 
 ### Fixed
