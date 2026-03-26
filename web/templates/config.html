@@ -235,6 +235,7 @@ document.addEventListener('DOMContentLoaded', function() {
 // Field type → acceptable units/device_class
 var FIELD_FILTERS = {
   read:                  { units: ['kWh'], unitSuffixes: [], device_class: ['energy'] },
+  power_sensor:          { units: ['W', 'w', 'kW'], unitSuffixes: [], device_class: ['power'] },
   rate:                  { units: [], unitSuffixes: ['/kwh'], device_class: ['monetary', 'currency'] },
   standing_charge_sensor:{ units: [], unitSuffixes: ['/day'], device_class: ['monetary', 'currency'] },
 };
@@ -347,6 +348,13 @@ function buildMainCard(meterId, meter) {
       '<div class="form-group"><label>Timezone</label>' +
         buildTzSelectForMeter(meterId, meta.timezone||'UTC') + '</div>' +
       '<div style="font-size:11px;color:var(--muted);margin-top:-8px;margin-bottom:8px;">Used to assign blocks to the correct local day. UK: Europe/London</div>' +
+
+      '<div class="form-group" style="grid-column:1/-1;"><label>Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — enables Live Summary page)</span></label>' +
+        buildEntityInput(meterId + '__power__power_sensor', meta.power_sensor||'', meterId, 'power', 'power_sensor', true) +
+        '<small style="color:var(--muted);">Live power in watts (W) — enables the live power gauge on the Summary page.</small></div>' +
+      '<div class="form-group" style="grid-column:1/-1;"><label>Postcode Prefix <span style="color:var(--muted);font-weight:400;">(optional — enables Carbon Intensity forecast)</span></label>' +
+        '<input type="text" class="js-meta" data-meter="' + meterId + '" data-key="postcode_prefix" value="' + esc(meta.postcode_prefix||'') + '" placeholder="e.g. DE, SW1, M" style="max-width:200px;">' +
+        '<small style="color:var(--muted);">🇬🇧 UK only — first part of your postcode (e.g. DE1, not just DE). Enables the 48-hour carbon intensity forecast on the Summary page via the National Grid API.</small></div>' +
 
     '</div>' +
 
@@ -523,9 +531,15 @@ function onContainerChange(e) {
   else if (el.classList.contains('js-meter-id'))  { renameMeter(m, el.value); }
   else if (el.classList.contains('js-ch-field')) {
     var ch = el.dataset.channel, f = el.dataset.field;
-    if (!config.meters[m].channels[ch]) config.meters[m].channels[ch] = {};
-    if (el.value) config.meters[m].channels[ch][f] = el.value;
-    else delete config.meters[m].channels[ch][f];
+    if (ch === 'power') {
+      // power_sensor stored in meter meta
+      if (el.value) config.meters[m].meta['power_sensor'] = el.value;
+      else delete config.meters[m].meta['power_sensor'];
+    } else {
+      if (!config.meters[m].channels[ch]) config.meters[m].channels[ch] = {};
+      if (el.value) config.meters[m].channels[ch][f] = el.value;
+      else delete config.meters[m].channels[ch][f];
+    }
   }
   else if (el.classList.contains('js-ch-meta')) {
     var ch2 = el.dataset.channel;
@@ -633,13 +647,6 @@ function hideDrop(inp) {
 // ── Save ──────────────────────────────────────────────────────────────────────
 async function saveConfig() {
   hideAlerts();
-  // Explicitly read disabled selectors — disabled elements don't fire change events
-  document.querySelectorAll('select.js-meta-int[data-key="block_minutes"]').forEach(function(el) {
-    var m = el.dataset.meter;
-    if (m && config.meters[m]) {
-      config.meters[m].meta['block_minutes'] = parseInt(el.value) || 30;
-    }
-  });
   try {
     var r = await fetch(apiUrl('/api/config'), {
       method: 'POST',
