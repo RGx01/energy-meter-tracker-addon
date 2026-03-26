@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.5.0-beta.1] — 2026-03-26
+## [1.5.0-beta.4] — 2026-03-26
 
 ### Added
 - **Summary page** — new ⚡ Summary page accessible from the sidebar providing a live at-a-glance view of current power and billing; appears automatically once a power sensor is configured
