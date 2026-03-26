@@ -284,12 +284,11 @@ def summary_page():
         today_str   = now_local.date().isoformat()
 
         def build_billing(blocks_iter, period_label):
-            """Accumulate billing totals mirroring energy_charts.py two-pass approach."""
+            """Accumulate billing totals using PASS 2 pre-computed remainder fields."""
             from collections import defaultdict
-            # Pass 1 accumulators
-            sub_kwh_cost = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0})  # m_id -> {kwh, cost}
-            main_imp_kwh  = main_imp_cost  = 0.0
-            main_exp_kwh  = main_exp_cost  = 0.0
+            sub_kwh_cost  = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0})
+            main_imp_kwh  = main_imp_cost = 0.0
+            main_exp_kwh  = main_exp_cost = 0.0
             sc_cost       = 0.0
             charged_days  = set()
             has_any       = False
@@ -304,60 +303,44 @@ def summary_page():
                     day_key = None
                 meters = b.get("meters", {}) or {}
 
-                # ── Pass 1: accumulate sub-meter totals ──
                 for m_id, m_data in meters.items():
                     meta = (m_data or {}).get("meta", {}) or {}
-                    if not meta.get("sub_meter"):
-                        continue
-                    imp = (m_data.get("channels", {}).get("import") or {})
-                    sub_kwh_cost[m_id]["kwh"]  += float(imp.get("kwh") or 0)
-                    sub_kwh_cost[m_id]["cost"] += float(imp.get("cost") or 0)
+                    imp  = (m_data.get("channels", {}).get("import") or {})
+                    exp  = (m_data.get("channels", {}).get("export") or {})
 
-                # ── Pass 2: main meter using kwh_total then subtracting sub-meters ──
-                for m_id, m_data in meters.items():
-                    meta = (m_data or {}).get("meta", {}) or {}
                     if meta.get("sub_meter"):
-                        continue
-                    imp = (m_data.get("channels", {}).get("import") or {})
-                    exp = (m_data.get("channels", {}).get("export") or {})
-                    # Use kwh_total (gross) then subtract sub-meters, matching energy_charts.py
-                    raw_kwh  = float(imp.get("kwh_total") or imp.get("kwh") or 0)
-                    raw_cost = float(imp.get("cost") or 0)
-                    sub_kwh_total  = sum(v["kwh"]  for v in sub_kwh_cost.values())
-                    sub_cost_total = sum(v["cost"] for v in sub_kwh_cost.values())
-                    main_imp_kwh  += max(0.0, raw_kwh  - sub_kwh_total)
-                    main_imp_cost += max(0.0, raw_cost - sub_cost_total)
-                    main_exp_kwh  += float(exp.get("kwh") or 0)
-                    main_exp_cost += float(exp.get("cost") or 0)
-                    # Standing charge once per day
-                    if day_key and day_key not in charged_days:
-                        sc = float(m_data.get("standing_charge") or 0)
-                        if sc > 0:
-                            sc_cost += sc
-                            charged_days.add(day_key)
-                    has_any = True
+                        # Sub-meters: use kwh_grid (grid-sourced only) and cost
+                        sub_kwh_cost[m_id]["kwh"]  += float(imp.get("kwh_grid") or imp.get("kwh") or 0)
+                        sub_kwh_cost[m_id]["cost"] += float(imp.get("cost") or 0)
+                    else:
+                        # Main meter: use kwh_remainder/cost_remainder — already grid-only after PASS 2
+                        main_imp_kwh  += float(imp.get("kwh_remainder") or imp.get("kwh") or 0)
+                        main_imp_cost += float(imp.get("cost_remainder") or imp.get("cost") or 0)
+                        main_exp_kwh  += float(exp.get("kwh") or 0)
+                        main_exp_cost += float(exp.get("cost") or 0)
+                        if day_key and day_key not in charged_days:
+                            sc = float(m_data.get("standing_charge") or 0)
+                            if sc > 0:
+                                sc_cost += sc
+                                charged_days.add(day_key)
+                        has_any = True
 
             if not has_any:
                 return None, []
 
-            # Total mirrors energy_charts: main remainder + sub-meters + export(neg) + standing
             sub_total_cost = sum(v["cost"] for v in sub_kwh_cost.values())
             total = main_imp_cost + sub_total_cost - main_exp_cost + sc_cost
 
             rows = []
-            # Grid Import (remainder after sub-meters)
             if main_imp_kwh > 0.0001 or main_imp_cost > 0.0001:
                 rows.append({"label": f"Grid Import ({main_imp_kwh:.2f} kWh)", "cost": main_imp_cost})
-            # Sub-meter breakdown
             for m_id in sorted(sub_kwh_cost.keys()):
                 cost = sub_kwh_cost[m_id]["cost"]
                 if cost > 0.0001:
                     label = (cfg.get("meters", {}).get(m_id, {}).get("meta") or {}).get("device") or m_id
                     rows.append({"label": f"↳ {label}", "cost": cost})
-            # Export credit
             if main_exp_kwh > 0.0001:
                 rows.append({"label": f"Grid Export ({main_exp_kwh:.2f} kWh)", "cost": -main_exp_cost})
-            # Standing charge
             if sc_cost > 0.0001:
                 rows.append({"label": "Standing Charge", "cost": sc_cost})
             return total, rows
