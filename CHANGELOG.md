@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.5.0-beta.1] — 2026-03-26
+
+### Added
+- **Summary page** — new ⚡ Summary page accessible from the sidebar providing a live at-a-glance view of current power and billing; appears automatically once a power sensor is configured
+- **Live power gauge** — asymmetric semicircular gauge showing net grid flow; import and export scales are calculated independently from the 95th percentile of the last 7 days of recorded blocks, giving a stable scale that reflects real usage patterns without rescaling mid-session
+- **Power sensor field** — optional power sensor field in Meter Config (main meter); supports sensors reporting in kW; once configured the Summary nav link appears
+- **Gauge colour coding** — import arc colour reflects grid carbon intensity (UK users with postcode configured) or import magnitude (green → amber → red); export always teal
+- **Live power rows** — import, export, battery and EV charger power shown as live rows below the gauge; battery and EV rows appear automatically when sub-meters matching those device types are configured; values shown in W below 1 kW and kW above
+- **Billing summary cards** — three billing cards showing Today, This Bill (billing month) and This Year costs; each card breaks down grid import (kWh), standing charge, grid export (kWh) and sub-meter costs; standing charge counted once per day using the same `charged_days` pattern as the chart engine
+- **Carbon intensity forecast** — 🇬🇧 UK only; add your outward postcode prefix (e.g. `DE1`) in Meter Config to enable a 48-hour carbon intensity forecast strip via the National Grid API; shows current gCO₂/kWh, index rating and colour-coded forecast bars; refreshes every 5 minutes with exponential backoff on failure
+- **Site name read from live config** — site name now read from `meters_config.json` at chart render time (same pattern as billing day introduced in 1.4.0); changing site name in Meter Config takes effect on the next chart render without waiting for a new block
+
+### Changed
+- Power sensor field and postcode prefix field added to Meter Config main meter card
+- Postcode prefix field clearly labelled as UK only with guidance to include the district number (e.g. `DE1` not `DE`)
+- Carbon intensity gauge colour falls back to magnitude-based colouring (green/amber/red by import level) when no postcode is configured, making the gauge useful globally
+- `/api/power` endpoint reads power sensor directly from HA state cache when configured; falls back to deriving kW from consecutive cumulative meter reads when not
+
+### Notes for upgrading users
+- **Power sensor** — add your live power sensor to Meter Config to enable the Summary page; this is a separate sensor from the cumulative kWh read sensors already configured; typically named something like `sensor.smart_meter_electricity_power`
+- **Carbon forecast** — UK users only; add your outward postcode district (e.g. `DE1`, `SW1A`, `M1`) to Meter Config; postcode must include the district number, not just the area code
+- **Summary page** — billing cards read from `blocks.json` and may differ slightly from chart billing summaries due to standing charge timing; the charts remain the authoritative billing view
+
+---
+
 ## [1.4.3] — 2026-03-24
 
 ### Fixed
