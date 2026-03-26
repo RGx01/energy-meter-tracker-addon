@@ -262,6 +262,53 @@ def charts_page():
     )
 
 
+def _format_billing(summary, cfg, currency):
+    """Convert energy_charts billing summary dict into (total, rows) for the summary template."""
+    if not summary:
+        return None, []
+    totals     = summary.get("totals", {})
+    meter_meta = summary.get("meter_meta", {})
+    total_cost = summary.get("total_cost")
+    if total_cost is None:
+        return None, []
+
+    rows = []
+    # Collect main import, sub-meters and export from meter_totals
+    main_imp_kwh = main_imp_cost = 0.0
+    main_exp_kwh = main_exp_cost = 0.0
+    sub_rows = []
+
+    for key, t in totals.items():
+        meta       = meter_meta.get(key, {})
+        is_sub     = t.get("is_submeter") or meta.get("is_submeter", False)
+        is_export  = "export" in key.lower()
+        cost       = float(t.get("cost") or 0)
+        kwh        = float(t.get("kwh") or 0)
+
+        if is_export:
+            main_exp_kwh  += kwh
+            main_exp_cost += abs(cost)
+        elif is_sub:
+            if abs(cost) > 0.0001 or kwh > 0.0001:
+                device = meta.get("device") or key.split("/")[0].strip()
+                sub_rows.append({"label": f"↳ {device}", "cost": cost, "kwh": kwh})
+        else:
+            main_imp_kwh  += kwh
+            main_imp_cost += cost
+
+    if main_imp_kwh > 0.0001 or main_imp_cost > 0.0001:
+        rows.append({"label": f"Grid Import ({main_imp_kwh:.2f} kWh)", "cost": main_imp_cost})
+    for r in sub_rows:
+        rows.append({"label": r["label"], "cost": r["cost"]})
+    if main_exp_kwh > 0.0001:
+        rows.append({"label": f"Grid Export ({main_exp_kwh:.2f} kWh)", "cost": -main_exp_cost})
+    sc = summary.get("total_standing", 0.0)
+    if sc > 0.0001:
+        rows.append({"label": "Standing Charge", "cost": sc})
+
+    return total_cost, rows
+
+
 @app.route("/summary")
 def summary_page():
     from energy_engine_io import load_json as _load_json
@@ -283,96 +330,34 @@ def summary_page():
         now_local   = datetime.now(_tz)
         today_str   = now_local.date().isoformat()
 
-        def build_billing(blocks_iter, period_label):
-            """Accumulate billing totals using PASS 2 pre-computed remainder fields."""
-            from collections import defaultdict
-            sub_kwh_cost  = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0})
-            main_imp_kwh  = main_imp_cost = 0.0
-            main_exp_kwh  = main_exp_cost = 0.0
-            sc_cost       = 0.0
-            charged_days  = set()
-            has_any       = False
+        # ── Use energy_charts.py billing calculation for accuracy ──
+        import energy_charts as _ec
+        now_naive = now_local.replace(tzinfo=None)
 
-            for b in blocks_iter:
-                if not b or not b.get("start"):
-                    continue
-                try:
-                    bdt     = datetime.fromisoformat(b["start"]).replace(tzinfo=ZoneInfo("UTC")).astimezone(_tz)
-                    day_key = bdt.date()
-                except Exception:
-                    day_key = None
-                meters = b.get("meters", {}) or {}
-
-                for m_id, m_data in meters.items():
-                    meta = (m_data or {}).get("meta", {}) or {}
-                    imp  = (m_data.get("channels", {}).get("import") or {})
-                    exp  = (m_data.get("channels", {}).get("export") or {})
-
-                    if meta.get("sub_meter"):
-                        # Sub-meters: use kwh_grid (grid-sourced only) and cost
-                        sub_kwh_cost[m_id]["kwh"]  += float(imp.get("kwh_grid") or imp.get("kwh") or 0)
-                        sub_kwh_cost[m_id]["cost"] += float(imp.get("cost") or 0)
-                    else:
-                        # Main meter: use kwh_remainder/cost_remainder — already grid-only after PASS 2
-                        main_imp_kwh  += float(imp.get("kwh_remainder") or imp.get("kwh") or 0)
-                        main_imp_cost += float(imp.get("cost_remainder") or imp.get("cost") or 0)
-                        main_exp_kwh  += float(exp.get("kwh") or 0)
-                        main_exp_cost += float(exp.get("cost") or 0)
-                        if day_key and day_key not in charged_days:
-                            sc = float(m_data.get("standing_charge") or 0)
-                            if sc > 0:
-                                sc_cost += sc
-                                charged_days.add(day_key)
-                        has_any = True
-
-            if not has_any:
-                return None, []
-
-            sub_total_cost = sum(v["cost"] for v in sub_kwh_cost.values())
-            total = main_imp_cost + sub_total_cost - main_exp_cost + sc_cost
-
-            rows = []
-            if main_imp_kwh > 0.0001 or main_imp_cost > 0.0001:
-                rows.append({"label": f"Grid Import ({main_imp_kwh:.2f} kWh)", "cost": main_imp_cost})
-            for m_id in sorted(sub_kwh_cost.keys()):
-                cost = sub_kwh_cost[m_id]["cost"]
-                if cost > 0.0001:
-                    label = (cfg.get("meters", {}).get(m_id, {}).get("meta") or {}).get("device") or m_id
-                    rows.append({"label": f"↳ {label}", "cost": cost})
-            if main_exp_kwh > 0.0001:
-                rows.append({"label": f"Grid Export ({main_exp_kwh:.2f} kWh)", "cost": -main_exp_cost})
-            if sc_cost > 0.0001:
-                rows.append({"label": "Standing Charge", "cost": sc_cost})
-            return total, rows
-
-        # ── Today ──
-        today_blocks = [b for b in blocks
-                        if b and b.get("start") and
-                        datetime.fromisoformat(b["start"]).replace(tzinfo=ZoneInfo("UTC")).astimezone(_tz).date().isoformat() == today_str]
-        today_total, today_rows = build_billing(today_blocks, "today")
+        # Today
+        today_start = now_naive.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end   = today_start.replace(hour=23, minute=59, second=59)
+        today_summary = _ec.calculate_billing_summary_for_period(blocks, today_start, today_end)
+        today_total, today_rows = _format_billing(today_summary, cfg, currency)
         today_date = now_local.strftime("%d %b %Y")
 
-        # ── Billing month ──
+        # Billing month
         bd = billing_day
-        if now_local.day >= bd:
-            period_start = now_local.replace(day=bd, hour=0, minute=0, second=0, microsecond=0)
+        if now_naive.day >= bd:
+            period_start = now_naive.replace(day=bd, hour=0, minute=0, second=0, microsecond=0)
         else:
-            m = now_local.month - 1 or 12
-            y = now_local.year if now_local.month > 1 else now_local.year - 1
-            period_start = now_local.replace(year=y, month=m, day=bd, hour=0, minute=0, second=0, microsecond=0)
-        month_blocks = [b for b in blocks
-                        if b and b.get("start") and
-                        datetime.fromisoformat(b["start"]).replace(tzinfo=ZoneInfo("UTC")).astimezone(_tz) >= period_start]
-        month_total, month_rows = build_billing(month_blocks, "month")
+            m = now_naive.month - 1 or 12
+            y = now_naive.year if now_naive.month > 1 else now_naive.year - 1
+            period_start = now_naive.replace(year=y, month=m, day=bd, hour=0, minute=0, second=0, microsecond=0)
+        month_summary = _ec.calculate_billing_summary_for_period(blocks, period_start, now_naive)
+        month_total, month_rows = _format_billing(month_summary, cfg, currency)
         month_period = f"{period_start.strftime('%d %b')} → {now_local.strftime('%d %b %Y')}"
 
-        # ── Calendar year ──
-        year_start = now_local.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-        year_blocks = [b for b in blocks
-                       if b and b.get("start") and
-                       datetime.fromisoformat(b["start"]).replace(tzinfo=ZoneInfo("UTC")).astimezone(_tz) >= year_start]
-        year_total, year_rows = build_billing(year_blocks, "year")
-        year_period = f"1 Jan → {now_local.strftime('%d %b %Y')}"
+        # Calendar year
+        year_start   = now_naive.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        year_summary = _ec.calculate_billing_summary_for_period(blocks, year_start, now_naive)
+        year_total, year_rows = _format_billing(year_summary, cfg, currency)
+        year_period  = f"1 Jan → {now_local.strftime('%d %b %Y')}"
 
         # ── Gauge scale — 95th percentile of kW from last 7 days ──
         from datetime import timedelta
