@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.5.0-beta.5] — 2026-03-26
+
+### Fixed
+- **Billing maths incorrect** — summary page billing totals now use `energy_charts.calculate_billing_summary_for_period` directly, the same function used by the chart billing page; eliminates all discrepancies between summary and chart billing figures including rate-band subtraction, standing charge grouping and export handling
+- **Battery and EV power rows showing inflated values** — removed battery and EV power rows from the gauge card; these were derived from cumulative kWh read sensors rather than dedicated power sensors, producing meaningless values; grid import and export rows remain
+- **Billing row order** — rows now consistently show Grid Import → sub-meter breakdown → Grid Export → Standing Charge
+- **Summary page too wide on mobile portrait** — billing cards now use `repeat(auto-fit, minmax(260px, 1fr))` which responds to actual container width rather than viewport media queries; stacks to single column on narrow screens regardless of iframe viewport reporting
+- **Gauge and carbon card overflow on mobile** — added `min-width: 0` and `overflow: hidden` to all grid children; gauge wrap is now `width: 100%` up to `max-width: 220px`
+- **Carbon intensity refresh** — replaced fixed 30-minute interval with 5-minute refresh and exponential backoff on failure (5min → 15min → 30min); gauge defaults to neutral grey when no carbon data available rather than red
+
+### Changed
+- Carbon intensity forecast extended from 24 hours to 48 hours
+- Gauge colour for import uses carbon intensity index when postcode configured (UK); falls back to magnitude-based colouring (green → amber → red) when no postcode configured
+- Gauge and carbon intensity card now displayed side by side on desktop, stacked on mobile
+
+---
+
 ## [1.5.0-beta.4] — 2026-03-26
 
 ### Added
