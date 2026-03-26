@@ -17,7 +17,7 @@ import os
 import threading
 from pathlib import Path
 
-from flask import Flask, jsonify, redirect, render_template, request, send_file, url_for
+from flask import Flask, Response, jsonify, redirect, render_template, request, send_file, url_for
 
 logger = logging.getLogger("server")
 
@@ -45,8 +45,20 @@ APP_VERSION = _read_version()
 
 
 @app.context_processor
-def inject_version():
-    return {"app_version": APP_VERSION}
+def inject_globals():
+    has_power_sensor = False
+    has_postcode = False
+    try:
+        from energy_engine_io import load_json as _lj
+        cfg = _lj(os.path.join(DATA_DIR, "meters_config.json"), {})
+        for m_data in cfg.get("meters", {}).values():
+            if not (m_data.get("meta") or {}).get("sub_meter"):
+                has_power_sensor = bool((m_data.get("meta") or {}).get("power_sensor"))
+                has_postcode     = bool((m_data.get("meta") or {}).get("postcode_prefix", "").strip())
+                break
+    except Exception:
+        pass
+    return {"app_version": APP_VERSION, "has_power_sensor": has_power_sensor, "has_postcode": has_postcode}
 
 
 class IngressMiddleware:
@@ -248,6 +260,386 @@ def charts_page():
         block_count=block_count,
         active="charts",
     )
+
+
+@app.route("/summary")
+def summary_page():
+    from energy_engine_io import load_json as _load_json
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    try:
+        cfg      = _load_json(os.path.join(DATA_DIR, "meters_config.json"), {})
+        blocks   = _load_json(os.path.join(DATA_DIR, "blocks.json"), [])
+        main_meta = {}
+        for md in cfg.get("meters", {}).values():
+            if not (md.get("meta") or {}).get("sub_meter"):
+                main_meta = md.get("meta") or {}
+                break
+        currency    = main_meta.get("currency_symbol", "£")
+        tz_name     = main_meta.get("timezone", "UTC")
+        billing_day = int(main_meta.get("billing_day") or 1)
+        _tz         = ZoneInfo(tz_name)
+        now_local   = datetime.now(_tz)
+        today_str   = now_local.date().isoformat()
+
+        def build_billing(blocks_iter, period_label):
+            """Accumulate billing totals for a set of blocks, return total and rows."""
+            imp_cost = exp_cost = sc_cost = 0.0
+            imp_kwh  = exp_kwh  = 0.0
+            sub_costs  = {}
+            charged_days = set()
+            has_any = False
+            for b in blocks_iter:
+                if not b or not b.get("start"):
+                    continue
+                try:
+                    bdt = datetime.fromisoformat(b["start"]).replace(tzinfo=ZoneInfo("UTC")).astimezone(_tz)
+                    day_key = bdt.date()
+                except Exception:
+                    day_key = None
+                meters = b.get("meters", {}) or {}
+                for m_id, m_data in meters.items():
+                    meta = (m_data or {}).get("meta", {}) or {}
+                    if meta.get("sub_meter"):
+                        imp = (m_data.get("channels", {}).get("import") or {})
+                        sub_costs[m_id] = sub_costs.get(m_id, 0.0) + float(imp.get("cost") or 0)
+                    else:
+                        imp = (m_data.get("channels", {}).get("import") or {})
+                        exp = (m_data.get("channels", {}).get("export") or {})
+                        imp_cost += float(imp.get("cost_remainder") or imp.get("cost") or 0)
+                        exp_cost += float(exp.get("cost") or 0)
+                        imp_kwh  += float(imp.get("kwh_remainder") or imp.get("kwh") or 0)
+                        exp_kwh  += float(exp.get("kwh") or 0)
+                        # Standing charge counted once per day only
+                        if day_key and day_key not in charged_days:
+                            sc = float(m_data.get("standing_charge") or 0)
+                            if sc > 0:
+                                sc_cost += sc
+                                charged_days.add(day_key)
+                        has_any = True
+            if not has_any:
+                return None, []
+            total = imp_cost + sc_cost - exp_cost
+            rows  = []
+            if imp_kwh > 0.0001 or imp_cost > 0.0001:
+                rows.append({"label": f"Grid Import ({imp_kwh:.2f} kWh)", "cost": imp_cost})
+            if sc_cost > 0.0001:
+                rows.append({"label": "Standing Charge", "cost": sc_cost})
+            if exp_kwh > 0.0001:
+                rows.append({"label": f"Grid Export ({exp_kwh:.2f} kWh)", "cost": -exp_cost})
+            for m_id, cost in sub_costs.items():
+                if cost > 0.0001:
+                    label = (cfg.get("meters", {}).get(m_id, {}).get("meta") or {}).get("device") or m_id
+                    rows.append({"label": f"↳ {label}", "cost": cost})
+            return total, rows
+
+        # ── Today ──
+        today_blocks = [b for b in blocks
+                        if b and b.get("start") and
+                        datetime.fromisoformat(b["start"]).replace(tzinfo=ZoneInfo("UTC")).astimezone(_tz).date().isoformat() == today_str]
+        today_total, today_rows = build_billing(today_blocks, "today")
+        today_date = now_local.strftime("%d %b %Y")
+
+        # ── Billing month ──
+        bd = billing_day
+        if now_local.day >= bd:
+            period_start = now_local.replace(day=bd, hour=0, minute=0, second=0, microsecond=0)
+        else:
+            m = now_local.month - 1 or 12
+            y = now_local.year if now_local.month > 1 else now_local.year - 1
+            period_start = now_local.replace(year=y, month=m, day=bd, hour=0, minute=0, second=0, microsecond=0)
+        month_blocks = [b for b in blocks
+                        if b and b.get("start") and
+                        datetime.fromisoformat(b["start"]).replace(tzinfo=ZoneInfo("UTC")).astimezone(_tz) >= period_start]
+        month_total, month_rows = build_billing(month_blocks, "month")
+        month_period = f"{period_start.strftime('%d %b')} → {now_local.strftime('%d %b %Y')}"
+
+        # ── Calendar year ──
+        year_start = now_local.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        year_blocks = [b for b in blocks
+                       if b and b.get("start") and
+                       datetime.fromisoformat(b["start"]).replace(tzinfo=ZoneInfo("UTC")).astimezone(_tz) >= year_start]
+        year_total, year_rows = build_billing(year_blocks, "year")
+        year_period = f"1 Jan → {now_local.strftime('%d %b %Y')}"
+
+        # ── Gauge scale — 95th percentile of kW from last 7 days ──
+        from datetime import timedelta
+        cutoff = now_local - timedelta(days=7)
+        block_minutes = int(main_meta.get("block_minutes") or 30)
+        hours_per_block = block_minutes / 60.0
+
+        imp_kw_vals = []
+        exp_kw_vals = []
+        rate_vals   = []
+
+        for b in blocks:
+            if not b or not b.get("start"):
+                continue
+            try:
+                bdt = datetime.fromisoformat(b["start"]).replace(tzinfo=ZoneInfo("UTC")).astimezone(_tz)
+                if bdt < cutoff:
+                    continue
+                meters = b.get("meters", {}) or {}
+                for m_id, m_data in meters.items():
+                    meta = (m_data or {}).get("meta", {}) or {}
+                    if meta.get("sub_meter"):
+                        continue
+                    ch_imp = (m_data.get("channels", {}).get("import") or {})
+                    ch_exp = (m_data.get("channels", {}).get("export") or {})
+                    imp_kwh = float(ch_imp.get("kwh_remainder") or ch_imp.get("kwh") or 0)
+                    exp_kwh = float(ch_exp.get("kwh") or 0)
+                    if imp_kwh > 0:
+                        imp_kw_vals.append(imp_kwh / hours_per_block)
+                    if exp_kwh > 0:
+                        exp_kw_vals.append(exp_kwh / hours_per_block)
+                    rate = float(ch_imp.get("rate_used") or ch_imp.get("rate") or 0)
+                    if rate > 0:
+                        rate_vals.append(rate)
+            except Exception:
+                continue
+
+        def percentile(vals, pct):
+            if not vals:
+                return None
+            s = sorted(vals)
+            idx = int(len(s) * pct / 100)
+            return s[min(idx, len(s) - 1)]
+
+        def nice_ceil(kw):
+            steps = [1, 2, 3, 5, 7, 10, 15, 20, 30, 50]
+            for s in steps:
+                if s >= kw:
+                    return s
+            return round(kw * 1.2)
+
+        p95_imp = percentile(imp_kw_vals, 95)
+        p95_exp = percentile(exp_kw_vals, 95)
+        gauge_max_imp = nice_ceil(p95_imp or 3.0)
+        gauge_max_exp = nice_ceil(p95_exp or 3.0)
+        gauge_max = gauge_max_imp  # kept for backward compat
+
+        # Rate thresholds — low = bottom 33rd pct, high = top 33rd pct
+        rate_low  = percentile(rate_vals, 33) or 0.10
+        rate_high = percentile(rate_vals, 67) or 0.25
+
+    except Exception as e:
+        logger.error("summary_page: %s", e)
+        currency = "£"
+        month_total = today_total = year_total = None
+        month_rows = today_rows = year_rows = []
+        month_period = year_period = today_date = ""
+        gauge_max = gauge_max_imp = 10; gauge_max_exp = 5; rate_low = 0.10; rate_high = 0.25
+
+    # Check if power sensor is configured
+    has_power_sensor = bool(main_meta.get("power_sensor"))
+
+    return render_template(
+        "summary.html",
+        active="summary",
+        currency=currency,
+        today_total=today_total,
+        today_rows=today_rows,
+        today_date=today_date,
+        month_total=month_total,
+        month_rows=month_rows,
+        month_period=month_period,
+        year_total=year_total,
+        year_rows=year_rows,
+        year_period=year_period,
+        has_power_sensor=has_power_sensor,
+        gauge_max_imp=gauge_max_imp,
+        gauge_max_exp=gauge_max_exp,
+        rate_low=rate_low,
+        rate_high=rate_high,
+    )
+
+
+@app.route("/api/power")
+def api_power():
+    """Returns live power (kW) from configured power sensor or derived from reads."""
+    try:
+        from energy_engine_io import load_json as _lj
+        from datetime import datetime
+        cfg        = _lj(os.path.join(DATA_DIR, "meters_config.json"), {})
+        block      = _lj(os.path.join(DATA_DIR, "current_block.json"), {})
+        meters_cfg = cfg.get("meters", {}) or {}
+        meters_blk = block.get("meters", {}) or {}
+
+        # Find power sensor and sub-meter sensors from config
+        power_sensor = bat_sensor = ev_sensor = None
+        for m_id, m_data in meters_cfg.items():
+            meta = (m_data or {}).get("meta", {}) or {}
+            if not meta.get("sub_meter"):
+                power_sensor = meta.get("power_sensor")
+            elif "battery" in m_id.lower() or "solax" in m_id.lower():
+                bat_sensor = ((m_data.get("channels") or {}).get("import") or {}).get("read")
+            elif "ev" in m_id.lower() or "zappi" in m_id.lower():
+                ev_sensor = ((m_data.get("channels") or {}).get("import") or {}).get("read")
+
+        def sensor_kw(entity_id):
+            if not entity_id or not _ha_client:
+                return None
+            val = _ha_client.get_state(entity_id)
+            if val in (None, "unknown", "unavailable"):
+                return None
+            try:
+                return round(float(val), 3)  # already in kW
+            except (ValueError, TypeError):
+                return None
+
+        def derive_kw(reads):
+            if not reads or len(reads) < 2:
+                return None
+            try:
+                r2 = reads[-1]
+                r1 = None
+                for r in reversed(reads[:-1]):
+                    if r["ts"] != r2["ts"] and float(r["value"]) != float(r2["value"]):
+                        r1 = r
+                        break
+                if r1 is None:
+                    return None
+                t1 = datetime.fromisoformat(r1["ts"])
+                t2 = datetime.fromisoformat(r2["ts"])
+                dt_hours = (t2 - t1).total_seconds() / 3600.0
+                if dt_hours <= 0 or dt_hours > 0.5:
+                    return None
+                delta_kwh = float(r2["value"]) - float(r1["value"])
+                return round(delta_kwh / dt_hours, 3)
+            except Exception:
+                return None
+
+        if power_sensor:
+            net_kw = sensor_kw(power_sensor)
+            imp_kw = max(0.0, net_kw)  if net_kw is not None else None
+            exp_kw = max(0.0, -net_kw) if net_kw is not None else None
+            bat_kw = sensor_kw(bat_sensor)
+            ev_kw  = sensor_kw(ev_sensor)
+        else:
+            imp_kw = exp_kw = bat_kw = ev_kw = None
+            for m_id, m_data in meters_blk.items():
+                if not m_data:
+                    continue
+                meta   = m_data.get("meta", {}) or {}
+                ch     = m_data.get("channels", {}) or {}
+                is_sub = meta.get("sub_meter", False)
+                if not is_sub:
+                    imp_kw = derive_kw(ch.get("import", {}).get("reads", []))
+                    exp_kw = derive_kw(ch.get("export", {}).get("reads", []))
+                elif "battery" in m_id.lower() or "solax" in m_id.lower():
+                    bat_kw = derive_kw(ch.get("import", {}).get("reads", []))
+                elif "ev" in m_id.lower() or "zappi" in m_id.lower():
+                    ev_kw = derive_kw(ch.get("import", {}).get("reads", []))
+            if imp_kw is not None: imp_kw = max(0.0, imp_kw)
+            if exp_kw is not None: exp_kw = max(0.0, exp_kw)
+
+        # Get current import rate from HA state cache
+        rate_sensor = None
+        try:
+            from energy_engine_io import load_json as _lj2
+            _cfg2 = _lj2(os.path.join(DATA_DIR, "meters_config.json"), {})
+            for _m in _cfg2.get("meters", {}).values():
+                if not (_m.get("meta") or {}).get("sub_meter"):
+                    rate_sensor = ((_m.get("channels") or {}).get("import") or {}).get("rate")
+                    break
+        except Exception:
+            pass
+        current_rate = None
+        if rate_sensor and _ha_client:
+            try:
+                rv = _ha_client.get_state(rate_sensor)
+                if rv not in (None, "unknown", "unavailable"):
+                    current_rate = round(float(rv), 6)
+            except Exception:
+                pass
+
+        return jsonify({
+            "import_kw":        imp_kw,
+            "export_kw":        exp_kw,
+            "battery_kw":       bat_kw,
+            "ev_kw":            ev_kw,
+            "max_kw":           10,
+            "has_power_sensor": bool(power_sensor),
+            "rate":             current_rate,
+        })
+    except Exception as e:
+        logger.error("api_power: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/carbon")
+def api_carbon():
+    """Fetch 24-hour carbon intensity forecast from National Grid API."""
+    import urllib.request
+    import urllib.error
+    try:
+        from energy_engine_io import load_json as _lj
+        cfg = _lj(os.path.join(DATA_DIR, "meters_config.json"), {})
+        postcode = None
+        for m_data in cfg.get("meters", {}).values():
+            meta = (m_data or {}).get("meta", {}) or {}
+            if not meta.get("sub_meter"):
+                postcode = meta.get("postcode_prefix", "").strip().upper()
+                break
+        if not postcode:
+            return jsonify({"error": "no_postcode"}), 404
+
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+        url = f"https://api.carbonintensity.org.uk/regional/intensity/{now_iso}/fw48h/postcode/{postcode}"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+
+        # Log raw structure for debugging
+        logger.info("api_carbon raw keys: %s", list(data.keys()) if isinstance(data, dict) else type(data).__name__)
+        slots = []
+        raw = data.get("data", [])
+        logger.info("api_carbon data type: %s", type(raw).__name__)
+        # Handle dict shape: {data: {regionid, postcode, data: [{from, to, intensity}]}}
+        if isinstance(raw, dict):
+            for slot in raw.get("data", []):
+                slots.append({
+                    "from":      slot.get("from"),
+                    "to":        slot.get("to"),
+                    "intensity": slot.get("intensity", {}).get("forecast"),
+                    "index":     slot.get("intensity", {}).get("index"),
+                })
+        # Handle list shape
+        elif isinstance(raw, list) and raw:
+            first = raw[0]
+            if "data" in first:
+                # [{regionid, postcode, data: [{from, to, intensity}]}]
+                for slot in first.get("data", []):
+                    slots.append({
+                        "from":      slot.get("from"),
+                        "to":        slot.get("to"),
+                        "intensity": slot.get("intensity", {}).get("forecast"),
+                        "index":     slot.get("intensity", {}).get("index"),
+                    })
+            elif "from" in first:
+                # flat [{from, to, intensity}]
+                for slot in raw:
+                    slots.append({
+                        "from":      slot.get("from"),
+                        "to":        slot.get("to"),
+                        "intensity": slot.get("intensity", {}).get("forecast"),
+                        "index":     slot.get("intensity", {}).get("index"),
+                    })
+        slots = slots[:96]  # cap at 48 hours
+
+        return jsonify({"postcode": postcode, "slots": slots})
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:500]
+        logger.warning("api_carbon: HTTP %s — %s", e.code, body)
+        return jsonify({"error": f"http_{e.code}", "detail": body}), 503
+    except urllib.error.URLError as e:
+        logger.warning("api_carbon: network error: %s", e)
+        return jsonify({"error": "network_error"}), 503
+    except Exception as e:
+        logger.error("api_carbon: type=%s repr=%r str=%s", type(e).__name__, e, e)
+        return jsonify({"error": str(e), "type": type(e).__name__, "repr": repr(e)}), 500
 
 
 @app.route("/import")

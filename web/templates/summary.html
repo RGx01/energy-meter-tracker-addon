@@ -1,0 +1,661 @@
+{% extends "base.html" %}
+
+{% block head %}
+<style>
+/* ── Summary page ── */
+.summary-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+  margin-bottom: 20px;
+  align-items: start;
+}
+
+.power-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+/* power-card no longer spans full width */
+
+/* ── Gauge ── */
+.gauge-wrap {
+  position: relative;
+  width: 220px;
+  height: 120px;
+}
+
+.gauge-wrap svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.gauge-value {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  text-align: center;
+}
+
+.gauge-kw {
+  font-size: 28px;
+  font-weight: 700;
+  font-family: var(--mono);
+  color: var(--text);
+  line-height: 1;
+}
+
+.gauge-unit {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.gauge-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+/* ── Power rows ── */
+.power-rows {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.power-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: var(--bg);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+
+.power-row-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.power-row-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.power-row-value {
+  font-size: 15px;
+  font-weight: 600;
+  font-family: var(--mono);
+  color: var(--text);
+}
+
+.power-row-value.import  { color: #ff6b6b; }
+.power-row-value.export  { color: #00d4aa; }
+.power-row-value.battery { color: #7c6af7; }
+.power-row-value.ev      { color: #f59e0b; }
+.power-row-value.net-import { color: #ff6b6b; }
+.power-row-value.net-export { color: #00d4aa; }
+
+/* ── Status dot ── */
+.status-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-right: 4px;
+}
+.status-dot.live { background: var(--success); animation: pulse 2s infinite; }
+.status-dot.stale { background: var(--warning); }
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* ── Billing summary ── */
+.billing-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 20px;
+}
+
+.billing-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 24px;
+}
+
+.billing-total {
+  font-size: 32px;
+  font-weight: 700;
+  font-family: var(--mono);
+  color: var(--accent);
+  line-height: 1;
+  margin-bottom: 4px;
+}
+
+.billing-period {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 16px;
+}
+
+.billing-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.billing-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  padding: 6px 10px;
+  background: var(--bg);
+  border-radius: 6px;
+}
+
+.billing-row-label { color: var(--muted); }
+.billing-row-value { font-family: var(--mono); font-weight: 600; color: var(--text); }
+
+/* ── Carbon intensity ── */
+.carbon-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 24px;
+  height: 100%;
+}
+
+.carbon-current {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.carbon-value {
+  font-size: 28px;
+  font-weight: 700;
+  font-family: var(--mono);
+  line-height: 1;
+}
+
+.carbon-unit {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.carbon-index {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin-bottom: 16px;
+  display: inline-block;
+}
+
+.carbon-index.very-low  { background: rgba(34,197,94,0.15);  color: #22c55e; }
+.carbon-index.low       { background: rgba(34,197,94,0.10);  color: #86efac; }
+.carbon-index.moderate  { background: rgba(245,158,11,0.15); color: #f59e0b; }
+.carbon-index.high      { background: rgba(240,82,82,0.15);  color: #ff6b6b; }
+.carbon-index.very-high { background: rgba(240,82,82,0.20);  color: #dc2626; }
+
+.carbon-forecast {
+  display: flex;
+  gap: 2px;
+  margin-top: 12px;
+  height: 40px;
+  align-items: flex-end;
+}
+
+.carbon-slot {
+  flex: 1;
+  border-radius: 2px 2px 0 0;
+  min-height: 4px;
+  cursor: default;
+  transition: opacity 0.15s;
+}
+
+.carbon-slot:hover { opacity: 0.8; }
+
+.carbon-slot.current-slot {
+  outline: 2px solid var(--text);
+  outline-offset: 1px;
+}
+
+.carbon-time-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.no-data {
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+  padding: 20px 0;
+}
+
+@media (max-width: 900px) {
+  .summary-grid { grid-template-columns: 1fr; }
+  .billing-grid { grid-template-columns: 1fr; }
+}
+</style>
+{% endblock %}
+
+{% block topbar %}
+<div class="topbar">
+  <div>
+    <h2>Summary</h2>
+    <div class="sub">Live power &amp; billing at a glance</div>
+  </div>
+  <div style="font-size:12px;color:var(--muted);">
+    <span class="status-dot live" id="status-dot"></span>
+    <span id="status-text">Connecting...</span>
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+
+<!-- ── Live Power ── -->
+{% if not has_power_sensor %}
+<div class="card" style="text-align:center;padding:32px;margin-bottom:20px;">
+  <div style="font-size:32px;margin-bottom:12px;">⚡</div>
+  <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No power sensor configured</div>
+  <div style="color:var(--muted);font-size:13px;">Add a power sensor in <a href="{{ url_for('config_page') }}" style="color:var(--accent);">Meter Config</a> to enable the live power gauge.</div>
+</div>
+{% else %}
+<div class="summary-grid">
+
+  <!-- Main gauge -->
+  <div class="power-card">
+    <div class="card-title">⚡ Live Power</div>
+    <div class="gauge-wrap">
+      <svg viewBox="0 0 220 120" xmlns="http://www.w3.org/2000/svg">
+        <!-- Background arc -->
+        <path d="M 20 110 A 90 90 0 0 1 200 110" fill="none" stroke="#2a2d3a" stroke-width="14" stroke-linecap="round"/>
+        <!-- Zero marker -->
+        <line x1="110" y1="24" x2="110" y2="36" stroke="#6b7080" stroke-width="2"/>
+        <!-- Value arc — drawn from centre outward -->
+        <path id="gauge-arc" d="M 20 110 A 90 90 0 0 1 200 110" fill="none" stroke="#00d4aa" stroke-width="14" stroke-linecap="round"
+              stroke-dasharray="283" stroke-dashoffset="283"
+              transform-origin="110 110"/>
+        <!-- Needle -->
+        <line id="gauge-needle" x1="110" y1="110" x2="110" y2="30"
+              stroke="#e8eaf0" stroke-width="2" stroke-linecap="round"
+              transform="rotate(0 110 110)"/>
+        <!-- Centre dot -->
+        <circle cx="110" cy="110" r="5" fill="#e8eaf0"/>
+        <!-- Labels -->
+        <text x="18" y="125" font-size="10" fill="#6b7080" text-anchor="middle">Export</text>
+        <text x="18" y="136" font-size="9" fill="#6b7080" text-anchor="middle" id="gauge-exp-max"></text>
+        <text x="202" y="125" font-size="10" fill="#6b7080" text-anchor="middle">Import</text>
+        <text x="202" y="136" font-size="9" fill="#6b7080" text-anchor="middle" id="gauge-imp-max"></text>
+        <text x="110" y="18" font-size="10" fill="#6b7080" text-anchor="middle">Net</text>
+      </svg>
+      <div class="gauge-value">
+        <div class="gauge-kw" id="net-kw">—</div>
+        <div class="gauge-unit" id="gauge-unit-label">kW net</div>
+      </div>
+    </div>
+
+    <div class="power-rows" style="max-width:420px;width:100%;">
+      <div class="power-row">
+        <div class="power-row-label">
+          <div class="power-row-dot" style="background:#ff6b6b;"></div>
+          Grid Import
+        </div>
+        <div class="power-row-value import" id="import-kw">— kW</div>
+      </div>
+      <div class="power-row">
+        <div class="power-row-label">
+          <div class="power-row-dot" style="background:#00d4aa;"></div>
+          Grid Export
+        </div>
+        <div class="power-row-value export" id="export-kw">— kW</div>
+      </div>
+      <div class="power-row" id="row-battery" style="display:none;">
+        <div class="power-row-label">
+          <div class="power-row-dot" style="background:#7c6af7;"></div>
+          Battery
+        </div>
+        <div class="power-row-value battery" id="battery-kw">— kW</div>
+      </div>
+      <div class="power-row" id="row-ev" style="display:none;">
+        <div class="power-row-label">
+          <div class="power-row-dot" style="background:#f59e0b;"></div>
+          EV Charger
+        </div>
+        <div class="power-row-value ev" id="ev-kw">— kW</div>
+      </div>
+    </div>
+  </div>
+
+  {% if has_postcode %}
+  <!-- Carbon intensity card -->
+  <div class="carbon-card">
+    <div class="card-title">🌿 Carbon Intensity</div>
+    <div id="carbon-loading" style="color:var(--muted);font-size:13px;">Loading forecast...</div>
+    <div id="carbon-content" style="display:none;">
+      <div class="carbon-current">
+        <div class="carbon-value" id="carbon-value">—</div>
+        <div class="carbon-unit">gCO₂/kWh</div>
+      </div>
+      <div class="carbon-index" id="carbon-index">—</div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">Next 48 hours</div>
+      <div class="carbon-forecast" id="carbon-forecast"></div>
+      <div class="carbon-time-labels" id="carbon-time-labels"></div>
+    </div>
+    <div id="carbon-error" style="display:none;color:var(--muted);font-size:13px;">
+      Could not load forecast. Check your postcode prefix in <a href="{{ url_for('config_page') }}" style="color:var(--accent);">Meter Config</a>.
+    </div>
+  </div>
+  {% endif %}
+
+</div>
+
+{% endif %}
+
+<!-- ── Billing Summary ── -->
+
+{# Macro for a billing card #}
+{% macro billing_card(title, total, rows, period) %}
+<div class="billing-card">
+  <div class="card-title">{{ title }}</div>
+  {% if total is not none %}
+  <div class="billing-total" style="color:{% if total < 0 %}var(--accent){% else %}var(--accent){% endif %};">
+    {% if total < 0 %}-{% endif %}{{ currency }}{{ "%.2f"|format(total|abs) }}
+  </div>
+  <div class="billing-period">{{ period }}</div>
+  <div class="billing-rows">
+    {% for row in rows %}
+    <div class="billing-row">
+      <div class="billing-row-label">{{ row.label }}</div>
+      <div class="billing-row-value" style="color:{% if row.cost < 0 %}var(--accent){% else %}var(--text){% endif %};">
+        {% if row.cost < 0 %}-{% endif %}{{ currency }}{{ "%.2f"|format(row.cost|abs) }}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="no-data">No data yet</div>
+  {% endif %}
+</div>
+{% endmacro %}
+
+<div class="billing-grid" style="grid-template-columns:1fr 1fr 1fr;">
+  {{ billing_card("☀️ Today", today_total, today_rows, today_date) }}
+  {{ billing_card("📅 This Bill", month_total, month_rows, month_period) }}
+  {{ billing_card("📆 This Year", year_total, year_rows, year_period) }}
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ── Server-provided gauge config ──
+var GAUGE_MAX_IMP = {{ gauge_max_imp | default(10) }};
+var GAUGE_MAX_EXP = {{ gauge_max_exp | default(5) }};
+var RATE_LOW      = {{ rate_low | default(0.10) }};
+var RATE_HIGH     = {{ rate_high | default(0.25) }};
+
+// ── Gauge helpers ──
+var GAUGE_ARC_LEN = 283;  // half-circle circumference for r=90
+
+var _currentCarbonIndex = null;
+
+function setGauge(netKw) {
+  var frac;
+  if (netKw >= 0) {
+    frac = Math.min(1, netKw / GAUGE_MAX_IMP);
+  } else {
+    frac = Math.max(-1, netKw / GAUGE_MAX_EXP);
+  }
+  var angle  = frac * 90;
+  var colour;
+  if (netKw < 0) {
+    colour = '#00d4aa';  // export — always teal
+  } else if (_currentCarbonIndex) {
+    // UK — carbon intensity based
+    colour = CARBON_COLOURS[_currentCarbonIndex.toLowerCase()] || '#6b7080';
+  } else {
+    // Global fallback — magnitude based (green → amber → red)
+    var impFrac = Math.min(1, netKw / (GAUGE_MAX_IMP || 10));
+    if (impFrac < 0.33)      colour = '#22c55e';  // low  — green
+    else if (impFrac < 0.66) colour = '#f59e0b';  // mid  — amber
+    else                     colour = '#ff6b6b';  // high — red
+  }
+
+  // Arc drawn from centre (offset=141.5 = half arc) outward to needle
+  // Positive frac (import) → extend right from centre
+  // Negative frac (export) → extend left from centre
+  var centreOffset = GAUGE_ARC_LEN / 2;  // 141.5 = zero point
+  var arcLen = Math.abs(frac) * centreOffset;
+
+  var arc    = document.getElementById('gauge-arc');
+  var needle = document.getElementById('gauge-needle');
+  var netEl  = document.getElementById('net-kw');
+
+  if (arc) {
+    if (frac >= 0) {
+      // Import — arc starts at centre, extends right
+      arc.style.strokeDasharray = arcLen + ' ' + (GAUGE_ARC_LEN - arcLen);
+      arc.style.strokeDashoffset = centreOffset;
+    } else {
+      // Export — arc starts at centre, extends left
+      arc.style.strokeDasharray = arcLen + ' ' + (GAUGE_ARC_LEN - arcLen);
+      arc.style.strokeDashoffset = -(centreOffset - arcLen);
+    }
+    arc.style.stroke = colour;
+  }
+  if (needle) needle.setAttribute('transform', 'rotate(' + angle + ' 110 110)');
+  if (netEl)  netEl.textContent = (netKw >= 0 ? '+' : '-') + fmtKw(Math.abs(netKw));
+  if (netEl)  netEl.style.color = colour;
+}
+
+function setRow(id, kw, showRow) {
+  var el  = document.getElementById(id);
+  var row = document.getElementById('row-' + id.replace('-kw', ''));
+  if (el)  el.textContent = (kw !== null ? fmtKw(kw) : '—');
+  if (row && showRow !== undefined) row.style.display = showRow ? '' : 'none';
+}
+
+// ── Polling ──
+var statusDot  = document.getElementById('status-dot');
+var statusText = document.getElementById('status-text');
+var pollTimer  = null;
+
+function fmtKw(kw) {
+  if (kw === null || kw === undefined) return '—';
+  var abs = Math.abs(kw);
+  if (abs < 1) return Math.round(abs * 1000) + ' W';
+  return abs.toFixed(2) + ' kW';
+}
+
+function updatePower() {
+  fetch(apiUrl('/api/power'))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (statusDot)  { statusDot.className = 'status-dot live'; }
+      if (statusText) statusText.textContent = 'Live';
+
+      var imp = d.import_kw !== null && d.import_kw !== undefined ? d.import_kw : 0;
+      var exp = d.export_kw !== null && d.export_kw !== undefined ? d.export_kw : 0;
+      var net = imp - exp;
+
+      setGauge(net);
+
+      var impEl = document.getElementById('import-kw');
+      var expEl = document.getElementById('export-kw');
+      if (impEl) impEl.textContent = fmtKw(imp);
+      if (expEl) expEl.textContent = fmtKw(exp);
+
+      setRow('battery-kw', d.battery_kw, d.battery_kw !== null && d.battery_kw !== undefined);
+      setRow('ev-kw',      d.ev_kw,      d.ev_kw !== null && d.ev_kw !== undefined);
+    })
+    .catch(function(err) {
+      if (statusDot)  { statusDot.className = 'status-dot stale'; }
+      if (statusText) statusText.textContent = 'Error';
+      console.error('Power poll error', err);
+    });
+}
+
+// Set gauge scale labels
+(function() {
+  var impEl = document.getElementById('gauge-imp-max');
+  var expEl = document.getElementById('gauge-exp-max');
+  if (impEl) impEl.textContent = fmtKw(GAUGE_MAX_IMP);
+  if (expEl) expEl.textContent = fmtKw(GAUGE_MAX_EXP);
+})();
+
+// Poll immediately then every 5 seconds
+updatePower();
+pollTimer = setInterval(updatePower, 5000);
+
+window.addEventListener('beforeunload', function() {
+  if (pollTimer) clearInterval(pollTimer);
+});
+
+// ── Carbon intensity ──
+var CARBON_COLOURS = {
+  'very low':  '#22c55e',
+  'low':       '#86efac',
+  'moderate':  '#f59e0b',
+  'high':      '#ff6b6b',
+  'very high': '#dc2626',
+};
+
+function carbonIndexClass(index) {
+  return (index || '').toLowerCase().replace(' ', '-');
+}
+
+function processCarbonData(d) {
+  var loadingEl  = document.getElementById('carbon-loading');
+  var contentEl  = document.getElementById('carbon-content');
+  var errorEl    = document.getElementById('carbon-error');
+
+  if (!d.slots || !d.slots.length) {
+    if (loadingEl) loadingEl.style.display = 'none';
+    if (errorEl)   errorEl.style.display = '';
+    return;
+  }
+  if (loadingEl) loadingEl.style.display = 'none';
+  if (errorEl)   errorEl.style.display = 'none';
+  if (contentEl) contentEl.style.display = '';
+
+  // Current slot
+  var now = new Date();
+  var current = d.slots[0];
+  for (var i = 0; i < d.slots.length; i++) {
+    var from = new Date(d.slots[i].from);
+    var to   = new Date(d.slots[i].to);
+    if (now >= from && now < to) { current = d.slots[i]; break; }
+  }
+
+  _currentCarbonIndex = current.index || null;
+
+  var valEl = document.getElementById('carbon-value');
+  var idxEl = document.getElementById('carbon-index');
+  if (valEl) {
+    valEl.textContent = current.intensity !== null ? current.intensity : '—';
+    valEl.style.color = CARBON_COLOURS[(current.index || '').toLowerCase()] || 'var(--text)';
+  }
+  if (idxEl) {
+    idxEl.textContent = current.index || '—';
+    idxEl.className = 'carbon-index ' + carbonIndexClass(current.index);
+  }
+
+  // Forecast bar
+  var forecastEl = document.getElementById('carbon-forecast');
+  var labelsEl   = document.getElementById('carbon-time-labels');
+  if (forecastEl) {
+    forecastEl.innerHTML = '';
+    var intensities = d.slots.map(function(s) { return s.intensity || 0; });
+    var maxI = Math.max.apply(null, intensities) || 1;
+    d.slots.forEach(function(slot) {
+      var fromDt = new Date(slot.from);
+      var isNow  = (now >= fromDt && now < new Date(slot.to));
+      var h      = Math.max(6, Math.round((slot.intensity / maxI) * 40));
+      var colour = CARBON_COLOURS[(slot.index || '').toLowerCase()] || '#6b7080';
+      var bar    = document.createElement('div');
+      bar.className = 'carbon-slot' + (isNow ? ' current-slot' : '');
+      bar.style.height = h + 'px';
+      bar.style.background = colour;
+      bar.title = fromDt.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})
+                + ' — ' + (slot.intensity || '?') + ' gCO₂/kWh (' + (slot.index || '?') + ')';
+      forecastEl.appendChild(bar);
+    });
+  }
+
+  // Time labels — every 6 hours (12 slots) for 48h view
+  if (labelsEl) {
+    labelsEl.innerHTML = '';
+    for (var j = 0; j < d.slots.length; j += 12) {
+      var s    = d.slots[j];
+      var span = document.createElement('span');
+      var dt   = new Date(s.from);
+      span.textContent = dt.toLocaleDateString([], {weekday:'short'}) + ' '
+                       + dt.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+      labelsEl.appendChild(span);
+    }
+  }
+}
+
+{% if has_postcode %}
+var _carbonFailCount = 0;
+var _carbonTimer = null;
+
+function scheduleCarbon() {
+  if (_carbonTimer) clearTimeout(_carbonTimer);
+  // Backoff: 5min normally, 15min after 1 failure, 30min after 2+
+  var delay = _carbonFailCount === 0 ? 5 * 60 * 1000
+            : _carbonFailCount === 1 ? 15 * 60 * 1000
+            : 30 * 60 * 1000;
+  _carbonTimer = setTimeout(function() { loadCarbonAndSchedule(); }, delay);
+}
+
+function loadCarbonAndSchedule() {
+  fetch(apiUrl('/api/carbon'))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      _carbonFailCount = 0;
+      processCarbonData(d);
+      scheduleCarbon();
+    })
+    .catch(function(err) {
+      _carbonFailCount++;
+      var loadingEl = document.getElementById('carbon-loading');
+      var errorEl   = document.getElementById('carbon-error');
+      if (loadingEl) loadingEl.style.display = 'none';
+      if (errorEl)   errorEl.style.display = '';
+      console.error('Carbon fetch error', err);
+      scheduleCarbon();
+    });
+}
+
+loadCarbonAndSchedule();
+{% endif %}
+</script>
+{% endblock %}

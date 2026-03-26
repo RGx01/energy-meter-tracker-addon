@@ -354,6 +354,11 @@
       <a href="{{ url_for('charts_page') }}"  class="{{ 'active' if active == 'charts' }}">
         <span class="nav-icon">📊</span> Charts
       </a>
+      {% if has_power_sensor %}
+      <a href="{{ url_for('summary_page') }}" class="{{ 'active' if active == 'summary' }}">
+        <span class="nav-icon">⚡</span> Summary
+      </a>
+      {% endif %}
       <a href="{{ url_for('import_page') }}"  class="{{ 'active' if active == 'import' }}">
         <span class="nav-icon">📥</span> Import Data
       </a>

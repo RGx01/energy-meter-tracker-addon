@@ -286,17 +286,18 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
 # Billing summary renderer
 # ─────────────────────────────────────────────────────────────
 
-def render_billing_summary(summary, currency='£'):
+def render_billing_summary(summary, currency='£', site_name=None):
     if not summary:
         return ""
 
     meter_meta = summary.get("meter_meta", {})
 
-    # ── Site header — find site name from first non-submeter channel ──
-    site_name = next(
-        (m.get("site") for m in meter_meta.values() if m.get("site") and not m.get("is_submeter")),
-        None
-    )
+    # ── Site header — prefer passed site_name, fall back to block meta ──
+    if not site_name:
+        site_name = next(
+            (m.get("site") for m in meter_meta.values() if m.get("site") and not m.get("is_submeter")),
+            None
+        )
     site_header = f'''
         <tr class="bill-site-header">
           <td colspan="4"><span class="censored">{site_name}</span></td>
@@ -395,7 +396,7 @@ def render_billing_summary(summary, currency='£'):
 # Daily chart builder (returns HTML string for one day)
 # ─────────────────────────────────────────────────────────────
 
-def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_minutes=30, currency='£'):
+def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_minutes=30, currency='£', site_name=None):
     slots = 1440 // block_minutes
     meter_kwh    = defaultdict(lambda: [0.0] * slots)
     meter_rate   = defaultdict(lambda: [0.0] * slots)
@@ -438,7 +439,7 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
             summary_rates["electricity_main"][round(main_rate, 4)] += main_kwh
             if "electricity_main" not in meter_display_name:
                 meta = main.get("meta", {}) or {}
-                meter_display_name["electricity_main"] = meta.get("site", "House")
+                meter_display_name["electricity_main"] = site_name or meta.get("site", "House")
 
             for meter_name, meter in meters.items():
                 if (meter or {}).get("meta", {}).get("sub_meter"):
@@ -785,8 +786,10 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
             if b and b.get("meters", {}) and b["meters"].get("electricity_main", {})
                and b["meters"]["electricity_main"].get("meta", {}).get("billing_day")
         ))
+        site_name = _main_meta.get("site") or None
     except (StopIteration, KeyError, TypeError, ValueError):
         billing_day = 1
+        site_name = None
 
     periods = get_all_billing_periods(blocks, billing_day, tz=_tz)
 
@@ -992,7 +995,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         ph         = f"{s_str} &rarr; {e_str}"   # period heading shorthand
 
         # Current period bill HTML (with optional current-period highlight class)
-        cur_bill = render_billing_summary(ps["summary"], currency=currency)
+        cur_bill = render_billing_summary(ps["summary"], currency=currency, site_name=site_name)
         extra    = " current-period" if is_current else ""
         cur_bill = cur_bill.replace('<div class="billing-summary">',
                                     f'<div class="billing-summary{extra}">', 1)
@@ -1011,7 +1014,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         prev_ps = find_prev_period(ps)
         if prev_ps:
             prev_h    = f"{prev_ps['start'].strftime('%d %b %Y')} &rarr; {(prev_ps['end'] - timedelta(seconds=1)).strftime('%d %b %Y')}"
-            prev_bill = render_billing_summary(prev_ps["summary"], currency=currency)
+            prev_bill = render_billing_summary(prev_ps["summary"], currency=currency, site_name=site_name)
             vs_prev_html = f'<div class="bill-compare-wrap">{col(ph, cur_bill)}{col(prev_h, prev_bill, True)}</div>'
         else:
             vs_prev_html = f'<div class="bill-compare-wrap">{col(ph, cur_bill)}{empty_col("No previous period available.")}</div>'
@@ -1020,7 +1023,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         year_ps = find_year_period(ps)
         if year_ps:
             year_h    = f"{year_ps['start'].strftime('%d %b %Y')} &rarr; {(year_ps['end'] - timedelta(seconds=1)).strftime('%d %b %Y')}"
-            year_bill = render_billing_summary(year_ps["summary"], currency=currency)
+            year_bill = render_billing_summary(year_ps["summary"], currency=currency, site_name=site_name)
             vs_year_html = f'<div class="bill-compare-wrap">{col(ph, cur_bill)}{col(year_h, year_bill, True)}</div>'
         else:
             vs_year_html = f'<div class="bill-compare-wrap">{col(ph, cur_bill)}{empty_col("No data for same period last year.")}</div>'
@@ -1028,7 +1031,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         # Daily charts
         day_charts_html = ""
         for day in ps["days"]:
-            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, block_minutes=block_minutes, currency=currency)
+            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, block_minutes=block_minutes, currency=currency, site_name=site_name)
 
         open_attr    = "open" if charts_open else ""
         toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}"
@@ -1058,7 +1061,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         ph         = gs["label"]
         bill_total = gs["summary"]["total_cost"]
 
-        cur_bill = render_billing_summary(gs["summary"], currency=currency)
+        cur_bill = render_billing_summary(gs["summary"], currency=currency, site_name=site_name)
         extra    = " current-period" if gs["is_current"] else ""
         cur_bill = cur_bill.replace('<div class="billing-summary">',
                                     f'<div class="billing-summary{extra}">', 1)
@@ -1074,7 +1077,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
 
         prev_gs = find_prev_fn(gs)
         if prev_gs:
-            prev_bill    = render_billing_summary(prev_gs["summary"], currency=currency)
+            prev_bill    = render_billing_summary(prev_gs["summary"], currency=currency, site_name=site_name)
             vs_prev_html = f'<div class="bill-compare-wrap">{col(ph, cur_bill)}{col(prev_gs["label"], prev_bill, True)}</div>'
         else:
             vs_prev_html = f'<div class="bill-compare-wrap">{col(ph, cur_bill)}{empty_col("No previous period available.")}</div>'
@@ -1082,7 +1085,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         if show_year_btn:
             year_gs = find_year_fn(gs)
             if year_gs:
-                year_bill    = render_billing_summary(year_gs["summary"], currency=currency)
+                year_bill    = render_billing_summary(year_gs["summary"], currency=currency, site_name=site_name)
                 vs_year_html = f'<div class="bill-compare-wrap">{col(ph, cur_bill)}{col(year_gs["label"], year_bill, True)}</div>'
             else:
                 vs_year_html = f'<div class="bill-compare-wrap">{col(ph, cur_bill)}{empty_col("No data for same period last year.")}</div>'
@@ -1091,7 +1094,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
 
         day_charts_html = ""
         for day in gs["days"]:
-            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, chart_prefix=f"{pid_prefix}_", block_minutes=block_minutes, currency=currency)
+            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, chart_prefix=f"{pid_prefix}_", block_minutes=block_minutes, currency=currency, site_name=site_name)
 
         toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}"
         open_attr    = "open" if gs["is_current"] else ""
