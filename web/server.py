@@ -272,18 +272,17 @@ def _format_billing(summary, cfg, currency):
     if total_cost is None:
         return None, []
 
-    rows = []
-    # Collect main import, sub-meters and export from meter_totals
     main_imp_kwh = main_imp_cost = 0.0
     main_exp_kwh = main_exp_cost = 0.0
     sub_rows = []
+    sub_imp_kwh_total = 0.0
 
     for key, t in totals.items():
-        meta       = meter_meta.get(key, {})
-        is_sub     = t.get("is_submeter") or meta.get("is_submeter", False)
-        is_export  = "export" in key.lower()
-        cost       = float(t.get("cost") or 0)
-        kwh        = float(t.get("kwh") or 0)
+        meta      = meter_meta.get(key, {})
+        is_sub    = t.get("is_submeter") or meta.get("is_submeter", False)
+        is_export = "export" in key.lower()
+        cost      = float(t.get("cost") or 0)
+        kwh       = float(t.get("kwh") or 0)
 
         if is_export:
             main_exp_kwh  += kwh
@@ -291,17 +290,28 @@ def _format_billing(summary, cfg, currency):
         elif is_sub:
             if abs(cost) > 0.0001 or kwh > 0.0001:
                 device = meta.get("device") or key.split("/")[0].strip()
-                sub_rows.append({"label": f"↳ {device}", "cost": cost, "kwh": kwh})
+                sub_rows.append({"label": f"↳ {device} ({kwh:.3f} kWh)", "cost": cost})
+                sub_imp_kwh_total += kwh
         else:
             main_imp_kwh  += kwh
             main_imp_cost += cost
 
+    rows = []
+    # Total import row (grid remainder + all sub-meters)
+    total_imp_kwh = main_imp_kwh + sub_imp_kwh_total
+    total_imp_cost = main_imp_cost + sum(float(r["cost"]) for r in sub_rows)
+    if total_imp_kwh > 0.0001 or total_imp_cost > 0.0001:
+        rows.append({"label": f"Total Import ({total_imp_kwh:.3f} kWh)", "cost": total_imp_cost, "bold": True})
+    # Grid remainder
     if main_imp_kwh > 0.0001 or main_imp_cost > 0.0001:
-        rows.append({"label": f"Grid Import ({main_imp_kwh:.2f} kWh)", "cost": main_imp_cost})
+        rows.append({"label": f"Grid Import ({main_imp_kwh:.3f} kWh)", "cost": main_imp_cost})
+    # Sub-meters
     for r in sub_rows:
-        rows.append({"label": r["label"], "cost": r["cost"]})
+        rows.append(r)
+    # Export
     if main_exp_kwh > 0.0001:
-        rows.append({"label": f"Grid Export ({main_exp_kwh:.2f} kWh)", "cost": -main_exp_cost})
+        rows.append({"label": f"Grid Export ({main_exp_kwh:.3f} kWh)", "cost": -main_exp_cost})
+    # Standing charge
     sc = summary.get("total_standing", 0.0)
     if sc > 0.0001:
         rows.append({"label": "Standing Charge", "cost": sc})
@@ -620,7 +630,7 @@ def api_billing():
         year_total, year_rows = _format_billing(year_summary, cfg, currency)
 
         def fmt_rows(rows):
-            return [{"label": r["label"], "cost": r["cost"]} for r in rows]
+            return [{"label": r["label"], "cost": r["cost"], "bold": r.get("bold", False)} for r in rows]
 
         return jsonify({
             "currency":     currency,
