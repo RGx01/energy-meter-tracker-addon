@@ -377,15 +377,15 @@
 <!-- ── Billing Summary ── -->
 
 {# Macro for a billing card #}
-{% macro billing_card(title, total, rows, period) %}
+{% macro billing_card(title, total, rows, period, card_id) %}
 <div class="billing-card">
   <div class="card-title">{{ title }}</div>
   {% if total is not none %}
-  <div class="billing-total" style="color:{% if total < 0 %}var(--accent){% else %}var(--accent){% endif %};">
+  <div class="billing-total" id="billing-total-{{ card_id }}">
     {% if total < 0 %}-{% endif %}{{ currency }}{{ "%.2f"|format(total|abs) }}
   </div>
-  <div class="billing-period">{{ period }}</div>
-  <div class="billing-rows">
+  <div class="billing-period" id="billing-period-{{ card_id }}">{{ period }}</div>
+  <div class="billing-rows" id="billing-rows-{{ card_id }}">
     {% for row in rows %}
     <div class="billing-row">
       <div class="billing-row-label">{{ row.label }}</div>
@@ -402,9 +402,9 @@
 {% endmacro %}
 
 <div class="billing-grid">
-  {{ billing_card("☀️ Today", today_total, today_rows, today_date) }}
-  {{ billing_card("📅 This Bill", month_total, month_rows, month_period) }}
-  {{ billing_card("📆 This Year", year_total, year_rows, year_period) }}
+  {{ billing_card("☀️ Today", today_total, today_rows, today_date, "today") }}
+  {{ billing_card("📅 This Bill", month_total, month_rows, month_period, "month") }}
+  {{ billing_card("📆 This Year", year_total, year_rows, year_period, "year") }}
 </div>
 
 {% endblock %}
@@ -412,10 +412,11 @@
 {% block scripts %}
 <script>
 // ── Server-provided gauge config ──
-var GAUGE_MAX_IMP = {{ gauge_max_imp | default(10) }};
-var GAUGE_MAX_EXP = {{ gauge_max_exp | default(5) }};
-var RATE_LOW      = {{ rate_low | default(0.10) }};
-var RATE_HIGH     = {{ rate_high | default(0.25) }};
+var GAUGE_MAX_IMP  = {{ gauge_max_imp | default(10) }};
+var GAUGE_MAX_EXP  = {{ gauge_max_exp | default(5) }};
+var RATE_LOW       = {{ rate_low | default(0.10) }};
+var RATE_HIGH      = {{ rate_high | default(0.25) }};
+var BLOCK_MINUTES  = {{ block_minutes | default(30) }};
 
 // ── Gauge helpers ──
 var GAUGE_ARC_LEN = 283;  // half-circle circumference for r=90
@@ -532,6 +533,63 @@ pollTimer = setInterval(updatePower, 5000);
 window.addEventListener('beforeunload', function() {
   if (pollTimer) clearInterval(pollTimer);
 });
+
+// ── Billing refresh — 1 minute after each block finalise ──
+function msUntilNextBillingRefresh() {
+  var now     = new Date();
+  var mins    = now.getMinutes();
+  var secs    = now.getSeconds();
+  var ms      = now.getMilliseconds();
+  var bm      = BLOCK_MINUTES || 30;
+  var elapsed = ((mins % bm) * 60 + secs) * 1000 + ms;
+  var blockMs = bm * 60 * 1000;
+  var msToNextBoundary = blockMs - elapsed;
+  return msToNextBoundary + 60 * 1000;  // 1 minute after boundary
+}
+
+function refreshBilling() {
+  // Reload just the billing section by fetching a new page and extracting the cards
+  fetch(apiUrl('/api/billing'))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      updateBillingCard('today',  d.today_total,  d.today_rows,  d.today_date,  d.currency);
+      updateBillingCard('month',  d.month_total,  d.month_rows,  d.month_period, d.currency);
+      updateBillingCard('year',   d.year_total,   d.year_rows,   d.year_period,  d.currency);
+      scheduleBillingRefresh();
+    })
+    .catch(function() { scheduleBillingRefresh(); });
+}
+
+function updateBillingCard(id, total, rows, period, currency) {
+  var totalEl  = document.getElementById('billing-total-' + id);
+  var periodEl = document.getElementById('billing-period-' + id);
+  var rowsEl   = document.getElementById('billing-rows-' + id);
+  if (!totalEl) return;
+  var absTotal = Math.abs(total);
+  var sign     = total < 0 ? '-' : '';
+  totalEl.textContent  = sign + currency + absTotal.toFixed(2);
+  totalEl.style.color  = total < 0 ? 'var(--accent)' : 'var(--accent)';
+  if (periodEl) periodEl.textContent = period;
+  if (rowsEl && rows) {
+    rowsEl.innerHTML = rows.map(function(r) {
+      var absC  = Math.abs(r.cost);
+      var signC = r.cost < 0 ? '-' : '';
+      var col   = r.cost < 0 ? 'var(--accent)' : 'var(--text)';
+      return '<div class="billing-row">'
+        + '<div class="billing-row-label">' + r.label + '</div>'
+        + '<div class="billing-row-value" style="color:' + col + ';">'
+        + signC + currency + absC.toFixed(2)
+        + '</div></div>';
+    }).join('');
+  }
+}
+
+function scheduleBillingRefresh() {
+  setTimeout(refreshBilling, msUntilNextBillingRefresh());
+}
+
+// Schedule first billing refresh
+scheduleBillingRefresh();
 
 // ── Carbon intensity ──
 var CARBON_COLOURS = {

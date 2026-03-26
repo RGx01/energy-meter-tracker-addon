@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.0-beta.6] — 2026-03-26
+
+### Added
+- **Billing auto-refresh** — Today, This Bill and This Year cards now update automatically without a page reload; refresh is scheduled 1 minute after each block finalise boundary (e.g. with 5-minute blocks, cards refresh at :01, :06, :11 etc); timing is derived from `block_minutes` so works correctly for all reconciliation period settings
+
+---
+
 ## [1.5.0-beta.5] — 2026-03-26
 
 ### Fixed
