@@ -257,8 +257,10 @@
   padding: 20px 0;
 }
 
-@media (max-width: 900px) {
+@media (max-width: 1100px) {
   .summary-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 700px) {
   .billing-grid { grid-template-columns: 1fr; }
 }
 </style>
@@ -336,20 +338,7 @@
         </div>
         <div class="power-row-value export" id="export-kw">— kW</div>
       </div>
-      <div class="power-row" id="row-battery" style="display:none;">
-        <div class="power-row-label">
-          <div class="power-row-dot" style="background:#7c6af7;"></div>
-          Battery
-        </div>
-        <div class="power-row-value battery" id="battery-kw">— kW</div>
-      </div>
-      <div class="power-row" id="row-ev" style="display:none;">
-        <div class="power-row-label">
-          <div class="power-row-dot" style="background:#f59e0b;"></div>
-          EV Charger
-        </div>
-        <div class="power-row-value ev" id="ev-kw">— kW</div>
-      </div>
+
     </div>
   </div>
 
@@ -393,9 +382,13 @@
     {% for row in rows %}
     <div class="billing-row">
       <div class="billing-row-label">{{ row.label }}</div>
+      {% if row.cost is not none %}
       <div class="billing-row-value" style="color:{% if row.cost < 0 %}var(--accent){% else %}var(--text){% endif %};">
         {% if row.cost < 0 %}-{% endif %}{{ currency }}{{ "%.2f"|format(row.cost|abs) }}
       </div>
+      {% else %}
+      <div class="billing-row-value" style="color:var(--muted);font-size:11px;">included</div>
+      {% endif %}
     </div>
     {% endfor %}
   </div>
@@ -512,8 +505,7 @@ function updatePower() {
       if (impEl) impEl.textContent = fmtKw(imp);
       if (expEl) expEl.textContent = fmtKw(exp);
 
-      setRow('battery-kw', d.battery_kw, d.battery_kw !== null && d.battery_kw !== undefined);
-      setRow('ev-kw',      d.ev_kw,      d.ev_kw !== null && d.ev_kw !== undefined);
+
     })
     .catch(function(err) {
       if (statusDot)  { statusDot.className = 'status-dot stale'; }

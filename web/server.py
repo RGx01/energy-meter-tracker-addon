@@ -320,18 +320,24 @@ def summary_page():
                         has_any = True
             if not has_any:
                 return None, []
+            # Total = grid import + standing charge - export credit
+            # Sub-meter costs are breakdowns of import, not additional charges
             total = imp_cost + sc_cost - exp_cost
             rows  = []
+            # Import row
             if imp_kwh > 0.0001 or imp_cost > 0.0001:
                 rows.append({"label": f"Grid Import ({imp_kwh:.2f} kWh)", "cost": imp_cost})
-            if sc_cost > 0.0001:
-                rows.append({"label": "Standing Charge", "cost": sc_cost})
-            if exp_kwh > 0.0001:
-                rows.append({"label": f"Grid Export ({exp_kwh:.2f} kWh)", "cost": -exp_cost})
-            for m_id, cost in sub_costs.items():
+            # Sub-meter breakdown (informational — already included in import cost)
+            for m_id, cost in sorted(sub_costs.items()):
                 if cost > 0.0001:
                     label = (cfg.get("meters", {}).get(m_id, {}).get("meta") or {}).get("device") or m_id
-                    rows.append({"label": f"↳ {label}", "cost": cost})
+                    rows.append({"label": f"↳ {label}", "cost": None})  # None = no cost shown, informational only
+            # Export credit
+            if exp_kwh > 0.0001:
+                rows.append({"label": f"Grid Export ({exp_kwh:.2f} kWh)", "cost": -exp_cost})
+            # Standing charge
+            if sc_cost > 0.0001:
+                rows.append({"label": "Standing Charge", "cost": sc_cost})
             return total, rows
 
         # ── Today ──
@@ -510,27 +516,37 @@ def api_power():
             except Exception:
                 return None
 
+        # Always derive battery/EV from cumulative reads — they don't have power sensors
+        bat_kw = ev_kw = None
+        for m_id, m_data in meters_blk.items():
+            if not m_data:
+                continue
+            meta   = m_data.get("meta", {}) or {}
+            ch     = m_data.get("channels", {}) or {}
+            if not meta.get("sub_meter", False):
+                continue
+            if "battery" in m_id.lower() or "solax" in m_id.lower() or "inverter" in m_id.lower():
+                bat_kw = derive_kw(ch.get("import", {}).get("reads", []))
+            elif "ev" in m_id.lower() or "zappi" in m_id.lower() or "charger" in m_id.lower():
+                ev_kw = derive_kw(ch.get("import", {}).get("reads", []))
+
         if power_sensor:
+            # Main meter — use direct power sensor (already in kW, +ve import, -ve export)
             net_kw = sensor_kw(power_sensor)
             imp_kw = max(0.0, net_kw)  if net_kw is not None else None
             exp_kw = max(0.0, -net_kw) if net_kw is not None else None
-            bat_kw = sensor_kw(bat_sensor)
-            ev_kw  = sensor_kw(ev_sensor)
         else:
-            imp_kw = exp_kw = bat_kw = ev_kw = None
+            # Main meter — derive from cumulative reads
+            imp_kw = exp_kw = None
             for m_id, m_data in meters_blk.items():
                 if not m_data:
                     continue
                 meta   = m_data.get("meta", {}) or {}
                 ch     = m_data.get("channels", {}) or {}
-                is_sub = meta.get("sub_meter", False)
-                if not is_sub:
+                if not meta.get("sub_meter", False):
                     imp_kw = derive_kw(ch.get("import", {}).get("reads", []))
                     exp_kw = derive_kw(ch.get("export", {}).get("reads", []))
-                elif "battery" in m_id.lower() or "solax" in m_id.lower():
-                    bat_kw = derive_kw(ch.get("import", {}).get("reads", []))
-                elif "ev" in m_id.lower() or "zappi" in m_id.lower():
-                    ev_kw = derive_kw(ch.get("import", {}).get("reads", []))
+                    break
             if imp_kw is not None: imp_kw = max(0.0, imp_kw)
             if exp_kw is not None: exp_kw = max(0.0, exp_kw)
 
