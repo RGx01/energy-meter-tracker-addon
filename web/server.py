@@ -448,6 +448,7 @@ def summary_page():
         gauge_max_exp=gauge_max_exp,
         rate_low=rate_low,
         rate_high=rate_high,
+        block_minutes=int(main_meta.get("block_minutes") or 30),
     )
 
 
@@ -571,6 +572,70 @@ def api_power():
         })
     except Exception as e:
         logger.error("api_power: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/billing")
+def api_billing():
+    """Return billing totals for Today, This Bill and This Year."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    import energy_charts as _ec
+    try:
+        from energy_engine_io import load_json as _lj
+        cfg      = _lj(os.path.join(DATA_DIR, "meters_config.json"), {})
+        blocks   = _lj(os.path.join(DATA_DIR, "blocks.json"), [])
+        main_meta = {}
+        for md in cfg.get("meters", {}).values():
+            if not (md.get("meta") or {}).get("sub_meter"):
+                main_meta = md.get("meta") or {}
+                break
+        currency    = main_meta.get("currency_symbol", "£")
+        tz_name     = main_meta.get("timezone", "UTC")
+        billing_day = int(main_meta.get("billing_day") or 1)
+        _tz         = ZoneInfo(tz_name)
+        now_local   = datetime.now(_tz)
+        now_naive   = now_local.replace(tzinfo=None)
+
+        # Today
+        today_start   = now_naive.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end     = today_start.replace(hour=23, minute=59, second=59)
+        today_summary = _ec.calculate_billing_summary_for_period(blocks, today_start, today_end)
+        today_total, today_rows = _format_billing(today_summary, cfg, currency)
+
+        # Billing month
+        bd = billing_day
+        if now_naive.day >= bd:
+            period_start = now_naive.replace(day=bd, hour=0, minute=0, second=0, microsecond=0)
+        else:
+            m = now_naive.month - 1 or 12
+            y = now_naive.year if now_naive.month > 1 else now_naive.year - 1
+            period_start = now_naive.replace(year=y, month=m, day=bd, hour=0, minute=0, second=0, microsecond=0)
+        month_summary = _ec.calculate_billing_summary_for_period(blocks, period_start, now_naive)
+        month_total, month_rows = _format_billing(month_summary, cfg, currency)
+
+        # Calendar year
+        year_start   = now_naive.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        year_summary = _ec.calculate_billing_summary_for_period(blocks, year_start, now_naive)
+        year_total, year_rows = _format_billing(year_summary, cfg, currency)
+
+        def fmt_rows(rows):
+            return [{"label": r["label"], "cost": r["cost"]} for r in rows]
+
+        return jsonify({
+            "currency":     currency,
+            "today_total":  today_total,
+            "today_rows":   fmt_rows(today_rows),
+            "today_date":   now_local.strftime("%d %b %Y"),
+            "month_total":  month_total,
+            "month_rows":   fmt_rows(month_rows),
+            "month_period": f"{period_start.strftime('%d %b')} → {now_local.strftime('%d %b %Y')}",
+            "year_total":   year_total,
+            "year_rows":    fmt_rows(year_rows),
+            "year_period":  f"1 Jan → {now_local.strftime('%d %b %Y')}",
+        })
+    except Exception as e:
+        logger.error("api_billing: %s", e)
         return jsonify({"error": str(e)}), 500
 
 
