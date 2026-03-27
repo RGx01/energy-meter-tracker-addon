@@ -387,9 +387,9 @@
   <div class="billing-period" id="billing-period-{{ card_id }}">{{ period }}</div>
   <div class="billing-rows" id="billing-rows-{{ card_id }}">
     {% for row in rows %}
-    <div class="billing-row">
-      <div class="billing-row-label">{{ row.label }}</div>
-      <div class="billing-row-value" style="color:{% if row.cost < 0 %}var(--accent){% else %}var(--text){% endif %};">
+    <div class="billing-row" {% if row.bold %}style="background:rgba(255,255,255,0.04);border-color:var(--muted);"{% endif %}>
+      <div class="billing-row-label" {% if row.bold %}style="color:var(--text);font-weight:600;"{% endif %}>{{ row.label }}</div>
+      <div class="billing-row-value" style="color:{% if row.cost < 0 %}var(--accent){% else %}var(--text){% endif %};{% if row.bold %}font-weight:600;{% endif %}">
         {% if row.cost < 0 %}-{% endif %}{{ currency }}{{ "%.2f"|format(row.cost|abs) }}
       </div>
     </div>
@@ -572,12 +572,15 @@ function updateBillingCard(id, total, rows, period, currency) {
   if (periodEl) periodEl.textContent = period;
   if (rowsEl && rows) {
     rowsEl.innerHTML = rows.map(function(r) {
-      var absC  = Math.abs(r.cost);
-      var signC = r.cost < 0 ? '-' : '';
-      var col   = r.cost < 0 ? 'var(--accent)' : 'var(--text)';
-      return '<div class="billing-row">'
-        + '<div class="billing-row-label">' + r.label + '</div>'
-        + '<div class="billing-row-value" style="color:' + col + ';">'
+      var absC    = Math.abs(r.cost);
+      var signC   = r.cost < 0 ? '-' : '';
+      var col     = r.cost < 0 ? 'var(--accent)' : 'var(--text)';
+      var boldRow = r.bold ? 'style="background:rgba(255,255,255,0.04);border-color:var(--muted);"' : '';
+      var boldLbl = r.bold ? 'style="color:var(--text);font-weight:600;"' : '';
+      var boldVal = r.bold ? ';font-weight:600;' : '';
+      return '<div class="billing-row" ' + boldRow + '>'
+        + '<div class="billing-row-label" ' + boldLbl + '>' + r.label + '</div>'
+        + '<div class="billing-row-value" style="color:' + col + boldVal + '">'
         + signC + currency + absC.toFixed(2)
         + '</div></div>';
     }).join('');

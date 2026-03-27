@@ -1,5 +1,31 @@
 # Changelog
 
+## [1.5.1] — 2026-03-26
+
+### Added
+- **Summary page** — new ⚡ Summary page accessible from the sidebar once a power sensor is configured; provides a live at-a-glance view of current power flow and billing
+- **Live power gauge** — asymmetric semicircular gauge showing net grid flow; import and export scales calculated independently from the 95th percentile of the last 7 days of blocks, giving a stable scale that reflects real usage patterns; scale labels shown at each end of the arc
+- **Gauge colour coding** — import arc colour reflects current grid carbon intensity index when UK postcode is configured (green = very low, amber = moderate, red = high); falls back to magnitude-based colouring (green → amber → red relative to import scale) when no postcode configured — works globally
+- **Live power rows** — grid import and export shown as live rows below the gauge in W (below 1 kW) or kW (above 1 kW); updates every 5 seconds
+- **Billing summary cards** — three cards showing Today, This Bill (billing month) and This Year; each shows a bold Total Import row followed by Grid Import, sub-meter breakdown with kWh, Grid Export with kWh, and Standing Charge; billing totals use `energy_charts.calculate_billing_summary_for_period` for accuracy matching the chart billing page exactly
+- **Billing auto-refresh** — billing cards update automatically 1 minute after each block boundary without a page reload; timing derived from `block_minutes` so works correctly for all reconciliation period settings
+- **Carbon intensity forecast** — 🇬🇧 UK only; add your outward postcode prefix (e.g. `DE1`) in Meter Config to enable a 48-hour carbon intensity forecast strip via the National Grid API (no API key required); shows current gCO₂/kWh, index rating badge and colour-coded forecast bars; gauge and carbon card displayed side by side on desktop, stacked on mobile; refreshes every 5 minutes with exponential backoff on failure (5min → 15min → 30min)
+- **Power sensor field** — optional power sensor field added to Meter Config main meter card; supports sensors already reporting in kW; once set the Summary nav link appears
+- **Postcode prefix field** — optional field in Meter Config for UK carbon intensity forecast; clearly labelled UK only; requires district number (e.g. `DE1` not `DE`)
+- **Site name read from live config** — site name now read from `meters_config.json` at chart render time; changing site name in Meter Config takes effect on the next chart render without waiting for a new block
+
+### Changed
+- Summary page billing uses `energy_charts.calculate_billing_summary_for_period` directly — same function as chart billing page — eliminating all discrepancies between summary and chart figures
+- Carbon intensity forecast extended to 48 hours
+- Billing cards use `repeat(auto-fit, minmax(260px, 1fr))` responsive grid — stacks to single column on narrow screens regardless of iframe viewport reporting
+
+### Notes for upgrading users
+- **Power sensor** — add your live power sensor (in kW) to Meter Config to enable the Summary page; this is a separate sensor from the cumulative kWh read sensors; typically named something like `sensor.smart_meter_electricity_power`
+- **Carbon forecast** — UK users only; add your outward postcode district (e.g. `DE1`, `SW1A`, `M1`) to Meter Config; postcode must include the district number
+- **Billing cards** — figures match the chart billing page; the charts remain the authoritative billing view
+
+---
+
 ## [1.5.0-beta.6] — 2026-03-26
 
 ### Added
