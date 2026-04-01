@@ -203,6 +203,10 @@
       <button class="bar-seg-btn"        onclick="barSetPeriod('monthly',this)">Monthly</button>
       <button class="bar-seg-btn"        onclick="barSetPeriod('yearly',this)">Yearly</button>
     </div>
+    <div class="bar-seg" id="bar-cal-seg">
+      <button class="bar-seg-btn active" onclick="barSetCalendar(false,this)">Billing</button>
+      <button class="bar-seg-btn"        onclick="barSetCalendar(true,this)">Calendar</button>
+    </div>
     <div class="bar-seg" id="bar-metric-seg">
       <button class="bar-seg-btn active" onclick="barSetMetric('kwh',this)">kWh</button>
       <button class="bar-seg-btn"        onclick="barSetMetric('cost',this)" id="bar-cost-btn">Cost</button>
@@ -225,8 +229,8 @@
   <div id="bar-legend" style="display:flex; gap:16px; margin-bottom:12px; font-size:12px; color:var(--muted); flex-wrap:wrap;"></div>
 
   <!-- Chart canvas -->
-  <div style="position:relative; width:100%; height:360px;">
-    <canvas id="barChart"></canvas>
+  <div id="bar-chart-wrap" style="position:relative; width:100%; max-width:100%; overflow:hidden; height:360px;">
+    <canvas id="barChart" style="max-width:100%;"></canvas>
   </div>
 
   <!-- Tabular view -->
@@ -281,13 +285,11 @@ window.addEventListener('orientationchange', function() {
   clearTimeout(_orientTimer);
   _orientTimer = setTimeout(function() {
     if (document.getElementById('chart-bar').style.display !== 'none' && barInited) {
-      // Destroy instance so Chart.js recalculates from fresh canvas dimensions
       if (barChartInstance) { barChartInstance.destroy(); barChartInstance = null; }
       barRender();
     }
-    // Also reload active iframe chart if visible
     resizeChartIframes();
-  }, 350);
+  }, 500);
 }, { passive: true });
 
 // Also handle resize-based orientation change (some browsers fire resize not orientationchange)
@@ -302,7 +304,7 @@ window.addEventListener('resize', function() {
         if (barChartInstance) { barChartInstance.destroy(); barChartInstance = null; }
         barRender();
       }
-    }, 350);
+    }, 500);
   }
 }, { passive: true });
 
@@ -410,6 +412,8 @@ var barCurrency = '£';
 var barPeriod = 'daily';
 var barMetric = 'kwh';
 var barView = 'totals';
+var barCalendar = false;   // false = billing periods, true = calendar periods
+var barBillingDay = 1;
 var barDailyMonth = null;
 var barActiveYears = null;
 var barChartInstance = null;
@@ -431,6 +435,7 @@ function barSaveState() {
       period:   barPeriod,
       metric:   barMetric,
       view:     barView,
+      calendar: barCalendar,
       month:    barDailyMonth,
       years:    barActiveYears ? [...barActiveYears] : [],
       standing: cb ? cb.checked : false,
@@ -446,6 +451,7 @@ function barLoadState(availableYears) {
     if (['daily','monthly','yearly'].indexOf(st.period) !== -1) barPeriod = st.period;
     if (['kwh','cost'].indexOf(st.metric) !== -1)              barMetric = st.metric;
     if (['totals','net'].indexOf(st.view) !== -1)              barView   = st.view;
+    if (typeof st.calendar === 'boolean')                      barCalendar = st.calendar;
     // Restore daily month only if it has data
     if (st.month && st.month.year && st.month.month) {
       var hasData = barData.some(function(r){ return r.year===st.month.year && r.month===st.month.month; });
@@ -470,6 +476,7 @@ async function barInit() {
     if (json.error) throw new Error(json.error);
     barData        = json.rows || [];
     barCurrency    = json.currency || '£';
+    barBillingDay  = json.billing_day || 1;
     barMeters      = json.meters  || [];
     barExportColor = json.export_color || '#ff7f0e';
     document.getElementById('bar-cost-btn').textContent = barCurrency + ' Cost';
@@ -495,6 +502,10 @@ function barSyncUI() {
     document.querySelectorAll('#bar-period-seg .bar-seg-btn').forEach(function(b){
       if (b.textContent.toLowerCase() === v) b.classList.toggle('active', barPeriod === v);
     });
+  });
+  document.querySelectorAll('#bar-cal-seg .bar-seg-btn').forEach(function(b){
+    var isCal = b.getAttribute('onclick') && b.getAttribute('onclick').indexOf('true') !== -1;
+    b.classList.toggle('active', isCal === barCalendar);
   });
   document.querySelectorAll('#bar-metric-seg .bar-seg-btn').forEach(function(b){
     b.classList.toggle('active', b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'"+barMetric+"'") !== -1);
@@ -608,40 +619,101 @@ function barAggRows(filterFn) {
   return result;
 }
 
+function barBillingKey(r) {
+  var bd = barBillingDay;
+  if (bd <= 1) return { bYear: r.year, bMonth: r.month };
+  if (r.day < bd) {
+    var bm = r.month - 1;
+    var by = r.year;
+    if (bm < 1) { bm = 12; by--; }
+    return { bYear: by, bMonth: bm };
+  }
+  return { bYear: r.year, bMonth: r.month };
+}
+
 function barGetDataForPeriod() {
   if (barPeriod === 'daily') {
-    var days = [...new Set(barData
-      .filter(function(r){ return r.year===barDailyMonth.year && r.month===barDailyMonth.month; })
-      .map(function(r){ return r.day; }))].sort(function(a,b){return a-b;});
+    var filtered;
+    if (barCalendar) {
+      filtered = barData.filter(function(r){
+        return r.year===barDailyMonth.year && r.month===barDailyMonth.month;
+      });
+    } else {
+      filtered = barData.filter(function(r){
+        var k = barBillingKey(r);
+        return k.bYear===barDailyMonth.year && k.bMonth===barDailyMonth.month;
+      });
+    }
+    filtered = filtered.slice().sort(function(a,b){
+      return (a.year*10000+a.month*100+a.day) - (b.year*10000+b.month*100+b.day);
+    });
+    var seen = {}, uniqueDates = [];
+    filtered.forEach(function(r) {
+      var k = r.year+'-'+r.month+'-'+r.day;
+      if (!seen[k]) { seen[k] = true; uniqueDates.push({year:r.year,month:r.month,day:r.day}); }
+    });
     return {
-      labels:  days.map(String),
-      aggList: days.map(function(d) {
-        return barAggRows(function(r){ return r.year===barDailyMonth.year && r.month===barDailyMonth.month && r.day===d; });
-      })
+      labels:  uniqueDates.map(function(d){ return String(d.day); }),
+      aggList: uniqueDates.map(function(d){
+        return barAggRows(function(r){ return r.year===d.year && r.month===d.month && r.day===d.day; });
+      }),
+      rawDates: uniqueDates
     };
   }
   if (barPeriod === 'monthly') {
     var activeYrs = barGetYears().filter(function(y){ return barActiveYears.has(y); });
     var buckets = [];
-    activeYrs.forEach(function(y) {
-      var months = [...new Set(barData.filter(function(r){return r.year===y;}).map(function(r){return r.month;}))].sort(function(a,b){return a-b;});
-      months.forEach(function(m){ buckets.push({y:y,m:m}); });
-    });
-    buckets.sort(function(a,b){ return a.y!==b.y ? a.y-b.y : a.m-b.m; });
-    return {
-      labels:  buckets.map(function(b){ return MONTHS_SHORT[b.m-1]+(activeYrs.length>1?' '+b.y:''); }),
-      aggList: buckets.map(function(b){ return barAggRows(function(r){ return r.year===b.y && r.month===b.m; }); })
-    };
+    if (barCalendar) {
+      activeYrs.forEach(function(y) {
+        var months = [...new Set(barData.filter(function(r){return r.year===y;}).map(function(r){return r.month;}))].sort(function(a,b){return a-b;});
+        months.forEach(function(m){ buckets.push({y:y,m:m}); });
+      });
+      buckets.sort(function(a,b){ return a.y!==b.y ? a.y-b.y : a.m-b.m; });
+      return {
+        labels:  buckets.map(function(b){ return MONTHS_SHORT[b.m-1]+(activeYrs.length>1?' '+b.y:''); }),
+        aggList: buckets.map(function(b){ return barAggRows(function(r){ return r.year===b.y && r.month===b.m; }); })
+      };
+    } else {
+      var seen = {};
+      barData.forEach(function(r) {
+        var k = barBillingKey(r);
+        var key = k.bYear + '-' + String(k.bMonth).padStart(2,'0');
+        if (!seen[key]) seen[key] = { y: k.bYear, m: k.bMonth };
+      });
+      buckets = Object.values(seen).sort(function(a,b){ return a.y!==b.y ? a.y-b.y : a.m-b.m; });
+      return {
+        labels:  buckets.map(function(b){ return MONTHS_SHORT[b.m-1]+' '+b.y; }),
+        aggList: buckets.map(function(b){
+          return barAggRows(function(r){
+            var k = barBillingKey(r);
+            return k.bYear===b.y && k.bMonth===b.m;
+          });
+        })
+      };
+    }
   }
   if (barPeriod === 'yearly') {
-    var activeYrs = barGetYears().filter(function(y){ return barActiveYears.has(y); });
-    return {
-      labels:  activeYrs.map(String),
-      aggList: activeYrs.map(function(y){ return barAggRows(function(r){ return r.year===y; }); })
-    };
+    if (barCalendar) {
+      var activeYrs = barGetYears().filter(function(y){ return barActiveYears.has(y); });
+      return {
+        labels:  activeYrs.map(String),
+        aggList: activeYrs.map(function(y){ return barAggRows(function(r){ return r.year===y; }); })
+      };
+    } else {
+      var activeYrs = barGetYears().filter(function(y){ return barActiveYears.has(y); });
+      var bYears = [...new Set(barData.map(function(r){ return barBillingKey(r).bYear; }))].sort();
+      bYears = bYears.filter(function(by){
+        return barData.some(function(r){ return barBillingKey(r).bYear===by && activeYrs.includes(r.year); });
+      });
+      return {
+        labels:  bYears.map(String),
+        aggList: bYears.map(function(by){
+          return barAggRows(function(r){ return barBillingKey(r).bYear===by; });
+        })
+      };
+    }
   }
 }
-
 function barYLabel(v) {
   var sym = barMetric==='cost' ? barCurrency : '';
   var unit = barMetric==='kwh' ? ' kWh' : '';
@@ -657,8 +729,9 @@ function barRender() {
   var pd = barGetDataForPeriod();
   var datasets = barGetDatasets(pd.labels, pd.aggList);
   var ctx = document.getElementById('barChart');
+  var wrap = document.getElementById('bar-chart-wrap');
   if (barChartInstance) { barChartInstance.destroy(); barChartInstance = null; }
-  // Reset canvas so Chart.js measures fresh from the container width
+  // Reset canvas dimensions so Chart.js measures fresh from the container
   ctx.style.width = ''; ctx.style.height = '';
   ctx.removeAttribute('width'); ctx.removeAttribute('height');
   barChartInstance = new Chart(ctx, {
@@ -735,7 +808,17 @@ function barBuildSubBar() {
     var prev = document.createElement('button'); prev.className = 'bar-nav-btn'; prev.textContent = '←';
     prev.onclick = function() { barDailyMonth.month--; if(barDailyMonth.month<1){barDailyMonth.month=12;barDailyMonth.year--;} barSaveState(); barRender(); };
     var lbl = document.createElement('span'); lbl.className = 'bar-period-label';
-    lbl.textContent = MONTHS_SHORT[barDailyMonth.month-1] + ' ' + barDailyMonth.year;
+    if (!barCalendar && barBillingDay > 1) {
+      // Show billing period date range e.g. "15 Mar – 14 Apr 2026"
+      var bd = barBillingDay;
+      var startM = barDailyMonth.month;
+      var startY = barDailyMonth.year;
+      var endM = startM + 1; var endY = startY;
+      if (endM > 12) { endM = 1; endY++; }
+      lbl.textContent = bd + ' ' + MONTHS_SHORT[startM-1] + ' – ' + (bd-1) + ' ' + MONTHS_SHORT[endM-1] + ' ' + endY;
+    } else {
+      lbl.textContent = MONTHS_SHORT[barDailyMonth.month-1] + ' ' + barDailyMonth.year;
+    }
     var next = document.createElement('button'); next.className = 'bar-nav-btn'; next.textContent = '→';
     next.onclick = function() { barDailyMonth.month++; if(barDailyMonth.month>12){barDailyMonth.month=1;barDailyMonth.year++;} barSaveState(); barRender(); };
     bar.appendChild(prev); bar.appendChild(lbl); bar.appendChild(next);
@@ -772,18 +855,21 @@ function barFmt(v, forCopy) {
   return (v < 0 ? '-' : '') + str;
 }
 
-function barPeriodLabel(lbl, idx) {
+function barPeriodLabel(lbl, idx, pd) {
   if (barPeriod === 'daily') {
-    // lbl is day number; add month and year from barDailyMonth
     var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    // Use rawDates if available (billing mode may span multiple calendar months)
+    if (pd && pd.rawDates && pd.rawDates[idx]) {
+      var d = pd.rawDates[idx];
+      return d.day + ' ' + MONTHS[d.month - 1] + ' ' + d.year;
+    }
     return lbl + ' ' + MONTHS[barDailyMonth.month - 1] + ' ' + barDailyMonth.year;
   }
   if (barPeriod === 'monthly') {
-    // lbl is already 'Jan' or 'Jan 2025' — ensure year is always shown
     if (lbl.indexOf(' ') === -1) return lbl + ' ' + barDailyMonth.year;
     return lbl;
   }
-  return lbl; // yearly: just the year number
+  return lbl;
 }
 
 function barBuildTable() {
@@ -838,7 +924,7 @@ function barBuildTable() {
   labels.forEach(function(lbl, i) {
     var agg = aggList[i];
     var rowTotal = 0;
-    html += '<tr><td>' + barPeriodLabel(lbl, i) + '</td>';
+    html += '<tr><td>' + barPeriodLabel(lbl, i, pd) + '</td>';
     cols.forEach(function(c) {
       var v = cellVal(agg, c);
       colTotals[c.key] += v;
@@ -926,6 +1012,7 @@ function barSetActive(segId, el) { document.querySelectorAll('#'+segId+' .bar-se
 function barSetPeriod(v, el) { barPeriod = v; barSetActive('bar-period-seg', el); barSaveState(); barRender(); }
 function barSetMetric(v, el) { barMetric = v; barSetActive('bar-metric-seg', el); barSaveState(); barRender(); }
 function barSetView(v, el)   { barView = v;   barSetActive('bar-view-seg', el);   barSaveState(); barRender(); }
+function barSetCalendar(v, el) { barCalendar = v; barSetActive('bar-cal-seg', el); barSaveState(); barRender(); }
 
 if (!window.Chart) {
   var s = document.createElement('script');
