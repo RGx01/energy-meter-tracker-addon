@@ -58,6 +58,64 @@ def rate(value, ts):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# floor_to_block (configurable block size)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestFloorToBlock(unittest.TestCase):
+
+    def test_30min_on_boundary(self):
+        self.assertEqual(engine.floor_to_block(dt("2026-01-01T09:30:00"), 30), dt("2026-01-01T09:30:00"))
+
+    def test_30min_mid_block(self):
+        self.assertEqual(engine.floor_to_block(dt("2026-01-01T09:17:00"), 30), dt("2026-01-01T09:00:00"))
+
+    def test_15min_on_boundary(self):
+        self.assertEqual(engine.floor_to_block(dt("2026-01-01T09:15:00"), 15), dt("2026-01-01T09:15:00"))
+
+    def test_15min_mid_block(self):
+        self.assertEqual(engine.floor_to_block(dt("2026-01-01T09:22:00"), 15), dt("2026-01-01T09:15:00"))
+
+    def test_5min_on_boundary(self):
+        self.assertEqual(engine.floor_to_block(dt("2026-01-01T09:10:00"), 5), dt("2026-01-01T09:10:00"))
+
+    def test_5min_mid_block(self):
+        self.assertEqual(engine.floor_to_block(dt("2026-01-01T09:13:00"), 5), dt("2026-01-01T09:10:00"))
+
+    def test_floor_to_hh_alias_matches_30min(self):
+        """Deprecated alias floor_to_hh should match floor_to_block(dt, 30)."""
+        d = dt("2026-01-01T09:17:33")
+        self.assertEqual(engine.floor_to_hh(d), engine.floor_to_block(d, 30))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# detect_currency_symbol
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDetectCurrencySymbol(unittest.TestCase):
+
+    def test_gbp(self):
+        self.assertEqual(engine.detect_currency_symbol("GBP/kWh"), "£")
+
+    def test_usd(self):
+        self.assertEqual(engine.detect_currency_symbol("USD/kWh"), "$")
+
+    def test_eur(self):
+        self.assertEqual(engine.detect_currency_symbol("EUR/kWh"), "€")
+
+    def test_unknown_code_returns_code(self):
+        self.assertEqual(engine.detect_currency_symbol("XYZ/kWh"), "XYZ")
+
+    def test_empty_returns_generic(self):
+        self.assertEqual(engine.detect_currency_symbol(""), "¤")
+
+    def test_none_returns_generic(self):
+        self.assertEqual(engine.detect_currency_symbol(None), "¤")
+
+    def test_no_slash_still_works(self):
+        self.assertEqual(engine.detect_currency_symbol("GBP"), "£")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # floor_to_hh
 # ─────────────────────────────────────────────────────────────────────────────
 

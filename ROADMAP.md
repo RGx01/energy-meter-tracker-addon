@@ -29,6 +29,20 @@ Guided setup wizard for first-time configuration of main meter and sub-meters.
 - Billing day always read from live config (takes effect immediately)
 - Help page internationalised; reconciliation period terminology throughout
 
+### 1.5.0 — Live Power Gauge
+- Live power gauge showing net grid flow (import/export kW)
+- Gauge colour reflects carbon intensity (UK) or import magnitude (global)
+- 48-hour carbon intensity forecast strip (UK, National Grid API, no key required)
+- Today, This Bill and This Year billing cards with sub-meter breakdown
+- Billing auto-refresh 1 minute after each block boundary
+- Power sensor and postcode prefix fields added to Meter Config
+
+### 1.5.1 — Live Power Refinements
+- Summary page renamed to Live Power throughout
+- Billing totals unified with chart billing page calculations
+- Gauge and carbon card layout fixes for mobile
+- Billing card responsive grid fixes
+
 ---
 
 ## Planned
@@ -47,19 +61,15 @@ The reconciliation period is locked once data collection begins, but currently t
 
 ---
 
-### 1.5.0 — Live Power Gauge
-**Theme: Real-time visibility**
+### 1.6.0 — Charts & Navigation Polish
+**Theme: Richer charting and smarter navigation**
 
-A live power gauge in the add-on sidebar showing current import and export power from your smart meter sensors.
-
-- Sidebar gauge component showing live import/export kW
-- Auto-refreshing without page reload (WebSocket or SSE)
-- Visual indicator of net flow direction (importing vs exporting)
-- Configurable sensor mapping (reads from existing meter config)
+- **Import / Export bar chart** — new chart tab showing import/export per day, month or year; import and export bars stacked directly above/below each other per period; switchable kWh/cost and Totals/Net views; monthly and yearly periods include a year selector for multi-year comparison with per-year colour coding
+- **Remember last visited page** — the add-on remembers which page you were on and returns you there on next load, rather than always defaulting to Charts
 
 ---
 
-### 1.6.0 — Gas Meters
+### 1.7.0 — Gas Meters
 **Theme: Whole-home energy tracking**
 
 Extend the engine to support gas meter recording alongside electricity.
@@ -75,7 +85,7 @@ Key design considerations:
 
 ---
 
-### 1.7.0 — Charting Insights
+### 1.8.0 — Charting Insights
 **Theme: Understand your energy patterns**
 
 New analytical views beyond raw consumption tracking.
@@ -89,7 +99,7 @@ Candidate features (final scope TBD):
 
 ---
 
-### 1.8.0 — High-Resolution Charting
+### 1.9.0 — High-Resolution Charting
 **Theme: See what's really happening within each block**
 
 Capture sensor data at full sensor resolution (e.g. every 10 seconds) for charting purposes, while keeping the reconciliation block size for billing accuracy.

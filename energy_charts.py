@@ -644,19 +644,19 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
     autosize: true,
     barmode: 'relative',
     margin: {{l:46, r:52, t:16, b:80}},
-    plot_bgcolor:  '#f8f9fa',
-    paper_bgcolor: 'white',
+    plot_bgcolor:  _getThemeColours().plotBg,
+    paper_bgcolor: _getThemeColours().paperBg,
     xaxis: {{
       tickmode: 'array', tickvals: tickVals, ticktext: tickTexts, tickangle: -45,
       showgrid: false
     }},
-    yaxis:  {{title:'kWh',   showgrid:true,  gridcolor:'#e5e5e5', titlefont:{{size:11}}}},
-    yaxis2: {{title:'{currency}/kWh', overlaying:'y', side:'right', showgrid:false, titlefont:{{size:11}}}},
+    yaxis:  {{title:'kWh',   showgrid:true,  gridcolor:_getThemeColours().gridC, titlefont:{{size:11, color:_getThemeColours().axisC}}, tickfont:{{color:_getThemeColours().axisC}}}},
+    yaxis2: {{title:'{currency}/kWh', overlaying:'y', side:'right', showgrid:false, titlefont:{{size:11, color:_getThemeColours().axisC}}, tickfont:{{color:_getThemeColours().axisC}}}},
     legend: {{
       orientation: 'h',
       x: 0.5, xanchor: 'center',
       y: -0.28, yanchor: 'top',
-      font: {{size: 11}},
+      font: {{size: 11, color: _getThemeColours().axisC}},
     }}
   }};
   function _doRender_{chart_id_safe}() {{
@@ -960,6 +960,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     <button class="view-btn" data-view="vs-prev"        onclick="showView('vs-prev')">vs Prev</button>
     <button class="view-btn vs-year-btn" data-view="vs-year" onclick="showView('vs-year')">vs Last Year</button>
     <button class="view-btn censor-btn" id="censor-toggle" onclick="toggleCensor()" title="Blur sensitive info">&#128065; Censor</button>
+    <button class="view-btn" id="theme-toggle" onclick="toggleTheme()" title="Toggle light/dark mode">&#9790;</button>
   </div>
 </div>"""
 
@@ -1168,7 +1169,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
 
     # ── Full HTML ──
     html = f"""<!DOCTYPE html>
-<html>
+<html data-theme="light">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1176,8 +1177,36 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
 <meta http-equiv="Pragma" content="no-cache"/>
 <meta http-equiv="Expires" content="0"/>
 <meta http-equiv="refresh" content="130"/>
+<script>
+(function(){{
+  var stored = localStorage.getItem('emt_chart_theme');
+  var sys = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', stored || sys);
+}})();
+function _getThemeColours() {{
+  var dark = document.documentElement.getAttribute('data-theme') !== 'light';
+  return {{
+    plotBg:  dark ? '#1a1d27' : '#f8f9fa',
+    paperBg: dark ? '#1a1d27' : '#ffffff',
+    axisC:   dark ? '#6b7080' : '#555566',
+    gridC:   dark ? '#2a2d3a' : '#e5e5e5',
+  }};
+}}
+</script>
 <script src="https://cdn.plot.ly/plotly-3.0.1.min.js"></script>
 <style>
+
+/* ── Theme variables ──────────────────────────── */
+:root {{
+  --bg:      #f0f2f5; --surface: #ffffff; --border: #d0d5dd;
+  --text:    #1a1d27; --muted:   #555970; --accent: #0a8c6a;
+  --card:    #ffffff; --input-bg:#fafafa;
+}}
+[data-theme="dark"] {{
+  --bg:      #0f1117; --surface: #1a1d27; --border: #2a2d3a;
+  --text:    #e8eaf0; --muted:   #6b7080; --accent: #00d4aa;
+  --card:    #1a1d27; --input-bg:#0f1117;
+}}
 
 /* ── Base ─────────────────────────────────────── */
 *, *::before, *::after {{ box-sizing: border-box; }}
@@ -1203,10 +1232,10 @@ html {{
 body {{
   margin: 0;
   padding: 0 16px 16px 16px;
-  background: #eaeaea;
+  background: var(--bg);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   font-size: 14px;
-  color: #222;
+  color: var(--text);
 }}
 
 .page-wrap {{
@@ -1221,10 +1250,10 @@ body {{
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  background: white;
+  background: var(--surface);
   padding: 8px 12px;
   border-radius: 0 0 8px 8px;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
   margin-bottom: 12px;
   flex-wrap: wrap;
   position: sticky;
@@ -1245,28 +1274,30 @@ body {{
 .period-nav select {{
   font-size: 11px;
   padding: 2px 7px;
-  border: 1px solid #ccc;
+  border: 1px solid var(--border);
   border-radius: 5px;
-  background: #fafafa;
+  background: var(--bg);
+  color: var(--text);
   cursor: pointer;
   min-width: 280px;
 }}
 .view-btn {{
   font-size: 11px;
   padding: 4px 10px;
-  border: 1px solid #ccc;
+  border: 1px solid var(--border);
   border-radius: 5px;
-  background: #f4f4f4;
+  background: var(--surface);
+  color: var(--muted);
   cursor: pointer;
   transition: background 0.15s, border-color 0.15s;
 }}
 .view-btn:hover {{
-  background: #e8e8e8;
+  background: var(--border);
 }}
 .view-btn.active {{
-  background: #1f77b4;
-  color: white;
-  border-color: #1a6699;
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
 }}
 
 /* ── Bill comparison layout ───────────────────── */
@@ -1284,10 +1315,10 @@ body {{
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #f9f9f9;
-  border: 1px dashed #ccc;
+  background: var(--surface);
+  border: 1px dashed var(--border);
   border-radius: 8px;
-  color: #999;
+  color: var(--muted);
   font-style: italic;
   padding: 20px;
 }}
@@ -1295,19 +1326,19 @@ body {{
   font-size: 15px;
   font-weight: 600;
   margin: 0 0 8px 0;
-  color: #333;
+  color: var(--text);
 }}
 .bill-view-heading.compare h2 {{
-  color: #888;
+  color: var(--muted);
 }}
 
 /* ── Billing card ─────────────────────────────── */
 .billing-summary {{
-  background: white;
+  background: var(--surface);
   padding: 16px 20px;
   margin-bottom: 12px;
   border-radius: 8px;
-  box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+  border: 1px solid var(--border);
   position: relative;
   overflow: hidden;
 }}
@@ -1320,7 +1351,7 @@ body {{
   transform: translate(-50%, -50%) rotate(-30deg);
   font-size: 22px;
   font-weight: 700;
-  color: rgba(0,0,0,0.12);
+  color: rgba(255,255,255,0.06);
   pointer-events: none;
   user-select: none;
   letter-spacing: 0.05em;
@@ -1328,28 +1359,28 @@ body {{
 }}
 
 .billing-summary.current-period {{
-  border: 2px solid #2f0057;
-  background: #faf5ff;
+  border: 2px solid var(--accent);
+  background: rgba(0,212,170,0.05);
 }}
 .bill-site-header td {{
   text-align: left;
   font-size: 15px;
   font-weight: 700;
-  color: #333;
+  color: var(--text);
   padding: 0 0 12px 0;
-  border-bottom: 2px solid #ddd;
+  border-bottom: 2px solid var(--border);
 }}
 .reads {{
   font-size: 11px;
   font-weight: 400;
-  color: #888;
+  color: var(--muted);
 }}
 
 .billing-summary h2 {{
   margin: 0 0 18px 0;
   font-size: 18px;
   font-weight: 600;
-  color: #2f0057;
+  color: var(--accent);
 }}
 
 /* ── Billing table ────────────────────────────── */
@@ -1368,25 +1399,25 @@ body {{
   padding-bottom: 2px;
   font-weight: 600;
   font-size: 13px;
-  color: #111;
-  border-top: 1px solid #eee;
+  color: var(--text);
+  border-top: 1px solid var(--border);
 }}
-.channel-header td {{ font-size: 11px; color: #888; padding-bottom: 2px; }}
+.channel-header td {{ font-size: 11px; color: var(--muted); padding-bottom: 2px; }}
 .channel-total td  {{ padding-top: 2px; font-weight: 600; }}
 .standing td       {{ padding-top: 8px; }}
 .grand-total td    {{
   padding-top: 8px;
   font-size: 14px;
   font-weight: 700;
-  color: #2f0057;
-  border-top: 2px solid #2f0057;
+  color: var(--accent);
+  border-top: 2px solid var(--accent);
 }}
 
 /* ── Details / toggle ─────────────────────────── */
 .day-charts-toggle {{
-  background: white;
+  background: var(--surface);
   border-radius: 8px;
-  box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+  border: 1px solid var(--border);
   margin-bottom: 24px;
   overflow: hidden;
 }}
@@ -1396,8 +1427,8 @@ body {{
   padding: 12px 20px;
   font-weight: 600;
   font-size: 14px;
-  color: #2f0057;
-  background: #f3eeff;
+  color: var(--accent);
+  background: rgba(0,212,170,0.08);
   user-select: none;
   list-style: none;
   display: flex;
@@ -1422,8 +1453,8 @@ body {{
 /* ── Day chart row ────────────────────────────── */
 .day-chart-wrap {{
   display: flex;
-  background: white;
-  border-bottom: 1px solid #ebebeb;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
   position: relative;
   overflow: hidden;
 }}
@@ -1436,7 +1467,7 @@ body {{
   min-width: 120px;
   max-width: 220px;
   padding: 12px 10px;
-  border-right: 1px solid #ebebeb;
+  border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   gap: 0;
@@ -1447,7 +1478,7 @@ body {{
 .day-label {{
   font-weight: 700;
   font-size: 1em;
-  color: #2f0057;
+  color: var(--accent);
   margin-bottom: 8px;
 }}
 
@@ -1457,18 +1488,18 @@ body {{
   flex-direction: column;
   margin-bottom: 7px;
 }}
-.scol.sub    {{ color: #666; }}
-.scol.export {{ color: #b85c00; }}
+.scol.sub    {{ color: var(--muted); }}
+.scol.export {{ color: #ff9944; }}
 
 .slabel {{
   font-weight: 600;
   font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: #999;
+  color: var(--muted);
   margin-bottom: 1px;
 }}
-.scol.export .slabel {{ color: #c8872a; }}
+.scol.export .slabel {{ color: #ffaa55; }}
 
 .stotals {{
   display: flex;
@@ -1480,25 +1511,25 @@ body {{
 .sval {{
   font-size: 12px;
   line-height: 1.6;
-  color: #222;
+  color: var(--text);
 }}
-.sval.export-val {{ color: #b85c00; }}
-.sval.sub-val    {{ color: #555; font-size: 11px; }}
-.scol.export .sval {{ color: #b85c00; }}
+.sval.export-val {{ color: #ff9944; }}
+.sval.sub-val    {{ color: var(--muted); font-size: 11px; }}
+.scol.export .sval {{ color: #ff9944; }}
 
 .sdivider {{
-  border-top: 1px solid #eee;
+  border-top: 1px solid var(--border);
   margin: 6px 0;
 }}
 
 .rate-row {{
   font-size: 0.8em;
-  color: #bbb;
+  color: #4b5563;
   line-height: 1.4;
   white-space: nowrap;
 }}
-.rate-row.export {{ color: #d4913a; }}
-.rate-row.sub    {{ color: #ccc; }}
+.rate-row.export {{ color: #ffaa55; }}
+.rate-row.sub    {{ color: #4b5563; }}
 
 /* ── Period mode toggle ───────────────────────── */
 .period-mode-toggle {{
@@ -1509,22 +1540,22 @@ body {{
 }}
 .period-mode-label {{
   font-size: 12px;
-  color: #666;
+  color: var(--muted);
   margin-right: 4px;
 }}
 .pmode-btn {{
   padding: 2px 7px;
   font-size: 11px;
-  border: 1px solid #ccc;
+  border: 1px solid var(--border);
   border-radius: 4px;
-  background: #f5f5f5;
+  background: var(--surface);
   cursor: pointer;
-  color: #333;
+  color: var(--muted);
 }}
 .pmode-btn.active {{
-  background: #1f77b4;
-  color: #fff;
-  border-color: #1f77b4;
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
 }}
 .period-select-wrap {{
   display: flex;
@@ -1540,36 +1571,36 @@ body {{
   align-items: center;
   justify-content: space-between;
   padding: 7px 4px 2px 4px;
-  border-top: 1px solid #eee;
+  border-top: 1px solid var(--border);
   font-size: 13px;
-  color: #333;
+  color: var(--text);
   order: 3;
   visibility: hidden;  /* always takes up space — never changes nav height */
 }}
 #sticky-bill-label {{
   font-weight: 600;
-  color: #2f0057;
+  color: var(--accent);
 }}
 #sticky-bill-btn {{
   font-size: 12px;
   padding: 4px 12px;
-  border: 1px solid #1f77b4;
+  border: 1px solid var(--accent);
   border-radius: 4px;
-  background: #f0f7ff;
-  color: #1f77b4;
+  background: rgba(0,212,170,0.08);
+  color: var(--accent);
   cursor: pointer;
   white-space: nowrap;
 }}
 #sticky-bill-btn:hover {{
-  background: #1f77b4;
-  color: white;
+  background: var(--accent);
+  color: var(--bg);
 }}
 
 /* ── Bill toggle ──────────────────────────────── */
 .bill-toggle {{
-  background: white;
+  background: var(--surface);
   border-radius: 8px;
-  box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+  border: 1px solid var(--border);
   margin-bottom: 12px;
   overflow: hidden;
 }}
@@ -1580,18 +1611,18 @@ body {{
   padding: 12px 20px;
   font-size: 14px;
   font-weight: 600;
-  color: #2f0057;
+  color: var(--accent);
   cursor: pointer;
   user-select: none;
   list-style: none;
-  background: white;
+  background: var(--surface);
   border-radius: 8px;
 }}
 .bill-toggle-summary::-webkit-details-marker {{ display: none; }}
 .bill-toggle-summary::before {{
   content: '▶';
   font-size: 11px;
-  color: #999;
+  color: var(--muted);
   transition: transform 0.2s;
   display: inline-block;
   width: 14px;
@@ -1624,9 +1655,9 @@ body {{
   .period-nav select {{
     font-size: 11px;
     padding: 2px 6px;
-    border: 1px solid #ccc;
+    border: 1px solid var(--border);
     border-radius: 5px;
-    background: #fafafa;
+    background: var(--bg);
     cursor: pointer;
     min-width: 0;
     width: 100%;
@@ -1652,7 +1683,7 @@ body {{
     flex: none;
     width: 100%;
     border-right: none;
-    border-bottom: 1px solid #ebebeb;
+    border-bottom: 1px solid var(--border);
     padding: 8px 12px;
     flex-direction: row;
     flex-wrap: wrap;
@@ -1883,6 +1914,39 @@ function stickyBillExpand() {{
   window.scrollTo({{ top: top, behavior: 'smooth' }});
 }}
 
+function toggleTheme() {{
+  var current = document.documentElement.getAttribute('data-theme');
+  var next = current === 'light' ? 'dark' : 'light';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('emt_chart_theme', next);
+  var btn = document.getElementById('theme-toggle');
+  if (btn) btn.textContent = next === 'dark' ? '\u263e' : '\u2600';
+  // Notify parent shell so it syncs all other iframes and shell UI
+  if (window.parent && window.parent !== window) {{
+    window.parent.postMessage({{type:'emt-theme-change', theme:next}}, '*');
+  }}
+  // Relayout Plotly charts in this iframe
+  var tc = _getThemeColours();
+  if (window._energyCharts) {{
+    Object.keys(window._energyCharts).forEach(function(id) {{
+      var el = document.getElementById(id);
+      if (el) {{
+        Plotly.relayout(el, {{
+          plot_bgcolor: tc.plotBg,
+          paper_bgcolor: tc.paperBg,
+          'xaxis.tickfont.color': tc.axisC,
+          'yaxis.gridcolor': tc.gridC,
+          'yaxis.titlefont.color': tc.axisC,
+          'yaxis.tickfont.color': tc.axisC,
+          'yaxis2.titlefont.color': tc.axisC,
+          'yaxis2.tickfont.color': tc.axisC,
+          'legend.font.color': tc.axisC,
+        }});
+      }}
+    }});
+  }}
+}}
+
 function toggleCensor() {{
   var on = document.body.classList.toggle('censor-on');
   var btn = document.getElementById('censor-toggle');
@@ -1909,6 +1973,32 @@ function showView(view) {{
   showView(savedView);
   // Restore censor
   if (sessionStorage.getItem('energyCensor')==='1') toggleCensor();
+  // Listen for theme changes from parent shell
+  window.addEventListener('message', function(e) {{
+    if (e.data && e.data.type === 'emt-theme') {{
+      document.documentElement.setAttribute('data-theme', e.data.theme);
+      var btn = document.getElementById('theme-toggle');
+      if (btn) btn.textContent = e.data.theme === 'dark' ? '\u263e' : '\u2600';
+      var tc = _getThemeColours();
+      if (window._energyCharts) {{
+        Object.keys(window._energyCharts).forEach(function(id) {{
+          var el = document.getElementById(id);
+          if (el) {{
+            Plotly.relayout(el, {{
+              plot_bgcolor: tc.plotBg, paper_bgcolor: tc.paperBg,
+              'xaxis.tickfont.color': tc.axisC, 'yaxis.gridcolor': tc.gridC,
+              'yaxis.titlefont.color': tc.axisC, 'yaxis.tickfont.color': tc.axisC,
+              'yaxis2.titlefont.color': tc.axisC, 'yaxis2.tickfont.color': tc.axisC,
+              'legend.font.color': tc.axisC,
+            }});
+          }}
+        }});
+      }}
+    }}
+  }});
+  // Sync toggle button icon to current theme
+  var _themeBtn = document.getElementById('theme-toggle');
+  if (_themeBtn) _themeBtn.textContent = document.documentElement.getAttribute('data-theme') === 'light' ? '\u2600' : '\u263e';
   // Activate mode
   setPeriodMode(savedMode);
   // Render charts in the initially visible section
@@ -2055,7 +2145,7 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None, curren
                 "x0": 0.86, "x1": 1.0,
                 "y0": day_str, "y1": day_str,
                 "y0shift": -0.5, "y1shift": 0.5,
-                "fillcolor": "rgba(0,0,0,0.07)",
+                "fillcolor": "__WEEKEND_FILL__",
                 "line": {"width": 0},
                 "layer": "below"
             })
@@ -2089,7 +2179,7 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None, curren
         {"x":-0.03,"y":(month_starts[i]+month_ends[i])/2,
          "xref":"paper","yref":"y","text":month_labels[i],
          "showarrow":False,"xanchor":"right","yanchor":"middle",
-         "textangle":270,"font":{"size":12,"color":"#000"}}
+         "textangle":270,"font":{"size":12,"color":"#6b7080"}}
         for i in range(len(month_labels))
     ]
 
@@ -2119,25 +2209,75 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None, curren
     weekend_z_json   = json.dumps(weekend_z)
     x_tickvals_json  = json.dumps(x_tickvals)
 
-    return f"""<html>
+    return f"""<html data-theme="light">
 <head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <meta http-equiv="refresh" content="130">
+<script>
+(function(){{
+  var stored = localStorage.getItem('emt_chart_theme');
+  var sys = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', stored || sys);
+}})();
+function _getThemeColours() {{
+  var dark = document.documentElement.getAttribute('data-theme') !== 'light';
+  return {{
+    plotBg:  dark ? '#1a1d27' : '#f8f9fa',
+    paperBg: dark ? '#1a1d27' : '#ffffff',
+    axisC:   dark ? '#6b7080' : '#555566',
+    gridC:   dark ? '#2a2d3a' : '#e5e5e5',
+  }};
+}}
+</script>
 <script src="https://cdn.plot.ly/plotly-3.0.1.min.js"></script>
 </head>
 <style>
+  :root {{
+    --bg: #f0f0f0; --surface: #ffffff; --border: #dddddd;
+    --text: #1a1a2e; --muted: #555566;
+    --scroll-guard-bg: rgba(0,0,0,0.03);
+    --scroll-guard-pill: rgba(0,0,0,0.15);
+  }}
+  [data-theme="dark"] {{
+    --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3a;
+    --text: #e8eaf0; --muted: #6b7080;
+    --scroll-guard-bg: rgba(255,255,255,0.03);
+    --scroll-guard-pill: rgba(255,255,255,0.15);
+  }}
   html {{ scroll-padding-top: 80px; }}
-html, body {{ margin:0; padding:0; overflow:hidden; }}
+html, body {{ margin:0; padding:0; overflow:hidden; touch-action: none; background:var(--bg); color:var(--text); }}
   #outer {{ width:{heatmap_width}px; transform-origin: top left; }}
-  #scroll {{ width:{heatmap_width}px; height:100vh; overflow-y:scroll; overflow-x:hidden; border:1px solid #aaa; position:relative; scrollbar-width:thin; }}
-    #scroll-guard {{
-      position: fixed;
-      top: 0; right: 0;
-      width: 20px;
-      height: 100%;
-      z-index: 100;
-      touch-action: pan-y;
-    }}
+  #scroll {{
+    width:{heatmap_width}px;
+    height:100vh;
+    overflow-y:scroll;
+    overflow-x:hidden;
+    border:1px solid var(--border);
+    position:relative;
+    scrollbar-width:thin;
+    touch-action: pan-y;
+    -webkit-overflow-scrolling: touch;
+  }}
+  #scroll-guard {{
+    position: fixed;
+    top: 0; right: 0;
+    width: 44px;
+    height: 100%;
+    z-index: 100;
+    touch-action: pan-y;
+    background: var(--scroll-guard-bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }}
+  #scroll-guard::before {{
+    content: '';
+    display: block;
+    width: 4px;
+    height: 48px;
+    background: var(--scroll-guard-pill);
+    border-radius: 2px;
+  }}
 </style>
 <body>
 <div id="outer">
@@ -2149,21 +2289,39 @@ html, body {{ margin:0; padding:0; overflow:hidden; }}
 <script>
 function scaleChart() {{
   var vw = window.innerWidth;
+  var vh = window.innerHeight;
   var cw = {heatmap_width};
+  var isMobile = vw <= 768 || (vh <= 500 && vw > vh);
   var outer = document.getElementById('outer');
-  if (vw < cw) {{
-    var scale = vw / cw;
+  var scroll = document.getElementById('scroll');
+  // On mobile reserve 44px on the right as a finger-grab scroll strip
+  var guardW = isMobile ? 44 : 0;
+  var availW = vw - guardW;
+  if (availW < cw) {{
+    var scale = availW / cw;
     outer.style.transform = 'scale(' + scale + ')';
     outer.style.transformOrigin = 'top left';
     outer.style.width = cw + 'px';
-    outer.style.height = Math.ceil(document.getElementById('scroll').offsetHeight * scale) + 'px';
+    outer.style.height = Math.ceil(scroll.offsetHeight * scale) + 'px';
   }} else {{
     outer.style.transform = '';
     outer.style.transformOrigin = '';
     outer.style.width = '';
     outer.style.height = '';
   }}
+  // On mobile show more rows to fill the screen
+  var maxRows = isMobile
+    ? Math.max(10, Math.floor((vh - {margin_t} - {margin_b}) / {row_height}) + 6)
+    : {visible_rows};
+  scroll.style.height = (Math.min({n_rows}, maxRows) * {row_height} + {margin_t} + {margin_b}) + 'px';
 }}
+// Prevent pinch-zoom on the chart — Plotly intercepts touches and can trigger browser zoom
+document.addEventListener('touchstart', function(e) {{
+  if (e.touches.length > 1) {{ e.preventDefault(); }}
+}}, {{ passive: false }});
+document.addEventListener('touchmove', function(e) {{
+  if (e.touches.length > 1) {{ e.preventDefault(); }}
+}}, {{ passive: false }});
 window.addEventListener('resize', scaleChart);
 scaleChart();
 </script>
@@ -2196,25 +2354,109 @@ var data = [
   x: {x_json},
   y: {y_json},
   type: 'heatmap',
-  colorscale: [[0, 'rgba(0,0,0,0)'], [1, 'rgba(0,0,0,0.07)']],
+  colorscale: _hmWeekendCs(),
   zmin: 0, zmax: 1,
   showscale: false,
   hoverinfo: 'skip'
 }}
 ];
+function _hmGetTheme() {{
+  var dark = document.documentElement.getAttribute('data-theme') !== 'light';
+  return {{
+    plotBg:  dark ? '#1a1d27' : '#f8f9fa',
+    paperBg: dark ? '#0f1117' : '#ffffff',
+    textC:   dark ? '#e8eaf0' : '#1a1a2e',
+    axisC:   dark ? '#6b7080' : '#555566',
+    monthC:  dark ? '#6b7080' : '#555566',
+  }};
+}}
+var _hmTc = _hmGetTheme();
+var _hmShapesRaw = {shapes_json};
+function _hmThemedShapes() {{
+  var dark = document.documentElement.getAttribute('data-theme') !== 'light';
+  var fill = dark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.07)';
+  return _hmShapesRaw.map(function(s) {{
+    return s.fillcolor === '__WEEKEND_FILL__' ? Object.assign({{}}, s, {{fillcolor: fill}}) : s;
+  }});
+}}
+var _hmShapes = _hmThemedShapes();
+function _hmWeekendCs() {{
+  return document.documentElement.getAttribute('data-theme') !== 'light'
+    ? [[0,'rgba(0,0,0,0)'],[1,'rgba(255,255,255,0.06)']]
+    : [[0,'rgba(0,0,0,0)'],[1,'rgba(0,0,0,0.07)']];
+}}
 var layout = {{
-  title: {{text: 'Net Energy Flow', x: 0.5}},
-  xaxis:  {{tickangle: -45, side: 'top', domain: [0, 0.85], tickmode: 'array', tickvals: {x_tickvals_json}, ticktext: {x_tickvals_json}}},
-  xaxis2: {{title: {{text: 'Daily Total', standoff: 10}}, side: 'top', domain: [0.86, 1]}},
-  yaxis:  {{type: 'category', tickmode: 'array', tickvals: {y_json}, ticktext: {y_ticktext_json}, fixedrange: true}},
-  shapes: {shapes_json},
+  title: {{text: 'Net Energy Flow', x: 0.5, font: {{color: _hmTc.textC}}}},
+  xaxis:  {{tickangle: -45, side: 'top', domain: [0, 0.85], tickmode: 'array', tickvals: {x_tickvals_json}, ticktext: {x_tickvals_json}, tickfont: {{color: _hmTc.axisC}}}},
+  xaxis2: {{title: {{text: 'Daily Total', standoff: 10, font: {{color: _hmTc.axisC}}}}, side: 'top', domain: [0.86, 1], tickfont: {{color: _hmTc.axisC}}}},
+  yaxis:  {{type: 'category', tickmode: 'array', tickvals: {y_json}, ticktext: {y_ticktext_json}, fixedrange: true, tickfont: {{color: _hmTc.axisC}}}},
+  shapes: _hmShapes,
   annotations: {annotations_json},
   height: {heatmap_height},
   width: {heatmap_width},
   margin: {{l: {margin_l}, r: {margin_r}, t: {margin_t}, b: {margin_b}}},
-  plot_bgcolor: '#f5f5f5',
-  paper_bgcolor: '#ffffff'
+  plot_bgcolor: _hmTc.plotBg,
+  paper_bgcolor: _hmTc.paperBg
 }};
+
+// Update month annotation colours to match theme
+var _annotations = {annotations_json};
+_annotations.forEach(function(a) {{ if (a.font) a.font.color = _hmTc.monthC; }});
+layout.annotations = _annotations;
+
+// Theme toggle button
+var _hmToggleBtn = document.createElement('button');
+_hmToggleBtn.id = 'hm-theme-btn';
+_hmToggleBtn.textContent = document.documentElement.getAttribute('data-theme') === 'light' ? '\u2600' : '\u263e';
+_hmToggleBtn.style.cssText = 'position:fixed;top:8px;right:52px;z-index:200;background:var(--surface);border:1px solid var(--border);color:var(--muted);border-radius:6px;padding:4px 8px;font-size:14px;cursor:pointer;';
+_hmToggleBtn.onclick = function() {{
+  var current = document.documentElement.getAttribute('data-theme');
+  var next = current === 'light' ? 'dark' : 'light';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('emt_chart_theme', next);
+  _hmToggleBtn.textContent = next === 'light' ? '\u2600' : '\u263e';
+  if (window.parent && window.parent !== window) {{
+    window.parent.postMessage({{type:'emt-theme-change', theme:next}}, '*');
+  }}
+  var tc = _hmGetTheme();
+  Plotly.relayout('heatmap', {{
+    plot_bgcolor: tc.plotBg,
+    paper_bgcolor: tc.paperBg,
+    'xaxis.tickfont.color': tc.axisC,
+    'xaxis2.tickfont.color': tc.axisC,
+    'xaxis2.title.font.color': tc.axisC,
+    'yaxis.tickfont.color': tc.axisC,
+    'title.font.color': tc.textC,
+  }});
+  // Update month label colours
+  var anns = layout.annotations.map(function(a) {{
+    return Object.assign({{}}, a, {{font: {{size: 12, color: tc.monthC}}}});
+  }});
+  Plotly.relayout('heatmap', {{annotations: anns}});
+  Plotly.relayout('heatmap', {{shapes: _hmThemedShapes()}});
+  Plotly.restyle('heatmap', {{colorscale: [_hmWeekendCs()]}}, [2]);
+}};
+document.body.appendChild(_hmToggleBtn);
+
+window.addEventListener('message', function(e) {{
+  if (e.data && e.data.type === 'emt-theme') {{
+    document.documentElement.setAttribute('data-theme', e.data.theme);
+    _hmToggleBtn.textContent = e.data.theme === 'light' ? '\u2600' : '\u263e';
+    var tc = _hmGetTheme();
+    Plotly.relayout('heatmap', {{
+      plot_bgcolor: tc.plotBg, paper_bgcolor: tc.paperBg,
+      'xaxis.tickfont.color': tc.axisC, 'xaxis2.tickfont.color': tc.axisC,
+      'xaxis2.title.font.color': tc.axisC, 'yaxis.tickfont.color': tc.axisC,
+      'title.font.color': tc.textC,
+    }});
+    var anns = layout.annotations.map(function(a) {{
+      return Object.assign({{}}, a, {{font: {{size: 12, color: tc.monthC}}}});
+    }});
+    Plotly.relayout('heatmap', {{annotations: anns}});
+    Plotly.relayout('heatmap', {{shapes: _hmThemedShapes()}});
+    Plotly.restyle('heatmap', {{colorscale: [_hmWeekendCs()]}}, [2]);
+  }}
+}});
 Plotly.newPlot('heatmap', data, layout, {{responsive: false, scrollZoom: false, touchZoom: false, displayModeBar: false}}).then(scaleChart);
 </script>
 </body>
