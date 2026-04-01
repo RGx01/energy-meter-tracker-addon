@@ -814,9 +814,10 @@ function barBuildTable() {
     }
     if (col.key === 'standing') return barStandingVal(agg);
     if (col.key === 'exp') {
-      return barMetric === 'kwh'
+      var expVal = barMetric === 'kwh'
         ? Object.values(agg.meters||{}).reduce(function(s,m){return s+m.exp_kwh;},0)
         : Object.values(agg.meters||{}).reduce(function(s,m){return s+m.exp_cost;},0);
+      return -expVal; // negative: export is a credit against import
     }
     // per-meter import
     var m = (agg.meters||{})[col.mid];
