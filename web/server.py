@@ -793,6 +793,8 @@ def api_blocks_summary():
         currency = main_meta.get("currency_symbol", "£")
         _tz      = ZoneInfo(tz_name)
 
+        billing_day = int(main_meta.get("billing_day") or 1)
+
         meter_colors = _ec.build_meter_colors(blocks)
 
         meter_labels = {}
@@ -900,6 +902,7 @@ def api_blocks_summary():
 
         return jsonify({
             "currency":     currency,
+            "billing_day":  billing_day,
             "rows":         rows,
             "meters":       meters_list,
             "export_color": export_color,

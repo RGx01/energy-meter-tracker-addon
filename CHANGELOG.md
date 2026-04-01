@@ -1,18 +1,27 @@
 # Changelog
 
-## [1.6.1] — 2026-04-01
+## [1.6.2] — 2026-04-01
 
 ### Added
-- **Usage Stats data table — totals column** — a Total column now appears at the right of the data table, summing all data columns for each row; the bottom-right cell shows the grand total for the period; styled to match the existing totals row (bold, full-brightness text, separator border)
+- **Usage Stats — Billing/Calendar period toggle** — a Billing / Calendar segmented control sits alongside the existing period controls; Billing mode groups data by billing period (respecting the configured billing day, e.g. 15 Mar – 14 Apr), Calendar mode groups by calendar month; applies to Daily, Monthly and Yearly views; preference is persisted to localStorage; in Daily/Billing mode the navigator label shows the full billing period date range (e.g. "15 Mar – 14 Apr 2026") and data table period labels show the full date including month and year to account for days spanning two calendar months
+- **Usage Stats data table — totals column** — a Total column now appears at the right of the data table, summing all data columns for each row; the bottom-right cell shows the grand total for the period; styled to match the existing totals row (bold, full-brightness text, left separator border)
 - **Usage Stats data table — period labels** — the Period column now shows full dates in daily mode (e.g. `1 Apr 2026`), full month and year in monthly mode (e.g. `Jan 2026`), and the year in yearly mode, rather than bare day or month numbers
+- **Global light/dark theme toggle** — a ☾/☀ button now appears in the sidebar footer on every page of the add-on (Live Power, Meter Config, Logs, Help, Charts, Import); toggling it updates all chart iframes simultaneously via postMessage and persists the preference to localStorage; the per-chart toggle buttons in the Billing and Heatmap charts continue to work and stay in sync with the global toggle
 
 ### Fixed
 - **Usage Stats export cost positive in data table** — export values were returned as positive numbers in the data table, causing the row Total and column totals to add export rather than subtract it; export now displays as a negative value (matching the chart where export bars fall below the axis) and totals are computed correctly
 - **Usage Stats meter labels include site name** — the main meter import legend and table column was labelled with the configured site name (e.g. "House import"); it now always shows "Grid import" to avoid exposing the site name in shared or externally accessed charts
 - **Light/dark theme toggle not working on Billing and Usage Stats** — resolved a cascade of issues: CSS variables were defined in `:root` with dark values and no `[data-theme="dark"]` override, so toggling `data-theme` had no effect on HTML elements; theme helper functions were defined after the data array that called them, causing silent JS errors; the shell (`base.html`) lacked `[data-theme="dark"]` overrides entirely; `base.html` now carries both theme variable sets, all chart generators use `[data-theme="dark"]` as the override block with light values as the `:root` default
+- **Heatmap totals bar white bars in dark mode** — the colorscale used `"white"` at the zero point, producing white stubs on low-import days against the dark background; two colorscales are now generated (light and dark), with the dark variant substituting `#1a1d27` for `"white"`; the correct colorscale is applied at render time and swapped on theme toggle
+- **Heatmap weekend shading in dark mode** — the weekend overlay used a white tint which was near-invisible on coloured cells; replaced with a dark overlay (`rgba(0,0,0,0.15)`) matching the light mode approach so shading is consistent in both themes
 - **Heatmap toggle button rendering as artefact over chart** — the ☾/☀ button was `position:fixed` at `right:52px`, overlapping the boundary between the heatmap and totals bar; changed to `position:absolute` within the chart container
 - **Heatmap mobile portrait gap** — the chart left a large black area below it on mobile portrait; `scaleChart()` now sets the scroll div to fill the full viewport height on mobile
 - **Heatmap scroll-guard strip visible on desktop** — the 44px scroll-grab strip was always rendered regardless of device; it now only shows (`display:flex`) when the mobile breakpoint is active
+- **Billing chart daily sections always collapsed after re-expanding** — the open/closed state of the Daily Charts `<details>` toggle was baked into the HTML at generation time and not persisted; the state is now saved to `sessionStorage` on each toggle and restored in `_revealSection` when a period is shown
+- **Heatmap mobile pinch zoom re-enabled** — Plotly re-enables its internal touch zoom despite `scrollZoom: false`; fixed by adding `fixedrange: true` to both x-axes and `dragmode: false` to the layout, which definitively blocks zoom regardless of touch interaction
+- **Heatmap scroll-guard strip overlapping totals bar on mobile** — the strip was `position:fixed; right:0` which overlaid the totals bar; moved to `left:0` over the y-axis date labels, a safe area the user doesn't need to interact with; `guardW` set to 0 so the full viewport width is used for the chart
+- **Heatmap mobile portrait — more rows now visible** — `scaleChart()` now calls `Plotly.relayout` to resize the Plotly chart height to match the scroll container height on mobile, causing Plotly to distribute all rows across the full viewport rather than clipping at the original Python-calculated height
+- **Usage Stats width unconstrained on mobile portrait** — Chart.js was rendering at the wrong width after orientation change because the `.main` flex container had no `min-width: 0`, allowing it to expand beyond the viewport; added `min-width: 0` and `overflow-x: hidden` to `.main` and `min-width: 0` to `.content` to enforce correct flex containment
 
 ---
 

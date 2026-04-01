@@ -1824,6 +1824,18 @@ function _revealSection(id) {{
     if (section) {{
       section.style.visibility = 'visible';
       section.style.position = 'relative';
+    // Restore day-charts-toggle open/closed state
+    section.querySelectorAll('.day-charts-toggle').forEach(function(det) {{
+      var key = 'energyChartsOpen_' + det.id;
+      var saved = sessionStorage.getItem(key);
+      if (saved !== null) {{ det.open = saved === '1'; }}
+      if (!det._listenerAdded) {{
+        det.addEventListener('toggle', function() {{
+          sessionStorage.setItem('energyChartsOpen_' + det.id, det.open ? '1' : '0');
+        }});
+        det._listenerAdded = true;
+      }}
+    }});
     // Re-apply current view so bill-view divs inside this section are correct
     var currentView = sessionStorage.getItem('energyView') || 'vanilla';
     section.querySelectorAll('.bill-view').forEach(function(el) {{
@@ -2127,7 +2139,14 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None, curren
     tot_max = max(daily_totals) if daily_totals else 1
     if tot_max == tot_min:
         tot_max += 1
-    totals_colorscale = make_colorscale(tot_min, tot_max)
+    totals_colorscale      = make_colorscale(tot_min, tot_max)
+    heatmap_colorscale_dark = make_colorscale(minVal, maxVal)
+    totals_colorscale_dark  = make_colorscale(tot_min, tot_max)
+    # Replace 'white' with the dark surface colour in dark variants
+    def _dark_cs(cs):
+        return [[s, c.replace('white', '#1a1d27')] for s, c in cs]
+    heatmap_colorscale_dark = _dark_cs(heatmap_colorscale_dark)
+    totals_colorscale_dark  = _dark_cs(totals_colorscale_dark)
 
     # ───── Weekend overlay data ─────
     shapes = []
@@ -2205,7 +2224,9 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None, curren
     annotations_json = json.dumps(annotations)
     customdata_json  = json.dumps(customdata_2d)
     heatmap_cs_json  = json.dumps(heatmap_colorscale)
-    totals_cs_json   = json.dumps(totals_colorscale)
+    totals_cs_json       = json.dumps(totals_colorscale)
+    heatmap_cs_dark_json = json.dumps(heatmap_colorscale_dark)
+    totals_cs_dark_json  = json.dumps(totals_colorscale_dark)
     weekend_z_json   = json.dumps(weekend_z)
     x_tickvals_json  = json.dumps(x_tickvals)
 
@@ -2260,12 +2281,12 @@ html, body {{ margin:0; padding:0; overflow:hidden; touch-action: none; backgrou
   }}
   #scroll-guard {{
     position: fixed;
-    top: 0; right: 0;
-    width: 44px;
+    top: 0; left: 0;
+    width: 40px;
     height: 100%;
     z-index: 100;
     touch-action: pan-y;
-    background: var(--scroll-guard-bg);
+    background: transparent;
     display: none;
     align-items: center;
     justify-content: center;
@@ -2276,10 +2297,11 @@ html, body {{ margin:0; padding:0; overflow:hidden; touch-action: none; backgrou
   #scroll-guard::before {{
     content: '';
     display: block;
-    width: 4px;
+    width: 3px;
     height: 48px;
     background: var(--scroll-guard-pill);
     border-radius: 2px;
+    opacity: 0.5;
   }}
 </style>
 <body>
@@ -2300,7 +2322,7 @@ function scaleChart() {{
   var guard  = document.getElementById('scroll-guard');
   // Show scroll-grab strip only on mobile
   if (guard) guard.classList.toggle('visible', isMobile);
-  var guardW = isMobile ? 44 : 0;
+  var guardW = 0; // guard now on left over y-axis labels, doesn't reduce chart width
   var availW = vw - guardW;
   if (availW < cw) {{
     var scale = availW / cw;
@@ -2324,6 +2346,10 @@ function scaleChart() {{
   // On mobile: fill the full viewport height so no gap appears below the chart
   if (isMobile) scrollH = vh;
   scroll.style.height = scrollH + 'px';
+  // On mobile resize the Plotly chart to match scrollH so rows fill the space
+  if (isMobile && window.Plotly) {{
+    Plotly.relayout('heatmap', {{height: scrollH}});
+  }}
 }}
 // Prevent pinch-zoom on the chart — Plotly intercepts touches and can trigger browser zoom
 document.addEventListener('touchstart', function(e) {{
@@ -2347,6 +2373,12 @@ function _hmGetTheme() {{
   }};
 }}
 var _hmTc = _hmGetTheme();
+var _hmCsLight = {heatmap_cs_json};
+var _hmCsDark  = {heatmap_cs_dark_json};
+var _hmTotCsLight = {totals_cs_json};
+var _hmTotCsDark  = {totals_cs_dark_json};
+function _hmGetCs()    {{ return document.documentElement.getAttribute('data-theme') !== 'light' ? _hmCsDark    : _hmCsLight; }}
+function _hmGetTotCs() {{ return document.documentElement.getAttribute('data-theme') !== 'light' ? _hmTotCsDark : _hmTotCsLight; }}
 var _hmShapesRaw = {shapes_json};
 function _hmThemedShapes() {{
   var dark = document.documentElement.getAttribute('data-theme') !== 'light';
@@ -2368,7 +2400,7 @@ var data = [
   y: {y_json},
   customdata: {customdata_json},
   type: 'heatmap',
-  colorscale: {heatmap_cs_json},
+  colorscale: _hmGetCs(),
   zmin: {minVal}, zmax: {maxVal}, zmid: 0,
   xgap: 1, ygap: 1, showscale: false,
   hovertemplate: 'Date: %{{customdata.date}}<br>Time: %{{customdata.time}}<br>Net: %{{z:.3f}} kWh<extra></extra>'
@@ -2379,7 +2411,7 @@ var data = [
   type: 'bar', xaxis: 'x2', orientation: 'h',
   marker: {{
     color: {totals_json},
-    colorscale: {totals_cs_json},
+    colorscale: _hmGetTotCs(),
     cmin: {tot_min}, cmax: {tot_max}, cmid: 0
   }},
   hovertemplate: 'Total: %{{x:.3f}} kWh<extra></extra>'
@@ -2397,13 +2429,14 @@ var data = [
 ];
 var layout = {{
   title: {{text: 'Net Energy Flow', x: 0.5, font: {{color: _hmTc.textC}}}},
-  xaxis:  {{tickangle: -45, side: 'top', domain: [0, 0.85], tickmode: 'array', tickvals: {x_tickvals_json}, ticktext: {x_tickvals_json}, tickfont: {{color: _hmTc.axisC}}}},
-  xaxis2: {{title: {{text: 'Daily Total', standoff: 10, font: {{color: _hmTc.axisC}}}}, side: 'top', domain: [0.86, 1], tickfont: {{color: _hmTc.axisC}}}},
+  xaxis:  {{tickangle: -45, side: 'top', domain: [0, 0.85], tickmode: 'array', tickvals: {x_tickvals_json}, ticktext: {x_tickvals_json}, tickfont: {{color: _hmTc.axisC}}, fixedrange: true}},
+  xaxis2: {{title: {{text: 'Daily Total', standoff: 10, font: {{color: _hmTc.axisC}}}}, side: 'top', domain: [0.86, 1], tickfont: {{color: _hmTc.axisC}}, fixedrange: true}},
   yaxis:  {{type: 'category', tickmode: 'array', tickvals: {y_json}, ticktext: {y_ticktext_json}, fixedrange: true, tickfont: {{color: _hmTc.axisC}}}},
   shapes: _hmShapes,
   annotations: {annotations_json},
   height: {heatmap_height},
   width: {heatmap_width},
+  dragmode: false,
   margin: {{l: {margin_l}, r: {margin_r}, t: {margin_t}, b: {margin_b}}},
   plot_bgcolor: _hmTc.plotBg,
   paper_bgcolor: _hmTc.paperBg
@@ -2445,6 +2478,8 @@ _hmToggleBtn.onclick = function() {{
   Plotly.relayout('heatmap', {{annotations: anns}});
   Plotly.relayout('heatmap', {{shapes: _hmThemedShapes()}});
   Plotly.restyle('heatmap', {{colorscale: [_hmWeekendCs()]}}, [2]);
+  Plotly.restyle('heatmap', {{colorscale: [_hmGetCs()]}}, [0]);
+  Plotly.restyle('heatmap', {{'marker.colorscale': [_hmGetTotCs()]}}, [1]);
 }};
 document.body.appendChild(_hmToggleBtn);
 
@@ -2465,6 +2500,8 @@ window.addEventListener('message', function(e) {{
     Plotly.relayout('heatmap', {{annotations: anns}});
     Plotly.relayout('heatmap', {{shapes: _hmThemedShapes()}});
     Plotly.restyle('heatmap', {{colorscale: [_hmWeekendCs()]}}, [2]);
+    Plotly.restyle('heatmap', {{colorscale: [_hmGetCs()]}}, [0]);
+    Plotly.restyle('heatmap', {{'marker.colorscale': [_hmGetTotCs()]}}, [1]);
   }}
 }});
 Plotly.newPlot('heatmap', data, layout, {{responsive: false, scrollZoom: false, touchZoom: false, displayModeBar: false}}).then(scaleChart);
