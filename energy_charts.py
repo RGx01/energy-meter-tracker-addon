@@ -2245,8 +2245,8 @@ function _getThemeColours() {{
     --scroll-guard-pill: rgba(255,255,255,0.15);
   }}
   html {{ scroll-padding-top: 80px; }}
-html, body {{ margin:0; padding:0; overflow:hidden; touch-action: none; background:var(--bg); color:var(--text); }}
-  #outer {{ width:{heatmap_width}px; transform-origin: top left; }}
+html, body {{ margin:0; padding:0; overflow:hidden; touch-action: none; background:var(--bg); color:var(--text); height:100%; }}
+  #outer {{ width:{heatmap_width}px; transform-origin: top left; position: relative; }}
   #scroll {{
     width:{heatmap_width}px;
     height:100vh;
@@ -2266,9 +2266,12 @@ html, body {{ margin:0; padding:0; overflow:hidden; touch-action: none; backgrou
     z-index: 100;
     touch-action: pan-y;
     background: var(--scroll-guard-bg);
-    display: flex;
+    display: none;
     align-items: center;
     justify-content: center;
+  }}
+  #scroll-guard.visible {{
+    display: flex;
   }}
   #scroll-guard::before {{
     content: '';
@@ -2292,9 +2295,11 @@ function scaleChart() {{
   var vh = window.innerHeight;
   var cw = {heatmap_width};
   var isMobile = vw <= 768 || (vh <= 500 && vw > vh);
-  var outer = document.getElementById('outer');
+  var outer  = document.getElementById('outer');
   var scroll = document.getElementById('scroll');
-  // On mobile reserve 44px on the right as a finger-grab scroll strip
+  var guard  = document.getElementById('scroll-guard');
+  // Show scroll-grab strip only on mobile
+  if (guard) guard.classList.toggle('visible', isMobile);
   var guardW = isMobile ? 44 : 0;
   var availW = vw - guardW;
   if (availW < cw) {{
@@ -2302,18 +2307,23 @@ function scaleChart() {{
     outer.style.transform = 'scale(' + scale + ')';
     outer.style.transformOrigin = 'top left';
     outer.style.width = cw + 'px';
-    outer.style.height = Math.ceil(scroll.offsetHeight * scale) + 'px';
+    // Set outer height to fill exactly the viewport so no gap below
+    // Don't force outer to vh — let scroll fill it instead
+    outer.style.height = 'auto';
   }} else {{
     outer.style.transform = '';
     outer.style.transformOrigin = '';
     outer.style.width = '';
     outer.style.height = '';
   }}
-  // On mobile show more rows to fill the screen
+  // On mobile fill as much of the viewport as possible
   var maxRows = isMobile
     ? Math.max(10, Math.floor((vh - {margin_t} - {margin_b}) / {row_height}) + 6)
     : {visible_rows};
-  scroll.style.height = (Math.min({n_rows}, maxRows) * {row_height} + {margin_t} + {margin_b}) + 'px';
+  var scrollH = Math.min({n_rows}, maxRows) * {row_height} + {margin_t} + {margin_b};
+  // On mobile: fill the full viewport height so no gap appears below the chart
+  if (isMobile) scrollH = vh;
+  scroll.style.height = scrollH + 'px';
 }}
 // Prevent pinch-zoom on the chart — Plotly intercepts touches and can trigger browser zoom
 document.addEventListener('touchstart', function(e) {{
@@ -2326,6 +2336,31 @@ window.addEventListener('resize', scaleChart);
 scaleChart();
 </script>
 <script>
+function _hmGetTheme() {{
+  var dark = document.documentElement.getAttribute('data-theme') !== 'light';
+  return {{
+    plotBg:  dark ? '#1a1d27' : '#f8f9fa',
+    paperBg: dark ? '#0f1117' : '#ffffff',
+    textC:   dark ? '#e8eaf0' : '#1a1a2e',
+    axisC:   dark ? '#6b7080' : '#555566',
+    monthC:  dark ? '#6b7080' : '#555566',
+  }};
+}}
+var _hmTc = _hmGetTheme();
+var _hmShapesRaw = {shapes_json};
+function _hmThemedShapes() {{
+  var dark = document.documentElement.getAttribute('data-theme') !== 'light';
+  var fill = dark ? 'rgba(0,0,0,0.15)' : 'rgba(0,0,0,0.10)';
+  return _hmShapesRaw.map(function(s) {{
+    return s.fillcolor === '__WEEKEND_FILL__' ? Object.assign({{}}, s, {{fillcolor: fill}}) : s;
+  }});
+}}
+var _hmShapes = _hmThemedShapes();
+function _hmWeekendCs() {{
+  return document.documentElement.getAttribute('data-theme') !== 'light'
+    ? [[0,'rgba(0,0,0,0)'],[1,'rgba(0,0,0,0.15)']]
+    : [[0,'rgba(0,0,0,0)'],[1,'rgba(0,0,0,0.10)']];
+}}
 var data = [
 {{
   z: {z_json},
@@ -2360,31 +2395,6 @@ var data = [
   hoverinfo: 'skip'
 }}
 ];
-function _hmGetTheme() {{
-  var dark = document.documentElement.getAttribute('data-theme') !== 'light';
-  return {{
-    plotBg:  dark ? '#1a1d27' : '#f8f9fa',
-    paperBg: dark ? '#0f1117' : '#ffffff',
-    textC:   dark ? '#e8eaf0' : '#1a1a2e',
-    axisC:   dark ? '#6b7080' : '#555566',
-    monthC:  dark ? '#6b7080' : '#555566',
-  }};
-}}
-var _hmTc = _hmGetTheme();
-var _hmShapesRaw = {shapes_json};
-function _hmThemedShapes() {{
-  var dark = document.documentElement.getAttribute('data-theme') !== 'light';
-  var fill = dark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.07)';
-  return _hmShapesRaw.map(function(s) {{
-    return s.fillcolor === '__WEEKEND_FILL__' ? Object.assign({{}}, s, {{fillcolor: fill}}) : s;
-  }});
-}}
-var _hmShapes = _hmThemedShapes();
-function _hmWeekendCs() {{
-  return document.documentElement.getAttribute('data-theme') !== 'light'
-    ? [[0,'rgba(0,0,0,0)'],[1,'rgba(255,255,255,0.06)']]
-    : [[0,'rgba(0,0,0,0)'],[1,'rgba(0,0,0,0.07)']];
-}}
 var layout = {{
   title: {{text: 'Net Energy Flow', x: 0.5, font: {{color: _hmTc.textC}}}},
   xaxis:  {{tickangle: -45, side: 'top', domain: [0, 0.85], tickmode: 'array', tickvals: {x_tickvals_json}, ticktext: {x_tickvals_json}, tickfont: {{color: _hmTc.axisC}}}},
@@ -2408,7 +2418,7 @@ layout.annotations = _annotations;
 var _hmToggleBtn = document.createElement('button');
 _hmToggleBtn.id = 'hm-theme-btn';
 _hmToggleBtn.textContent = document.documentElement.getAttribute('data-theme') === 'light' ? '\u2600' : '\u263e';
-_hmToggleBtn.style.cssText = 'position:fixed;top:8px;right:52px;z-index:200;background:var(--surface);border:1px solid var(--border);color:var(--muted);border-radius:6px;padding:4px 8px;font-size:14px;cursor:pointer;';
+_hmToggleBtn.style.cssText = 'position:absolute;top:6px;right:6px;z-index:200;background:var(--surface);border:1px solid var(--border);color:var(--muted);border-radius:6px;padding:3px 8px;font-size:13px;cursor:pointer;opacity:0.85;';
 _hmToggleBtn.onclick = function() {{
   var current = document.documentElement.getAttribute('data-theme');
   var next = current === 'light' ? 'dark' : 'light';

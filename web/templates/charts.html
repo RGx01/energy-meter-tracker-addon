@@ -94,6 +94,14 @@
     color: var(--text);
   }
   #bar-table td { color: var(--muted); }
+  #bar-table td.col-total {
+    font-weight: 500;
+    color: var(--text);
+    border-left: 2px solid var(--border);
+  }
+  #bar-table th.col-total {
+    border-left: 2px solid var(--border);
+  }
   #bar-table tr:hover td { background: rgba(255,255,255,0.03); }
 
   .chart-frame-wrap {
@@ -764,6 +772,20 @@ function barFmt(v, forCopy) {
   return (v < 0 ? '-' : '') + str;
 }
 
+function barPeriodLabel(lbl, idx) {
+  if (barPeriod === 'daily') {
+    // lbl is day number; add month and year from barDailyMonth
+    var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return lbl + ' ' + MONTHS[barDailyMonth.month - 1] + ' ' + barDailyMonth.year;
+  }
+  if (barPeriod === 'monthly') {
+    // lbl is already 'Jan' or 'Jan 2025' — ensure year is always shown
+    if (lbl.indexOf(' ') === -1) return lbl + ' ' + barDailyMonth.year;
+    return lbl;
+  }
+  return lbl; // yearly: just the year number
+}
+
 function barBuildTable() {
   var tbl = document.getElementById('bar-table');
   if (!tbl || !barData) return;
@@ -802,28 +824,35 @@ function barBuildTable() {
     return barMetric === 'kwh' ? m.imp_kwh : m.imp_cost;
   }
 
-  // Build HTML
+  // Build HTML — add Total column header
   var html = '<thead><tr><th>Period</th>';
   cols.forEach(function(c){ html += '<th>' + c.label + '</th>'; });
+  html += '<th class="col-total">Total</th>';
   html += '</tr></thead><tbody>';
 
-  var totals = {};
-  cols.forEach(function(c){ totals[c.key] = 0; });
+  var colTotals = {};
+  cols.forEach(function(c){ colTotals[c.key] = 0; });
+  var grandTotal = 0;
 
   labels.forEach(function(lbl, i) {
     var agg = aggList[i];
-    html += '<tr><td>' + lbl + '</td>';
+    var rowTotal = 0;
+    html += '<tr><td>' + barPeriodLabel(lbl, i) + '</td>';
     cols.forEach(function(c) {
       var v = cellVal(agg, c);
-      totals[c.key] += v;
+      colTotals[c.key] += v;
+      rowTotal += v;
       html += '<td>' + barFmt(v) + '</td>';
     });
+    grandTotal += rowTotal;
+    html += '<td class="col-total">' + barFmt(rowTotal) + '</td>';
     html += '</tr>';
   });
 
   // Totals row
   html += '<tr><td>Total</td>';
-  cols.forEach(function(c){ html += '<td>' + barFmt(totals[c.key]) + '</td>'; });
+  cols.forEach(function(c){ html += '<td>' + barFmt(colTotals[c.key]) + '</td>'; });
+  html += '<td class="col-total">' + barFmt(grandTotal) + '</td>';
   html += '</tr>';
 
   html += '</tbody>';
