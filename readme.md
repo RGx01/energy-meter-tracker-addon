@@ -2,6 +2,8 @@
 
 A Home Assistant add-on that records your electricity usage in precise configurable intervals — matching your energy supplier's meter reconciliation period for accurate billing.
 
+![Usage Stats chart showing daily import/export breakdown by sub-meter](screenshots/usage_stats.png)
+
 ## What it does
 
 - Records import and export meter readings at configurable reconciliation period boundaries — 5, 15 or 30 minutes — matching your supplier's billing resolution
@@ -9,14 +11,14 @@ A Home Assistant add-on that records your electricity usage in precise configura
 - Tracks sub-meters (EV charger, home battery, heat pump) and distributes grid consumption across them
 - Fills gaps automatically if the add-on restarts mid-session
 - Publishes four cumulative sensors back to Home Assistant
-- Serves a local web UI on port 8099 for configuration, charts, live summary and data management
+- Serves a local web UI on port 8099 for configuration, charts, live power and data management
 
-## What's new in 1.5.1
+## What's new in 1.6.0
 
-- **⚡ Summary page** — live power gauge, billing cards for Today / This Bill / This Year, and a 48-hour carbon intensity forecast (UK)
-- **Live power gauge** — asymmetric gauge with import/export scales derived from your last 7 days of usage; colour reflects carbon intensity (UK) or import magnitude (global)
-- **Billing cards** — accurate billing totals matching the chart billing page exactly, with sub-meter breakdown and kWh figures; auto-refreshes 1 minute after each block finalise
-- **Carbon intensity forecast** — 🇬🇧 UK only; 48-hour forecast from the National Grid API via your postcode prefix; no API key required
+- **📈 Usage Stats chart** — new chart tab showing daily, monthly and yearly import/export with sub-meter breakdown in billing colours; switchable between kWh and cost; data table with copy-to-clipboard export
+- **⚡ Live Power renamed** — the Summary page is now called Live Power throughout
+- **Remember last page** — the add-on remembers which page and chart tab you were on and restores it on refresh
+- **Mobile improvements** — heatmap pinch-zoom disabled, wider scroll strip, responsive height; help page collapsible sections; Usage Stats redraws correctly after device rotation
 
 ## Requirements
 
@@ -108,21 +110,43 @@ Access the UI at `http://<your-ha-ip>:8099`
 | Page | Description |
 |------|-------------|
 | Meter Config | Configure main meter, sub-meters, sensors, power sensor and postcode |
-| Charts | Net energy heatmap and daily import/export charts with billing summaries |
-| ⚡ Summary | Live power gauge, billing cards and carbon intensity forecast |
-| Import Data | Migrate data from a previous installation or restore a backup |
+| Charts | Billing chart, net energy heatmap and usage stats |
+| ⚡ Live Power | Live power gauge, billing cards and carbon intensity forecast |
+| Import & Backup | Migrate data from a previous installation or restore a backup |
 | Logs | Live add-on log viewer |
 | Help | Full reference documentation |
 
-## Summary Page
+## Charts
 
-The Summary page appears in the sidebar once a **power sensor** is configured in Meter Config. It provides:
+### Billing
 
-- **Live power gauge** — shows net grid flow with asymmetric import/export scales derived from your usage history
-- **Billing cards** — Today, This Bill and This Year with full breakdown including sub-meters; figures match the chart billing page exactly
+The daily billing chart shows import, export and sub-meter consumption for each day, with accurate cost calculations matching the engine's billing logic. Billing periods, standing charges and rate changes are all handled correctly.
+
+### Net Energy Heatmap
+
+A half-hour heatmap showing net grid flow (import − export) for every reconciliation period. Colour-coded from red (import) through white to blue (export), making it easy to spot patterns — overnight EV charging, solar export windows, evening peaks.
+
+![Net energy heatmap](screenshots/heatmap.png)
+
+### Usage Stats
+
+Import and export broken down by day, month or year with sub-meter stacking. Switch between kWh and cost, and between Totals and Net views. A data table below the chart mirrors exactly what the chart shows, with a copy-to-clipboard button for exporting to Excel or Google Sheets.
+
+![Usage Stats chart](screenshots/usage_stats.png)
+
+## Live Power
+
+The Live Power page appears in the sidebar once a **power sensor** is configured in Meter Config.
+
+![Live Power page showing gauge, carbon intensity and billing cards](screenshots/live_power.png)
+
+It provides:
+
+- **Live power gauge** — shows net grid flow with asymmetric import/export scales derived from your usage history; colour reflects carbon intensity (UK) or import magnitude (global)
+- **Billing cards** — Today, This Bill and This Year with full sub-meter breakdown; figures match the Billing chart exactly
 - **Carbon intensity** (🇬🇧 UK only) — add your outward postcode prefix (e.g. `DE1`) in Meter Config to enable a 48-hour forecast strip from the National Grid API
 
-### Configuring the Summary page
+### Configuring Live Power
 
 In Meter Config → main meter card:
 

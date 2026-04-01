@@ -1,0 +1,57 @@
+[
+  {
+    "name": "30min / 90 days / solar / sub-meters",
+    "result": "PASS",
+    "note": ""
+  },
+  {
+    "name": "30min / 7 days / import only",
+    "result": "PASS",
+    "note": ""
+  },
+  {
+    "name": "30min / 1 day / solar",
+    "result": "PASS",
+    "note": ""
+  },
+  {
+    "name": "30min / 31 days / export only",
+    "result": "PASS",
+    "note": ""
+  },
+  {
+    "name": "30min / 14 days / mixed / with gap",
+    "result": "PASS",
+    "note": ""
+  },
+  {
+    "name": "15min / 7 days / solar",
+    "result": "PASS",
+    "note": ""
+  },
+  {
+    "name": "15min / 31 days / mixed / sub-meters",
+    "result": "PASS",
+    "note": ""
+  },
+  {
+    "name": "5min / 2 days / solar",
+    "result": "PASS",
+    "note": ""
+  },
+  {
+    "name": "5min / 7 days / import only",
+    "result": "PASS",
+    "note": ""
+  },
+  {
+    "name": "5min / 7 days / mixed / sub-meters",
+    "result": "PASS",
+    "note": ""
+  },
+  {
+    "name": "5min / 2 days / export only",
+    "result": "PASS",
+    "note": ""
+  }
+]

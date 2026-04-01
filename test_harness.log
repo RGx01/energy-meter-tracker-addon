@@ -1,0 +1,164 @@
+Test harness started — target: http://192.168.20.16:8099
+Log: /addons/energy_meter_tracker/test_harness.log
+
+⚠️  WARNING
+This harness will OVERWRITE blocks.json on the target instance.
+ALL EXISTING DATA WILL BE LOST.
+
+Target: http://192.168.20.16:8099
+
+Only run this against a development or test instance.
+NEVER run against a production installation.
+
+
+════════════════════════════════════════════════════════════
+  Test 1/11: 30min / 90 days / solar / sub-meters
+════════════════════════════════════════════════════════════
+  Generating 90 days × 30min blocks...
+  Uploading blocks.json...
+  ✅ Upload OK
+  Regenerating charts...
+  ✅ Charts regenerated
+  Opening: http://192.168.20.16:8099/charts
+  → Open in browser: http://192.168.20.16:8099/charts
+
+
+════════════════════════════════════════════════════════════
+  Test 2/11: 30min / 7 days / import only
+════════════════════════════════════════════════════════════
+  Generating 7 days × 30min blocks...
+  Uploading blocks.json...
+  ✅ Upload OK
+  Regenerating charts...
+  ✅ Charts regenerated
+  Opening: http://192.168.20.16:8099/charts
+  → Open in browser: http://192.168.20.16:8099/charts
+
+
+════════════════════════════════════════════════════════════
+  Test 3/11: 30min / 1 day / solar
+════════════════════════════════════════════════════════════
+  Generating 1 days × 30min blocks...
+  Uploading blocks.json...
+  ✅ Upload OK
+  Regenerating charts...
+  ✅ Charts regenerated
+  Opening: http://192.168.20.16:8099/charts
+  → Open in browser: http://192.168.20.16:8099/charts
+
+
+════════════════════════════════════════════════════════════
+  Test 4/11: 30min / 31 days / export only
+════════════════════════════════════════════════════════════
+  Generating 31 days × 30min blocks...
+  Uploading blocks.json...
+  ✅ Upload OK
+  Regenerating charts...
+  ✅ Charts regenerated
+  Opening: http://192.168.20.16:8099/charts
+  → Open in browser: http://192.168.20.16:8099/charts
+
+
+════════════════════════════════════════════════════════════
+  Test 5/11: 30min / 14 days / mixed / with gap
+════════════════════════════════════════════════════════════
+  Generating 14 days × 30min blocks...
+  Uploading blocks.json...
+  ✅ Upload OK
+  Regenerating charts...
+  ✅ Charts regenerated
+  Opening: http://192.168.20.16:8099/charts
+  → Open in browser: http://192.168.20.16:8099/charts
+
+
+════════════════════════════════════════════════════════════
+  Test 6/11: 15min / 7 days / solar
+════════════════════════════════════════════════════════════
+  Generating 7 days × 15min blocks...
+  Uploading blocks.json...
+  ✅ Upload OK
+  Regenerating charts...
+  ✅ Charts regenerated
+  Opening: http://192.168.20.16:8099/charts
+  → Open in browser: http://192.168.20.16:8099/charts
+
+
+════════════════════════════════════════════════════════════
+  Test 7/11: 15min / 31 days / mixed / sub-meters
+════════════════════════════════════════════════════════════
+  Generating 31 days × 15min blocks...
+  Uploading blocks.json...
+  ✅ Upload OK
+  Regenerating charts...
+  ✅ Charts regenerated
+  Opening: http://192.168.20.16:8099/charts
+  → Open in browser: http://192.168.20.16:8099/charts
+
+
+════════════════════════════════════════════════════════════
+  Test 8/11: 5min / 2 days / solar
+════════════════════════════════════════════════════════════
+  Generating 2 days × 5min blocks...
+  Uploading blocks.json...
+  ✅ Upload OK
+  Regenerating charts...
+  ✅ Charts regenerated
+  Opening: http://192.168.20.16:8099/charts
+  → Open in browser: http://192.168.20.16:8099/charts
+
+
+════════════════════════════════════════════════════════════
+  Test 9/11: 5min / 7 days / import only
+════════════════════════════════════════════════════════════
+  Generating 7 days × 5min blocks...
+  Uploading blocks.json...
+  ✅ Upload OK
+  Regenerating charts...
+  ✅ Charts regenerated
+  Opening: http://192.168.20.16:8099/charts
+  → Open in browser: http://192.168.20.16:8099/charts
+
+
+════════════════════════════════════════════════════════════
+  Test 10/11: 5min / 7 days / mixed / sub-meters
+════════════════════════════════════════════════════════════
+  Generating 7 days × 5min blocks...
+  Uploading blocks.json...
+  ✅ Upload OK
+  Regenerating charts...
+  ✅ Charts regenerated
+  Opening: http://192.168.20.16:8099/charts
+  → Open in browser: http://192.168.20.16:8099/charts
+
+
+════════════════════════════════════════════════════════════
+  Test 11/11: 5min / 2 days / export only
+════════════════════════════════════════════════════════════
+  Generating 2 days × 5min blocks...
+  Uploading blocks.json...
+  ✅ Upload OK
+  Regenerating charts...
+  ✅ Charts regenerated
+  Opening: http://192.168.20.16:8099/charts
+  → Open in browser: http://192.168.20.16:8099/charts
+
+
+════════════════════════════════════════════════════════════
+  Test Summary
+════════════════════════════════════════════════════════════
+  ✅ PASS   30min / 90 days / solar / sub-meters
+  ✅ PASS   30min / 7 days / import only
+  ✅ PASS   30min / 1 day / solar
+  ✅ PASS   30min / 31 days / export only
+  ✅ PASS   30min / 14 days / mixed / with gap
+  ✅ PASS   15min / 7 days / solar
+  ✅ PASS   15min / 31 days / mixed / sub-meters
+  ✅ PASS   5min / 2 days / solar
+  ✅ PASS   5min / 7 days / import only
+  ✅ PASS   5min / 7 days / mixed / sub-meters
+  ✅ PASS   5min / 2 days / export only
+
+  Passed: 11  Failed: 0  Skipped: 0  Errors: 0
+
+  Results saved to test_results.json
+  Log saved to /addons/energy_meter_tracker/test_harness.log

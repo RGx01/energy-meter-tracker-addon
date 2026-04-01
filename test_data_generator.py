@@ -160,18 +160,29 @@ def make_block(start_dt, block_minutes, scenario, include_sub_meters,
     if include_sub_meters:
         ev_kwh = sub_meter_kwh(hour, block_minutes, "ev_charger")
         bat_kwh = sub_meter_kwh(hour, block_minutes, "house_battery")
+        sub_total_kwh  = ev_kwh + bat_kwh
+        sub_total_cost = (ev_kwh + bat_kwh) * rate
+
+        # kwh_remainder = grid import minus sub-meter consumption (grid-authoritative)
+        imp_remainder     = max(0.0, imp_kwh - sub_total_kwh)
+        imp_cost_remainder = max(0.0, imp_cost - sub_total_cost)
+
+        meters["electricity_main"]["channels"]["import"]["kwh_total"]      = round(imp_kwh, 6)
+        meters["electricity_main"]["channels"]["import"]["kwh_remainder"]  = round(imp_remainder, 6)
+        meters["electricity_main"]["channels"]["import"]["cost_remainder"] = round(imp_cost_remainder, 6)
 
         meters["ev_charger"] = {
             "channels": {
                 "import": {
-                    "kwh":  ev_kwh,
-                    "rate": rate,
-                    "cost": ev_kwh * rate
+                    "kwh":      ev_kwh,
+                    "kwh_grid": ev_kwh,
+                    "rate":     rate,
+                    "cost":     ev_kwh * rate
                 }
             },
             "meta": {
-                "device":     "Zappi EV Charger",
-                "sub_meter":  True,
+                "device":       "Zappi EV Charger",
+                "sub_meter":    True,
                 "parent_meter": "electricity_main"
             },
             "interpolated": False
@@ -179,18 +190,23 @@ def make_block(start_dt, block_minutes, scenario, include_sub_meters,
         meters["house_battery"] = {
             "channels": {
                 "import": {
-                    "kwh":  bat_kwh,
-                    "rate": rate,
-                    "cost": bat_kwh * rate
+                    "kwh":      bat_kwh,
+                    "kwh_grid": bat_kwh,
+                    "rate":     rate,
+                    "cost":     bat_kwh * rate
                 }
             },
             "meta": {
-                "device":     "Solax Battery",
-                "sub_meter":  True,
+                "device":       "Solax Battery",
+                "sub_meter":    True,
                 "parent_meter": "electricity_main"
             },
             "interpolated": False
         }
+    else:
+        # No sub-meters — kwh_total equals kwh (no sub-meter subtraction)
+        meters["electricity_main"]["channels"]["import"]["kwh_total"]     = round(imp_kwh, 6)
+        meters["electricity_main"]["channels"]["import"]["kwh_remainder"] = round(imp_kwh, 6)
 
     return {
         "start":  start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
