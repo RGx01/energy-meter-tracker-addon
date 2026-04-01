@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.6.1] — 2026-04-01
+
+### Added
+- **Usage Stats data table — totals column** — a Total column now appears at the right of the data table, summing all data columns for each row; the bottom-right cell shows the grand total for the period; styled to match the existing totals row (bold, full-brightness text, separator border)
+- **Usage Stats data table — period labels** — the Period column now shows full dates in daily mode (e.g. `1 Apr 2026`), full month and year in monthly mode (e.g. `Jan 2026`), and the year in yearly mode, rather than bare day or month numbers
+
+### Fixed
+- **Usage Stats export cost positive in data table** — export values were returned as positive numbers in the data table, causing the row Total and column totals to add export rather than subtract it; export now displays as a negative value (matching the chart where export bars fall below the axis) and totals are computed correctly
+- **Usage Stats meter labels include site name** — the main meter import legend and table column was labelled with the configured site name (e.g. "House import"); it now always shows "Grid import" to avoid exposing the site name in shared or externally accessed charts
+- **Light/dark theme toggle not working on Billing and Usage Stats** — resolved a cascade of issues: CSS variables were defined in `:root` with dark values and no `[data-theme="dark"]` override, so toggling `data-theme` had no effect on HTML elements; theme helper functions were defined after the data array that called them, causing silent JS errors; the shell (`base.html`) lacked `[data-theme="dark"]` overrides entirely; `base.html` now carries both theme variable sets, all chart generators use `[data-theme="dark"]` as the override block with light values as the `:root` default
+- **Heatmap toggle button rendering as artefact over chart** — the ☾/☀ button was `position:fixed` at `right:52px`, overlapping the boundary between the heatmap and totals bar; changed to `position:absolute` within the chart container
+- **Heatmap mobile portrait gap** — the chart left a large black area below it on mobile portrait; `scaleChart()` now sets the scroll div to fill the full viewport height on mobile
+- **Heatmap scroll-guard strip visible on desktop** — the 44px scroll-grab strip was always rendered regardless of device; it now only shows (`display:flex`) when the mobile breakpoint is active
+
+---
+
 ## [1.6.0] — 2026-04-01
 
 ### Added
