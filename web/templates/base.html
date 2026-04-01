@@ -1,6 +1,13 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
+  <script>
+    (function() {
+      var stored = localStorage.getItem('emt_chart_theme');
+      var sys = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', stored || sys);
+    })();
+  </script>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Energy Meter Tracker</title>
@@ -9,6 +16,23 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
+      --bg:        #f0f2f5;
+      --surface:   #ffffff;
+      --border:    #d0d5dd;
+      --accent:    #0a8c6a;
+      --accent2:   #5a48c7;
+      --text:      #1a1d27;
+      --muted:     #555970;
+      --danger:    #c0392b;
+      --success:   #1a7a3c;
+      --warning:   #b45309;
+      --nav-w:     220px;
+      --radius:    8px;
+      --mono:      'Courier New', Courier, monospace;
+      --sans:      -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    }
+
+    [data-theme="dark"] {
       --bg:        #0f1117;
       --surface:   #1a1d27;
       --border:    #2a2d3a;
@@ -19,10 +43,19 @@
       --danger:    #f05252;
       --success:   #22c55e;
       --warning:   #f59e0b;
-      --nav-w:     220px;
-      --radius:    8px;
-      --mono:      'Courier New', Courier, monospace;
-      --sans:      -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    }
+
+    [data-theme="light"] {
+      --bg:        #f0f2f5;
+      --surface:   #ffffff;
+      --border:    #d0d5dd;
+      --accent:    #0a8c6a;
+      --accent2:   #5a48c7;
+      --text:      #1a1d27;
+      --muted:     #555970;
+      --danger:    #c0392b;
+      --success:   #1a7a3c;
+      --warning:   #b45309;
     }
 
     html, body {
@@ -356,7 +389,7 @@
       </a>
       {% if has_power_sensor %}
       <a href="{{ url_for('summary_page') }}" class="{{ 'active' if active == 'summary' }}">
-        <span class="nav-icon">⚡</span> Summary
+        <span class="nav-icon">⚡</span> Live Power
       </a>
       {% endif %}
       <a href="{{ url_for('import_page') }}"  class="{{ 'active' if active == 'import' }}">
@@ -369,8 +402,10 @@
         <span class="nav-icon">📖</span> Help
       </a>
     </nav>
-    <div class="sidebar-footer">
-      {% if app_version %}v{{ app_version }} &middot; {% endif %}port 8099
+    <div class="sidebar-footer" style="display:flex; align-items:center; justify-content:space-between;">
+      <span>{% if app_version %}v{{ app_version }} &middot; {% endif %}port 8099</span>
+      <button id="global-theme-btn" onclick="globalToggleTheme()" title="Toggle light/dark mode"
+        style="background:transparent; border:1px solid var(--border); border-radius:var(--radius); color:var(--muted); padding:2px 8px; font-size:14px; cursor:pointer; line-height:1.4;">&#9790;</button>
     </div>
   </aside>
 
@@ -395,10 +430,48 @@ function closeSidebar() {
   document.getElementById('sidebar').classList.remove('open');
   document.getElementById('sidebar-overlay').classList.remove('open');
 }
-// Close sidebar when a nav link is tapped on mobile
-document.querySelectorAll('.sidebar nav a').forEach(function(a) {
-  a.addEventListener('click', closeSidebar);
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  localStorage.setItem('emt_chart_theme', theme);
+  // Sync global toggle icon
+  var btn = document.getElementById('global-theme-btn');
+  if (btn) btn.textContent = theme === 'dark' ? '\u263e' : '\u2600';
+  // Notify all iframes so their internal theme toggles stay in sync
+  document.querySelectorAll('iframe').forEach(function(f) {
+    try { f.contentWindow.postMessage({type:'emt-theme', theme:theme}, '*'); } catch(e) {}
+  });
+}
+function globalToggleTheme() {
+  var current = document.documentElement.getAttribute('data-theme');
+  applyTheme(current === 'light' ? 'dark' : 'light');
+}
+// Listen for theme changes from iframes (e.g. heatmap toggle button)
+window.addEventListener('message', function(e) {
+  if (e.data && e.data.type === 'emt-theme-change') {
+    applyTheme(e.data.theme);
+  }
 });
+// Sync global theme toggle icon on load
+(function() {
+  var theme = document.documentElement.getAttribute('data-theme') || 'dark';
+  var btn = document.getElementById('global-theme-btn');
+  if (btn) btn.textContent = theme === 'dark' ? '\u263e' : '\u2600';
+})();
+// Remember last visited page — set on nav click and on every page load
+document.querySelectorAll('.sidebar nav a').forEach(function(a) {
+  a.addEventListener('click', function() {
+    var href = a.getAttribute('href');
+    var page = href.replace(/^\//, '').split('/')[0] || 'charts';
+    fetch(apiUrl('/api/last-page'), { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({page: page}) });
+    closeSidebar();
+  });
+});
+(function() {
+  var active = '{{ active }}';
+  if (active) {
+    fetch(apiUrl('/api/last-page'), { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({page: active}) });
+  }
+})();
 // Show mobile topbar only on small screens
 function checkMobile() {
   var mt = document.getElementById('mobile-topbar');

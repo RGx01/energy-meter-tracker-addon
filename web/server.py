@@ -160,8 +160,23 @@ def save_config(data: dict):
 def index():
     cfg = load_config()
     if cfg.get("meters"):
-        return redirect(url_for("charts_page"))
+        last = request.cookies.get("emt_last_page", "charts")
+        valid = {"charts", "summary", "import", "logs", "help", "config"}
+        if last not in valid:
+            last = "charts"
+        return redirect(url_for(last + "_page"))
     return redirect(url_for("config_page"))
+
+
+@app.route("/api/last-page", methods=["POST"])
+def api_set_last_page():
+    page = request.get_json(force=True).get("page", "charts")
+    valid = {"charts", "summary", "import", "logs", "help", "config"}
+    if page not in valid:
+        page = "charts"
+    resp = jsonify({"ok": True})
+    resp.set_cookie("emt_last_page", page, max_age=60*60*24*365, samesite="Lax")
+    return resp
 
 
 @app.route("/config")
@@ -745,6 +760,153 @@ def serve_daily():
         return "Chart not yet generated", 404
     return send_file(p)
 
+
+@app.route("/api/charts/blocks-summary")
+def api_blocks_summary():
+    """Return billing-accurate per-period data for the Usage Stats bar chart.
+
+    Strategy:
+    - Main meter grid remainder: from calculate_billing_summary_for_period
+      (billing-accurate, handles sub-meter subtraction correctly)
+    - Sub-meters: aggregated directly from blocks by meter_id (avoids fragile
+      display-key reverse-mapping)
+    - Standing charge: from billing summary (once per day, correct)
+    - Export: from blocks directly by meter_id
+    """
+    try:
+        from energy_engine_io import load_json as _lj
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+        import energy_charts as _ec
+        from collections import defaultdict
+
+        cfg    = _lj(os.path.join(DATA_DIR, "meters_config.json"), {})
+        blocks = _lj(os.path.join(DATA_DIR, "blocks.json"), [])
+
+        main_meta = {}
+        for md in cfg.get("meters", {}).values():
+            if not (md.get("meta") or {}).get("sub_meter"):
+                main_meta = md.get("meta") or {}
+                break
+
+        tz_name  = main_meta.get("timezone", "UTC")
+        currency = main_meta.get("currency_symbol", "£")
+        _tz      = ZoneInfo(tz_name)
+
+        meter_colors = _ec.build_meter_colors(blocks)
+
+        meter_labels = {}
+        for meter_id, meter_cfg in cfg.get("meters", {}).items():
+            meta  = (meter_cfg.get("meta") or {})
+            is_sub = bool(meta.get("sub_meter"))
+            if is_sub:
+                label = meta.get("device") or meta.get("site") or meter_id
+            else:
+                label = "Grid"   # main meter always labelled generically
+            meter_labels[meter_id] = label
+
+        # Collect all unique local dates from blocks
+        dated = []
+        for b in blocks:
+            if not b or not b.get("start"):
+                continue
+            try:
+                dt = datetime.fromisoformat(b["start"]).replace(tzinfo=ZoneInfo("UTC")).astimezone(_tz)
+                dated.append(dt.date())
+            except Exception:
+                continue
+
+        if not dated:
+            return jsonify({"currency": currency, "rows": [], "meters": [], "export_color": "#ff7f0e"})
+
+        all_dates = sorted(set(dated))
+
+        rows = []
+        for d in all_dates:
+            ps = datetime(d.year, d.month, d.day, 0, 0, 0)
+            pe = datetime(d.year, d.month, d.day, 23, 59, 59)
+
+            # ── Main meter remainder via billing summary (billing-accurate) ──
+            s        = _ec.calculate_billing_summary_for_period(blocks, ps, pe)
+            standing = float(s.get("total_standing") or 0)
+
+            main_imp_kwh  = 0.0
+            main_imp_cost = 0.0
+            main_exp_kwh  = 0.0
+            main_exp_cost = 0.0
+            for key, t in (s.get("totals") or {}).items():
+                if t.get("is_submeter"):
+                    continue
+                if "export" in key.lower():
+                    main_exp_kwh  += float(t.get("kwh")  or 0)
+                    main_exp_cost += abs(float(t.get("cost") or 0))
+                else:
+                    main_imp_kwh  += float(t.get("kwh")  or 0)
+                    main_imp_cost += float(t.get("cost") or 0)
+
+            # ── Sub-meters aggregated directly from blocks by meter_id ──
+            sub_totals = defaultdict(lambda: {"imp_kwh":0.0,"imp_cost":0.0,"exp_kwh":0.0,"exp_cost":0.0})
+            for b in blocks:
+                if not b or not b.get("start"):
+                    continue
+                try:
+                    bdt = datetime.fromisoformat(b["start"])
+                    if not (ps <= bdt <= pe):
+                        continue
+                    for mid, md in (b.get("meters") or {}).items():
+                        if not (md or {}).get("meta", {}).get("sub_meter"):
+                            continue
+                        ch_imp = (md.get("channels") or {}).get("import") or {}
+                        ch_exp = (md.get("channels") or {}).get("export") or {}
+                        sub_totals[mid]["imp_kwh"]  += float(ch_imp.get("kwh_grid", ch_imp.get("kwh", 0)) or 0)
+                        sub_totals[mid]["imp_cost"] += float(ch_imp.get("cost", 0) or 0)
+                        sub_totals[mid]["exp_kwh"]  += float(ch_exp.get("kwh", 0) or 0)
+                        sub_totals[mid]["exp_cost"] += float(ch_exp.get("cost", 0) or 0)
+                except Exception:
+                    continue
+
+            # ── Assemble meters_out ──
+            meters_out = {"electricity_main": {
+                "imp_kwh":  round(main_imp_kwh,  4),
+                "imp_cost": round(main_imp_cost, 4),
+                "exp_kwh":  round(main_exp_kwh,  4),
+                "exp_cost": round(main_exp_cost, 4),
+            }}
+            for mid, st in sub_totals.items():
+                meters_out[mid] = {f: round(v, 4) for f, v in st.items()}
+
+            rows.append({
+                "year":     d.year,
+                "month":    d.month,
+                "day":      d.day,
+                "standing": round(standing, 4),
+                "meters":   meters_out,
+                "imp_kwh":  round(main_imp_kwh  + sum(m["imp_kwh"]  for mid,m in meters_out.items() if mid != "electricity_main"), 4),
+                "exp_kwh":  round(main_exp_kwh, 4),
+                "imp_cost": round(main_imp_cost + sum(m["imp_cost"] for mid,m in meters_out.items() if mid != "electricity_main"), 4),
+                "exp_cost": round(main_exp_cost, 4),
+            })
+
+        all_meter_ids = [m for m in meter_colors if m != "electricity_main_export"]
+        meters_list = [{
+            "id":    mid,
+            "label": meter_labels.get(mid, mid),
+            "color": meter_colors[mid],
+            "is_sub": mid != "electricity_main",
+        } for mid in all_meter_ids]
+
+        export_color = meter_colors.get("electricity_main_export",
+                       meter_colors.get("electricity_main", "#ff7f0e"))
+
+        return jsonify({
+            "currency":     currency,
+            "rows":         rows,
+            "meters":       meters_list,
+            "export_color": export_color,
+        })
+    except Exception as e:
+        logger.error("api_blocks_summary: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/charts/heatmap")
 def api_chart_heatmap():

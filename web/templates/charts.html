@@ -22,11 +22,88 @@
   .chart-tab:hover { background: rgba(255,255,255,0.05); color: var(--text); }
   .chart-tab.active { background: rgba(0,212,170,0.1); color: var(--accent); border-color: var(--accent); }
 
+  /* Bar chart controls */
+  .bar-seg {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .bar-seg-btn {
+    background: transparent;
+    border: none;
+    border-right: 1px solid var(--border);
+    padding: 5px 13px;
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+    font-family: var(--sans);
+  }
+  .bar-seg-btn:last-child { border-right: none; }
+  .bar-seg-btn.active { background: rgba(0,212,170,0.1); color: var(--accent); }
+  .bar-seg-btn:hover:not(.active) { background: rgba(255,255,255,0.05); color: var(--text); }
+  .bar-nav-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 4px 10px;
+    font-size: 13px;
+    color: var(--muted);
+    cursor: pointer;
+    font-family: var(--sans);
+  }
+  .bar-nav-btn:hover { background: rgba(255,255,255,0.05); color: var(--text); }
+  .bar-period-label {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text);
+    min-width: 110px;
+    text-align: center;
+  }
+  .bar-year-btn {
+    font-size: 12px;
+    padding: 3px 10px;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    font-family: var(--sans);
+  }
+  .bar-legend-dot { width:10px; height:10px; border-radius:2px; display:inline-block; margin-right:4px; }
+  #bar-table th, #bar-table td {
+    padding: 6px 10px;
+    text-align: right;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  #bar-table th:first-child, #bar-table td:first-child { text-align: left; }
+  #bar-table th {
+    font-size: 11px;
+    color: var(--muted);
+    font-weight: 500;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+    position: sticky;
+    top: 0;
+  }
+  #bar-table tr:last-child td {
+    border-bottom: none;
+    font-weight: 500;
+    border-top: 2px solid var(--border);
+    color: var(--text);
+  }
+  #bar-table td { color: var(--muted); }
+  #bar-table tr:hover td { background: rgba(255,255,255,0.03); }
+
   .chart-frame-wrap {
     background: white;
     border-radius: var(--radius);
     overflow: hidden;
     border: 1px solid var(--border);
+  }
+  #chart-bar {
+    background: var(--surface);
   }
   .chart-frame-wrap iframe {
     width: 100%;
@@ -52,7 +129,7 @@
 <div class="topbar">
   <div>
     <h2>Charts</h2>
-    <div class="sub">Net energy heatmap and daily import/export</div>
+    <div class="sub">Billing, net energy heatmap and usage stats</div>
   </div>
   <button class="btn btn-secondary" onclick="regenerate()">↺ Regenerate Charts</button>
 </div>
@@ -74,8 +151,9 @@
 {% endif %}
 
 <div class="chart-tabs">
-  <button class="chart-tab active" onclick="showChart('daily', this)">📊 Daily Usage</button>
+  <button class="chart-tab active" onclick="showChart('daily', this)">📊 Billing</button>
   <button class="chart-tab"        onclick="showChart('heatmap', this)">🔥 Net Heatmap</button>
+  <button class="chart-tab"        onclick="showChart('bar', this)">📈 Usage Stats</button>
 </div>
 
 <!-- Daily usage chart -->
@@ -105,6 +183,54 @@
       <span>No heatmap data yet.</span>
     </div>
   {% endif %}
+</div>
+
+<!-- Import / Export bar chart -->
+<div id="chart-bar" class="chart-frame-wrap" style="display:none; padding: 24px;">
+
+  <!-- Controls -->
+  <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; align-items:center;">
+    <div class="bar-seg" id="bar-period-seg">
+      <button class="bar-seg-btn active" onclick="barSetPeriod('daily',this)">Daily</button>
+      <button class="bar-seg-btn"        onclick="barSetPeriod('monthly',this)">Monthly</button>
+      <button class="bar-seg-btn"        onclick="barSetPeriod('yearly',this)">Yearly</button>
+    </div>
+    <div class="bar-seg" id="bar-metric-seg">
+      <button class="bar-seg-btn active" onclick="barSetMetric('kwh',this)">kWh</button>
+      <button class="bar-seg-btn"        onclick="barSetMetric('cost',this)" id="bar-cost-btn">Cost</button>
+    </div>
+    <div class="bar-seg" id="bar-view-seg">
+      <button class="bar-seg-btn active" onclick="barSetView('totals',this)">Totals</button>
+      <button class="bar-seg-btn"        onclick="barSetView('net',this)">Net</button>
+    </div>
+    <label id="bar-standing-wrap" style="display:none; align-items:center; gap:6px; font-size:12px; color:var(--muted); cursor:pointer;">
+      <input type="checkbox" id="bar-standing-cb" onchange="barSaveState(); barRender();" style="width:14px;height:14px;accent-color:var(--accent);cursor:pointer;">
+      Inc. standing charge
+    </label>
+    <button class="bar-seg-btn" id="bar-theme-btn" onclick="barToggleTheme()" title="Toggle light/dark" style="margin-left:auto; border:0.5px solid var(--border); border-radius:var(--radius); padding:5px 10px; font-size:14px;">&#9790;</button>
+  </div>
+
+  <!-- Period navigator (daily) / year selector (monthly+yearly) -->
+  <div id="bar-sub-bar" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:16px; min-height:28px;"></div>
+
+  <!-- Legend -->
+  <div id="bar-legend" style="display:flex; gap:16px; margin-bottom:12px; font-size:12px; color:var(--muted); flex-wrap:wrap;"></div>
+
+  <!-- Chart canvas -->
+  <div style="position:relative; width:100%; height:360px;">
+    <canvas id="barChart"></canvas>
+  </div>
+
+  <!-- Tabular view -->
+  <div style="display:flex; align-items:center; justify-content:space-between; margin-top:28px; margin-bottom:10px;">
+    <span style="font-size:12px; font-weight:500; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em;">Data table</span>
+    <button class="btn btn-secondary btn-sm" onclick="barCopyTable()" id="bar-copy-btn">⎘ Copy to clipboard</button>
+  </div>
+  <div style="overflow-x:auto;">
+    <table id="bar-table" style="width:100%; border-collapse:collapse; font-size:12px; font-family:var(--mono);">
+    </table>
+  </div>
+
 </div>
 
 {% endblock %}
@@ -141,12 +267,58 @@ function resizeChartIframes() {
 
 window.addEventListener('resize', resizeChartIframes, { passive: true });
 
+// On orientation change, force a full bar chart redraw after layout settles
+var _orientTimer = null;
+window.addEventListener('orientationchange', function() {
+  clearTimeout(_orientTimer);
+  _orientTimer = setTimeout(function() {
+    if (document.getElementById('chart-bar').style.display !== 'none' && barInited) {
+      // Destroy instance so Chart.js recalculates from fresh canvas dimensions
+      if (barChartInstance) { barChartInstance.destroy(); barChartInstance = null; }
+      barRender();
+    }
+    // Also reload active iframe chart if visible
+    resizeChartIframes();
+  }, 350);
+}, { passive: true });
+
+// Also handle resize-based orientation change (some browsers fire resize not orientationchange)
+var _lastOrientation = window.innerWidth > window.innerHeight ? 'landscape' : 'portrait';
+window.addEventListener('resize', function() {
+  var current = window.innerWidth > window.innerHeight ? 'landscape' : 'portrait';
+  if (current !== _lastOrientation) {
+    _lastOrientation = current;
+    clearTimeout(_orientTimer);
+    _orientTimer = setTimeout(function() {
+      if (document.getElementById('chart-bar').style.display !== 'none' && barInited) {
+        if (barChartInstance) { barChartInstance.destroy(); barChartInstance = null; }
+        barRender();
+      }
+    }, 350);
+  }
+}, { passive: true });
+
 // Suppress resize reload when iframe content triggers layout changes
 window.addEventListener('message', function(e) {
   if (e.data && e.data.type === 'suppressResize') {
     _suppressResize = true;
     clearTimeout(_resizeTimer);
     setTimeout(function() { _suppressResize = false; }, 800);
+  }
+  // Theme toggle from parent shell — reload active iframe chart with new theme
+  if (e.data && e.data.type === 'emt-theme') {
+    var activeTab = document.querySelector('.chart-tab.active');
+    var activeName = activeTab && activeTab.textContent.indexOf('Billing') !== -1 ? 'daily'
+                   : activeTab && activeTab.textContent.indexOf('Heatmap') !== -1 ? 'heatmap'
+                   : null;
+    if (activeName) {
+      chartsLoaded[activeName] = false;
+      loadChartContent(activeName, true);
+    }
+    // Update bar chart if visible
+    var btn = document.getElementById('bar-theme-btn');
+    if (btn) btn.textContent = e.data.theme === 'dark' ? '\u263e' : '\u2600';
+    if (barInited && barData && window.Chart) barRender();
   }
 });
 
@@ -159,19 +331,27 @@ async function loadChartContent(name, force) {
   try {
     var h = getChartHeight();
     var r = await fetch(apiUrl(endpoint) + '?t=' + Date.now());
-    var data = await r.json();
+    if (!r.ok) {
+      throw new Error('HTTP ' + r.status + ' ' + r.statusText);
+    }
+    var text = await r.text();
+    var data;
+    try {
+      data = JSON.parse(text);
+    } catch(parseErr) {
+      throw new Error('JSON parse failed: ' + parseErr.message + ' — response starts: ' + text.substring(0, 120));
+    }
     if (data.html) {
-      var blob = new Blob([data.html], { type: 'text/html' });
-      var blobUrl = URL.createObjectURL(blob);
       var iframe = document.createElement('iframe');
       iframe.className = 'chart-iframe';
       iframe.style.cssText = 'width:100%;height:' + h + ';border:none;display:block;';
-      iframe.src = blobUrl;
-      iframe.onload = function() { URL.revokeObjectURL(blobUrl); };
+      iframe.srcdoc = data.html;
       el.style.height = h;
       el.innerHTML = '';
       el.appendChild(iframe);
       chartsLoaded[name] = true;
+    } else {
+      throw new Error('No html in response — keys: ' + Object.keys(data).join(', '));
     }
   } catch(e) {
     el.innerHTML = '<div style="padding:40px;text-align:center;color:var(--danger);">Failed to load chart: ' + e.message + '</div>';
@@ -192,7 +372,10 @@ function showChart(name, btn) {
   btn.classList.add('active');
   document.getElementById('chart-daily').style.display   = name === 'daily'   ? 'block' : 'none';
   document.getElementById('chart-heatmap').style.display = name === 'heatmap' ? 'block' : 'none';
-  loadChartContent(name);
+  document.getElementById('chart-bar').style.display     = name === 'bar'     ? 'block' : 'none';
+  if (name === 'bar') { barInit(); }
+  else { loadChartContent(name); }
+  try { localStorage.setItem('emt_chart_tab', name); } catch(e) {}
   setTimeout(function() { _suppressResize = false; }, 200);
 }
 
@@ -213,7 +396,526 @@ async function regenerate() {
   }
 }
 
-document.addEventListener('DOMContentLoaded', function() { loadChartContent('daily'); });
+// ── Usage Stats Bar Chart ─────────────────────────────────────────────────────
+var barData = null;
+var barCurrency = '£';
+var barPeriod = 'daily';
+var barMetric = 'kwh';
+var barView = 'totals';
+var barDailyMonth = null;
+var barActiveYears = null;
+var barChartInstance = null;
+var barInited = false;
+var barMeters = [];       // [{id, label, color, is_sub}]
+var barExportColor = '#ff7f0e';
+
+var MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+function barIncStanding() {
+  var cb = document.getElementById('bar-standing-cb');
+  return cb ? cb.checked : false;
+}
+
+function barSaveState() {
+  try {
+    var cb = document.getElementById('bar-standing-cb');
+    localStorage.setItem('emt_bar_state', JSON.stringify({
+      period:   barPeriod,
+      metric:   barMetric,
+      view:     barView,
+      month:    barDailyMonth,
+      years:    barActiveYears ? [...barActiveYears] : [],
+      standing: cb ? cb.checked : false,
+    }));
+  } catch(e) {}
+}
+
+function barLoadState(availableYears) {
+  try {
+    var raw = localStorage.getItem('emt_bar_state');
+    if (!raw) return;
+    var st = JSON.parse(raw);
+    if (['daily','monthly','yearly'].indexOf(st.period) !== -1) barPeriod = st.period;
+    if (['kwh','cost'].indexOf(st.metric) !== -1)              barMetric = st.metric;
+    if (['totals','net'].indexOf(st.view) !== -1)              barView   = st.view;
+    // Restore daily month only if it has data
+    if (st.month && st.month.year && st.month.month) {
+      var hasData = barData.some(function(r){ return r.year===st.month.year && r.month===st.month.month; });
+      if (hasData) barDailyMonth = st.month;
+    }
+    // Restore active years — only keep those that still exist in the data
+    if (st.years && st.years.length) {
+      var validYears = st.years.filter(function(y){ return availableYears.indexOf(y) !== -1; });
+      if (validYears.length) barActiveYears = new Set(validYears);
+    }
+    // Restore standing charge checkbox
+    var cb = document.getElementById('bar-standing-cb');
+    if (cb && typeof st.standing === 'boolean') cb.checked = st.standing;
+  } catch(e) {}
+}
+
+async function barInit() {
+  if (barInited && barData) { barRender(); return; }
+  try {
+    var r = await fetch(apiUrl('/api/charts/blocks-summary'));
+    var json = await r.json();
+    if (json.error) throw new Error(json.error);
+    barData        = json.rows || [];
+    barCurrency    = json.currency || '£';
+    barMeters      = json.meters  || [];
+    barExportColor = json.export_color || '#ff7f0e';
+    document.getElementById('bar-cost-btn').textContent = barCurrency + ' Cost';
+    var now   = new Date();
+    var years = [...new Set(barData.map(r => r.year))].sort();
+    // Set defaults before loading saved state
+    barDailyMonth  = { year: now.getFullYear(), month: now.getMonth() + 1 };
+    barActiveYears = new Set(years);
+    // Restore saved state (validated against available data)
+    barLoadState(years);
+    // Sync control UI to restored state
+    barSyncUI();
+    barInited = true;
+    barRender();
+  } catch(e) {
+    document.getElementById('chart-bar').innerHTML += '<div style="color:var(--danger);padding:20px;">Failed to load data: ' + e.message + '</div>';
+  }
+}
+
+function barSyncUI() {
+  // Sync period/metric/view segment buttons to current state vars
+  ['daily','monthly','yearly'].forEach(function(v) {
+    document.querySelectorAll('#bar-period-seg .bar-seg-btn').forEach(function(b){
+      if (b.textContent.toLowerCase() === v) b.classList.toggle('active', barPeriod === v);
+    });
+  });
+  document.querySelectorAll('#bar-metric-seg .bar-seg-btn').forEach(function(b){
+    b.classList.toggle('active', b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'"+barMetric+"'") !== -1);
+  });
+  document.querySelectorAll('#bar-view-seg .bar-seg-btn').forEach(function(b){
+    b.classList.toggle('active', b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'"+barView+"'") !== -1);
+  });
+}
+
+function barGetYears() {
+  return [...new Set(barData.map(r => r.year))].sort();
+}
+
+// Aggregate rows for a given filter function, returning per-meter sums
+function barVal(meterAgg, mid, isExport) {
+  var m = meterAgg.meters[mid];
+  if (!m) return 0;
+  if (barMetric === 'kwh') return isExport ? m.exp_kwh  : m.imp_kwh;
+  else                     return isExport ? m.exp_cost : m.imp_cost;
+}
+
+function barStandingVal(agg) {
+  if (!barIncStanding() || barMetric === 'kwh') return 0;
+  return agg.standing || 0;
+}
+
+function barGetDatasets(labels, aggList) {
+  if (barView === 'net') {
+    return [{
+      label: 'Net',
+      data: aggList.map(function(agg) {
+        var imp = barMetric === 'kwh' ? agg.imp_kwh  : (agg.imp_cost + barStandingVal(agg));
+        var exp = barMetric === 'kwh' ? agg.exp_kwh  :  agg.exp_cost;
+        return Math.round((imp - exp) * 1000) / 1000;
+      }),
+      backgroundColor: aggList.map(function(agg) {
+        var imp = barMetric === 'kwh' ? agg.imp_kwh : agg.imp_cost;
+        var exp = barMetric === 'kwh' ? agg.exp_kwh : agg.exp_cost;
+        return imp >= exp ? (barMeters[0] && barMeters[0].color || '#1f77b4') : barExportColor;
+      }),
+      borderRadius: 3
+    }];
+  }
+
+  // Totals — import meters stacked above axis, export below, all in same stack
+  var datasets = [];
+
+  barMeters.forEach(function(meter) {
+    datasets.push({
+      label: meter.label + ' import',
+      data: aggList.map(function(agg) { return Math.round(barVal(agg, meter.id, false) * 1000) / 1000; }),
+      backgroundColor: meter.color,
+      borderRadius: 0,
+      stack: 'main'   // single stack so import/export are vertically aligned per bucket
+    });
+  });
+
+  if (barMetric === 'cost') {
+    datasets.push({
+      label: 'Standing charge',
+      data: aggList.map(function(agg) { return barIncStanding() ? Math.round(barStandingVal(agg) * 1000) / 1000 : 0; }),
+      backgroundColor: '#4b5563',
+      borderRadius: 0,
+      stack: 'main'
+    });
+  }
+
+  var hasExport = aggList.some(function(agg) {
+    return Object.values(agg.meters || {}).some(function(m) { return (barMetric==='kwh'?m.exp_kwh:m.exp_cost) > 0; });
+  });
+  if (hasExport) {
+    datasets.push({
+      label: 'Export',
+      data: aggList.map(function(agg) {
+        var total = Object.values(agg.meters || {}).reduce(function(s,m){ return s+(barMetric==='kwh'?m.exp_kwh:m.exp_cost); }, 0);
+        return -Math.round(total * 1000) / 1000;
+      }),
+      backgroundColor: barExportColor,
+      borderRadius: 3,
+      stack: 'main'   // same stack — export sits below zero on same axis
+    });
+  }
+
+  return datasets;
+}
+
+function barAggRows(filterFn) {
+  var filtered = barData.filter(filterFn);
+  var result = { standing:0, imp_kwh:0, exp_kwh:0, imp_cost:0, exp_cost:0, meters:{} };
+  filtered.forEach(function(row) {
+    result.standing  += row.standing  || 0;
+    result.imp_kwh   += row.imp_kwh   || 0;
+    result.exp_kwh   += row.exp_kwh   || 0;
+    result.imp_cost  += row.imp_cost  || 0;
+    result.exp_cost  += row.exp_cost  || 0;
+    Object.keys(row.meters || {}).forEach(function(mid) {
+      if (!result.meters[mid]) result.meters[mid] = {imp_kwh:0,imp_cost:0,exp_kwh:0,exp_cost:0};
+      var m = row.meters[mid];
+      result.meters[mid].imp_kwh  += m.imp_kwh  || 0;
+      result.meters[mid].imp_cost += m.imp_cost || 0;
+      result.meters[mid].exp_kwh  += m.exp_kwh  || 0;
+      result.meters[mid].exp_cost += m.exp_cost || 0;
+    });
+  });
+  // Round
+  result.standing = Math.round(result.standing * 10000) / 10000;
+  result.imp_kwh  = Math.round(result.imp_kwh  * 10000) / 10000;
+  result.exp_kwh  = Math.round(result.exp_kwh  * 10000) / 10000;
+  result.imp_cost = Math.round(result.imp_cost * 10000) / 10000;
+  result.exp_cost = Math.round(result.exp_cost * 10000) / 10000;
+  return result;
+}
+
+function barGetDataForPeriod() {
+  if (barPeriod === 'daily') {
+    var days = [...new Set(barData
+      .filter(function(r){ return r.year===barDailyMonth.year && r.month===barDailyMonth.month; })
+      .map(function(r){ return r.day; }))].sort(function(a,b){return a-b;});
+    return {
+      labels:  days.map(String),
+      aggList: days.map(function(d) {
+        return barAggRows(function(r){ return r.year===barDailyMonth.year && r.month===barDailyMonth.month && r.day===d; });
+      })
+    };
+  }
+  if (barPeriod === 'monthly') {
+    var activeYrs = barGetYears().filter(function(y){ return barActiveYears.has(y); });
+    var buckets = [];
+    activeYrs.forEach(function(y) {
+      var months = [...new Set(barData.filter(function(r){return r.year===y;}).map(function(r){return r.month;}))].sort(function(a,b){return a-b;});
+      months.forEach(function(m){ buckets.push({y:y,m:m}); });
+    });
+    buckets.sort(function(a,b){ return a.y!==b.y ? a.y-b.y : a.m-b.m; });
+    return {
+      labels:  buckets.map(function(b){ return MONTHS_SHORT[b.m-1]+(activeYrs.length>1?' '+b.y:''); }),
+      aggList: buckets.map(function(b){ return barAggRows(function(r){ return r.year===b.y && r.month===b.m; }); })
+    };
+  }
+  if (barPeriod === 'yearly') {
+    var activeYrs = barGetYears().filter(function(y){ return barActiveYears.has(y); });
+    return {
+      labels:  activeYrs.map(String),
+      aggList: activeYrs.map(function(y){ return barAggRows(function(r){ return r.year===y; }); })
+    };
+  }
+}
+
+function barYLabel(v) {
+  var sym = barMetric==='cost' ? barCurrency : '';
+  var unit = barMetric==='kwh' ? ' kWh' : '';
+  return (v<0?'-':'') + sym + Math.abs(v).toFixed(0) + unit;
+}
+
+function barRender() {
+  if (!barData) return;
+  // Show/hide standing charge toggle (cost mode only)
+  var sw = document.getElementById('bar-standing-wrap');
+  if (sw) sw.style.display = barMetric === 'cost' ? 'flex' : 'none';
+
+  var pd = barGetDataForPeriod();
+  var datasets = barGetDatasets(pd.labels, pd.aggList);
+  var ctx = document.getElementById('barChart');
+  if (barChartInstance) { barChartInstance.destroy(); barChartInstance = null; }
+  // Reset canvas so Chart.js measures fresh from the container width
+  ctx.style.width = ''; ctx.style.height = '';
+  ctx.removeAttribute('width'); ctx.removeAttribute('height');
+  barChartInstance = new Chart(ctx, {
+    type: 'bar',
+    data: { labels: pd.labels, datasets: datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: barGetTheme().tooltipBg,
+          borderColor: barGetTheme().tooltipBorder,
+          borderWidth: 1,
+          titleColor: barGetTheme().tooltipTitle,
+          bodyColor: barGetTheme().tooltipBody,
+          footerColor: barGetTheme().tooltipBody,
+          callbacks: {
+          label: function(c) {
+            var v = c.raw;
+            var sym = barMetric==='cost' ? barCurrency : '';
+            var unit = barMetric==='kwh' ? ' kWh' : '';
+            return ' ' + c.dataset.label + ': ' + (v<0?'-':'') + sym + Math.abs(v).toFixed(barMetric==='cost'?2:3) + unit;
+          },
+          footer: function(items) {
+            if (items.length === 0) return '';
+            var sym = barMetric==='cost' ? barCurrency : '';
+            var unit = barMetric==='kwh' ? ' kWh' : '';
+            var idx = items[0].dataIndex;
+            var agg = barGetDataForPeriod().aggList[idx];
+            if (!agg) return '';
+            var imp = barMetric === 'kwh' ? agg.imp_kwh : (agg.imp_cost + barStandingVal(agg));
+            var exp = barMetric === 'kwh' ? agg.exp_kwh : agg.exp_cost;
+            var net = imp - exp;
+            var total = imp + exp;
+            var dp = barMetric === 'cost' ? 2 : 3;
+            var netStr = (net < 0 ? '-' : '') + sym + Math.abs(net).toFixed(dp) + unit;
+            var impStr = sym + imp.toFixed(dp) + unit;
+            var expStr = sym + exp.toFixed(dp) + unit;
+            if (barView === 'net') return '';
+            return '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nImport: ' + impStr + '  Export: ' + expStr + '\nNet: ' + netStr;
+          }
+        }}
+      },
+      scales: {
+        x: { stacked: true, grid: { display: false }, ticks: { font:{size:11}, color:barGetTheme().axisC, autoSkip: true, maxRotation: 45 } },
+        y: { stacked: true, grid: { color:barGetTheme().gridC }, ticks: { font:{size:11}, color:barGetTheme().axisC, callback: barYLabel } }
+      }
+    }
+  });
+  barBuildLegend();
+  barBuildSubBar();
+  barBuildTable();
+}
+
+function barBuildLegend() {
+  var el = document.getElementById('bar-legend');
+  el.innerHTML = '';
+  function dot(color, label) {
+    return '<span style="display:flex;align-items:center;gap:5px;"><span class="bar-legend-dot" style="background:' + color + '"></span>' + label + '</span>';
+  }
+  if (barView === 'net') {
+    el.innerHTML = dot(barMeters[0]&&barMeters[0].color||'#1f77b4','Net import') + dot(barExportColor,'Net export');
+    return;
+  }
+  barMeters.forEach(function(m) { el.innerHTML += dot(m.color, m.label + ' import'); });
+  if (barMetric === 'cost' && barIncStanding()) { el.innerHTML += dot('#4b5563', 'Standing charge'); }
+  el.innerHTML += dot(barExportColor, 'Export');
+}
+
+function barBuildSubBar() {
+  var bar = document.getElementById('bar-sub-bar');
+  bar.innerHTML = '';
+  if (barPeriod === 'daily') {
+    var prev = document.createElement('button'); prev.className = 'bar-nav-btn'; prev.textContent = '←';
+    prev.onclick = function() { barDailyMonth.month--; if(barDailyMonth.month<1){barDailyMonth.month=12;barDailyMonth.year--;} barSaveState(); barRender(); };
+    var lbl = document.createElement('span'); lbl.className = 'bar-period-label';
+    lbl.textContent = MONTHS_SHORT[barDailyMonth.month-1] + ' ' + barDailyMonth.year;
+    var next = document.createElement('button'); next.className = 'bar-nav-btn'; next.textContent = '→';
+    next.onclick = function() { barDailyMonth.month++; if(barDailyMonth.month>12){barDailyMonth.month=1;barDailyMonth.year++;} barSaveState(); barRender(); };
+    bar.appendChild(prev); bar.appendChild(lbl); bar.appendChild(next);
+  } else {
+    var lbl2 = document.createElement('span');
+    lbl2.style.cssText = 'font-size:12px;color:var(--muted);margin-right:4px;';
+    lbl2.textContent = 'Years:';
+    bar.appendChild(lbl2);
+    var years = barGetYears();
+    years.forEach(function(y) {
+      var i = years.indexOf(y);
+      var on = barActiveYears.has(y);
+      var color = barMeters[0] ? barMeters[0].color : '#1f77b4';
+      var btn = document.createElement('button');
+      btn.className = 'bar-year-btn';
+      btn.textContent = String(y);
+      if (on) { btn.style.borderColor = color; btn.style.background = color+'22'; btn.style.color = color; }
+      btn.onclick = function() {
+        if (barActiveYears.has(y) && barActiveYears.size === 1) return;
+        barActiveYears.has(y) ? barActiveYears.delete(y) : barActiveYears.add(y);
+        barSaveState();
+        barRender();
+      };
+      bar.appendChild(btn);
+    });
+  }
+}
+
+function barFmt(v, forCopy) {
+  var sym = barMetric === 'cost' ? barCurrency : '';
+  var unit = barMetric === 'kwh' ? ' kWh' : '';
+  var abs = Math.abs(v);
+  var str = sym + abs.toFixed(barMetric==='cost'?2:3) + unit;
+  return (v < 0 ? '-' : '') + str;
+}
+
+function barBuildTable() {
+  var tbl = document.getElementById('bar-table');
+  if (!tbl || !barData) return;
+  var pd = barGetDataForPeriod();
+  var aggList = pd.aggList;
+  var labels  = pd.labels;
+
+  // Build column headers
+  var cols = []; // [{key, label}]
+  if (barView === 'net') {
+    cols.push({key:'net', label:'Net'});
+  } else {
+    barMeters.forEach(function(m) { cols.push({key:'imp_'+m.id, label: m.label + ' import', mid: m.id, dir:'imp'}); });
+    if (barMetric === 'cost' && barIncStanding()) cols.push({key:'standing', label:'Standing charge'});
+    cols.push({key:'exp', label:'Export', dir:'exp'});
+  }
+
+  var sym = barMetric === 'cost' ? barCurrency : '';
+  var unit = barMetric === 'kwh' ? ' kWh' : '';
+
+  function cellVal(agg, col) {
+    if (col.key === 'net') {
+      var imp = barMetric === 'kwh' ? agg.imp_kwh : (agg.imp_cost + barStandingVal(agg));
+      var exp = barMetric === 'kwh' ? agg.exp_kwh : agg.exp_cost;
+      return imp - exp;
+    }
+    if (col.key === 'standing') return barStandingVal(agg);
+    if (col.key === 'exp') {
+      return barMetric === 'kwh'
+        ? Object.values(agg.meters||{}).reduce(function(s,m){return s+m.exp_kwh;},0)
+        : Object.values(agg.meters||{}).reduce(function(s,m){return s+m.exp_cost;},0);
+    }
+    // per-meter import
+    var m = (agg.meters||{})[col.mid];
+    if (!m) return 0;
+    return barMetric === 'kwh' ? m.imp_kwh : m.imp_cost;
+  }
+
+  // Build HTML
+  var html = '<thead><tr><th>Period</th>';
+  cols.forEach(function(c){ html += '<th>' + c.label + '</th>'; });
+  html += '</tr></thead><tbody>';
+
+  var totals = {};
+  cols.forEach(function(c){ totals[c.key] = 0; });
+
+  labels.forEach(function(lbl, i) {
+    var agg = aggList[i];
+    html += '<tr><td>' + lbl + '</td>';
+    cols.forEach(function(c) {
+      var v = cellVal(agg, c);
+      totals[c.key] += v;
+      html += '<td>' + barFmt(v) + '</td>';
+    });
+    html += '</tr>';
+  });
+
+  // Totals row
+  html += '<tr><td>Total</td>';
+  cols.forEach(function(c){ html += '<td>' + barFmt(totals[c.key]) + '</td>'; });
+  html += '</tr>';
+
+  html += '</tbody>';
+  tbl.innerHTML = html;
+}
+
+function barCopyTable() {
+  var tbl = document.getElementById('bar-table');
+  if (!tbl) return;
+  var lines = [];
+  tbl.querySelectorAll('tr').forEach(function(row) {
+    var cells = [];
+    row.querySelectorAll('th,td').forEach(function(cell){ cells.push(cell.textContent.trim()); });
+    lines.push(cells.join('\t'));
+  });
+  var text = lines.join('\n');
+
+  function onSuccess() {
+    var btn = document.getElementById('bar-copy-btn');
+    if (btn) { btn.textContent = '✓ Copied'; setTimeout(function(){ btn.textContent = '⎘ Copy to clipboard'; }, 2000); }
+  }
+
+  // Always use the execCommand fallback — works over HTTP and in iframes
+  var ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.style.cssText = 'position:fixed;top:0;left:0;width:2em;height:2em;padding:0;border:none;outline:none;box-shadow:none;background:transparent;opacity:0;';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  ta.setSelectionRange(0, ta.value.length);
+  var ok = false;
+  try { ok = document.execCommand('copy'); } catch(e) {}
+  document.body.removeChild(ta);
+  if (ok) { onSuccess(); return; }
+
+  // Try modern API as fallback (HTTPS only)
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(onSuccess).catch(function(){});
+  }
+}
+
+function barGetTheme() {
+  var dark = document.documentElement.getAttribute('data-theme') !== 'light';
+  return {
+    axisC:  dark ? '#6b7080' : '#555566',
+    gridC:  dark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.08)',
+    tooltipBg: dark ? '#1a1d27' : '#ffffff',
+    tooltipBorder: dark ? '#2a2d3a' : '#dddddd',
+    tooltipTitle: dark ? '#e8eaf0' : '#1a1a2e',
+    tooltipBody: dark ? '#6b7080' : '#555566',
+  };
+}
+
+function barToggleTheme() {
+  var current = document.documentElement.getAttribute('data-theme');
+  var next = current === 'light' ? 'dark' : 'light';
+  var btn = document.getElementById('bar-theme-btn');
+  if (btn) btn.textContent = next === 'dark' ? '\u263e' : '\u2600';
+  if (typeof applyTheme === 'function') {
+    applyTheme(next);
+  } else {
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('emt_chart_theme', next);
+  }
+  if (barInited && barData && window.Chart) barRender();
+}
+
+function barSetActive(segId, el) { document.querySelectorAll('#'+segId+' .bar-seg-btn').forEach(b=>b.classList.remove('active')); el.classList.add('active'); }
+function barSetPeriod(v, el) { barPeriod = v; barSetActive('bar-period-seg', el); barSaveState(); barRender(); }
+function barSetMetric(v, el) { barMetric = v; barSetActive('bar-metric-seg', el); barSaveState(); barRender(); }
+function barSetView(v, el)   { barView = v;   barSetActive('bar-view-seg', el);   barSaveState(); barRender(); }
+
+if (!window.Chart) {
+  var s = document.createElement('script');
+  s.src = 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js';
+  document.head.appendChild(s);
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+  var saved = null;
+  try { saved = localStorage.getItem('emt_chart_tab'); } catch(e) {}
+  var tabs = document.querySelectorAll('.chart-tab');
+  if (saved === 'heatmap') { showChart('heatmap', tabs[1]); }
+  else if (saved === 'bar') { showChart('bar', tabs[2]); }
+  else { loadChartContent('daily'); }
+  // Sync theme toggle icon
+  var theme = document.documentElement.getAttribute('data-theme') || 'dark';
+  var btn = document.getElementById('bar-theme-btn');
+  if (btn) btn.textContent = theme === 'dark' ? '\u263e' : '\u2600';
+});
+
 
 function show(id) {
   document.getElementById(id).classList.add('show');

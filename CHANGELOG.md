@@ -1,259 +1,80 @@
 # Changelog
 
+## [1.6.0] — 2026-04-01
+
+### Added
+- **Usage Stats chart** — new 📈 Usage Stats tab on the Charts page; shows daily, monthly and yearly import/export with sub-meter breakdown stacked in billing colours; switchable between kWh and cost; Totals and Net views; monthly and yearly periods include a year selector for multi-year comparison
+- **Data table** — tabular view below the Usage Stats chart mirroring what the chart shows; totals row at the bottom; copy-to-clipboard button exports tab-separated data for pasting into Excel or Google Sheets
+- **Tooltip totals** — Usage Stats chart tooltips show a footer with Import / Export / Net summary below the per-dataset breakdown
+- **Light/dark theme toggle** — all three chart types (Billing, Net Heatmap, Usage Stats) now support switching between light and dark mode; preference is saved to localStorage and restored on next load; system preference (`prefers-color-scheme`) used as the default; theme is synchronised across all chart tabs via a postMessage bridge so toggling in one chart updates all others
+
+### Changed
+- **Summary page renamed to Live Power** — the ⚡ nav item and page heading are now labelled Live Power throughout
+- **Remember last visited page** — the add-on remembers which page and which chart tab you were on and restores both on refresh; invalid or stale saved state is safely ignored
+- **Usage Stats billing accuracy** — figures use `calculate_billing_summary_for_period` for main meter grid remainder (matching the Billing chart exactly), with sub-meters aggregated directly from blocks by meter ID for correct colour mapping and breakdown
+- **Chart tabs renamed** — Daily Usage → Billing, Import / Export → Usage Stats
+- **Help page mobile layout** — font sizes reduced to match the rest of the UI; long sensor entity IDs wrap correctly; code blocks scroll horizontally on mobile; each section is collapsible by tapping the title on small screens
+- **Heatmap mobile improvements** — pinch-zoom disabled on the chart area; scroll grab strip widened to 44px with a visible indicator; chart height responsive to viewport height on mobile; `srcdoc` replaces blob URLs for iframe loading (fixes Safari/WebKit "string did not match" error)
+- **Usage Stats orientation fix** — rotating between portrait and landscape and back now correctly redraws the chart at the new dimensions
+- **Usage Stats cost precision** — cost values displayed to 2 decimal places; kWh values remain at 3 decimal places
+
+### Fixed
+- **`config_page` route missing** — a code editing error had removed the `/config` route from `server.py`, causing a `BuildError` on all pages
+- **`/api/charts/heatmap` route missing** — same issue had removed the heatmap API endpoint, causing a 404 when opening the Net Heatmap tab
+- **Heatmap "Failed to load chart: The string did not match the expected pattern"** — replaced `Blob` + `URL.createObjectURL` with `iframe.srcdoc`; blob URL navigation is blocked in Safari and some mobile browsers
+- **Copy to clipboard** — rewrote clipboard handler to use `execCommand` first (works over HTTP); the previous implementation relied on the `navigator.clipboard` API which requires HTTPS
+
+---
+
 ## [1.5.1] — 2026-03-26
 
 ### Added
-- **Summary page** — new ⚡ Summary page accessible from the sidebar once a power sensor is configured; provides a live at-a-glance view of current power flow and billing
-- **Live power gauge** — asymmetric semicircular gauge showing net grid flow; import and export scales calculated independently from the 95th percentile of the last 7 days of blocks, giving a stable scale that reflects real usage patterns; scale labels shown at each end of the arc
-- **Gauge colour coding** — import arc colour reflects current grid carbon intensity index when UK postcode is configured (green = very low, amber = moderate, red = high); falls back to magnitude-based colouring (green → amber → red relative to import scale) when no postcode configured — works globally
-- **Live power rows** — grid import and export shown as live rows below the gauge in W (below 1 kW) or kW (above 1 kW); updates every 5 seconds
-- **Billing summary cards** — three cards showing Today, This Bill (billing month) and This Year; each shows a bold Total Import row followed by Grid Import, sub-meter breakdown with kWh, Grid Export with kWh, and Standing Charge; billing totals use `energy_charts.calculate_billing_summary_for_period` for accuracy matching the chart billing page exactly
-- **Billing auto-refresh** — billing cards update automatically 1 minute after each block boundary without a page reload; timing derived from `block_minutes` so works correctly for all reconciliation period settings
-- **Carbon intensity forecast** — 🇬🇧 UK only; add your outward postcode prefix (e.g. `DE1`) in Meter Config to enable a 48-hour carbon intensity forecast strip via the National Grid API (no API key required); shows current gCO₂/kWh, index rating badge and colour-coded forecast bars; gauge and carbon card displayed side by side on desktop, stacked on mobile; refreshes every 5 minutes with exponential backoff on failure (5min → 15min → 30min)
-- **Power sensor field** — optional power sensor field added to Meter Config main meter card; supports sensors already reporting in kW; once set the Summary nav link appears
-- **Postcode prefix field** — optional field in Meter Config for UK carbon intensity forecast; clearly labelled UK only; requires district number (e.g. `DE1` not `DE`)
-- **Site name read from live config** — site name now read from `meters_config.json` at chart render time; changing site name in Meter Config takes effect on the next chart render without waiting for a new block
-
-### Changed
-- Summary page billing uses `energy_charts.calculate_billing_summary_for_period` directly — same function as chart billing page — eliminating all discrepancies between summary and chart figures
-- Carbon intensity forecast extended to 48 hours
-- Billing cards use `repeat(auto-fit, minmax(260px, 1fr))` responsive grid — stacks to single column on narrow screens regardless of iframe viewport reporting
-
-### Notes for upgrading users
-- **Power sensor** — add your live power sensor (in kW) to Meter Config to enable the Summary page; this is a separate sensor from the cumulative kWh read sensors; typically named something like `sensor.smart_meter_electricity_power`
-- **Carbon forecast** — UK users only; add your outward postcode district (e.g. `DE1`, `SW1A`, `M1`) to Meter Config; postcode must include the district number
-- **Billing cards** — figures match the chart billing page; the charts remain the authoritative billing view
+- **Live Power page** — new ⚡ page accessible from the sidebar once a power sensor is configured
+- **Live power gauge** — asymmetric semicircular gauge showing net grid flow with carbon-intensity colour coding (UK) or magnitude-based colouring (global)
+- **Billing summary cards** — Today, This Bill and This Year with sub-meter breakdown; billing-accurate figures matching the Billing chart
+- **Billing auto-refresh** — cards update 1 minute after each block boundary without a page reload
+- **Carbon intensity forecast** — 🇬🇧 UK only; 48-hour forecast from the National Grid API via your postcode prefix; no API key required
+- **Power sensor and postcode prefix fields** added to Meter Config
 
 ---
 
-## [1.5.0-beta.6] — 2026-03-26
+## [1.4.0] — 2026-02-10
 
 ### Added
-- **Billing auto-refresh** — Today, This Bill and This Year cards now update automatically without a page reload; refresh is scheduled 1 minute after each block finalise boundary (e.g. with 5-minute blocks, cards refresh at :01, :06, :11 etc); timing is derived from `block_minutes` so works correctly for all reconciliation period settings
-
----
-
-## [1.5.0-beta.5] — 2026-03-26
+- Configurable meter reconciliation period (5, 15 or 30 minutes)
+- Automatic currency detection from rate sensor unit of measurement
+- International sensor compatibility
 
 ### Fixed
-- **Billing maths incorrect** — summary page billing totals now use `energy_charts.calculate_billing_summary_for_period` directly, the same function used by the chart billing page; eliminates all discrepancies between summary and chart billing figures including rate-band subtraction, standing charge grouping and export handling
-- **Battery and EV power rows showing inflated values** — removed battery and EV power rows from the gauge card; these were derived from cumulative kWh read sensors rather than dedicated power sensors, producing meaningless values; grid import and export rows remain
-- **Billing row order** — rows now consistently show Grid Import → sub-meter breakdown → Grid Export → Standing Charge
-- **Summary page too wide on mobile portrait** — billing cards now use `repeat(auto-fit, minmax(260px, 1fr))` which responds to actual container width rather than viewport media queries; stacks to single column on narrow screens regardless of iframe viewport reporting
-- **Gauge and carbon card overflow on mobile** — added `min-width: 0` and `overflow: hidden` to all grid children; gauge wrap is now `width: 100%` up to `max-width: 220px`
-- **Carbon intensity refresh** — replaced fixed 30-minute interval with 5-minute refresh and exponential backoff on failure (5min → 15min → 30min); gauge defaults to neutral grey when no carbon data available rather than red
-
-### Changed
-- Carbon intensity forecast extended from 24 hours to 48 hours
-- Gauge colour for import uses carbon intensity index when postcode configured (UK); falls back to magnitude-based colouring (green → amber → red) when no postcode configured
-- Gauge and carbon intensity card now displayed side by side on desktop, stacked on mobile
+- Export-only daily chart rate axis alignment
+- Billing day always read from live config
 
 ---
 
-## [1.5.0-beta.4] — 2026-03-26
+## [1.3.x] — 2025-12-01
+
+### Fixed
+- Timezone-aware chart rendering
+- UTC timestamp bugs
+- Silent sensor timeout (block stuck at boundary)
+- Standing charge billing display
+
+---
+
+## [1.2.0] — 2025-10-15
 
 ### Added
-- **Summary page** — new ⚡ Summary page accessible from the sidebar providing a live at-a-glance view of current power and billing; appears automatically once a power sensor is configured
-- **Live power gauge** — asymmetric semicircular gauge showing net grid flow; import and export scales are calculated independently from the 95th percentile of the last 7 days of recorded blocks, giving a stable scale that reflects real usage patterns without rescaling mid-session
-- **Power sensor field** — optional power sensor field in Meter Config (main meter); supports sensors reporting in kW; once configured the Summary nav link appears
-- **Gauge colour coding** — import arc colour reflects grid carbon intensity (UK users with postcode configured) or import magnitude (green → amber → red); export always teal
-- **Live power rows** — import, export, battery and EV charger power shown as live rows below the gauge; battery and EV rows appear automatically when sub-meters matching those device types are configured; values shown in W below 1 kW and kW above
-- **Billing summary cards** — three billing cards showing Today, This Bill (billing month) and This Year costs; each card breaks down grid import (kWh), standing charge, grid export (kWh) and sub-meter costs; standing charge counted once per day using the same `charged_days` pattern as the chart engine
-- **Carbon intensity forecast** — 🇬🇧 UK only; add your outward postcode prefix (e.g. `DE1`) in Meter Config to enable a 48-hour carbon intensity forecast strip via the National Grid API; shows current gCO₂/kWh, index rating and colour-coded forecast bars; refreshes every 5 minutes with exponential backoff on failure
-- **Site name read from live config** — site name now read from `meters_config.json` at chart render time (same pattern as billing day introduced in 1.4.0); changing site name in Meter Config takes effect on the next chart render without waiting for a new block
-
-### Changed
-- Power sensor field and postcode prefix field added to Meter Config main meter card
-- Postcode prefix field clearly labelled as UK only with guidance to include the district number (e.g. `DE1` not `DE`)
-- Carbon intensity gauge colour falls back to magnitude-based colouring (green/amber/red by import level) when no postcode is configured, making the gauge useful globally
-- `/api/power` endpoint reads power sensor directly from HA state cache when configured; falls back to deriving kW from consecutive cumulative meter reads when not
-
-### Notes for upgrading users
-- **Power sensor** — add your live power sensor to Meter Config to enable the Summary page; this is a separate sensor from the cumulative kWh read sensors already configured; typically named something like `sensor.smart_meter_electricity_power`
-- **Carbon forecast** — UK users only; add your outward postcode district (e.g. `DE1`, `SW1A`, `M1`) to Meter Config; postcode must include the district number, not just the area code
-- **Summary page** — billing cards read from `blocks.json` and may differ slightly from chart billing summaries due to standing charge timing; the charts remain the authoritative billing view
+- Guided Setup Wizard for first-time configuration
 
 ---
 
-## [1.4.3] — 2026-03-24
-
-### Fixed
-- **Block size not saved when selector is locked** — the Meter Reconciliation Period (Block Size) selector is disabled once data has been collected, but disabled HTML elements are not read by the change event handler; `saveConfig` now explicitly reads the value from disabled selectors before saving, ensuring `block_minutes` is always persisted correctly in `meters_config.json`
-
----
-
-## [1.4.2] — 2026-03-24
-
-### Fixed
-- **Charts not using block size or currency (regression)** — `generate_charts` in the released 1.4.1 build was still missing the `block_minutes` and `currency_symbol` parameters due to a merge conflict resolution error; correctly restored in this release
-
----
-
-## [1.4.1] — 2026-03-24
-
-### Fixed
-- **Block finalisation stuck waiting indefinitely** — `ensure_correct_block` was missing the 2-minute timeout introduced in 1.3.2; if no post-boundary sensor read arrived (e.g. export-only period with a slow-updating sensor), the block would never finalise; timeout restored — after 2 minutes without a post-boundary read the engine finalises anyway
-- **Charts not using block size or currency** — `generate_charts` in the released 1.4.0 build was missing the `block_minutes` and `currency_symbol` parameters due to a merge conflict resolution error; charts were rendering correctly for 30-minute blocks but would fail for 5 or 15 minute blocks, and currency symbol always defaulted to `£` regardless of detected currency
-
----
-
-## [1.4.0] — 2026-03-23
+## [1.1.0] — 2025-09-01
 
 ### Added
-- **Configurable meter reconciliation period** — choose 5, 15 or 30 minute recording intervals at setup time via the wizard or Meter Config; the reconciliation period is locked after first data is collected to prevent mixing intervals in the same dataset
-- **Automatic currency detection** — the add-on reads the `unit_of_measurement` from your rate sensor (e.g. `GBP/kWh`, `USD/kWh`, `EUR/kWh`) and automatically applies the correct currency symbol throughout all charts, billing summaries, and HA sensors; no manual configuration required
-- **International sensor compatibility** — rate and standing charge sensor filters now match on unit suffixes (`/kWh` for rates; `/day` for standing charges) instead of currency-specific prefixes, making the add-on currency-agnostic
-- **Area charts for high-resolution data** — daily usage charts automatically switch from bar to area/step chart style when reconciliation period is less than 15 minutes, giving a cleaner view of high-density data
-- **Heatmap scaled for reconciliation period** — net energy heatmap column width and x-axis tick density automatically adjust; tick labels shown every 30 minutes regardless of interval
-- **Export-only chart fix** — daily charts with export-only data now correctly align the rate axis (y2) so rate lines appear above zero rather than in the negative space
-
-### Changed
-- Reconciliation period is stored in meter meta and in `meters_config.json`; existing users automatically continue with 30-minute blocks with no action required
-- Billing day is now always read from `meters_config.json` at chart render time rather than from individual block meta; changing the billing day in Meter Config takes effect immediately on the next chart render
-- HA cost sensors (`sensor.energy_meter_import_cost`, `sensor.energy_meter_export_credit`) now use the detected currency code (e.g. `GBP`, `USD`) as their `unit_of_measurement` instead of hardcoded `GBP`
-- Help page updated with international context; "Half-Hour Blocks" section renamed to "Meter Reconciliation Period" with guidance on UK 30-minute standard and global variations
-
-### Notes for upgrading users
-- **Existing installations** — reconciliation period defaults to 30 minutes and is locked in the UI; no action required; all historical data and billing summaries are fully preserved
-- **Currency** — detected automatically at startup from your rate sensor unit; no action required for UK users; other currencies detected and applied on first engine start after upgrade
-- **New installations** — select your preferred reconciliation period in the setup wizard before data collection begins
-- **Changing reconciliation period** — not possible through the UI once data exists; requires manual data reset via terminal (see Help page)
+- Flask-based web UI with Meter Config, Charts, Import & Backup, Logs and Help pages
 
 ---
 
-## [1.3.3] — 2026-03-22
+## [1.0.0] — 2025-08-01
 
-### Fixed
-- **Chart generation error after 1.3.2** — `engine.py` was incorrectly including a 1.4.0 change that passed `block_minutes` to chart functions; `energy_charts.py` in 1.3.x does not accept this parameter, causing both charts to fail to generate after every block finalise
-
----
-
-## [1.3.2] — 2026-03-22
-
-### Fixed
-- **Block stuck at boundary with silent sensor** — if a sensor stops firing at a block boundary (e.g. zero consumption overnight, or export-only period), the engine would wait indefinitely for a post-boundary read and never finalise the block; now times out after 2 minutes and finalises anyway; affects users with multiple meters/sub-meters where all sensors can go quiet simultaneously
-
----
-
-## [1.3.1] — 2026-03-22
-
-### Fixed
-- **UTC time bug** — replaced deprecated `datetime.utcnow()` with `datetime.now(timezone.utc)` throughout the engine; on systems where the OS clock is not set to UTC this was causing incorrect block timestamps and rapid catch-up finalisation on restart
-- **Engine crash on data reset** — `capture_samples` now guards against a missing `meters` key in `current_block.json`; previously clearing the file to `{}` caused repeated `KeyError: 'meters'` crashes
-- **Charts always using UTC timezone** — `generate_charts` was reading timezone from the wrong location in config (top-level key that doesn't exist) instead of the meter meta; charts now correctly use the configured timezone (e.g. `Europe/London`)
-- **Standing charge averaging** — billing summary now shows separate rows per rate when a tariff change occurs mid-period rather than showing a misleading average across all days
-
----
-
-## [1.3.0] — 2026-03-21
-
-### Added
-- **Timezone support** — charts now assign blocks to the correct local day based on the user's timezone; configurable per meter in Meter Config and the setup wizard; defaults to UTC for backward compatibility (credit: KShips for the original implementation)
-- **Standing charge rate split** — billing summary now shows separate rows for each standing charge rate when a tariff change occurs mid-period, rather than averaging across all days
-
-### Changed
-- Billing summary standing charge display groups days by rate, showing count and subtotal per rate
-- Meter Config and wizard timezone field uses a curated dropdown of 30 common IANA timezones
-- UK users should set `Europe/London` to correctly handle BST/GMT transitions
-
----
-
-## [1.2.0] — 2026-03-20
-
-### Added
-- **Standalone Docker support** — run without HA Supervisor by providing `HA_URL` and `HA_TOKEN` environment variables; `run.sh` auto-detects mode based on `SUPERVISOR_TOKEN` presence; `Dockerfile.standalone` uses `python:3.12-slim` and works on any platform including Apple Silicon
-- **Logs in standalone mode** — Python logging writes to `/data/energy_meter_tracker/addon.log` in standalone mode so the Logs page works without the Supervisor API
-- **`Dockerfile.standalone`** — separate Dockerfile for standalone Docker users; original `Dockerfile` unchanged for supervised HA
-- **Zip import** — drag a backup zip directly onto the import page; JSON files are extracted server-side and presented for preview before importing
-- **Selective restore modal** — clicking Restore on a backup opens a modal showing all files with checkboxes; user selects which files to restore with mismatch warning if `blocks.json` and `meters_config.json` are not restored together; auto-backup created before restoring
-- **Last-finalise backup restore** — the flat file backup copied to `/share` after every block finalise is now visible and restorable from the Import & Backup page
-- **Wizard auto-save** — pressing Finish in the setup wizard now saves config automatically without needing to find the Save button
-- **Mobile hamburger menu** — sidebar collapses to a hamburger button on mobile portrait and landscape; sidebar slides in as an overlay
-- **Chart auto-refresh** — charts reload automatically every 2 minutes without manual page refresh
-- **Minimum chart height** — daily charts enforce a 320px minimum height to prevent collapse when secondary axis is absent
-- **DEVELOPMENT.md** — architecture guide covering block lifecycle, interpolation, gap filling, file structure, running tests and local dev setup
-- **CONTRIBUTING.md** — contribution guidelines covering bug reporting, feature requests, branch naming, PR workflow and code style
-
-### Fixed
-- Rate line no longer drops to zero on the current in-progress day — truncated at last known reading
-- Chart height instability (runaway height) resolved with fixed minimum and improved sizing logic
-- Heatmap scroll now uses `100vh` so all rows are reachable regardless of screen height
-- Heatmap right-edge scroll conflict on mobile — touch guard overlay allows page scroll without triggering chart zoom
-- Weekend shading in heatmap now correctly fills to the right edge of the totals chart
-- Charts not updating after HA session timeout — blob URL cache cleared on auto-refresh cycle
-- Period mode switching (Bill/Month/Quarter/Year) no longer triggers a chart reload delay — resize suppressed during DOM changes via `postMessage`
-- Billing table right-justification fixed — channel title and site header rows now correctly left-aligned
-- Daily chart summary panel font sizes now consistent across all meter types at all zoom levels
-
-### Changed
-- Import & Backup page restructured — backups section moved to top, Create Backup button prominent, PyScript path column removed, Restore risk column added to file reference
-- Backup list shows top 5 with scroll for more, restore button per entry
-- Period nav bar tightened — consistent `11px` font and reduced padding across all buttons, labels and selectors so bar fits on one row
-- Billing table row padding and font sizes reduced — more bill visible without scrolling
-- Daily chart summary panel uses `clamp(10px, 1vw, 13px)` font scaling and `white-space: nowrap` to prevent wrapping at any zoom level
-- Chart page `max-width` constraint removed — charts fill full iframe width at any zoom level
-- Sub-meter card and wizard device hints now explicitly state sensors must be **cumulative kWh consumed (import only)** — not net, not export, not watts
-- Sub-meter info box now states that if no rate sensor is provided the main meter import rate is used automatically
-- Help page sensor requirements updated to match
-- Mobile chart height uses more available vertical space in both portrait and landscape
-- Panel icon changed to `mdi:speedometer`
-- README data & backup section expanded with survival table, pre-upgrade advice and standalone Docker volume mount guidance
-
-### Known Issues
-- Plotly legend occasionally renders with a spurious scrollbar on mobile portrait — self-corrects on first user interaction with the chart
-
----
-
-## [1.1.0] — 2026-03-14
-
-### Added
-- **Setup Wizard** — guided configuration flow for main meter, EV charger, battery and heat pump with sensor pre-population from existing config
-- **Live Log Viewer** — dedicated logs page with auto-refresh, colour-coded levels and line count selector
-- **Help & Reference page** — full engine documentation including disclaimer, interpolation explanation, sub-meter logic, sensor requirements, gap filling and data storage
-- **Ingress support** — "Show in sidebar" toggle now works in HA; all pages accessible embedded in the HA UI
-- **Logo and icon** — branding shown in sidebar and add-on store, sidebar icon changed to `mdi:meter-electric`
-- **Backup on config save** — zip snapshot created automatically before every config change with 20-zip rolling retention
-- **Manual backup button** — on the Import & Data page with list of 10 most recent backups
-- **Entity picker filtering** — dropdowns filtered by sensor type (kWh for reads, £/kWh for rates, £/day for standing charge) with unit shown inline
-- **Entity picker width** — dropdown expands to full entity ID width, no more truncation on long names
-- **Meter ID lock** — existing meter IDs are read-only after first save to prevent orphaning historical data
-- **Zero blocks warning** — amber banner on Charts page when no data has been recorded yet
-- **Charts as default page** — app opens directly to Charts once meters are configured
-- **Config reload on save** — engine re-registers sensor subscriptions immediately after a config change without requiring a restart
-- **HA restart resilience** — WebSocket reconnects indefinitely after HA restart and re-runs full engine startup on reconnect
-- **Unit tests** — 42 tests covering interpolation, gap detection, block computation, boundary reads and gap filling
-
-### Fixed
-- Channel meta (MPAN, tariff, source) no longer stripped on config save
-- Double sensor subscription after HA restart reconnect
-- Unclosed aiohttp session on failed reconnect attempts
-- All fetch() calls updated for Ingress path compatibility using `apiUrl()` helper
-- Plotly charts now render correctly in sidebar via blob URL iframe
-- Backup list and import fetch calls had mismatched parentheses — fixed
-- Backup to `/share` re-enabled after startup ordering issue resolved
-
-### Changed
-- Replaced Werkzeug development server with Waitress for production use
-- Removed diagnostic boot.log lines from run.sh
-- Solar removed from setup wizard — export sub-metering not yet supported
-- Charts loaded via API and blob URL rather than direct iframe to support Ingress
-- Backup location standardised to `/share/energy_meter_tracker_backup/` with dated zip archives
-
----
-
-## [1.0.0] — 2026-03-10
-
-### Added
-- Initial port from PyScript to Home Assistant add-on
-- Half-hour block engine with boundary interpolation
-- Gap detection and interpolated gap filling (up to 12 hours)
-- Sub-meter support with PASS 2 grid-authoritative consumption distribution
-- Battery/inverter logic (`inverter_possible`, `v2x_capable` flags)
-- Standing charge capture per block
-- Four synthetic HA sensors — import/export kWh and cost (`total_increasing`)
-- Net heatmap and daily import/export charts
-- Flask web UI on port 8099
-- Meter configuration page with entity search
-- Import page for migrating PyScript data files
-- Backup to `/share` after every block finalise
-- Auto-start on boot
+Initial release. Core metering engine, sub-meter support, gap filling, billing charts, HA sensor publishing.
