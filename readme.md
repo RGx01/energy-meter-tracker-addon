@@ -2,7 +2,8 @@
 
 A Home Assistant add-on that records your electricity usage in precise configurable intervals — matching your energy supplier's meter reconciliation period for accurate billing.
 
-![Usage Stats chart showing daily import/export breakdown by sub-meter](screenshots/usage_stats.png)
+![Usage Stats chart showing daily import/export breakdown by sub-meter](screenshots/usage_stats0.png)
+![Usage Stats chart showing daily import/export breakdown by sub-meter](screenshots/usage_stats1.png)
 
 ## What it does
 
