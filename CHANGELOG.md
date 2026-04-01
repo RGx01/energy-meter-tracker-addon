@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.6.3] — 2026-04-01
+
+### Fixed
+- **Heatmap mobile portrait — chart fills full viewport** — the CSS `transform: scale()` used to fit the chart width to the mobile screen reduces the visual size of the element but does not change its layout dimensions; previously setting `scroll.style.height = vh` only set the layout height, which after the scale transform rendered visually as `vh × scale` (roughly 30% of the viewport on a typical phone); the fix sets both `outer` and `scroll` height to `vh / scale` so the post-transform visual height exactly equals the viewport height — the Plotly chart at natural row height fills the screen and the user scrolls to see all rows
+- **Heatmap mobile pinch zoom** — added `fixedrange: true` to both x-axes and `dragmode: false` to the Plotly layout to definitively block touch zoom regardless of Plotly's internal touch handling
+- **Heatmap scroll-guard strip overlapping totals bar** — moved from `position:fixed; right:0` to `position:fixed; left:0` so it sits over the y-axis date labels rather than the totals bar
+- **Usage Stats width unconstrained on mobile portrait** — `min-width: 0` and `overflow-x: hidden` added to `.main`; `min-width: 0` added to `.content`; without these, flex children can expand beyond the viewport causing the chart to overflow and appear cut off until a resize event corrects it
+
+---
+
 ## [1.6.2] — 2026-04-01
 
 ### Added

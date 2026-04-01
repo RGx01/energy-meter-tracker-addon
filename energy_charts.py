@@ -2267,10 +2267,10 @@ function _getThemeColours() {{
   }}
   html {{ scroll-padding-top: 80px; }}
 html, body {{ margin:0; padding:0; overflow:hidden; touch-action: none; background:var(--bg); color:var(--text); height:100%; }}
-  #outer {{ width:{heatmap_width}px; transform-origin: top left; position: relative; }}
+  #outer {{ width:{heatmap_width}px; transform-origin: top left; position: relative; min-height: 100vh; }}
   #scroll {{
     width:{heatmap_width}px;
-    height:100vh;
+    height:auto;
     overflow-y:scroll;
     overflow-x:hidden;
     border:1px solid var(--border);
@@ -2329,27 +2329,26 @@ function scaleChart() {{
     outer.style.transform = 'scale(' + scale + ')';
     outer.style.transformOrigin = 'top left';
     outer.style.width = cw + 'px';
-    // Set outer height to fill exactly the viewport so no gap below
-    // Don't force outer to vh — let scroll fill it instead
-    outer.style.height = 'auto';
+    if (isMobile) {{
+      // After scaling, visual height = layout height * scale.
+      // To make the chart fill vh visually, set layout height = vh / scale.
+      var targetH = Math.ceil(vh / scale);
+      outer.style.height = targetH + 'px';
+      scroll.style.height = targetH + 'px';
+    }} else {{
+      outer.style.height = 'auto';
+      var scrollH = Math.min({n_rows}, {visible_rows}) * {row_height} + {margin_t} + {margin_b};
+      scroll.style.height = scrollH + 'px';
+    }}
   }} else {{
     outer.style.transform = '';
     outer.style.transformOrigin = '';
     outer.style.width = '';
     outer.style.height = '';
+    var scrollH = Math.min({n_rows}, {visible_rows}) * {row_height} + {margin_t} + {margin_b};
+    scroll.style.height = scrollH + 'px';
   }}
-  // On mobile fill as much of the viewport as possible
-  var maxRows = isMobile
-    ? Math.max(10, Math.floor((vh - {margin_t} - {margin_b}) / {row_height}) + 6)
-    : {visible_rows};
-  var scrollH = Math.min({n_rows}, maxRows) * {row_height} + {margin_t} + {margin_b};
-  // On mobile: fill the full viewport height so no gap appears below the chart
-  if (isMobile) scrollH = vh;
-  scroll.style.height = scrollH + 'px';
-  // On mobile resize the Plotly chart to match scrollH so rows fill the space
-  if (isMobile && window.Plotly) {{
-    Plotly.relayout('heatmap', {{height: scrollH}});
-  }}
+  // Never relayout Plotly height — cells must stay square at their natural row_height
 }}
 // Prevent pinch-zoom on the chart — Plotly intercepts touches and can trigger browser zoom
 document.addEventListener('touchstart', function(e) {{
