@@ -10,6 +10,7 @@
   <div style="display:flex;gap:8px;">
     <button class="btn btn-secondary" id="btn-wizard">✦ Setup Wizard</button>
     <button class="btn btn-secondary" id="btn-refresh">↺ Refresh Entities</button>
+    <a href="{{ url_for('config_history_page') }}" class="btn btn-secondary">🕓 Billing History</a>
     <button class="btn btn-primary" id="btn-save">💾 Save Config</button>
   </div>
 </div>
@@ -74,6 +75,22 @@
     </div>
   </div>
 </div>
+
+<!-- ── Change Reason Modal ────────────────────────────────────────────────── -->
+<div id="change-reason-modal" style="display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,0.5);align-items:center;justify-content:center;">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:24px;max-width:420px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.3);">
+    <div style="font-size:15px;font-weight:600;margin-bottom:8px;color:var(--text);">Save Configuration</div>
+    <div style="font-size:13px;color:var(--muted);margin-bottom:16px;">Optionally describe what changed — this is recorded in config history.</div>
+    <input id="change-reason-input" type="text" placeholder="e.g. Switched to Octopus Energy, changed billing day"
+      style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;margin-bottom:16px;">
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button id="change-reason-skip" class="btn" style="font-size:13px;">Skip</button>
+      <button id="change-reason-save" class="btn btn-primary" style="font-size:13px;">💾 Save</button>
+    </div>
+  </div>
+</div>
+
+
 
 {% endblock %}
 
@@ -645,19 +662,51 @@ function hideDrop(inp) {
 }
 
 // ── Save ──────────────────────────────────────────────────────────────────────
-async function saveConfig() {
+function _doSave(changeReason) {
   hideAlerts();
-  try {
-    var r = await fetch(apiUrl('/api/config'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(config)
-    });
-    var data = await r.json();
+  var payload = Object.assign({}, config);
+  if (changeReason) payload.change_reason = changeReason;
+  fetch(apiUrl('/api/config'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  }).then(function(r) { return r.json(); }).then(function(data) {
     if (data.ok) show('alert-success');
     else showError(data.error || 'Save failed');
-  } catch(e) { showError(e.message); }
+  }).catch(function(e) { showError(e.message); });
 }
+
+function saveConfig() {
+  // Show the change reason modal — user can skip or provide a reason
+  var modal = document.getElementById('change-reason-modal');
+  var input = document.getElementById('change-reason-input');
+  input.value = '';
+  modal.style.display = 'flex';
+  setTimeout(function() { input.focus(); }, 50);
+}
+
+document.getElementById('change-reason-save').addEventListener('click', function() {
+  var reason = document.getElementById('change-reason-input').value.trim();
+  document.getElementById('change-reason-modal').style.display = 'none';
+  _doSave(reason || null);
+});
+
+document.getElementById('change-reason-skip').addEventListener('click', function() {
+  document.getElementById('change-reason-modal').style.display = 'none';
+  _doSave(null);
+});
+
+document.getElementById('change-reason-input').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') {
+    var reason = this.value.trim();
+    document.getElementById('change-reason-modal').style.display = 'none';
+    _doSave(reason || null);
+  } else if (e.key === 'Escape') {
+    document.getElementById('change-reason-modal').style.display = 'none';
+  }
+});
+
+// Config history moved to /config-history page
 
 // ── Wizard ────────────────────────────────────────────────────────────────────
 var wiz = {
@@ -1017,7 +1066,7 @@ async function wizApplyAndClose() {
 
   closeWizard();
   renderAll();
-  // Auto-save after wizard completes
+  // Auto-save after wizard completes — no change reason for initial setup
   try {
     var r = await fetch(apiUrl('/api/config'), {
       method: 'POST',

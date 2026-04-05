@@ -28,6 +28,7 @@ from energy_engine_io import (
 )
 import energy_charts
 from ha_client import HAClient
+from block_store import BlockStore, open_block_store, migrate_json_to_sqlite
 
 logger = logging.getLogger("engine")
 
@@ -38,7 +39,8 @@ logger = logging.getLogger("engine")
 DATA_DIR           = "/data/energy_meter_tracker"
 CONFIG_PATH        = f"{DATA_DIR}/meters_config.json"
 CURRENT_BLOCK_PATH = f"{DATA_DIR}/current_block.json"
-BLOCKS_PATH        = f"{DATA_DIR}/blocks.json"
+BLOCKS_PATH        = f"{DATA_DIR}/blocks.json"    # read-only: used only for one-time migration on startup
+BLOCKS_DB_PATH     = f"{DATA_DIR}/blocks.db"
 TOTALS_PATH        = f"{DATA_DIR}/cumulative_totals.json"
 
 import os as _os_engine
@@ -47,6 +49,16 @@ SHARE_BACKUP_DIR   = (
     if _os_engine.environ.get("EMT_MODE") == "standalone"
     else "/share/energy_meter_tracker_backup"
 )
+
+# Module-level BlockStore instance — opened in engine_startup()
+_store: BlockStore | None = None
+
+
+def get_store() -> BlockStore:
+    """Return the active BlockStore. Raises if engine_startup has not run."""
+    if _store is None:
+        raise RuntimeError("BlockStore not initialised — engine_startup() has not run")
+    return _store
 
 CHART_DIR          = "/data/energy_meter_tracker"   # accessible from HA /local/
 BLOCK_MINUTES      = 30  # default — overridden at runtime from config
@@ -92,9 +104,7 @@ def io_save(path: str, data):
 
 
 def append_block(block: dict):
-    blocks = load_json(BLOCKS_PATH, [])
-    blocks.append(block)
-    io_save(BLOCKS_PATH, blocks)
+    get_store().append_block(block)
 
 
 def io_save_file(path: str, content: str):
@@ -106,14 +116,18 @@ def io_save_file(path: str, content: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _backup_to_share():
-    """Copy data files to /share/energy_meter_tracker_backup after each finalise."""
+    """Backup data files to SHARE_BACKUP_DIR after each block finalise."""
     try:
         ensure_dir(SHARE_BACKUP_DIR)
-        for filename in ("blocks.json", "cumulative_totals.json", "meters_config.json", "current_block.json"):
-            src = f"{DATA_DIR}/{filename}"
-            dst = f"{SHARE_BACKUP_DIR}/{filename}"
-            if os.path.exists(src):
-                shutil.copy2(src, dst)
+        # Backup SQLite DB using online backup API (safe while engine is writing)
+        store = get_store()
+        store.backup(f"{SHARE_BACKUP_DIR}/blocks.db")
+        # Copy remaining JSON files
+        for filename in ("cumulative_totals.json", "meters_config.json", "current_block.json"):
+            src_path = f"{DATA_DIR}/{filename}"
+            dst_path = f"{SHARE_BACKUP_DIR}/{filename}"
+            if os.path.exists(src_path):
+                shutil.copy2(src_path, dst_path)
         logger.info("_backup_to_share: backup written to %s", SHARE_BACKUP_DIR)
     except Exception as e:
         logger.warning("_backup_to_share: failed: %s", e)
@@ -686,8 +700,12 @@ async def update_ha_sensors(ha: HAClient, engine_totals: dict):
 # Chart generation helper
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_charts(blocks: list):
-    if not blocks:
+def generate_charts(store: "BlockStore"):
+    """
+    Generate all charts from the BlockStore.
+    Queries only the data each chart needs rather than loading all blocks.
+    """
+    if store.count_blocks() == 0:
         logger.info("generate_charts: no blocks, skipping")
         return
     config        = load_config()
@@ -699,6 +717,14 @@ def generate_charts(blocks: list):
     timezone_name   = main_meta.get("timezone", "UTC")
     block_minutes   = int(main_meta.get("block_minutes") or 30)
     currency_symbol = main_meta.get("currency_symbol", "£")
+
+    # Both charts need all blocks for now — phase 2 of optimisation will
+    # push date-range queries into the charting functions themselves.
+    # This is still a significant win: the store is queried once and both
+    # charts share the same list, vs the old approach of loading the full
+    # JSON file twice (once per chart call site).
+    blocks = store.get_all_blocks()
+
     try:
         html = energy_charts.generate_net_heatmap(blocks, timezone_name=timezone_name, block_minutes=block_minutes, currency=currency_symbol)
         io_save_file(f"{CHART_DIR}/net_heatmap.html", html)
@@ -987,8 +1013,7 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
     logger.info("finalise_block: rolling buffer pruned, new block starts %s", iso(block_end_dt))
 
     # ── Generate charts ────────────────────────────────────────────────────
-    blocks = load_json(BLOCKS_PATH, [])
-    generate_charts(blocks)
+    generate_charts(get_store())
 
     # ── Backup to /share ───────────────────────────────────────────────────
     _backup_to_share()
@@ -1215,17 +1240,38 @@ async def engine_startup(ha: HAClient):
     # Persist currency to meters_config so charts can read it
     save_json_atomic(CONFIG_PATH, config)
 
-    # ── Validate blocks store ────────────────────────────────────────────
-    blocks = load_json(BLOCKS_PATH, [])
-    if not isinstance(blocks, list):
-        save_json_atomic(BLOCKS_PATH, [])
-        blocks = []
+    # ── Open BlockStore (auto-migrate from blocks.json if needed) ────────
+    global _store
+    _store = open_block_store(BLOCKS_DB_PATH)
 
-    logger.info("engine_startup: %d existing blocks loaded", len(blocks))
+    if _store.get_current_config_period_id() is None:
+        # Fresh DB — check if blocks.json exists to migrate
+        if os.path.exists(BLOCKS_PATH):
+            logger.info("engine_startup: blocks.json found — running auto-migration to SQLite")
+            migrated = migrate_json_to_sqlite(BLOCKS_PATH, _store, config)
+            logger.info("engine_startup: migration complete — %d blocks migrated", migrated)
+            # Rename blocks.json so it's preserved but no longer used
+            migrated_path = BLOCKS_PATH + ".migrated"
+            try:
+                os.rename(BLOCKS_PATH, migrated_path)
+                logger.info("engine_startup: blocks.json renamed to %s", migrated_path)
+            except Exception as e:
+                logger.warning("engine_startup: could not rename blocks.json: %s", e)
+        elif os.path.exists(BLOCKS_PATH + ".migrated"):
+            # DB was deleted but migrated source still exists — re-migrate from it
+            logger.info("engine_startup: blocks.json.migrated found — re-migrating to fresh DB")
+            migrated = migrate_json_to_sqlite(BLOCKS_PATH + ".migrated", _store, config)
+            logger.info("engine_startup: re-migration complete — %d blocks migrated", migrated)
+        else:
+            # Brand new install — create initial config period
+            _store.insert_config_period(config)
+            logger.info("engine_startup: new install — initial config period created")
+
+    logger.info("engine_startup: %d existing blocks in store", _store.count_blocks())
 
     # ── Session gap detection ────────────────────────────────────────────
-    if blocks:
-        last_block     = blocks[-1]
+    last_block = _store.get_last_block()
+    if last_block:
         last_block_end = last_block.get("end")
         if last_block_end:
             missing_windows = detect_gap(last_block_end, datetime.now(timezone.utc).replace(tzinfo=None))
@@ -1242,5 +1288,5 @@ async def engine_startup(ha: HAClient):
                 logger.info("engine_startup: no session gap detected")
 
     # ── Startup charts ───────────────────────────────────────────────────
-    generate_charts(blocks)
+    generate_charts(_store)
     logger.info("engine_startup: complete")

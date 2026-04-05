@@ -34,7 +34,7 @@
       <div id="restore-file-list" style="margin-bottom:16px;"></div>
 
       <div id="restore-mismatch-warn" style="display:none;background:rgba(240,82,82,0.08);border:1px solid var(--danger);border-radius:var(--radius);padding:12px 14px;margin-bottom:16px;font-size:13px;line-height:1.7;color:var(--danger);">
-        ⚠️ <strong>Mismatch risk:</strong> restoring <code>blocks.json</code> without <code>meters_config.json</code>
+        ⚠️ <strong>Mismatch risk:</strong> restoring <code>blocks.db</code> without <code>meters_config.json</code>
         (or vice versa) may cause calculation errors if meter IDs have changed between backups.
       </div>
 
@@ -78,8 +78,8 @@
   " ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)" onclick="document.getElementById('file-input').click()">
     <div style="font-size:32px;margin-bottom:8px;">📂</div>
     <div style="color:var(--text);font-size:14px;margin-bottom:4px;">Drop a backup zip or JSON files here, or click to browse</div>
-    <div style="color:var(--muted);font-size:12px;">Accepts .zip backup archives or individual .json files</div>
-    <input type="file" id="file-input" multiple accept=".json,.zip" style="display:none" onchange="onFileSelect(this.files)">
+    <div style="color:var(--muted);font-size:12px;">Accepts .zip backup archives, blocks.db, or individual .json files</div>
+    <input type="file" id="file-input" multiple accept=".json,.zip,.db" style="display:none" onchange="onFileSelect(this.files)">
   </div>
 
   <div id="file-list" style="margin-bottom:20px;display:none;">
@@ -105,8 +105,8 @@
     </thead>
     <tbody>
       <tr style="border-bottom:1px solid var(--border);">
-        <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">blocks.json</td>
-        <td style="padding:10px 0;color:var(--text);">All finalised half-hourly blocks</td>
+        <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">blocks.db</td>
+        <td style="padding:10px 0;color:var(--text);">All finalised blocks (SQLite). Legacy blocks.json also accepted.</td>
         <td style="padding:10px 0;color:var(--warning);font-size:12px;">Restore with config together</td>
       </tr>
       <tr style="border-bottom:1px solid var(--border);">
@@ -132,7 +132,7 @@
 
 {% block scripts %}
 <script>
-const KNOWN_FILES = ['blocks.json','current_block.json','cumulative_totals.json','meters_config.json'];
+const KNOWN_FILES = ['blocks.db','blocks.json','current_block.json','cumulative_totals.json','meters_config.json'];
 let selectedFiles = {};
 let _restoreZip   = null;
 let _restoreFlat  = false;
@@ -156,7 +156,7 @@ async function onFileSelect(files) {
   for (const f of Array.from(files)) {
     if (f.name.endsWith('.zip')) {
       await extractZipToSelected(f);
-    } else if (f.name.endsWith('.json')) {
+    } else if (f.name.endsWith('.json') || f.name.endsWith('.db')) {
       selectedFiles[f.name] = f;
     }
   }
@@ -229,7 +229,8 @@ async function doImport() {
   hideAlerts();
   const form = new FormData();
   const fieldMap = {
-    'blocks.json':            'blocks',
+    'blocks.db':              'blocks',   // current format
+    'blocks.json':            'blocks',   // legacy format — server migrates automatically
     'current_block.json':     'current_block',
     'cumulative_totals.json': 'cumulative_totals',
     'meters_config.json':     'meters_config',
@@ -281,10 +282,11 @@ async function restoreFromFlat() {
     });
 
     var riskMap = {
-      'blocks.json':            { risk: 'warning', note: 'Restore with meters_config.json for safety' },
+      'blocks.db':              { risk: 'warning', note: 'Restore with meters_config.json for safety' },
+      'blocks.json':            { risk: 'warning', note: 'Legacy format — will be migrated to blocks.db on restore' },
       'current_block.json':     { risk: 'success', note: 'Safe to restore alone' },
       'cumulative_totals.json': { risk: 'success', note: 'Safe to restore alone' },
-      'meters_config.json':     { risk: 'warning', note: 'Restore with blocks.json for safety' },
+      'meters_config.json':     { risk: 'warning', note: 'Restore with blocks.db for safety' },
     };
 
     var listEl = document.getElementById('restore-file-list');
