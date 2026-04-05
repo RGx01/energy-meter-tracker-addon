@@ -1628,6 +1628,78 @@ def api_backup_restore():
                     pass
             _store = None
 
+        # ── Sync meters_config.json ↔ active config period ─────────────────
+        # Case 1: meters_config.json restored — update the active period in the
+        #         DB to match, so billing history and the file stay in sync.
+        # Case 2: blocks.db restored without meters_config.json — write the
+        #         active period's full_config_json back to meters_config.json
+        #         so the file reflects the DB state.
+        try:
+            import json as _json2
+            from energy_engine_io import load_json as _lj_sync, save_json_atomic as _sja_sync
+            cfg_path = os.path.join(DATA_DIR, "meters_config.json")
+            store_sync = _get_store()
+
+            if "meters_config.json" in restored:
+                # Case 1: file was restored — push its content into the active DB period
+                restored_cfg = _lj_sync(cfg_path, {})
+                if restored_cfg:
+                    active_cp = store_sync._conn.execute(
+                        "SELECT id FROM config_periods WHERE effective_to IS NULL "
+                        "ORDER BY effective_from DESC LIMIT 1"
+                    ).fetchone()
+                    if active_cp:
+                        main_meta = {}
+                        for md in restored_cfg.get("meters", {}).values():
+                            if not (md.get("meta") or {}).get("sub_meter"):
+                                main_meta = md.get("meta") or {}
+                                break
+                        store_sync._conn.execute(
+                            """UPDATE config_periods
+                               SET billing_day       = ?,
+                                   block_minutes      = ?,
+                                   timezone           = ?,
+                                   currency_symbol    = ?,
+                                   currency_code      = ?,
+                                   site_name          = ?,
+                                   full_config_json   = ?
+                               WHERE id = ?""",
+                            (
+                                int(main_meta.get("billing_day") or 1),
+                                int(main_meta.get("block_minutes") or 30),
+                                main_meta.get("timezone", "UTC"),
+                                main_meta.get("currency_symbol", "£"),
+                                main_meta.get("currency_code", "GBP"),
+                                main_meta.get("site"),
+                                _json2.dumps(restored_cfg),
+                                active_cp["id"],
+                            )
+                        )
+                        store_sync._conn.commit()
+                        logger.info(
+                            "api_backup_restore: active config period updated "
+                            "to match restored meters_config.json"
+                        )
+                        restored.append("config_periods (synced from meters_config.json)")
+
+            elif "blocks.db" in restored and "meters_config.json" not in restored:
+                # Case 2: DB restored without config file — write active period back to file
+                active_cp = store_sync._conn.execute(
+                    "SELECT full_config_json FROM config_periods "
+                    "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+                ).fetchone()
+                if active_cp and active_cp["full_config_json"]:
+                    db_cfg = _json2.loads(active_cp["full_config_json"])
+                    _sja_sync(cfg_path, db_cfg)
+                    logger.info(
+                        "api_backup_restore: meters_config.json restored "
+                        "from active config period in restored DB"
+                    )
+                    restored.append("meters_config.json (synced from restored blocks.db)")
+
+        except Exception as _sync_e:
+            logger.warning("api_backup_restore: config sync failed: %s", _sync_e)
+
         return jsonify({"ok": True, "restored": restored})
     except Exception as e:
         logger.error("api_backup_restore: %s", e)
