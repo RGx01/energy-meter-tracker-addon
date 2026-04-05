@@ -129,6 +129,399 @@ def get_all_calmonth_periods(blocks, tz=None):
     return periods
 
 
+def get_billing_periods_from_config_periods(config_periods, tz=None):
+    """
+    Fast alternative to get_billing_periods_from_config_history that takes
+    config_periods rows (from store.get_config_periods()) instead of all blocks.
+
+    Avoids loading every block from the database — only needs the config period
+    metadata and the first/last block_start per period.
+
+    Returns the same list of (start_datetime, end_datetime) tuples as
+    get_billing_periods_from_config_history.
+    """
+    if not config_periods:
+        return []
+
+    _tz = tz or ZoneInfo("UTC")
+
+    # Build synthetic block-like segments from config_period rows
+    # Each segment: (billing_day, ef_date, seg_last_naive)
+    segments = []
+    for p in config_periods:
+        if not p.get("effective_from"):
+            continue
+        billing_day = int(p.get("billing_day") or 1)
+
+        # Parse effective_from UTC → local date
+        from datetime import datetime as _dt2, timezone as _tz2
+        try:
+            ef_iso = p["effective_from"].replace(" ", "T").split(".")[0]
+            ef_utc = _dt2.fromisoformat(ef_iso).replace(tzinfo=_tz2.utc)
+            ef_local_date = ef_utc.astimezone(_tz).date()
+        except Exception:
+            continue
+
+        # seg_last: last block date in this period (local), or ef_date if no blocks
+        last_bs = p.get("last_block_start")
+        if last_bs:
+            try:
+                last_utc = _dt2.fromisoformat(
+                    str(last_bs).replace(" ", "T").split(".")[0]
+                ).replace(tzinfo=_tz2.utc)
+                last_local = last_utc.astimezone(_tz).date()
+            except Exception:
+                last_local = ef_local_date
+        else:
+            last_local = ef_local_date
+
+        segments.append((billing_day, ef_local_date, last_local))
+
+    if not segments:
+        return []
+
+    # Use the same period-generation logic as get_billing_periods_from_config_history
+    # Build synthetic blocks with _effective_from/_billing_day/_timezone set,
+    # then delegate to the existing function.
+    # Simpler: reconstruct the period list directly using the same algorithm.
+
+    import calendar as _cal
+    from datetime import datetime as _dt3, timedelta as _td
+
+    def _date_to_naive(d):
+        return _dt3(d.year, d.month, d.day, 0, 0, 0)
+
+    def _period_end_from_start(p_start, billing_day):
+        m = p_start.month + 1
+        y = p_start.year + (1 if m > 12 else 0)
+        m = m - 12 if m > 12 else m
+        try:
+            return p_start.replace(year=y, month=m, day=billing_day,
+                                   hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+        except ValueError:
+            last_day = _cal.monthrange(y, m)[1]
+            return p_start.replace(year=y, month=m, day=last_day,
+                                   hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+
+    def _transition_date(ef_local_date, new_bd):
+        if ef_local_date.day < new_bd:
+            try:
+                return ef_local_date.replace(day=new_bd)
+            except ValueError:
+                import calendar
+                last = calendar.monthrange(ef_local_date.year, ef_local_date.month)[1]
+                return ef_local_date.replace(day=last)
+        else:
+            m = ef_local_date.month + 1
+            y = ef_local_date.year + (1 if m > 12 else 0)
+            m = m - 12 if m > 12 else m
+            try:
+                return ef_local_date.replace(year=y, month=m, day=new_bd)
+            except ValueError:
+                import calendar
+                last = calendar.monthrange(y, m)[1]
+                return ef_local_date.replace(year=y, month=m, day=last)
+
+    # Compute transitions between segments
+    transitions = []
+    for i in range(len(segments) - 1):
+        next_bd, next_ef, _ = segments[i + 1]
+        transitions.append(_transition_date(next_ef, next_bd))
+
+    # first_block_date: first block across all periods
+    first_block_date = None
+    for p in config_periods:
+        fb = p.get("first_block_start")
+        if fb:
+            try:
+                from datetime import datetime as _dt4, timezone as _tz3
+                fb_utc = _dt4.fromisoformat(
+                    str(fb).replace(" ", "T").split(".")[0]
+                ).replace(tzinfo=_tz3.utc)
+                fb_local = fb_utc.astimezone(_tz).date()
+                if first_block_date is None or fb_local < first_block_date:
+                    first_block_date = fb_local
+            except Exception:
+                pass
+
+    if first_block_date is None:
+        return []
+
+    periods = []
+
+    for seg_idx, (billing_day, ef_date, seg_last) in enumerate(segments):
+        seg_end = _date_to_naive(transitions[seg_idx]) if seg_idx < len(transitions) else None
+        seg_last_dt = _date_to_naive(seg_last) + _td(days=1)
+
+        if seg_idx == 0:
+            ref = first_block_date
+            m, y = ref.month, ref.year
+            if ref.day < billing_day:
+                m -= 1
+                if m == 0: m = 12; y -= 1
+            try:
+                period_start = _date_to_naive(ref.replace(year=y, month=m, day=billing_day))
+            except ValueError:
+                period_start = _date_to_naive(ref.replace(
+                    year=y, month=m, day=_cal.monthrange(y, m)[1]))
+        else:
+            period_start = _date_to_naive(transitions[seg_idx - 1])
+
+        truncate_from = None
+        if seg_end:
+            p0 = period_start
+            while True:
+                pe0 = _period_end_from_start(p0, billing_day)
+                if pe0 > seg_end - _td(days=1):
+                    truncate_from = p0
+                    break
+                p0 = pe0
+
+        while True:
+            period_end = _period_end_from_start(period_start, billing_day)
+
+            if seg_end and truncate_from is not None and period_start == truncate_from:
+                period_end = seg_end
+            elif seg_end and truncate_from is not None and period_end == truncate_from:
+                next_ef_naive = _date_to_naive(segments[seg_idx + 1][1])
+                if period_start < next_ef_naive <= truncate_from:
+                    period_end = seg_end
+            elif seg_end and period_end > seg_end:
+                period_end = seg_end
+
+            if period_end > period_start:
+                entry = (period_start, period_end)
+                if not periods or periods[-1] != entry:
+                    periods.append(entry)
+
+            if seg_end and period_end >= seg_end:
+                break
+            if period_end >= seg_last_dt:
+                if seg_end and truncate_from is not None and period_end <= truncate_from:
+                    truncated = (truncate_from, seg_end)
+                    if not periods or periods[-1] != truncated:
+                        periods.append(truncated)
+                break
+
+            period_start = period_end
+
+    return periods
+
+
+def get_billing_periods_from_config_history(blocks, tz=None):
+    """
+    Build billing periods using the historically correct billing_day for each
+    config period, using effective_from as the authoritative segment boundary.
+
+    Transition rule: given effective_from date and new billing_day,
+      - if effective_from.day < new_bd: transition = new_bd of effective_from.month
+      - if effective_from.day >= new_bd: transition = new_bd of effective_from.month + 1
+    The old config's last period ends at transition, the new config starts at transition.
+
+    Falls back to get_all_billing_periods() if blocks lack config period info.
+    """
+    if not blocks:
+        return []
+
+    _tz = tz or ZoneInfo("UTC")
+    sorted_blocks = sorted(
+        [b for b in blocks if b and b.get("start")],
+        key=lambda b: b["start"]
+    )
+
+    # Check whether blocks carry config period info
+    has_config_info = any(b.get("_billing_day") is not None for b in sorted_blocks)
+    if not has_config_info:
+        billing_day = int(
+            (sorted_blocks[0].get("meters", {}) or {})
+            .get("electricity_main", {}).get("meta", {}).get("billing_day") or 1
+        )
+        return get_all_billing_periods(sorted_blocks, billing_day, tz=_tz)
+
+    import calendar as _cal
+    from datetime import datetime as _dt2, timezone as _tz2, timedelta as _td
+
+    def _ef_to_local_date(ef_iso):
+        """Parse effective_from UTC ISO → local date in configured timezone."""
+        ef = _dt2.fromisoformat(ef_iso.replace(" ", "T").split(".")[0])
+        ef_utc = ef.replace(tzinfo=_tz2.utc)
+        return ef_utc.astimezone(_tz).date()
+
+    def _transition_date(ef_local_date, new_bd):
+        """
+        Compute the billing period transition date given effective_from (local)
+        and new billing_day.
+        """
+        if ef_local_date.day < new_bd:
+            # new billing day hasn't arrived yet this month — transition this month
+            try:
+                return ef_local_date.replace(day=new_bd)
+            except ValueError:
+                import calendar
+                last = calendar.monthrange(ef_local_date.year, ef_local_date.month)[1]
+                return ef_local_date.replace(day=last)
+        else:
+            # new billing day already passed this month — transition next month
+            m = ef_local_date.month + 1
+            y = ef_local_date.year + (1 if m > 12 else 0)
+            m = m - 12 if m > 12 else m
+            try:
+                return ef_local_date.replace(year=y, month=m, day=new_bd)
+            except ValueError:
+                import calendar
+                last = calendar.monthrange(y, m)[1]
+                return ef_local_date.replace(year=y, month=m, day=last)
+
+    def _date_to_naive(d):
+        """Convert date to midnight naive datetime."""
+        return _dt2(d.year, d.month, d.day, 0, 0, 0)
+
+    def _period_end_from_start(p_start, billing_day):
+        """One billing month from p_start — next occurrence of billing_day."""
+        m = p_start.month + 1
+        y = p_start.year + (1 if m > 12 else 0)
+        m = m - 12 if m > 12 else m
+        try:
+            return p_start.replace(year=y, month=m, day=billing_day,
+                                   hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+        except ValueError:
+            last_day = _cal.monthrange(y, m)[1]
+            return p_start.replace(year=y, month=m, day=last_day,
+                                   hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+
+    # Build segments: one per unique _effective_from value
+    segments = []   # list of (billing_day, effective_from_local_date, seg_last_naive)
+    cur_ef = None
+    cur_bd = None
+    cur_ef_date = None
+    seg_last = None
+
+    for b in sorted_blocks:
+        ef = b.get("_effective_from") or ""
+        bd = b.get("_billing_day") or 1
+        dt = _parse_block_start(b["start"], _tz).replace(tzinfo=None)
+        dt_date = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        if ef != cur_ef:
+            if cur_ef is not None:
+                segments.append((cur_bd, cur_ef_date, seg_last))
+            cur_ef = ef
+            cur_bd = bd
+            try:
+                cur_ef_date = _ef_to_local_date(ef)
+            except Exception:
+                cur_ef_date = dt.date()
+        seg_last = dt_date
+
+    if cur_ef is not None:
+        segments.append((cur_bd, cur_ef_date, seg_last))
+
+    import logging as _logging
+    _logging.getLogger(__name__).info(
+        "get_billing_periods_from_config_history: %d segments: %s",
+        len(segments),
+        [(bd, str(ef), sl.strftime('%Y-%m-%d')) for bd, ef, sl in segments]
+    )
+
+    if not segments:
+        return []
+
+    # transitions[i] = the date where segment i ends and segment i+1 begins.
+    # Computed from effective_from and new billing_day:
+    #   if ef_date.day < new_bd: transition = new_bd of ef_date.month
+    #   if ef_date.day >= new_bd: transition = new_bd of ef_date.month + 1
+    transitions = []
+    for i in range(len(segments) - 1):
+        next_bd, next_ef, _ = segments[i + 1]
+        t = _transition_date(next_ef, next_bd)
+        transitions.append(t)
+
+    # Generate billing periods for each segment.
+    # Each segment runs from the previous transition to the next transition.
+    # Segment 0 starts from the billing period containing the first block.
+    # Subsequent segments start exactly at their transition date.
+    periods = []
+
+    # first_block_date: the local date of the very first block
+    first_block_date = _parse_block_start(
+        sorted_blocks[0]["start"], _tz
+    ).date()
+
+    for seg_idx, (billing_day, ef_date, seg_last_naive) in enumerate(segments):
+        # Each segment's periods end at the next segment's effective_from (truncation).
+        seg_end     = _date_to_naive(transitions[seg_idx]) if seg_idx < len(transitions) else None
+        seg_last_dt = seg_last_naive + _td(days=1)  # exclusive upper bound
+
+        if seg_idx == 0:
+            # First segment: billing periods start at the billing_day boundary
+            # on or before the first block, and run until truncated at seg_end.
+            ref = first_block_date
+            m, y = ref.month, ref.year
+            if ref.day < billing_day:
+                m -= 1
+                if m == 0: m = 12; y -= 1
+            try:
+                period_start = _date_to_naive(ref.replace(year=y, month=m, day=billing_day))
+            except ValueError:
+                period_start = _date_to_naive(ref.replace(
+                    year=y, month=m, day=_cal.monthrange(y, m)[1]))
+        else:
+            # Subsequent segments: start at the transition date (new billing_day
+            # boundary). Bills can only be truncated — the transition date is
+            # always a billing_day boundary of the new config.
+            period_start = _date_to_naive(transitions[seg_idx - 1])
+
+        # Pre-compute truncate_from: the start of the billing period that
+        # contains (seg_end - 1 day). This is the LAST period under the old config.
+        # All periods before truncate_from are complete. truncate_from→seg_end is final.
+        truncate_from = None
+        if seg_end:
+            from datetime import timedelta as _td2
+            target = seg_end - _td2(days=1)
+            p0 = period_start
+            while True:
+                pe0 = _period_end_from_start(p0, billing_day)
+                if pe0 > target:
+                    truncate_from = p0
+                    break
+                p0 = pe0
+
+        while True:
+            period_end = _period_end_from_start(period_start, billing_day)
+
+            if seg_end and truncate_from is not None and period_start == truncate_from:
+                # This is the final period — clamp to seg_end
+                period_end = seg_end
+            elif seg_end and truncate_from is not None and period_end == truncate_from:
+                # This period ends exactly at truncate_from. If ef_date falls
+                # strictly inside (period_start, truncate_from), this period
+                # straddles the config change and should extend to seg_end.
+                next_ef_naive = _date_to_naive(segments[seg_idx + 1][1])
+                if period_start < next_ef_naive <= truncate_from:
+                    period_end = seg_end
+            elif seg_end and period_end > seg_end:
+                period_end = seg_end
+
+            if period_end > period_start:
+                entry = (period_start, period_end)
+                if not periods or periods[-1] != entry:
+                    periods.append(entry)
+
+            if seg_end and period_end >= seg_end:
+                break
+            if period_end >= seg_last_dt:
+                # Data ends — generate truncated final period if not yet done
+                if seg_end and truncate_from is not None:
+                    if period_end <= truncate_from:
+                        # Haven't reached truncate_from yet — append clamped period
+                        truncated = (truncate_from, seg_end)
+                        if not periods or periods[-1] != truncated:
+                            periods.append(truncated)
+                break
+
+            period_start = period_end
+    return periods
+
+
 def get_all_quarter_periods(blocks, tz=None):
     """Calendar quarters: Q1=Jan-Apr, Q2=Apr-Jul, Q3=Jul-Oct, Q4=Oct-Jan."""
     if not blocks:
@@ -181,7 +574,18 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
     meter_meta     = {}   # display_key -> {site, device, mpan, tariff, is_submeter}
 
     for block in sorted([b for b in blocks if b and b.get("start")], key=lambda b: b["start"]):
-        block_start = datetime.fromisoformat(block["start"])
+        # block["start"] is a UTC ISO string; parse it and convert to local naive
+        # so BST blocks at 23:xx UTC compare correctly against local period boundaries.
+        _block_utc = datetime.fromisoformat(block["start"])
+        _tz_name = ((block.get("meters") or {})
+                    .get("electricity_main", {}) or {})
+        _tz_name = (_tz_name.get("meta") or {}).get("timezone") or block.get("_timezone")
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+            block_start = _block_utc.replace(tzinfo=_ZI("UTC")).astimezone(
+                _ZI(_tz_name or "UTC")).replace(tzinfo=None)
+        except Exception:
+            block_start = _block_utc
         if not (period_start <= block_start < period_end):
             continue
 
@@ -769,8 +1173,8 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     meter_colors = build_meter_colors(blocks)
 
     # ── Billing periods ──
-    # Read billing_day from meters_config.json first (reflects latest user setting),
-    # fall back to block meta for backward compatibility
+    # Use historically correct billing_day per block from config_periods join.
+    # Falls back to reading from meters_config.json / block meta for legacy data.
     try:
         from energy_engine_io import load_json as _load_json
         import os as _os
@@ -780,24 +1184,43 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
             if not (_md.get("meta") or {}).get("sub_meter"):
                 _main_meta = _md.get("meta") or {}
                 break
-        billing_day = int(_main_meta.get("billing_day") or 0) or int(next(
-            b["meters"]["electricity_main"]["meta"]["billing_day"]
-            for b in blocks
-            if b and b.get("meters", {}) and b["meters"].get("electricity_main", {})
-               and b["meters"]["electricity_main"].get("meta", {}).get("billing_day")
-        ))
         site_name = _main_meta.get("site") or None
-    except (StopIteration, KeyError, TypeError, ValueError):
-        billing_day = 1
+    except Exception:
         site_name = None
 
-    periods = get_all_billing_periods(blocks, billing_day, tz=_tz)
+    periods = get_billing_periods_from_config_history(blocks, tz=_tz)
+    # billing_day for display: use current config value (most recent period)
+    try:
+        billing_day = int(_main_meta.get("billing_day") or 1)
+    except Exception:
+        billing_day = 1
+
+    # Pre-index blocks by date string for fast per-period lookup
+    _blocks_by_date = defaultdict(list)
+    for _b in blocks:
+        if _b and _b.get("start"):
+            try:
+                _bd = datetime.fromisoformat(_b["start"]).replace(tzinfo=ZoneInfo("UTC")).astimezone(_tz)
+                _blocks_by_date[_bd.date().isoformat()].append(_b)
+            except Exception:
+                pass
+
+    def _blocks_for_period(p_start, p_end):
+        """Return only the blocks that fall within [p_start, p_end)."""
+        result = []
+        d = p_start.date()
+        while d < p_end.date():
+            result.extend(_blocks_by_date.get(d.isoformat(), []))
+            from datetime import timedelta as _td
+            d += _td(days=1)
+        return result
 
     # ── Build per-period data ──
     period_sections = []   # list of dicts
 
     for i, (p_start, p_end) in enumerate(periods):
-        summary   = calculate_billing_summary_for_period(blocks, p_start, p_end)
+        period_blocks = _blocks_for_period(p_start, p_end)
+        summary   = calculate_billing_summary_for_period(period_blocks, p_start, p_end)
         is_current = p_start.date() <= today < p_end.date()
         is_prev    = (len(periods) > 1) and (i == len(periods) - 2) and not is_current
 
@@ -817,13 +1240,23 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
             "days":       period_days,
         })
 
+    # Filter out periods that have no blocks at all (e.g. tiny config-change slivers
+    # that fall between billing day and the config change date)
+    period_sections = [ps for ps in period_sections if ps["days"] or ps["is_current"]]
+
+    # Re-assign is_prev after filtering (second-to-last non-current period)
+    non_current = [ps for ps in period_sections if not ps["is_current"]]
+    if non_current:
+        non_current[-1]["is_prev"] = True
+
     # Sort periods newest-first for display
     period_sections_display = list(reversed(period_sections))
 
     # ── Quarter periods ──
     quarter_sections = []
     for i, (q_start, q_end) in enumerate(get_all_quarter_periods(blocks, tz=_tz)):
-        summary    = calculate_billing_summary_for_period(blocks, q_start, q_end)
+        quarter_blocks = _blocks_for_period(q_start, q_end)
+        summary    = calculate_billing_summary_for_period(quarter_blocks, q_start, q_end)
         is_current = q_start.date() <= today < q_end.date()
         q_num      = (q_start.month - 1) // 3 + 1
         quarter_sections.append({

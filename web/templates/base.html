@@ -384,7 +384,7 @@
       <p>Home Assistant Add-on</p>
     </div>
     <nav>
-      <a href="{{ url_for('config_page') }}"  class="{{ 'active' if active == 'config' }}">
+      <a href="{{ url_for('config_page') }}"  class="{{ 'active' if active in ('config', 'config_history') }}">
         <span class="nav-icon">⚙️</span> Meter Config
       </a>
       <a href="{{ url_for('charts_page') }}"  class="{{ 'active' if active == 'charts' }}">

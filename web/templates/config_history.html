@@ -1,0 +1,480 @@
+{% extends "base.html" %}
+
+{% block topbar_title %}Billing History{% endblock %}
+{% block topbar_sub %}Track billing day, address and supplier changes over time{% endblock %}
+
+{% block head %}
+<style>
+  /* Modal inputs — consistent across light/dark */
+  .modal-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    font-family: inherit;
+  }
+  .modal-input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .modal-input:disabled,
+  .modal-input[readonly] {
+    background: var(--bg);
+    color: var(--text);
+    -webkit-text-fill-color: var(--text);
+    cursor: not-allowed;
+    opacity: 1;
+    border-style: dashed;
+  }
+  .modal-input[type="date"]::-webkit-datetime-edit,
+  .modal-input[type="date"]:disabled::-webkit-datetime-edit,
+  .modal-input[type="date"][readonly]::-webkit-datetime-edit {
+    color: var(--text);
+    -webkit-text-fill-color: var(--text);
+  }
+</style>
+{% endblock %}
+
+{% block topbar %}
+<div class="topbar" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+  <div>
+    <h2 style="margin:0;">🕓 Billing History</h2>
+    <div class="sub">Track billing day, address and supplier changes over time</div>
+  </div>
+  <div style="display:flex;gap:8px;">
+    <a href="{{ url_for('config_page') }}" class="btn btn-secondary" style="font-size:13px;">← Meter Config</a>
+    <button class="btn btn-primary" style="font-size:13px;" onclick="newPeriod()">＋ New Period</button>
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="alert-success" class="alert alert-success"></div>
+<div id="alert-error"   class="alert alert-danger"></div>
+
+<div style="font-size:13px;color:var(--muted);margin-bottom:20px;line-height:1.6;">
+  Use <strong>New Period</strong> when you change address, supplier, meters or billing day.
+  Historical billing charts use the billing day that was active <em>when each block was recorded</em>.
+  You can edit dates on any period if a change was entered retrospectively.
+</div>
+
+<div id="history-loading" style="color:var(--muted);font-size:13px;padding:20px 0;">Loading…</div>
+<div id="history-container" style="display:none;"></div>
+
+<!-- ── Edit modal ────────────────────────────────────────────────────────── -->
+<div id="edit-modal" style="display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,0.5);align-items:center;justify-content:center;overflow-y:auto;padding:20px 0;">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:24px;max-width:480px;width:92%;box-shadow:0 8px 32px rgba(0,0,0,0.3);margin:auto;">
+    <div style="font-size:15px;font-weight:600;margin-bottom:16px;color:var(--text);">Edit Config Period</div>
+
+    <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);margin-bottom:10px;">Dates</div>
+
+    <div style="margin-bottom:12px;">
+      <label id="label-from" style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">Effective From</label>
+      <input id="edit-from" type="date" class="modal-input">
+      <div style="font-size:11px;color:var(--muted);margin-top:2px;">When this config became active (whole days only — time snapped to midnight).</div>
+    </div>
+
+    <div id="edit-to-wrap" style="margin-bottom:12px;">
+      <label id="label-to" style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">Effective To</label>
+      <input id="edit-to" type="date" class="modal-input">
+      <div id="edit-to-hint" style="font-size:11px;color:var(--muted);margin-top:2px;"></div>
+    </div>
+
+    <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;margin-bottom:16px;font-size:12px;color:var(--muted);">
+      ℹ️ Adjacent periods are snapped automatically — no gaps or overlaps will be created.
+    </div>
+
+    <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);margin-bottom:10px;">Billing Config</div>
+
+    <div style="margin-bottom:12px;">
+      <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">Billing Day</label>
+      <input id="edit-billing-day" type="number" min="1" max="28" class="modal-input">
+      <div style="font-size:11px;color:var(--muted);margin-top:2px;">Day of month your billing period starts (1–28).</div>
+    </div>
+
+    <div style="margin-bottom:12px;">
+      <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">Timezone</label>
+      <input id="edit-timezone" type="text" placeholder="e.g. Europe/London"
+        class="modal-input">
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px;">
+      <div>
+        <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">Currency Symbol</label>
+        <input id="edit-currency-symbol" type="text" maxlength="3" placeholder="£"
+          class="modal-input">
+      </div>
+      <div>
+        <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">Currency Code</label>
+        <input id="edit-currency-code" type="text" maxlength="3" placeholder="GBP"
+          class="modal-input">
+      </div>
+    </div>
+
+    <div style="margin-bottom:16px;">
+      <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">Site Name</label>
+      <input id="edit-site-name" type="text" placeholder="e.g. Home"
+        class="modal-input">
+    </div>
+
+    <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);margin-bottom:10px;">Notes</div>
+
+    <div style="margin-bottom:20px;">
+      <input id="edit-reason" type="text" placeholder="Change reason (optional)"
+        class="modal-input">
+    </div>
+
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button onclick="closeModal()" class="btn" style="font-size:13px;">Cancel</button>
+      <button onclick="saveEdit()" class="btn btn-primary" style="font-size:13px;">Save Changes</button>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+var _periods  = [];
+var _editId   = null;
+var _timezone = 'UTC';  // populated from API response
+
+function escHtml(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Format a UTC ISO string for display in the configured timezone
+// ── Date utilities ───────────────────────────────────────────────────────────
+// All dates are stored as UTC ISO strings in the DB.
+// We display them in the configured timezone and accept input in that timezone.
+
+function _utcToTz(iso) {
+  // Returns a Date object — handle both T and space separators, with or without microseconds
+  var normalized = iso.replace(' ', 'T').split('.')[0]; // strip microseconds
+  return new Date(normalized.includes('Z') ? normalized : normalized + 'Z');
+}
+
+function fmtDt(iso) {
+  if (!iso) return '—';
+  try {
+    var d = _utcToTz(iso);
+    if (isNaN(d.getTime())) return iso.slice(0, 10);
+    // Show date only — periods are day-aligned so time is always midnight
+    return d.toLocaleDateString('en-GB', {
+      timeZone: _timezone,
+      day: '2-digit', month: 'short', year: 'numeric',
+    });
+  } catch(e) { return iso.slice(0, 10); }
+}
+function toLocalInput(iso) {
+  // Convert UTC ISO string → YYYY-MM-DD in configured timezone
+  // for use as an <input type="date"> value
+  if (!iso) return '';
+  try {
+    var d = _utcToTz(iso);
+    if (isNaN(d.getTime())) return '';
+    // Format as YYYY-MM-DD in configured timezone
+    return new Intl.DateTimeFormat('sv-SE', {
+      timeZone: _timezone,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(d);
+  } catch(e) { return iso.slice(0, 10); }
+}
+
+function fromLocalInput(val) {
+  // Convert YYYY-MM-DD (midnight in configured timezone) → UTC ISO string
+  if (!val) return null;
+  try {
+    // Treat val as midnight in _timezone, find the UTC equivalent
+    var naive = val + 'T00:00:00'; // YYYY-MM-DDTHH:MM:SS local midnight
+    var guess = new Date(naive + 'Z'); // treat as UTC first
+    var rendered = new Intl.DateTimeFormat('sv-SE', {
+      timeZone: _timezone,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).format(guess);
+    // rendered is "YYYY-MM-DD HH:MM:SS" in _timezone
+    // Difference between what we want (midnight local) and what we got
+    var want    = new Date(naive + 'Z').getTime();
+    var got     = new Date(rendered.replace(' ', 'T') + 'Z').getTime();
+    var offset  = want - got; // ms the guess is off by
+    var utcMs   = guess.getTime() + offset;
+    return new Date(utcMs).toISOString().slice(0, 19);
+  } catch(e) { return val.replace('T', 'T') + ':00'; }
+}
+
+// ── Load ──────────────────────────────────────────────────────────────────────
+function load() {
+  fetch(apiUrl('/api/config/history'))
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      document.getElementById('history-loading').style.display = 'none';
+      document.getElementById('history-container').style.display = 'block';
+      if (data.timezone) {
+        _timezone = data.timezone;
+        // Update modal labels to show configured timezone
+        var tzLabel = ' (' + _timezone + ')';
+        document.getElementById('label-from').textContent = 'Effective From' + tzLabel;
+        document.getElementById('label-to').textContent   = 'Effective To' + tzLabel;
+      }
+      if (!data.periods || data.periods.length === 0) {
+        document.getElementById('history-container').innerHTML =
+          '<div style="color:var(--muted);font-size:13px;padding:20px 0;">No config history recorded yet. Save a Meter Config to create the first period.</div>';
+        return;
+      }
+      _periods = data.periods;
+      render();
+    })
+    .catch(function(e) {
+      document.getElementById('history-loading').innerHTML =
+        '<div style="color:var(--danger);font-size:13px;">Could not load config history: ' + escHtml(e.message) + '</div>';
+    });
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function render() {
+  var html = '';
+  _periods.forEach(function(p, i) {
+    var isActive = p.effective_to === null;
+    var from     = fmtDt(p.effective_from);
+    var to       = isActive ? '<span style="color:var(--accent);font-weight:600;">current</span>' : fmtDt(p.effective_to);
+    var badge    = isActive ? '<span style="background:var(--accent);color:#fff;font-size:10px;padding:1px 7px;border-radius:10px;margin-left:8px;vertical-align:middle;">active</span>' : '';
+
+    var meta = [
+      '<strong>Billing day</strong> ' + p.billing_day,
+      '<strong>Resolution</strong> ' + p.block_minutes + ' min',
+      '<strong>Timezone</strong> ' + escHtml(p.timezone),
+      '<strong>Currency</strong> ' + escHtml(p.currency_symbol),
+    ];
+    if (p.site_name) meta.push('<strong>Site</strong> ' + escHtml(p.site_name));
+
+    var blockInfo = p.block_count > 0
+      ? '<span style="color:var(--muted);font-size:12px;">' + p.block_count.toLocaleString() + ' blocks recorded under this config</span>'
+      : '<span style="color:var(--muted);font-size:12px;">no blocks recorded under this config</span>';
+
+    var reason = p.change_reason
+      ? '<div style="font-size:13px;color:var(--muted);margin-top:6px;font-style:italic;">"' + escHtml(p.change_reason) + '"</div>'
+      : '';
+
+    html += '<div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px 20px;margin-bottom:12px;">';
+    html += '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;">';
+    html += '<div style="flex:1;">';
+
+    // Date range row
+    html += '<div style="font-size:14px;font-weight:600;color:var(--text);margin-bottom:6px;">';
+    html += escHtml(from) + ' → ' + to + badge;
+    html += '</div>';
+
+    // Meta row
+    html += '<div style="font-size:12px;color:var(--muted);line-height:1.8;">';
+    html += meta.join(' &nbsp;·&nbsp; ');
+    html += '</div>';
+
+    // Reason
+    html += reason;
+
+    // Block count
+    html += '<div style="margin-top:8px;">' + blockInfo + '</div>';
+
+    html += '</div>'; // flex:1
+
+    // Edit button
+    html += '<div style="display:flex;gap:6px;flex-shrink:0;">';
+    html += '<button onclick="openEdit(' + p.id + ')" class="btn" style="font-size:12px;white-space:nowrap;">✏️ Edit</button>';
+    if (_periods.length > 1) {
+      html += '<button onclick="confirmDelete(' + p.id + ',' + p.block_count + ',' + (isActive ? 1 : 0) + ')" class="btn" style="font-size:12px;white-space:nowrap;color:var(--danger);border-color:var(--danger);">🗑️ Remove period</button>';
+    }
+    html += '</div>';
+
+    html += '</div>'; // flex row
+    html += '</div>'; // card
+  });
+
+  document.getElementById('history-container').innerHTML = html;
+}
+
+// ── Edit modal ────────────────────────────────────────────────────────────────
+function openEdit(id) {
+  var p = _periods.find(function(x) { return x.id === id; });
+  if (!p) return;
+  _editId = id;
+  var isActive = p.effective_to === null;
+  document.getElementById('edit-from').value          = toLocalInput(p.effective_from);
+  document.getElementById('edit-to').value            = toLocalInput(p.effective_to);
+  // effective_to is derived by chain rebuild for non-active periods.
+  // Only the active period can have effective_to cleared.
+  // For non-active periods, show it read-only — edit effective_from of the NEXT period instead.
+  var toWrap2 = document.getElementById('edit-to-wrap');
+  var toInput = document.getElementById('edit-to');
+  var toHint  = document.getElementById('edit-to-hint');
+  if (isActive) {
+    // Active period: effective_to is always null — hide the field entirely
+    toWrap2.style.display = 'none';
+    toInput.readOnly = false;
+    toInput.disabled = true;
+    toInput.value = '';
+  } else {
+    // Non-active: show read-only effective_to (set by next period's effective_from)
+    toWrap2.style.display = '';
+    toInput.readOnly = true;
+    toInput.disabled = false;
+    toHint.textContent = "Set by the next period's Effective From. To change it, edit the next period's start date.";
+  }
+  document.getElementById('edit-billing-day').value   = p.billing_day || 1;
+  document.getElementById('edit-timezone').value      = p.timezone || '';
+  document.getElementById('edit-currency-symbol').value = p.currency_symbol || '';
+  document.getElementById('edit-currency-code').value   = (p.currency_code || '').toUpperCase();
+  document.getElementById('edit-site-name').value     = p.site_name || '';
+  document.getElementById('edit-reason').value        = p.change_reason || '';
+  var _mt = document.querySelector('#edit-modal div[style*="font-size:15px"]'); if (_mt) _mt.textContent = 'Edit Config Period';
+  document.getElementById('edit-modal').style.display = 'flex';
+  // Constrain effective_from max date for non-active periods
+  var fromInput = document.getElementById('edit-from');
+  if (!isActive && p.effective_to) {
+    // Max is 1 day before effective_to
+    var maxD = new Date(toLocalInput(p.effective_to) + 'T00:00:00');
+    maxD.setDate(maxD.getDate() - 1);
+    fromInput.max = maxD.toISOString().slice(0, 10);
+  } else {
+    fromInput.removeAttribute('max');
+  }
+  setTimeout(function() { fromInput.focus(); }, 50);
+}
+
+function closeModal() {
+  document.getElementById('edit-modal').style.display = 'none';
+  _editId = null;
+}
+
+function saveEdit() {
+  var fromVal        = fromLocalInput(document.getElementById('edit-from').value);
+  var toInput2       = document.getElementById('edit-to');
+  var toVal          = (toInput2 && !toInput2.readOnly && !toInput2.disabled) ? fromLocalInput(toInput2.value) : undefined;
+  var billingDay     = parseInt(document.getElementById('edit-billing-day').value, 10);
+  var timezone       = document.getElementById('edit-timezone').value.trim();
+  var currencySymbol = document.getElementById('edit-currency-symbol').value.trim();
+  var currencyCode   = document.getElementById('edit-currency-code').value.trim().toUpperCase();
+  var siteName       = document.getElementById('edit-site-name').value.trim() || null;
+  var reasonVal      = document.getElementById('edit-reason').value.trim() || null;
+
+  if (!fromVal) { showError('Effective From date is required'); return; }
+  // Validate effective_from < effective_to if both present
+  if (toVal && fromVal && fromVal >= toVal) {
+    showError('Effective From must be before Effective To'); return;
+  }
+  if (isNaN(billingDay) || billingDay < 1 || billingDay > 28) {
+    showError('Billing day must be between 1 and 28'); return;
+  }
+
+  var isCreate = (_editId === null);
+  var url    = isCreate ? apiUrl('/api/config/history') : apiUrl('/api/config/history/' + _editId);
+  var method = isCreate ? 'POST' : 'PUT';
+
+  fetch(url, {
+    method: method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      effective_from:  fromVal,
+      ...(toVal !== undefined ? {effective_to: toVal || null} : {}),
+      billing_day:     billingDay,
+      timezone:        timezone,
+      currency_symbol: currencySymbol,
+      currency_code:   currencyCode,
+      site_name:       siteName,
+      change_reason:   reasonVal,
+    })
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    if (data.ok) {
+      closeModal();
+      showSuccess(isCreate ? 'New billing period created.' : 'Config period updated. Billing chart regenerated.');
+      load();
+    } else {
+      showError(data.error || (isCreate ? 'Create failed' : 'Update failed'));
+    }
+  })
+  .catch(function(e) { showError(e.message); });
+}
+
+// Close modal on backdrop click
+document.getElementById('edit-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeModal();
+});
+
+// Close modal on Escape
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') closeModal();
+});
+
+// ── Alerts ────────────────────────────────────────────────────────────────────
+function showSuccess(msg) {
+  var el = document.getElementById('alert-success');
+  el.textContent = '✓ ' + msg;
+  el.classList.add('show');
+  setTimeout(function() { el.classList.remove('show'); }, 4000);
+}
+
+function showError(msg) {
+  var el = document.getElementById('alert-error');
+  el.textContent = msg;
+  el.classList.add('show');
+}
+
+// ── Delete ────────────────────────────────────────────────────────────────────
+function newPeriod() {
+  // Open edit modal pre-populated with today's date and current active config values
+  var active = periods.find(function(p) { return !p.effective_to; });
+  if (!active) { alert('No active config period found.'); return; }
+  _editId = null;  // null = create mode
+  document.getElementById('edit-from').value          = new Date().toISOString().slice(0,10);
+  document.getElementById('edit-billing-day').value   = active.billing_day || 1;
+  document.getElementById('edit-timezone').value      = active.timezone || 'UTC';
+  document.getElementById('edit-currency-symbol').value = active.currency_symbol || '£';
+  document.getElementById('edit-currency-code').value = active.currency_code || 'GBP';
+  document.getElementById('edit-site-name').value     = active.site_name || '';
+  document.getElementById('edit-reason').value        = '';
+  // Hide effective_to — not relevant when creating (chain rebuild sets it)
+  var toWrap = document.getElementById('edit-to-wrap');
+  if (toWrap) toWrap.style.display = 'none';
+  // Update modal title for create mode
+  var title = document.querySelector('#edit-modal [style*="font-size:15px"]');
+  if (title) title.textContent = 'New Billing Period';
+  document.getElementById('edit-modal').style.display = 'flex';
+}
+
+function confirmDelete(id, blockCount, isActive) {
+  var extra = isActive
+    ? ' This is the current active period — the previous period will become active.'
+    : '';
+  var msg = blockCount > 0
+    ? 'Remove this config period? Its ' + blockCount.toLocaleString() + ' blocks will be reassigned to the previous period — no measurement data will be lost.' + extra
+    : 'Remove this config period? It has no blocks so nothing will be reassigned.' + extra;
+  if (!confirm(msg)) return;
+  doDelete(id);
+}
+
+function doDelete(id) {
+  fetch(apiUrl('/api/config/history/' + id), { method: 'DELETE' })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.ok) {
+        var msg = 'Config period removed.';
+        if (data.blocks_reassigned > 0)
+          msg += ' ' + data.blocks_reassigned.toLocaleString() + ' blocks reassigned to adjacent period — no data lost. Charts regenerated.';
+        showSuccess(msg);
+        load();
+      } else {
+        showError(data.error || 'Delete failed');
+      }
+    })
+    .catch(function(e) { showError(e.message); });
+}
+
+load();
+</script>
+{% endblock %}

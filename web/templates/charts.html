@@ -414,7 +414,7 @@ var barMetric = 'kwh';
 var barView = 'totals';
 var barCalendar = false;   // false = billing periods, true = calendar periods
 var barBillingDay = 1;
-var barDailyMonth = null;
+var barDailyMonth = null;  // now a bKey string e.g. "2026-04-15"
 var barActiveYears = null;
 var barChartInstance = null;
 var barInited = false;
@@ -436,7 +436,7 @@ function barSaveState() {
       metric:   barMetric,
       view:     barView,
       calendar: barCalendar,
-      month:    barDailyMonth,
+      bKey:     typeof barDailyMonth === 'string' ? barDailyMonth : (barDailyMonth ? (barDailyMonth.year + '-' + String(barDailyMonth.month).padStart(2,'0') + '-01') : null),
       years:    barActiveYears ? [...barActiveYears] : [],
       standing: cb ? cb.checked : false,
     }));
@@ -455,7 +455,7 @@ function barLoadState(availableYears) {
     // Restore daily month only if it has data
     if (st.month && st.month.year && st.month.month) {
       var hasData = barData.some(function(r){ return r.year===st.month.year && r.month===st.month.month; });
-      if (hasData) barDailyMonth = st.month;
+      if (hasData) barDailyMonth = st.bKey;
     }
     // Restore active years — only keep those that still exist in the data
     if (st.years && st.years.length) {
@@ -483,7 +483,14 @@ async function barInit() {
     var now   = new Date();
     var years = [...new Set(barData.map(r => r.year))].sort();
     // Set defaults before loading saved state
-    barDailyMonth  = { year: now.getFullYear(), month: now.getMonth() + 1 };
+    // For billing mode, find the billing month containing the most recent data row
+    if (barData.length > 0) {
+      var lastRow = barData[barData.length - 1];
+      var k = barBillingKey(lastRow);
+      barDailyMonth = k.bKey;
+    } else {
+      barDailyMonth  = null;
+    }
     barActiveYears = new Set(years);
     // Restore saved state (validated against available data)
     barLoadState(years);
@@ -620,15 +627,19 @@ function barAggRows(filterFn) {
 }
 
 function barBillingKey(r) {
-  var bd = barBillingDay;
-  if (bd <= 1) return { bYear: r.year, bMonth: r.month };
-  if (r.day < bd) {
-    var bm = r.month - 1;
-    var by = r.year;
-    if (bm < 1) { bm = 12; by--; }
-    return { bYear: by, bMonth: bm };
+  // Use the pre-computed billing_period_start from the server (authoritative).
+  // Falls back to computing from billing_day for rows without it.
+  if (r.billing_period_start) {
+    return { bKey: r.billing_period_start };
   }
-  return { bYear: r.year, bMonth: r.month };
+  // Legacy fallback
+  var bd = r.billing_day || barBillingDay;
+  var startDay = bd, startMonth = r.month, startYear = r.year;
+  if (r.day < bd) {
+    startMonth = r.month - 1;
+    if (startMonth < 1) { startMonth = 12; startYear--; }
+  }
+  return { bKey: startYear + '-' + String(startMonth).padStart(2,'0') + '-' + String(startDay).padStart(2,'0') };
 }
 
 function barGetDataForPeriod() {
@@ -636,12 +647,13 @@ function barGetDataForPeriod() {
     var filtered;
     if (barCalendar) {
       filtered = barData.filter(function(r){
-        return r.year===barDailyMonth.year && r.month===barDailyMonth.month;
+        var _dm = barDailyMonth ? barDailyMonth.slice(0,7) : null;
+        return _dm && (r.year + '-' + String(r.month).padStart(2,'0')) === _dm;
       });
     } else {
       filtered = barData.filter(function(r){
         var k = barBillingKey(r);
-        return k.bYear===barDailyMonth.year && k.bMonth===barDailyMonth.month;
+        return k.bKey === barDailyMonth;
       });
     }
     filtered = filtered.slice().sort(function(a,b){
@@ -677,17 +689,20 @@ function barGetDataForPeriod() {
       var seen = {};
       barData.forEach(function(r) {
         var k = barBillingKey(r);
-        var key = k.bYear + '-' + String(k.bMonth).padStart(2,'0');
-        if (!seen[key]) seen[key] = { y: k.bYear, m: k.bMonth };
+        var key = k.bKey;
+        if (!seen[key]) seen[key] = key;
       });
-      buckets = Object.values(seen).sort(function(a,b){ return a.y!==b.y ? a.y-b.y : a.m-b.m; });
+      buckets = Object.keys(seen).sort();
       return {
-        labels:  buckets.map(function(b){ return MONTHS_SHORT[b.m-1]+' '+b.y; }),
-        aggList: buckets.map(function(b){
-          return barAggRows(function(r){
-            var k = barBillingKey(r);
-            return k.bYear===b.y && k.bMonth===b.m;
-          });
+        labels:  buckets.map(function(bk){
+          // Label: "Apr 2026" from first row with this bKey
+          var sample = barData.find(function(r){ return barBillingKey(r).bKey===bk; });
+          if (!sample) return bk.slice(0,7);
+          var d = new Date(bk + 'T00:00:00Z');
+          return MONTHS_SHORT[d.getUTCMonth()] + ' ' + d.getUTCFullYear();
+        }),
+        aggList: buckets.map(function(bk){
+          return barAggRows(function(r){ return barBillingKey(r).bKey===bk; });
         })
       };
     }
@@ -701,14 +716,14 @@ function barGetDataForPeriod() {
       };
     } else {
       var activeYrs = barGetYears().filter(function(y){ return barActiveYears.has(y); });
-      var bYears = [...new Set(barData.map(function(r){ return barBillingKey(r).bYear; }))].sort();
+      var bYears = [...new Set(barData.map(function(r){ return barBillingKey(r).bKey.slice(0,4); }))].sort();
       bYears = bYears.filter(function(by){
-        return barData.some(function(r){ return barBillingKey(r).bYear===by && activeYrs.includes(r.year); });
+        return barData.some(function(r){ return barBillingKey(r).bKey.slice(0,4)===by && activeYrs.includes(r.year); });
       });
       return {
         labels:  bYears.map(String),
         aggList: bYears.map(function(by){
-          return barAggRows(function(r){ return barBillingKey(r).bYear===by; });
+          return barAggRows(function(r){ return barBillingKey(r).bKey.slice(0,4)===by; });
         })
       };
     }
@@ -805,24 +820,101 @@ function barBuildSubBar() {
   var bar = document.getElementById('bar-sub-bar');
   bar.innerHTML = '';
   if (barPeriod === 'daily') {
-    var prev = document.createElement('button'); prev.className = 'bar-nav-btn'; prev.textContent = '←';
-    prev.onclick = function() { barDailyMonth.month--; if(barDailyMonth.month<1){barDailyMonth.month=12;barDailyMonth.year--;} barSaveState(); barRender(); };
-    var lbl = document.createElement('span'); lbl.className = 'bar-period-label';
-    if (!barCalendar && barBillingDay > 1) {
-      // Show billing period date range e.g. "15 Mar – 14 Apr 2026"
-      var bd = barBillingDay;
-      var startM = barDailyMonth.month;
-      var startY = barDailyMonth.year;
-      var endM = startM + 1; var endY = startY;
-      if (endM > 12) { endM = 1; endY++; }
-      lbl.textContent = bd + ' ' + MONTHS_SHORT[startM-1] + ' – ' + (bd-1) + ' ' + MONTHS_SHORT[endM-1] + ' ' + endY;
+    if (!barCalendar) {
+      // Billing mode: navigate between bKey values (billing period start dates)
+      var allBKeys = [...new Set(barData.map(function(r){ return barBillingKey(r).bKey; }))].sort();
+      if (!barDailyMonth || allBKeys.indexOf(barDailyMonth) < 0) {
+        barDailyMonth = allBKeys.length > 0 ? allBKeys[allBKeys.length - 1] : null;
+      }
+      var curIdx = allBKeys.indexOf(barDailyMonth);
+
+      var prev = document.createElement('button'); prev.className = 'bar-nav-btn'; prev.textContent = '\u2190';
+      prev.disabled = (curIdx <= 0);
+      prev.onclick = function() {
+        var keys = [...new Set(barData.map(function(r){ return barBillingKey(r).bKey; }))].sort();
+        var i = keys.indexOf(barDailyMonth);
+        if (i > 0) { barDailyMonth = keys[i-1]; barSaveState(); barRender(); }
+      };
+
+      var lbl = document.createElement('span'); lbl.className = 'bar-period-label';
+      var periodRows = barData.filter(function(r){ return barBillingKey(r).bKey === barDailyMonth; });
+      if (periodRows.length > 0 && barDailyMonth) {
+        var sorted = periodRows.slice().sort(function(a,b){
+          return (a.year*10000+a.month*100+a.day)-(b.year*10000+b.month*100+b.day);
+        });
+        var first = sorted[0];
+        var fStr = first.day + ' ' + MONTHS_SHORT[first.month-1];
+        // End date: use billing_period_end from server if available (authoritative,
+        // handles truncated periods). Fall back to nextBKey or bd arithmetic.
+        var endStr;
+        if (first.billing_period_end) {
+          var epd = new Date(first.billing_period_end + 'T00:00:00Z');
+          epd.setUTCDate(epd.getUTCDate() - 1); // exclusive→inclusive
+          endStr = epd.getUTCDate() + ' ' + MONTHS_SHORT[epd.getUTCMonth()] + ' ' + epd.getUTCFullYear();
+        } else if (curIdx + 1 < allBKeys.length) {
+          var nextD = new Date(allBKeys[curIdx + 1] + 'T00:00:00Z');
+          nextD.setUTCDate(nextD.getUTCDate() - 1);
+          endStr = nextD.getUTCDate() + ' ' + MONTHS_SHORT[nextD.getUTCMonth()] + ' ' + nextD.getUTCFullYear();
+        } else {
+          var bkDate  = new Date(barDailyMonth + 'T00:00:00Z');
+          var bd      = first.billing_day || barBillingDay;
+          var bkDay   = bkDate.getUTCDate();
+          var bkMonth = bkDate.getUTCMonth() + 1;
+          var bkYear  = bkDate.getUTCFullYear();
+          var endM, endY;
+          if (bkDay < bd) {
+            endM = bkMonth; endY = bkYear;
+          } else {
+            endM = bkMonth + 1; endY = bkYear;
+            if (endM > 12) { endM = 1; endY++; }
+          }
+          var endDay = bd - 1;
+          if (endDay < 1) {
+            endM--; if (endM < 1) { endM = 12; endY--; }
+            endDay = new Date(endY, endM, 0).getDate();
+          }
+          endStr = endDay + ' ' + MONTHS_SHORT[endM-1] + ' ' + endY;
+        }
+        lbl.textContent = fStr + ' \u2013 ' + endStr;
+      } else {
+        lbl.textContent = barDailyMonth || '\u2014';
+      }
+      var next = document.createElement('button'); next.className = 'bar-nav-btn'; next.textContent = '\u2192';
+      next.disabled = (curIdx >= allBKeys.length - 1);
+      next.onclick = function() {
+        var keys = [...new Set(barData.map(function(r){ return barBillingKey(r).bKey; }))].sort();
+        var i = keys.indexOf(barDailyMonth);
+        if (i < keys.length - 1) { barDailyMonth = keys[i+1]; barSaveState(); barRender(); }
+      };
+
+      bar.appendChild(prev); bar.appendChild(lbl); bar.appendChild(next);
     } else {
-      lbl.textContent = MONTHS_SHORT[barDailyMonth.month-1] + ' ' + barDailyMonth.year;
-    }
-    var next = document.createElement('button'); next.className = 'bar-nav-btn'; next.textContent = '→';
-    next.onclick = function() { barDailyMonth.month++; if(barDailyMonth.month>12){barDailyMonth.month=1;barDailyMonth.year++;} barSaveState(); barRender(); };
-    bar.appendChild(prev); bar.appendChild(lbl); bar.appendChild(next);
-  } else {
+      // Calendar mode: navigate by year+month
+      if (!barDailyMonth || typeof barDailyMonth !== 'object') {
+        var now2 = new Date();
+        barDailyMonth = { year: now2.getFullYear(), month: now2.getMonth() + 1 };
+      }
+      var prev = document.createElement('button'); prev.className = 'bar-nav-btn'; prev.textContent = '\u2190';
+      prev.onclick = function() {
+        if (typeof barDailyMonth === 'string') {
+          var d2 = new Date(barDailyMonth + 'T00:00:00Z');
+          barDailyMonth = { year: d2.getUTCFullYear(), month: d2.getUTCMonth() + 1 };
+        }
+        barDailyMonth.month--; if(barDailyMonth.month<1){barDailyMonth.month=12;barDailyMonth.year--;} barSaveState(); barRender();
+      };
+      var lbl = document.createElement('span'); lbl.className = 'bar-period-label';
+      var _dm = typeof barDailyMonth === 'object' ? barDailyMonth : { year: parseInt(barDailyMonth), month: parseInt(barDailyMonth.slice(5,7)) };
+      lbl.textContent = MONTHS_SHORT[_dm.month-1] + ' ' + _dm.year;
+      var next = document.createElement('button'); next.className = 'bar-nav-btn'; next.textContent = '\u2192';
+      next.onclick = function() {
+        if (typeof barDailyMonth === 'string') {
+          var d3 = new Date(barDailyMonth + 'T00:00:00Z');
+          barDailyMonth = { year: d3.getUTCFullYear(), month: d3.getUTCMonth() + 1 };
+        }
+        barDailyMonth.month++; if(barDailyMonth.month>12){barDailyMonth.month=1;barDailyMonth.year++;} barSaveState(); barRender();
+      };
+      bar.appendChild(prev); bar.appendChild(lbl); bar.appendChild(next);
+    }  } else {
     var lbl2 = document.createElement('span');
     lbl2.style.cssText = 'font-size:12px;color:var(--muted);margin-right:4px;';
     lbl2.textContent = 'Years:';
@@ -863,10 +955,12 @@ function barPeriodLabel(lbl, idx, pd) {
       var d = pd.rawDates[idx];
       return d.day + ' ' + MONTHS[d.month - 1] + ' ' + d.year;
     }
-    return lbl + ' ' + MONTHS[barDailyMonth.month - 1] + ' ' + barDailyMonth.year;
+    var _bmd = barDailyMonth && typeof barDailyMonth === 'string' ? { year: parseInt(barDailyMonth), month: parseInt(barDailyMonth.slice(5,7)) } : (barDailyMonth || { year: new Date().getFullYear(), month: new Date().getMonth()+1 });
+    return lbl + ' ' + MONTHS[_bmd.month - 1] + ' ' + _bmd.year;
   }
   if (barPeriod === 'monthly') {
-    if (lbl.indexOf(' ') === -1) return lbl + ' ' + barDailyMonth.year;
+    var _bmy = barDailyMonth && typeof barDailyMonth === 'string' ? barDailyMonth.slice(0,4) : (barDailyMonth ? String(barDailyMonth.year) : '');
+    if (lbl.indexOf(' ') === -1) return lbl + ' ' + _bmy;
     return lbl;
   }
   return lbl;

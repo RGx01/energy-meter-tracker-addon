@@ -1,5 +1,31 @@
 # Energy Meter Tracker
 
+[![GitHub Release][releases-shield]][releases]
+![Project Stage][project-stage-shield]
+[![License][license-shield]](LICENSE.md)
+[![Community Forum][forum-shield]][forum]
+[![GitHub Activity][commits-shield]][commits]
+![Project Maintenance][maintenance-shield]
+
+![Supports aarch64 Architecture][aarch64-shield]
+![Supports amd64 Architecture][amd64-shield]
+![Supports armhf Architecture][armhf-shield]
+![Supports armv7 Architecture][armv7-shield]
+
+[releases-shield]: https://img.shields.io/github/release/RGx01/energy-meter-tracker-addon.svg
+[releases]: https://github.com/RGx01/energy-meter-tracker-addon/releases
+[project-stage-shield]: https://img.shields.io/badge/project%20stage-production%20ready-brightgreen.svg
+[license-shield]: https://img.shields.io/github/license/RGx01/energy-meter-tracker-addon.svg
+[forum-shield]: https://img.shields.io/badge/community-forum-informational.svg
+[forum]: https://community.home-assistant.io/t/energy-meter-tracker/995674
+[commits-shield]: https://img.shields.io/github/commit-activity/y/RGx01/energy-meter-tracker-addon.svg
+[commits]: https://github.com/RGx01/energy-meter-tracker-addon/commits/main
+[maintenance-shield]: https://img.shields.io/maintenance/yes/2026.svg
+[aarch64-shield]: https://img.shields.io/badge/aarch64-yes-green.svg
+[amd64-shield]: https://img.shields.io/badge/amd64-yes-green.svg
+[armhf-shield]: https://img.shields.io/badge/armhf-yes-green.svg
+[armv7-shield]: https://img.shields.io/badge/armv7-yes-green.svg
+
 A Home Assistant add-on that records your electricity usage in precise configurable intervals — matching your energy supplier's meter reconciliation period for accurate billing.
 
 ![Usage Stats chart showing daily import/export breakdown by sub-meter](screenshots/usage_stats0.png)
@@ -14,12 +40,13 @@ A Home Assistant add-on that records your electricity usage in precise configura
 - Publishes four cumulative sensors back to Home Assistant
 - Serves a local web UI on port 8099 for configuration, charts, live power and data management
 
-## What's new in 1.6.0
+## What's new in 2.0.0
 
-- **📈 Usage Stats chart** — new chart tab showing daily, monthly and yearly import/export with sub-meter breakdown in billing colours; switchable between kWh and cost; data table with copy-to-clipboard export
-- **⚡ Live Power renamed** — the Summary page is now called Live Power throughout
-- **Remember last page** — the add-on remembers which page and chart tab you were on and restores it on refresh
-- **Mobile improvements** — heatmap pinch-zoom disabled, wider scroll strip, responsive height; help page collapsible sections; Usage Stats redraws correctly after device rotation
+- **🗄️ SQLite storage** — blocks are now stored in a SQLite database rather than a JSON file; queries are indexed and fast regardless of how much history you have; migration from `blocks.json` is automatic on first start
+- **🕓 Billing History** — config changes are now recorded as history; billing charts always use the billing day and rates that were active when each block was recorded; access via the **Billing History** button on Meter Config
+- **📅 Billing period transitions** — when you change your billing day the old period is correctly truncated at the transition date; usage stats and live power always show the right period boundaries
+- **⚡ Live Power loads instantly** — billing card data (Today, This Bill, This Year) now loads asynchronously after page render using fast SQL aggregation queries that complete in milliseconds regardless of history length
+- **📈 Usage Stats billing periods** — the navigator now shows the correct inclusive end date for each billing period, including truncated transition periods
 
 ## Requirements
 
@@ -111,6 +138,7 @@ Access the UI at `http://<your-ha-ip>:8099`
 | Page | Description |
 |------|-------------|
 | Meter Config | Configure main meter, sub-meters, sensors, power sensor and postcode |
+| Billing History | View, edit and add config periods; record billing day / address / supplier changes |
 | Charts | Billing chart, net energy heatmap and usage stats |
 | ⚡ Live Power | Live power gauge, billing cards and carbon intensity forecast |
 | Import & Backup | Migrate data from a previous installation or restore a backup |
@@ -121,7 +149,7 @@ Access the UI at `http://<your-ha-ip>:8099`
 
 ### Billing
 
-The daily billing chart shows import, export and sub-meter consumption for each day, with accurate cost calculations matching the engine's billing logic. Billing periods, standing charges and rate changes are all handled correctly.
+The daily billing chart shows import, export and sub-meter consumption for each day, with accurate cost calculations matching the engine's billing logic. Billing periods, standing charges and rate changes are all handled correctly. If your billing day has changed, each period uses the billing day that was active at the time.
 
 ### Net Energy Heatmap
 
@@ -132,6 +160,8 @@ A half-hour heatmap showing net grid flow (import − export) for every reconcil
 ### Usage Stats
 
 Import and export broken down by day, month or year with sub-meter stacking. Switch between kWh and cost, and between Totals and Net views. A data table below the chart mirrors exactly what the chart shows, with a copy-to-clipboard button for exporting to Excel or Google Sheets.
+
+Billing mode groups data by your billing periods (respecting billing day changes). Calendar mode groups by calendar month.
 
 ![Usage Stats chart](screenshots/usage_stats.png)
 
@@ -144,7 +174,7 @@ The Live Power page appears in the sidebar once a **power sensor** is configured
 It provides:
 
 - **Live power gauge** — shows net grid flow with asymmetric import/export scales derived from your usage history; colour reflects carbon intensity (UK) or import magnitude (global)
-- **Billing cards** — Today, This Bill and This Year with full sub-meter breakdown; figures match the Billing chart exactly
+- **Billing cards** — Today, This Bill and This Year with full sub-meter breakdown; figures match the Billing chart exactly; This Bill uses your billing history to show the correct period even if your billing day has changed
 - **Carbon intensity** (🇬🇧 UK only) — add your outward postcode prefix (e.g. `DE1`) in Meter Config to enable a 48-hour forecast strip from the National Grid API
 
 ### Configuring Live Power
@@ -155,6 +185,26 @@ In Meter Config → main meter card:
 |-------|-------------|
 | Power Sensor | Live power in kW — e.g. `sensor.smart_meter_electricity_power` |
 | Postcode Prefix | 🇬🇧 UK only — outward postcode with district, e.g. `DE1`, `SW1A`, `M1` |
+
+## Billing History
+
+The Billing History page records when your billing configuration changed. Access it via the **🕓 Billing History** button on the Meter Config page.
+
+Use **New Period** when you:
+- Move address
+- Change energy supplier
+- Change your billing day
+- Add or change meters
+
+Each period stores the billing day, timezone, currency, site name and a freetext change reason. Billing charts always use the config that was active when each block was recorded, so historical figures remain accurate after any change.
+
+### Period transitions
+
+When you add a new period, the previous period's final billing cycle is **truncated** at the transition date — it cannot be extended. If your billing day changes from the 3rd to the 15th and you set the effective date to the 10th, your last bill under the old config runs from the 3rd to the 14th, and your first bill under the new config starts on the 15th.
+
+### Removing periods
+
+When 2 or more periods exist, any period can be removed. Blocks from the removed period are reassigned to the previous (older) period. If you remove the active (most recent) period, the previous period becomes active again.
 
 ## Home Assistant Sensors
 
@@ -171,9 +221,9 @@ These are compatible with the HA Energy dashboard and Utility Meter integrations
 
 ## Data & Backup
 
-### HA OS / Supervised
+### Storage
 
-Data is stored in the add-on's private `/data/` directory, managed by the Supervisor. After every block finalise, all data files are also copied to `/share/energy_meter_tracker_backup/`. Zip snapshots are created automatically before every config save and are accessible from the Import & Backup page.
+All blocks are stored in a SQLite database (`energy_meter.db`) in the add-on's data directory. After every block finalise, the database and config are also copied to `/share/energy_meter_tracker_backup/`. Zip snapshots are created automatically before every config save and are accessible from the Import & Backup page.
 
 | Event | `/data/` | `/share/energy_meter_tracker_backup/` |
 |-------|----------|---------------------------------------|
@@ -184,6 +234,10 @@ Data is stored in the add-on's private `/data/` directory, managed by the Superv
 > ⚠️ **Uninstalling wipes `/data/`**. Always ensure a recent backup exists in `/share/` before uninstalling.
 
 > ℹ️ There is no automatic pre-upgrade backup in supervised mode. Your most recent `/share` backup and the automatic zip before the last config save are your safety net. Create a manual backup before upgrading if you want extra assurance.
+
+### Migrating from 1.x
+
+If you are upgrading from a version that used `blocks.json`, the add-on will automatically migrate your data to SQLite on first start. The original `blocks.json` is preserved. Migration typically takes a few seconds for a year of 5-minute blocks.
 
 ### Standalone Docker
 
@@ -198,12 +252,3 @@ The volume mount is **essential** — without it all data is lost when the conta
 ## Disclaimer
 
 Energy Meter Tracker is for informational use only. It cannot replicate your supplier's authoritative Half-Hourly reconciliation. Do not use this data for billing disputes or formal energy accounting.
-
-## Supported Hardware
-
-| Architecture | Supported |
-|-------------|-----------|
-| amd64 | ✅ |
-| aarch64 | ✅ |
-| armhf | ✅ |
-| armv7 | ✅ |

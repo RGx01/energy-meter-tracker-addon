@@ -47,12 +47,38 @@ ec.calculate_billing_summary_for_period = lambda *a, **kw: {
     "total_cost": 0.0,
     "meter_meta": {},
 }
+ec.get_billing_periods_from_config_history = lambda *a, **kw: []
+ec.get_billing_periods_from_config_periods = lambda *a, **kw: []
 sys.modules["energy_charts"] = ec
 
 # Stub ha_client
 hc = types.ModuleType("ha_client")
 hc.HAClient = MagicMock
 sys.modules["ha_client"] = hc
+
+# Stub block_store — use real in-memory BlockStore pre-loaded with MINIMAL_BLOCKS
+# (defined after MINIMAL_BLOCKS below, wired in via make_client)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from block_store import BlockStore, open_block_store
+
+def _make_test_store(blocks=None):
+    """Create an in-memory BlockStore pre-loaded with given blocks."""
+    store = BlockStore(":memory:")
+    store.insert_config_period({
+        "meters": {"electricity_main": {"meta": {
+            "billing_day": 1, "block_minutes": 30,
+            "timezone": "Europe/London",
+            "currency_symbol": "£", "currency_code": "GBP",
+        }}}
+    })
+    if blocks:
+        store.append_blocks(blocks)
+    return store
+
+bs_mod = types.ModuleType("block_store")
+bs_mod.BlockStore       = BlockStore
+bs_mod.open_block_store = lambda path: _make_test_store()
+sys.modules["block_store"] = bs_mod
 
 # Stub engine (pause/resume only)
 eng = types.ModuleType("engine")
@@ -115,11 +141,14 @@ MINIMAL_BLOCKS = [
 ]
 
 
-def make_client():
-    """Return a Flask test client with DATA_DIR and CHART_DIR initialised."""
+def make_client(blocks=None):
+    """Return a Flask test client with DATA_DIR, CHART_DIR and BlockStore initialised."""
     server.DATA_DIR  = "/tmp/emt_test_data"
     server.CHART_DIR = "/tmp/emt_test_charts"
     server._ha_client = MagicMock()
+    # Reset and inject a fresh in-memory store for each test
+    blks = blocks if blocks is not None else MINIMAL_BLOCKS
+    server._store = _make_test_store(blks)
     return server.app.test_client()
 
 
@@ -307,8 +336,9 @@ class TestApiBlocksSummary(unittest.TestCase):
 
     def _get(self, config=None, blocks=None):
         cfg = config or MINIMAL_CONFIG
-        blk = blocks or MINIMAL_BLOCKS
-        eio.load_json = lambda path, default=None: cfg if "meters_config" in path else (blk if "blocks" in path else default)
+        blk = blocks if blocks is not None else MINIMAL_BLOCKS
+        eio.load_json = lambda path, default=None: cfg if "meters_config" in path else default
+        server._store = _make_test_store(blk)
         return self.client.get("/api/charts/blocks-summary")
 
     def test_returns_200(self):
@@ -338,7 +368,8 @@ class TestApiBlocksSummary(unittest.TestCase):
                 self.assertIn(field, row)
 
     def test_empty_blocks_returns_empty_rows(self):
-        eio.load_json = lambda path, default=None: MINIMAL_CONFIG if "meters_config" in path else ([] if "blocks" in path else default)
+        eio.load_json = lambda path, default=None: MINIMAL_CONFIG if "meters_config" in path else default
+        server._store = _make_test_store([])
         r = self.client.get("/api/charts/blocks-summary")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.get_json()["rows"], [])

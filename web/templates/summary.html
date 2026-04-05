@@ -396,7 +396,7 @@
     {% endfor %}
   </div>
   {% else %}
-  <div class="no-data">No data yet</div>
+  <div class="no-data" id="billing-loading-{{ card_id }}" style="color:var(--muted);font-size:13px;">Loading…</div>
   {% endif %}
 </div>
 {% endmacro %}
@@ -561,9 +561,35 @@ function refreshBilling() {
 }
 
 function updateBillingCard(id, total, rows, period, currency) {
-  var totalEl  = document.getElementById('billing-total-' + id);
-  var periodEl = document.getElementById('billing-period-' + id);
-  var rowsEl   = document.getElementById('billing-rows-' + id);
+  var totalEl   = document.getElementById('billing-total-' + id);
+  var periodEl  = document.getElementById('billing-period-' + id);
+  var rowsEl    = document.getElementById('billing-rows-' + id);
+  var loadingEl = document.getElementById('billing-loading-' + id);
+  // If card is still in loading state, rebuild it
+  if (!totalEl && loadingEl) {
+    var card = loadingEl.closest('.billing-card');
+    if (card && total !== null && total !== undefined) {
+      var sign = total < 0 ? '-' : '';
+      var absT = Math.abs(total).toFixed(2);
+      var rowsHtml = (rows || []).map(function(r) {
+        var absC = Math.abs(r.cost); var signC = r.cost < 0 ? '-' : '';
+        var col = r.cost < 0 ? 'var(--accent)' : 'var(--text)';
+        var boldRow = r.bold ? 'style="background:rgba(255,255,255,0.04);border-color:var(--muted);"' : '';
+        var boldLbl = r.bold ? 'style="color:var(--text);font-weight:600;"' : '';
+        var boldVal = r.bold ? ';font-weight:600;' : '';
+        return '<div class="billing-row" ' + boldRow + '>'
+          + '<div class="billing-row-label" ' + boldLbl + '>' + r.label + '</div>'
+          + '<div class="billing-row-value" style="color:' + col + boldVal + '">'
+          + signC + currency + absC.toFixed(2) + '</div></div>';
+      }).join('');
+      loadingEl.outerHTML =
+        '<div class="billing-total" id="billing-total-' + id + '" style="color:var(--accent);">'
+        + sign + currency + absT + '</div>'
+        + '<div class="billing-period" id="billing-period-' + id + '">' + (period || '') + '</div>'
+        + '<div class="billing-rows" id="billing-rows-' + id + '">' + rowsHtml + '</div>';
+    }
+    return;
+  }
   if (!totalEl) return;
   var absTotal = Math.abs(total);
   var sign     = total < 0 ? '-' : '';
@@ -591,8 +617,8 @@ function scheduleBillingRefresh() {
   setTimeout(refreshBilling, msUntilNextBillingRefresh());
 }
 
-// Schedule first billing refresh
-scheduleBillingRefresh();
+// Load billing immediately on page load, then schedule future refreshes
+refreshBilling();
 
 // ── Carbon intensity ──
 var CARBON_COLOURS = {
