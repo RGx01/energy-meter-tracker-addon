@@ -141,14 +141,17 @@ MINIMAL_BLOCKS = [
 ]
 
 
-def make_client(blocks=None):
+def make_client(blocks=None, store=None):
     """Return a Flask test client with DATA_DIR, CHART_DIR and BlockStore initialised."""
     server.DATA_DIR  = "/tmp/emt_test_data"
     server.CHART_DIR = "/tmp/emt_test_charts"
     server._ha_client = MagicMock()
-    # Reset and inject a fresh in-memory store for each test
-    blks = blocks if blocks is not None else MINIMAL_BLOCKS
-    server._store = _make_test_store(blks)
+    # Allow caller to inject a pre-built store (e.g. with custom config periods)
+    if store is not None:
+        server._store = store
+    else:
+        blks = blocks if blocks is not None else MINIMAL_BLOCKS
+        server._store = _make_test_store(blks)
     return server.app.test_client()
 
 
@@ -497,6 +500,275 @@ class TestIndexRedirect(unittest.TestCase):
         self.assertIn(r.status_code, (301, 302))
         self.assertIn("charts", r.headers["Location"])
 
+
+
+class TestApiCorrections(unittest.TestCase):
+    """Tests for /api/corrections/preview and /api/corrections/apply."""
+
+    def setUp(self):
+        self.client = make_client()
+
+    def _post(self, url, body):
+        return self.client.post(url, json=body,
+                                content_type='application/json')
+
+    # ── Preview ───────────────────────────────────────────────────────────────
+
+    def test_preview_standing_returns_200(self):
+        r = self._post('/api/corrections/preview', {
+            'type': 'standing', 'from_date': '2026-01-01',
+            'to_date': '2026-12-31', 'value': 0.5046,
+        })
+        self.assertEqual(r.status_code, 200)
+
+    def test_preview_returns_required_keys(self):
+        r = self._post('/api/corrections/preview', {
+            'type': 'standing', 'from_date': '2026-01-01',
+            'to_date': '2026-12-31', 'value': 0.5046,
+        })
+        d = json.loads(r.data)
+        for key in ('days', 'blocks', 'current_min', 'current_max'):
+            self.assertIn(key, d, f"Missing key: {key}")
+
+    def test_preview_rate_import_returns_200(self):
+        r = self._post('/api/corrections/preview', {
+            'type': 'rate', 'channel': 'import',
+            'from_date': '2026-01-01', 'to_date': '2026-12-31', 'value': 0.245,
+        })
+        self.assertEqual(r.status_code, 200)
+
+    def test_preview_rate_export_returns_200(self):
+        r = self._post('/api/corrections/preview', {
+            'type': 'rate', 'channel': 'export',
+            'from_date': '2026-01-01', 'to_date': '2026-12-31', 'value': 0.15,
+        })
+        self.assertEqual(r.status_code, 200)
+
+    def test_preview_invalid_type_returns_400(self):
+        r = self._post('/api/corrections/preview', {
+            'type': 'invalid', 'from_date': '2026-01-01',
+            'to_date': '2026-12-31', 'value': 0.5,
+        })
+        self.assertEqual(r.status_code, 400)
+
+    def test_preview_missing_dates_returns_400(self):
+        r = self._post('/api/corrections/preview', {
+            'type': 'standing', 'value': 0.5,
+        })
+        self.assertEqual(r.status_code, 400)
+
+    # ── Apply ─────────────────────────────────────────────────────────────────
+
+    def test_apply_standing_returns_200(self):
+        r = self._post('/api/corrections/apply', {
+            'type': 'standing', 'from_date': '2026-01-01',
+            'to_date': '2026-12-31', 'value': 0.5046,
+        })
+        self.assertEqual(r.status_code, 200)
+
+    def test_apply_returns_updated_blocks(self):
+        r = self._post('/api/corrections/apply', {
+            'type': 'standing', 'from_date': '2026-01-01',
+            'to_date': '2026-12-31', 'value': 0.5046,
+        })
+        d = json.loads(r.data)
+        self.assertIn('updated_blocks', d)
+        self.assertIsInstance(d['updated_blocks'], int)
+
+    def test_apply_rate_import_with_recalc(self):
+        r = self._post('/api/corrections/apply', {
+            'type': 'rate', 'channel': 'import',
+            'from_date': '2026-01-01', 'to_date': '2026-12-31',
+            'value': 0.30, 'recalc_cost': True,
+        })
+        self.assertEqual(r.status_code, 200)
+        d = json.loads(r.data)
+        self.assertIn('updated_blocks', d)
+
+    def test_apply_rate_export_without_recalc(self):
+        r = self._post('/api/corrections/apply', {
+            'type': 'rate', 'channel': 'export',
+            'from_date': '2026-01-01', 'to_date': '2026-12-31',
+            'value': 0.15, 'recalc_cost': False,
+        })
+        self.assertEqual(r.status_code, 200)
+
+    def test_apply_negative_value_returns_400(self):
+        r = self._post('/api/corrections/apply', {
+            'type': 'standing', 'from_date': '2026-01-01',
+            'to_date': '2026-12-31', 'value': -1.0,
+        })
+        self.assertEqual(r.status_code, 400)
+
+    def test_apply_missing_value_returns_400(self):
+        r = self._post('/api/corrections/apply', {
+            'type': 'standing', 'from_date': '2026-01-01',
+            'to_date': '2026-12-31',
+        })
+        self.assertEqual(r.status_code, 400)
+
+    def test_apply_invalid_type_returns_400(self):
+        r = self._post('/api/corrections/apply', {
+            'type': 'bad', 'from_date': '2026-01-01',
+            'to_date': '2026-12-31', 'value': 0.5,
+        })
+        self.assertEqual(r.status_code, 400)
+
+    def test_apply_actually_updates_standing_charge(self):
+        """Apply correction then verify value changed in DB."""
+        store = server._get_store()
+        # Check initial value
+        before = store._conn.execute(
+            "SELECT MIN(standing_charge) as sc FROM blocks"
+        ).fetchone()["sc"]
+
+        new_val = (before or 0.0) + 1.0  # guaranteed different
+        self._post('/api/corrections/apply', {
+            'type': 'standing', 'from_date': '2026-01-01',
+            'to_date': '2026-12-31', 'value': new_val,
+        })
+
+        after = store._conn.execute(
+            "SELECT MIN(standing_charge) as sc FROM blocks"
+        ).fetchone()["sc"]
+        self.assertAlmostEqual(after or 0.0, new_val, places=4,
+                               msg="Standing charge not updated in DB")
+
+    def test_apply_rate_recalculates_cost_correctly(self):
+        """After rate correction with recalc, cost = rate × kwh."""
+        store = server._get_store()
+        new_rate = 0.30
+
+        self._post('/api/corrections/apply', {
+            'type': 'rate', 'channel': 'import',
+            'from_date': '2026-01-01', 'to_date': '2026-12-31',
+            'value': new_rate, 'recalc_cost': True,
+        })
+
+        rows = store._conn.execute(
+            "SELECT imp_kwh, imp_rate, imp_cost FROM blocks "
+            "WHERE imp_rate IS NOT NULL AND imp_kwh IS NOT NULL"
+        ).fetchall()
+        for row in rows:
+            expected_cost = round(row["imp_kwh"] * new_rate, 6)
+            self.assertAlmostEqual(row["imp_cost"], expected_cost, places=4,
+                                   msg=f"Cost not recalculated: {row['imp_cost']} != {expected_cost}")
+
+
+class TestApiConfigHistoryDelete(unittest.TestCase):
+    """
+    When the active config period is deleted, the server must:
+    1. Promote the predecessor to active (effective_to = NULL)
+    2. Write the predecessor's full_config_json back to meters_config.json
+    3. Return config_restored=True in the response
+    When a non-active period is deleted, meters_config.json must NOT change.
+    """
+
+    def _make_two_period_store(self):
+        """In-memory store with two config periods."""
+        import json
+        store = BlockStore(":memory:")
+        cfg_old = {"meters": {"electricity_main": {"meta": {
+            "billing_day": 1, "block_minutes": 30, "timezone": "Europe/London",
+            "currency_symbol": "£", "currency_code": "GBP", "site": "Old Site",
+        }}}}
+        cfg_new = {"meters": {"electricity_main": {"meta": {
+            "billing_day": 15, "block_minutes": 30, "timezone": "Europe/London",
+            "currency_symbol": "£", "currency_code": "GBP", "site": "New Site",
+        }}}}
+        # Period 1 — older, non-active
+        store._conn.execute("""
+            INSERT INTO config_periods
+            (effective_from, effective_to, billing_day, block_minutes, timezone,
+             currency_symbol, currency_code, site_name, change_reason, full_config_json)
+            VALUES ('2026-01-01T00:00:00', '2026-03-01T00:00:00', 1, 30,
+                    'Europe/London', '£', 'GBP', 'Old Site', NULL, ?)
+        """, (json.dumps(cfg_old),))
+        # Period 2 — active
+        store._conn.execute("""
+            INSERT INTO config_periods
+            (effective_from, effective_to, billing_day, block_minutes, timezone,
+             currency_symbol, currency_code, site_name, change_reason, full_config_json)
+            VALUES ('2026-03-01T00:00:00', NULL, 15, 30,
+                    'Europe/London', '£', 'GBP', 'New Site', NULL, ?)
+        """, (json.dumps(cfg_new),))
+        store._conn.commit()
+        return store, cfg_old, cfg_new
+
+    def test_delete_active_returns_config_restored_true(self):
+        store, cfg_old, cfg_new = self._make_two_period_store()
+        client = make_client(store=store)
+        active_id = store._conn.execute(
+            "SELECT id FROM config_periods WHERE effective_to IS NULL"
+        ).fetchone()["id"]
+
+        with patch("energy_engine_io.save_json_atomic", return_value=None) as mock_save,              patch("server.load_config", return_value=cfg_new):
+            r = client.delete(f"/api/config/history/{active_id}")
+
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertTrue(data.get("ok"))
+        self.assertTrue(data.get("config_restored"),
+                        "config_restored must be True when active period deleted")
+
+    def test_delete_active_writes_predecessor_config(self):
+        """meters_config.json must be overwritten with the predecessor's full_config_json."""
+        import json as _json
+        store, cfg_old, cfg_new = self._make_two_period_store()
+        client = make_client(store=store)
+        active_id = store._conn.execute(
+            "SELECT id FROM config_periods WHERE effective_to IS NULL"
+        ).fetchone()["id"]
+
+        written = {}
+        def capture_save(path, data):
+            written["path"] = path
+            written["data"] = data
+
+        with patch("energy_engine_io.save_json_atomic", side_effect=capture_save),              patch("server.load_config", return_value=cfg_new):
+            client.delete(f"/api/config/history/{active_id}")
+
+        self.assertIn("path", written, "save_json_atomic was not called")
+        self.assertIn("meters_config.json", written["path"])
+        # The written config should be the OLD (predecessor) config, not the new one
+        written_site = (written["data"].get("meters", {})
+                        .get("electricity_main", {})
+                        .get("meta", {})
+                        .get("site"))
+        self.assertEqual(written_site, "Old Site",
+                         "meters_config.json should be restored to predecessor's config")
+
+    def test_delete_non_active_does_not_write_config(self):
+        """Deleting a non-active period must not touch meters_config.json."""
+        import json as _json
+        store, cfg_old, cfg_new = self._make_two_period_store()
+        client = make_client(store=store)
+        non_active_id = store._conn.execute(
+            "SELECT id FROM config_periods WHERE effective_to IS NOT NULL"
+        ).fetchone()["id"]
+
+        with patch("energy_engine_io.save_json_atomic", return_value=None) as mock_save,              patch("server.load_config", return_value=cfg_new):
+            r = client.delete(f"/api/config/history/{non_active_id}")
+
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertFalse(data.get("config_restored", True),
+                         "config_restored must be False when non-active period deleted")
+        mock_save.assert_not_called()
+
+    def test_delete_only_period_returns_400(self):
+        """Cannot delete the only period."""
+        store = BlockStore(":memory:")
+        store.insert_config_period({"meters": {"electricity_main": {"meta": {
+            "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
+            "currency_symbol": "£", "currency_code": "GBP",
+        }}}})
+        only_id = store._conn.execute(
+            "SELECT id FROM config_periods LIMIT 1"
+        ).fetchone()["id"]
+        client = make_client(store=store)
+        r = client.delete(f"/api/config/history/{only_id}")
+        self.assertEqual(r.status_code, 400)
 
 # ─────────────────────────────────────────────────────────────────────────────
 

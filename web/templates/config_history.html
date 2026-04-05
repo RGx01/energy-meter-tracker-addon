@@ -449,24 +449,27 @@ function newPeriod() {
 
 function confirmDelete(id, blockCount, isActive) {
   var extra = isActive
-    ? ' This is the current active period — the previous period will become active.'
+    ? '\n\nThis is the current active period. The previous period will become active and Meter Config will be restored to that period\'s settings.'
     : '';
   var msg = blockCount > 0
     ? 'Remove this config period? Its ' + blockCount.toLocaleString() + ' blocks will be reassigned to the previous period — no measurement data will be lost.' + extra
     : 'Remove this config period? It has no blocks so nothing will be reassigned.' + extra;
   if (!confirm(msg)) return;
-  doDelete(id);
+  doDelete(id, isActive);
 }
 
-function doDelete(id) {
+function doDelete(id, isActive) {
   fetch(apiUrl('/api/config/history/' + id), { method: 'DELETE' })
     .then(function(r) { return r.json(); })
     .then(function(data) {
       if (data.ok) {
-        var msg = 'Config period removed.';
+        var parts = ['Config period removed.'];
         if (data.blocks_reassigned > 0)
-          msg += ' ' + data.blocks_reassigned.toLocaleString() + ' blocks reassigned to adjacent period — no data lost. Charts regenerated.';
-        showSuccess(msg);
+          parts.push(data.blocks_reassigned.toLocaleString() + ' blocks reassigned — no data lost.');
+        if (data.config_restored)
+          parts.push('Meter Config restored to the previous period\'s settings. The engine will pick up the restored config on its next tick.');
+        parts.push('Charts regenerated.');
+        showSuccess(parts.join(' '));
         load();
       } else {
         showError(data.error || 'Delete failed');
