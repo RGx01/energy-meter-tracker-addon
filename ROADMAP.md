@@ -30,71 +30,116 @@ Usage Stats chart (daily/monthly/yearly with sub-meter breakdown), global light/
 ### 1.6.x — Polish & Fixes
 Billing/Calendar period toggle, data table totals column, heatmap mobile fixes, light/dark mode fixes throughout.
 
-### 2.0.0 — SQLite & Billing History
-- **SQLite storage** — all blocks stored in an indexed database; automatic migration from `blocks.json`
-- **Billing History** — config periods tracked in the database; billing charts use historically correct billing day and rates
+---
+
+## In Development (unreleased — basis for 2.1.0)
+
+### SQLite & Billing History
+- **SQLite storage** — all blocks in an indexed database; automatic migration from `blocks.json`
+- **Billing History** — config periods tracked; billing charts use historically correct billing day and rates
 - **Billing period transitions** — truncation-only model; correct period boundaries in usage stats and live power
 - **Live Power performance** — instant page load with async billing cards; SQL aggregation replaces full block scans
-- **Billing History UI** — New Period button, remove period for all periods (when 2+ exist), block reassignment on edit/delete
+- **Historical Corrections** — bulk-update standing charge or import/export rates across a date range via the Import & Backup page
+- **Billing alignment** — kWh, cost and standing charge now agree between Billing chart, Usage Stats and Live Power including BST period boundaries
+- **Config history fixes** — deleting the active period restores `meters_config.json` from the predecessor; restoring `meters_config.json` from backup syncs the active config period in the DB
 
 ---
 
 ## Planned
 
-### 2.1.0 — Data Management
+### 2.1.0 — Full SQLite: Eliminate JSON Files
+**Theme: Single source of truth — one database, no JSON state files**
+
+The unreleased SQLite work moved blocks to the DB but left three JSON files as live state. This release completes the transition so the database is the only thing that needs to be backed up or restored, and the codebase is significantly simpler.
+
+**`cumulative_totals.json` → derived from `blocks` table** (trivial)
+
+`SUM(imp_kwh)`, `SUM(exp_kwh)`, `SUM(imp_cost)`, `SUM(exp_cost)` from the blocks table gives the same numbers. On startup the engine runs this query instead of loading the file. The file is no longer written after each finalise.
+
+**`meters_config.json` → `config_periods.full_config_json`** (low risk)
+
+The active config period's `full_config_json` already contains the complete meters config. The engine and server query the active config period directly. The file becomes a convenience export only — written on config save for human readability, never read back as live state.
+
+Migration: on startup, if `config_periods` is empty and `meters_config.json` exists, use the file to seed the first period (existing behaviour). If `config_periods` has rows, ignore the file entirely.
+
+**`current_block.json` → `current_block` table + `reads` table** (most complex)
+
+The in-progress block contains a rolling reads buffer and gap marker — the engine writes it every tick. The `reads` table schema and `insert_read()` already exist but the engine never calls them.
+- Add a `current_block` table (one row: block_start, block_end, gap_marker, serialised state)
+- Engine writes each sensor capture to the `reads` table rather than accumulating in JSON
+- On startup, reconstruct in-progress state from `current_block` + `reads` instead of `current_block.json`
+
+**Backup and restore simplification**
+
+Once all state is in the DB, backup = SQLite online backup API. Restore = copy the file. The Import & Backup page gains:
+- Download the live DB directly
+- Restore by uploading a DB file
+- Selective table restore (e.g. restore `blocks` from an older DB without touching `config_periods`)
+
+**Deprecations removed in this release**
+
+| Artefact | Removed in |
+|----------|-----------|
+| `migrate_json_to_sqlite()` in `block_store.py` | 2.1.0 |
+| `blocks.json` preservation after migration | 2.1.0 |
+| `cumulative_totals.json` as live state | 2.1.0 |
+| `current_block.json` as live state | 2.1.0 |
+| `meters_config.json` as live state | 2.1.0 |
+| `SQLITE_MIGRATION_PLAN.md` | 2.1.0 |
+
+> The engine refactor for `current_block.json` is the riskiest part — recommend a design spike to ensure tick-loop latency is not affected before development begins.
+
+---
+
+### 2.2.0 — Data Management
 **Theme: Give users control over their data**
 
-Now that blocks are in SQLite, data management operations are safe and atomic.
+With the DB as the single source of truth, data management operations are safe and atomic.
 
 - Stop / Start engine controls (pause recording without restarting the add-on)
 - Reset data wizard — guided flow: stop engine → backup → clear blocks → reconfigure → restart
 - Selective date range deletion (e.g. remove a period of bad data)
+- DB-to-DB migration tool (copy blocks between installs or from older DB files)
 - Confirmation dialogs and safety checks throughout
-- Help page documentation for the reset procedure
-
-> Prerequisite for users who need to change their reconciliation period or start fresh after a misconfiguration.
-
----
-
-### 2.2.0 — Charting Insights
-**Theme: Understand your energy patterns**
-
-New analytical views beyond raw consumption tracking.
-
-Candidate features (final scope TBD):
-- Cost forecasting — projected bill based on current period consumption rate
-- Peak demand analysis — identify highest consumption periods and times of day
-- Solar self-consumption ratio (requires solar generation sub-meter)
-- Tariff optimisation hints (e.g. best EV charging windows for Agile tariff users)
-- Day-of-week consumption patterns
 
 ---
 
 ### 2.3.0 — High-Resolution Charting
 **Theme: See what's really happening within each block**
 
-Capture sensor data at full resolution (e.g. every 10 seconds) for charting, while keeping reconciliation blocks for billing accuracy.
+Capture sensor data at full resolution (e.g. every 10 seconds) for charting, while keeping reconciliation blocks for billing accuracy. The `reads` table (populated since 2.1.0) is the data source.
 
-Key design considerations:
-- High-res data stored in a separate SQLite table from reconciliation blocks
+- High-res data already stored per sensor capture in the `reads` table
 - Configurable retention (default 7 days — storage is significant at 10s resolution)
 - Daily charts rendered from high-res data when available, falling back to block data for older periods
 - No impact on billing calculations — reconciliation blocks remain authoritative
 
 ---
 
-### 2.x — Gas Meters
+### 2.4.0 — Gas Meters
 **Theme: Whole-home energy tracking**
 
 Extend the engine to support gas meter recording alongside electricity.
 
-Key design considerations:
 - Gas uses m³ or ft³ — requires calorific value and correction factor conversion to kWh
 - Billing periods and standing charges may differ from electricity
 - Gas meters update less frequently than smart electricity meters
 - Separate chart views and a combined electricity + gas billing summary
 
 > Requires a design spike before development begins.
+
+---
+
+### 2.5.0 — Charting Insights
+**Theme: Understand your energy patterns**
+
+New analytical views. Planned after Gas Meters so insights can reflect whole-home consumption.
+
+- Cost forecasting — projected bill based on current period consumption rate
+- Peak demand analysis — highest consumption periods and times of day
+- Solar self-consumption ratio (requires solar generation sub-meter)
+- Tariff optimisation hints (e.g. best EV charging windows for Agile tariff users)
+- Day-of-week consumption patterns
 
 ---
 
@@ -108,24 +153,6 @@ Key design considerations:
 
 ---
 
-## Planned Deprecations
-
-### Migration tools — deprecation target: 2.2.0
-
-The following tools were introduced to support the 1.x → 2.0.0 SQLite migration and will be removed once the migration window has passed:
-
-| Tool | Purpose | Planned removal |
-|------|---------|-----------------|
-| `migrate_json_to_sqlite()` in `block_store.py` | Migrates `blocks.json` to `energy_meter.db` on first start | 2.2.0 |
-| `SQLITE_MIGRATION_PLAN.md` | Internal migration design document | 2.2.0 |
-| `blocks.json` preservation after migration | Original JSON file is kept as a fallback during the migration window | 2.2.0 |
-
-Users upgrading from 1.x should ensure they have confirmed their data migrated correctly before 2.2.0 is released. After removal, `blocks.json` will no longer be read or preserved — only `energy_meter.db` will be used.
-
-> If you are still on 1.x and plan to upgrade, do so before 2.2.0. The migration runs automatically on first start and requires no manual steps.
-
----
-
 ## Release Principles
 
 - Each release has a clear theme and a testable scope
@@ -133,4 +160,4 @@ Users upgrading from 1.x should ensure they have confirmed their data migrated c
 - Breaking changes (data format, config schema) require a migration path and deprecation notice
 - The reconciliation block is the authoritative unit — higher-resolution features are additive, not replacements
 - User data is never deleted without explicit confirmation
-- Migration tools are maintained for at least two minor releases after the migration they support
+- Migration tools are maintained for at least one full minor release after the migration they support
