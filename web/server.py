@@ -1372,9 +1372,46 @@ def api_config_history_update(period_id):
 @app.route("/api/config/history/<int:period_id>", methods=["DELETE"])
 def api_config_history_delete(period_id):
     """Delete a config period, re-assigning its blocks to an adjacent period."""
+    import json as _json
     try:
-        store  = _get_store()
+        store = _get_store()
+
+        # Check before deleting whether this is the active period
+        cp = store.get_config_period(period_id)
+        is_active = cp and cp.get("effective_to") is None
+
         result = store.delete_config_period(period_id)
+
+        # Rebuild chain first so effective_to values are consistent
+        try:
+            _rebuild_config_period_chain(store)
+        except Exception as _e:
+            logger.warning("api_config_history_delete: chain rebuild failed: %s", _e)
+
+        # If we deleted the active period, the predecessor is now active.
+        # Write its full_config_json back to meters_config.json so the engine,
+        # charts and billing all read the correct (now-current) config.
+        if is_active:
+            try:
+                new_active = store._conn.execute(
+                    "SELECT full_config_json FROM config_periods "
+                    "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+                ).fetchone()
+                if new_active and new_active["full_config_json"]:
+                    from energy_engine_io import save_json_atomic as _sja
+                    restored_cfg = _json.loads(new_active["full_config_json"])
+                    cfg_path = os.path.join(DATA_DIR, "meters_config.json")
+                    _sja(cfg_path, restored_cfg)
+                    logger.info(
+                        "api_config_history_delete: meters_config.json restored "
+                        "from newly-active config period"
+                    )
+            except Exception as _e:
+                logger.warning(
+                    "api_config_history_delete: could not restore meters_config.json: %s", _e
+                )
+
+        # Regenerate charts
         try:
             import energy_charts as _ec
             blocks = store.get_all_blocks()
@@ -1390,18 +1427,19 @@ def api_config_history_delete(period_id):
                 bm       = int(main_meta.get("block_minutes") or 30)
                 currency = main_meta.get("currency_symbol", "£")
                 os.makedirs(CHART_DIR, exist_ok=True)
-                html = _ec.generate_daily_import_export_charts(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency)
+                html = _ec.generate_daily_import_export_charts(
+                    blocks, timezone_name=tz_name, block_minutes=bm, currency=currency
+                )
                 with open(os.path.join(CHART_DIR, "daily_usage.html"), "w") as f:
                     f.write(html)
         except Exception as _e:
             logger.warning("api_config_history_delete: chart regen failed: %s", _e)
-        # Rebuild chain after delete to ensure no gaps
-        try:
-            _rebuild_config_period_chain(store)
-        except Exception as _e:
-            logger.warning("api_config_history_delete: chain rebuild failed: %s", _e)
 
-        return jsonify({"ok": True, "blocks_reassigned": result["blocks_reassigned"]})
+        return jsonify({
+            "ok": True,
+            "blocks_reassigned": result["blocks_reassigned"],
+            "config_restored": is_active,
+        })
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
@@ -1810,3 +1848,154 @@ def api_import():
             if engine and hasattr(engine, 'resume_engine'):
                 engine.resume_engine()
         threading.Thread(target=delayed_resume, daemon=True).start()
+
+# ── Historical corrections ────────────────────────────────────────────────────
+
+@app.route("/api/corrections/preview", methods=["POST"])
+def api_corrections_preview():
+    """
+    Preview what a standing-charge or rate correction would affect.
+    Body: { type: "standing"|"rate", from_date: "YYYY-MM-DD", to_date: "YYYY-MM-DD",
+            value: float, channel: "import"|"export" (rate only) }
+    Returns: { days: int, blocks: int, current_min: float, current_max: float }
+    """
+    try:
+        data       = request.get_json(force=True) or {}
+        corr_type  = data.get("type")          # "standing" or "rate"
+        from_date  = data.get("from_date", "")
+        to_date    = data.get("to_date", "")
+        channel    = data.get("channel", "import")  # for rate corrections
+
+        if corr_type not in ("standing", "rate"):
+            return jsonify({"error": "type must be 'standing' or 'rate'"}), 400
+        if not from_date or not to_date:
+            return jsonify({"error": "from_date and to_date required"}), 400
+
+        store = _get_store()
+
+        if corr_type == "standing":
+            cur = store._conn.execute(
+                """SELECT COUNT(DISTINCT local_date) as days,
+                          COUNT(*) as blocks,
+                          MIN(standing_charge) as cur_min,
+                          MAX(standing_charge) as cur_max
+                   FROM blocks
+                   WHERE local_date >= ? AND local_date <= ?""",
+                (from_date, to_date)
+            )
+        else:
+            col = "imp_rate" if channel == "import" else "exp_rate"
+            cur = store._conn.execute(
+                f"""SELECT COUNT(DISTINCT local_date) as days,
+                           COUNT(*) as blocks,
+                           MIN({col}) as cur_min,
+                           MAX({col}) as cur_max
+                    FROM blocks
+                    WHERE local_date >= ? AND local_date <= ?
+                      AND {col} IS NOT NULL""",
+                (from_date, to_date)
+            )
+
+        row = cur.fetchone()
+        return jsonify({
+            "days":        row["days"]    or 0,
+            "blocks":      row["blocks"]  or 0,
+            "current_min": row["cur_min"] or 0,
+            "current_max": row["cur_max"] or 0,
+        })
+    except Exception as e:
+        logger.error("api_corrections_preview: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/corrections/apply", methods=["POST"])
+def api_corrections_apply():
+    """
+    Apply a standing-charge or rate correction to the live database.
+    Body: { type: "standing"|"rate", from_date: "YYYY-MM-DD", to_date: "YYYY-MM-DD",
+            value: float, channel: "import"|"export" (rate only),
+            recalc_cost: bool (rate only — recalculate imp_cost from rate × kwh) }
+    Returns: { updated_blocks: int }
+    """
+    try:
+        data        = request.get_json(force=True) or {}
+        corr_type   = data.get("type")
+        from_date   = data.get("from_date", "")
+        to_date     = data.get("to_date", "")
+        value       = data.get("value")
+        channel     = data.get("channel", "import")
+        recalc_cost = bool(data.get("recalc_cost", True))
+
+        if corr_type not in ("standing", "rate"):
+            return jsonify({"error": "type must be 'standing' or 'rate'"}), 400
+        if not from_date or not to_date:
+            return jsonify({"error": "from_date and to_date required"}), 400
+        if value is None:
+            return jsonify({"error": "value required"}), 400
+
+        value = float(value)
+        if value < 0:
+            return jsonify({"error": "value must be >= 0"}), 400
+
+        store = _get_store()
+
+        if corr_type == "standing":
+            cur = store._conn.execute(
+                """UPDATE blocks SET standing_charge = ?
+                   WHERE local_date >= ? AND local_date <= ?""",
+                (value, from_date, to_date)
+            )
+            store._conn.commit()
+            updated = cur.rowcount
+            logger.info(
+                "api_corrections_apply: standing_charge set to %.4f "
+                "for %d blocks (%s → %s)", value, updated, from_date, to_date
+            )
+
+        else:  # rate correction
+            if channel == "import":
+                if recalc_cost:
+                    cur = store._conn.execute(
+                        """UPDATE blocks
+                           SET imp_rate = ?,
+                               imp_cost = ROUND(imp_kwh * ?, 6)
+                           WHERE local_date >= ? AND local_date <= ?
+                             AND imp_rate IS NOT NULL""",
+                        (value, value, from_date, to_date)
+                    )
+                else:
+                    cur = store._conn.execute(
+                        """UPDATE blocks SET imp_rate = ?
+                           WHERE local_date >= ? AND local_date <= ?
+                             AND imp_rate IS NOT NULL""",
+                        (value, from_date, to_date)
+                    )
+            else:  # export
+                if recalc_cost:
+                    cur = store._conn.execute(
+                        """UPDATE blocks
+                           SET exp_rate = ?,
+                               exp_cost = ROUND(exp_kwh * ?, 6)
+                           WHERE local_date >= ? AND local_date <= ?
+                             AND exp_rate IS NOT NULL""",
+                        (value, value, from_date, to_date)
+                    )
+                else:
+                    cur = store._conn.execute(
+                        """UPDATE blocks SET exp_rate = ?
+                           WHERE local_date >= ? AND local_date <= ?
+                             AND exp_rate IS NOT NULL""",
+                        (value, from_date, to_date)
+                    )
+            store._conn.commit()
+            updated = cur.rowcount
+            logger.info(
+                "api_corrections_apply: %s rate set to %.6f "
+                "(recalc_cost=%s) for %d blocks (%s → %s)",
+                channel, value, recalc_cost, updated, from_date, to_date
+            )
+
+        return jsonify({"ok": True, "updated_blocks": updated})
+    except Exception as e:
+        logger.error("api_corrections_apply: %s", e)
+        return jsonify({"error": str(e)}), 500
