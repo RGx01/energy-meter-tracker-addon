@@ -16,100 +16,130 @@ Flask-based web UI with Meter Config, Charts, Import & Backup, Logs and Help pag
 Guided setup wizard for first-time configuration of main meter and sub-meters.
 
 ### 1.3.x — Stability & Timezone
-- Timezone-aware chart rendering
-- UTC timestamp bug fixes
-- Silent sensor timeout fix (block stuck at boundary)
-- Standing charge billing display fix
+Timezone-aware chart rendering, UTC timestamp fixes, silent sensor timeout fix, standing charge billing fix.
 
 ### 1.4.0 — Global Readiness
-- Configurable meter reconciliation period (5, 15 or 30 minutes)
-- Automatic currency detection from rate sensor unit of measurement
-- International sensor compatibility (currency-agnostic sensor filters)
-- Export-only daily chart fix (rate axis alignment)
-- Billing day always read from live config (takes effect immediately)
-- Help page internationalised; reconciliation period terminology throughout
+Configurable reconciliation period (5/15/30 min), automatic currency detection, international sensor compatibility.
 
 ### 1.5.0 — Live Power Gauge
-- Live power gauge showing net grid flow (import/export kW)
-- Gauge colour reflects carbon intensity (UK) or import magnitude (global)
-- 48-hour carbon intensity forecast strip (UK, National Grid API, no key required)
-- Today, This Bill and This Year billing cards with sub-meter breakdown
-- Billing auto-refresh 1 minute after each block boundary
-- Power sensor and postcode prefix fields added to Meter Config
+Live power gauge, carbon intensity forecast, billing cards (Today / This Bill / This Year), billing auto-refresh.
 
-### 1.5.1 — Live Power Refinements
-- Summary page renamed to Live Power throughout
-- Billing totals unified with chart billing page calculations
-- Gauge and carbon card layout fixes for mobile
-- Billing card responsive grid fixes
+### 1.6.0 — Usage Stats & Theme
+Usage Stats chart (daily/monthly/yearly with sub-meter breakdown), global light/dark theme toggle, remember last page, mobile improvements.
+
+### 1.6.x — Polish & Fixes
+Billing/Calendar period toggle, data table totals column, heatmap mobile fixes, light/dark mode fixes throughout.
+
+---
+
+## In Development (unreleased — basis for 2.1.0)
+
+### SQLite & Billing History
+- **SQLite storage** — all blocks in an indexed database; automatic migration from `blocks.json`
+- **Billing History** — config periods tracked; billing charts use historically correct billing day and rates
+- **Billing period transitions** — truncation-only model; correct period boundaries in usage stats and live power
+- **Live Power performance** — instant page load with async billing cards; SQL aggregation replaces full block scans
+- **Historical Corrections** — bulk-update standing charge or import/export rates across a date range via the Import & Backup page
+- **Billing alignment** — kWh, cost and standing charge now agree between Billing chart, Usage Stats and Live Power including BST period boundaries
+- **Config history fixes** — deleting the active period restores `meters_config.json` from the predecessor; restoring `meters_config.json` from backup syncs the active config period in the DB
 
 ---
 
 ## Planned
 
-### 1.4.x — Data Management
+### 2.1.0 — Full SQLite: Eliminate JSON Files
+**Theme: Single source of truth — one database, no JSON state files**
+
+The unreleased SQLite work moved blocks to the DB but left three JSON files as live state. This release completes the transition so the database is the only thing that needs to be backed up or restored, and the codebase is significantly simpler.
+
+**`cumulative_totals.json` → derived from `blocks` table** (trivial)
+
+`SUM(imp_kwh)`, `SUM(exp_kwh)`, `SUM(imp_cost)`, `SUM(exp_cost)` from the blocks table gives the same numbers. On startup the engine runs this query instead of loading the file. The file is no longer written after each finalise.
+
+**`meters_config.json` → `config_periods.full_config_json`** (low risk)
+
+The active config period's `full_config_json` already contains the complete meters config. The engine and server query the active config period directly. The file becomes a convenience export only — written on config save for human readability, never read back as live state.
+
+Migration: on startup, if `config_periods` is empty and `meters_config.json` exists, use the file to seed the first period (existing behaviour). If `config_periods` has rows, ignore the file entirely.
+
+**`current_block.json` → `current_block` table + `reads` table** (most complex)
+
+The in-progress block contains a rolling reads buffer and gap marker — the engine writes it every tick. The `reads` table schema and `insert_read()` already exist but the engine never calls them.
+- Add a `current_block` table (one row: block_start, block_end, gap_marker, serialised state)
+- Engine writes each sensor capture to the `reads` table rather than accumulating in JSON
+- On startup, reconstruct in-progress state from `current_block` + `reads` instead of `current_block.json`
+
+**Backup and restore simplification**
+
+Once all state is in the DB, backup = SQLite online backup API. Restore = copy the file. The Import & Backup page gains:
+- Download the live DB directly
+- Restore by uploading a DB file
+- Selective table restore (e.g. restore `blocks` from an older DB without touching `config_periods`)
+
+**Deprecations removed in this release**
+
+| Artefact | Removed in |
+|----------|-----------|
+| `migrate_json_to_sqlite()` in `block_store.py` | 2.1.0 |
+| `blocks.json` preservation after migration | 2.1.0 |
+| `cumulative_totals.json` as live state | 2.1.0 |
+| `current_block.json` as live state | 2.1.0 |
+| `meters_config.json` as live state | 2.1.0 |
+| `SQLITE_MIGRATION_PLAN.md` | 2.1.0 |
+
+> The engine refactor for `current_block.json` is the riskiest part — recommend a design spike to ensure tick-loop latency is not affected before development begins.
+
+---
+
+### 2.2.0 — Data Management
 **Theme: Give users control over their data**
 
-The reconciliation period is locked once data collection begins, but currently the only way to reset data is via terminal. This release adds proper data management tools to the UI.
+With the DB as the single source of truth, data management operations are safe and atomic.
 
 - Stop / Start engine controls (pause recording without restarting the add-on)
-- Reset data wizard — guided flow: stop engine → backup → clear data → reconfigure → restart
+- Reset data wizard — guided flow: stop engine → backup → clear blocks → reconfigure → restart
+- Selective date range deletion (e.g. remove a period of bad data)
+- DB-to-DB migration tool (copy blocks between installs or from older DB files)
 - Confirmation dialogs and safety checks throughout
-- Help page documentation for the reset procedure
-
-> This is a prerequisite for users who need to change their reconciliation period or start fresh after a misconfiguration.
 
 ---
 
-### 1.6.0 — Charts & Navigation Polish
-**Theme: Richer charting and smarter navigation**
+### 2.3.0 — High-Resolution Charting
+**Theme: See what's really happening within each block**
 
-- **Import / Export bar chart** — new chart tab showing import/export per day, month or year; import and export bars stacked directly above/below each other per period; switchable kWh/cost and Totals/Net views; monthly and yearly periods include a year selector for multi-year comparison with per-year colour coding
-- **Remember last visited page** — the add-on remembers which page you were on and returns you there on next load, rather than always defaulting to Charts
+Capture sensor data at full resolution (e.g. every 10 seconds) for charting, while keeping reconciliation blocks for billing accuracy. The `reads` table (populated since 2.1.0) is the data source.
+
+- High-res data already stored per sensor capture in the `reads` table
+- Configurable retention (default 7 days — storage is significant at 10s resolution)
+- Daily charts rendered from high-res data when available, falling back to block data for older periods
+- No impact on billing calculations — reconciliation blocks remain authoritative
 
 ---
 
-### 1.7.0 — Gas Meters
+### 2.4.0 — Gas Meters
 **Theme: Whole-home energy tracking**
 
 Extend the engine to support gas meter recording alongside electricity.
 
-Key design considerations:
 - Gas uses m³ or ft³ — requires calorific value and correction factor conversion to kWh
 - Billing periods and standing charges may differ from electricity
 - Gas meters update less frequently than smart electricity meters
-- Separate chart views for gas consumption
-- Potential for combined electricity + gas billing summary
+- Separate chart views and a combined electricity + gas billing summary
 
-> Requires a design spike before development begins. Scope may split across sub-releases.
+> Requires a design spike before development begins.
 
 ---
 
-### 1.8.0 — Charting Insights
+### 2.5.0 — Charting Insights
 **Theme: Understand your energy patterns**
 
-New analytical views beyond raw consumption tracking.
+New analytical views. Planned after Gas Meters so insights can reflect whole-home consumption.
 
-Candidate features (final scope TBD):
-- Peak demand analysis — identify highest consumption periods
-- Solar self-consumption ratio (requires solar generation sub-meter)
 - Cost forecasting — projected bill based on current period consumption rate
-- Day-of-week and time-of-day consumption heatmaps
-- Tariff optimisation hints (e.g. best EV charging windows on Agile)
-
----
-
-### 1.9.0 — High-Resolution Charting
-**Theme: See what's really happening within each block**
-
-Capture sensor data at full sensor resolution (e.g. every 10 seconds) for charting purposes, while keeping the reconciliation block size for billing accuracy.
-
-Key design considerations:
-- High-res data stored in a separate buffer from reconciliation blocks
-- Configurable retention period (default 7 days suggested — storage is significant at 10s resolution)
-- Daily charts rendered from high-res data when available, falling back to block data for older periods
-- No impact on billing calculations — reconciliation blocks remain authoritative
-- Migration path for users upgrading from lower-resolution historical data
+- Peak demand analysis — highest consumption periods and times of day
+- Solar self-consumption ratio (requires solar generation sub-meter)
+- Tariff optimisation hints (e.g. best EV charging windows for Agile tariff users)
+- Day-of-week consumption patterns
 
 ---
 
@@ -118,16 +148,16 @@ Key design considerations:
 - **Solar generation tracking** — export sub-metering and self-consumption breakdown
 - **V2G / V2X export** — breakdown of EV-to-grid export by device
 - **Multiple batteries / inverters** — better support for complex hybrid systems
-- **Historical data migration tool** — convert 30-minute blocks to finer resolution when supplier resolution changes
-- **HACS / community distribution** — evaluate distribution channels beyond the add-on store
 - **Multi-dwelling / multi-site** — support for properties with more than one grid connection
+- **HACS / community distribution** — evaluate distribution channels beyond the add-on store
 
 ---
 
 ## Release Principles
 
-- Each release should have a clear theme and a testable scope
+- Each release has a clear theme and a testable scope
 - Billing accuracy is never compromised by new features
-- Breaking changes (data format, config schema) require a migration path
+- Breaking changes (data format, config schema) require a migration path and deprecation notice
 - The reconciliation block is the authoritative unit — higher-resolution features are additive, not replacements
 - User data is never deleted without explicit confirmation
+- Migration tools are maintained for at least one full minor release after the migration they support

@@ -93,6 +93,23 @@ SHARE_BACKUP_DIR = (
 _ha_client = None   # reference to the running HAClient instance
 _event_loop = None  # asyncio event loop — captured at init time
 
+# BlockStore — opened lazily on first use, shared across all server requests
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(__file__)))
+from block_store import BlockStore, open_block_store
+_store: BlockStore | None = None
+
+
+def _get_store() -> BlockStore:
+    """Return the server's BlockStore, opening it lazily on first call."""
+    global _store
+    if _store is None:
+        if DATA_DIR is None:
+            raise RuntimeError("server.init() has not been called")
+        db_path = _os.path.join(DATA_DIR, "blocks.db")
+        _store = open_block_store(db_path)
+    return _store
+
 
 def init(data_dir: str, chart_dir: str, ha_client):
     global DATA_DIR, CHART_DIR, _ha_client, _event_loop
@@ -119,6 +136,66 @@ def _run():
 
 def config_path():
     return os.path.join(DATA_DIR, "meters_config.json")
+
+
+def _rebuild_config_period_chain(store):
+    """
+    Re-sort all config periods by effective_from and rebuild the contiguous
+    chain: each period's effective_to is set to the next period's effective_from,
+    with the last (most recent) period getting effective_to = NULL.
+
+    Also reassigns blocks so every block's config_period_id matches the period
+    whose [effective_from, effective_to) range contains the block's block_start.
+
+    Called after any insert, edit or delete of a config period.
+    """
+    cur = store._conn.execute(
+        "SELECT id, effective_from FROM config_periods ORDER BY effective_from ASC"
+    )
+    periods = cur.fetchall()
+    if not periods:
+        return
+
+    # Build effective_to for each period
+    updates = []
+    for i, row in enumerate(periods):
+        if i + 1 < len(periods):
+            updates.append((periods[i + 1]["effective_from"], row["id"]))
+        else:
+            updates.append((None, row["id"]))
+
+    store._conn.execute("BEGIN")
+    for effective_to, period_id in updates:
+        store._conn.execute(
+            "UPDATE config_periods SET effective_to = ? WHERE id = ?",
+            (effective_to, period_id)
+        )
+
+    # Reassign blocks: each block goes to the period containing its block_start
+    # Fetch updated periods
+    cur2 = store._conn.execute(
+        "SELECT id, effective_from, effective_to FROM config_periods ORDER BY effective_from ASC"
+    )
+    chain = cur2.fetchall()
+    for i, period in enumerate(chain):
+        pid          = period["id"]
+        ef_from      = period["effective_from"]
+        ef_to        = period["effective_to"]
+        if ef_to is not None:
+            store._conn.execute(
+                """UPDATE blocks SET config_period_id = ?
+                   WHERE block_start >= ? AND block_start < ?""",
+                (pid, ef_from, ef_to)
+            )
+        else:
+            # Last period: all blocks from effective_from onwards
+            store._conn.execute(
+                """UPDATE blocks SET config_period_id = ?
+                   WHERE block_start >= ?""",
+                (pid, ef_from)
+            )
+
+    store._conn.execute("COMMIT")
 
 
 def load_config():
@@ -183,10 +260,7 @@ def api_set_last_page():
 def config_page():
     cfg = load_config()
     try:
-        from energy_engine_io import load_json as _lj
-        import os as _os
-        _blocks = _lj(_os.path.join(DATA_DIR, "blocks.json"), [])
-        has_data = len(_blocks) > 0
+        has_data = _get_store().count_blocks() > 0
     except Exception:
         has_data = False
     tz_select_html = '<select class="js-meta" data-key="timezone"><option value="UTC">UTC</option><option value="Europe/London">Europe/London (UK)</option><option value="Europe/Dublin">Europe/Dublin (Ireland)</option><option value="Europe/Lisbon">Europe/Lisbon (Portugal)</option><option value="Europe/Paris">Europe/Paris (France, Belgium, Netherlands)</option><option value="Europe/Berlin">Europe/Berlin (Germany, Austria)</option><option value="Europe/Amsterdam">Europe/Amsterdam</option><option value="Europe/Rome">Europe/Rome (Italy)</option><option value="Europe/Madrid">Europe/Madrid (Spain)</option><option value="Europe/Stockholm">Europe/Stockholm (Sweden, Norway, Denmark)</option><option value="Europe/Helsinki">Europe/Helsinki (Finland)</option><option value="Europe/Warsaw">Europe/Warsaw (Poland)</option><option value="Europe/Athens">Europe/Athens (Greece)</option><option value="Europe/Istanbul">Europe/Istanbul (Turkey)</option><option value="Europe/Moscow">Europe/Moscow (Russia)</option><option value="America/New_York">America/New_York (US Eastern)</option><option value="America/Chicago">America/Chicago (US Central)</option><option value="America/Denver">America/Denver (US Mountain)</option><option value="America/Los_Angeles">America/Los_Angeles (US Pacific)</option><option value="America/Toronto">America/Toronto (Canada Eastern)</option><option value="America/Vancouver">America/Vancouver (Canada Pacific)</option><option value="America/Sao_Paulo">America/Sao_Paulo (Brazil)</option><option value="Asia/Dubai">Asia/Dubai (UAE)</option><option value="Asia/Kolkata">Asia/Kolkata (India)</option><option value="Asia/Singapore">Asia/Singapore</option><option value="Asia/Tokyo">Asia/Tokyo (Japan)</option><option value="Asia/Shanghai">Asia/Shanghai (China)</option><option value="Australia/Sydney">Australia/Sydney</option><option value="Australia/Perth">Australia/Perth</option><option value="Pacific/Auckland">Pacific/Auckland (New Zealand)</option></select>'
@@ -263,9 +337,7 @@ def charts_page():
     heatmap_exists = os.path.exists(os.path.join(CHART_DIR, "net_heatmap.html"))
     daily_exists   = os.path.exists(os.path.join(CHART_DIR, "daily_usage.html"))
     try:
-        from energy_engine_io import load_json as _load_json
-        blocks = _load_json(os.path.join(DATA_DIR, "blocks.json"), [])
-        block_count = len(blocks)
+        block_count = _get_store().count_blocks()
     except Exception:
         block_count = 0
     return render_template(
@@ -334,15 +406,18 @@ def _format_billing(summary, cfg, currency):
     return total_cost, rows
 
 
+# Cache for gauge scale — recomputed at most every 30 minutes
+_gauge_cache = {"ts": None, "max_imp": 10, "max_exp": 5, "rate_low": 0.10, "rate_high": 0.25}
+
 @app.route("/summary")
 def summary_page():
-    from energy_engine_io import load_json as _load_json
     from datetime import datetime
     from zoneinfo import ZoneInfo
+    from energy_engine_io import load_json as _load_json
 
     try:
         cfg      = _load_json(os.path.join(DATA_DIR, "meters_config.json"), {})
-        blocks   = _load_json(os.path.join(DATA_DIR, "blocks.json"), [])
+        store    = _get_store()
         main_meta = {}
         for md in cfg.get("meters", {}).values():
             if not (md.get("meta") or {}).get("sub_meter"):
@@ -355,94 +430,61 @@ def summary_page():
         now_local   = datetime.now(_tz)
         today_str   = now_local.date().isoformat()
 
-        # ── Use energy_charts.py billing calculation for accuracy ──
-        import energy_charts as _ec
-        now_naive = now_local.replace(tzinfo=None)
+        # ── Billing cards are populated by SSE on first tick — skip expensive
+        # block queries on initial page load so the page renders instantly ──
+        today_total = today_rows = today_date = None
+        month_total = month_rows = month_period = None
+        year_total  = year_rows  = year_period  = None
+        today_date  = now_local.strftime("%d %b %Y")
 
-        # Today
-        today_start = now_naive.replace(hour=0, minute=0, second=0, microsecond=0)
-        today_end   = today_start.replace(hour=23, minute=59, second=59)
-        today_summary = _ec.calculate_billing_summary_for_period(blocks, today_start, today_end)
-        today_total, today_rows = _format_billing(today_summary, cfg, currency)
-        today_date = now_local.strftime("%d %b %Y")
-
-        # Billing month
-        bd = billing_day
-        if now_naive.day >= bd:
-            period_start = now_naive.replace(day=bd, hour=0, minute=0, second=0, microsecond=0)
-        else:
-            m = now_naive.month - 1 or 12
-            y = now_naive.year if now_naive.month > 1 else now_naive.year - 1
-            period_start = now_naive.replace(year=y, month=m, day=bd, hour=0, minute=0, second=0, microsecond=0)
-        month_summary = _ec.calculate_billing_summary_for_period(blocks, period_start, now_naive)
-        month_total, month_rows = _format_billing(month_summary, cfg, currency)
-        month_period = f"{period_start.strftime('%d %b')} → {now_local.strftime('%d %b %Y')}"
-
-        # Calendar year
-        year_start   = now_naive.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-        year_summary = _ec.calculate_billing_summary_for_period(blocks, year_start, now_naive)
-        year_total, year_rows = _format_billing(year_summary, cfg, currency)
-        year_period  = f"1 Jan → {now_local.strftime('%d %b %Y')}"
-
-        # ── Gauge scale — 95th percentile of kW from last 7 days ──
+        # ── Gauge scale — use cache, recompute every 30 minutes ──
         from datetime import timedelta
-        cutoff = now_local - timedelta(days=7)
+        import time as _time
         block_minutes = int(main_meta.get("block_minutes") or 30)
-        hours_per_block = block_minutes / 60.0
-
-        imp_kw_vals = []
-        exp_kw_vals = []
-        rate_vals   = []
-
-        for b in blocks:
-            if not b or not b.get("start"):
-                continue
+        now_ts = _time.time()
+        if _gauge_cache["ts"] is None or now_ts - _gauge_cache["ts"] > 1800:
             try:
-                bdt = datetime.fromisoformat(b["start"]).replace(tzinfo=ZoneInfo("UTC")).astimezone(_tz)
-                if bdt < cutoff:
-                    continue
-                meters = b.get("meters", {}) or {}
-                for m_id, m_data in meters.items():
-                    meta = (m_data or {}).get("meta", {}) or {}
-                    if meta.get("sub_meter"):
-                        continue
-                    ch_imp = (m_data.get("channels", {}).get("import") or {})
-                    ch_exp = (m_data.get("channels", {}).get("export") or {})
-                    imp_kwh = float(ch_imp.get("kwh_remainder") or ch_imp.get("kwh") or 0)
-                    exp_kwh = float(ch_exp.get("kwh") or 0)
-                    if imp_kwh > 0:
-                        imp_kw_vals.append(imp_kwh / hours_per_block)
-                    if exp_kwh > 0:
-                        exp_kw_vals.append(exp_kwh / hours_per_block)
-                    rate = float(ch_imp.get("rate_used") or ch_imp.get("rate") or 0)
-                    if rate > 0:
-                        rate_vals.append(rate)
-            except Exception:
-                continue
+                hours_per_block = block_minutes / 60.0
+                cutoff_dt = now_local.replace(tzinfo=None) - timedelta(days=7)
+                now_naive2 = now_local.replace(tzinfo=None)
+                imp_kw_vals, exp_kw_vals, rate_vals = [], [], []
+                for b in store.get_blocks_for_range(cutoff_dt, now_naive2):
+                    if not b or not b.get("start"): continue
+                    try:
+                        for m_id, m_data in (b.get("meters") or {}).items():
+                            meta = (m_data or {}).get("meta", {}) or {}
+                            if meta.get("sub_meter"): continue
+                            ch_imp = (m_data.get("channels", {}).get("import") or {})
+                            ch_exp = (m_data.get("channels", {}).get("export") or {})
+                            imp_kwh = float(ch_imp.get("kwh_remainder") or ch_imp.get("kwh") or 0)
+                            exp_kwh = float(ch_exp.get("kwh") or 0)
+                            if imp_kwh > 0: imp_kw_vals.append(imp_kwh / hours_per_block)
+                            if exp_kwh > 0: exp_kw_vals.append(exp_kwh / hours_per_block)
+                            rate = float(ch_imp.get("rate_used") or ch_imp.get("rate") or 0)
+                            if rate > 0: rate_vals.append(rate)
+                    except Exception: continue
+                def _pct(vals, p):
+                    if not vals: return None
+                    s = sorted(vals); return s[min(int(len(s)*p/100), len(s)-1)]
+                def _nc(kw):
+                    for s in [1,2,3,5,7,10,15,20,30,50]:
+                        if s >= kw: return s
+                    return round(kw*1.2)
+                _gauge_cache.update({
+                    "ts": now_ts,
+                    "max_imp": _nc(_pct(imp_kw_vals, 95) or 3.0),
+                    "max_exp": _nc(_pct(exp_kw_vals, 95) or 3.0),
+                    "rate_low":  _pct(rate_vals, 33) or 0.10,
+                    "rate_high": _pct(rate_vals, 67) or 0.25,
+                })
+            except Exception as _ge:
+                logger.warning("summary_page: gauge cache update failed: %s", _ge)
 
-        def percentile(vals, pct):
-            if not vals:
-                return None
-            s = sorted(vals)
-            idx = int(len(s) * pct / 100)
-            return s[min(idx, len(s) - 1)]
-
-        def nice_ceil(kw):
-            steps = [1, 2, 3, 5, 7, 10, 15, 20, 30, 50]
-            for s in steps:
-                if s >= kw:
-                    return s
-            return round(kw * 1.2)
-
-        p95_imp = percentile(imp_kw_vals, 95)
-        p95_exp = percentile(exp_kw_vals, 95)
-        gauge_max_imp = nice_ceil(p95_imp or 3.0)
-        gauge_max_exp = nice_ceil(p95_exp or 3.0)
-        gauge_max = gauge_max_imp  # kept for backward compat
-
-        # Rate thresholds — low = bottom 33rd pct, high = top 33rd pct
-        rate_low  = percentile(rate_vals, 33) or 0.10
-        rate_high = percentile(rate_vals, 67) or 0.25
+        gauge_max_imp = _gauge_cache["max_imp"]
+        gauge_max_exp = _gauge_cache["max_exp"]
+        gauge_max     = gauge_max_imp
+        rate_low      = _gauge_cache["rate_low"]
+        rate_high     = _gauge_cache["rate_high"]
 
     except Exception as e:
         logger.error("summary_page: %s", e)
@@ -602,50 +644,108 @@ def api_power():
 
 @app.route("/api/billing")
 def api_billing():
-    """Return billing totals for Today, This Bill and This Year."""
-    from datetime import datetime
+    """Return billing totals for Today, This Bill and This Year using fast SQL aggregation."""
+    from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
     import energy_charts as _ec
     try:
         from energy_engine_io import load_json as _lj
         cfg      = _lj(os.path.join(DATA_DIR, "meters_config.json"), {})
-        blocks   = _lj(os.path.join(DATA_DIR, "blocks.json"), [])
+        store    = _get_store()
         main_meta = {}
         for md in cfg.get("meters", {}).values():
             if not (md.get("meta") or {}).get("sub_meter"):
                 main_meta = md.get("meta") or {}
                 break
-        currency    = main_meta.get("currency_symbol", "£")
-        tz_name     = main_meta.get("timezone", "UTC")
+        currency = main_meta.get("currency_symbol", "£")
+        tz_name  = main_meta.get("timezone", "UTC")
         billing_day = int(main_meta.get("billing_day") or 1)
-        _tz         = ZoneInfo(tz_name)
-        now_local   = datetime.now(_tz)
-        now_naive   = now_local.replace(tzinfo=None)
+        _tz      = ZoneInfo(tz_name)
+        now_local = datetime.now(_tz)
+        now_naive = now_local.replace(tzinfo=None)
+
+        def _fmt_total(totals, label_imp, label_exp):
+            """Format SQL totals into billing card total + rows."""
+            imp_cost = totals["imp_cost"]
+            exp_cost = totals["exp_cost"]
+            standing = totals["standing"]
+            total    = round(imp_cost + standing - exp_cost, 2)
+            rows = []
+            if totals["imp_kwh"] > 0.001 or imp_cost > 0.001:
+                rows.append({"label": f"{label_imp} ({totals['imp_kwh']:.3f} kWh)",
+                             "cost": imp_cost, "bold": True})
+                rows.append({"label": f"Grid Import ({totals['imp_kwh']:.3f} kWh)",
+                             "cost": imp_cost, "bold": False})
+            if totals["exp_kwh"] > 0.001:
+                rows.append({"label": f"Grid Export ({totals['exp_kwh']:.3f} kWh)",
+                             "cost": -exp_cost, "bold": False})
+            if standing > 0.001:
+                rows.append({"label": "Standing Charge", "cost": standing, "bold": False})
+            return total, rows
+
+        # Use local_date-based queries throughout — correctly handles BST blocks
+        # at 23:xx UTC that belong to the next local calendar day.
+        today_local_date = now_local.date().isoformat()
 
         # Today
-        today_start   = now_naive.replace(hour=0, minute=0, second=0, microsecond=0)
-        today_end     = today_start.replace(hour=23, minute=59, second=59)
-        today_summary = _ec.calculate_billing_summary_for_period(blocks, today_start, today_end)
-        today_total, today_rows = _format_billing(today_summary, cfg, currency)
+        today_t = store.get_billing_totals_for_local_date_range(
+            today_local_date, today_local_date
+        )
+        today_total, today_rows = _fmt_total(today_t, "Total Import", "Total Import")
 
-        # Billing month
-        bd = billing_day
-        if now_naive.day >= bd:
-            period_start = now_naive.replace(day=bd, hour=0, minute=0, second=0, microsecond=0)
+        # Billing period — find current period from config history
+        _bp_periods = _ec.get_billing_periods_from_config_periods(
+            store.get_config_periods(), tz=_tz
+        )
+        _today_date = now_local.date()
+        period_start = period_end_excl = None
+        for (_bps, _bpe) in _bp_periods:
+            if _bps.date() <= _today_date < _bpe.date():
+                period_start, period_end_excl = _bps, _bpe
+                break
+        if period_start is None:
+            if _bp_periods:
+                period_start, period_end_excl = _bp_periods[-1]
+            else:
+                bd = billing_day
+                if now_local.day >= bd:
+                    period_start = now_local.replace(day=bd, hour=0, minute=0, second=0, microsecond=0)
+                else:
+                    m = now_local.month - 1 or 12
+                    y = now_local.year if now_local.month > 1 else now_local.year - 1
+                    period_start = now_local.replace(year=y, month=m, day=bd, hour=0, minute=0, second=0, microsecond=0)
+
+        # Derive local date strings for period boundaries
+        if hasattr(period_start, 'tzinfo') and period_start.tzinfo is not None:
+            period_start_date = period_start.astimezone(_tz).date()
         else:
-            m = now_naive.month - 1 or 12
-            y = now_naive.year if now_naive.month > 1 else now_naive.year - 1
-            period_start = now_naive.replace(year=y, month=m, day=bd, hour=0, minute=0, second=0, microsecond=0)
-        month_summary = _ec.calculate_billing_summary_for_period(blocks, period_start, now_naive)
-        month_total, month_rows = _format_billing(month_summary, cfg, currency)
+            period_start_date = period_start.date()
 
-        # Calendar year
-        year_start   = now_naive.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-        year_summary = _ec.calculate_billing_summary_for_period(blocks, year_start, now_naive)
-        year_total, year_rows = _format_billing(year_summary, cfg, currency)
+        if period_end_excl is not None:
+            _end_incl = period_end_excl - timedelta(days=1)
+            if hasattr(_end_incl, 'tzinfo') and _end_incl.tzinfo is not None:
+                _end_incl_date = _end_incl.astimezone(_tz).date()
+            else:
+                _end_incl_date = _end_incl.date()
+            month_period_end_str = _end_incl_date.strftime('%d %b %Y')
+        else:
+            month_period_end_str = now_local.strftime('%d %b %Y')
+
+        month_t = store.get_billing_totals_for_local_date_range(
+            period_start_date.isoformat(), today_local_date
+        )
+        month_total, month_rows = _fmt_total(month_t, "Total Import", "Total Import")
+
+        # Calendar year — from Jan 1 local to today local
+        year_start_date = now_local.date().replace(month=1, day=1).isoformat()
+        year_t = store.get_billing_totals_for_local_date_range(
+            year_start_date, today_local_date
+        )
+        year_total, year_rows = _fmt_total(year_t, "Total Import", "Total Import")
 
         def fmt_rows(rows):
-            return [{"label": r["label"], "cost": r["cost"], "bold": r.get("bold", False)} for r in rows]
+            return [{"label": r["label"], "cost": r["cost"], "bold": r.get("bold", False)}
+                    for r in rows]
 
         return jsonify({
             "currency":     currency,
@@ -654,7 +754,7 @@ def api_billing():
             "today_date":   now_local.strftime("%d %b %Y"),
             "month_total":  month_total,
             "month_rows":   fmt_rows(month_rows),
-            "month_period": f"{period_start.strftime('%d %b')} → {now_local.strftime('%d %b %Y')}",
+            "month_period": f"{period_start.strftime('%d %b')} → {month_period_end_str}",
             "year_total":   year_total,
             "year_rows":    fmt_rows(year_rows),
             "year_period":  f"1 Jan → {now_local.strftime('%d %b %Y')}",
@@ -743,6 +843,11 @@ def import_page():
     return render_template("import.html", active="import")
 
 
+@app.route("/config-history")
+def config_history_page():
+    return render_template("config_history.html", active="config_history")
+
+
 # ── Chart file serving ────────────────────────────────────────────────────────
 
 @app.route("/charts/net_heatmap.html")
@@ -780,8 +885,8 @@ def api_blocks_summary():
         import energy_charts as _ec
         from collections import defaultdict
 
-        cfg    = _lj(os.path.join(DATA_DIR, "meters_config.json"), {})
-        blocks = _lj(os.path.join(DATA_DIR, "blocks.json"), [])
+        cfg   = _lj(os.path.join(DATA_DIR, "meters_config.json"), {})
+        store = _get_store()
 
         main_meta = {}
         for md in cfg.get("meters", {}).values():
@@ -795,7 +900,22 @@ def api_blocks_summary():
 
         billing_day = int(main_meta.get("billing_day") or 1)
 
-        meter_colors = _ec.build_meter_colors(blocks)
+        # Use local dates from the store index (pre-computed, timezone-correct)
+        all_date_strs = store.get_local_dates()
+        if not all_date_strs:
+            # Fallback: get meter colors from a small sample
+            sample = store.get_blocks_for_range(
+                datetime(2000,1,1), datetime(2100,1,1)
+            )
+            meter_colors = _ec.build_meter_colors(sample)
+            return jsonify({"currency": currency, "rows": [], "meters": [], "export_color": "#ff7f0e"})
+
+        # Build meter colors from a representative sample (first 200 blocks)
+        from datetime import date as _date
+        first_date = datetime.strptime(all_date_strs[0], "%Y-%m-%d")
+        sample_end = first_date.replace(hour=23, minute=59, second=59)
+        sample_blocks = store.get_blocks_for_range(first_date, sample_end)
+        meter_colors = _ec.build_meter_colors(sample_blocks)
 
         meter_labels = {}
         for meter_id, meter_cfg in cfg.get("meters", {}).items():
@@ -804,33 +924,80 @@ def api_blocks_summary():
             if is_sub:
                 label = meta.get("device") or meta.get("site") or meter_id
             else:
-                label = "Grid"   # main meter always labelled generically
+                label = "Grid"
             meter_labels[meter_id] = label
 
-        # Collect all unique local dates from blocks
-        dated = []
-        for b in blocks:
-            if not b or not b.get("start"):
-                continue
-            try:
-                dt = datetime.fromisoformat(b["start"]).replace(tzinfo=ZoneInfo("UTC")).astimezone(_tz)
-                dated.append(dt.date())
-            except Exception:
-                continue
+        all_dates = [datetime.strptime(d, "%Y-%m-%d").date() for d in all_date_strs]
 
-        if not dated:
-            return jsonify({"currency": currency, "rows": [], "meters": [], "export_color": "#ff7f0e"})
+        # Fetch all blocks in one query using local_date boundaries
+        # This correctly captures BST blocks at 23:xx UTC that belong to the next local day
+        from datetime import timedelta as _td
+        if all_dates:
+            all_blocks_flat = store.get_blocks_for_local_date_range(
+                all_date_strs[0], all_date_strs[-1]
+            )
+        else:
+            all_blocks_flat = []
 
-        all_dates = sorted(set(dated))
+        # Index by local_date
+        from collections import defaultdict as _dd
+        # Index blocks by local_date using the pre-computed field on each block
+        # (set by _row_to_block from the local_date column — timezone-correct).
+        _blocks_by_local_date = _dd(list)
+        from zoneinfo import ZoneInfo as _ZI
+        for _blk in all_blocks_flat:
+            # _row_to_block sets "start" as UTC ISO; derive local_date correctly
+            _blk_dt = _blk.get("start", "")
+            if _blk_dt:
+                try:
+                    _local_d = datetime.fromisoformat(_blk_dt).replace(
+                        tzinfo=_ZI("UTC")).astimezone(_ZI(tz_name)).date().isoformat()
+                    _blocks_by_local_date[_local_d].append(_blk)
+                except Exception:
+                    pass
+
+        # Pre-compute billing_period_start for each date using config periods
+        # (fast — no full block scan needed).
+        _bp_start_by_date = {}
+        try:
+            _bp_periods = _ec.get_billing_periods_from_config_periods(
+                store.get_config_periods(), tz=_ZI(tz_name)
+            )
+            from datetime import timedelta as _td2
+            for (_bps, _bpe) in _bp_periods:
+                _d = _bps.date()
+                while _d < _bpe.date():
+                    _bp_start_by_date[_d.isoformat()] = (
+                        _bps.date().isoformat(),
+                        _bpe.date().isoformat(),  # exclusive end
+                    )
+                    _d += _td2(days=1)
+            logger.info("api_blocks_summary: billing periods computed: %s",
+                        [(s.strftime('%Y-%m-%d'), e.strftime('%Y-%m-%d')) for s,e in _bp_periods])
+        except Exception as _bpe_err:
+            logger.warning("api_blocks_summary: billing period pre-compute failed: %s", _bpe_err)
 
         rows = []
         for d in all_dates:
-            ps = datetime(d.year, d.month, d.day, 0, 0, 0)
-            pe = datetime(d.year, d.month, d.day, 23, 59, 59)
+            day_blocks = _blocks_by_local_date.get(d.isoformat(), [])
 
             # ── Main meter remainder via billing summary (billing-accurate) ──
-            s        = _ec.calculate_billing_summary_for_period(blocks, ps, pe)
-            standing = float(s.get("total_standing") or 0)
+            # Use a very wide UTC window so all blocks in day_blocks pass the
+            # internal block_start filter. day_blocks is pre-filtered by local_date
+            # so only the correct day's blocks are present.
+            ps_utc = datetime(d.year, d.month, d.day, 0, 0, 0) - _td(hours=14)
+            pe_utc = datetime(d.year, d.month, d.day, 23, 59, 59) + _td(hours=14)
+            s        = _ec.calculate_billing_summary_for_period(day_blocks, ps_utc, pe_utc)
+
+            # Standing charge: take directly from any block — it is the same value
+            # on all blocks for a given local day. Do NOT use s["total_standing"]
+            # because calculate_billing_summary groups by block_start.date() (UTC)
+            # which double-counts on BST days (23:xx UTC block = next local day).
+            # standing_charge lives at block["meters"][meter_id]["standing_charge"]
+            standing = 0.0
+            if day_blocks:
+                _first_meter = next(iter((day_blocks[0].get("meters") or {}).values()), {})
+                standing = float(_first_meter.get("standing_charge") or 0.0)
 
             main_imp_kwh  = 0.0
             main_imp_cost = 0.0
@@ -846,15 +1013,12 @@ def api_blocks_summary():
                     main_imp_kwh  += float(t.get("kwh")  or 0)
                     main_imp_cost += float(t.get("cost") or 0)
 
-            # ── Sub-meters aggregated directly from blocks by meter_id ──
+            # ── Sub-meters aggregated directly from day_blocks ──
             sub_totals = defaultdict(lambda: {"imp_kwh":0.0,"imp_cost":0.0,"exp_kwh":0.0,"exp_cost":0.0})
-            for b in blocks:
+            for b in day_blocks:
                 if not b or not b.get("start"):
                     continue
                 try:
-                    bdt = datetime.fromisoformat(b["start"])
-                    if not (ps <= bdt <= pe):
-                        continue
                     for mid, md in (b.get("meters") or {}).items():
                         if not (md or {}).get("meta", {}).get("sub_meter"):
                             continue
@@ -877,12 +1041,27 @@ def api_blocks_summary():
             for mid, st in sub_totals.items():
                 meters_out[mid] = {f: round(v, 4) for f, v in st.items()}
 
+            # Get the historically correct billing_day for this date from blocks
+            row_billing_day = billing_day  # default to current
+            if day_blocks:
+                bd = day_blocks[0].get("_billing_day")
+                if bd is not None:
+                    row_billing_day = int(bd)
+
+            # Look up pre-computed billing period start/end for this date
+            _bp_entry = _bp_start_by_date.get(d.isoformat())
+            _bp_start = _bp_entry[0] if _bp_entry else d.isoformat()
+            _bp_end   = _bp_entry[1] if _bp_entry else None  # exclusive end
+
             rows.append({
-                "year":     d.year,
-                "month":    d.month,
-                "day":      d.day,
-                "standing": round(standing, 4),
-                "meters":   meters_out,
+                "year":                 d.year,
+                "month":               d.month,
+                "day":                 d.day,
+                "billing_day":         row_billing_day,
+                "billing_period_start": _bp_start,
+                "billing_period_end":   _bp_end,
+                "standing":    round(standing, 4),
+                "meters":      meters_out,
                 "imp_kwh":  round(main_imp_kwh  + sum(m["imp_kwh"]  for mid,m in meters_out.items() if mid != "electricity_main"), 4),
                 "exp_kwh":  round(main_exp_kwh, 4),
                 "imp_cost": round(main_imp_cost + sum(m["imp_cost"] for mid,m in meters_out.items() if mid != "electricity_main"), 4),
@@ -969,18 +1148,348 @@ def api_get_config():
     return jsonify(load_config())
 
 
+@app.route("/api/config/history")
+def api_config_history():
+    """Return config period history with block counts per period."""
+    try:
+        store = _get_store()
+        cur = store._conn.execute(
+            """
+            SELECT cp.id, cp.effective_from, cp.effective_to, cp.billing_day,
+                   cp.block_minutes, cp.timezone, cp.currency_symbol, cp.currency_code,
+                   cp.site_name, cp.change_reason,
+                   COUNT(DISTINCT b.block_start) as block_count
+            FROM config_periods cp
+            LEFT JOIN blocks b ON b.config_period_id = cp.id
+            GROUP BY cp.id
+            ORDER BY cp.effective_from DESC
+            """
+        )
+        rows = []
+        for r in cur.fetchall():
+            rows.append({
+                "id":             r["id"],
+                "effective_from": r["effective_from"],
+                "effective_to":   r["effective_to"],
+                "billing_day":    r["billing_day"],
+                "block_minutes":  r["block_minutes"],
+                "timezone":       r["timezone"],
+                "currency_symbol":r["currency_symbol"],
+                "currency_code":  r["currency_code"],
+                "site_name":      r["site_name"],
+                "change_reason":  r["change_reason"],
+                "block_count":    r["block_count"],
+            })
+        # Include the configured timezone for client-side date formatting
+        cfg_tz = "UTC"
+        try:
+            from energy_engine_io import load_json as _lj_tz
+            _cfg_tz = _lj_tz(os.path.join(DATA_DIR, "meters_config.json"), {})
+            for _m in _cfg_tz.get("meters", {}).values():
+                if not (_m.get("meta") or {}).get("sub_meter"):
+                    cfg_tz = (_m.get("meta") or {}).get("timezone", "UTC")
+                    break
+        except Exception:
+            pass
+        return jsonify({"periods": rows, "timezone": cfg_tz})
+    except Exception as e:
+        logger.error("api_config_history: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/config/history", methods=["POST"])
+def api_config_history_create():
+    """Create a new config period, inheriting full_config_json from the current active period."""
+    try:
+        store = _get_store()
+        data  = request.get_json(force=True)
+
+        from datetime import datetime as _dt
+        # Required: effective_from
+        ef_from_raw = data.get("effective_from")
+        if not ef_from_raw:
+            return jsonify({"error": "effective_from is required"}), 400
+        ef_from = str(ef_from_raw).replace(" ", "T").split(".")[0]
+        try:
+            _dt.fromisoformat(ef_from)
+        except ValueError:
+            return jsonify({"error": "Invalid effective_from date"}), 400
+
+        # Get the current active period to inherit its full_config_json
+        cur = store._conn.execute(
+            "SELECT * FROM config_periods WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+        )
+        active = cur.fetchone()
+        if not active:
+            return jsonify({"error": "No active config period found to inherit from"}), 400
+
+        import json as _json
+        full_cfg = _json.loads(active["full_config_json"]) if active["full_config_json"] else {}
+
+        # Apply any overrides from the request
+        billing_day     = data.get("billing_day", active["billing_day"])
+        timezone        = data.get("timezone", active["timezone"])
+        currency_symbol = data.get("currency_symbol", active["currency_symbol"])
+        currency_code   = data.get("currency_code", active["currency_code"])
+        site_name       = data.get("site_name", active["site_name"])
+        change_reason   = data.get("change_reason") or None
+
+        # Update full_config_json with overrides
+        for mid, md in full_cfg.get("meters", {}).items():
+            meta = md.get("meta") or {}
+            if "billing_day"      in data: meta["billing_day"]      = int(billing_day)
+            if "timezone"         in data: meta["timezone"]         = timezone
+            if "currency_symbol"  in data: meta["currency_symbol"]  = currency_symbol
+            if "currency_code"    in data: meta["currency_code"]    = currency_code
+            if "site_name"        in data: meta["site_name"]        = site_name
+            md["meta"] = meta
+
+        with store._conn:
+            store._conn.execute(
+                """INSERT INTO config_periods
+                   (effective_from, effective_to, billing_day, block_minutes, timezone,
+                    currency_symbol, currency_code, site_name, change_reason, full_config_json)
+                   VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    ef_from,
+                    int(billing_day) if billing_day else 1,
+                    int(active["block_minutes"] or 30),
+                    timezone or "UTC",
+                    currency_symbol or "£",
+                    currency_code or "GBP",
+                    site_name,
+                    change_reason,
+                    _json.dumps(full_cfg),
+                )
+            )
+
+        # Rebuild chain — sorts by effective_from and reassigns blocks
+        _rebuild_config_period_chain(store)
+
+        logger.info("api_config_history_create: new period from %s", ef_from)
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.error("api_config_history_create: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/config/history/<int:period_id>", methods=["PUT"])
+def api_config_history_update(period_id):
+    """Update effective_from, effective_to, or change_reason for a config period."""
+    try:
+        store = _get_store()
+        data  = request.get_json(force=True)
+
+        # Validate period exists
+        cp = store.get_config_period(period_id)
+        if not cp:
+            return jsonify({"error": "Config period not found"}), 404
+
+        allowed = {
+            "effective_from", "effective_to", "change_reason",
+            "billing_day", "timezone",
+            "currency_symbol", "currency_code", "site_name",
+        }
+        updates = {k: v for k, v in data.items() if k in allowed}
+        if not updates:
+            return jsonify({"error": "No valid fields to update"}), 400
+
+        # Type coerce numeric fields
+        from datetime import datetime as _dt
+        for field in ("billing_day", "block_minutes"):
+            if field in updates and updates[field] is not None:
+                try:
+                    updates[field] = int(updates[field])
+                except (ValueError, TypeError):
+                    return jsonify({"error": f"Invalid value for {field}"}), 400
+
+        # Normalise and validate date fields — ensure T separator, no microseconds
+        for field in ("effective_from", "effective_to"):
+            if field in updates and updates[field]:
+                val = str(updates[field]).replace(" ", "T").split(".")[0]
+                try:
+                    _dt.fromisoformat(val)
+                    updates[field] = val  # store normalised form
+                except ValueError:
+                    return jsonify({"error": f"Invalid date format for {field}"}), 400
+
+        # Validate effective_from < effective_to if both present
+        from_val = updates.get("effective_from") or cp.get("effective_from")
+        to_val   = updates.get("effective_to")   or cp.get("effective_to")
+        if from_val and to_val:
+            if _dt.fromisoformat(from_val) >= _dt.fromisoformat(to_val):
+                return jsonify({"error": "Effective From must be before Effective To"}), 400
+
+        # Build UPDATE statement
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values     = list(updates.values()) + [period_id]
+        with store._conn:
+            store._conn.execute(
+                f"UPDATE config_periods SET {set_clause} WHERE id = ?",
+                values
+            )
+
+        logger.info("api_config_history_update: period %d updated %s", period_id, list(updates.keys()))
+
+        # Rebuild the contiguous chain: sort all periods by effective_from,
+        # then set each period's effective_to = next period's effective_from.
+        # Robust regardless of how far the date was moved.
+        try:
+            _rebuild_config_period_chain(store)
+        except Exception as _snap_e:
+            logger.warning("api_config_history_update: chain rebuild failed: %s", _snap_e)
+
+                # Regenerate charts since billing periods may have changed
+        try:
+            import energy_charts as _ec
+            import os as _os
+            blocks = store.get_all_blocks()
+            if blocks:
+                from energy_engine_io import load_json as _lj_ec
+                cfg       = _lj_ec(os.path.join(DATA_DIR, "meters_config.json"), {})
+                main_meta = {}
+                for md in cfg.get("meters", {}).values():
+                    if not (md.get("meta") or {}).get("sub_meter"):
+                        main_meta = md.get("meta") or {}
+                        break
+                tz_name   = main_meta.get("timezone", "UTC")
+                bm        = int(main_meta.get("block_minutes") or 30)
+                currency  = main_meta.get("currency_symbol", "£")
+                os.makedirs(CHART_DIR, exist_ok=True)
+                html = _ec.generate_daily_import_export_charts(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency)
+                with open(os.path.join(CHART_DIR, "daily_usage.html"), "w") as f:
+                    f.write(html)
+                logger.info("api_config_history_update: charts regenerated")
+        except Exception as _e:
+            logger.warning("api_config_history_update: chart regen failed: %s", _e)
+
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.error("api_config_history_update: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/config/history/<int:period_id>", methods=["DELETE"])
+def api_config_history_delete(period_id):
+    """Delete a config period, re-assigning its blocks to an adjacent period."""
+    import json as _json
+    try:
+        store = _get_store()
+
+        # Check before deleting whether this is the active period
+        cp = store.get_config_period(period_id)
+        is_active = cp and cp.get("effective_to") is None
+
+        result = store.delete_config_period(period_id)
+
+        # Rebuild chain first so effective_to values are consistent
+        try:
+            _rebuild_config_period_chain(store)
+        except Exception as _e:
+            logger.warning("api_config_history_delete: chain rebuild failed: %s", _e)
+
+        # If we deleted the active period, the predecessor is now active.
+        # Write its full_config_json back to meters_config.json so the engine,
+        # charts and billing all read the correct (now-current) config.
+        if is_active:
+            try:
+                new_active = store._conn.execute(
+                    "SELECT full_config_json FROM config_periods "
+                    "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+                ).fetchone()
+                if new_active and new_active["full_config_json"]:
+                    from energy_engine_io import save_json_atomic as _sja
+                    restored_cfg = _json.loads(new_active["full_config_json"])
+                    cfg_path = os.path.join(DATA_DIR, "meters_config.json")
+                    _sja(cfg_path, restored_cfg)
+                    logger.info(
+                        "api_config_history_delete: meters_config.json restored "
+                        "from newly-active config period"
+                    )
+            except Exception as _e:
+                logger.warning(
+                    "api_config_history_delete: could not restore meters_config.json: %s", _e
+                )
+
+        # Regenerate charts
+        try:
+            import energy_charts as _ec
+            blocks = store.get_all_blocks()
+            if blocks:
+                from energy_engine_io import load_json as _lj_del
+                cfg       = _lj_del(os.path.join(DATA_DIR, "meters_config.json"), {})
+                main_meta = {}
+                for md in cfg.get("meters", {}).values():
+                    if not (md.get("meta") or {}).get("sub_meter"):
+                        main_meta = md.get("meta") or {}
+                        break
+                tz_name  = main_meta.get("timezone", "UTC")
+                bm       = int(main_meta.get("block_minutes") or 30)
+                currency = main_meta.get("currency_symbol", "£")
+                os.makedirs(CHART_DIR, exist_ok=True)
+                html = _ec.generate_daily_import_export_charts(
+                    blocks, timezone_name=tz_name, block_minutes=bm, currency=currency
+                )
+                with open(os.path.join(CHART_DIR, "daily_usage.html"), "w") as f:
+                    f.write(html)
+        except Exception as _e:
+            logger.warning("api_config_history_delete: chart regen failed: %s", _e)
+
+        return jsonify({
+            "ok": True,
+            "blocks_reassigned": result["blocks_reassigned"],
+            "config_restored": is_active,
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error("api_config_history_delete: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/config", methods=["POST"])
 def api_save_config():
     try:
-        data = request.get_json(force=True)
-        if not isinstance(data, dict) or "meters" not in data:
+        payload = request.get_json(force=True)
+        if not isinstance(payload, dict) or "meters" not in payload:
             return jsonify({"error": "Invalid config structure"}), 400
+
+        # change_reason is an optional UI field, not part of the config schema
+        change_reason = payload.pop("change_reason", None) or None
+        data = payload
 
         # Zip current data before committing config change
         _create_backup_zip(label="pre_config_save")
 
         save_config(data)
         logger.info("server: meters_config.json saved (%d meters)", len(data["meters"]))
+
+        # Snapshot the new config as a config period only if billing-significant
+        # meta has changed (sensor changes, postcode etc don't need a new period)
+        try:
+            from block_store import config_meta_significant
+            store = _get_store()
+            cur_id = store.get_current_config_period_id()
+            should_create = True
+            if cur_id is not None:
+                cur_cp = store.get_config_period(cur_id)
+                if cur_cp:
+                    import json as _json
+                    old_cfg = _json.loads(cur_cp["full_config_json"])
+                    if not config_meta_significant(old_cfg, data):
+                        should_create = False
+                        # Still update the full_config_json snapshot in place
+                        with store._conn:
+                            store._conn.execute(
+                                "UPDATE config_periods SET full_config_json = ? WHERE id = ?",
+                                (_json.dumps(data), cur_id)
+                            )
+                        logger.info("server: config saved — no billing meta change, period unchanged")
+            if should_create:
+                store.insert_config_period(data, change_reason=change_reason)
+                logger.info("server: config period snapshot created (reason=%s)", change_reason or "none")
+        except Exception as _e:
+            logger.warning("server: config period snapshot failed: %s", _e)
 
         # Re-run engine_startup to pick up new sensor subscriptions
         import asyncio
@@ -1022,7 +1531,7 @@ def api_backup_list():
     try:
         zips = sorted(glob.glob(f"{SHARE_BACKUP_DIR}/backups/*.zip"), reverse=True)
         # Check for flat files from last finalise
-        known = ["blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"]
+        known = ["blocks.db", "blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"]
         flat_files = []
         for fname in known:
             fpath = f"{SHARE_BACKUP_DIR}/{fname}"
@@ -1044,34 +1553,33 @@ def api_backup_list():
 @app.route("/api/backup/restore", methods=["POST"])
 def api_backup_restore():
     """Restore selected data files from a named backup zip or from last-finalise flat files."""
+    global _store
     import zipfile, shutil
     try:
         data      = request.get_json(force=True)
         zipname   = data.get("zip", "")
-        selected  = data.get("files", None)  # list of filenames, or None for all
-        from_flat = data.get("from_flat", False)  # restore from flat share files
-        known     = {"blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"}
+        selected  = data.get("files", None)
+        from_flat = data.get("from_flat", False)
+        known     = {"blocks.db", "blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"}
 
-        # Validate zip name only when restoring from a zip (not flat files)
         if not from_flat:
             if not zipname or "/" in zipname or "\\" in zipname:
                 return jsonify({"error": "Invalid zip name"}), 400
 
         _create_backup_zip(label="pre_restore")
 
+        restored = []
+
         if from_flat:
-            # Restore from flat files in SHARE_BACKUP_DIR
-            restored = []
             for fname in (selected or list(known)):
                 if fname not in known:
                     continue
-                src = f"{SHARE_BACKUP_DIR}/{fname}"
-                dst = os.path.join(DATA_DIR, fname)
-                if os.path.exists(src):
-                    shutil.copy2(src, dst)
+                src_path = f"{SHARE_BACKUP_DIR}/{fname}"
+                dst_path = os.path.join(DATA_DIR, fname)
+                if os.path.exists(src_path):
+                    shutil.copy2(src_path, dst_path)
                     restored.append(fname)
             logger.info("api_backup_restore: restored flat files %s", restored)
-            return jsonify({"ok": True, "restored": restored})
         else:
             if not zipname or "/" in zipname or "\\" in zipname:
                 return jsonify({"error": "Invalid zip name"}), 400
@@ -1086,16 +1594,116 @@ def api_backup_restore():
                     if selected is not None and basename not in selected:
                         continue
                     dest = os.path.join(DATA_DIR, basename)
-                    with zf.open(name) as src, open(dest, "wb") as dst:
-                        dst.write(src.read())
-            restored = selected or list(known)
+                    with zf.open(name) as zf_src:
+                        with open(dest, "wb") as dst:
+                            dst.write(zf_src.read())
+                    restored.append(basename)
             logger.info("api_backup_restore: restored %s from %s", restored, zipname)
-            return jsonify({"ok": True, "restored": restored})
+
+        # If a legacy blocks.json was restored from an old backup, auto-migrate it
+        legacy_json = os.path.join(DATA_DIR, "blocks.json")
+        if "blocks.json" in restored and os.path.exists(legacy_json):
+            try:
+                from block_store import migrate_json_to_sqlite
+                from energy_engine_io import load_json as _lj3
+                cfg = _lj3(os.path.join(DATA_DIR, "meters_config.json"), {})
+                db_path = os.path.join(DATA_DIR, "blocks.db")
+                if os.path.exists(db_path):
+                    os.remove(db_path)
+                _store = None
+                store = _get_store()
+                migrated = migrate_json_to_sqlite(legacy_json, store, cfg)
+                os.rename(legacy_json, legacy_json + ".migrated")
+                restored.append("blocks.db (migrated from legacy blocks.json)")
+                logger.info("api_backup_restore: migrated legacy blocks.json -> blocks.db (%d blocks)", migrated)
+            except Exception as _e:
+                logger.warning("api_backup_restore: legacy migration failed: %s", _e)
+
+        # Reset store connection so next request gets fresh handle to restored DB
+        if "blocks.db" in restored or "blocks.json" in restored:
+            if _store:
+                try:
+                    _store.close()
+                except Exception:
+                    pass
+            _store = None
+
+        # ── Sync meters_config.json ↔ active config period ─────────────────
+        # Case 1: meters_config.json restored — update the active period in the
+        #         DB to match, so billing history and the file stay in sync.
+        # Case 2: blocks.db restored without meters_config.json — write the
+        #         active period's full_config_json back to meters_config.json
+        #         so the file reflects the DB state.
+        try:
+            import json as _json2
+            from energy_engine_io import load_json as _lj_sync, save_json_atomic as _sja_sync
+            cfg_path = os.path.join(DATA_DIR, "meters_config.json")
+            store_sync = _get_store()
+
+            if "meters_config.json" in restored:
+                # Case 1: file was restored — push its content into the active DB period
+                restored_cfg = _lj_sync(cfg_path, {})
+                if restored_cfg:
+                    active_cp = store_sync._conn.execute(
+                        "SELECT id FROM config_periods WHERE effective_to IS NULL "
+                        "ORDER BY effective_from DESC LIMIT 1"
+                    ).fetchone()
+                    if active_cp:
+                        main_meta = {}
+                        for md in restored_cfg.get("meters", {}).values():
+                            if not (md.get("meta") or {}).get("sub_meter"):
+                                main_meta = md.get("meta") or {}
+                                break
+                        store_sync._conn.execute(
+                            """UPDATE config_periods
+                               SET billing_day       = ?,
+                                   block_minutes      = ?,
+                                   timezone           = ?,
+                                   currency_symbol    = ?,
+                                   currency_code      = ?,
+                                   site_name          = ?,
+                                   full_config_json   = ?
+                               WHERE id = ?""",
+                            (
+                                int(main_meta.get("billing_day") or 1),
+                                int(main_meta.get("block_minutes") or 30),
+                                main_meta.get("timezone", "UTC"),
+                                main_meta.get("currency_symbol", "£"),
+                                main_meta.get("currency_code", "GBP"),
+                                main_meta.get("site"),
+                                _json2.dumps(restored_cfg),
+                                active_cp["id"],
+                            )
+                        )
+                        store_sync._conn.commit()
+                        logger.info(
+                            "api_backup_restore: active config period updated "
+                            "to match restored meters_config.json"
+                        )
+                        restored.append("config_periods (synced from meters_config.json)")
+
+            elif "blocks.db" in restored and "meters_config.json" not in restored:
+                # Case 2: DB restored without config file — write active period back to file
+                active_cp = store_sync._conn.execute(
+                    "SELECT full_config_json FROM config_periods "
+                    "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+                ).fetchone()
+                if active_cp and active_cp["full_config_json"]:
+                    db_cfg = _json2.loads(active_cp["full_config_json"])
+                    _sja_sync(cfg_path, db_cfg)
+                    logger.info(
+                        "api_backup_restore: meters_config.json restored "
+                        "from active config period in restored DB"
+                    )
+                    restored.append("meters_config.json (synced from restored blocks.db)")
+
+        except Exception as _sync_e:
+            logger.warning("api_backup_restore: config sync failed: %s", _sync_e)
+
+        return jsonify({"ok": True, "restored": restored})
     except Exception as e:
         logger.error("api_backup_restore: %s", e)
         return jsonify({"error": str(e)}), 500
-
-
 @app.route("/api/import/extract-zip", methods=["POST"])
 def api_import_extract_zip():
     """Extract JSON files from an uploaded zip and return them as base64."""
@@ -1104,7 +1712,7 @@ def api_import_extract_zip():
         zf_file = request.files.get("zipfile")
         if not zf_file:
             return jsonify({"error": "No zip file provided"}), 400
-        known = {"blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"}
+        known = {"blocks.db", "blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"}
         files = {}
         with zipfile.ZipFile(zf_file.stream, "r") as zf:
             for name in zf.namelist():
@@ -1123,7 +1731,7 @@ def api_import_extract_zip():
 @app.route("/api/backup/flat-info", methods=["GET"])
 def api_backup_flat_info():
     """Return metadata about the last-finalise flat backup files."""
-    known = ["blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"]
+    known = ["blocks.db", "blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"]
     from datetime import datetime as _dt
     files = {}
     for fname in known:
@@ -1150,7 +1758,7 @@ def api_import_extract_zip_by_name():
         zip_path = f"{SHARE_BACKUP_DIR}/backups/{zipname}"
         if not os.path.exists(zip_path):
             return jsonify({"error": "Backup not found"}), 404
-        known = {"blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"}
+        known = {"blocks.db", "blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"}
         files = {}
         with zipfile.ZipFile(zip_path, "r") as zf:
             for name in zf.namelist():
@@ -1174,12 +1782,22 @@ def _create_backup_zip(label="backup"):
     os.makedirs(backup_dir, exist_ok=True)
     timestamp = _dt.utcnow().strftime("%Y%m%dT%H%M%S")
     zip_path  = f"{backup_dir}/{timestamp}_{label}.zip"
-    files = ["blocks.json", "cumulative_totals.json", "meters_config.json", "current_block.json"]
+    files = ["cumulative_totals.json", "meters_config.json", "current_block.json"]
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        # Backup blocks DB using SQLite online backup API into a temp file
+        import tempfile
+        db_src = os.path.join(DATA_DIR, "blocks.db")
+        if os.path.exists(db_src):
+            try:
+                _get_store().backup(db_src + ".bak")
+                zf.write(db_src + ".bak", "blocks.db")
+                os.remove(db_src + ".bak")
+            except Exception as _e:
+                logger.warning("_create_backup_zip: blocks.db backup failed: %s", _e)
         for fname in files:
-            src = f"{DATA_DIR}/{fname}"
-            if os.path.exists(src):
-                zf.write(src, fname)
+            src_f = f"{DATA_DIR}/{fname}"
+            if os.path.exists(src_f):
+                zf.write(src_f, fname)
     # Keep only the 20 most recent zips
     all_zips = sorted(glob.glob(f"{backup_dir}/*.zip"))
     for old_zip in all_zips[:-20]:
@@ -1193,16 +1811,26 @@ def _create_backup_zip(label="backup"):
 def api_regenerate_charts():
     """Trigger chart regeneration from current blocks data."""
     try:
-        from energy_engine_io import load_json
         import energy_charts
-        blocks = load_json(os.path.join(DATA_DIR, "blocks.json"), [])
-        if not blocks:
+        from energy_engine_io import load_json as _lj_regen
+        store = _get_store()
+        if store.count_blocks() == 0:
             return jsonify({"error": "No blocks data available"}), 400
+        cfg       = _lj_regen(os.path.join(DATA_DIR, "meters_config.json"), {})
+        main_meta = {}
+        for md in cfg.get("meters", {}).values():
+            if not (md.get("meta") or {}).get("sub_meter"):
+                main_meta = md.get("meta") or {}
+                break
+        tz_name  = main_meta.get("timezone", "UTC")
+        bm       = int(main_meta.get("block_minutes") or 30)
+        currency = main_meta.get("currency_symbol", "£")
         os.makedirs(CHART_DIR, exist_ok=True)
-        html = energy_charts.generate_net_heatmap(blocks)
+        blocks = store.get_all_blocks()
+        html = energy_charts.generate_net_heatmap(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency)
         with open(os.path.join(CHART_DIR, "net_heatmap.html"), "w") as f:
             f.write(html)
-        html = energy_charts.generate_daily_import_export_charts(blocks)
+        html = energy_charts.generate_daily_import_export_charts(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency)
         with open(os.path.join(CHART_DIR, "daily_usage.html"), "w") as f:
             f.write(html)
         logger.info("server: charts regenerated on demand")
@@ -1228,8 +1856,36 @@ def api_import():
             engine.pause_engine()
 
         imported = []
+        # Handle blocks import: write temp JSON then migrate into SQLite
+        blocks_file = request.files.get("blocks")
+        if blocks_file:
+            import tempfile
+            blocks_data = json.loads(blocks_file.read().decode("utf-8"))
+            # Write to a temp JSON file for migrate_json_to_sqlite
+            tmp_json = os.path.join(DATA_DIR, "blocks_import.json.tmp")
+            with open(tmp_json, "w") as out:
+                json.dump(blocks_data, out)
+            try:
+                from block_store import migrate_json_to_sqlite
+                cfg_path = os.path.join(DATA_DIR, "meters_config.json")
+                from energy_engine_io import load_json as _lj2
+                cfg = _lj2(cfg_path, {})
+                # Reset the store and migrate
+                db_path = os.path.join(DATA_DIR, "blocks.db")
+                if os.path.exists(db_path):
+                    os.remove(db_path)
+                global _store
+                _store = None  # force re-open
+                store = _get_store()
+                migrate_json_to_sqlite(tmp_json, store, cfg)
+                imported.append("blocks.db")
+                logger.info("server: imported blocks.json -> blocks.db (%d blocks)", len(blocks_data))
+            finally:
+                if os.path.exists(tmp_json):
+                    os.remove(tmp_json)
+
+        # Handle remaining JSON files
         file_map = {
-            "blocks":            "blocks.json",
             "current_block":     "current_block.json",
             "cumulative_totals": "cumulative_totals.json",
             "meters_config":     "meters_config.json",
@@ -1264,3 +1920,154 @@ def api_import():
             if engine and hasattr(engine, 'resume_engine'):
                 engine.resume_engine()
         threading.Thread(target=delayed_resume, daemon=True).start()
+
+# ── Historical corrections ────────────────────────────────────────────────────
+
+@app.route("/api/corrections/preview", methods=["POST"])
+def api_corrections_preview():
+    """
+    Preview what a standing-charge or rate correction would affect.
+    Body: { type: "standing"|"rate", from_date: "YYYY-MM-DD", to_date: "YYYY-MM-DD",
+            value: float, channel: "import"|"export" (rate only) }
+    Returns: { days: int, blocks: int, current_min: float, current_max: float }
+    """
+    try:
+        data       = request.get_json(force=True) or {}
+        corr_type  = data.get("type")          # "standing" or "rate"
+        from_date  = data.get("from_date", "")
+        to_date    = data.get("to_date", "")
+        channel    = data.get("channel", "import")  # for rate corrections
+
+        if corr_type not in ("standing", "rate"):
+            return jsonify({"error": "type must be 'standing' or 'rate'"}), 400
+        if not from_date or not to_date:
+            return jsonify({"error": "from_date and to_date required"}), 400
+
+        store = _get_store()
+
+        if corr_type == "standing":
+            cur = store._conn.execute(
+                """SELECT COUNT(DISTINCT local_date) as days,
+                          COUNT(*) as blocks,
+                          MIN(standing_charge) as cur_min,
+                          MAX(standing_charge) as cur_max
+                   FROM blocks
+                   WHERE local_date >= ? AND local_date <= ?""",
+                (from_date, to_date)
+            )
+        else:
+            col = "imp_rate" if channel == "import" else "exp_rate"
+            cur = store._conn.execute(
+                f"""SELECT COUNT(DISTINCT local_date) as days,
+                           COUNT(*) as blocks,
+                           MIN({col}) as cur_min,
+                           MAX({col}) as cur_max
+                    FROM blocks
+                    WHERE local_date >= ? AND local_date <= ?
+                      AND {col} IS NOT NULL""",
+                (from_date, to_date)
+            )
+
+        row = cur.fetchone()
+        return jsonify({
+            "days":        row["days"]    or 0,
+            "blocks":      row["blocks"]  or 0,
+            "current_min": row["cur_min"] or 0,
+            "current_max": row["cur_max"] or 0,
+        })
+    except Exception as e:
+        logger.error("api_corrections_preview: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/corrections/apply", methods=["POST"])
+def api_corrections_apply():
+    """
+    Apply a standing-charge or rate correction to the live database.
+    Body: { type: "standing"|"rate", from_date: "YYYY-MM-DD", to_date: "YYYY-MM-DD",
+            value: float, channel: "import"|"export" (rate only),
+            recalc_cost: bool (rate only — recalculate imp_cost from rate × kwh) }
+    Returns: { updated_blocks: int }
+    """
+    try:
+        data        = request.get_json(force=True) or {}
+        corr_type   = data.get("type")
+        from_date   = data.get("from_date", "")
+        to_date     = data.get("to_date", "")
+        value       = data.get("value")
+        channel     = data.get("channel", "import")
+        recalc_cost = bool(data.get("recalc_cost", True))
+
+        if corr_type not in ("standing", "rate"):
+            return jsonify({"error": "type must be 'standing' or 'rate'"}), 400
+        if not from_date or not to_date:
+            return jsonify({"error": "from_date and to_date required"}), 400
+        if value is None:
+            return jsonify({"error": "value required"}), 400
+
+        value = float(value)
+        if value < 0:
+            return jsonify({"error": "value must be >= 0"}), 400
+
+        store = _get_store()
+
+        if corr_type == "standing":
+            cur = store._conn.execute(
+                """UPDATE blocks SET standing_charge = ?
+                   WHERE local_date >= ? AND local_date <= ?""",
+                (value, from_date, to_date)
+            )
+            store._conn.commit()
+            updated = cur.rowcount
+            logger.info(
+                "api_corrections_apply: standing_charge set to %.4f "
+                "for %d blocks (%s → %s)", value, updated, from_date, to_date
+            )
+
+        else:  # rate correction
+            if channel == "import":
+                if recalc_cost:
+                    cur = store._conn.execute(
+                        """UPDATE blocks
+                           SET imp_rate = ?,
+                               imp_cost = ROUND(imp_kwh * ?, 6)
+                           WHERE local_date >= ? AND local_date <= ?
+                             AND imp_rate IS NOT NULL""",
+                        (value, value, from_date, to_date)
+                    )
+                else:
+                    cur = store._conn.execute(
+                        """UPDATE blocks SET imp_rate = ?
+                           WHERE local_date >= ? AND local_date <= ?
+                             AND imp_rate IS NOT NULL""",
+                        (value, from_date, to_date)
+                    )
+            else:  # export
+                if recalc_cost:
+                    cur = store._conn.execute(
+                        """UPDATE blocks
+                           SET exp_rate = ?,
+                               exp_cost = ROUND(exp_kwh * ?, 6)
+                           WHERE local_date >= ? AND local_date <= ?
+                             AND exp_rate IS NOT NULL""",
+                        (value, value, from_date, to_date)
+                    )
+                else:
+                    cur = store._conn.execute(
+                        """UPDATE blocks SET exp_rate = ?
+                           WHERE local_date >= ? AND local_date <= ?
+                             AND exp_rate IS NOT NULL""",
+                        (value, from_date, to_date)
+                    )
+            store._conn.commit()
+            updated = cur.rowcount
+            logger.info(
+                "api_corrections_apply: %s rate set to %.6f "
+                "(recalc_cost=%s) for %d blocks (%s → %s)",
+                channel, value, recalc_cost, updated, from_date, to_date
+            )
+
+        return jsonify({"ok": True, "updated_blocks": updated})
+    except Exception as e:
+        logger.error("api_corrections_apply: %s", e)
+        return jsonify({"error": str(e)}), 500
