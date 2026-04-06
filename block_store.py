@@ -804,16 +804,51 @@ class BlockStore:
 
     def get_cumulative_totals(self) -> dict:
         """
-        Return lifetime cumulative totals derived from the blocks table.
-        Replaces cumulative_totals.json — no separate file needed.
+        Return lifetime cumulative totals for HA sensor publishing.
+
+        Mirrors engine PASS 3 logic exactly:
+          - Main meter (is_sub_meter=0): use imp_kwh_remainder if available
+            (house-only grid load after sub-meters claimed their share),
+            falling back to imp_kwh (correct when no sub-meters configured).
+          - Sub-meters (is_sub_meter=1): use imp_kwh_grid if available
+            (the portion the sub-meter drew from the grid rather than from
+            solar/battery), falling back to imp_kwh.
+
+        This avoids double-counting: electricity_main.imp_kwh already
+        includes EV charger and battery consumption; adding sub-meter
+        imp_kwh on top inflates the total by the sub-meter kWh.
+
+        export_kwh/imp_cost/exp_cost: main meter only (sub-meters don't
+        have independent costs or export).
         """
+        active_period_sq = (
+            "SELECT id FROM config_periods "
+            "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+        )
         cur = self._conn.execute(
-            """SELECT
-                 COALESCE(SUM(imp_kwh),  0.0) as import_kwh,
-                 COALESCE(SUM(exp_kwh),  0.0) as export_kwh,
-                 COALESCE(SUM(imp_cost), 0.0) as import_cost,
-                 COALESCE(SUM(exp_cost), 0.0) as export_cost
-               FROM blocks"""
+            f"""SELECT
+                 COALESCE(SUM(
+                   CASE
+                     WHEN m.is_sub_meter = 0 THEN
+                       CASE
+                         WHEN b.imp_kwh_remainder IS NOT NULL THEN b.imp_kwh_remainder
+                         WHEN b.imp_kwh_grid      IS NOT NULL THEN b.imp_kwh_grid
+                         ELSE b.imp_kwh
+                       END
+                     ELSE  -- sub-meter: use grid portion, fallback to kwh
+                       CASE
+                         WHEN b.imp_kwh_grid IS NOT NULL THEN b.imp_kwh_grid
+                         ELSE b.imp_kwh
+                       END
+                   END
+                 ), 0.0) as import_kwh,
+                 COALESCE(SUM(CASE WHEN m.is_sub_meter = 0 THEN b.exp_kwh  ELSE 0 END), 0.0) as export_kwh,
+                 COALESCE(SUM(CASE WHEN m.is_sub_meter = 0 THEN b.imp_cost ELSE 0 END), 0.0) as import_cost,
+                 COALESCE(SUM(CASE WHEN m.is_sub_meter = 0 THEN b.exp_cost ELSE 0 END), 0.0) as export_cost
+               FROM blocks b
+               JOIN meters m
+                 ON m.meter_id = b.meter_id
+                AND m.config_period_id = ({active_period_sq})"""
         )
         row = cur.fetchone()
         return {

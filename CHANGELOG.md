@@ -1,5 +1,32 @@
 # Changelog
 
+## [2.1.1] — 2026-04-06
+
+### Fixed
+- **`get_cumulative_totals()` double-counting sub-meter consumption** — the four HA
+  sensors (import kWh, export kWh, import cost, export cost) were incorrectly inflated
+  for installations with sub-meters (EV charger, battery etc).
+
+  `electricity_main.imp_kwh` already includes sub-meter consumption. The previous
+  implementation did `SELECT SUM(imp_kwh) FROM blocks` across all meters, which added
+  sub-meter `imp_kwh` a second time. On a system with an EV charger and battery this
+  produced import sensor readings roughly 67% higher than actual grid import.
+
+  The fix mirrors the engine's PASS 3 finalise logic:
+  - Main meter: uses `imp_kwh_remainder` (house-only grid load after sub-meters),
+    falling back to `imp_kwh` when no sub-meters are configured
+  - Sub-meters: uses `imp_kwh_grid` (the portion drawn from the grid rather than
+    from solar/battery), falling back to `imp_kwh`
+  - Cost and export figures: main meter only
+
+  **Historical block data is unaffected** — the blocks table, billing charts, and
+  per-block calculations were correct throughout. Only the HA sensor values
+  published after each block finalise were wrong.
+
+  Users without sub-meters are unaffected.
+
+---
+
 ## [2.1.0] — 2026-04-06
 
 ### Changed (breaking — upgrade path is fully automatic)

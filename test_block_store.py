@@ -1175,9 +1175,8 @@ class TestCurrentBlock(unittest.TestCase):
         self.assertEqual(totals["import_kwh"], 0.0)
         self.assertEqual(totals["export_kwh"], 0.0)
 
-    def test_get_cumulative_totals_matches_sum(self):
-        """Cumulative totals equal the sum across all blocks in the table."""
-        # Need a config period first
+    def test_get_cumulative_totals_no_sub_meters(self):
+        """Without sub-meters, totals equal direct SUM of main meter blocks."""
         self.store.insert_config_period({"meters": {"electricity_main": {"meta": {
             "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
             "currency_symbol": "£", "currency_code": "GBP",
@@ -1206,6 +1205,65 @@ class TestCurrentBlock(unittest.TestCase):
         self.assertAlmostEqual(totals["import_cost"], 0.858, places=4)
         self.assertAlmostEqual(totals["export_kwh"],  0.3,   places=4)
         self.assertAlmostEqual(totals["export_cost"], 0.024, places=4)
+
+    def test_get_cumulative_totals_with_sub_meters(self):
+        """
+        With sub-meters, totals must NOT double-count.
+        electricity_main.imp_kwh already includes sub-meter consumption.
+        get_cumulative_totals should use:
+          - main meter: imp_kwh_remainder (house-only grid load)
+          - sub-meter:  imp_kwh_grid (sub-meter grid portion), or imp_kwh
+          TOTAL = remainder + sub_grid ≈ main.imp_kwh
+        """
+        cfg = {"meters": {
+            "electricity_main": {"meta": {
+                "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
+                "currency_symbol": "£", "currency_code": "GBP",
+            }, "channels": {
+                "import": {"read": "sensor.main", "rate": "sensor.rate"},
+                "export": {"read": "sensor.exp",  "rate": "sensor.exprate"},
+            }},
+            "ev_charger": {"meta": {
+                "sub_meter": True, "parent_meter": "electricity_main",
+            }, "channels": {
+                "import": {"read": "sensor.ev", "rate": "sensor.rate"},
+            }},
+        }}
+        self.store.insert_config_period(cfg)
+        cp_id = self.store._conn.execute(
+            "SELECT id FROM config_periods LIMIT 1"
+        ).fetchone()["id"]
+
+        # One block: main draws 3.0 kWh total, EV uses 2.0, house uses 1.0
+        # main: imp_kwh=3.0, imp_kwh_remainder=1.0 (house only), imp_cost=0.735
+        # ev:   imp_kwh=2.0, imp_kwh_grid=2.0 (all from grid), no independent cost
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year,
+            local_month, local_day, meter_id, config_period_id, interpolated,
+            imp_kwh, imp_kwh_remainder, imp_cost, exp_kwh, exp_cost, standing_charge)
+            VALUES ('2026-01-01T00:00:00','2026-01-01T00:30:00','2026-01-01',
+            2026,1,1,'electricity_main',?,0, 3.0,1.0,0.735, 0.0,0.0, 0.5)
+        """, (cp_id,))
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year,
+            local_month, local_day, meter_id, config_period_id, interpolated,
+            imp_kwh, imp_kwh_grid, imp_cost, exp_kwh, exp_cost, standing_charge)
+            VALUES ('2026-01-01T00:00:00','2026-01-01T00:30:00','2026-01-01',
+            2026,1,1,'ev_charger',?,0, 2.0,2.0,0.0, 0.0,0.0, 0.0)
+        """, (cp_id,))
+        self.store._conn.commit()
+
+        totals = self.store.get_cumulative_totals()
+
+        # Correct: remainder(1.0) + ev_grid(2.0) = 3.0 kWh total grid import
+        self.assertAlmostEqual(totals["import_kwh"], 3.0, places=4,
+            msg="Sub-meter must not double-count: total grid = house(1) + ev_grid(2) = 3")
+        # Cost only from main meter
+        self.assertAlmostEqual(totals["import_cost"], 0.735, places=4,
+            msg="Import cost must come from main meter only")
+        # NOT 5.0 (3.0 + 2.0 double-counted)
+        self.assertNotAlmostEqual(totals["import_kwh"], 5.0, places=1,
+            msg="5.0 would indicate double-counting bug")
 
 
 class TestUpgradePaths(unittest.TestCase):
