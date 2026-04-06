@@ -2,7 +2,7 @@
 
 [![GitHub Release][releases-shield]][releases]
 ![Project Stage][project-stage-shield]
-[![License][license-shield]](LICENSE.md)
+[![License][license-shield]](LICENSE)
 [![Community Forum][forum-shield]][forum]
 [![GitHub Activity][commits-shield]][commits]
 ![Project Maintenance][maintenance-shield]
@@ -15,7 +15,7 @@
 [releases-shield]: https://img.shields.io/github/release/RGx01/energy-meter-tracker-addon.svg
 [releases]: https://github.com/RGx01/energy-meter-tracker-addon/releases
 [project-stage-shield]: https://img.shields.io/badge/project%20stage-production%20ready-brightgreen.svg
-[license-shield]: https://img.shields.io/github/license/RGx01/energy-meter-tracker-addon.svg
+[license-shield]: https://img.shields.io/badge/license-BUSL--1.1-blue.svg
 [forum-shield]: https://img.shields.io/badge/community-forum-informational.svg
 [forum]: https://community.home-assistant.io/t/energy-meter-tracker/995674
 [commits-shield]: https://img.shields.io/github/commit-activity/y/RGx01/energy-meter-tracker-addon.svg
@@ -40,13 +40,13 @@ A Home Assistant add-on that records your electricity usage in precise configura
 - Publishes four cumulative sensors back to Home Assistant
 - Serves a local web UI on port 8099 for configuration, charts, live power and data management
 
-## What's new in 2.0.0
+## What's new in 2.1.x
 
-- **🗄️ SQLite storage** — blocks are now stored in a SQLite database rather than a JSON file; queries are indexed and fast regardless of how much history you have; migration from `blocks.json` is automatic on first start
-- **🕓 Billing History** — config changes are now recorded as history; billing charts always use the billing day and rates that were active when each block was recorded; access via the **Billing History** button on Meter Config
-- **📅 Billing period transitions** — when you change your billing day the old period is correctly truncated at the transition date; usage stats and live power always show the right period boundaries
-- **⚡ Live Power loads instantly** — billing card data (Today, This Bill, This Year) now loads asynchronously after page render using fast SQL aggregation queries that complete in milliseconds regardless of history length
-- **📈 Usage Stats billing periods** — the navigator now shows the correct inclusive end date for each billing period, including truncated transition periods
+- **🗄️ Single source of truth** — `energy_meter.db` is now the only file that matters; backup and restore is a single file copy; all JSON state files eliminated
+- **🔧 Historical Corrections enhanced** — time-of-day window (DST-aware), per-meter targeting, and per-block preview table before committing
+- **🗂️ Data Management page** — renamed from Import & Backup; backup UI updated for single-file model; deprecated file entries flagged
+- **📊 Sub-meter billing fixed** — Live Power Today/This Bill/This Year and HA sensors now correctly exclude sub-meter double-counting
+- **🏷️ Supplier field** — now recorded per billing period on the Billing History page, giving a full historical record of which supplier was active when each block was recorded
 
 ## Requirements
 
@@ -141,7 +141,7 @@ Access the UI at `http://<your-ha-ip>:8099`
 | Billing History | View, edit and add config periods; record billing day / address / supplier changes |
 | Charts | Billing chart, net energy heatmap and usage stats |
 | ⚡ Live Power | Live power gauge, billing cards and carbon intensity forecast |
-| Import & Backup | Migrate data from a previous installation or restore a backup |
+| Data Management | Backups, restore, imports and historical corrections |
 | Logs | Live add-on log viewer |
 | Help | Full reference documentation |
 
@@ -223,7 +223,7 @@ These are compatible with the HA Energy dashboard and Utility Meter integrations
 
 ### Storage
 
-All blocks are stored in a SQLite database (`energy_meter.db`) in the add-on's data directory. After every block finalise, the database and config are also copied to `/share/energy_meter_tracker_backup/`. Zip snapshots are created automatically before every config save and are accessible from the Import & Backup page.
+All blocks are stored in a SQLite database (`energy_meter.db`) in the add-on's data directory. After every block finalise, the database and config are also copied to `/share/energy_meter_tracker_backup/`. Zip snapshots are created automatically before every config save and are accessible from the Data Management page.
 
 | Event | `/data/` | `/share/energy_meter_tracker_backup/` |
 |-------|----------|---------------------------------------|
@@ -233,7 +233,7 @@ All blocks are stored in a SQLite database (`energy_meter.db`) in the add-on's d
 
 > ⚠️ **Uninstalling wipes `/data/`**. Always ensure a recent backup exists in `/share/` before uninstalling.
 
-> ℹ️ There is no automatic pre-upgrade backup in supervised mode. Your most recent `/share` backup and the automatic zip before the last config save are your safety net. Create a manual backup before upgrading if you want extra assurance.
+> ℹ️ There is no automatic pre-upgrade backup in supervised mode. Your most recent `/share` backup and the automatic zip before the last config save are your safety net. Create a manual backup from the Data Management page before upgrading if you want extra assurance.
 
 ### Migrating from 1.x
 
