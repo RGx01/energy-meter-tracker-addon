@@ -46,9 +46,65 @@ Tracks billing configuration history. Every billing-significant change creates a
 | `currency_code` | TEXT | e.g. `GBP` |
 | `site_name` | TEXT | Display name |
 | `change_reason` | TEXT | Freetext note |
-| `full_config_json` | TEXT | Full `meters_config.json` snapshot at save time |
 
-`effective_from` is always snapped to **midnight in the configured timezone** (converted to UTC) when a config is saved.
+`effective_from` is always snapped to **midnight in the configured timezone** (converted to UTC) when a config is saved. `full_config_json` was removed in 2.1.0 — meter definitions live in the `meters` and `meter_channels` tables.
+
+### `meters`
+
+One row per meter per config period. `meter_id` is a stable string key (e.g. `electricity_main`). `blocks.meter_id` references this by value (no FK) so adding, removing, or re-adding a meter never causes constraint issues on historical blocks.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `config_period_id` | INTEGER FK | Which config period this meter belongs to |
+| `meter_id` | TEXT | Stable key e.g. `electricity_main`, `ev_charger` |
+| `is_sub_meter` | INTEGER | 1 if this is a sub-meter |
+| `parent_meter_id` | TEXT | `meter_id` of parent (sub-meters only) |
+| `device_label` | TEXT | Display name e.g. `EV Charger` |
+| `protected` | INTEGER | 1 if protected load (EV, heat pump) |
+| `inverter_possible` | INTEGER | 1 if battery/inverter capable |
+| `power_sensor` | TEXT | HA entity_id for live power (main meter only) |
+| `postcode_prefix` | TEXT | UK postcode prefix for carbon intensity (main meter only) |
+
+### `meter_channels`
+
+Per-channel sensor configuration. One row per meter per channel (`import`/`export`).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `meter_id` | INTEGER FK | → `meters.id` |
+| `channel` | TEXT | `import` or `export` |
+| `read_sensor` | TEXT | HA entity_id for kWh cumulative sensor |
+| `rate_sensor` | TEXT | HA entity_id for rate (£/kWh) sensor |
+| `standing_charge_sensor` | TEXT | HA entity_id (optional) |
+| `mpan` | TEXT | Meter Point Administration Number (optional) |
+| `tariff` | TEXT | Tariff name/code (optional) |
+
+### `current_block`
+
+Single-row table (id always = 1) holding the in-progress block state. Replaces `current_block.json`. Gap state is fully relational — no JSON blobs.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER | Always 1 — enforces single row |
+| `block_start` | TEXT | UTC ISO — current block window start |
+| `block_end` | TEXT | UTC ISO — current block window end |
+| `last_checkpoint` | TEXT | UTC ISO — last sensor capture timestamp |
+| `gap_detected_at` | TEXT | UTC ISO — when gap was detected; NULL if no active gap |
+| `interpolated` | INTEGER | 1 if this is a gap-filled block |
+
+### `current_reads`
+
+Rolling reads/rates buffer for the in-progress block. Replaces the `reads[]` and `rates[]` arrays in `current_block.json`. Fully replaced on every `save_current_block()` call. Gap seed rows (pre-gap meter readings used to interpolate missing blocks) are stored here with `is_gap_seed > 0` rather than in a separate JSON blob.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `captured_at` | TEXT | UTC ISO — when reading was taken |
+| `meter_id` | TEXT | e.g. `electricity_main` |
+| `channel` | TEXT | `import` or `export` |
+| `channel_type` | TEXT | `read` (kWh) or `rate` (£/kWh) |
+| `value` | REAL | kWh for reads, £/kWh for rates |
+| `standing_charge` | REAL | Standing charge at capture time (reads only) |
+| `is_gap_seed` | INTEGER | 0=live read, 1=gap seed kWh, 2=gap seed rate |
 
 ### `blocks`
 
@@ -150,16 +206,21 @@ If the engine restarts after an outage, `detect_gap()` counts missing windows be
 
 ```
 /data/energy_meter_tracker/
-    energy_meter.db          — SQLite database (blocks + config_periods)
-    current_block.json       — in-progress block with live reads
-    cumulative_totals.json   — running totals for HA sensors
-    meters_config.json       — meter and channel configuration
+    energy_meter.db          — SQLite database (all state — blocks, config, current block)
+    meters_config.json       — convenience export only; not read back as live state
 
 /share/energy_meter_tracker_backup/
-    energy_meter.db          — copied after every finalise
-    meters_config.json       — copied after every finalise
+    energy_meter.db          — copied after every finalise (SQLite online backup API)
+    meters_config.json       — copied after every finalise (human-readable export)
     backups/
         YYYYMMDDTHHMMSS_label.zip   — zip snapshots (20 max)
+```
+
+### Deprecated files (still present for migration window)
+```
+current_block.json.migrated  — renamed from current_block.json on first 2.1.0 startup
+blocks.json.migrated         — renamed from blocks.json on first 2.0.0 startup
+cumulative_totals.json       — ignored since 2.1.0; can be deleted
 ```
 
 ---
@@ -183,8 +244,9 @@ python3 -m unittest discover -v
 ### Test coverage
 
 - `test_engine.py` — `floor_to_hh`, `interpolate_value`, `detect_gap`, `compute_channel`, `select_opening_read`, `select_closing_read`, gap marker helpers, `build_gap_blocks`, `extract_last_reads`
-- `test_block_store.py` — SQLite schema, block insertion, `get_blocks_for_range`, config period CRUD, `delete_config_period` (block reassignment), `get_billing_totals_for_range` (SQL vs block-method comparison, BST boundary)
-- `test_server.py` — all API endpoints, billing accuracy, config history CRUD
+- `test_block_store.py` — SQLite schema, block insertion, `get_blocks_for_range`, `get_blocks_for_local_date_range`, config period CRUD, `delete_config_period` (cascade to meters/channels, block reassignment), `get_billing_totals_for_local_date_range` (SQL vs block-method comparison, BST boundary), `save_current_block`/`load_current_block` roundtrip (reads, rates, gap marker via `is_gap_seed`, standing charge), `get_cumulative_totals`, normalised meter schema (`_write_meters`, `config_from_db`, sub-meters, channel meta, mpan/tariff, multi-period isolation), migration tests (`migrate_full_config_json` — full 2.0→2.1 path against real SQLite file: meters populated, blobs dropped, columns added, idempotency)
+- `test_server.py` — all API endpoints, billing accuracy, config history CRUD, historical corrections (preview + apply, all types, recalc, validation)
+- `test_usage_stats_vs_billing.py` — daily/monthly/yearly Usage Stats rows vs SQL ground truth; BST boundary days; standing charge once per local day; billing chart vs usage stats cross-method agreement
 
 When adding new logic, add corresponding tests. All test files use module stubs so they run without HA, Flask or filesystem access.
 
@@ -236,8 +298,23 @@ Sub-meter sensors (CT clamps, device integrations) are less accurate than the DC
 **Why interpolation at boundaries?**
 Without it, a sensor update that arrives at 09:28 would be assigned entirely to one block. Interpolation splits the delta proportionally so each block gets the fraction that actually occurred within it.
 
+**Why is `energy_meter.db` the single source of truth?**
+Having three JSON files (`current_block.json`, `cumulative_totals.json`, `meters_config.json`) alongside the database created split-brain risks — manual DB edits were silently overwritten by file reads, backup/restore had to handle multiple files consistently, and the sync logic between file and DB was a recurring source of bugs. A single DB file eliminates all of these: backup is a SQLite online backup, restore is a file copy, and there is no ambiguity about which store is authoritative.
+
+**Why is the config fully normalised rather than stored as a JSON blob?**
+`full_config_json` was the fastest path to getting config into the DB, but it meant that individual config fields (billing_day, timezone, sensor entity IDs) could not be queried directly. The normalised `meters` and `meter_channels` tables allow the billing and billing history logic to join directly on config fields, make adding/removing meters a simple row operation, and eliminate a class of bugs where the blob and the scalar columns could disagree.
+
+**Why `is_gap_seed` rather than a separate gap_seeds table?**
+The gap seed rows (pre-gap meter readings used to interpolate missing blocks) have exactly the same shape as live `current_reads` rows. Storing them in the same table with a discriminator column (`is_gap_seed`) avoids a join and keeps `load_current_block()` simple — one query returns all rows, live and seed alike, and the caller reconstructs the `_gap_marker` dict from the flag values.
+
+**Why `load_config()` falls back to `meters_config.json`?**
+The fallback exists only for fresh installs and the migration window. If `config_periods` has rows, the file is never consulted. This means the file can drift from the DB without causing problems — it is written for human readability only. The fallback will be removed once the migration window closes.
+
 **Why `local_date` pre-computed at insert?**
 SQLite's `DATE()` function operates in UTC. Standing charge must be summed once per local calendar day. Pre-computing `local_date` at insert time (using the configured timezone) avoids needing to pass timezone offsets into every query and handles BST/GMT transitions correctly.
+
+**Why corrections operate on `/data/` not `/share/`?**
+`/share/energy_meter_tracker_backup/` is overwritten after every block finalise by the engine's backup routine. Any manual edits there are ephemeral. The correction tools always write to the live database at `/data/energy_meter_tracker/energy_meter.db`. The next backup cycle will then propagate the corrected values to `/share/`.
 
 **Why truncation-only billing transitions?**
 Allowing periods to be extended (e.g. moving the transition date later) would make it possible to create billing periods longer than one month, which doesn't match how suppliers work. Truncation-only means the user always gets a partial final period under the old config, and a clean start under the new config — matching real billing behaviour.

@@ -2,7 +2,7 @@
 
 [![GitHub Release][releases-shield]][releases]
 ![Project Stage][project-stage-shield]
-[![License][license-shield]](LICENSE.md)
+[![License][license-shield]](LICENSE)
 [![Community Forum][forum-shield]][forum]
 [![GitHub Activity][commits-shield]][commits]
 ![Project Maintenance][maintenance-shield]
@@ -15,7 +15,7 @@
 [releases-shield]: https://img.shields.io/github/release/RGx01/energy-meter-tracker-addon.svg
 [releases]: https://github.com/RGx01/energy-meter-tracker-addon/releases
 [project-stage-shield]: https://img.shields.io/badge/project%20stage-production%20ready-brightgreen.svg
-[license-shield]: https://img.shields.io/github/license/RGx01/energy-meter-tracker-addon.svg
+[license-shield]: https://img.shields.io/badge/license-BUSL--1.1-blue.svg
 [forum-shield]: https://img.shields.io/badge/community-forum-informational.svg
 [forum]: https://community.home-assistant.io/t/energy-meter-tracker/995674
 [commits-shield]: https://img.shields.io/github/commit-activity/y/RGx01/energy-meter-tracker-addon.svg
@@ -40,13 +40,14 @@ A Home Assistant add-on that records your electricity usage in precise configura
 - Publishes four cumulative sensors back to Home Assistant
 - Serves a local web UI on port 8099 for configuration, charts, live power and data management
 
-## What's new in 2.0.0
+## What's new in 2.0.1
 
+- **🛠️ Historical Corrections** — bulk-update standing charge or import/export rates across a date range directly in the live database; always edits `/data/` not the `/share` backup copy
+- **📊 Billing alignment fixed** — kWh, cost and standing charge now agree exactly between Billing chart, Usage Stats and Live Power for all dates including BST period boundaries
 - **🗄️ SQLite storage** — blocks are now stored in a SQLite database rather than a JSON file; queries are indexed and fast regardless of how much history you have; migration from `blocks.json` is automatic on first start
 - **🕓 Billing History** — config changes are now recorded as history; billing charts always use the billing day and rates that were active when each block was recorded; access via the **Billing History** button on Meter Config
 - **📅 Billing period transitions** — when you change your billing day the old period is correctly truncated at the transition date; usage stats and live power always show the right period boundaries
 - **⚡ Live Power loads instantly** — billing card data (Today, This Bill, This Year) now loads asynchronously after page render using fast SQL aggregation queries that complete in milliseconds regardless of history length
-- **📈 Usage Stats billing periods** — the navigator now shows the correct inclusive end date for each billing period, including truncated transition periods
 
 ## Requirements
 
