@@ -3,6 +3,14 @@
 ## [2.1.1] — 2026-04-06
 
 ### Fixed
+- **Sub-meter flags missing from reconstructed block dicts** — `_row_to_block` built
+  `meter.meta` from `config_periods` columns only, never setting `sub_meter`,
+  `parent_meter`, or `device`. Charts and billing relied on `meta.sub_meter` to
+  identify sub-meters; without it all meters appeared as main meters, sub-meters were
+  not plotted separately, and billing calculations were wrong. Fixed by joining the
+  `meters` table in `_select_blocks` and `get_last_block` and populating the full meta
+  from the joined columns.
+
 - **`get_cumulative_totals()` double-counting sub-meter consumption** — the four HA
   sensors (import kWh, export kWh, import cost, export cost) were incorrectly inflated
   for installations with sub-meters (EV charger, battery etc).
