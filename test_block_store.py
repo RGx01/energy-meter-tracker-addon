@@ -1240,6 +1240,63 @@ class TestCurrentBlock(unittest.TestCase):
         self.assertAlmostEqual(totals["export_kwh"],  0.3,   places=4)
         self.assertAlmostEqual(totals["export_cost"], 0.024, places=4)
 
+    def test_billing_totals_no_double_counting(self):
+        """
+        get_billing_totals_for_local_date_range must not double-count sub-meters.
+        electricity_main.imp_kwh already includes sub-meter consumption.
+        """
+        cfg = {"meters": {
+            "electricity_main": {"meta": {
+                "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
+                "currency_symbol": "£", "currency_code": "GBP",
+            }, "channels": {
+                "import": {"read": "sensor.main", "rate": "sensor.rate"},
+                "export": {"read": "sensor.exp",  "rate": "sensor.exprate"},
+            }},
+            "ev_charger": {"meta": {
+                "sub_meter": True, "parent_meter": "electricity_main",
+            }, "channels": {
+                "import": {"read": "sensor.ev", "rate": "sensor.rate"},
+            }},
+        }}
+        self.store.insert_config_period(cfg)
+        cp_id = self.store._conn.execute(
+            "SELECT id FROM config_periods LIMIT 1"
+        ).fetchone()["id"]
+
+        # main: 3.0 kWh total, remainder=1.0 (house), cost=0.735
+        # ev:   2.0 kWh, all from grid, no independent cost
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year,
+            local_month, local_day, meter_id, config_period_id, interpolated,
+            imp_kwh, imp_kwh_remainder, imp_cost, exp_kwh, exp_cost, standing_charge)
+            VALUES ('2026-01-01T00:00:00','2026-01-01T00:30:00','2026-01-01',
+            2026,1,1,'electricity_main',?,0, 3.0,1.0,0.735, 0.2,0.024, 0.5)
+        """, (cp_id,))
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year,
+            local_month, local_day, meter_id, config_period_id, interpolated,
+            imp_kwh, imp_kwh_grid, imp_cost, exp_kwh, exp_cost, standing_charge)
+            VALUES ('2026-01-01T00:00:00','2026-01-01T00:30:00','2026-01-01',
+            2026,1,1,'ev_charger',?,0, 2.0,2.0,0.0, 0.0,0.0, 0.0)
+        """, (cp_id,))
+        self.store._conn.commit()
+
+        t = self.store.get_billing_totals_for_local_date_range('2026-01-01', '2026-01-01')
+
+        # imp_kwh: remainder(1.0) + ev_grid(2.0) = 3.0, NOT 3.0+2.0=5.0
+        self.assertAlmostEqual(t["imp_kwh"], 3.0, places=3,
+            msg="Billing totals must not double-count sub-meter imp_kwh")
+        self.assertNotAlmostEqual(t["imp_kwh"], 5.0, places=1,
+            msg="5.0 kWh indicates double-counting bug")
+        # cost from main meter only
+        self.assertAlmostEqual(t["imp_cost"], 0.735, places=3)
+        # export from main meter only
+        self.assertAlmostEqual(t["exp_kwh"], 0.2, places=3)
+        self.assertAlmostEqual(t["exp_cost"], 0.024, places=3)
+        # standing from main meter only
+        self.assertAlmostEqual(t["standing"], 0.5, places=3)
+
     def test_get_cumulative_totals_with_sub_meters(self):
         """
         With sub-meters, totals must NOT double-count.
