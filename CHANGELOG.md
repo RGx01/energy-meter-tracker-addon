@@ -1,5 +1,34 @@
 # Changelog
 
+## [2.1.3] — 2026-04-06
+
+### Fixed
+- **Sub-meter flags missing from reconstructed block dicts** — `_row_to_block` built
+  `meter.meta` from `config_periods` columns only, never setting `sub_meter`,
+  `parent_meter`, or `device`. Charts, Live Power and Usage Stats relied on
+  `meta.sub_meter` to identify sub-meters; without it all meters appeared as main
+  meters, sub-meters were not plotted separately, and billing calculations were wrong.
+  Fixed by joining the `meters` table in `_select_blocks` and `get_last_block` and
+  populating the full meta from the joined columns.
+
+- **`get_cumulative_totals()` double-counting sub-meter consumption** — the four HA
+  sensors (import kWh, export kWh, import cost, export cost) were incorrectly inflated
+  for installations with sub-meters. `electricity_main.imp_kwh` already includes
+  sub-meter consumption; the previous implementation added sub-meter `imp_kwh` a
+  second time. Fix mirrors engine PASS 3 logic — main meter uses `imp_kwh_remainder`,
+  sub-meters use `imp_kwh_grid`, cost and export from main meter only.
+  Historical block data unaffected. Users without sub-meters unaffected.
+
+### Also includes
+- All 2.1.0 changes (fully relational DB, JSON file elimination, normalised schema)
+- Data Management page (renamed from Import & Backup)
+- Enhanced Historical Corrections (time-of-day window, per-meter targeting, per-block preview)
+
+> 2.1.1 and 2.1.2 were briefly live during a difficult release cycle and have been
+> superseded by this release. If you are on 2.1.1 or 2.1.2 please update immediately.
+
+---
+
 ## [2.1.2] — 2026-04-06
 
 ### Fixed

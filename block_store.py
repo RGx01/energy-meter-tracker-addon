@@ -55,22 +55,46 @@ CREATE TABLE IF NOT EXISTS config_periods (
     currency_symbol  TEXT    NOT NULL DEFAULT '£',
     currency_code    TEXT    NOT NULL DEFAULT 'GBP',
     site_name        TEXT,
-    change_reason    TEXT,
-    full_config_json TEXT    NOT NULL
-);
+    change_reason    TEXT
+);  -- full_config_json removed in 2.1.0; meters/channels in normalised tables
 
--- Meter registry: one row per meter per config period.
+-- Meter definitions: one row per meter per config period.
+-- meter_id is a stable string key (e.g. "electricity_main", "ev_charger").
+-- blocks.meter_id references this by value (no FK) so adding/removing/
+-- re-adding a meter never causes constraint issues on historical blocks.
 CREATE TABLE IF NOT EXISTS meters (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    meter_id         TEXT    NOT NULL,
-    is_sub_meter     INTEGER NOT NULL DEFAULT 0,
-    device_label     TEXT,
-    parent_meter_id  TEXT,
-    config_period_id INTEGER NOT NULL,
-    FOREIGN KEY (config_period_id) REFERENCES config_periods(id)
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    config_period_id   INTEGER NOT NULL,
+    meter_id           TEXT    NOT NULL,
+    is_sub_meter       INTEGER NOT NULL DEFAULT 0,
+    parent_meter_id    TEXT,               -- meter_id of parent (sub-meters only)
+    device_label       TEXT,               -- display name e.g. "EV Charger"
+    protected          INTEGER DEFAULT 0,  -- protected load (EV, heat pump)
+    inverter_possible  INTEGER DEFAULT 0,  -- battery / inverter capable
+    power_sensor       TEXT,               -- HA entity_id (main meter only)
+    postcode_prefix    TEXT,               -- UK carbon intensity (main meter only)
+    FOREIGN KEY (config_period_id) REFERENCES config_periods(id),
+    UNIQUE (config_period_id, meter_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_meters_meter_id ON meters (meter_id);
+CREATE INDEX IF NOT EXISTS idx_meters_period    ON meters (config_period_id);
+CREATE INDEX IF NOT EXISTS idx_meters_meter_id  ON meters (meter_id);
+
+-- Per-channel sensor configuration for each meter.
+CREATE TABLE IF NOT EXISTS meter_channels (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    meter_id                INTEGER NOT NULL,  -- FK → meters.id
+    channel                 TEXT    NOT NULL,  -- 'import' or 'export'
+    read_sensor             TEXT,              -- HA entity_id for kWh sensor
+    rate_sensor             TEXT,              -- HA entity_id for rate sensor
+    standing_charge_sensor  TEXT,              -- HA entity_id (optional)
+    mpan                    TEXT,              -- meter point reference number
+    tariff                  TEXT,              -- tariff name / code
+    FOREIGN KEY (meter_id) REFERENCES meters(id),
+    UNIQUE (meter_id, channel)
+);
+
+CREATE INDEX IF NOT EXISTS idx_meter_channels_meter ON meter_channels (meter_id);
 
 -- Blocks: pure measurement data, no repeated config fields.
 -- config_period_id links each block to the config that was active when
@@ -127,6 +151,35 @@ CREATE TABLE IF NOT EXISTS reads (
 CREATE INDEX IF NOT EXISTS idx_reads_captured   ON reads (captured_at);
 CREATE INDEX IF NOT EXISTS idx_reads_block      ON reads (block_id);
 CREATE INDEX IF NOT EXISTS idx_reads_meter_time ON reads (meter_id, captured_at);
+
+-- current_block: single-row table holding the in-progress block state.
+-- Replaces current_block.json as the engine's live state store.
+-- gap_detected_at IS NOT NULL means a gap marker is active.
+CREATE TABLE IF NOT EXISTS current_block (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),  -- enforce single row
+    block_start     TEXT,       -- UTC ISO — current block window start
+    block_end       TEXT,       -- UTC ISO — current block window end
+    last_checkpoint TEXT,       -- UTC ISO — last capture timestamp
+    gap_detected_at TEXT,       -- UTC ISO — when gap was detected, NULL if no gap
+    interpolated    INTEGER NOT NULL DEFAULT 0
+);
+
+-- Rolling reads/rates buffer for the in-progress block.
+-- is_gap_seed: 0=live read, 1=gap seed kWh read, 2=gap seed rate reading.
+-- Gap seed rows are the pre-gap meter readings used to interpolate missing blocks.
+CREATE TABLE IF NOT EXISTS current_reads (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at     TEXT    NOT NULL,
+    meter_id        TEXT    NOT NULL,
+    channel         TEXT    NOT NULL,   -- 'import' or 'export'
+    channel_type    TEXT    NOT NULL DEFAULT 'read',  -- 'read' or 'rate'
+    value           REAL    NOT NULL,   -- kWh for reads, £/kWh for rates
+    standing_charge REAL,
+    is_gap_seed     INTEGER NOT NULL DEFAULT 0  -- 0=live, 1=gap seed read, 2=gap seed rate
+);
+
+CREATE INDEX IF NOT EXISTS idx_current_reads_meter ON current_reads (meter_id, channel, channel_type);
+CREATE INDEX IF NOT EXISTS idx_current_reads_time  ON current_reads (captured_at);
 """
 
 
@@ -380,6 +433,15 @@ class BlockStore:
 
     def _ensure_schema(self) -> None:
         self._conn.executescript(_DDL)
+        # Create is_gap_seed index only if column exists (deferred for upgrade compat)
+        cr_cols = [r[1] for r in self._conn.execute(
+            "PRAGMA table_info(current_reads)"
+        ).fetchall()]
+        if "is_gap_seed" in cr_cols:
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_current_reads_gap "
+                "ON current_reads (is_gap_seed)"
+            )
         cur = self._conn.execute(
             "SELECT value FROM store_meta WHERE key = 'schema_version'"
         )
@@ -470,6 +532,18 @@ class BlockStore:
                     (cp["effective_from"],)
                 )
 
+            # Delete normalised meter rows before removing the period
+            # (FK constraint: meters.config_period_id → config_periods.id)
+            meter_ids = [r["id"] for r in self._conn.execute(
+                "SELECT id FROM meters WHERE config_period_id = ?", (period_id,)
+            ).fetchall()]
+            for mid in meter_ids:
+                self._conn.execute(
+                    "DELETE FROM meter_channels WHERE meter_id = ?", (mid,)
+                )
+            self._conn.execute(
+                "DELETE FROM meters WHERE config_period_id = ?", (period_id,)
+            )
             self._conn.execute(
                 "DELETE FROM config_periods WHERE id = ?", (period_id,)
             )
@@ -581,6 +655,227 @@ class BlockStore:
         end_date   = end.date().isoformat()
         return self.get_billing_totals_for_local_date_range(start_date, end_date)
 
+    # ── Current block (replaces current_block.json) ──────────────────────────
+
+    def save_current_block(self, block: dict) -> None:
+        """
+        Persist the in-progress block state to the current_block table.
+        Replaces current_block.json.
+
+        Gap marker state (previously a JSON blob) is now stored relationally:
+          - current_block.gap_detected_at: timestamp when gap was detected
+          - current_reads rows with is_gap_seed=1 (kWh) or 2 (rate): the
+            pre-gap readings used to interpolate missing blocks
+
+        block: the engine's current_block dict containing:
+          start, end, interpolated, _last_checkpoint,
+          _gap_marker (optional: {detected_at, pre_reads, last_known_rates}),
+          meters[meter_id].channels[channel].reads[], .rates[]
+        """
+        block_start     = block.get("start")
+        block_end       = block.get("end")
+        last_checkpoint = block.get("_last_checkpoint")
+        gap_marker      = block.get("_gap_marker")
+        gap_detected_at = (gap_marker or {}).get("detected_at") if gap_marker else None
+        interpolated    = 1 if block.get("interpolated") else 0
+
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO current_block
+                       (id, block_start, block_end, last_checkpoint, gap_detected_at, interpolated)
+                   VALUES (1, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       block_start     = excluded.block_start,
+                       block_end       = excluded.block_end,
+                       last_checkpoint = excluded.last_checkpoint,
+                       gap_detected_at = excluded.gap_detected_at,
+                       interpolated    = excluded.interpolated""",
+                (block_start, block_end, last_checkpoint, gap_detected_at, interpolated)
+            )
+
+            # Replace all current_reads with the rolling buffer + gap seed rows
+            self._conn.execute("DELETE FROM current_reads")
+            rows = []
+
+            # Live reads and rates from the rolling buffer (is_gap_seed=0)
+            for meter_id, meter_data in (block.get("meters") or {}).items():
+                sc = float((meter_data or {}).get("standing_charge") or 0.0)
+                for channel, ch_data in ((meter_data or {}).get("channels") or {}).items():
+                    for r in (ch_data.get("reads") or []):
+                        rows.append((r.get("ts"), meter_id, channel, "read",
+                                     float(r.get("value", 0)), sc, 0))
+                    for r in (ch_data.get("rates") or []):
+                        rows.append((r.get("ts"), meter_id, channel, "rate",
+                                     float(r.get("value", 0)), None, 0))
+
+            # Gap seed rows from _gap_marker (is_gap_seed=1 for reads, 2 for rates)
+            if gap_marker:
+                for meter_id, channels in (gap_marker.get("pre_reads") or {}).items():
+                    for channel, r in (channels or {}).items():
+                        if r:
+                            rows.append((r.get("ts"), meter_id, channel, "read",
+                                         float(r.get("value", 0)), None, 1))
+                for meter_id, channels in (gap_marker.get("last_known_rates") or {}).items():
+                    for channel, r in (channels or {}).items():
+                        if r:
+                            rows.append((r.get("ts"), meter_id, channel, "rate",
+                                         float(r.get("value", 0)), None, 2))
+
+            if rows:
+                self._conn.executemany(
+                    """INSERT INTO current_reads
+                           (captured_at, meter_id, channel, channel_type,
+                            value, standing_charge, is_gap_seed)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    rows
+                )
+
+    def load_current_block(self) -> dict:
+        """
+        Load the in-progress block state from the DB.
+        Returns a block dict in the same shape the engine expects,
+        or {} if no current block exists.
+
+        Gap marker is reconstructed from gap_detected_at and is_gap_seed rows.
+        """
+        from collections import defaultdict
+
+        row = self._conn.execute(
+            "SELECT * FROM current_block WHERE id = 1"
+        ).fetchone()
+
+        if not row or not row["block_start"]:
+            return {}
+
+        block = {
+            "start":            row["block_start"],
+            "end":              row["block_end"],
+            "interpolated":     bool(row["interpolated"]),
+            "_last_checkpoint": row["last_checkpoint"],
+            "meters":           {},
+        }
+
+        # Load all current_reads rows — live and gap seed
+        reads_cur = self._conn.execute(
+            """SELECT meter_id, channel, channel_type, value,
+                      standing_charge, captured_at, is_gap_seed
+               FROM current_reads ORDER BY captured_at ASC"""
+        )
+        all_rows = reads_cur.fetchall()
+
+        # Live reads (is_gap_seed=0) → reconstruct meters/channels
+        meter_reads = defaultdict(lambda: defaultdict(list))
+        meter_rates = defaultdict(lambda: defaultdict(list))
+        meter_sc    = {}
+        for r in all_rows:
+            if r["is_gap_seed"] != 0:
+                continue
+            mid = r["meter_id"]; ch = r["channel"]
+            entry = {"ts": r["captured_at"], "value": r["value"]}
+            if r["channel_type"] == "read":
+                meter_reads[mid][ch].append(entry)
+                if r["standing_charge"] is not None:
+                    meter_sc[mid] = r["standing_charge"]
+            else:
+                meter_rates[mid][ch].append(entry)
+
+        all_meter_ids = set(list(meter_reads.keys()) + list(meter_rates.keys()))
+        for mid in all_meter_ids:
+            channels = {}
+            for ch in set(list(meter_reads[mid].keys()) + list(meter_rates[mid].keys())):
+                channels[ch] = {
+                    "reads": meter_reads[mid].get(ch, []),
+                    "rates": meter_rates[mid].get(ch, []),
+                }
+            block["meters"][mid] = {
+                "channels": channels,
+                "standing_charge": meter_sc.get(mid, 0.0),
+                "meta": {},
+            }
+
+        # Reconstruct _gap_marker from gap_detected_at + gap seed rows
+        if row["gap_detected_at"]:
+            pre_reads       = defaultdict(dict)
+            last_known_rates = defaultdict(dict)
+            for r in all_rows:
+                if r["is_gap_seed"] == 1:  # gap seed kWh read
+                    pre_reads[r["meter_id"]][r["channel"]] = {
+                        "ts": r["captured_at"], "value": r["value"]
+                    }
+                elif r["is_gap_seed"] == 2:  # gap seed rate
+                    last_known_rates[r["meter_id"]][r["channel"]] = {
+                        "ts": r["captured_at"], "value": r["value"]
+                    }
+            block["_gap_marker"] = {
+                "detected_at":      row["gap_detected_at"],
+                "pre_reads":        dict(pre_reads),
+                "last_known_rates": dict(last_known_rates),
+            }
+
+        return block
+
+    def clear_current_block(self) -> None:
+        """Clear the in-progress block state (e.g. after a reset)."""
+        with self._conn:
+            self._conn.execute("DELETE FROM current_block")
+            self._conn.execute("DELETE FROM current_reads")
+
+    def get_cumulative_totals(self) -> dict:
+        """
+        Return lifetime cumulative totals for HA sensor publishing.
+
+        Mirrors engine PASS 3 logic exactly:
+          - Main meter (is_sub_meter=0): use imp_kwh_remainder if available
+            (house-only grid load after sub-meters claimed their share),
+            falling back to imp_kwh (correct when no sub-meters configured).
+          - Sub-meters (is_sub_meter=1): use imp_kwh_grid if available
+            (the portion the sub-meter drew from the grid rather than from
+            solar/battery), falling back to imp_kwh.
+
+        This avoids double-counting: electricity_main.imp_kwh already
+        includes EV charger and battery consumption; adding sub-meter
+        imp_kwh on top inflates the total by the sub-meter kWh.
+
+        export_kwh/imp_cost/exp_cost: main meter only (sub-meters don't
+        have independent costs or export).
+        """
+        active_period_sq = (
+            "SELECT id FROM config_periods "
+            "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+        )
+        cur = self._conn.execute(
+            f"""SELECT
+                 COALESCE(SUM(
+                   CASE
+                     WHEN m.is_sub_meter = 0 THEN
+                       CASE
+                         WHEN b.imp_kwh_remainder IS NOT NULL THEN b.imp_kwh_remainder
+                         WHEN b.imp_kwh_grid      IS NOT NULL THEN b.imp_kwh_grid
+                         ELSE b.imp_kwh
+                       END
+                     ELSE  -- sub-meter: use grid portion, fallback to kwh
+                       CASE
+                         WHEN b.imp_kwh_grid IS NOT NULL THEN b.imp_kwh_grid
+                         ELSE b.imp_kwh
+                       END
+                   END
+                 ), 0.0) as import_kwh,
+                 COALESCE(SUM(CASE WHEN m.is_sub_meter = 0 THEN b.exp_kwh  ELSE 0 END), 0.0) as export_kwh,
+                 COALESCE(SUM(CASE WHEN m.is_sub_meter = 0 THEN b.imp_cost ELSE 0 END), 0.0) as import_cost,
+                 COALESCE(SUM(CASE WHEN m.is_sub_meter = 0 THEN b.exp_cost ELSE 0 END), 0.0) as export_cost
+               FROM blocks b
+               JOIN meters m
+                 ON m.meter_id = b.meter_id
+                AND m.config_period_id = ({active_period_sq})"""
+        )
+        row = cur.fetchone()
+        return {
+            "import_kwh":  round(float(row["import_kwh"]),  6),
+            "export_kwh":  round(float(row["export_kwh"]),  6),
+            "import_cost": round(float(row["import_cost"]), 6),
+            "export_cost": round(float(row["export_cost"]), 6),
+        }
+
 
     def get_config_period_for_date(self, date_iso: str) -> Optional[dict]:
         """
@@ -600,6 +895,147 @@ class BlockStore:
         row = cur.fetchone()
         return dict(row) if row else None
 
+    def _snap_to_midnight_utc(self, raw_from: str, tz_name: str) -> str:
+        """Snap a UTC ISO timestamp to local midnight, returned as UTC ISO."""
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+            from datetime import datetime as _dt2, timezone as _tz2
+            raw_dt = _dt2.fromisoformat(raw_from.replace(" ", "T").split(".")[0])
+            raw_dt_utc = raw_dt.replace(tzinfo=_tz2.utc)
+            local_dt = raw_dt_utc.astimezone(_ZI(tz_name))
+            midnight_local = local_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            return midnight_local.astimezone(_tz2.utc).replace(tzinfo=None).strftime(
+                "%Y-%m-%dT%H:%M:%S"
+            )
+        except Exception:
+            return raw_from.replace(" ", "T").split(".")[0]
+
+    def _write_meters(self, config_json: dict, period_id: int) -> None:
+        """
+        Upsert meters and meter_channels rows
+        for a config period from a config dict.
+        """
+        for meter_id, meter_cfg in (config_json.get("meters") or {}).items():
+            meta = meter_cfg.get("meta") or {}
+            is_sub      = 1 if meta.get("sub_meter") else 0
+            parent      = meta.get("parent_meter")
+            device      = meta.get("device")
+            protected   = 1 if meta.get("protected") else 0
+            inv_poss    = 1 if meta.get("inverter_possible") else 0
+            power_s     = meta.get("power_sensor")
+            postcode    = meta.get("postcode_prefix")
+
+            cur = self._conn.execute(
+                """INSERT INTO meters
+                       (config_period_id, meter_id, is_sub_meter, parent_meter_id,
+                        device_label, protected, inverter_possible,
+                        power_sensor, postcode_prefix)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(config_period_id, meter_id) DO UPDATE SET
+                       is_sub_meter      = excluded.is_sub_meter,
+                       parent_meter_id   = excluded.parent_meter_id,
+                       device_label      = excluded.device_label,
+                       protected         = excluded.protected,
+                       inverter_possible = excluded.inverter_possible,
+                       power_sensor      = excluded.power_sensor,
+                       postcode_prefix   = excluded.postcode_prefix""",
+                (period_id, meter_id, is_sub, parent, device,
+                 protected, inv_poss, power_s, postcode)
+            )
+            meter_row_id = cur.lastrowid or self._conn.execute(
+                "SELECT id FROM meters WHERE config_period_id=? AND meter_id=?",
+                (period_id, meter_id)
+            ).fetchone()["id"]
+
+            for channel, ch_cfg in (meter_cfg.get("channels") or {}).items():
+                ch_meta = ch_cfg.get("meta") or {}
+                self._conn.execute(
+                    """INSERT INTO meter_channels
+                           (meter_id, channel, read_sensor, rate_sensor,
+                            standing_charge_sensor, mpan, tariff)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(meter_id, channel) DO UPDATE SET
+                           read_sensor            = excluded.read_sensor,
+                           rate_sensor            = excluded.rate_sensor,
+                           standing_charge_sensor = excluded.standing_charge_sensor,
+                           mpan                   = excluded.mpan,
+                           tariff                 = excluded.tariff""",
+                    (
+                        meter_row_id, channel,
+                        ch_cfg.get("read"),
+                        ch_cfg.get("rate"),
+                        ch_cfg.get("standing_charge_sensor"),
+                        ch_meta.get("mpan"),
+                        ch_meta.get("tariff"),
+                    )
+                )
+
+    def config_from_db(self, period_id: int) -> dict:
+        """
+        Reconstruct a config dict (matching the old meters_config.json shape)
+        from the normalised meters/meter_channels tables.
+        """
+        cp = self.get_config_period(period_id)
+        if not cp:
+            return {"schema_version": "1.0", "meters": {}}
+
+        meters_out = {}
+        m_rows = self._conn.execute(
+            "SELECT * FROM meters WHERE config_period_id=? ORDER BY id",
+            (period_id,)
+        ).fetchall()
+
+        for m in m_rows:
+            mid = m["meter_id"]
+            meta = {
+                "billing_day":    cp["billing_day"],
+                "block_minutes":  cp["block_minutes"],
+                "timezone":       cp["timezone"],
+                "currency_symbol": cp["currency_symbol"],
+                "currency_code":  cp["currency_code"],
+                "site":           cp["site_name"],
+            }
+            if m["is_sub_meter"]:
+                meta["sub_meter"] = True
+            if m["parent_meter_id"]:
+                meta["parent_meter"] = m["parent_meter_id"]
+            if m["device_label"]:
+                meta["device"] = m["device_label"]
+            if m["protected"]:
+                meta["protected"] = True
+            if m["inverter_possible"]:
+                meta["inverter_possible"] = True
+            if m["power_sensor"]:
+                meta["power_sensor"] = m["power_sensor"]
+            if m["postcode_prefix"]:
+                meta["postcode_prefix"] = m["postcode_prefix"]
+
+            channels = {}
+            ch_rows = self._conn.execute(
+                "SELECT * FROM meter_channels WHERE meter_id=?", (m["id"],)
+            ).fetchall()
+            for ch in ch_rows:
+                ch_dict = {}
+                if ch["read_sensor"]:
+                    ch_dict["read"] = ch["read_sensor"]
+                if ch["rate_sensor"]:
+                    ch_dict["rate"] = ch["rate_sensor"]
+                if ch["standing_charge_sensor"]:
+                    ch_dict["standing_charge_sensor"] = ch["standing_charge_sensor"]
+                # mpan / tariff as channel meta dict (preserves engine-expected shape)
+                ch_meta = {}
+                if ch["mpan"]:
+                    ch_meta["mpan"] = ch["mpan"]
+                if ch["tariff"]:
+                    ch_meta["tariff"] = ch["tariff"]
+                if ch_meta:
+                    ch_dict["meta"] = ch_meta
+                channels[ch["channel"]] = ch_dict
+
+            meters_out[mid] = {"meta": meta, "channels": channels}
+
+        return {"schema_version": "1.0", "meters": meters_out}
+
     def insert_config_period(self,
                              config_json: dict,
                              effective_from: Optional[str] = None,
@@ -607,6 +1043,7 @@ class BlockStore:
         """
         Snapshot the current config as a new config period.
         Closes the previous period's effective_to.
+        Writes meter definitions to the normalised meters/meter_channels tables.
         Returns the new period's id.
         """
         main_meta = {}
@@ -615,40 +1052,19 @@ class BlockStore:
                 main_meta = m.get("meta") or {}
                 break
 
-        # Snap effective_from to midnight (start of day) in the configured timezone.
-        # Config changes recorded mid-day still apply from the start of that day,
-        # keeping billing periods aligned on whole days.
         tz_name = main_meta.get("timezone", "UTC")
-        raw_from = effective_from or _utc_now_iso()
-        try:
-            from zoneinfo import ZoneInfo as _ZI
-            from datetime import datetime as _dt2, timezone as _tz2
-            # Parse the raw timestamp as UTC
-            raw_dt = _dt2.fromisoformat(raw_from.replace(" ", "T").split(".")[0])
-            raw_dt_utc = raw_dt.replace(tzinfo=_tz2.utc)
-            # Convert to configured timezone and snap to midnight
-            local_dt = raw_dt_utc.astimezone(_ZI(tz_name))
-            midnight_local = local_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-            # Convert midnight back to UTC
-            midnight_utc = midnight_local.astimezone(_tz2.utc).replace(tzinfo=None)
-            now = midnight_utc.strftime("%Y-%m-%dT%H:%M:%S")
-        except Exception:
-            now = raw_from.replace(" ", "T").split(".")[0]
+        now = self._snap_to_midnight_utc(effective_from or _utc_now_iso(), tz_name)
 
         with self._conn:
-            # Close previous period — snap its effective_to to our effective_from
             self._conn.execute(
                 "UPDATE config_periods SET effective_to = ? WHERE effective_to IS NULL",
                 (now,)
             )
             cur = self._conn.execute(
-                """
-                INSERT INTO config_periods
-                    (effective_from, effective_to, billing_day, block_minutes,
-                     timezone, currency_symbol, currency_code, site_name,
-                     change_reason, full_config_json)
-                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                """INSERT INTO config_periods
+                       (effective_from, effective_to, billing_day, block_minutes,
+                        timezone, currency_symbol, currency_code, site_name, change_reason)
+                   VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     now,
                     int(main_meta.get("billing_day") or 1),
@@ -658,13 +1074,247 @@ class BlockStore:
                     main_meta.get("currency_code", "GBP"),
                     main_meta.get("site", main_meta.get("site_name")),
                     change_reason,
-                    json.dumps(config_json),
                 )
             )
             period_id = cur.lastrowid
+            self._write_meters(config_json, period_id)
 
         logger.info("insert_config_period: new period id=%d effective_from=%s", period_id, now)
         return period_id
+
+    def migrate_full_config_json(self) -> int:
+        """
+        One-time migration for 2.0→2.1 upgrade. Safe to call on every startup.
+
+        Steps (each guarded independently so partial upgrades resume correctly):
+          1. full_config_json → normalised meters/meter_channels + column drop
+          2. gap_marker blob  → gap_detected_at column + is_gap_seed rows
+          3. is_gap_seed column added to current_reads if missing
+          4. mpan/tariff columns added to meter_channels if missing
+
+        Returns the number of config periods whose meters were migrated (step 1).
+        """
+        migrated = 0
+
+        # ── Step 0: upgrade meters table schema if it has the old 2.0.x shape ──
+        # The 2.0.x meters table lacked protected, inverter_possible,
+        # power_sensor, postcode_prefix. Recreate with the full 2.1.0 schema.
+        m_cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(meters)"
+        ).fetchall()}
+        if m_cols and "protected" not in m_cols:
+            try:
+                with self._conn:
+                    self._conn.execute("""
+                        CREATE TABLE IF NOT EXISTS meters_new (
+                            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                            config_period_id   INTEGER NOT NULL,
+                            meter_id           TEXT    NOT NULL,
+                            is_sub_meter       INTEGER NOT NULL DEFAULT 0,
+                            parent_meter_id    TEXT,
+                            device_label       TEXT,
+                            protected          INTEGER DEFAULT 0,
+                            inverter_possible  INTEGER DEFAULT 0,
+                            power_sensor       TEXT,
+                            postcode_prefix    TEXT,
+                            FOREIGN KEY (config_period_id) REFERENCES config_periods(id),
+                            UNIQUE (config_period_id, meter_id)
+                        )
+                    """)
+                    # Copy compatible columns from old meters table
+                    old_m_cols = {r[1] for r in self._conn.execute(
+                        "PRAGMA table_info(meters)"
+                    ).fetchall()}
+                    common = {"id", "config_period_id", "meter_id", "is_sub_meter",
+                              "parent_meter_id", "device_label"} & old_m_cols
+                    col_list = ", ".join(sorted(common))
+                    self._conn.execute(f"""
+                        INSERT INTO meters_new ({col_list})
+                        SELECT {col_list} FROM meters
+                    """)
+                    self._conn.execute("DROP TABLE meters")
+                    self._conn.execute("ALTER TABLE meters_new RENAME TO meters")
+                logger.info("migrate_full_config_json: upgraded meters table schema")
+            except Exception as _e:
+                logger.warning(
+                    "migrate_full_config_json: meters schema upgrade failed: %s", _e
+                )
+
+        # ── Step 1: full_config_json → normalised meter tables ───────────────
+        cp_cols = [r[1] for r in self._conn.execute(
+            "PRAGMA table_info(config_periods)"
+        ).fetchall()]
+        if "full_config_json" in cp_cols:
+            rows = self._conn.execute(
+                "SELECT id, full_config_json FROM config_periods "
+                "WHERE full_config_json IS NOT NULL AND full_config_json != ''"
+            ).fetchall()
+            for row in rows:
+                period_id = row["id"]
+                existing = self._conn.execute(
+                    "SELECT COUNT(*) FROM meters WHERE config_period_id=?", (period_id,)
+                ).fetchone()[0]
+                if existing:
+                    continue
+                try:
+                    cfg = json.loads(row["full_config_json"])
+                    with self._conn:
+                        self._write_meters(cfg, period_id)
+                    migrated += 1
+                except Exception as e:
+                    logger.warning(
+                        "migrate_full_config_json: period %d failed: %s", period_id, e
+                    )
+            try:
+                # Temporarily disable FK enforcement for table recreation
+                self._conn.execute("PRAGMA foreign_keys = OFF")
+                with self._conn:
+                    self._conn.execute("""
+                        CREATE TABLE IF NOT EXISTS config_periods_new (
+                            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                            effective_from   TEXT    NOT NULL,
+                            effective_to     TEXT,
+                            billing_day      INTEGER NOT NULL DEFAULT 1,
+                            block_minutes    INTEGER NOT NULL DEFAULT 30,
+                            timezone         TEXT    NOT NULL DEFAULT 'UTC',
+                            currency_symbol  TEXT    NOT NULL DEFAULT '£',
+                            currency_code    TEXT    NOT NULL DEFAULT 'GBP',
+                            site_name        TEXT,
+                            change_reason    TEXT
+                        )
+                    """)
+                    self._conn.execute("""
+                        INSERT INTO config_periods_new
+                            (id, effective_from, effective_to, billing_day, block_minutes,
+                             timezone, currency_symbol, currency_code, site_name, change_reason)
+                        SELECT id, effective_from, effective_to, billing_day, block_minutes,
+                               timezone, currency_symbol, currency_code, site_name, change_reason
+                        FROM config_periods
+                    """)
+                    self._conn.execute("DROP TABLE config_periods")
+                    self._conn.execute(
+                        "ALTER TABLE config_periods_new RENAME TO config_periods"
+                    )
+                logger.info(
+                    "migrate_full_config_json: dropped full_config_json, %d periods migrated",
+                    migrated
+                )
+            except Exception as e:
+                logger.warning("migrate_full_config_json: column drop failed: %s", e)
+            finally:
+                self._conn.execute("PRAGMA foreign_keys = ON")
+
+        # ── Step 2a: is_gap_seed column on current_reads (must precede gap_marker migration) ───────────────────────
+        cr_cols = [r[1] for r in self._conn.execute(
+            "PRAGMA table_info(current_reads)"
+        ).fetchall()]
+        if "is_gap_seed" not in cr_cols:
+            try:
+                with self._conn:
+                    self._conn.execute(
+                        "ALTER TABLE current_reads "
+                        "ADD COLUMN is_gap_seed INTEGER NOT NULL DEFAULT 0"
+                    )
+                    self._conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_current_reads_gap "
+                        "ON current_reads (is_gap_seed)"
+                    )
+                logger.info(
+                    "migrate_full_config_json: added is_gap_seed to current_reads"
+                )
+            except Exception as _e:
+                logger.warning(
+                    "migrate_full_config_json: is_gap_seed add failed: %s", _e
+                )
+
+        # ── Step 2b: gap_marker blob → gap_detected_at + is_gap_seed rows ────
+        cb_cols = [r[1] for r in self._conn.execute(
+            "PRAGMA table_info(current_block)"
+        ).fetchall()]
+        if "gap_marker" in cb_cols:
+            try:
+                with self._conn:
+                    cb_row = self._conn.execute(
+                        "SELECT gap_marker FROM current_block WHERE id=1"
+                    ).fetchone()
+                    gap_detected_at = None
+                    if cb_row and cb_row["gap_marker"]:
+                        try:
+                            gm = json.loads(cb_row["gap_marker"])
+                            gap_detected_at = gm.get("detected_at")
+                            for meter_id, channels in (gm.get("pre_reads") or {}).items():
+                                for ch, r in (channels or {}).items():
+                                    if r:
+                                        self._conn.execute(
+                                            """INSERT OR IGNORE INTO current_reads
+                                               (captured_at, meter_id, channel,
+                                                channel_type, value, is_gap_seed)
+                                               VALUES (?, ?, ?, 'read', ?, 1)""",
+                                            (r.get("ts"), meter_id, ch, r.get("value", 0))
+                                        )
+                            for meter_id, channels in (gm.get("last_known_rates") or {}).items():
+                                for ch, r in (channels or {}).items():
+                                    if r:
+                                        self._conn.execute(
+                                            """INSERT OR IGNORE INTO current_reads
+                                               (captured_at, meter_id, channel,
+                                                channel_type, value, is_gap_seed)
+                                               VALUES (?, ?, ?, 'rate', ?, 2)""",
+                                            (r.get("ts"), meter_id, ch, r.get("value", 0))
+                                        )
+                        except Exception as _ge:
+                            logger.warning(
+                                "migrate_full_config_json: gap_marker parse failed: %s", _ge
+                            )
+                    self._conn.execute("""
+                        CREATE TABLE IF NOT EXISTS current_block_new (
+                            id              INTEGER PRIMARY KEY CHECK (id = 1),
+                            block_start     TEXT,
+                            block_end       TEXT,
+                            last_checkpoint TEXT,
+                            gap_detected_at TEXT,
+                            interpolated    INTEGER NOT NULL DEFAULT 0
+                        )
+                    """)
+                    self._conn.execute("""
+                        INSERT INTO current_block_new
+                            (id, block_start, block_end, last_checkpoint,
+                             gap_detected_at, interpolated)
+                        SELECT id, block_start, block_end, last_checkpoint, ?, interpolated
+                        FROM current_block
+                    """, (gap_detected_at,))
+                    self._conn.execute("DROP TABLE current_block")
+                    self._conn.execute(
+                        "ALTER TABLE current_block_new RENAME TO current_block"
+                    )
+                logger.info(
+                    "migrate_full_config_json: dropped gap_marker, gap_detected_at set"
+                )
+            except Exception as _e:
+                logger.warning(
+                    "migrate_full_config_json: gap_marker migration failed: %s", _e
+                )
+
+        # ── Step 4: mpan/tariff columns on meter_channels ─────────────────────
+        mc_cols = [r[1] for r in self._conn.execute(
+            "PRAGMA table_info(meter_channels)"
+        ).fetchall()]
+        for _col, _defn in [("mpan", "TEXT"), ("tariff", "TEXT")]:
+            if _col not in mc_cols:
+                try:
+                    with self._conn:
+                        self._conn.execute(
+                            f"ALTER TABLE meter_channels ADD COLUMN {_col} {_defn}"
+                        )
+                    logger.info(
+                        "migrate_full_config_json: added %s to meter_channels", _col
+                    )
+                except Exception as _e:
+                    logger.warning(
+                        "migrate_full_config_json: %s column add failed: %s", _col, _e
+                    )
+
+        return migrated
 
     # ── Write ─────────────────────────────────────────────────────────────
 

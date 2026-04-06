@@ -269,11 +269,25 @@ class TestConfigPeriods(unittest.TestCase):
         self.assertEqual(cp["site_name"], "Test Home")
         self.assertIsNone(cp["effective_to"])
 
-    def test_full_config_json_stored(self):
+    def test_config_from_db_roundtrip(self):
+        """config_from_db() should reproduce the original config dict."""
         self.store.insert_config_period(EXAMPLE_CONFIG)
-        cp = self.store.get_config_period(1)
-        stored = json.loads(cp["full_config_json"])
-        self.assertEqual(stored, EXAMPLE_CONFIG)
+        period_id = self.store.get_current_config_period_id()
+        restored = self.store.config_from_db(period_id)
+        # Check top-level structure
+        self.assertIn("meters", restored)
+        self.assertIn("electricity_main", restored["meters"])
+        # Check billing scalar fields round-trip
+        main_meta = restored["meters"]["electricity_main"]["meta"]
+        orig_meta  = EXAMPLE_CONFIG["meters"]["electricity_main"]["meta"]
+        self.assertEqual(main_meta["billing_day"],     orig_meta["billing_day"])
+        self.assertEqual(main_meta["timezone"],        orig_meta["timezone"])
+        self.assertEqual(main_meta["currency_symbol"], orig_meta["currency_symbol"])
+        # Check channel sensors
+        imp = restored["meters"]["electricity_main"]["channels"]["import"]
+        orig_imp = EXAMPLE_CONFIG["meters"]["electricity_main"]["channels"]["import"]
+        self.assertEqual(imp.get("read"), orig_imp.get("read"))
+        self.assertEqual(imp.get("rate"), orig_imp.get("rate"))
 
     def test_second_config_period_closes_first(self):
         self.store.insert_config_period(EXAMPLE_CONFIG,
@@ -929,13 +943,10 @@ class TestBillingTotalsVsBlockMethod(unittest.TestCase):
         self.ec = ec
 
         self.store = BlockStore(":memory:")
-        self.store._conn.execute("""
-            INSERT INTO config_periods
-            (effective_from, effective_to, billing_day, block_minutes, timezone,
-             currency_symbol, currency_code, site_name, change_reason, full_config_json)
-            VALUES ('2026-01-01T00:00:00', NULL, 3, 30, 'Europe/London', '£', 'GBP', 'Home', NULL, '{}')
-        """)
-        self.store._conn.commit()
+        self.store.insert_config_period({"meters": {"electricity_main": {"meta": {
+            "billing_day": 3, "block_minutes": 30, "timezone": "Europe/London",
+            "currency_symbol": "£", "currency_code": "GBP", "site": "Home",
+        }}}})
         self.cp_id = self.store._conn.execute(
             "SELECT id FROM config_periods LIMIT 1"
         ).fetchone()["id"]
@@ -1032,3 +1043,812 @@ class TestBillingTotalsVsBlockMethod(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCurrentBlock(unittest.TestCase):
+    """Tests for save_current_block / load_current_block / clear_current_block."""
+
+    def setUp(self):
+        import sys, types
+        eio = types.ModuleType("energy_engine_io"); eio.load_json = lambda *a,**kw: {}
+        sys.modules.setdefault("energy_engine_io", eio)
+        self.store = BlockStore(":memory:")
+
+    def _make_block(self, start="2026-04-05T00:00:00", end="2026-04-05T00:30:00"):
+        return {
+            "start": start, "end": end,
+            "interpolated": False,
+            "_last_checkpoint": "2026-04-05T00:10:00",
+            "meters": {
+                "electricity_main": {
+                    "meta": {},
+                    "standing_charge": 0.5046,
+                    "channels": {
+                        "import": {
+                            "reads": [
+                                {"ts": "2026-04-05T00:00:00", "value": 28000.0},
+                                {"ts": "2026-04-05T00:10:00", "value": 28000.5},
+                            ],
+                            "rates": [
+                                {"ts": "2026-04-05T00:00:00", "value": 0.245},
+                            ],
+                        },
+                        "export": {
+                            "reads": [{"ts": "2026-04-05T00:00:00", "value": 10000.0}],
+                            "rates": [{"ts": "2026-04-05T00:00:00", "value": 0.0}],
+                        },
+                    },
+                }
+            },
+        }
+
+    def test_save_and_load_roundtrip(self):
+        block = self._make_block()
+        self.store.save_current_block(block)
+        loaded = self.store.load_current_block()
+
+        self.assertEqual(loaded["start"], block["start"])
+        self.assertEqual(loaded["end"], block["end"])
+        self.assertEqual(loaded["_last_checkpoint"], block["_last_checkpoint"])
+        self.assertFalse(loaded["interpolated"])
+
+    def test_reads_roundtrip(self):
+        block = self._make_block()
+        self.store.save_current_block(block)
+        loaded = self.store.load_current_block()
+
+        imp_reads = loaded["meters"]["electricity_main"]["channels"]["import"]["reads"]
+        self.assertEqual(len(imp_reads), 2)
+        self.assertAlmostEqual(imp_reads[0]["value"], 28000.0, places=3)
+        self.assertAlmostEqual(imp_reads[1]["value"], 28000.5, places=3)
+
+    def test_rates_roundtrip(self):
+        block = self._make_block()
+        self.store.save_current_block(block)
+        loaded = self.store.load_current_block()
+
+        imp_rates = loaded["meters"]["electricity_main"]["channels"]["import"]["rates"]
+        self.assertEqual(len(imp_rates), 1)
+        self.assertAlmostEqual(imp_rates[0]["value"], 0.245, places=4)
+
+    def test_standing_charge_roundtrip(self):
+        block = self._make_block()
+        self.store.save_current_block(block)
+        loaded = self.store.load_current_block()
+
+        sc = loaded["meters"]["electricity_main"]["standing_charge"]
+        self.assertAlmostEqual(sc, 0.5046, places=4)
+
+    def test_gap_marker_roundtrip(self):
+        """Gap marker stored as gap_detected_at + is_gap_seed rows, not a JSON blob."""
+        block = self._make_block()
+        block["_gap_marker"] = {
+            "detected_at": "2026-04-05T00:05:00",
+            "pre_reads": {
+                "electricity_main": {"import": {"ts": "2026-04-04T23:55:00", "value": 27999.9}}
+            },
+            "last_known_rates": {
+                "electricity_main": {"import": {"ts": "2026-04-04T23:55:00", "value": 0.245}}
+            },
+        }
+        self.store.save_current_block(block)
+
+        # Verify storage is relational — gap_detected_at column, not a blob
+        row = self.store._conn.execute(
+            "SELECT gap_detected_at FROM current_block WHERE id=1"
+        ).fetchone()
+        self.assertEqual(row["gap_detected_at"], "2026-04-05T00:05:00",
+                         "gap_detected_at must be stored as a column, not a JSON blob")
+        # Verify gap_marker blob column no longer exists — schema is fully relational
+        cols = [r[1] for r in self.store._conn.execute(
+            "PRAGMA table_info(current_block)"
+        ).fetchall()]
+        self.assertNotIn("gap_marker", cols,
+            "gap_marker blob must not exist — gap state stored as gap_detected_at + is_gap_seed rows")
+
+        # Verify gap seed rows exist
+        seed_rows = self.store._conn.execute(
+            "SELECT * FROM current_reads WHERE is_gap_seed > 0"
+        ).fetchall()
+        self.assertGreater(len(seed_rows), 0, "Gap seed rows must be stored in current_reads")
+
+        # Verify full roundtrip
+        loaded = self.store.load_current_block()
+        self.assertIn("_gap_marker", loaded)
+        self.assertEqual(loaded["_gap_marker"]["detected_at"], "2026-04-05T00:05:00")
+        pre = loaded["_gap_marker"]["pre_reads"]
+        self.assertAlmostEqual(
+            pre["electricity_main"]["import"]["value"], 27999.9, places=3
+        )
+
+    def test_no_gap_marker_absent(self):
+        block = self._make_block()
+        self.store.save_current_block(block)
+        loaded = self.store.load_current_block()
+        self.assertNotIn("_gap_marker", loaded)
+        # Verify gap_detected_at is NULL
+        row = self.store._conn.execute(
+            "SELECT gap_detected_at FROM current_block WHERE id=1"
+        ).fetchone()
+        self.assertIsNone(row["gap_detected_at"])
+
+    def test_save_overwrites_previous(self):
+        block1 = self._make_block(start="2026-04-05T00:00:00")
+        block2 = self._make_block(start="2026-04-05T00:30:00", end="2026-04-05T01:00:00")
+        self.store.save_current_block(block1)
+        self.store.save_current_block(block2)
+        loaded = self.store.load_current_block()
+        self.assertEqual(loaded["start"], "2026-04-05T00:30:00")
+
+    def test_save_replaces_reads(self):
+        """Each save replaces all reads — no accumulation across saves."""
+        block1 = self._make_block()
+        self.store.save_current_block(block1)
+        block2 = self._make_block()
+        block2["meters"]["electricity_main"]["channels"]["import"]["reads"] = [
+            {"ts": "2026-04-05T00:25:00", "value": 28001.0}
+        ]
+        self.store.save_current_block(block2)
+        loaded = self.store.load_current_block()
+        imp_reads = loaded["meters"]["electricity_main"]["channels"]["import"]["reads"]
+        self.assertEqual(len(imp_reads), 1)
+        self.assertAlmostEqual(imp_reads[0]["value"], 28001.0, places=3)
+
+    def test_load_empty_returns_empty_dict(self):
+        loaded = self.store.load_current_block()
+        self.assertEqual(loaded, {})
+
+    def test_clear_removes_state(self):
+        self.store.save_current_block(self._make_block())
+        self.store.clear_current_block()
+        loaded = self.store.load_current_block()
+        self.assertEqual(loaded, {})
+
+    def test_get_cumulative_totals_empty(self):
+        totals = self.store.get_cumulative_totals()
+        self.assertEqual(totals["import_kwh"], 0.0)
+        self.assertEqual(totals["export_kwh"], 0.0)
+
+    def test_get_cumulative_totals_no_sub_meters(self):
+        """Without sub-meters, totals equal direct SUM of main meter blocks."""
+        self.store.insert_config_period({"meters": {"electricity_main": {"meta": {
+            "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
+            "currency_symbol": "£", "currency_code": "GBP",
+        }}}})
+        cp_id = self.store._conn.execute(
+            "SELECT id FROM config_periods LIMIT 1"
+        ).fetchone()["id"]
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year,
+            local_month, local_day, meter_id, config_period_id, interpolated,
+            imp_kwh, imp_cost, exp_kwh, exp_cost, standing_charge)
+            VALUES ('2026-01-01T00:00:00','2026-01-01T00:30:00','2026-01-01',
+            2026,1,1,'electricity_main',?,0, 1.5,0.368, 0.3,0.024, 0.5)
+        """, (cp_id,))
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year,
+            local_month, local_day, meter_id, config_period_id, interpolated,
+            imp_kwh, imp_cost, exp_kwh, exp_cost, standing_charge)
+            VALUES ('2026-01-01T00:30:00','2026-01-01T01:00:00','2026-01-01',
+            2026,1,1,'electricity_main',?,0, 2.0,0.490, 0.0,0.0, 0.5)
+        """, (cp_id,))
+        self.store._conn.commit()
+
+        totals = self.store.get_cumulative_totals()
+        self.assertAlmostEqual(totals["import_kwh"],  3.5,   places=4)
+        self.assertAlmostEqual(totals["import_cost"], 0.858, places=4)
+        self.assertAlmostEqual(totals["export_kwh"],  0.3,   places=4)
+        self.assertAlmostEqual(totals["export_cost"], 0.024, places=4)
+
+    def test_get_cumulative_totals_with_sub_meters(self):
+        """
+        With sub-meters, totals must NOT double-count.
+        electricity_main.imp_kwh already includes sub-meter consumption.
+        get_cumulative_totals should use:
+          - main meter: imp_kwh_remainder (house-only grid load)
+          - sub-meter:  imp_kwh_grid (sub-meter grid portion), or imp_kwh
+          TOTAL = remainder + sub_grid ≈ main.imp_kwh
+        """
+        cfg = {"meters": {
+            "electricity_main": {"meta": {
+                "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
+                "currency_symbol": "£", "currency_code": "GBP",
+            }, "channels": {
+                "import": {"read": "sensor.main", "rate": "sensor.rate"},
+                "export": {"read": "sensor.exp",  "rate": "sensor.exprate"},
+            }},
+            "ev_charger": {"meta": {
+                "sub_meter": True, "parent_meter": "electricity_main",
+            }, "channels": {
+                "import": {"read": "sensor.ev", "rate": "sensor.rate"},
+            }},
+        }}
+        self.store.insert_config_period(cfg)
+        cp_id = self.store._conn.execute(
+            "SELECT id FROM config_periods LIMIT 1"
+        ).fetchone()["id"]
+
+        # One block: main draws 3.0 kWh total, EV uses 2.0, house uses 1.0
+        # main: imp_kwh=3.0, imp_kwh_remainder=1.0 (house only), imp_cost=0.735
+        # ev:   imp_kwh=2.0, imp_kwh_grid=2.0 (all from grid), no independent cost
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year,
+            local_month, local_day, meter_id, config_period_id, interpolated,
+            imp_kwh, imp_kwh_remainder, imp_cost, exp_kwh, exp_cost, standing_charge)
+            VALUES ('2026-01-01T00:00:00','2026-01-01T00:30:00','2026-01-01',
+            2026,1,1,'electricity_main',?,0, 3.0,1.0,0.735, 0.0,0.0, 0.5)
+        """, (cp_id,))
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year,
+            local_month, local_day, meter_id, config_period_id, interpolated,
+            imp_kwh, imp_kwh_grid, imp_cost, exp_kwh, exp_cost, standing_charge)
+            VALUES ('2026-01-01T00:00:00','2026-01-01T00:30:00','2026-01-01',
+            2026,1,1,'ev_charger',?,0, 2.0,2.0,0.0, 0.0,0.0, 0.0)
+        """, (cp_id,))
+        self.store._conn.commit()
+
+        totals = self.store.get_cumulative_totals()
+
+        # Correct: remainder(1.0) + ev_grid(2.0) = 3.0 kWh total grid import
+        self.assertAlmostEqual(totals["import_kwh"], 3.0, places=4,
+            msg="Sub-meter must not double-count: total grid = house(1) + ev_grid(2) = 3")
+        # Cost only from main meter
+        self.assertAlmostEqual(totals["import_cost"], 0.735, places=4,
+            msg="Import cost must come from main meter only")
+        # NOT 5.0 (3.0 + 2.0 double-counted)
+        self.assertNotAlmostEqual(totals["import_kwh"], 5.0, places=1,
+            msg="5.0 would indicate double-counting bug")
+
+
+class TestUpgradePaths(unittest.TestCase):
+    """
+    Verify that the 1.x→2.1.0 and 2.0→2.1.0 upgrade paths work correctly:
+    - New DB tables are created automatically (CREATE TABLE IF NOT EXISTS)
+    - Config is loaded from file when DB has no periods (1.x path)
+    - Config is loaded from DB when periods exist (2.0 path)
+    - current_block.json migration seeds the DB correctly
+    """
+
+    def setUp(self):
+        import sys, types
+        eio = types.ModuleType("energy_engine_io"); eio.load_json = lambda *a,**kw: {}
+        sys.modules.setdefault("energy_engine_io", eio)
+
+    def test_new_tables_created_on_existing_db(self):
+        """
+        Simulates a 2.0.0 DB that lacks current_block and current_reads tables.
+        Opening it with BlockStore should create them via CREATE TABLE IF NOT EXISTS.
+        """
+        import tempfile, os, sqlite3
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            db_path = f.name
+        try:
+            # Create a minimal 2.0.0-style DB with blocks and config_periods only
+            conn = sqlite3.connect(db_path)
+            conn.execute("""CREATE TABLE config_periods (
+                id INTEGER PRIMARY KEY, effective_from TEXT, effective_to TEXT,
+                billing_day INTEGER, block_minutes INTEGER, timezone TEXT,
+                currency_symbol TEXT, currency_code TEXT, site_name TEXT,
+                change_reason TEXT, full_config_json TEXT NOT NULL)""")
+            conn.execute("""CREATE TABLE blocks (
+                id INTEGER PRIMARY KEY, block_start TEXT, block_end TEXT,
+                local_date TEXT NOT NULL, local_year INTEGER, local_month INTEGER,
+                local_day INTEGER, meter_id TEXT, config_period_id INTEGER,
+                interpolated INTEGER, imp_kwh REAL, imp_cost REAL,
+                exp_kwh REAL, exp_cost REAL, standing_charge REAL NOT NULL DEFAULT 0)""")
+            conn.commit()
+            conn.close()
+
+            # Opening with BlockStore should add missing tables
+            store = BlockStore(db_path)
+            # Verify new tables exist
+            tables = {r[0] for r in store._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            self.assertIn("current_block", tables,
+                "current_block table must be created on 2.0→2.1 upgrade")
+            self.assertIn("current_reads", tables,
+                "current_reads table must be created on 2.0→2.1 upgrade")
+        finally:
+            os.unlink(db_path)
+
+    def test_empty_db_has_no_current_block(self):
+        """Fresh DB: load_current_block returns empty dict."""
+        store = BlockStore(":memory:")
+        self.assertEqual(store.load_current_block(), {})
+
+    def test_config_period_none_when_empty(self):
+        """Fresh DB (1.x path): get_current_config_period_id returns None."""
+        store = BlockStore(":memory:")
+        self.assertIsNone(store.get_current_config_period_id())
+
+    def test_config_period_present_after_insert(self):
+        """After insert_config_period (2.0 path): get_current_config_period_id returns id."""
+        import json
+        store = BlockStore(":memory:")
+        cfg = {"meters": {"electricity_main": {"meta": {
+            "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
+            "currency_symbol": "£", "currency_code": "GBP",
+        }}}}
+        store.insert_config_period(cfg)
+        self.assertIsNotNone(store.get_current_config_period_id())
+
+    def test_current_block_migration_from_file(self):
+        """
+        Simulates 2.0→2.1 current_block.json migration:
+        load_current_block() returns empty, then file is loaded and saved to DB.
+        """
+        import json
+        store = BlockStore(":memory:")
+        # DB is empty (no current block)
+        self.assertEqual(store.load_current_block(), {})
+
+        # Simulate file content (as written by 2.0.0 engine)
+        cb_from_file = {
+            "start": "2026-04-05T00:00:00",
+            "end":   "2026-04-05T00:30:00",
+            "interpolated": False,
+            "_last_checkpoint": "2026-04-05T00:15:00",
+            "meters": {
+                "electricity_main": {
+                    "meta": {},
+                    "standing_charge": 0.50,
+                    "channels": {
+                        "import": {
+                            "reads": [{"ts": "2026-04-05T00:00:00", "value": 28000.0}],
+                            "rates": [{"ts": "2026-04-05T00:00:00", "value": 0.245}],
+                        }
+                    }
+                }
+            }
+        }
+
+        # Migration step: save file content to DB
+        store.save_current_block(cb_from_file)
+
+        # Verify it round-trips correctly
+        loaded = store.load_current_block()
+        self.assertEqual(loaded["start"], "2026-04-05T00:00:00")
+        self.assertEqual(loaded["_last_checkpoint"], "2026-04-05T00:15:00")
+        reads = loaded["meters"]["electricity_main"]["channels"]["import"]["reads"]
+        self.assertEqual(len(reads), 1)
+        self.assertAlmostEqual(reads[0]["value"], 28000.0, places=3)
+
+    def test_cumulative_totals_from_empty_db(self):
+        """Fresh DB (or 2.1.0 after removing file): totals are all zero."""
+        store = BlockStore(":memory:")
+        totals = store.get_cumulative_totals()
+        self.assertEqual(totals["import_kwh"], 0.0)
+        self.assertEqual(totals["export_kwh"], 0.0)
+        self.assertEqual(totals["import_cost"], 0.0)
+        self.assertEqual(totals["export_cost"], 0.0)
+
+
+class TestNormalisedMeters(unittest.TestCase):
+    """Tests for the normalised meters/meter_channels tables."""
+
+    def setUp(self):
+        import sys, types
+        eio = types.ModuleType("energy_engine_io"); eio.load_json = lambda *a, **kw: {}
+        sys.modules.setdefault("energy_engine_io", eio)
+        self.store = BlockStore(":memory:")
+
+    def _cfg(self, billing_day=1, site="Home", sub_meters=None):
+        cfg = {"meters": {"electricity_main": {"meta": {
+            "billing_day": billing_day, "block_minutes": 30,
+            "timezone": "Europe/London", "currency_symbol": "£",
+            "currency_code": "GBP", "site": site,
+        }, "channels": {
+            "import": {"read": "sensor.import_kwh", "rate": "sensor.import_rate",
+                       "standing_charge_sensor": "sensor.standing"},
+            "export": {"read": "sensor.export_kwh", "rate": "sensor.export_rate"},
+        }}}}
+        if sub_meters:
+            for mid, label in sub_meters.items():
+                cfg["meters"][mid] = {"meta": {
+                    "sub_meter": True, "parent_meter": "electricity_main",
+                    "device": label, "protected": True,
+                }, "channels": {
+                    "import": {"read": f"sensor.{mid}_kwh", "rate": "sensor.import_rate"},
+                }}
+        return cfg
+
+    def test_insert_creates_meter_rows(self):
+        cfg = self._cfg()
+        self.store.insert_config_period(cfg)
+        rows = self.store._conn.execute("SELECT * FROM meters").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["meter_id"], "electricity_main")
+        self.assertEqual(rows[0]["is_sub_meter"], 0)
+
+    def test_insert_creates_channel_rows(self):
+        cfg = self._cfg()
+        self.store.insert_config_period(cfg)
+        rows = self.store._conn.execute("SELECT * FROM meter_channels ORDER BY channel").fetchall()
+        self.assertEqual(len(rows), 2)
+        channels = {r["channel"] for r in rows}
+        self.assertEqual(channels, {"import", "export"})
+
+    def test_import_sensors_stored(self):
+        cfg = self._cfg()
+        self.store.insert_config_period(cfg)
+        ch = self.store._conn.execute(
+            "SELECT * FROM meter_channels WHERE channel='import'"
+        ).fetchone()
+        self.assertEqual(ch["read_sensor"], "sensor.import_kwh")
+        self.assertEqual(ch["rate_sensor"], "sensor.import_rate")
+        self.assertEqual(ch["standing_charge_sensor"], "sensor.standing")
+
+    def test_sub_meter_flags_stored(self):
+        cfg = self._cfg(sub_meters={"ev_charger": "EV Charger"})
+        self.store.insert_config_period(cfg)
+        sub = self.store._conn.execute(
+            "SELECT * FROM meters WHERE meter_id='ev_charger'"
+        ).fetchone()
+        self.assertEqual(sub["is_sub_meter"], 1)
+        self.assertEqual(sub["parent_meter_id"], "electricity_main")
+        self.assertEqual(sub["device_label"], "EV Charger")
+        self.assertEqual(sub["protected"], 1)
+
+    def test_config_from_db_roundtrip_simple(self):
+        """config_from_db reproduces sensor entity IDs correctly."""
+        cfg = self._cfg()
+        self.store.insert_config_period(cfg)
+        pid = self.store.get_current_config_period_id()
+        out = self.store.config_from_db(pid)
+        imp = out["meters"]["electricity_main"]["channels"]["import"]
+        self.assertEqual(imp["read"], "sensor.import_kwh")
+        self.assertEqual(imp["rate"], "sensor.import_rate")
+        self.assertEqual(imp["standing_charge_sensor"], "sensor.standing")
+
+    def test_config_from_db_roundtrip_sub_meter(self):
+        """Sub-meter flags and parent_meter survive the roundtrip."""
+        cfg = self._cfg(sub_meters={"ev_charger": "EV Charger"})
+        self.store.insert_config_period(cfg)
+        pid = self.store.get_current_config_period_id()
+        out = self.store.config_from_db(pid)
+        self.assertIn("ev_charger", out["meters"])
+        meta = out["meters"]["ev_charger"]["meta"]
+        self.assertTrue(meta.get("sub_meter"))
+        self.assertEqual(meta.get("parent_meter"), "electricity_main")
+        self.assertEqual(meta.get("device"), "EV Charger")
+        self.assertTrue(meta.get("protected"))
+
+    def test_config_from_db_billing_scalars(self):
+        """Billing scalars from config_periods appear on every meter's meta."""
+        cfg = self._cfg(billing_day=15, site="Test Home")
+        self.store.insert_config_period(cfg)
+        pid = self.store.get_current_config_period_id()
+        out = self.store.config_from_db(pid)
+        meta = out["meters"]["electricity_main"]["meta"]
+        self.assertEqual(meta["billing_day"], 15)
+        self.assertEqual(meta["site"], "Test Home")
+        self.assertEqual(meta["timezone"], "Europe/London")
+
+    def test_channel_meta_stored_and_retrieved(self):
+        """mpan/tariff in channel meta round-trips through meter_channels columns."""
+        cfg = self._cfg()
+        cfg["meters"]["electricity_main"]["channels"]["import"]["meta"] = {
+            "mpan": "1234567890123", "tariff": "Agile",
+        }
+        self.store.insert_config_period(cfg)
+        pid = self.store.get_current_config_period_id()
+        out = self.store.config_from_db(pid)
+        ch_meta = out["meters"]["electricity_main"]["channels"]["import"].get("meta", {})
+        self.assertEqual(ch_meta.get("mpan"), "1234567890123")
+        self.assertEqual(ch_meta.get("tariff"), "Agile")
+
+    def test_second_period_has_own_meter_rows(self):
+        """Each config period gets its own set of meter rows."""
+        cfg1 = self._cfg(billing_day=1, site="Period 1")
+        cfg2 = self._cfg(billing_day=15, site="Period 2",
+                         sub_meters={"ev_charger": "EV"})
+        self.store.insert_config_period(cfg1)
+        self.store.insert_config_period(cfg2)
+
+        periods = self.store._conn.execute(
+            "SELECT id FROM config_periods ORDER BY effective_from"
+        ).fetchall()
+        p1_id, p2_id = periods[0]["id"], periods[1]["id"]
+
+        out1 = self.store.config_from_db(p1_id)
+        out2 = self.store.config_from_db(p2_id)
+
+        self.assertNotIn("ev_charger", out1["meters"])
+        self.assertIn("ev_charger", out2["meters"])
+        self.assertEqual(out1["meters"]["electricity_main"]["meta"]["billing_day"], 1)
+        self.assertEqual(out2["meters"]["electricity_main"]["meta"]["billing_day"], 15)
+
+    def test_delete_period_cascades_meters(self):
+        """Deleting a config period removes its meter and channel rows."""
+        cfg1 = self._cfg(site="First")
+        cfg2 = self._cfg(site="Second")
+        self.store.insert_config_period(cfg1)
+        self.store.insert_config_period(cfg2)
+
+        p1_id = self.store._conn.execute(
+            "SELECT id FROM config_periods ORDER BY effective_from LIMIT 1"
+        ).fetchone()["id"]
+
+        self.store.delete_config_period(p1_id)
+
+        remaining = self.store._conn.execute(
+            "SELECT config_period_id FROM meters"
+        ).fetchall()
+        period_ids = {r["config_period_id"] for r in remaining}
+        self.assertNotIn(p1_id, period_ids,
+            "Meter rows for deleted period must be removed")
+
+    def test_save_config_rewrites_meter_rows(self):
+        """
+        Saving a config that removes a sub-meter deletes the old meter row.
+        """
+        cfg_with_sub = self._cfg(sub_meters={"ev_charger": "EV Charger"})
+        self.store.insert_config_period(cfg_with_sub)
+        pid = self.store.get_current_config_period_id()
+
+        # Verify ev_charger exists
+        count_before = self.store._conn.execute(
+            "SELECT COUNT(*) FROM meters WHERE config_period_id=?", (pid,)
+        ).fetchone()[0]
+        self.assertEqual(count_before, 2)  # main + ev_charger
+
+        # Remove sub-meter from config (simulate save_config removing a meter)
+        cfg_no_sub = self._cfg()
+        with self.store._conn:
+            self.store._conn.execute(
+                """UPDATE config_periods
+                   SET billing_day=?, block_minutes=?, timezone=?,
+                       currency_symbol=?, currency_code=?, site_name=?
+                   WHERE id=?""",
+                (1, 30, "Europe/London", "£", "GBP", "Home", pid)
+            )
+            old_mids = [r["id"] for r in self.store._conn.execute(
+                "SELECT id FROM meters WHERE config_period_id=?", (pid,)
+            ).fetchall()]
+            for mid in old_mids:
+                self.store._conn.execute(
+                    "DELETE FROM meter_channels WHERE meter_id=?", (mid,))
+            self.store._conn.execute(
+                "DELETE FROM meters WHERE config_period_id=?", (pid,))
+            self.store._write_meters(cfg_no_sub, pid)
+
+        count_after = self.store._conn.execute(
+            "SELECT COUNT(*) FROM meters WHERE config_period_id=?", (pid,)
+        ).fetchone()[0]
+        self.assertEqual(count_after, 1,
+            "ev_charger meter row must be removed when absent from new config")
+
+
+class TestMigration(unittest.TestCase):
+    """Tests for migrate_full_config_json — 2.0→2.1 upgrade path."""
+
+    def setUp(self):
+        import sys, types
+        eio = types.ModuleType("energy_engine_io"); eio.load_json = lambda *a, **kw: {}
+        sys.modules.setdefault("energy_engine_io", eio)
+
+    def _make_v20_db(self, path):
+        """Create a minimal 2.0.0-style DB with full_config_json and gap_marker blob."""
+        import sqlite3, json
+        conn = sqlite3.connect(path)
+        conn.execute("""CREATE TABLE config_periods (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            effective_from TEXT NOT NULL, effective_to TEXT,
+            billing_day INTEGER NOT NULL DEFAULT 1,
+            block_minutes INTEGER NOT NULL DEFAULT 30,
+            timezone TEXT NOT NULL DEFAULT 'UTC',
+            currency_symbol TEXT NOT NULL DEFAULT '£',
+            currency_code TEXT NOT NULL DEFAULT 'GBP',
+            site_name TEXT, change_reason TEXT,
+            full_config_json TEXT NOT NULL)""")
+        conn.execute("""CREATE TABLE blocks (
+            id INTEGER PRIMARY KEY, block_start TEXT, block_end TEXT,
+            local_date TEXT NOT NULL, local_year INTEGER, local_month INTEGER,
+            local_day INTEGER, meter_id TEXT, config_period_id INTEGER,
+            interpolated INTEGER, imp_kwh REAL, imp_cost REAL,
+            exp_kwh REAL, exp_cost REAL, standing_charge REAL NOT NULL DEFAULT 0)""")
+        conn.execute("""CREATE TABLE meters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, meter_id TEXT NOT NULL,
+            is_sub_meter INTEGER NOT NULL DEFAULT 0, device_label TEXT,
+            parent_meter_id TEXT, config_period_id INTEGER NOT NULL)""")
+        conn.execute("""CREATE TABLE current_block (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            block_start TEXT, block_end TEXT, last_checkpoint TEXT,
+            gap_marker TEXT, interpolated INTEGER NOT NULL DEFAULT 0)""")
+        conn.execute("""CREATE TABLE current_reads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            captured_at TEXT NOT NULL, meter_id TEXT NOT NULL,
+            channel TEXT NOT NULL, channel_type TEXT NOT NULL DEFAULT 'read',
+            value REAL NOT NULL, standing_charge REAL)""")
+        # Minimal config
+        cfg = {"meters": {"electricity_main": {"meta": {
+            "billing_day": 1, "block_minutes": 30, "timezone": "Europe/London",
+            "currency_symbol": "£", "currency_code": "GBP", "site": "Home",
+        }, "channels": {
+            "import": {"read": "sensor.import", "rate": "sensor.rate",
+                        "meta": {"mpan": "1234567890", "tariff": "Agile"}},
+            "export": {"read": "sensor.export", "rate": "sensor.rate"},
+        }}}}
+        conn.execute(
+            "INSERT INTO config_periods "
+            "(effective_from, billing_day, block_minutes, timezone, "
+            "currency_symbol, currency_code, full_config_json) "
+            "VALUES ('2026-01-01T00:00:00', 1, 30, 'Europe/London', '£', 'GBP', ?)",
+            (json.dumps(cfg),)
+        )
+        # Gap marker blob
+        gap = {
+            "detected_at": "2026-04-05T12:00:00",
+            "pre_reads": {"electricity_main": {"import": {"ts": "2026-04-05T11:55:00", "value": 28000.0}}},
+            "last_known_rates": {"electricity_main": {"import": {"ts": "2026-04-05T11:55:00", "value": 0.245}}},
+        }
+        conn.execute(
+            "INSERT INTO current_block (id, block_start, block_end, gap_marker, interpolated) "
+            "VALUES (1, '2026-04-05T12:00:00', '2026-04-05T12:30:00', ?, 0)",
+            (json.dumps(gap),)
+        )
+        conn.commit()
+        conn.close()
+
+    def test_migrate_populates_meters_table(self):
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            path = f.name
+        try:
+            self._make_v20_db(path)
+            store = BlockStore(path)
+            store.migrate_full_config_json()
+            count = store._conn.execute("SELECT COUNT(*) FROM meters").fetchone()[0]
+            self.assertGreater(count, 0, "meters table must be populated after migration")
+        finally:
+            os.unlink(path)
+
+    def test_migrate_drops_full_config_json(self):
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            path = f.name
+        try:
+            self._make_v20_db(path)
+            store = BlockStore(path)
+            store.migrate_full_config_json()
+            cols = [r[1] for r in store._conn.execute(
+                "PRAGMA table_info(config_periods)"
+            ).fetchall()]
+            self.assertNotIn("full_config_json", cols,
+                "full_config_json column must be dropped after migration")
+        finally:
+            os.unlink(path)
+
+    def test_migrate_drops_gap_marker_blob(self):
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            path = f.name
+        try:
+            self._make_v20_db(path)
+            store = BlockStore(path)
+            store.migrate_full_config_json()
+            cols = [r[1] for r in store._conn.execute(
+                "PRAGMA table_info(current_block)"
+            ).fetchall()]
+            self.assertNotIn("gap_marker", cols,
+                "gap_marker blob column must be dropped after migration")
+            self.assertIn("gap_detected_at", cols,
+                "gap_detected_at column must exist after migration")
+        finally:
+            os.unlink(path)
+
+    def test_migrate_preserves_gap_detected_at(self):
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            path = f.name
+        try:
+            self._make_v20_db(path)
+            store = BlockStore(path)
+            store.migrate_full_config_json()
+            row = store._conn.execute(
+                "SELECT gap_detected_at FROM current_block WHERE id=1"
+            ).fetchone()
+            self.assertEqual(row["gap_detected_at"], "2026-04-05T12:00:00",
+                "gap_detected_at must be populated from migrated gap_marker blob")
+        finally:
+            os.unlink(path)
+
+    def test_migrate_seeds_gap_seed_rows(self):
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            path = f.name
+        try:
+            self._make_v20_db(path)
+            store = BlockStore(path)
+            store.migrate_full_config_json()
+            seeds = store._conn.execute(
+                "SELECT * FROM current_reads WHERE is_gap_seed > 0"
+            ).fetchall()
+            self.assertGreater(len(seeds), 0,
+                "Gap seed rows must be written to current_reads during migration")
+        finally:
+            os.unlink(path)
+
+    def test_migrate_adds_is_gap_seed_column(self):
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            path = f.name
+        try:
+            self._make_v20_db(path)
+            store = BlockStore(path)
+            store.migrate_full_config_json()
+            cols = [r[1] for r in store._conn.execute(
+                "PRAGMA table_info(current_reads)"
+            ).fetchall()]
+            self.assertIn("is_gap_seed", cols,
+                "is_gap_seed column must be added to current_reads during migration")
+        finally:
+            os.unlink(path)
+
+    def test_migrate_adds_mpan_tariff_columns(self):
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            path = f.name
+        try:
+            self._make_v20_db(path)
+            store = BlockStore(path)
+            store.migrate_full_config_json()
+            cols = [r[1] for r in store._conn.execute(
+                "PRAGMA table_info(meter_channels)"
+            ).fetchall()]
+            self.assertIn("mpan",   cols, "mpan column must be added to meter_channels")
+            self.assertIn("tariff", cols, "tariff column must be added to meter_channels")
+        finally:
+            os.unlink(path)
+
+    def test_migrate_populates_mpan_tariff(self):
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            path = f.name
+        try:
+            self._make_v20_db(path)
+            store = BlockStore(path)
+            store.migrate_full_config_json()
+            ch = store._conn.execute(
+                "SELECT mpan, tariff FROM meter_channels WHERE channel='import'"
+            ).fetchone()
+            self.assertEqual(ch["mpan"],   "1234567890")
+            self.assertEqual(ch["tariff"], "Agile")
+        finally:
+            os.unlink(path)
+
+    def test_migrate_config_from_db_roundtrip(self):
+        """After migration, config_from_db returns correct sensor IDs."""
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            path = f.name
+        try:
+            self._make_v20_db(path)
+            store = BlockStore(path)
+            store.migrate_full_config_json()
+            pid = store._conn.execute(
+                "SELECT id FROM config_periods LIMIT 1"
+            ).fetchone()["id"]
+            cfg = store.config_from_db(pid)
+            self.assertIn("electricity_main", cfg["meters"])
+            imp = cfg["meters"]["electricity_main"]["channels"]["import"]
+            self.assertEqual(imp["read"], "sensor.import")
+            self.assertEqual(imp["rate"], "sensor.rate")
+            self.assertEqual(imp.get("meta", {}).get("mpan"), "1234567890")
+        finally:
+            os.unlink(path)
+
+    def test_migrate_idempotent(self):
+        """Running migration twice has no ill effects."""
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            path = f.name
+        try:
+            self._make_v20_db(path)
+            store = BlockStore(path)
+            result1 = store.migrate_full_config_json()
+            result2 = store.migrate_full_config_json()
+            self.assertEqual(result2, 0, "Second migration must return 0 (nothing to do)")
+        finally:
+            os.unlink(path)
