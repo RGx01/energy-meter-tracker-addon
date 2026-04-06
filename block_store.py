@@ -238,14 +238,32 @@ def _row_to_block(rows: list[sqlite3.Row]) -> dict:
         exp_kwh  = row["exp_kwh"]  or 0.0
         exp_cost = row["exp_cost"] or 0.0
 
+        # Build meta — include sub-meter flags from meters table if joined
+        meta = {
+            "block_minutes":  row["block_minutes"],
+            "timezone":       row["timezone"],
+            "billing_day":    row["billing_day"],
+            "currency_symbol":row["currency_symbol"],
+            "currency_code":  row["currency_code"],
+        }
+        try:
+            if row["is_sub_meter"]:
+                meta["sub_meter"] = True
+            if row["parent_meter_id"]:
+                meta["parent_meter"] = row["parent_meter_id"]
+            if row["device_label"]:
+                meta["device"] = row["device_label"]
+            if row["inverter_possible"]:
+                meta["inverter_possible"] = True
+            if row["power_sensor"]:
+                meta["power_sensor"] = row["power_sensor"]
+            if row["postcode_prefix"]:
+                meta["postcode_prefix"] = row["postcode_prefix"]
+        except IndexError:
+            pass  # meters columns not present (e.g. get_last_block pre-join)
+
         meter_block = {
-            "meta": {
-                "block_minutes":  row["block_minutes"],
-                "timezone":       row["timezone"],
-                "billing_day":    row["billing_day"],
-                "currency_symbol":row["currency_symbol"],
-                "currency_code":  row["currency_code"],
-            },
+            "meta": meta,
             "interpolated":   bool(row["interpolated"]),
             "standing_charge": row["standing_charge"] or 0.0,
             "channels":       {},
@@ -720,9 +738,13 @@ class BlockStore:
     def _select_blocks(self, where: str, params: tuple) -> list[dict]:
         sql = f"""
             SELECT b.*, cp.billing_day, cp.block_minutes, cp.timezone,
-                   cp.currency_symbol, cp.currency_code, cp.effective_from
+                   cp.currency_symbol, cp.currency_code, cp.effective_from,
+                   m.is_sub_meter, m.parent_meter_id, m.device_label,
+                   m.inverter_possible, m.power_sensor, m.postcode_prefix
             FROM blocks b
             JOIN config_periods cp ON b.config_period_id = cp.id
+            LEFT JOIN meters m ON m.meter_id = b.meter_id
+                               AND m.config_period_id = b.config_period_id
             {where}
             ORDER BY b.block_start, b.meter_id
         """
@@ -738,9 +760,13 @@ class BlockStore:
         cur = self._conn.execute(
             """
             SELECT b.*, cp.billing_day, cp.block_minutes, cp.timezone,
-                   cp.currency_symbol, cp.currency_code, cp.effective_from
+                   cp.currency_symbol, cp.currency_code, cp.effective_from,
+                   m.is_sub_meter, m.parent_meter_id, m.device_label,
+                   m.inverter_possible, m.power_sensor, m.postcode_prefix
             FROM blocks b
             JOIN config_periods cp ON b.config_period_id = cp.id
+            LEFT JOIN meters m ON m.meter_id = b.meter_id
+                               AND m.config_period_id = b.config_period_id
             WHERE b.block_start = (SELECT MAX(block_start) FROM blocks)
             ORDER BY b.meter_id
             """

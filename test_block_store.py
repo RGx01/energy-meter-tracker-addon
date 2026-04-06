@@ -594,6 +594,40 @@ class TestBlockFidelity(unittest.TestCase):
         zappi_imp = out[0]["meters"]["zappi_ev"]["channels"]["import"]
         self.assertAlmostEqual(zappi_imp["kwh_grid"], 0.3, places=4)
 
+    def test_sub_meter_meta_flags_in_retrieved_blocks(self):
+        """
+        Blocks retrieved from DB must include sub_meter, parent_meter, device
+        in meter.meta — the charts and billing rely on these to identify
+        sub-meters. This requires _select_blocks to JOIN the meters table.
+        """
+        self.store.insert_config_period(EXAMPLE_CONFIG_WITH_SUB,
+                                        effective_from="2026-03-01T00:00:00")
+        block = make_block_with_sub("2026-03-01T00:00:00")
+        self.store.append_block(block, config_period_id=2)
+        out = self.store.get_all_blocks()
+        meters = out[0]["meters"]
+
+        # Main meter: sub_meter must be absent or False
+        main_meta = meters["electricity_main"]["meta"]
+        self.assertFalse(main_meta.get("sub_meter", False),
+            "Main meter must not be flagged as sub_meter")
+
+        # Sub-meter: must have sub_meter=True, parent_meter, device
+        zappi_meta = meters["zappi_ev"]["meta"]
+        self.assertTrue(zappi_meta.get("sub_meter"),
+            "zappi_ev must be flagged as sub_meter in retrieved block meta")
+        self.assertEqual(zappi_meta.get("parent_meter"), "electricity_main",
+            "parent_meter must be populated from meters table")
+        self.assertEqual(zappi_meta.get("device"), "Zappi EV Charger",
+            "device label must be populated from meters table")
+
+    def test_main_meter_no_sub_meter_flag(self):
+        """Main meter without sub-meters must not have sub_meter in meta."""
+        out = self.store.get_all_blocks()
+        if out:
+            main_meta = out[0]["meters"]["electricity_main"]["meta"]
+            self.assertFalse(main_meta.get("sub_meter", False))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests: local date calculation
