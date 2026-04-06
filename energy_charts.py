@@ -55,6 +55,7 @@ COLOR_PALETTE = [
 
 
 def build_meter_colors(blocks):
+    """Build meter colour map from a list of blocks (legacy — misses meters not active on sampled day)."""
     all_meters = []
     for block in blocks:
         meters = block.get("meters", {}) or {}
@@ -67,6 +68,28 @@ def build_meter_colors(blocks):
         export = (main.get("channels", {}) or {}).get("export", {}) or {}
         if (export.get("kwh") or 0.0) > 0 and "electricity_main_export" not in all_meters:
             all_meters.append("electricity_main_export")
+    return {m: COLOR_PALETTE[i % len(COLOR_PALETTE)] for i, m in enumerate(all_meters)}
+
+
+def build_meter_colors_from_config(cfg: dict) -> dict:
+    """
+    Build meter colour map from the config dict rather than from blocks.
+    This ensures all configured sub-meters get a colour even if they were
+    added after the first block date and would be absent from a sampled day.
+    Order: electricity_main, sub-meters (in config order),
+           electricity_main_export (always last).
+    """
+    all_meters = ["electricity_main"]
+    for meter_id, meter_cfg in (cfg.get("meters") or {}).items():
+        meta = (meter_cfg.get("meta") or {})
+        if meta.get("sub_meter") and meter_id not in all_meters:
+            all_meters.append(meter_id)
+    # Export gets a slot whether or not there is export data
+    for meter_id, meter_cfg in (cfg.get("meters") or {}).items():
+        if not (meter_cfg.get("meta") or {}).get("sub_meter"):
+            if "export" in (meter_cfg.get("channels") or {}):
+                if "electricity_main_export" not in all_meters:
+                    all_meters.append("electricity_main_export")
     return {m: COLOR_PALETTE[i % len(COLOR_PALETTE)] for i, m in enumerate(all_meters)}
 
 
