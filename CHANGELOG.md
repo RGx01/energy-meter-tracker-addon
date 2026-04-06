@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.1.6] — 2026-04-06
+
+### Fixed
+- **`supplier` and `v2x_capable` meta fields silently dropped on config save** —
+  `_write_meters` only persisted a subset of meter meta fields; both fields were
+  lost on every config save.
+
+  `supplier` is now a column on `config_periods` (not `meters`) giving it a full
+  historical record — if you change supplier you create a new config period, just
+  like changing billing day, and historical blocks retain a reference to the supplier
+  that was active when they were recorded.
+
+  `v2x_capable` is a column on `meters` (correct — it is a per-meter property, not
+  billing-period-specific).
+
+  Existing databases are upgraded automatically on startup. Users who had configured
+  a V2G-capable meter will need to re-save their meter config once to restore the
+  `v2x_capable` flag. The `supplier` field can be set via Edit on the Billing History
+  page for any config period where it matters.
+
+---
+
 ## [2.1.5] — 2026-04-06
 
 ### Fixed
