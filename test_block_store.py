@@ -608,6 +608,38 @@ class TestBlockFidelity(unittest.TestCase):
         zappi_imp = out[0]["meters"]["zappi_ev"]["channels"]["import"]
         self.assertAlmostEqual(zappi_imp["kwh_grid"], 0.3, places=4)
 
+    def test_supplier_and_v2x_round_trip(self):
+        """
+        supplier survives via config_periods (historical record per billing period).
+        v2x_capable survives via meters table (per-meter property).
+        """
+        cfg = {"meters": {
+            "electricity_main": {"meta": {
+                "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
+                "currency_symbol": "£", "currency_code": "GBP",
+                "supplier": "Octopus Energy",
+                "v2x_capable": False,
+            }, "channels": {"import": {"read": "s.imp", "rate": "s.rate"}}},
+            "ev_charger": {"meta": {
+                "sub_meter": True, "parent_meter": "electricity_main",
+                "v2x_capable": True,
+            }, "channels": {"import": {"read": "s.ev", "rate": "s.rate"}}},
+        }}
+        store2 = new_store()
+        store2.insert_config_period(cfg)
+        pid = store2.get_current_config_period_id()
+        out = store2.config_from_db(pid)
+        store2.close()
+
+        # supplier comes from config_periods — available on main meter meta
+        self.assertEqual(out["meters"]["electricity_main"]["meta"].get("supplier"),
+                         "Octopus Energy",
+                         "supplier must be stored on config_periods and returned in main meter meta")
+        # v2x_capable comes from meters table
+        self.assertFalse(out["meters"]["electricity_main"]["meta"].get("v2x_capable", False))
+        self.assertTrue(out["meters"]["ev_charger"]["meta"].get("v2x_capable"),
+                        "v2x_capable must be stored on meters table")
+
     def test_sub_meter_meta_flags_in_retrieved_blocks(self):
         """
         Blocks retrieved from DB must include sub_meter, parent_meter, device

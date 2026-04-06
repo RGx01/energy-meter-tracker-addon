@@ -115,10 +115,17 @@
       </div>
     </div>
 
-    <div style="margin-bottom:16px;">
-      <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">Site Name</label>
-      <input id="edit-site-name" type="text" placeholder="e.g. Home"
-        class="modal-input">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px;">
+      <div>
+        <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">Site Name</label>
+        <input id="edit-site-name" type="text" placeholder="e.g. Home"
+          class="modal-input">
+      </div>
+      <div>
+        <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">Supplier</label>
+        <input id="edit-supplier" type="text" placeholder="e.g. Octopus Energy"
+          class="modal-input">
+      </div>
     </div>
 
     <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);margin-bottom:10px;">Notes</div>
@@ -251,6 +258,7 @@ function render() {
       '<strong>Currency</strong> ' + escHtml(p.currency_symbol),
     ];
     if (p.site_name) meta.push('<strong>Site</strong> ' + escHtml(p.site_name));
+    if (p.supplier)  meta.push('<strong>Supplier</strong> ' + escHtml(p.supplier));
 
     var blockInfo = p.block_count > 0
       ? '<span style="color:var(--muted);font-size:12px;">' + p.block_count.toLocaleString() + ' blocks recorded under this config</span>'
@@ -329,6 +337,7 @@ function openEdit(id) {
   document.getElementById('edit-currency-symbol').value = p.currency_symbol || '';
   document.getElementById('edit-currency-code').value   = (p.currency_code || '').toUpperCase();
   document.getElementById('edit-site-name').value     = p.site_name || '';
+  document.getElementById('edit-supplier').value      = p.supplier || '';
   document.getElementById('edit-reason').value        = p.change_reason || '';
   var _mt = document.querySelector('#edit-modal div[style*="font-size:15px"]'); if (_mt) _mt.textContent = 'Edit Config Period';
   document.getElementById('edit-modal').style.display = 'flex';
@@ -385,6 +394,7 @@ function saveEdit() {
       currency_symbol: currencySymbol,
       currency_code:   currencyCode,
       site_name:       siteName,
+      supplier:        document.getElementById('edit-supplier').value.trim() || null,
       change_reason:   reasonVal,
     })
   })
