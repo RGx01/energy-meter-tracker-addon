@@ -1,5 +1,92 @@
 # Changelog
 
+## [2.1.1] — 2026-04-06
+
+### Fixed
+- **`get_cumulative_totals()` double-counting sub-meter consumption** — the four HA
+  sensors (import kWh, export kWh, import cost, export cost) were incorrectly inflated
+  for installations with sub-meters (EV charger, battery etc).
+
+  `electricity_main.imp_kwh` already includes sub-meter consumption. The previous
+  implementation did `SELECT SUM(imp_kwh) FROM blocks` across all meters, which added
+  sub-meter `imp_kwh` a second time. On a system with an EV charger and battery this
+  produced import sensor readings roughly 67% higher than actual grid import.
+
+  The fix mirrors the engine's PASS 3 finalise logic:
+  - Main meter: uses `imp_kwh_remainder` (house-only grid load after sub-meters),
+    falling back to `imp_kwh` when no sub-meters are configured
+  - Sub-meters: uses `imp_kwh_grid` (the portion drawn from the grid rather than
+    from solar/battery), falling back to `imp_kwh`
+  - Cost and export figures: main meter only
+
+  **Historical block data is unaffected** — the blocks table, billing charts, and
+  per-block calculations were correct throughout. Only the HA sensor values
+  published after each block finalise were wrong.
+
+  Users without sub-meters are unaffected.
+
+---
+
+## [2.1.0] — 2026-04-06
+
+### Changed (breaking — upgrade path is fully automatic)
+- **`energy_meter.db` is now the only file that matters** — it is the single source of truth for all state; backup and restore requires only this one file
+- **`cumulative_totals.json` eliminated** — lifetime totals derived via `SELECT SUM(...)` on the blocks table; file silently ignored on startup
+- **`current_block.json` eliminated** — in-progress block state now stored in the new `current_block` and `current_reads` tables; migrated automatically on first 2.1.0 startup and renamed `.migrated`
+- **`meters_config.json` is a convenience export only** — written on every config save for human readability, never read back as live state
+- **Config is fully normalised** — `full_config_json` blob removed from `config_periods`; meter definitions live in the `meters` and `meter_channels` tables; `gap_marker` blob removed from `current_block` and replaced with `gap_detected_at` column and `is_gap_seed` rows in `current_reads`; `mpan` and `tariff` promoted to proper columns on `meter_channels`
+
+### Added
+- `meters` table — fully populated: one row per meter per config period, with all sensor entity IDs, sub-meter flags, and optional fields
+- `meter_channels` table — per-channel sensor config (`read_sensor`, `rate_sensor`, `standing_charge_sensor`, `mpan`, `tariff`)
+- `current_block` table — single-row in-progress block state (`block_start`, `block_end`, `last_checkpoint`, `gap_detected_at`)
+- `current_reads` table — rolling reads/rates buffer with `is_gap_seed` column (0=live, 1=gap seed kWh, 2=gap seed rate)
+- `BlockStore.config_from_db(period_id)` — reconstructs full config dict by joining normalised tables; no JSON parsing
+- `BlockStore._write_meters(config, period_id)` — upserts meter and channel rows from a config dict
+- `BlockStore.save_current_block()` / `load_current_block()` / `clear_current_block()` — DB persistence for in-progress block state
+- `BlockStore.get_cumulative_totals()` — single SQL aggregation replacing `cumulative_totals.json`
+- `BlockStore.migrate_full_config_json()` — automatic 2.0→2.1 upgrade: populates normalised tables from `full_config_json` blobs, migrates `gap_marker` blob, adds missing columns; safe to call on every startup; idempotent
+- **Historical Corrections enhanced** — rate corrections now support:
+  - Time-of-day window (`from_time` / `to_time` in local time, DST-aware — e.g. "from 15:00" for a mid-day tariff change)
+  - Per-meter targeting (`meter_id` selector populated from blocks table — correct `ev_charger` independently of main meter)
+  - Per-block preview table showing block time, current rate, new rate, kWh, current cost, new cost, and cost delta before committing
+  - `/api/corrections/meters` endpoint returning distinct meter IDs for the UI selector
+- Import & Backup page — file reference table updated; restore modal reflects single-file model; deprecated file entries removed
+
+### Removed
+- `full_config_json TEXT` column from `config_periods`
+- `gap_marker TEXT` blob column from `current_block`
+- `meter_channel_meta` key/value table (replaced by proper columns on `meter_channels`)
+- `cumulative_totals.json`, `current_block.json`, `meters_config.json` as authoritative state files
+
+### Migration
+On first startup after upgrading from 1.x:
+- `blocks.json` is migrated to `energy_meter.db` and renamed `.migrated` (existing 2.0.x behaviour)
+- `current_block.json` is migrated to the DB and renamed `.migrated`
+- `cumulative_totals.json` is ignored
+
+On first startup after upgrading from 2.0.x:
+- `energy_meter.db` is opened; new tables (`current_block`, `current_reads`, `meter_channels`) are created automatically
+- `migrate_full_config_json()` populates the normalised meter tables from existing `full_config_json` blobs and drops the column
+- `gap_marker` blob is migrated to `gap_detected_at` + `is_gap_seed` rows
+- `current_block.json` is migrated to the DB and renamed `.migrated`
+
+---
+
+## [2.0.1] — 2026-04-05
+
+### Added
+- **Historical Corrections** — new section on the Import & Backup page; bulk-update standing charge or import/export rates across a local date range in the live database (`/data/energy_meter_tracker/energy_meter.db`); Preview shows affected block and day counts plus current value range before committing; rate corrections optionally recalculate cost from corrected rate × kWh
+
+### Fixed
+- **kWh and cost alignment between Billing chart and Usage Stats** — `calculate_billing_summary_for_period` was comparing UTC block_start strings against local naive period boundaries; BST blocks at `23:xx UTC` (local midnight) were excluded from billing periods and daily summaries they belonged to; block_start is now converted to local time before filtering, fixing both kWh totals and standing charge grouping in the Billing chart
+- **Standing charge double-counted in Usage Stats (BST days)** — standing charge was read from `s["total_standing"]` which used UTC date grouping, counting the `23:xx UTC` block as a separate day; now read directly from `block["meters"][meter_id]["standing_charge"]` (same value on all blocks for a local day)
+- **Standing charge not shown in Usage Stats** — `standing_charge` is at `block["meters"][meter_id]["standing_charge"]`, not the top-level block dict; previous code did `blocks[0].get("standing_charge")` which always returned `None`
+- **Usage Stats blocks fetched by local_date** — all block queries in `api_blocks_summary` now use `get_blocks_for_local_date_range` (local_date column) rather than UTC block_start boundaries, ensuring BST blocks are never missed
+- **Billing period computation in Usage Stats** — replaced `get_all_blocks()` + `get_billing_periods_from_config_history` with the fast `get_config_periods()` + `get_billing_periods_from_config_periods`; eliminates a full block scan on every Usage Stats page load
+
+---
+
 ## [2.0.0] — 2026-04-05
 
 ### Added
