@@ -613,27 +613,57 @@ class BlockStore:
         kWh/cost and standing charge — correctly handles BST/GMT blocks at
         23:xx UTC that belong to the next local calendar day.
 
+        Mirrors PASS 3 logic to avoid double-counting sub-meter consumption:
+          - Main meter: imp_kwh_remainder (house-only), fallback imp_kwh_grid, fallback imp_kwh
+          - Sub-meters: imp_kwh_grid (grid portion), fallback imp_kwh
+          - Cost and export: main meter only
+
         first_local_date / last_local_date: YYYY-MM-DD strings (inclusive).
         """
+        active_period_sq = (
+            "SELECT id FROM config_periods "
+            "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+        )
         cur = self._conn.execute(
-            """SELECT
-                 SUM(imp_kwh)  as imp_kwh,
-                 SUM(imp_cost) as imp_cost,
-                 SUM(exp_kwh)  as exp_kwh,
-                 SUM(exp_cost) as exp_cost
-               FROM blocks
-               WHERE local_date >= ? AND local_date <= ?""",
+            f"""SELECT
+                 COALESCE(SUM(
+                   CASE
+                     WHEN m.is_sub_meter = 0 THEN
+                       CASE
+                         WHEN b.imp_kwh_remainder IS NOT NULL THEN b.imp_kwh_remainder
+                         WHEN b.imp_kwh_grid      IS NOT NULL THEN b.imp_kwh_grid
+                         ELSE b.imp_kwh
+                       END
+                     ELSE
+                       CASE
+                         WHEN b.imp_kwh_grid IS NOT NULL THEN b.imp_kwh_grid
+                         ELSE b.imp_kwh
+                       END
+                   END
+                 ), 0.0) as imp_kwh,
+                 COALESCE(SUM(CASE WHEN m.is_sub_meter = 0 THEN b.imp_cost ELSE 0 END), 0.0) as imp_cost,
+                 COALESCE(SUM(CASE WHEN m.is_sub_meter = 0 THEN b.exp_kwh  ELSE 0 END), 0.0) as exp_kwh,
+                 COALESCE(SUM(CASE WHEN m.is_sub_meter = 0 THEN b.exp_cost ELSE 0 END), 0.0) as exp_cost
+               FROM blocks b
+               JOIN meters m
+                 ON m.meter_id = b.meter_id
+                AND m.config_period_id = ({active_period_sq})
+               WHERE b.local_date >= ? AND b.local_date <= ?""",
             (first_local_date, last_local_date)
         )
         row = cur.fetchone()
 
-        # Standing charge: once per local calendar day using local_date column
+        # Standing charge: once per local calendar day, main meter only
         cur2 = self._conn.execute(
-            """SELECT SUM(daily_sc) as standing FROM (
-                 SELECT MIN(standing_charge) as daily_sc
-                 FROM blocks
-                 WHERE local_date >= ? AND local_date <= ?
-                 GROUP BY local_date
+            f"""SELECT SUM(daily_sc) as standing FROM (
+                 SELECT MIN(b.standing_charge) as daily_sc
+                 FROM blocks b
+                 JOIN meters m
+                   ON m.meter_id = b.meter_id
+                  AND m.config_period_id = ({active_period_sq})
+                 WHERE b.local_date >= ? AND b.local_date <= ?
+                   AND m.is_sub_meter = 0
+                 GROUP BY b.local_date
                )""",
             (first_local_date, last_local_date)
         )
