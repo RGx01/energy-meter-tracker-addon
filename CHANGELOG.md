@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.1.5] — 2026-04-06
+
+### Fixed
+- **Live Power Today / This Bill / This Year cards showing inflated values for
+  sub-meter installations** — `get_billing_totals_for_local_date_range()` did
+  `SUM(imp_kwh)` across all meters with no sub-meter filter, double-counting
+  sub-meter consumption already included in `electricity_main.imp_kwh`. On a
+  system with an EV charger and battery, Today showed ~79% more kWh and cost
+  than actual grid import. Fixed by applying the same PASS 3 logic as
+  `get_cumulative_totals`: main meter uses `imp_kwh_remainder`, sub-meters use
+  `imp_kwh_grid`, cost/export/standing from main meter only. Standing charge
+  query also restricted to main meter rows to prevent duplication.
+
+---
+
 ## [2.1.4] — 2026-04-06
 
 ### Fixed
