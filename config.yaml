@@ -1,6 +1,6 @@
 name: "Energy Meter Tracker"
 description: "Electricity metering engine with configurable reconciliation periods, sub-meter support, gap filling, and billing charts"
-version: "2.1.2"
+version: "2.1.3"
 slug: "energy_meter_tracker"
 init: false
 startup: application
@@ -12,7 +12,7 @@ arch:
   - armv7
 
 # ── Persistent storage ────────────────────────────────────────────────────────
-# /data  → add-on private storage (blocks.json, current_block.json, etc.)
+# /data  → add-on private storage (blocks.db — single SQLite database)
 # /share → shared with HA so charts are accessible via /local/
 map:
   - data:rw
