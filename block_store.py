@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS config_periods (
     currency_symbol  TEXT    NOT NULL DEFAULT '£',
     currency_code    TEXT    NOT NULL DEFAULT 'GBP',
     site_name        TEXT,
+    supplier         TEXT,               -- energy supplier name (display + historical record)
     change_reason    TEXT
 );  -- full_config_json removed in 2.1.0; meters/channels in normalised tables
 
@@ -73,6 +74,7 @@ CREATE TABLE IF NOT EXISTS meters (
     inverter_possible  INTEGER DEFAULT 0,  -- battery / inverter capable
     power_sensor       TEXT,               -- HA entity_id (main meter only)
     postcode_prefix    TEXT,               -- UK carbon intensity (main meter only)
+    v2x_capable        INTEGER DEFAULT 0,  -- V2G / bidirectional charging capable
     FOREIGN KEY (config_period_id) REFERENCES config_periods(id),
     UNIQUE (config_period_id, meter_id)
 );
@@ -312,6 +314,8 @@ def _row_to_block(rows: list[sqlite3.Row]) -> dict:
                 meta["power_sensor"] = row["power_sensor"]
             if row["postcode_prefix"]:
                 meta["postcode_prefix"] = row["postcode_prefix"]
+            if row["v2x_capable"]:
+                meta["v2x_capable"] = True
         except IndexError:
             pass  # meters columns not present (e.g. get_last_block pre-join)
 
@@ -433,6 +437,28 @@ class BlockStore:
 
     def _ensure_schema(self) -> None:
         self._conn.executescript(_DDL)
+
+        # ── Incremental column additions ──────────────────────────────────────
+        # These run on every open so new columns are available immediately,
+        # even before migrate_full_config_json() runs. ALTER TABLE IF NOT EXISTS
+        # is not supported in SQLite < 3.37 so we check PRAGMA first.
+        _m_cols  = {r[1] for r in self._conn.execute("PRAGMA table_info(meters)").fetchall()}
+        _cp_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(config_periods)").fetchall()}
+        _mc_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(meter_channels)").fetchall()}
+
+        for _col, _tbl, _defn, _col_set in [
+            ("v2x_capable", "meters",         "INTEGER DEFAULT 0", _m_cols),
+            ("supplier",    "config_periods",  "TEXT",              _cp_cols),
+            ("mpan",        "meter_channels",  "TEXT",              _mc_cols),
+            ("tariff",      "meter_channels",  "TEXT",              _mc_cols),
+        ]:
+            if _col not in _col_set:
+                try:
+                    self._conn.execute(f"ALTER TABLE {_tbl} ADD COLUMN {_col} {_defn}")
+                    self._conn.commit()
+                except Exception:
+                    pass  # already exists or table missing — migrate will handle it
+
         # Create is_gap_seed index only if column exists (deferred for upgrade compat)
         cr_cols = [r[1] for r in self._conn.execute(
             "PRAGMA table_info(current_reads)"
@@ -954,13 +980,14 @@ class BlockStore:
             inv_poss    = 1 if meta.get("inverter_possible") else 0
             power_s     = meta.get("power_sensor")
             postcode    = meta.get("postcode_prefix")
+            v2x         = 1 if meta.get("v2x_capable") else 0
 
             cur = self._conn.execute(
                 """INSERT INTO meters
                        (config_period_id, meter_id, is_sub_meter, parent_meter_id,
                         device_label, protected, inverter_possible,
-                        power_sensor, postcode_prefix)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        power_sensor, postcode_prefix, v2x_capable)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(config_period_id, meter_id) DO UPDATE SET
                        is_sub_meter      = excluded.is_sub_meter,
                        parent_meter_id   = excluded.parent_meter_id,
@@ -968,9 +995,10 @@ class BlockStore:
                        protected         = excluded.protected,
                        inverter_possible = excluded.inverter_possible,
                        power_sensor      = excluded.power_sensor,
-                       postcode_prefix   = excluded.postcode_prefix""",
+                       postcode_prefix   = excluded.postcode_prefix,
+                       v2x_capable       = excluded.v2x_capable""",
                 (period_id, meter_id, is_sub, parent, device,
-                 protected, inv_poss, power_s, postcode)
+                 protected, inv_poss, power_s, postcode, v2x)
             )
             meter_row_id = cur.lastrowid or self._conn.execute(
                 "SELECT id FROM meters WHERE config_period_id=? AND meter_id=?",
@@ -1025,6 +1053,8 @@ class BlockStore:
                 "currency_code":  cp["currency_code"],
                 "site":           cp["site_name"],
             }
+            if cp["supplier"]:
+                meta["supplier"] = cp["supplier"]
             if m["is_sub_meter"]:
                 meta["sub_meter"] = True
             if m["parent_meter_id"]:
@@ -1039,6 +1069,8 @@ class BlockStore:
                 meta["power_sensor"] = m["power_sensor"]
             if m["postcode_prefix"]:
                 meta["postcode_prefix"] = m["postcode_prefix"]
+            if m["v2x_capable"]:
+                meta["v2x_capable"] = True
 
             channels = {}
             ch_rows = self._conn.execute(
@@ -1093,8 +1125,9 @@ class BlockStore:
             cur = self._conn.execute(
                 """INSERT INTO config_periods
                        (effective_from, effective_to, billing_day, block_minutes,
-                        timezone, currency_symbol, currency_code, site_name, change_reason)
-                   VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)""",
+                        timezone, currency_symbol, currency_code, site_name,
+                        supplier, change_reason)
+                   VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     now,
                     int(main_meta.get("billing_day") or 1),
@@ -1103,6 +1136,7 @@ class BlockStore:
                     main_meta.get("currency_symbol", "£"),
                     main_meta.get("currency_code", "GBP"),
                     main_meta.get("site", main_meta.get("site_name")),
+                    main_meta.get("supplier"),
                     change_reason,
                 )
             )
@@ -1147,6 +1181,8 @@ class BlockStore:
                             inverter_possible  INTEGER DEFAULT 0,
                             power_sensor       TEXT,
                             postcode_prefix    TEXT,
+                            supplier           TEXT,
+                            v2x_capable        INTEGER DEFAULT 0,
                             FOREIGN KEY (config_period_id) REFERENCES config_periods(id),
                             UNIQUE (config_period_id, meter_id)
                         )
@@ -1169,6 +1205,26 @@ class BlockStore:
                 logger.warning(
                     "migrate_full_config_json: meters schema upgrade failed: %s", _e
                 )
+
+        # ── Step 0b: add v2x_capable to meters if missing ───────────────────
+        # Must run before Step 1 (_write_meters) which INSERTs this column.
+        m_cols_now = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(meters)"
+        ).fetchall()}
+        for _col, _defn in [("v2x_capable", "INTEGER DEFAULT 0")]:
+            if _col not in m_cols_now:
+                try:
+                    with self._conn:
+                        self._conn.execute(
+                            f"ALTER TABLE meters ADD COLUMN {_col} {_defn}"
+                        )
+                    logger.info(
+                        "migrate_full_config_json: added %s to meters", _col
+                    )
+                except Exception as _e:
+                    logger.warning(
+                        "migrate_full_config_json: %s column add failed: %s", _col, _e
+                    )
 
         # ── Step 1: full_config_json → normalised meter tables ───────────────
         cp_cols = [r[1] for r in self._conn.execute(
@@ -1344,6 +1400,26 @@ class BlockStore:
                         "migrate_full_config_json: %s column add failed: %s", _col, _e
                     )
 
+        # ── Step 5: supplier column on config_periods ────────────────────────
+        # Supplier belongs on config_periods (not meters) so it has a historical
+        # record — each config period records which supplier was active.
+        # Attempt to migrate supplier from the full_config_json if still present
+        # in any period (2.0.x databases that haven't been fully migrated yet).
+        cp_cols = [r[1] for r in self._conn.execute(
+            "PRAGMA table_info(config_periods)"
+        ).fetchall()]
+        if "supplier" not in cp_cols:
+            try:
+                with self._conn:
+                    self._conn.execute(
+                        "ALTER TABLE config_periods ADD COLUMN supplier TEXT"
+                    )
+                logger.info("migrate_full_config_json: added supplier to config_periods")
+            except Exception as _e:
+                logger.warning(
+                    "migrate_full_config_json: supplier column add failed: %s", _e
+                )
+
         return migrated
 
     # ── Write ─────────────────────────────────────────────────────────────
@@ -1420,7 +1496,8 @@ class BlockStore:
             SELECT b.*, cp.billing_day, cp.block_minutes, cp.timezone,
                    cp.currency_symbol, cp.currency_code, cp.effective_from,
                    m.is_sub_meter, m.parent_meter_id, m.device_label,
-                   m.inverter_possible, m.power_sensor, m.postcode_prefix
+                   m.inverter_possible, m.power_sensor, m.postcode_prefix,
+                   m.v2x_capable
             FROM blocks b
             JOIN config_periods cp ON b.config_period_id = cp.id
             LEFT JOIN meters m ON m.meter_id = b.meter_id
@@ -1442,7 +1519,8 @@ class BlockStore:
             SELECT b.*, cp.billing_day, cp.block_minutes, cp.timezone,
                    cp.currency_symbol, cp.currency_code, cp.effective_from,
                    m.is_sub_meter, m.parent_meter_id, m.device_label,
-                   m.inverter_possible, m.power_sensor, m.postcode_prefix
+                   m.inverter_possible, m.power_sensor, m.postcode_prefix,
+                   m.v2x_capable
             FROM blocks b
             JOIN config_periods cp ON b.config_period_id = cp.id
             LEFT JOIN meters m ON m.meter_id = b.meter_id

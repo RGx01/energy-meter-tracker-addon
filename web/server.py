@@ -1226,7 +1226,7 @@ def api_config_history():
             """
             SELECT cp.id, cp.effective_from, cp.effective_to, cp.billing_day,
                    cp.block_minutes, cp.timezone, cp.currency_symbol, cp.currency_code,
-                   cp.site_name, cp.change_reason,
+                   cp.site_name, cp.supplier, cp.change_reason,
                    COUNT(DISTINCT b.block_start) as block_count
             FROM config_periods cp
             LEFT JOIN blocks b ON b.config_period_id = cp.id
@@ -1246,6 +1246,7 @@ def api_config_history():
                 "currency_symbol":r["currency_symbol"],
                 "currency_code":  r["currency_code"],
                 "site_name":      r["site_name"],
+                "supplier":       r["supplier"],
                 "change_reason":  r["change_reason"],
                 "block_count":    r["block_count"],
             })
@@ -1286,7 +1287,7 @@ def api_config_history_create():
         # Load current active config — this is now read from normalised tables
         active_cp = store._conn.execute(
             "SELECT id, billing_day, block_minutes, timezone, "
-            "currency_symbol, currency_code, site_name "
+            "currency_symbol, currency_code, site_name, supplier "
             "FROM config_periods WHERE effective_to IS NULL "
             "ORDER BY effective_from DESC LIMIT 1"
         ).fetchone()
@@ -1299,6 +1300,7 @@ def api_config_history_create():
         currency_symbol = data.get("currency_symbol", active_cp["currency_symbol"])
         currency_code   = data.get("currency_code",   active_cp["currency_code"])
         site_name       = data.get("site_name",       active_cp["site_name"])
+        supplier        = data.get("supplier",        active_cp["supplier"])
         change_reason   = data.get("change_reason") or None
 
         # Reconstruct config from DB, apply overrides, then insert new period
@@ -1310,14 +1312,15 @@ def api_config_history_create():
             if "currency_symbol" in data: meta["currency_symbol"] = currency_symbol
             if "currency_code"   in data: meta["currency_code"]   = currency_code
             if "site_name"       in data: meta["site_name"]       = site_name
+            if "supplier"        in data: meta["supplier"]        = supplier
             md["meta"] = meta
 
         with store._conn:
             cur = store._conn.execute(
                 """INSERT INTO config_periods
                    (effective_from, effective_to, billing_day, block_minutes, timezone,
-                    currency_symbol, currency_code, site_name, change_reason)
-                   VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)""",
+                    currency_symbol, currency_code, site_name, supplier, change_reason)
+                   VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     ef_from,
                     int(billing_day) if billing_day else 1,
@@ -1326,6 +1329,7 @@ def api_config_history_create():
                     currency_symbol or "£",
                     currency_code or "GBP",
                     site_name,
+                    supplier,
                     change_reason,
                 )
             )
@@ -1355,7 +1359,7 @@ def api_config_history_update(period_id):
         allowed = {
             "effective_from", "effective_to", "change_reason",
             "billing_day", "timezone",
-            "currency_symbol", "currency_code", "site_name",
+            "currency_symbol", "currency_code", "site_name", "supplier",
         }
         updates = {k: v for k, v in data.items() if k in allowed}
         if not updates:
@@ -1766,7 +1770,8 @@ def api_backup_restore():
                                    timezone        = ?,
                                    currency_symbol = ?,
                                    currency_code   = ?,
-                                   site_name       = ?
+                                   site_name       = ?,
+                                   supplier        = ?
                                WHERE id = ?""",
                             (
                                 int(main_meta.get("billing_day") or 1),
@@ -1775,6 +1780,7 @@ def api_backup_restore():
                                 main_meta.get("currency_symbol", "£"),
                                 main_meta.get("currency_code", "GBP"),
                                 main_meta.get("site"),
+                                main_meta.get("supplier"),
                                 period_id,
                             )
                         )
