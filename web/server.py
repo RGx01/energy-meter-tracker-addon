@@ -979,19 +979,12 @@ def api_blocks_summary():
         # Use local dates from the store index (pre-computed, timezone-correct)
         all_date_strs = store.get_local_dates()
         if not all_date_strs:
-            # Fallback: get meter colors from a small sample
-            sample = store.get_blocks_for_range(
-                datetime(2000,1,1), datetime(2100,1,1)
-            )
-            meter_colors = _ec.build_meter_colors(sample)
+            meter_colors = _ec.build_meter_colors_from_config(cfg)
             return jsonify({"currency": currency, "rows": [], "meters": [], "export_color": "#ff7f0e"})
 
-        # Build meter colors from a representative sample (first 200 blocks)
-        from datetime import date as _date
-        first_date = datetime.strptime(all_date_strs[0], "%Y-%m-%d")
-        sample_end = first_date.replace(hour=23, minute=59, second=59)
-        sample_blocks = store.get_blocks_for_range(first_date, sample_end)
-        meter_colors = _ec.build_meter_colors(sample_blocks)
+        # Build meter colors from config — not from a block sample, which would
+        # miss sub-meters that were added after the first block date.
+        meter_colors = _ec.build_meter_colors_from_config(cfg)
 
         meter_labels = {}
         for meter_id, meter_cfg in cfg.get("meters", {}).items():
