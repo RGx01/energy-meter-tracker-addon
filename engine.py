@@ -38,10 +38,10 @@ logger = logging.getLogger("engine")
 
 DATA_DIR           = "/data/energy_meter_tracker"
 CONFIG_PATH        = f"{DATA_DIR}/meters_config.json"
-CURRENT_BLOCK_PATH = f"{DATA_DIR}/current_block.json"
+# current_block.json removed in 2.1.0 — state stored in DB current_block table
 BLOCKS_PATH        = f"{DATA_DIR}/blocks.json"    # read-only: used only for one-time migration on startup
 BLOCKS_DB_PATH     = f"{DATA_DIR}/blocks.db"
-TOTALS_PATH        = f"{DATA_DIR}/cumulative_totals.json"
+# cumulative_totals.json removed in 2.1.0 — totals derived from blocks table
 
 import os as _os_engine
 SHARE_BACKUP_DIR   = (
@@ -123,7 +123,7 @@ def _backup_to_share():
         store = get_store()
         store.backup(f"{SHARE_BACKUP_DIR}/blocks.db")
         # Copy remaining JSON files
-        for filename in ("cumulative_totals.json", "meters_config.json", "current_block.json"):
+        for filename in ("meters_config.json",):  # current_block state is in DB
             src_path = f"{DATA_DIR}/{filename}"
             dst_path = f"{SHARE_BACKUP_DIR}/{filename}"
             if os.path.exists(src_path):
@@ -183,6 +183,23 @@ def detect_currency_symbol(unit_of_measurement: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
+    """
+    Load meter configuration from the normalised DB tables.
+    Falls back to meters_config.json only before the DB is open (startup)
+    or if no config period exists yet (fresh install).
+    """
+    global _store
+    if _store is not None:
+        try:
+            cp = _store._conn.execute(
+                "SELECT id FROM config_periods "
+                "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+            ).fetchone()
+            if cp:
+                return _store.config_from_db(cp["id"])
+        except Exception as _e:
+            logger.warning("load_config: DB read failed, falling back to file: %s", _e)
+    # Pre-startup fallback — DB not open yet or fresh install
     return load_json(CONFIG_PATH, {"meters": {}})
 
 
@@ -381,7 +398,7 @@ def ensure_correct_block(ha: HAClient, current_block: dict, now: datetime) -> di
 
     finalise_block(ha, block_data=current_block)
 
-    new_block = load_json(CURRENT_BLOCK_PATH, {})
+    new_block = _store.load_current_block()
     if not new_block or not new_block.get("start"):
         logger.warning("ensure_correct_block: pruned buffer missing, creating fresh")
         return create_block(start, end, block_minutes=int(get_block_minutes()))
@@ -744,7 +761,7 @@ def generate_charts(store: "BlockStore"):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: bool = False):
-    cb = block_data if block_data is not None else load_json(CURRENT_BLOCK_PATH, {})
+    cb = block_data if block_data is not None else _store.load_current_block()
 
     if not cb or not cb.get("meters"):
         logger.warning("finalise_block: nothing to finalise")
@@ -943,16 +960,8 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
 
     append_block(block)
 
-    # ── PASS 4 — update cumulative totals ─────────────────────────────────
-    engine_totals = load_json(TOTALS_PATH, {
-        "import_kwh": 0.0, "export_kwh": 0.0,
-        "import_cost": 0.0, "export_cost": 0.0,
-    })
-    engine_totals["import_kwh"]  += block["totals"]["import_kwh"]
-    engine_totals["export_kwh"]  += block["totals"]["export_kwh"]
-    engine_totals["import_cost"] += block["totals"]["import_cost"]
-    engine_totals["export_cost"] += block["totals"]["export_cost"]
-    io_save(TOTALS_PATH, engine_totals)
+    # ── PASS 4 — update cumulative totals (derived from DB, no JSON file) ───
+    engine_totals = _store.get_cumulative_totals()
 
     # ── Update HA sensors (schedule on the event loop — finalise_block is sync) ──
     loop = asyncio.get_event_loop()
@@ -1009,7 +1018,7 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
         pruned_block["_gap_marker"] = cb["_gap_marker"]
         logger.info("finalise_block: gap marker carried forward")
 
-    io_save(CURRENT_BLOCK_PATH, pruned_block)
+    _store.save_current_block(pruned_block)
     logger.info("finalise_block: rolling buffer pruned, new block starts %s", iso(block_end_dt))
 
     # ── Generate charts ────────────────────────────────────────────────────
@@ -1078,7 +1087,7 @@ async def _engine_tick(ha: HAClient):
         return
     now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    current_block = load_json(CURRENT_BLOCK_PATH, {})
+    current_block = _store.load_current_block()
 
     # Load block size from config (may have changed since startup)
     block_minutes = get_block_minutes()
@@ -1144,24 +1153,14 @@ async def _engine_tick(ha: HAClient):
                 for gb in gap_blocks:
                     append_block(gb)
 
-                engine_totals = load_json(TOTALS_PATH, {
-                    "import_kwh": 0.0, "export_kwh": 0.0,
-                    "import_cost": 0.0, "export_cost": 0.0,
-                })
-                for gb in gap_blocks:
-                    engine_totals["import_kwh"]  += gb["totals"]["import_kwh"]
-                    engine_totals["export_kwh"]  += gb["totals"]["export_kwh"]
-                    engine_totals["import_cost"] += gb["totals"]["import_cost"]
-                    engine_totals["export_cost"] += gb["totals"]["export_cost"]
-
-                io_save(TOTALS_PATH, engine_totals)
+                engine_totals = _store.get_cumulative_totals()
                 await update_ha_sensors(ha, engine_totals)
                 logger.info("gap fill: %d interpolated blocks inserted", len(gap_blocks))
             else:
                 logger.warning("gap fill: no missing windows found, clearing marker")
 
             clear_gap_marker(current_block)
-            io_save(CURRENT_BLOCK_PATH, current_block)
+            _store.save_current_block(current_block)
 
     # Block lifecycle
     updated_block = ensure_correct_block(ha, current_block, now)
@@ -1169,7 +1168,7 @@ async def _engine_tick(ha: HAClient):
 
     if block_changed or periodic_checkpoint or near_boundary:
         updated_block["_last_checkpoint"] = now.isoformat()
-        io_save(CURRENT_BLOCK_PATH, updated_block)
+        _store.save_current_block(updated_block)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1238,11 +1237,62 @@ async def engine_startup(ha: HAClient):
                     logger.warning("engine_startup: currency detection failed: %s", e)
             break
     # Persist currency to meters_config so charts can read it
-    save_json_atomic(CONFIG_PATH, config)
+    # Write meters_config.json as a convenience export (human-readable).
+    # The DB config_period is the authoritative source — this file is not read back.
+    try:
+        save_json_atomic(CONFIG_PATH, config)
+    except Exception as _e:
+        logger.warning("engine_startup: could not write meters_config.json export: %s", _e)
 
     # ── Open BlockStore (auto-migrate from blocks.json if needed) ────────
     global _store
     _store = open_block_store(BLOCKS_DB_PATH)
+
+    # Migrate full_config_json → normalised tables (2.0→2.1 one-time upgrade)
+    try:
+        migrated = _store.migrate_full_config_json()
+        if migrated:
+            logger.info(
+                "engine_startup: migrated %d config periods to normalised schema", migrated
+            )
+    except Exception as _me:
+        logger.warning("engine_startup: full_config_json migration failed: %s", _me)
+
+    # Sync startup config (possibly with freshly detected currency) to DB.
+    # Rewrites the normalised meter rows for the active period — handles
+    # both 2.0→2.1 upgrades (meters table was empty) and currency detection.
+    try:
+        active_id = _store.get_current_config_period_id()
+        if active_id is not None:
+            main_meta_sync = {}
+            for _m in config.get("meters", {}).values():
+                if not (_m.get("meta") or {}).get("sub_meter"):
+                    main_meta_sync = _m.get("meta") or {}
+                    break
+            with _store._conn:
+                _store._conn.execute(
+                    """UPDATE config_periods
+                       SET billing_day     = ?,
+                           block_minutes   = ?,
+                           timezone        = ?,
+                           currency_symbol = ?,
+                           currency_code   = ?,
+                           site_name       = ?
+                       WHERE id = ?""",
+                    (
+                        int(main_meta_sync.get("billing_day") or 1),
+                        int(main_meta_sync.get("block_minutes") or 30),
+                        main_meta_sync.get("timezone", "UTC"),
+                        main_meta_sync.get("currency_symbol", "£"),
+                        main_meta_sync.get("currency_code", "GBP"),
+                        main_meta_sync.get("site"),
+                        active_id,
+                    )
+                )
+                _store._write_meters(config, active_id)
+            logger.info("engine_startup: active config period synced to normalised tables")
+    except Exception as _sync_e:
+        logger.warning("engine_startup: config sync to DB failed: %s", _sync_e)
 
     if _store.get_current_config_period_id() is None:
         # Fresh DB — check if blocks.json exists to migrate
@@ -1269,6 +1319,28 @@ async def engine_startup(ha: HAClient):
 
     logger.info("engine_startup: %d existing blocks in store", _store.count_blocks())
 
+    # ── Migrate current_block.json → DB (one-time, 2.1.0 upgrade) ───────
+    current_block_json_path = os.path.join(DATA_DIR, "current_block.json")
+    if os.path.exists(current_block_json_path):
+        cb_in_db = _store.load_current_block()
+        if not cb_in_db or not cb_in_db.get("start"):
+            try:
+                cb_from_file = load_json(current_block_json_path, {})
+                if cb_from_file and cb_from_file.get("start"):
+                    _store.save_current_block(cb_from_file)
+                    logger.info(
+                        "engine_startup: current_block.json migrated to DB (start=%s)",
+                        cb_from_file.get("start")
+                    )
+            except Exception as _cbe:
+                logger.warning("engine_startup: current_block.json migration failed: %s", _cbe)
+        # Rename so it's no longer read on subsequent startups
+        try:
+            os.rename(current_block_json_path, current_block_json_path + ".migrated")
+            logger.info("engine_startup: current_block.json renamed to .migrated")
+        except Exception as _cbe:
+            logger.warning("engine_startup: could not rename current_block.json: %s", _cbe)
+
     # ── Session gap detection ────────────────────────────────────────────
     last_block = _store.get_last_block()
     if last_block:
@@ -1279,10 +1351,10 @@ async def engine_startup(ha: HAClient):
                 logger.warning(
                     "engine_startup: session gap detected — %d missing blocks", len(missing_windows)
                 )
-                current_block        = load_json(CURRENT_BLOCK_PATH, {})
+                current_block        = _store.load_current_block()
                 pre_reads, last_rates = extract_last_reads(last_block)
                 set_gap_marker(current_block, pre_reads, last_rates)
-                io_save(CURRENT_BLOCK_PATH, current_block)
+                _store.save_current_block(current_block)
                 logger.info("engine_startup: gap marker set, will fill on first capture")
             else:
                 logger.info("engine_startup: no session gap detected")
