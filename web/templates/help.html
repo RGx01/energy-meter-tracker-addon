@@ -249,20 +249,17 @@
 <!-- ── Data storage ──────────────────────────────────────────────────────── -->
 <div class="card help-section">
   <div class="card-title">💾 Data Storage &amp; Backup</div>
-  <p>
-    All data is stored in a single SQLite database:
-  </p>
   <ul>
-    <li><code>blocks.db</code> — everything: all finalised blocks, config history, meter definitions, and current block state. This is the only file you need to back up.</li>
-    <li><code>meters_config.json</code> — human-readable config export, written automatically for reference. The database is authoritative — this file is not read back as live state.</li>
+    <li><code>blocks.json</code> — all finalised reconciliation period blocks (the primary dataset)</li>
+    <li><code>current_block.json</code> — the in-progress block with live sensor readings</li>
+    <li><code>cumulative_totals.json</code> — running totals for the four HA sensors</li>
+    <li><code>meters_config.json</code> — your meter and channel configuration</li>
   </ul>
   <p style="margin-top:12px;">
-    Data is stored in the add-on's private <code>/data/energy_meter_tracker/</code> directory. After
-    every block finalise, <code>blocks.db</code> is copied to
-    <code>/share/energy_meter_tracker_backup/</code> using SQLite's online backup API — no risk of
-    a corrupted mid-write copy. A zip snapshot is also created automatically before every config
-    save, and manually on demand from the
-    <a href="{{ url_for('import_page') }}" style="color:var(--accent);">Data Management page</a>.
+    Data is stored in the add-on's private <code>/data/</code> directory. After every block finalise,
+    all four files are copied to <code>/share/energy_meter_tracker_backup/</code>. A zip snapshot
+    is also created automatically before every config save, and manually on demand from the
+    <a href="{{ url_for('import_page') }}" style="color:var(--accent);">Import &amp; Backup page</a>.
   </p>
   <div class="warn-box">
     ⚠️ <strong>Uninstalling the add-on will wipe <code>/data/</code>.</strong> Always ensure you

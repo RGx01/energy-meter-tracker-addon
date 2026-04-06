@@ -47,35 +47,47 @@ Billing/Calendar period toggle, data table totals column, heatmap mobile fixes, 
 
 ## Planned
 
-### 2.1.0 — Full SQLite: Single Source of Truth
-**Theme: One database file, fully relational, no JSON blobs**
+### 2.1.0 — Full SQLite: Eliminate JSON Files
+**Theme: Single source of truth — one database, no JSON state files**
 
-All state is now in `energy_meter.db`. Backup and restore is a single file copy. The schema is fully normalised — no JSON blobs anywhere.
+The unreleased SQLite work moved blocks to the DB but left three JSON files as live state. This release completes the transition so the database is the only thing that needs to be backed up or restored, and the codebase is significantly simpler.
 
-**What shipped:**
-- `cumulative_totals.json` eliminated — totals derived from `SELECT SUM(...)` on the blocks table
-- `current_block.json` eliminated — in-progress block state in `current_block` + `current_reads` tables
-- `meters_config.json` demoted to convenience export — authoritative config in normalised DB tables
-- `full_config_json` blob dropped from `config_periods` — replaced by `meters` and `meter_channels` tables
-- `gap_marker` blob dropped from `current_block` — replaced by `gap_detected_at` column and `is_gap_seed` rows in `current_reads`
-- `meter_channel_meta` EAV table dropped — `mpan` and `tariff` promoted to proper columns on `meter_channels`
-- `migrate_full_config_json()` — automatic upgrade from 2.0.x: four independent steps, safe to re-run, idempotent
-- Import & Backup page updated — file reference table and restore UI reflect single-file model
-- Historical Corrections enhanced — rate corrections now support time-of-day window (DST-aware), per-meter targeting, and per-block preview table before committing
+**`cumulative_totals.json` → derived from `blocks` table** (trivial)
 
-**Deprecations removed**
+`SUM(imp_kwh)`, `SUM(exp_kwh)`, `SUM(imp_cost)`, `SUM(exp_cost)` from the blocks table gives the same numbers. On startup the engine runs this query instead of loading the file. The file is no longer written after each finalise.
+
+**`meters_config.json` → `config_periods.full_config_json`** (low risk)
+
+The active config period's `full_config_json` already contains the complete meters config. The engine and server query the active config period directly. The file becomes a convenience export only — written on config save for human readability, never read back as live state.
+
+Migration: on startup, if `config_periods` is empty and `meters_config.json` exists, use the file to seed the first period (existing behaviour). If `config_periods` has rows, ignore the file entirely.
+
+**`current_block.json` → `current_block` table + `reads` table** (most complex)
+
+The in-progress block contains a rolling reads buffer and gap marker — the engine writes it every tick. The `reads` table schema and `insert_read()` already exist but the engine never calls them.
+- Add a `current_block` table (one row: block_start, block_end, gap_marker, serialised state)
+- Engine writes each sensor capture to the `reads` table rather than accumulating in JSON
+- On startup, reconstruct in-progress state from `current_block` + `reads` instead of `current_block.json`
+
+**Backup and restore simplification**
+
+Once all state is in the DB, backup = SQLite online backup API. Restore = copy the file. The Import & Backup page gains:
+- Download the live DB directly
+- Restore by uploading a DB file
+- Selective table restore (e.g. restore `blocks` from an older DB without touching `config_periods`)
+
+**Deprecations removed in this release**
 
 | Artefact | Removed in |
 |----------|-----------|
+| `migrate_json_to_sqlite()` in `block_store.py` | 2.1.0 |
+| `blocks.json` preservation after migration | 2.1.0 |
 | `cumulative_totals.json` as live state | 2.1.0 |
 | `current_block.json` as live state | 2.1.0 |
 | `meters_config.json` as live state | 2.1.0 |
-| `full_config_json` blob column on `config_periods` | 2.1.0 |
-| `gap_marker` blob column on `current_block` | 2.1.0 |
-| `meter_channel_meta` key/value table | 2.1.0 |
 | `SQLITE_MIGRATION_PLAN.md` | 2.1.0 |
 
-> `migrate_json_to_sqlite()` is retained to support users upgrading directly from 1.x. It will be removed in 2.2.0 once the migration window closes.
+> The engine refactor for `current_block.json` is the riskiest part — recommend a design spike to ensure tick-loop latency is not affected before development begins.
 
 ---
 

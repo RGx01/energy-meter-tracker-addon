@@ -50,7 +50,7 @@ def inject_globals():
     has_postcode = False
     try:
         from energy_engine_io import load_json as _lj
-        cfg = load_config()
+        cfg = _lj(os.path.join(DATA_DIR, "meters_config.json"), {})
         for m_data in cfg.get("meters", {}).values():
             if not (m_data.get("meta") or {}).get("sub_meter"):
                 has_power_sensor = bool((m_data.get("meta") or {}).get("power_sensor"))
@@ -199,22 +199,6 @@ def _rebuild_config_period_chain(store):
 
 
 def load_config():
-    """
-    Load meter configuration from the normalised DB tables.
-    Falls back to meters_config.json only for fresh installs before any
-    config period exists.
-    """
-    try:
-        store = _get_store()
-        cp = store._conn.execute(
-            "SELECT id FROM config_periods "
-            "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
-        ).fetchone()
-        if cp:
-            return store.config_from_db(cp["id"])
-    except Exception:
-        pass
-    # Fallback: fresh install only
     p = config_path()
     if not os.path.exists(p):
         return {"schema_version": "1.0", "meters": {}}
@@ -223,88 +207,28 @@ def load_config():
 
 
 def save_config(data: dict):
-    """
-    Save meter configuration. The DB (normalised meters/meter_channels tables)
-    is the authoritative store. meters_config.json is written as a
-    human-readable export only and is not read back as live state.
-    """
-    # Preserve channel meta from existing config that the UI doesn't manage.
-    # Read from DB (authoritative) rather than the JSON file.
-    try:
-        existing = load_config()
-        for meter_id, meter in existing.get("meters", {}).items():
-            for ch_id, ch in meter.get("channels", {}).items():
-                if "meta" in ch:
-                    try:
-                        data["meters"][meter_id]["channels"][ch_id].setdefault("meta", ch["meta"])
-                    except (KeyError, TypeError):
-                        pass
-    except Exception:
-        pass
+    p = config_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
 
-    # Write to the active config period in the DB (normalised tables)
-    try:
-        store = _get_store()
-        main_meta = {}
-        for md in data.get("meters", {}).values():
-            if not (md.get("meta") or {}).get("sub_meter"):
-                main_meta = md.get("meta") or {}
-                break
-        active = store._conn.execute(
-            "SELECT id FROM config_periods WHERE effective_to IS NULL "
-            "ORDER BY effective_from DESC LIMIT 1"
-        ).fetchone()
-        if active:
-            period_id = active["id"]
-            with store._conn:
-                # Update billing scalar fields on config_periods
-                store._conn.execute(
-                    """UPDATE config_periods
-                       SET billing_day     = ?,
-                           block_minutes   = ?,
-                           timezone        = ?,
-                           currency_symbol = ?,
-                           currency_code   = ?,
-                           site_name       = ?
-                       WHERE id = ?""",
-                    (
-                        int(main_meta.get("billing_day") or 1),
-                        int(main_meta.get("block_minutes") or 30),
-                        main_meta.get("timezone", "UTC"),
-                        main_meta.get("currency_symbol", "£"),
-                        main_meta.get("currency_code", "GBP"),
-                        main_meta.get("site"),
-                        period_id,
-                    )
-                )
-                # Rewrite normalised meter rows for this period
-                # Delete existing rows first (upsert handles adds/updates;
-                # deletion handles meters removed from config)
-                old_meter_ids = [r["id"] for r in store._conn.execute(
-                    "SELECT id FROM meters WHERE config_period_id=?", (period_id,)
-                ).fetchall()]
-                for mid in old_meter_ids:
-                    store._conn.execute(
-                        "DELETE FROM meter_channels WHERE meter_id=?", (mid,)
-                    )
-                store._conn.execute(
-                    "DELETE FROM meters WHERE config_period_id=?", (period_id,)
-                )
-                store._write_meters(data, period_id)
-    except Exception as _e:
-        logger.error("save_config: DB write failed: %s", _e)
-        raise
+    # Preserve channel meta from existing config that the UI doesn't manage
+    if os.path.exists(p):
+        try:
+            with open(p) as f:
+                existing = json.load(f)
+            for meter_id, meter in existing.get("meters", {}).items():
+                for ch_id, ch in meter.get("channels", {}).items():
+                    if "meta" in ch:
+                        try:
+                            data["meters"][meter_id]["channels"][ch_id].setdefault("meta", ch["meta"])
+                        except (KeyError, TypeError):
+                            pass
+        except Exception:
+            pass
 
-    # Write meters_config.json as a convenience export (not read back as state)
-    try:
-        p = config_path()
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        tmp = p + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, p)
-    except Exception as _e:
-        logger.warning("save_config: could not write meters_config.json export: %s", _e)
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, p)
 
 
 # ── Pages ─────────────────────────────────────────────────────────────────────
@@ -492,7 +416,7 @@ def summary_page():
     from energy_engine_io import load_json as _load_json
 
     try:
-        cfg      = load_config()
+        cfg      = _load_json(os.path.join(DATA_DIR, "meters_config.json"), {})
         store    = _get_store()
         main_meta = {}
         for md in cfg.get("meters", {}).values():
@@ -601,8 +525,8 @@ def api_power():
     try:
         from energy_engine_io import load_json as _lj
         from datetime import datetime
-        cfg        = load_config()
-        block      = _get_store().load_current_block()
+        cfg        = _lj(os.path.join(DATA_DIR, "meters_config.json"), {})
+        block      = _lj(os.path.join(DATA_DIR, "current_block.json"), {})
         meters_cfg = cfg.get("meters", {}) or {}
         meters_blk = block.get("meters", {}) or {}
 
@@ -688,7 +612,7 @@ def api_power():
         rate_sensor = None
         try:
             from energy_engine_io import load_json as _lj2
-            _cfg2 = load_config()
+            _cfg2 = _lj2(os.path.join(DATA_DIR, "meters_config.json"), {})
             for _m in _cfg2.get("meters", {}).values():
                 if not (_m.get("meta") or {}).get("sub_meter"):
                     rate_sensor = ((_m.get("channels") or {}).get("import") or {}).get("rate")
@@ -726,7 +650,7 @@ def api_billing():
     import energy_charts as _ec
     try:
         from energy_engine_io import load_json as _lj
-        cfg      = load_config()
+        cfg      = _lj(os.path.join(DATA_DIR, "meters_config.json"), {})
         store    = _get_store()
         main_meta = {}
         for md in cfg.get("meters", {}).values():
@@ -847,7 +771,7 @@ def api_carbon():
     import urllib.error
     try:
         from energy_engine_io import load_json as _lj
-        cfg = load_config()
+        cfg = _lj(os.path.join(DATA_DIR, "meters_config.json"), {})
         postcode = None
         for m_data in cfg.get("meters", {}).values():
             meta = (m_data or {}).get("meta", {}) or {}
@@ -961,7 +885,7 @@ def api_blocks_summary():
         import energy_charts as _ec
         from collections import defaultdict
 
-        cfg   = load_config()
+        cfg   = _lj(os.path.join(DATA_DIR, "meters_config.json"), {})
         store = _get_store()
 
         main_meta = {}
@@ -1260,7 +1184,7 @@ def api_config_history():
         cfg_tz = "UTC"
         try:
             from energy_engine_io import load_json as _lj_tz
-            _cfg_tz = load_config()
+            _cfg_tz = _lj_tz(os.path.join(DATA_DIR, "meters_config.json"), {})
             for _m in _cfg_tz.get("meters", {}).values():
                 if not (_m.get("meta") or {}).get("sub_meter"):
                     cfg_tz = (_m.get("meta") or {}).get("timezone", "UTC")
@@ -1275,12 +1199,13 @@ def api_config_history():
 
 @app.route("/api/config/history", methods=["POST"])
 def api_config_history_create():
-    """Create a new config period, inheriting meter definitions from the current active period."""
+    """Create a new config period, inheriting full_config_json from the current active period."""
     try:
         store = _get_store()
         data  = request.get_json(force=True)
 
         from datetime import datetime as _dt
+        # Required: effective_from
         ef_from_raw = data.get("effective_from")
         if not ef_from_raw:
             return jsonify({"error": "effective_from is required"}), 400
@@ -1290,56 +1215,57 @@ def api_config_history_create():
         except ValueError:
             return jsonify({"error": "Invalid effective_from date"}), 400
 
-        # Load current active config — this is now read from normalised tables
-        active_cp = store._conn.execute(
-            "SELECT id, billing_day, block_minutes, timezone, "
-            "currency_symbol, currency_code, site_name "
-            "FROM config_periods WHERE effective_to IS NULL "
-            "ORDER BY effective_from DESC LIMIT 1"
-        ).fetchone()
-        if not active_cp:
+        # Get the current active period to inherit its full_config_json
+        cur = store._conn.execute(
+            "SELECT * FROM config_periods WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+        )
+        active = cur.fetchone()
+        if not active:
             return jsonify({"error": "No active config period found to inherit from"}), 400
 
-        # Build override values
-        billing_day     = data.get("billing_day",     active_cp["billing_day"])
-        timezone        = data.get("timezone",        active_cp["timezone"])
-        currency_symbol = data.get("currency_symbol", active_cp["currency_symbol"])
-        currency_code   = data.get("currency_code",   active_cp["currency_code"])
-        site_name       = data.get("site_name",       active_cp["site_name"])
+        import json as _json
+        full_cfg = _json.loads(active["full_config_json"]) if active["full_config_json"] else {}
+
+        # Apply any overrides from the request
+        billing_day     = data.get("billing_day", active["billing_day"])
+        timezone        = data.get("timezone", active["timezone"])
+        currency_symbol = data.get("currency_symbol", active["currency_symbol"])
+        currency_code   = data.get("currency_code", active["currency_code"])
+        site_name       = data.get("site_name", active["site_name"])
         change_reason   = data.get("change_reason") or None
 
-        # Reconstruct config from DB, apply overrides, then insert new period
-        full_cfg = store.config_from_db(active_cp["id"])
-        for md in full_cfg.get("meters", {}).values():
+        # Update full_config_json with overrides
+        for mid, md in full_cfg.get("meters", {}).items():
             meta = md.get("meta") or {}
-            if "billing_day"     in data: meta["billing_day"]     = int(billing_day)
-            if "timezone"        in data: meta["timezone"]        = timezone
-            if "currency_symbol" in data: meta["currency_symbol"] = currency_symbol
-            if "currency_code"   in data: meta["currency_code"]   = currency_code
-            if "site_name"       in data: meta["site_name"]       = site_name
+            if "billing_day"      in data: meta["billing_day"]      = int(billing_day)
+            if "timezone"         in data: meta["timezone"]         = timezone
+            if "currency_symbol"  in data: meta["currency_symbol"]  = currency_symbol
+            if "currency_code"    in data: meta["currency_code"]    = currency_code
+            if "site_name"        in data: meta["site_name"]        = site_name
             md["meta"] = meta
 
         with store._conn:
-            cur = store._conn.execute(
+            store._conn.execute(
                 """INSERT INTO config_periods
                    (effective_from, effective_to, billing_day, block_minutes, timezone,
-                    currency_symbol, currency_code, site_name, change_reason)
-                   VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)""",
+                    currency_symbol, currency_code, site_name, change_reason, full_config_json)
+                   VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     ef_from,
                     int(billing_day) if billing_day else 1,
-                    int(active_cp["block_minutes"] or 30),
+                    int(active["block_minutes"] or 30),
                     timezone or "UTC",
                     currency_symbol or "£",
                     currency_code or "GBP",
                     site_name,
                     change_reason,
+                    _json.dumps(full_cfg),
                 )
             )
-            new_period_id = cur.lastrowid
-            store._write_meters(full_cfg, new_period_id)
 
+        # Rebuild chain — sorts by effective_from and reassigns blocks
         _rebuild_config_period_chain(store)
+
         logger.info("api_config_history_create: new period from %s", ef_from)
         return jsonify({"ok": True})
     except Exception as e:
@@ -1420,7 +1346,7 @@ def api_config_history_update(period_id):
             blocks = store.get_all_blocks()
             if blocks:
                 from energy_engine_io import load_json as _lj_ec
-                cfg       = load_config()
+                cfg       = _lj_ec(os.path.join(DATA_DIR, "meters_config.json"), {})
                 main_meta = {}
                 for md in cfg.get("meters", {}).values():
                     if not (md.get("meta") or {}).get("sub_meter"):
@@ -1463,16 +1389,17 @@ def api_config_history_delete(period_id):
             logger.warning("api_config_history_delete: chain rebuild failed: %s", _e)
 
         # If we deleted the active period, the predecessor is now active.
-        # Write its config back to meters_config.json (convenience export).
+        # Write its full_config_json back to meters_config.json so the engine,
+        # charts and billing all read the correct (now-current) config.
         if is_active:
             try:
                 new_active = store._conn.execute(
-                    "SELECT id FROM config_periods "
+                    "SELECT full_config_json FROM config_periods "
                     "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
                 ).fetchone()
-                if new_active:
+                if new_active and new_active["full_config_json"]:
                     from energy_engine_io import save_json_atomic as _sja
-                    restored_cfg = store.config_from_db(new_active["id"])
+                    restored_cfg = _json.loads(new_active["full_config_json"])
                     cfg_path = os.path.join(DATA_DIR, "meters_config.json")
                     _sja(cfg_path, restored_cfg)
                     logger.info(
@@ -1490,7 +1417,7 @@ def api_config_history_delete(period_id):
             blocks = store.get_all_blocks()
             if blocks:
                 from energy_engine_io import load_json as _lj_del
-                cfg       = load_config()
+                cfg       = _lj_del(os.path.join(DATA_DIR, "meters_config.json"), {})
                 main_meta = {}
                 for md in cfg.get("meters", {}).values():
                     if not (md.get("meta") or {}).get("sub_meter"):
@@ -1534,52 +1461,35 @@ def api_save_config():
         # Zip current data before committing config change
         _create_backup_zip(label="pre_config_save")
 
-        # Determine if billing-significant meta changed before writing,
-        # so we know whether to create a new period or update in place.
+        save_config(data)
+        logger.info("server: meters_config.json saved (%d meters)", len(data["meters"]))
+
+        # Snapshot the new config as a config period only if billing-significant
+        # meta has changed (sensor changes, postcode etc don't need a new period)
         try:
             from block_store import config_meta_significant
-            import json as _json
             store = _get_store()
             cur_id = store.get_current_config_period_id()
             should_create = True
             if cur_id is not None:
-                old_cfg = store.config_from_db(cur_id)
-                if old_cfg.get("meters"):
+                cur_cp = store.get_config_period(cur_id)
+                if cur_cp:
+                    import json as _json
+                    old_cfg = _json.loads(cur_cp["full_config_json"])
                     if not config_meta_significant(old_cfg, data):
                         should_create = False
+                        # Still update the full_config_json snapshot in place
+                        with store._conn:
+                            store._conn.execute(
+                                "UPDATE config_periods SET full_config_json = ? WHERE id = ?",
+                                (_json.dumps(data), cur_id)
+                            )
+                        logger.info("server: config saved — no billing meta change, period unchanged")
             if should_create:
-                # New billing period — insert_config_period writes to normalised tables
                 store.insert_config_period(data, change_reason=change_reason)
-                logger.info("server: config period created (reason=%s)", change_reason or "none")
-                # Write file export (not authoritative — convenience only)
-                try:
-                    p = config_path()
-                    os.makedirs(os.path.dirname(p), exist_ok=True)
-                    tmp = p + ".tmp"
-                    with open(tmp, "w") as _f:
-                        _json.dump(data, _f, indent=2)
-                    os.replace(tmp, p)
-                except Exception as _fe:
-                    logger.warning("server: could not write meters_config.json export: %s", _fe)
-            else:
-                # No billing change — save_config updates the active period in-place
-                save_config(data)
-                logger.info("server: config saved — no billing meta change, period unchanged")
+                logger.info("server: config period snapshot created (reason=%s)", change_reason or "none")
         except Exception as _e:
-            logger.warning("server: config save failed: %s", _e)
-            # Fallback: always attempt file export so UI isn't left stale
-            try:
-                p = config_path()
-                os.makedirs(os.path.dirname(p), exist_ok=True)
-                import json as _j2
-                tmp = p + ".tmp"
-                with open(tmp, "w") as _f:
-                    _j2.dump(data, _f, indent=2)
-                os.replace(tmp, p)
-            except Exception:
-                pass
-
-        logger.info("server: config saved (%d meters)", len(data["meters"]))
+            logger.warning("server: config period snapshot failed: %s", _e)
 
         # Re-run engine_startup to pick up new sensor subscriptions
         import asyncio
@@ -1621,21 +1531,17 @@ def api_backup_list():
     try:
         zips = sorted(glob.glob(f"{SHARE_BACKUP_DIR}/backups/*.zip"), reverse=True)
         # Check for flat files from last finalise
-        primary = ["blocks.db", "meters_config.json"]
-        legacy  = ["blocks.json"]   # written by 1.x/2.0.x, no longer updated
+        known = ["blocks.db", "blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"]
         flat_files = []
-        for fname in primary + legacy:
+        for fname in known:
             fpath = f"{SHARE_BACKUP_DIR}/{fname}"
             if os.path.exists(fpath):
                 mtime = os.path.getmtime(fpath)
                 from datetime import datetime as _dt
-                entry = {
+                flat_files.append({
                     "name": fname,
-                    "modified": _dt.utcfromtimestamp(mtime).strftime("%Y-%m-%dT%H:%M:%S"),
-                }
-                if fname in legacy:
-                    entry["legacy"] = True
-                flat_files.append(entry)
+                    "modified": _dt.utcfromtimestamp(mtime).strftime("%Y-%m-%dT%H:%M:%S")
+                })
         return jsonify({
             "zips": [os.path.basename(z) for z in zips],
             "flat": flat_files
@@ -1654,7 +1560,7 @@ def api_backup_restore():
         zipname   = data.get("zip", "")
         selected  = data.get("files", None)
         from_flat = data.get("from_flat", False)
-        known     = {"blocks.db", "blocks.json", "meters_config.json"}  # current_block and cumulative_totals now in DB
+        known     = {"blocks.db", "blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"}
 
         if not from_flat:
             if not zipname or "/" in zipname or "\\" in zipname:
@@ -1722,27 +1628,11 @@ def api_backup_restore():
                     pass
             _store = None
 
-        # Run schema migration immediately after restoring a DB — handles the case
-        # where a 2.0.x blocks.db (with full_config_json blob, empty meters table)
-        # is restored. Migration must run BEFORE the config sync below so that
-        # config_from_db() has normalised data to work with.
-        if "blocks.db" in restored or "blocks.json" in restored:
-            try:
-                store_mig = _get_store()
-                n = store_mig.migrate_full_config_json()
-                if n:
-                    logger.info(
-                        "api_backup_restore: ran migrate_full_config_json — "
-                        "%d periods migrated from full_config_json", n
-                    )
-            except Exception as _mig_e:
-                logger.warning("api_backup_restore: schema migration failed: %s", _mig_e)
-
         # ── Sync meters_config.json ↔ active config period ─────────────────
         # Case 1: meters_config.json restored — update the active period in the
         #         DB to match, so billing history and the file stay in sync.
         # Case 2: blocks.db restored without meters_config.json — write the
-        #         active period's config (from normalised tables) back to meters_config.json
+        #         active period's full_config_json back to meters_config.json
         #         so the file reflects the DB state.
         try:
             import json as _json2
@@ -1751,7 +1641,7 @@ def api_backup_restore():
             store_sync = _get_store()
 
             if "meters_config.json" in restored:
-                # Case 1: file was restored — push its content into the normalised tables
+                # Case 1: file was restored — push its content into the active DB period
                 restored_cfg = _lj_sync(cfg_path, {})
                 if restored_cfg:
                     active_cp = store_sync._conn.execute(
@@ -1764,16 +1654,15 @@ def api_backup_restore():
                             if not (md.get("meta") or {}).get("sub_meter"):
                                 main_meta = md.get("meta") or {}
                                 break
-                        period_id = active_cp["id"]
-                        # Update scalar fields
                         store_sync._conn.execute(
                             """UPDATE config_periods
-                               SET billing_day     = ?,
-                                   block_minutes   = ?,
-                                   timezone        = ?,
-                                   currency_symbol = ?,
-                                   currency_code   = ?,
-                                   site_name       = ?
+                               SET billing_day       = ?,
+                                   block_minutes      = ?,
+                                   timezone           = ?,
+                                   currency_symbol    = ?,
+                                   currency_code      = ?,
+                                   site_name          = ?,
+                                   full_config_json   = ?
                                WHERE id = ?""",
                             (
                                 int(main_meta.get("billing_day") or 1),
@@ -1782,41 +1671,31 @@ def api_backup_restore():
                                 main_meta.get("currency_symbol", "£"),
                                 main_meta.get("currency_code", "GBP"),
                                 main_meta.get("site"),
-                                period_id,
+                                _json2.dumps(restored_cfg),
+                                active_cp["id"],
                             )
                         )
-                        # Rewrite normalised meter rows
-                        old_mids = [r["id"] for r in store_sync._conn.execute(
-                            "SELECT id FROM meters WHERE config_period_id=?", (period_id,)
-                        ).fetchall()]
-                        for mid in old_mids:
-                            store_sync._conn.execute(
-                                "DELETE FROM meter_channels WHERE meter_id=?", (mid,))
-                        store_sync._conn.execute(
-                            "DELETE FROM meters WHERE config_period_id=?", (period_id,))
-                        store_sync._write_meters(restored_cfg, period_id)
                         store_sync._conn.commit()
                         logger.info(
                             "api_backup_restore: active config period updated "
-                            "from restored meters_config.json"
+                            "to match restored meters_config.json"
                         )
                         restored.append("config_periods (synced from meters_config.json)")
 
             elif "blocks.db" in restored and "meters_config.json" not in restored:
                 # Case 2: DB restored without config file — write active period back to file
                 active_cp = store_sync._conn.execute(
-                    "SELECT id FROM config_periods WHERE effective_to IS NULL "
-                    "ORDER BY effective_from DESC LIMIT 1"
+                    "SELECT full_config_json FROM config_periods "
+                    "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
                 ).fetchone()
-                if active_cp:
-                    db_cfg = store_sync.config_from_db(active_cp["id"])
-                    if db_cfg.get("meters"):
-                        _sja_sync(cfg_path, db_cfg)
-                        logger.info(
-                            "api_backup_restore: meters_config.json written "
-                            "from active config period in restored DB"
-                        )
-                        restored.append("meters_config.json (synced from restored blocks.db)")
+                if active_cp and active_cp["full_config_json"]:
+                    db_cfg = _json2.loads(active_cp["full_config_json"])
+                    _sja_sync(cfg_path, db_cfg)
+                    logger.info(
+                        "api_backup_restore: meters_config.json restored "
+                        "from active config period in restored DB"
+                    )
+                    restored.append("meters_config.json (synced from restored blocks.db)")
 
         except Exception as _sync_e:
             logger.warning("api_backup_restore: config sync failed: %s", _sync_e)
@@ -1833,7 +1712,7 @@ def api_import_extract_zip():
         zf_file = request.files.get("zipfile")
         if not zf_file:
             return jsonify({"error": "No zip file provided"}), 400
-        known = {"blocks.db", "blocks.json", "meters_config.json"}
+        known = {"blocks.db", "blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"}
         files = {}
         with zipfile.ZipFile(zf_file.stream, "r") as zf:
             for name in zf.namelist():
@@ -1851,35 +1730,19 @@ def api_import_extract_zip():
 
 @app.route("/api/backup/flat-info", methods=["GET"])
 def api_backup_flat_info():
-    """Return metadata about the last-finalise flat backup files.
-
-    Primary files (written by 2.1.0+):
-      blocks.db       — the only file needed for a full restore
-      meters_config.json — convenience export
-
-    Legacy files (written by older versions, no longer updated):
-      blocks.json     — flat JSON format from 1.x/2.0.x
-    """
+    """Return metadata about the last-finalise flat backup files."""
+    known = ["blocks.db", "blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"]
     from datetime import datetime as _dt
-    # Primary files — written by current engine
-    primary = ["blocks.db", "meters_config.json"]
-    # Legacy files — may be present from older versions, no longer written
-    legacy  = ["blocks.json"]
-
     files = {}
-    for fname in primary + legacy:
+    for fname in known:
         fpath = f"{SHARE_BACKUP_DIR}/{fname}"
         if os.path.exists(fpath):
             mtime = os.path.getmtime(fpath)
             size  = os.path.getsize(fpath)
-            entry = {
+            files[fname] = {
                 "modified": _dt.utcfromtimestamp(mtime).strftime("%Y-%m-%dT%H:%M:%S UTC"),
-                "size_kb":  round(size / 1024, 1),
+                "size_kb":  round(size / 1024, 1)
             }
-            if fname in legacy:
-                entry["legacy"] = True
-                entry["note"]   = "Legacy format from v1.x/v2.0.x — no longer updated"
-            files[fname] = entry
     return jsonify(files)
 
 
@@ -1895,7 +1758,7 @@ def api_import_extract_zip_by_name():
         zip_path = f"{SHARE_BACKUP_DIR}/backups/{zipname}"
         if not os.path.exists(zip_path):
             return jsonify({"error": "Backup not found"}), 404
-        known = {"blocks.db", "blocks.json", "meters_config.json"}
+        known = {"blocks.db", "blocks.json", "current_block.json", "cumulative_totals.json", "meters_config.json"}
         files = {}
         with zipfile.ZipFile(zip_path, "r") as zf:
             for name in zf.namelist():
@@ -1919,7 +1782,7 @@ def _create_backup_zip(label="backup"):
     os.makedirs(backup_dir, exist_ok=True)
     timestamp = _dt.utcnow().strftime("%Y%m%dT%H%M%S")
     zip_path  = f"{backup_dir}/{timestamp}_{label}.zip"
-    files = ["meters_config.json"]  # current_block and cumulative_totals now in DB
+    files = ["cumulative_totals.json", "meters_config.json", "current_block.json"]
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         # Backup blocks DB using SQLite online backup API into a temp file
         import tempfile
@@ -1953,7 +1816,7 @@ def api_regenerate_charts():
         store = _get_store()
         if store.count_blocks() == 0:
             return jsonify({"error": "No blocks data available"}), 400
-        cfg       = load_config()
+        cfg       = _lj_regen(os.path.join(DATA_DIR, "meters_config.json"), {})
         main_meta = {}
         for md in cfg.get("meters", {}).values():
             if not (md.get("meta") or {}).get("sub_meter"):
@@ -2021,9 +1884,11 @@ def api_import():
                 if os.path.exists(tmp_json):
                     os.remove(tmp_json)
 
-        # Handle remaining JSON files (current_block and cumulative_totals now in DB)
+        # Handle remaining JSON files
         file_map = {
-            "meters_config": "meters_config.json",
+            "current_block":     "current_block.json",
+            "cumulative_totals": "cumulative_totals.json",
+            "meters_config":     "meters_config.json",
         }
         for field, filename in file_map.items():
             f = request.files.get(field)
@@ -2058,126 +1923,20 @@ def api_import():
 
 # ── Historical corrections ────────────────────────────────────────────────────
 
-def _corrections_time_to_utc(time_str: str, tz_name: str,
-                              anchor_date: str = "") -> str:
-    """
-    Convert a local HH:MM time string to UTC HH:MM for use in block_start TIME() filter.
-    anchor_date (YYYY-MM-DD) should be the correction date so the correct DST offset is
-    applied — e.g. a March date uses GMT, an April date uses BST.
-    Returns the original string if conversion fails.
-    """
-    if not time_str:
-        return time_str
-    try:
-        from zoneinfo import ZoneInfo
-        from datetime import datetime, timezone
-        h, m = int(time_str[:2]), int(time_str[3:5])
-        if anchor_date:
-            y, mo, d = int(anchor_date[:4]), int(anchor_date[5:7]), int(anchor_date[8:10])
-            naive = datetime(y, mo, d, h, m, 0)
-        else:
-            naive = datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
-        local_dt = naive.replace(tzinfo=ZoneInfo(tz_name))
-        utc_dt   = local_dt.astimezone(timezone.utc)
-        return utc_dt.strftime("%H:%M")
-    except Exception:
-        return time_str
-
-
-def _corrections_build_where(corr_type, from_date, to_date, channel,
-                              from_time_utc, to_time_utc, meter_id):
-    """
-    Build WHERE clause and params for corrections queries.
-
-    Date filtering uses local_date (pre-computed at insert in the configured timezone)
-    so BST blocks that fall on a different UTC calendar day are handled correctly.
-
-    Time filtering uses TIME(block_start) in UTC, with the times already converted
-    from local to UTC by _corrections_time_to_utc. When the converted window crosses
-    UTC midnight (e.g. Economy 7 00:30-07:30 BST = 23:30-06:30 UTC), the clause uses
-    OR instead of AND so blocks on both sides of midnight are included.
-    """
-    col = None
-    if corr_type == "rate":
-        col = "imp_rate" if channel == "import" else "exp_rate"
-
-    clauses = ["local_date >= ?", "local_date <= ?"]
-    params  = [from_date, to_date]
-
-    if from_time_utc and to_time_utc:
-        if from_time_utc <= to_time_utc:
-            # Normal window — entirely within one UTC day
-            clauses.append("TIME(block_start) >= ?")
-            params.append(from_time_utc)
-            clauses.append("TIME(block_start) < ?")
-            params.append(to_time_utc)
-        else:
-            # Window crosses UTC midnight (e.g. BST night rate)
-            # Select blocks OUTSIDE the gap (i.e. after from OR before to)
-            clauses.append(
-                "(TIME(block_start) >= ? OR TIME(block_start) < ?)"
-            )
-            params.extend([from_time_utc, to_time_utc])
-    elif from_time_utc:
-        clauses.append("TIME(block_start) >= ?")
-        params.append(from_time_utc)
-    elif to_time_utc:
-        clauses.append("TIME(block_start) < ?")
-        params.append(to_time_utc)
-
-    if meter_id and meter_id != "all":
-        clauses.append("meter_id = ?")
-        params.append(meter_id)
-    if col:
-        clauses.append(f"{col} IS NOT NULL")
-
-    return " AND ".join(clauses), params, col
-
-
-@app.route("/api/corrections/meters", methods=["GET"])
-def api_corrections_meters():
-    """Return distinct meter_ids present in the blocks table for the corrections UI."""
-    try:
-        store = _get_store()
-        rows = store._conn.execute(
-            "SELECT DISTINCT meter_id FROM blocks ORDER BY meter_id"
-        ).fetchall()
-        return jsonify({"meters": [r["meter_id"] for r in rows]})
-    except Exception as e:
-        logger.error("api_corrections_meters: %s", e)
-        return jsonify({"error": str(e)}), 500
-
-
 @app.route("/api/corrections/preview", methods=["POST"])
 def api_corrections_preview():
     """
-    Preview what a correction would affect — returns per-block detail for rate
-    corrections so the user can verify exactly which blocks will change.
-
-    Body: {
-      type: "standing"|"rate",
-      from_date: "YYYY-MM-DD", to_date: "YYYY-MM-DD",
-      value: float,
-      channel: "import"|"export"  (rate only),
-      from_time: "HH:MM"          (optional local time — start of window),
-      to_time:   "HH:MM"          (optional local time — end of window, exclusive),
-      meter_id:  "all"|"<meter>"  (optional — default "all")
-    }
-
-    Returns for standing: { days, blocks, current_min, current_max }
-    Returns for rate:     { blocks: [{block_start, meter_id, current_rate,
-                                       new_rate, kwh, current_cost, new_cost}] }
+    Preview what a standing-charge or rate correction would affect.
+    Body: { type: "standing"|"rate", from_date: "YYYY-MM-DD", to_date: "YYYY-MM-DD",
+            value: float, channel: "import"|"export" (rate only) }
+    Returns: { days: int, blocks: int, current_min: float, current_max: float }
     """
     try:
         data       = request.get_json(force=True) or {}
-        corr_type  = data.get("type")
+        corr_type  = data.get("type")          # "standing" or "rate"
         from_date  = data.get("from_date", "")
         to_date    = data.get("to_date", "")
-        channel    = data.get("channel", "import")
-        from_time  = data.get("from_time", "")   # local HH:MM
-        to_time    = data.get("to_time", "")     # local HH:MM
-        meter_id   = data.get("meter_id", "all")
-        value      = data.get("value")
+        channel    = data.get("channel", "import")  # for rate corrections
 
         if corr_type not in ("standing", "rate"):
             return jsonify({"error": "type must be 'standing' or 'rate'"}), 400
@@ -2185,83 +1944,37 @@ def api_corrections_preview():
             return jsonify({"error": "from_date and to_date required"}), 400
 
         store = _get_store()
-        cfg   = load_config()
-        main_meta = {}
-        for md in cfg.get("meters", {}).values():
-            if not (md.get("meta") or {}).get("sub_meter"):
-                main_meta = md.get("meta") or {}
-                break
-        tz_name = main_meta.get("timezone", "UTC")
-
-        # Use from_date as DST anchor so March/BST offsets are correct
-        from_time_utc = _corrections_time_to_utc(from_time, tz_name, from_date) if from_time else ""
-        to_time_utc   = _corrections_time_to_utc(to_time,   tz_name, from_date) if to_time   else ""
-
-        where, params, col = _corrections_build_where(
-            corr_type, from_date, to_date, channel,
-            from_time_utc, to_time_utc, meter_id
-        )
 
         if corr_type == "standing":
             cur = store._conn.execute(
-                f"""SELECT COUNT(DISTINCT local_date) as days,
+                """SELECT COUNT(DISTINCT local_date) as days,
                           COUNT(*) as blocks,
                           MIN(standing_charge) as cur_min,
                           MAX(standing_charge) as cur_max
-                   FROM blocks WHERE {where}""",
-                params
+                   FROM blocks
+                   WHERE local_date >= ? AND local_date <= ?""",
+                (from_date, to_date)
             )
-            row = cur.fetchone()
-            return jsonify({
-                "days":        row["days"]    or 0,
-                "blocks":      row["blocks"]  or 0,
-                "current_min": round(float(row["cur_min"] or 0), 6),
-                "current_max": round(float(row["cur_max"] or 0), 6),
-            })
-
-        else:  # rate — return per-block detail
-            kwh_col  = "imp_kwh"  if channel == "import" else "exp_kwh"
-            cost_col = "imp_cost" if channel == "import" else "exp_cost"
+        else:
+            col = "imp_rate" if channel == "import" else "exp_rate"
             cur = store._conn.execute(
-                f"""SELECT block_start, meter_id, {col} as current_rate,
-                           {kwh_col} as kwh, {cost_col} as current_cost
-                    FROM blocks WHERE {where}
-                    ORDER BY block_start, meter_id""",
-                params
+                f"""SELECT COUNT(DISTINCT local_date) as days,
+                           COUNT(*) as blocks,
+                           MIN({col}) as cur_min,
+                           MAX({col}) as cur_max
+                    FROM blocks
+                    WHERE local_date >= ? AND local_date <= ?
+                      AND {col} IS NOT NULL""",
+                (from_date, to_date)
             )
-            rows = cur.fetchall()
 
-            # Convert block_start UTC → local for display
-            from zoneinfo import ZoneInfo
-            from datetime import datetime, timezone as _tz
-            tz = ZoneInfo(tz_name)
-
-            blocks_out = []
-            for r in rows:
-                cur_rate = float(r["current_rate"] or 0)
-                kwh      = float(r["kwh"] or 0)
-                cur_cost = float(r["current_cost"] or 0)
-                try:
-                    utc_dt   = datetime.fromisoformat(r["block_start"]).replace(tzinfo=_tz.utc)
-                    local_dt = utc_dt.astimezone(tz)
-                    display  = local_dt.strftime("%d/%m %H:%M")
-                except Exception:
-                    display = r["block_start"]
-
-                new_cost = round(kwh * float(value), 6) if value is not None else None
-                blocks_out.append({
-                    "block_start":   r["block_start"],
-                    "display":       display,
-                    "meter_id":      r["meter_id"],
-                    "current_rate":  round(cur_rate, 6),
-                    "new_rate":      float(value) if value is not None else None,
-                    "kwh":           round(kwh, 6),
-                    "current_cost":  round(cur_cost, 6),
-                    "new_cost":      new_cost,
-                })
-
-            return jsonify({"blocks": blocks_out})
-
+        row = cur.fetchone()
+        return jsonify({
+            "days":        row["days"]    or 0,
+            "blocks":      row["blocks"]  or 0,
+            "current_min": row["cur_min"] or 0,
+            "current_max": row["cur_max"] or 0,
+        })
     except Exception as e:
         logger.error("api_corrections_preview: %s", e)
         return jsonify({"error": str(e)}), 500
@@ -2271,16 +1984,9 @@ def api_corrections_preview():
 def api_corrections_apply():
     """
     Apply a standing-charge or rate correction to the live database.
-    Body: {
-      type: "standing"|"rate",
-      from_date: "YYYY-MM-DD", to_date: "YYYY-MM-DD",
-      value: float,
-      channel: "import"|"export"  (rate only),
-      recalc_cost: bool           (rate only — recalculate cost from rate × kwh),
-      from_time: "HH:MM"          (optional local time — start of window),
-      to_time:   "HH:MM"          (optional local time — end of window, exclusive),
-      meter_id:  "all"|"<meter>"  (optional — default "all")
-    }
+    Body: { type: "standing"|"rate", from_date: "YYYY-MM-DD", to_date: "YYYY-MM-DD",
+            value: float, channel: "import"|"export" (rate only),
+            recalc_cost: bool (rate only — recalculate imp_cost from rate × kwh) }
     Returns: { updated_blocks: int }
     """
     try:
@@ -2291,9 +1997,6 @@ def api_corrections_apply():
         value       = data.get("value")
         channel     = data.get("channel", "import")
         recalc_cost = bool(data.get("recalc_cost", True))
-        from_time   = data.get("from_time", "")
-        to_time     = data.get("to_time", "")
-        meter_id    = data.get("meter_id", "all")
 
         if corr_type not in ("standing", "rate"):
             return jsonify({"error": "type must be 'standing' or 'rate'"}), 400
@@ -2307,60 +2010,55 @@ def api_corrections_apply():
             return jsonify({"error": "value must be >= 0"}), 400
 
         store = _get_store()
-        cfg   = load_config()
-        main_meta = {}
-        for md in cfg.get("meters", {}).values():
-            if not (md.get("meta") or {}).get("sub_meter"):
-                main_meta = md.get("meta") or {}
-                break
-        tz_name = main_meta.get("timezone", "UTC")
-
-        # Use from_date as DST anchor so March/BST offsets are correct
-        from_time_utc = _corrections_time_to_utc(from_time, tz_name, from_date) if from_time else ""
-        to_time_utc   = _corrections_time_to_utc(to_time,   tz_name, from_date) if to_time   else ""
-
-        where, params, col = _corrections_build_where(
-            corr_type, from_date, to_date, channel,
-            from_time_utc, to_time_utc, meter_id
-        )
 
         if corr_type == "standing":
             cur = store._conn.execute(
-                f"UPDATE blocks SET standing_charge = ? WHERE {where}",
-                [value] + params
+                """UPDATE blocks SET standing_charge = ?
+                   WHERE local_date >= ? AND local_date <= ?""",
+                (value, from_date, to_date)
             )
             store._conn.commit()
             updated = cur.rowcount
             logger.info(
-                "api_corrections_apply: standing_charge=%.4f %d blocks (%s %s→%s %s→%s)",
-                value, updated, meter_id, from_date, to_date,
-                from_time or "00:00", to_time or "24:00"
+                "api_corrections_apply: standing_charge set to %.4f "
+                "for %d blocks (%s → %s)", value, updated, from_date, to_date
             )
 
         else:  # rate correction
-            kwh_col = "imp_kwh" if channel == "import" else "exp_kwh"
-            if recalc_cost:
-                cost_col = "imp_cost" if channel == "import" else "exp_cost"
-                cur = store._conn.execute(
-                    f"""UPDATE blocks
-                        SET {col} = ?,
-                            {cost_col} = ROUND({kwh_col} * ?, 6)
-                        WHERE {where}""",
-                    [value, value] + params
-                )
-            else:
-                cur = store._conn.execute(
-                    f"UPDATE blocks SET {col} = ? WHERE {where}",
-                    [value] + params
-                )
-            store._conn.commit()
-            updated = cur.rowcount
-            logger.info(
-                "api_corrections_apply: %s %s_rate=%.6f recalc=%s %d blocks (%s %s→%s %s→%s)",
-                meter_id, channel, value, recalc_cost, updated,
-                meter_id, from_date, to_date,
-                from_time or "00:00", to_time or "24:00"
-            )
+            if channel == "import":
+                if recalc_cost:
+                    cur = store._conn.execute(
+                        """UPDATE blocks
+                           SET imp_rate = ?,
+                               imp_cost = ROUND(imp_kwh * ?, 6)
+                           WHERE local_date >= ? AND local_date <= ?
+                             AND imp_rate IS NOT NULL""",
+                        (value, value, from_date, to_date)
+                    )
+                else:
+                    cur = store._conn.execute(
+                        """UPDATE blocks SET imp_rate = ?
+                           WHERE local_date >= ? AND local_date <= ?
+                             AND imp_rate IS NOT NULL""",
+                        (value, from_date, to_date)
+                    )
+            else:  # export
+                if recalc_cost:
+                    cur = store._conn.execute(
+                        """UPDATE blocks
+                           SET exp_rate = ?,
+                               exp_cost = ROUND(exp_kwh * ?, 6)
+                           WHERE local_date >= ? AND local_date <= ?
+                             AND exp_rate IS NOT NULL""",
+                        (value, value, from_date, to_date)
+                    )
+                else:
+                    cur = store._conn.execute(
+                        """UPDATE blocks SET exp_rate = ?
+                           WHERE local_date >= ? AND local_date <= ?
+                             AND exp_rate IS NOT NULL""",
+                        (value, from_date, to_date)
+                    )
             store._conn.commit()
             updated = cur.rowcount
             logger.info(

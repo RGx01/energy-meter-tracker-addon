@@ -16,17 +16,7 @@ sys.modules.setdefault("energy_engine_io", eio)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from block_store import BlockStore
-
-# Always import the real energy_charts — not a stub that another test suite
-# may have injected into sys.modules when running combined test discovery.
-import importlib
-_ec_spec = importlib.util.spec_from_file_location(
-    "energy_charts_real",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "energy_charts.py")
-)
-_ec_mod = importlib.util.module_from_spec(_ec_spec)
-_ec_spec.loader.exec_module(_ec_mod)
-ec = _ec_mod
+import energy_charts as ec
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -35,10 +25,14 @@ TZ = ZoneInfo("Europe/London")
 
 def make_store():
     store = BlockStore(":memory:")
-    store.insert_config_period({"meters": {"electricity_main": {"meta": {
-        "billing_day": 15, "block_minutes": 30, "timezone": "Europe/London",
-        "currency_symbol": "£", "currency_code": "GBP", "site": "Home",
-    }}}})
+    store._conn.execute("""
+        INSERT INTO config_periods
+        (effective_from, effective_to, billing_day, block_minutes, timezone,
+         currency_symbol, currency_code, site_name, change_reason, full_config_json)
+        VALUES ('2026-01-01T00:00:00', NULL, 15, 30, 'Europe/London',
+                '£', 'GBP', 'Home', NULL, '{}')
+    """)
+    store._conn.commit()
     return store, store._conn.execute(
         "SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
 

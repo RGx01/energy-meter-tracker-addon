@@ -3,8 +3,8 @@
 {% block topbar %}
 <div class="topbar">
   <div>
-    <h2>Data Management</h2>
-    <div class="sub">Backups, restore, imports and historical corrections</div>
+    <h2>Import &amp; Backup</h2>
+    <div class="sub">Restore from a backup or migrate data from a previous install</div>
   </div>
   <div style="display:flex;gap:8px;">
     <button class="btn btn-secondary" id="btn-backup" onclick="doManualBackup()">💾 Backup Now</button>
@@ -34,7 +34,8 @@
       <div id="restore-file-list" style="margin-bottom:16px;"></div>
 
       <div id="restore-mismatch-warn" style="display:none;background:rgba(240,82,82,0.08);border:1px solid var(--danger);border-radius:var(--radius);padding:12px 14px;margin-bottom:16px;font-size:13px;line-height:1.7;color:var(--danger);">
-        ℹ️ <strong>Note:</strong> <code>blocks.db</code> contains all data including config — restoring it alone is safe and complete.
+        ⚠️ <strong>Mismatch risk:</strong> restoring <code>blocks.db</code> without <code>meters_config.json</code>
+        (or vice versa) may cause calculation errors if meter IDs have changed between backups.
       </div>
 
       <div style="display:flex;gap:10px;justify-content:flex-end;">
@@ -61,7 +62,8 @@
 <div class="card">
   <div class="card-title">📥 Import Data Files</div>
   <p style="color:var(--muted);font-size:13px;margin-bottom:20px;line-height:1.7;">
-    Drag in a <strong>backup zip</strong> or <strong>blocks.db</strong> file to restore data.
+    Drag in a <strong>backup zip</strong> or individual <strong>JSON files</strong> to restore data.
+    You can remove files you don't want to import before confirming.
     <strong style="color:var(--warning);">Warning:</strong> importing will overwrite existing data.
   </p>
 
@@ -76,8 +78,8 @@
   " ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)" onclick="document.getElementById('file-input').click()">
     <div style="font-size:32px;margin-bottom:8px;">📂</div>
     <div style="color:var(--text);font-size:14px;margin-bottom:4px;">Drop a backup zip or JSON files here, or click to browse</div>
-    <div style="color:var(--muted);font-size:12px;">Accepts .zip backup archives or blocks.db</div>
-    <input type="file" id="file-input" multiple accept=".zip,.db,.json" style="display:none" onchange="onFileSelect(this.files)">
+    <div style="color:var(--muted);font-size:12px;">Accepts .zip backup archives, blocks.db, or individual .json files</div>
+    <input type="file" id="file-input" multiple accept=".json,.zip,.db" style="display:none" onchange="onFileSelect(this.files)">
   </div>
 
   <div id="file-list" style="margin-bottom:20px;display:none;">
@@ -104,111 +106,33 @@
     <tbody>
       <tr style="border-bottom:1px solid var(--border);">
         <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">blocks.db</td>
-        <td style="padding:10px 0;color:var(--text);">Everything — blocks, config history, current block state. This is the only file you need to back up or restore.</td>
-        <td style="padding:10px 0;color:var(--success);font-size:12px;">Safe alone — self-contained</td>
+        <td style="padding:10px 0;color:var(--text);">All finalised blocks (SQLite). Legacy blocks.json also accepted.</td>
+        <td style="padding:10px 0;color:var(--warning);font-size:12px;">Restore with config together</td>
       </tr>
       <tr style="border-bottom:1px solid var(--border);">
-        <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">blocks.json</td>
-        <td style="padding:10px 0;color:var(--text);">Legacy flat-file format from v1.x. Migrated automatically on import.</td>
-        <td style="padding:10px 0;color:var(--warning);font-size:12px;">Legacy — use blocks.db instead</td>
+        <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">current_block.json</td>
+        <td style="padding:10px 0;color:var(--text);">Rolling buffer for current half-hour</td>
+        <td style="padding:10px 0;color:var(--success);font-size:12px;">Safe alone</td>
+      </tr>
+      <tr style="border-bottom:1px solid var(--border);">
+        <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">cumulative_totals.json</td>
+        <td style="padding:10px 0;color:var(--text);">Running totals for HA sensors</td>
+        <td style="padding:10px 0;color:var(--success);font-size:12px;">Safe alone</td>
       </tr>
       <tr>
         <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">meters_config.json</td>
-        <td style="padding:10px 0;color:var(--text);">Human-readable config export. Authoritative config is inside blocks.db — this file is written for reference only.</td>
-        <td style="padding:10px 0;color:var(--muted);font-size:12px;">Export only — not required</td>
+        <td style="padding:10px 0;color:var(--text);">Meter and channel configuration</td>
+        <td style="padding:10px 0;color:var(--warning);font-size:12px;">Restore with blocks together</td>
       </tr>
     </tbody>
   </table>
-</div>
-
-<!-- ── Historical Corrections ───────────────────────────────────────────── -->
-<div class="card">
-  <div class="card-title">🔧 Historical Corrections</div>
-  <div style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.7;">
-    Correct standing charges or tariff rates for specific blocks in the live database.
-    Rate corrections show a per-block preview before applying so you can verify exactly
-    which blocks will change. Always operates on the live <code style="font-family:var(--mono);font-size:12px;">blocks.db</code>.
-  </div>
-
-  <!-- Type -->
-  <div style="margin-bottom:14px;">
-    <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:6px;">Correction type</label>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;">
-      <button id="corr-type-standing" class="btn btn-primary" onclick="corrSetType('standing')" style="font-size:12px;">Standing Charge</button>
-      <button id="corr-type-rate-imp" class="btn" onclick="corrSetType('rate-import')" style="font-size:12px;">Import Rate</button>
-      <button id="corr-type-rate-exp" class="btn" onclick="corrSetType('rate-export')" style="font-size:12px;">Export Rate</button>
-    </div>
-  </div>
-
-  <!-- Date range -->
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;">
-    <div>
-      <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">From date (local)</label>
-      <input id="corr-from" type="date" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;font-family:inherit;">
-    </div>
-    <div>
-      <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">To date (local, inclusive)</label>
-      <input id="corr-to" type="date" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;font-family:inherit;">
-    </div>
-  </div>
-
-  <!-- Time window (rate only) -->
-  <div id="corr-time-row" style="display:none;margin-bottom:14px;">
-    <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:6px;">
-      Time window <span style="font-weight:400;">(local time — leave blank to apply all day)</span>
-    </label>
-    <div style="display:flex;gap:8px;align-items:center;">
-      <input id="corr-from-time" type="time" placeholder="00:00"
-        style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;font-family:inherit;">
-      <span style="color:var(--muted);font-size:13px;">to</span>
-      <input id="corr-to-time" type="time" placeholder="24:00"
-        style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;font-family:inherit;">
-      <span style="font-size:11px;color:var(--muted);">end is exclusive</span>
-    </div>
-    <div style="font-size:11px;color:var(--muted);margin-top:4px;">
-      Useful for mid-day tariff changes or time-of-use rates (e.g. Economy 7 00:30–07:30).
-    </div>
-  </div>
-
-  <!-- Meter selector (rate only) -->
-  <div id="corr-meter-row" style="display:none;margin-bottom:14px;">
-    <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">Meter</label>
-    <select id="corr-meter"
-      style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;font-family:inherit;min-width:200px;">
-      <option value="all">All meters</option>
-    </select>
-  </div>
-
-  <!-- Value -->
-  <div style="margin-bottom:14px;">
-    <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;" id="corr-value-label">New standing charge (£/day)</label>
-    <input id="corr-value" type="number" min="0" step="0.000001" placeholder="e.g. 0.245000"
-      style="width:200px;box-sizing:border-box;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;font-family:inherit;">
-  </div>
-
-  <!-- Recalc cost (rate only) -->
-  <div id="corr-recalc-row" style="display:none;margin-bottom:14px;">
-    <label style="font-size:12px;font-weight:600;color:var(--muted);display:flex;align-items:center;gap:8px;cursor:pointer;">
-      <input id="corr-recalc" type="checkbox" checked> Recalculate cost from corrected rate × kWh
-    </label>
-    <div style="font-size:11px;color:var(--muted);margin-top:4px;">Uncheck to update the rate value only without changing cost figures.</div>
-  </div>
-
-  <!-- Actions -->
-  <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
-    <button class="btn" onclick="corrPreview()" style="font-size:13px;">🔍 Preview</button>
-    <button class="btn" id="corr-apply-btn" onclick="corrApply()" style="font-size:13px;color:var(--danger);border-color:var(--danger);display:none;">✓ Apply correction</button>
-  </div>
-
-  <div id="corr-preview" style="display:none;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px 16px;font-size:13px;margin-bottom:12px;"></div>
-  <div id="corr-result"  style="display:none;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px 16px;font-size:13px;"></div>
 </div>
 
 {% endblock %}
 
 {% block scripts %}
 <script>
-const KNOWN_FILES = ['blocks.db','blocks.json','meters_config.json'];
+const KNOWN_FILES = ['blocks.db','blocks.json','current_block.json','cumulative_totals.json','meters_config.json'];
 let selectedFiles = {};
 let _restoreZip   = null;
 let _restoreFlat  = false;
@@ -305,9 +229,11 @@ async function doImport() {
   hideAlerts();
   const form = new FormData();
   const fieldMap = {
-    'blocks.db':    'blocks',   // current format
-    'blocks.json':  'blocks',   // legacy format — server migrates automatically
-    'meters_config.json': 'meters_config',  // convenience export — optional
+    'blocks.db':              'blocks',   // current format
+    'blocks.json':            'blocks',   // legacy format — server migrates automatically
+    'current_block.json':     'current_block',
+    'cumulative_totals.json': 'cumulative_totals',
+    'meters_config.json':     'meters_config',
   };
 
   let hasKnown = false;
@@ -356,11 +282,11 @@ async function restoreFromFlat() {
     });
 
     var riskMap = {
-      'blocks.db':              { risk: 'success', note: 'Safe to restore alone — contains all data' },
+      'blocks.db':              { risk: 'warning', note: 'Restore with meters_config.json for safety' },
       'blocks.json':            { risk: 'warning', note: 'Legacy format — will be migrated to blocks.db on restore' },
-      'meters_config.json':     { risk: 'muted',   note: 'Config export only — not required' },
-      'current_block.json':     { risk: 'muted',   note: 'No longer used — will be ignored (state is now in blocks.db)' },
-      'cumulative_totals.json': { risk: 'muted',   note: 'No longer used — will be ignored (totals derived from blocks)' },
+      'current_block.json':     { risk: 'success', note: 'Safe to restore alone' },
+      'cumulative_totals.json': { risk: 'success', note: 'Safe to restore alone' },
+      'meters_config.json':     { risk: 'warning', note: 'Restore with blocks.db for safety' },
     };
 
     var listEl = document.getElementById('restore-file-list');
@@ -369,9 +295,8 @@ async function restoreFromFlat() {
       var risk = riskMap[name] || { risk: 'muted', note: '' };
       return '<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;' +
              'background:var(--bg);border-radius:var(--radius);border:1px solid var(--border);margin-bottom:6px;cursor:pointer;">' +
-        '<input type="checkbox" class="restore-cb" data-file="' + name + '"' +
-               ((['current_block.json','cumulative_totals.json'].includes(name)) ? '' : ' checked') +
-               ' style="margin-top:2px;width:15px;height:15px;accent-color:var(--accent);" ' +
+        '<input type="checkbox" class="restore-cb" data-file="' + name + '" checked ' +
+               'style="margin-top:2px;width:15px;height:15px;accent-color:var(--accent);" ' +
                'onchange="checkRestoreMismatch()">' +
         '<div>' +
           '<div style="font-family:var(--mono);font-size:13px;">' + name + '</div>' +
@@ -414,11 +339,10 @@ async function restoreFromZip(zipName) {
 
   // Build checkbox list
   const riskMap = {
-    'blocks.db':              { risk: 'success', note: 'Safe to restore alone — contains all data' },
-    'blocks.json':            { risk: 'warning', note: 'Legacy format — will be migrated to blocks.db on restore' },
-    'meters_config.json':     { risk: 'muted',   note: 'Config export only — not required' },
-    'current_block.json':     { risk: 'muted',   note: 'No longer used — will be ignored (state is now in blocks.db)' },
-    'cumulative_totals.json': { risk: 'muted',   note: 'No longer used — will be ignored (totals derived from blocks)' },
+    'blocks.json':            { risk: 'warning', note: 'Restore with meters_config.json for safety' },
+    'current_block.json':     { risk: 'success', note: 'Safe to restore alone' },
+    'cumulative_totals.json': { risk: 'success', note: 'Safe to restore alone' },
+    'meters_config.json':     { risk: 'warning', note: 'Restore with blocks.json for safety' },
   };
 
   const listEl = document.getElementById('restore-file-list');
@@ -427,8 +351,7 @@ async function restoreFromZip(zipName) {
     return `<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;
                            background:var(--bg);border-radius:var(--radius);
                            border:1px solid var(--border);margin-bottom:6px;cursor:pointer;">
-      <input type="checkbox" class="restore-cb" data-file="${name}"
-             ${(['current_block.json','cumulative_totals.json'].includes(name)) ? '' : 'checked'}
+      <input type="checkbox" class="restore-cb" data-file="${name}" checked
              style="margin-top:2px;width:15px;height:15px;accent-color:var(--accent);"
              onchange="checkRestoreMismatch()">
       <div>
@@ -444,8 +367,11 @@ async function restoreFromZip(zipName) {
 
 function checkRestoreMismatch() {
   const checked = Array.from(document.querySelectorAll('.restore-cb:checked')).map(function(cb) { return cb.dataset.file; });
-  // blocks.db is self-contained — no mismatch risk between files
-  document.getElementById('restore-mismatch-warn').style.display = 'none';
+  const hasBlocks = checked.includes('blocks.json');
+  const hasConfig = checked.includes('meters_config.json');
+  const warn = document.getElementById('restore-mismatch-warn');
+  // Show warning if one is selected without the other
+  warn.style.display = (hasBlocks !== hasConfig) ? 'block' : 'none';
   document.getElementById('restore-confirm-btn').disabled = checked.length === 0;
 }
 
@@ -519,12 +445,10 @@ async function loadBackupList() {
     var html = '';
 
     // ── Last finalise flat files ──
-    var flat    = data.flat || [];
-    var primary = flat.filter(function(f) { return !f.legacy; });
-    var legacyFiles = flat.filter(function(f) { return f.legacy; });
-
-    if (primary.length > 0) {
-      var latestMod = primary.reduce(function(latest, f) {
+    var flat = data.flat || [];
+    if (flat.length > 0) {
+      // Find the most recent modified timestamp
+      var latestMod = flat.reduce(function(latest, f) {
         return f.modified > latest ? f.modified : latest;
       }, '');
       html += '<div style="margin-bottom:16px;">' +
@@ -535,34 +459,9 @@ async function loadBackupList() {
         '<div>' +
           '<div style="font-size:13px;font-weight:500;">Block finalise snapshot</div>' +
           '<div style="font-size:11px;color:var(--muted);margin-top:2px;">Last updated: ' + latestMod + '</div>' +
-          '<div style="font-size:11px;color:var(--muted);">Contains: ' + primary.map(function(f){return f.name;}).join(', ') + '</div>' +
+          '<div style="font-size:11px;color:var(--muted);">Contains: ' + flat.map(function(f){return f.name;}).join(', ') + '</div>' +
         '</div>' +
         '<button class="btn btn-secondary btn-sm" onclick="restoreFromFlat()">↩ Restore</button>' +
-        '</div>';
-      if (legacyFiles.length > 0) {
-        html += '<div style="margin-top:6px;padding:6px 10px;font-size:11px;color:var(--muted);' +
-          'background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);">' +
-          '⚠ Also present (legacy, no longer updated): ' +
-          legacyFiles.map(function(f) { return f.name; }).join(', ') +
-          ' — these are from a previous version and can be deleted from <code>/share/energy_meter_tracker_backup/</code>' +
-          '</div>';
-      }
-      html += '</div>';
-    } else if (legacyFiles.length > 0) {
-      // Only legacy files present — show with restore option but warn clearly
-      html += '<div style="margin-bottom:16px;">' +
-        '<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;' +
-        'color:var(--muted);margin-bottom:8px;">Last Finalise Backup</div>' +
-        '<div style="padding:10px 12px;background:var(--bg);border-radius:var(--radius);border:1px solid var(--border);">' +
-          '<div style="font-size:13px;font-weight:500;color:var(--warning);">Legacy backup files only</div>' +
-          '<div style="font-size:11px;color:var(--muted);margin-top:4px;">Contains: ' +
-          legacyFiles.map(function(f) { return f.name; }).join(', ') + '</div>' +
-          '<div style="font-size:11px;color:var(--muted);margin-top:2px;">' +
-          'These are from v1.x or v2.0.x. A new <code>blocks.db</code> snapshot will appear here after the next block finalise.' +
-          '</div>' +
-          '<div style="margin-top:8px;">' +
-          '<button class="btn btn-secondary btn-sm" onclick="restoreFromFlat()">↩ Restore legacy files</button>' +
-          '</div>' +
         '</div></div>';
     }
 
@@ -604,8 +503,7 @@ function showError(msg) {
 
 document.addEventListener('DOMContentLoaded', function() {
   loadBackupList();
-  corrLoadMeters();
-  // Update backup path display
+  // Update backup path display to reflect actual path (supervised vs standalone)
   fetch(apiUrl('/api/backup/info'))
     .then(function(r) { return r.json(); })
     .then(function(data) {
@@ -613,232 +511,6 @@ document.addEventListener('DOMContentLoaded', function() {
       if (el && data.backup_dir) el.textContent = data.backup_dir + '/backups/';
     })
     .catch(function() {});
-  // Load currency symbol for corrections labels
-  fetch(apiUrl('/api/config'))
-    .then(function(r) { return r.json(); })
-    .then(function(cfg) {
-      var sym = '£';
-      Object.values(cfg.meters || {}).forEach(function(m) {
-        if (!(m.meta || {}).sub_meter && (m.meta || {}).currency_symbol)
-          sym = m.meta.currency_symbol;
-      });
-      window._corrSym = sym;
-      corrSetType('standing');  // re-render labels with correct symbol
-    })
-    .catch(function() {});
 });
-
-function escHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-// ── Historical Corrections ─────────────────────────────────────────────────
-var _corrType = 'standing';
-
-function corrSetType(t) {
-  _corrType = t;
-  var isRate = t !== 'standing';
-  var sym = window._corrSym || '£';
-  var labels = {
-    'standing':    'New standing charge (' + sym + '/day)',
-    'rate-import': 'New import rate (' + sym + '/kWh)',
-    'rate-export': 'New export rate (' + sym + '/kWh)',
-  };
-  document.getElementById('corr-value-label').textContent = labels[t] || '';
-  document.getElementById('corr-recalc-row').style.display  = isRate ? '' : 'none';
-  document.getElementById('corr-time-row').style.display    = isRate ? '' : 'none';
-  document.getElementById('corr-meter-row').style.display   = isRate ? '' : 'none';
-  ['corr-type-standing','corr-type-rate-imp','corr-type-rate-exp'].forEach(function(id) {
-    document.getElementById(id).className = 'btn';
-  });
-  var active = t === 'standing' ? 'corr-type-standing' : t === 'rate-import' ? 'corr-type-rate-imp' : 'corr-type-rate-exp';
-  document.getElementById(active).className = 'btn btn-primary';
-  document.getElementById('corr-preview').style.display  = 'none';
-  document.getElementById('corr-result').style.display   = 'none';
-  document.getElementById('corr-apply-btn').style.display = 'none';
-}
-
-function corrLoadMeters() {
-  fetch(apiUrl('/api/corrections/meters'))
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      var sel = document.getElementById('corr-meter');
-      var existing = Array.from(sel.options).map(function(o) { return o.value; });
-      (d.meters || []).forEach(function(m) {
-        if (!existing.includes(m)) {
-          var opt = document.createElement('option');
-          opt.value = m; opt.textContent = m;
-          sel.appendChild(opt);
-        }
-      });
-    })
-    .catch(function() {});
-}
-
-function corrPreview() {
-  var from      = document.getElementById('corr-from').value;
-  var to        = document.getElementById('corr-to').value;
-  var value     = document.getElementById('corr-value').value;
-  var fromTime  = _corrType !== 'standing' ? document.getElementById('corr-from-time').value : '';
-  var toTime    = _corrType !== 'standing' ? document.getElementById('corr-to-time').value   : '';
-  var meterId   = _corrType !== 'standing' ? document.getElementById('corr-meter').value      : 'all';
-  var prev      = document.getElementById('corr-preview');
-  var applyBtn  = document.getElementById('corr-apply-btn');
-
-  if (!from || !to || !value) { alert('Please fill in date range and new value.'); return; }
-  if (from > to) { alert('From date must be on or before To date.'); return; }
-
-  prev.style.display = 'block';
-  prev.innerHTML = '<span style="color:var(--muted);">Checking…</span>';
-  applyBtn.style.display = 'none';
-
-  var body = {
-    type:      _corrType === 'standing' ? 'standing' : 'rate',
-    from_date: from, to_date: to, value: parseFloat(value),
-    channel:   _corrType === 'rate-export' ? 'export' : 'import',
-    from_time: fromTime, to_time: toTime, meter_id: meterId,
-  };
-
-  fetch(apiUrl('/api/corrections/preview'), {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(body),
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    if (d.error) {
-      prev.innerHTML = '<span style="color:var(--danger);">' + escHtml(d.error) + '</span>';
-      return;
-    }
-
-    if (_corrType === 'standing') {
-      // Summary view for standing charge
-      if (!d.blocks) {
-        prev.innerHTML = '<span style="color:var(--muted);">No blocks found in that date range.</span>';
-        return;
-      }
-      var curRange = d.current_min === d.current_max
-        ? d.current_min.toFixed(4)
-        : d.current_min.toFixed(4) + ' – ' + d.current_max.toFixed(4);
-      prev.innerHTML =
-        '<strong>' + d.blocks.toLocaleString() + ' blocks</strong> across <strong>' +
-        d.days + ' local days</strong> will be updated.<br>' +
-        'Current standing charge: <strong>' + curRange + '</strong> → ' +
-        'New value: <strong>' + parseFloat(value).toFixed(4) + '</strong>';
-      applyBtn.style.display = '';
-      return;
-    }
-
-    // Per-block detail view for rate corrections
-    var blocks = d.blocks || [];
-    if (blocks.length === 0) {
-      prev.innerHTML = '<span style="color:var(--muted);">No blocks found matching those filters.</span>';
-      return;
-    }
-
-    var newVal = parseFloat(value);
-    var totalCurCost = 0, totalNewCost = 0;
-    blocks.forEach(function(b) { totalCurCost += b.current_cost; totalNewCost += b.new_cost; });
-
-    var sym = window._corrSym || '£';
-    var rows = blocks.map(function(b) {
-      var costChange = b.new_cost - b.current_cost;
-      var changeCol  = costChange >= 0 ? 'var(--danger)' : 'var(--success)';
-      var changeSign = costChange >= 0 ? '+' : '';
-      return '<tr style="border-bottom:1px solid var(--border);">' +
-        '<td style="padding:5px 8px;font-family:var(--mono);font-size:12px;">' + escHtml(b.display) + '</td>' +
-        '<td style="padding:5px 8px;font-size:12px;">' + escHtml(b.meter_id) + '</td>' +
-        '<td style="padding:5px 8px;text-align:right;font-size:12px;">' + b.kwh.toFixed(4) + '</td>' +
-        '<td style="padding:5px 8px;text-align:right;font-size:12px;">' + b.current_rate.toFixed(6) + '</td>' +
-        '<td style="padding:5px 8px;text-align:right;font-size:12px;color:var(--accent);">' + newVal.toFixed(6) + '</td>' +
-        '<td style="padding:5px 8px;text-align:right;font-size:12px;">' + sym + b.current_cost.toFixed(4) + '</td>' +
-        '<td style="padding:5px 8px;text-align:right;font-size:12px;">' + sym + b.new_cost.toFixed(4) + '</td>' +
-        '<td style="padding:5px 8px;text-align:right;font-size:12px;color:' + changeCol + ';">' + changeSign + sym + Math.abs(costChange).toFixed(4) + '</td>' +
-        '</tr>';
-    }).join('');
-
-    var totalChange = totalNewCost - totalCurCost;
-    var totalSign   = totalChange >= 0 ? '+' : '';
-    var totalCol    = totalChange >= 0 ? 'var(--danger)' : 'var(--success)';
-
-    var needsScroll = blocks.length > 10;
-    prev.innerHTML =
-      '<div style="margin-bottom:10px;font-size:13px;">' +
-        '<strong>' + blocks.length + ' blocks</strong> will be updated. ' +
-        'Total cost change: <span style="color:' + totalCol + ';font-weight:600;">' +
-        totalSign + sym + Math.abs(totalChange).toFixed(4) + '</span>' +
-      '</div>' +
-      '<div style="' + (needsScroll ? 'max-height:300px;overflow-y:auto;' : '') + '">' +
-      '<table style="width:100%;border-collapse:collapse;">' +
-        '<thead><tr style="border-bottom:2px solid var(--border);">' +
-          '<th style="text-align:left;padding:5px 8px;font-size:11px;color:var(--muted);font-weight:600;">Block</th>' +
-          '<th style="text-align:left;padding:5px 8px;font-size:11px;color:var(--muted);font-weight:600;">Meter</th>' +
-          '<th style="text-align:right;padding:5px 8px;font-size:11px;color:var(--muted);font-weight:600;">kWh</th>' +
-          '<th style="text-align:right;padding:5px 8px;font-size:11px;color:var(--muted);font-weight:600;">Cur rate</th>' +
-          '<th style="text-align:right;padding:5px 8px;font-size:11px;color:var(--muted);font-weight:600;">New rate</th>' +
-          '<th style="text-align:right;padding:5px 8px;font-size:11px;color:var(--muted);font-weight:600;">Cur cost</th>' +
-          '<th style="text-align:right;padding:5px 8px;font-size:11px;color:var(--muted);font-weight:600;">New cost</th>' +
-          '<th style="text-align:right;padding:5px 8px;font-size:11px;color:var(--muted);font-weight:600;">Change</th>' +
-        '</tr></thead>' +
-        '<tbody>' + rows + '</tbody>' +
-      '</table></div>';
-
-    applyBtn.style.display = '';
-  })
-  .catch(function(e) {
-    prev.innerHTML = '<span style="color:var(--danger);">Error: ' + escHtml(e.message) + '</span>';
-  });
-}
-
-function corrApply() {
-  var from     = document.getElementById('corr-from').value;
-  var to       = document.getElementById('corr-to').value;
-  var value    = document.getElementById('corr-value').value;
-  var recalc   = _corrType !== 'standing' ? document.getElementById('corr-recalc').checked : false;
-  var fromTime = _corrType !== 'standing' ? document.getElementById('corr-from-time').value : '';
-  var toTime   = _corrType !== 'standing' ? document.getElementById('corr-to-time').value   : '';
-  var meterId  = _corrType !== 'standing' ? document.getElementById('corr-meter').value      : 'all';
-  var result   = document.getElementById('corr-result');
-  var applyBtn = document.getElementById('corr-apply-btn');
-  var typeLabel = _corrType === 'standing' ? 'standing charge' : (_corrType === 'rate-export' ? 'export rate' : 'import rate');
-  var timeDesc  = (fromTime || toTime) ? (' ' + (fromTime||'00:00') + '–' + (toTime||'end')) : '';
-  var meterDesc = (meterId && meterId !== 'all') ? (' for ' + meterId) : '';
-
-  if (!confirm('Apply ' + typeLabel + ' correction' + meterDesc + ' on ' + from + (from !== to ? ' to ' + to : '') + timeDesc + '? This modifies the live database.')) return;
-
-  applyBtn.disabled = true;
-  result.style.display = 'block';
-  result.innerHTML = '<span style="color:var(--muted);">Applying…</span>';
-
-  var body = {
-    type:        _corrType === 'standing' ? 'standing' : 'rate',
-    from_date:   from, to_date: to, value: parseFloat(value),
-    channel:     _corrType === 'rate-export' ? 'export' : 'import',
-    recalc_cost: recalc,
-    from_time:   fromTime, to_time: toTime, meter_id: meterId,
-  };
-
-  fetch(apiUrl('/api/corrections/apply'), {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(body),
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    applyBtn.disabled = false;
-    if (d.error) {
-      result.innerHTML = '<span style="color:var(--danger);">Error: ' + escHtml(d.error) + '</span>';
-      return;
-    }
-    result.innerHTML = '<span style="color:var(--accent);">✓ Updated <strong>' +
-      d.updated_blocks.toLocaleString() + '</strong> blocks successfully.</span>';
-    applyBtn.style.display = 'none';
-    document.getElementById('corr-preview').style.display = 'none';
-  })
-  .catch(function(e) {
-    applyBtn.disabled = false;
-    result.innerHTML = '<span style="color:var(--danger);">Error: ' + escHtml(e.message) + '</span>';
-  });
-}
 </script>
 {% endblock %}
