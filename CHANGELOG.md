@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.1.2] — 2026-04-06
+
+### Fixed
+- Re-release of 2.1.1 fixes under a new version number. 2.1.1 was briefly
+  live before being rolled back, leaving some users on 2.1.1 with the broken
+  build. 2.1.2 ensures all users receive the corrected version.
+  See 2.1.1 release notes for the full list of fixes.
+
+---
+
 ## [2.1.1] — 2026-04-06
 
 ### Fixed
