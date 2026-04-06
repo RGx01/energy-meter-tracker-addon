@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.1.4] — 2026-04-06
+
+### Fixed
+- **Sub-meters added after the first block date missing from Usage Stats** —
+  `build_meter_colors` sampled only the first day of blocks to determine which
+  meters to plot. Sub-meters that were added to the config after data collection
+  began (e.g. a battery added weeks after the EV charger) had no blocks on the
+  first day and were silently excluded from Usage Stats charts and data table.
+  Fixed by replacing the block-sample approach with `build_meter_colors_from_config`
+  which builds the colour map directly from the config dict, guaranteeing all
+  configured meters are represented regardless of when they first recorded data.
+
+---
+
 ## [2.1.3] — 2026-04-06
 
 ### Fixed
