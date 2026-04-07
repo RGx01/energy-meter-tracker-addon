@@ -1157,7 +1157,7 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
 # Main entry point
 # ─────────────────────────────────────────────────────────────
 
-def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minutes=None, currency='£'):
+def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minutes=None, currency='£', cfg=None):
 
     if not blocks:
         return "<html><body><p>No data available.</p></body></html>"
@@ -1193,7 +1193,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         except Exception:
             pass
 
-    meter_colors = build_meter_colors(blocks)
+    meter_colors = build_meter_colors_from_config(cfg) if cfg else build_meter_colors(blocks)
 
     # ── Billing periods ──
     # Use historically correct billing_day per block from config_periods join.

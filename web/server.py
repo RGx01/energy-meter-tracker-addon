@@ -1427,7 +1427,7 @@ def api_config_history_update(period_id):
                 bm        = int(main_meta.get("block_minutes") or 30)
                 currency  = main_meta.get("currency_symbol", "£")
                 os.makedirs(CHART_DIR, exist_ok=True)
-                html = _ec.generate_daily_import_export_charts(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency)
+                html = _ec.generate_daily_import_export_charts(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency, cfg=cfg)
                 with open(os.path.join(CHART_DIR, "daily_usage.html"), "w") as f:
                     f.write(html)
                 logger.info("api_config_history_update: charts regenerated")
@@ -1498,7 +1498,7 @@ def api_config_history_delete(period_id):
                 currency = main_meta.get("currency_symbol", "£")
                 os.makedirs(CHART_DIR, exist_ok=True)
                 html = _ec.generate_daily_import_export_charts(
-                    blocks, timezone_name=tz_name, block_minutes=bm, currency=currency
+                    blocks, timezone_name=tz_name, block_minutes=bm, currency=currency, cfg=load_config()
                 )
                 with open(os.path.join(CHART_DIR, "daily_usage.html"), "w") as f:
                     f.write(html)
@@ -1966,7 +1966,7 @@ def api_regenerate_charts():
         html = energy_charts.generate_net_heatmap(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency)
         with open(os.path.join(CHART_DIR, "net_heatmap.html"), "w") as f:
             f.write(html)
-        html = energy_charts.generate_daily_import_export_charts(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency)
+        html = energy_charts.generate_daily_import_export_charts(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency, cfg=cfg)
         with open(os.path.join(CHART_DIR, "daily_usage.html"), "w") as f:
             f.write(html)
         logger.info("server: charts regenerated on demand")
@@ -2095,6 +2095,10 @@ def _corrections_build_where(corr_type, from_date, to_date, channel,
     from local to UTC by _corrections_time_to_utc. When the converted window crosses
     UTC midnight (e.g. Economy 7 00:30-07:30 BST = 23:30-06:30 UTC), the clause uses
     OR instead of AND so blocks on both sides of midnight are included.
+
+    Standing charge corrections are always restricted to the main meter
+    (meter_id in the meters table with is_sub_meter=0) — sub-meter rows
+    carry sc=0.0 and must not be overwritten.
     """
     col = None
     if corr_type == "rate":
@@ -2124,9 +2128,16 @@ def _corrections_build_where(corr_type, from_date, to_date, channel,
         clauses.append("TIME(block_start) < ?")
         params.append(to_time_utc)
 
-    if meter_id and meter_id != "all":
+    if corr_type == "standing":
+        # Standing charge only lives on main meter rows — always restrict
+        # regardless of the meter_id selector (which is hidden for standing)
+        clauses.append(
+            "meter_id IN (SELECT meter_id FROM meters WHERE is_sub_meter = 0)"
+        )
+    elif meter_id and meter_id != "all":
         clauses.append("meter_id = ?")
         params.append(meter_id)
+
     if col:
         clauses.append(f"{col} IS NOT NULL")
 
