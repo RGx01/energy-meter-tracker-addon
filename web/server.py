@@ -931,7 +931,10 @@ def serve_heatmap():
     p = os.path.join(CHART_DIR, "net_heatmap.html")
     if not os.path.exists(p):
         return "Chart not yet generated", 404
-    return send_file(p)
+    resp = send_file(p)
+    resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 
 @app.route("/charts/daily_usage.html")
@@ -939,7 +942,10 @@ def serve_daily():
     p = os.path.join(CHART_DIR, "daily_usage.html")
     if not os.path.exists(p):
         return "Chart not yet generated", 404
-    return send_file(p)
+    resp = send_file(p)
+    resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 
 @app.route("/api/charts/blocks-summary")
@@ -1166,7 +1172,11 @@ def api_chart_heatmap():
     if not os.path.exists(p):
         return jsonify({"html": None})
     with open(p) as f:
-        return jsonify({"html": f.read()})
+        resp = jsonify({"html": f.read()})
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.route("/api/charts/daily")

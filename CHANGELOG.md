@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.1.9] — 2026-04-07
+
+### Fixed
+- **Billing chart not auto-refreshing** — the 2-minute auto-refresh timer used
+  `textContent.indexOf('Daily')` to identify the active tab, which stopped working
+  when the billing tab was renamed from "Daily Usage" to "Billing" in 1.6.0. With
+  a third "Usage Stats" tab also present, the fallback logic refreshed the heatmap
+  instead of the billing chart when Usage Stats was active, leaving the billing chart
+  stale until a hard refresh. Fixed by adding `data-chart` attributes to tab buttons
+  and clearing all `chartsLoaded` state on every timer tick so any tab switch always
+  fetches fresh data.
+
+- **`api/charts/daily` and `api/charts/heatmap` missing cache headers** — the JSON
+  endpoints serving chart HTML had no `Cache-Control` headers, allowing some browsers
+  and the HA ingress proxy to cache responses. Added `no-cache, no-store,
+  must-revalidate` headers to both endpoints.
+
+---
+
 ## [2.1.8] — 2026-04-07
 
 ### Fixed
