@@ -88,6 +88,7 @@ With the DB as the single source of truth, data management operations are safe a
 - Reset data wizard — guided flow: stop engine → backup → clear blocks → reconfigure → restart
 - Selective date range deletion (e.g. remove a period of bad data)
 - DB-to-DB migration tool (copy blocks between installs or from older DB files)
+- **Compact database** — "Compact" button on the Data Management page runs `VACUUM` on demand; rebuilds the file, reclaims free pages from deleted/updated rows; blocking operation so user-initiated only; DB grows at ~40 KB/day so compaction is never urgent but useful after bulk deletions or long history
 - Confirmation dialogs and safety checks throughout
 
 ---

@@ -1,8 +1,28 @@
 # Changelog
 
-## [2.1.6] — 2026-04-06
+## [2.1.7] — 2026-04-06
 
 ### Fixed
+- **Standing charge corrections updating sub-meter rows** — the correction
+  query filtered only by `local_date`, so it updated all meter rows including
+  `ev_charger` and `house_battery` which should always have `standing_charge = 0`.
+  This caused the preview to show `current_min = 0.0` (from sub-meter rows) instead
+  of the real standing charge, and the apply wrote incorrect values to sub-meter rows.
+  Fixed by restricting standing charge corrections to main meter rows only via a
+  subquery on the `meters` table (`is_sub_meter = 0`).
+
+- **Billing chart and Usage Stats colours out of sync** — both charts now use
+  `build_meter_colors_from_config(cfg)` so sub-meters always get the same colour
+  in both views. Previously the billing chart built its colour map from the first
+  day of block data, which could assign different indices to sub-meters added after
+  data collection began, causing colour mismatches between charts.
+
+- **Startup crash on pre-2.1.6 databases: `no such column: m.v2x_capable`** —
+  `get_last_block()` selects `m.v2x_capable` explicitly, but on older databases
+  this column doesn't exist until `migrate_full_config_json()` runs — which is
+  too late. Fixed by moving all incremental column additions into `_ensure_schema()`
+  so they run at `open_block_store()` time, before any query.
+
 - **`supplier` and `v2x_capable` meta fields silently dropped on config save** —
   `_write_meters` only persisted a subset of meter meta fields; both fields were
   lost on every config save.
