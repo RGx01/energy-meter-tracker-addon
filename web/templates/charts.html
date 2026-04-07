@@ -159,9 +159,9 @@
 {% endif %}
 
 <div class="chart-tabs">
-  <button class="chart-tab active" onclick="showChart('daily', this)">📊 Billing</button>
-  <button class="chart-tab"        onclick="showChart('heatmap', this)">🔥 Net Heatmap</button>
-  <button class="chart-tab"        onclick="showChart('bar', this)">📈 Usage Stats</button>
+  <button class="chart-tab active" data-chart="daily"   onclick="showChart('daily', this)">📊 Billing</button>
+  <button class="chart-tab"        data-chart="heatmap" onclick="showChart('heatmap', this)">🔥 Net Heatmap</button>
+  <button class="chart-tab"        data-chart="bar"     onclick="showChart('bar', this)">📈 Usage Stats</button>
 </div>
 
 <!-- Daily usage chart -->
@@ -250,6 +250,7 @@
 {% block scripts %}
 <script>
 var chartsLoaded = {};
+var _activeChart = 'daily';
 function getChartHeight() {
   var isMobile = window.innerWidth <= 768 || (window.innerHeight <= 500 && window.innerWidth > window.innerHeight);
   return Math.max(window.innerHeight - (isMobile ? 80 : 220), 350) + 'px';
@@ -368,12 +369,16 @@ async function loadChartContent(name, force) {
   }
 }
 
-// Auto-refresh charts every 2 minutes — clears cache so new blocks appear
+// Auto-refresh charts every 2 minutes — force reload of active chart
+// and clear cached state for all charts so switching tabs fetches fresh data
 setInterval(function() {
+  chartsLoaded = {};  // clear all — forces re-fetch on next tab switch too
   var activeTab = document.querySelector('.chart-tab.active');
-  var activeName = activeTab && activeTab.textContent.indexOf('Daily') !== -1 ? 'daily' : 'heatmap';
-  chartsLoaded[activeName] = false;
-  loadChartContent(activeName, true);
+  if (!activeTab) return;
+  var name = activeTab.dataset.chart || (activeTab.textContent.indexOf('Heatmap') !== -1 ? 'heatmap' : 'daily');
+  if (name === 'daily' || name === 'heatmap') {
+    loadChartContent(name, true);
+  }
 }, 120000);
 
 function showChart(name, btn) {
@@ -383,6 +388,7 @@ function showChart(name, btn) {
   document.getElementById('chart-daily').style.display   = name === 'daily'   ? 'block' : 'none';
   document.getElementById('chart-heatmap').style.display = name === 'heatmap' ? 'block' : 'none';
   document.getElementById('chart-bar').style.display     = name === 'bar'     ? 'block' : 'none';
+  _activeChart = name;
   if (name === 'bar') { barInit(); }
   else { loadChartContent(name); }
   try { localStorage.setItem('emt_chart_tab', name); } catch(e) {}
@@ -1125,6 +1131,16 @@ document.addEventListener('DOMContentLoaded', function() {
   var theme = document.documentElement.getAttribute('data-theme') || 'dark';
   var btn = document.getElementById('bar-theme-btn');
   if (btn) btn.textContent = theme === 'dark' ? '\u263e' : '\u2600';
+});
+
+// Refresh the active chart whenever the page becomes visible again
+// (handles tab switching, browser tab focus, and ingress navigation)
+document.addEventListener('visibilitychange', function() {
+  if (document.visibilityState === 'visible') {
+    chartsLoaded = {};
+    if (_activeChart === 'bar') { barInit(); }
+    else { loadChartContent(_activeChart || 'daily'); }
+  }
 });
 
 
