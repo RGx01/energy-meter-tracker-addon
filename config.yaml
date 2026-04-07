@@ -1,6 +1,6 @@
 name: "Energy Meter Tracker"
 description: "Electricity metering engine with configurable reconciliation periods, sub-meter support, gap filling, and billing charts"
-version: "2.1.6"
+version: "2.1.7"
 slug: "energy_meter_tracker"
 init: false
 startup: application
