@@ -1,5 +1,61 @@
 # Changelog
 
+## [2.1.8] — 2026-04-07
+
+### Fixed
+- **Chart regeneration on every gap-fill block** — when the engine restarts after a
+  long offline period, charts were regenerated once per missing block. A 6-hour gap
+  with 5-minute blocks triggers 72 chart regeneration cycles, each taking ~7 seconds,
+  causing minutes of CPU load before the engine catches up. Fixed by skipping chart
+  regeneration for interpolated (gap-fill) blocks — charts are regenerated once at
+  startup and again on the first live block.
+
+- **Gap-fill blocks showing zero rate and cost** — after the `extract_last_reads`
+  fix in this release, `last_known_rates` entries became `{"ts":..., "value":...}`
+  dicts instead of raw floats. The gap-fill rate lookup expected a float, so rate
+  and cost were silently zeroed for all interpolated blocks during catch-up.
+  Fixed by adding a `_rate_value()` helper that unwraps either format.
+
+- **Crash on startup with session gap: `AttributeError: 'float' object has no attribute 'get'`** —
+  `extract_last_reads()` stored the last known rate as a raw float in `last_known_rates`.
+  `save_current_block()` expects `{"ts": ..., "value": ...}` dicts and calls `r.get("ts")`
+  on each entry — crashing when it encounters a float. This path is triggered when the
+  engine restarts after a session gap and the last known rates come from a finalised block
+  (which stores rate directly on the channel, not in a rates list). Fixed by always
+  returning rates as `{"ts": ..., "value": ...}` dicts from `extract_last_reads()`.
+
+- **Gap fill using first post-outage read instead of latest** — when the engine
+  restarts after a gap, `post_reads` was populated with `reads[0]` (the first
+  sensor capture after restart). If the sensor updated multiple times before gap
+  fill triggered, the interpolation endpoint was stale — later sensor values were
+  ignored. Fixed by using `reads[-1]` (the most recent read) as the post-gap
+  anchor, giving the most accurate interpolation endpoint available.
+
+- **Gap fill not running after session outage** — `extract_last_reads()` was
+  called on the last finalised block (from DB via `_row_to_block`) which stores
+  sensor values as `read_end` floats with no timestamps, not as `{"ts", "value"}`
+  dicts. The gap fill anchor `pre_ts` was therefore always `None`, causing
+  `detect_gap()` to return no missing windows and silently skip gap fill entirely.
+  Fixed by using `read_end` and the block's `end` timestamp when extracting reads
+  from finalised DB blocks, giving `detect_gap` a valid anchor.
+
+- **False large kWh spike on sub-meters after add-on restart** — when the engine
+  restarts after a session gap (e.g. upgrade, HA restart), the current in-progress
+  block retains stale channel reads from before the restart. Sub-meters that use
+  cumulative sensors produce a delta spanning the entire offline period, resulting
+  in a false import spike on the first post-restart block.
+
+  The main meter is unaffected — it uses boundary interpolation from a precise
+  pair of reads around the block start/end. Sub-meters accumulate all reads
+  directly, so the stale pre-restart read was included in the delta calculation.
+
+  Fixed by clearing the current block's channel reads on startup when a session
+  gap is detected. The gap marker's `pre_reads` correctly captures the pre-gap
+  values for gap interpolation; live reads accumulate fresh from the first
+  post-restart sensor capture.
+
+---
+
 ## [2.1.7] — 2026-04-06
 
 ### Fixed
