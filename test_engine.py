@@ -37,9 +37,28 @@ hc = types.ModuleType("ha_client")
 hc.HAClient = MagicMock
 sys.modules["ha_client"] = hc
 
+# Stub block_store — use real in-memory BlockStore so engine functions work
+from block_store import BlockStore, open_block_store, migrate_json_to_sqlite
+import block_store as _bs_module
+_test_store = BlockStore(":memory:")
+_test_store.insert_config_period({
+    "meters": {"electricity_main": {"meta": {
+        "timezone": "UTC", "billing_day": 1,
+        "block_minutes": 30, "currency_symbol": "£", "currency_code": "GBP",
+    }}}
+})
+
+bs = types.ModuleType("block_store")
+bs.BlockStore              = BlockStore
+bs.open_block_store        = lambda path: _test_store
+bs.migrate_json_to_sqlite  = migrate_json_to_sqlite
+sys.modules["block_store"] = bs
+
 # Now import the engine
 sys.path.insert(0, os.path.dirname(__file__))
 import engine
+# Wire the test store into the engine module
+engine._store = _test_store
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -491,8 +510,44 @@ class TestExtractLastReads(unittest.TestCase):
             }
         }
         reads, rates = engine.extract_last_reads(block)
+        # Reads: last read value
         self.assertEqual(reads["electricity_main"]["import"]["value"], 1001.0)
-        self.assertEqual(rates["electricity_main"]["import"], 0.25)
+        # Rates: now always returned as {"ts": ..., "value": ...} dict
+        # (so save_current_block can call r.get("ts") safely)
+        self.assertIsInstance(rates["electricity_main"]["import"], dict)
+        self.assertAlmostEqual(rates["electricity_main"]["import"]["value"], 0.25)
+
+    def test_extracts_rate_from_finalised_block(self):
+        """Finalised blocks from DB have rate on channel, not in rates list.
+        extract_last_reads must return rate as a dict with ts."""
+        block = {
+            "end": "2026-04-07T09:00:00",
+            "meters": {
+                "electricity_main": {
+                    "channels": {
+                        "import": {
+                            "reads": [],      # no live reads — finalised block
+                            "rates": [],      # no rates list
+                            "rate": 0.245,    # rate stored directly on channel
+                            "read_end": 28000.5,  # last sensor read
+                        }
+                    }
+                }
+            }
+        }
+        reads, rates = engine.extract_last_reads(block)
+        # Rate must be a dict with ts and value
+        self.assertIsInstance(rates["electricity_main"]["import"], dict,
+            "Rate from finalised block must be a dict, not a float")
+        self.assertAlmostEqual(rates["electricity_main"]["import"]["value"], 0.245)
+        self.assertEqual(rates["electricity_main"]["import"]["ts"], "2026-04-07T09:00:00",
+            "Rate ts must be the block end time, not None")
+        # Read must be populated from read_end with block end timestamp
+        self.assertIn("electricity_main", reads)
+        self.assertAlmostEqual(reads["electricity_main"]["import"]["value"], 28000.5,
+            msg="read_end must be used as pre-gap read value")
+        self.assertEqual(reads["electricity_main"]["import"]["ts"], "2026-04-07T09:00:00",
+            "Read ts must be the block end time so detect_gap gets a valid anchor")
 
     def test_empty_block(self):
         reads, rates = engine.extract_last_reads({"meters": {}})

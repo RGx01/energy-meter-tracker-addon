@@ -276,6 +276,20 @@ def detect_gap(last_read_ts: str | None, now: datetime, block_minutes: int = BLO
 
 
 def extract_last_reads(block: dict):
+    """
+    Extract the last known read and rate from each channel of a block dict.
+    Returns (reads, rates) where both are {meter: {channel: {"ts": ..., "value": ...}}}.
+    Both must be dicts-of-dicts so save_current_block can call r.get("ts")/r.get("value"),
+    and so detect_gap gets a valid timestamp for pre_ts (gap fill anchor).
+
+    Handles two block shapes:
+    - Live current_block: channels have "reads" list of {"ts", "value"} dicts
+    - Finalised DB block (_row_to_block): channels have "read_end" float + block "end" timestamp
+    """
+    from datetime import datetime, timezone as _tz
+    _now_iso  = datetime.now(_tz.utc).isoformat()
+    # Use block end time as timestamp anchor for finalised DB blocks
+    block_end_iso = block.get("end") or _now_iso
     reads = {}
     rates = {}
     for meter_name, meter_data in block.get("meters", {}).items():
@@ -284,20 +298,47 @@ def extract_last_reads(block: dict):
         for channel_name, channel in meter_data.get("channels", {}).items():
             channel_reads = channel.get("reads", [])
             channel_rates = channel.get("rates", [])
+
             if channel_reads:
-                reads[meter_name][channel_name] = channel_reads[-1]
+                last_read = channel_reads[-1]
+                if isinstance(last_read, dict):
+                    reads[meter_name][channel_name] = last_read
+                else:
+                    reads[meter_name][channel_name] = {"ts": block_end_iso, "value": float(last_read)}
+            elif channel.get("read_end") is not None:
+                # Finalised DB block — read_end is the last sensor value, block end is the timestamp
+                reads[meter_name][channel_name] = {
+                    "ts":    block_end_iso,
+                    "value": float(channel["read_end"]),
+                }
+
             if channel_rates:
-                rates[meter_name][channel_name] = channel_rates[-1]["value"]
+                last_rate = channel_rates[-1]
+                if isinstance(last_rate, dict):
+                    rates[meter_name][channel_name] = {
+                        "ts":    last_rate.get("ts", block_end_iso),
+                        "value": float(last_rate.get("value", 0)),
+                    }
+                else:
+                    rates[meter_name][channel_name] = {"ts": block_end_iso, "value": float(last_rate)}
             else:
-                rate = channel.get("rate", 0.0)
+                # Fallback: rate stored directly on channel (finalised DB block)
+                rate = channel.get("rate") or channel.get("rate_used")
                 if rate:
-                    rates[meter_name][channel_name] = rate
+                    rates[meter_name][channel_name] = {"ts": block_end_iso, "value": float(rate)}
     return reads, rates
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gap marker helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _rate_value(rate_entry) -> float:
+    """Unwrap a rate entry that may be a float or a {"ts":..., "value":...} dict."""
+    if isinstance(rate_entry, dict):
+        return float(rate_entry.get("value", 0.0))
+    return float(rate_entry or 0.0)
+
 
 def set_gap_marker(block: dict, pre_reads: dict, last_known_rates: dict):
     block["_gap_marker"] = {
@@ -596,10 +637,12 @@ def build_gap_blocks(
                             opener   = interpolate_value(pre_read, post_read, window_start)
                             closer   = interpolate_value(pre_read, post_read, window_end)
                             sub_kwh  = max(round(closer["value"] - opener["value"], 6), 0.0)
-                            sub_rate = last_known_rates.get(meter_name, {}).get(channel_name)
-                            if sub_rate is None:
+                            _sr = last_known_rates.get(meter_name, {}).get(channel_name)
+                            if _sr is None:
                                 parent_name = meter_meta.get("parent_meter")
-                                sub_rate = last_known_rates.get(parent_name, {}).get(channel_name, 0.0)
+                                _sr = last_known_rates.get(parent_name, {}).get(channel_name)
+                            sub_rate = _rate_value(_sr)
+                            if not sub_rate:
                                 logger.info("build_gap_blocks: %s/%s using parent rate %.4f", meter_name, channel_name, sub_rate)
                             sub_cost  = round(sub_kwh * sub_rate, 6)
                             sub_start = opener["value"]
@@ -629,7 +672,7 @@ def build_gap_blocks(
                 opener = interpolate_value(pre_read, post_read, window_start)
                 closer = interpolate_value(pre_read, post_read, window_end)
                 kwh    = max(round(closer["value"] - opener["value"], 6), 0.0)
-                rate   = last_known_rates.get(meter_name, {}).get(channel_name, 0.0)
+                rate   = _rate_value(last_known_rates.get(meter_name, {}).get(channel_name, 0.0))
                 cost   = round(kwh * rate, 6)
 
                 meter_block["channels"][channel_name] = {
@@ -1022,7 +1065,12 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
     logger.info("finalise_block: rolling buffer pruned, new block starts %s", iso(block_end_dt))
 
     # ── Generate charts ────────────────────────────────────────────────────
-    generate_charts(get_store())
+    # Skip chart regeneration for interpolated (gap-fill) blocks — during a
+    # long offline gap this would regenerate charts once per missing block,
+    # causing minutes of CPU load. Charts are regenerated once at startup
+    # (generate_charts in engine_startup) and again on the first live block.
+    if not interpolated:
+        generate_charts(get_store())
 
     # ── Backup to /share ───────────────────────────────────────────────────
     _backup_to_share()
@@ -1125,7 +1173,10 @@ async def _engine_tick(ha: HAClient):
             for channel_name, channel in meter_data.get("channels", {}).items():
                 reads = channel.get("reads", [])
                 if reads:
-                    post_reads[meter_name][channel_name] = reads[0]
+                    # Use the LAST (most recent) read as post-gap anchor, not the first.
+                    # If the sensor updated multiple times before gap fill triggered,
+                    # reads[-1] gives the best interpolation endpoint.
+                    post_reads[meter_name][channel_name] = reads[-1]
                     has_real_read = True
 
         if not has_real_read:
@@ -1355,9 +1406,19 @@ async def engine_startup(ha: HAClient):
                 )
                 current_block        = _store.load_current_block()
                 pre_reads, last_rates = extract_last_reads(last_block)
+                # Clear stale reads from before the restart — if we leave them in,
+                # the sub-meter's channel reads will span the restart gap, producing
+                # a false large delta on the first post-restart block (e.g. 10 kWh
+                # from a battery sensor whose cumulative read advanced while offline).
+                # The gap marker's pre_reads captures the correct pre-gap values;
+                # live reads will accumulate fresh from the first post-restart capture.
+                for meter_data in (current_block.get("meters") or {}).values():
+                    for channel in (meter_data.get("channels") or {}).values():
+                        channel["reads"] = []
+                        channel["rates"] = []
                 set_gap_marker(current_block, pre_reads, last_rates)
                 _store.save_current_block(current_block)
-                logger.info("engine_startup: gap marker set, will fill on first capture")
+                logger.info("engine_startup: gap marker set, stale reads cleared, will fill on first capture")
             else:
                 logger.info("engine_startup: no session gap detected")
 
