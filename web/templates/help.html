@@ -292,6 +292,17 @@
     Replace <code>192.168.1.x</code> with your Docker host IP and restart HA. This adds a sidebar
     entry that embeds the UI within HA — similar to the supervised experience.
   </p>
+  <p style="margin-top:8px;">
+    <strong>Embedding charts in Lovelace</strong> — use the dedicated Lovelace endpoints
+    rather than the plain chart file URLs. These include a meta refresh and aggressive
+    no-cache headers so the Lovelace web card always shows current data:
+  </p>
+  <pre class="help-pre">http://192.168.1.x:8099/lovelace/billing   # Billing chart
+http://192.168.1.x:8099/lovelace/heatmap   # Net energy heatmap</pre>
+  <p style="margin-top:8px;">
+    Add these as <strong>Webpage</strong> cards in your Lovelace dashboard. The chart refreshes
+    every 130 seconds automatically — you do not need to set a refresh interval on the card itself.
+  </p>
   <div class="warn-box">
     ⚠️ <strong>The volume mount is essential.</strong> Always run with
     <code>-v /path/to/data:/data/energy_meter_tracker</code> — without it all data is lost
