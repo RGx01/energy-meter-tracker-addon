@@ -40,13 +40,13 @@ A Home Assistant add-on that records your electricity usage in precise configura
 - Publishes four cumulative sensors back to Home Assistant
 - Serves a local web UI on port 8099 for configuration, charts, live power and data management
 
-## What's new in 2.1.x
+## What's new in 2.2.0
 
-- **🗄️ Single source of truth** — `energy_meter.db` is now the only file that matters; backup and restore is a single file copy; all JSON state files eliminated
-- **🔧 Historical Corrections enhanced** — time-of-day window (DST-aware), per-meter targeting, and per-block preview table before committing
-- **🗂️ Data Management page** — renamed from Import & Backup; backup UI updated for single-file model; deprecated file entries flagged
-- **📊 Sub-meter billing fixed** — Live Power Today/This Bill/This Year and HA sensors now correctly exclude sub-meter double-counting
-- **🏷️ Supplier field** — now recorded per billing period on the Billing History page, giving a full historical record of which supplier was active when each block was recorded
+- **📊 Bill summary redesigned** — Import now shows total grid draw at the top (matching what your supplier bills) with sub-meter breakdown (House, EV charger, Battery) indented beneath — makes reconciliation against your Octopus or other supplier statement straightforward
+- **🗑️ Delete Blocks** — new sub-page to permanently remove blocks for a date range, with optional per-meter filtering, block count preview, and explicit confirmation before applying
+- **🔧 Historical Corrections** — promoted to its own sub-page under Data Management, matching the pattern of Billing History under Meter Config
+- **🗜️ Compact Database** — VACUUM button on the Data Management page reclaims free pages from deleted or updated rows; engine is paused briefly during compaction
+- **📺 Lovelace chart endpoints** — `/lovelace/billing` and `/lovelace/heatmap` serve the charts with auto-refresh and aggressive no-cache headers for reliable embedding in HA dashboard web cards
 
 ## Requirements
 

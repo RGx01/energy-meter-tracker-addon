@@ -1941,3 +1941,92 @@ class TestMigration(unittest.TestCase):
             self.assertEqual(result2, 0, "Second migration must return 0 (nothing to do)")
         finally:
             os.unlink(path)
+
+
+class TestBlockDeletion(unittest.TestCase):
+    """Tests for delete_blocks_for_date_range and count_blocks_for_date_range."""
+
+    def _make_store(self):
+        store = BlockStore(":memory:")
+        store.insert_config_period({"meters": {"electricity_main": {"meta": {
+            "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
+            "currency_symbol": "£", "currency_code": "GBP",
+        }, "channels": {"import": {"read": "s.imp", "rate": "s.rate"}}},
+        "ev_charger": {"meta": {"sub_meter": True, "parent_meter": "electricity_main"},
+                       "channels": {"import": {"read": "s.ev", "rate": "s.rate"}}},
+        }})
+        cp_id = store.get_current_config_period_id()
+        rows = [
+            ("2026-03-01T00:00:00", "electricity_main", "2026-03-01", 1.0),
+            ("2026-03-01T00:30:00", "electricity_main", "2026-03-01", 1.0),
+            ("2026-03-01T00:00:00", "ev_charger",       "2026-03-01", 0.5),
+            ("2026-03-02T00:00:00", "electricity_main", "2026-03-02", 2.0),
+            ("2026-03-02T00:30:00", "electricity_main", "2026-03-02", 2.0),
+            ("2026-03-03T00:00:00", "electricity_main", "2026-03-03", 3.0),
+        ]
+        for (bs, mid, ld, kwh) in rows:
+            store._conn.execute("""
+                INSERT INTO blocks (block_start, block_end, meter_id, config_period_id,
+                  local_date, local_year, local_month, local_day, interpolated,
+                  imp_kwh, imp_rate, imp_cost, standing_charge)
+                VALUES (?,?,?,?,?,2026,3,1,0,?,0.07,?,0.5)
+            """, (bs, bs, mid, cp_id, ld, kwh, kwh * 0.07))
+        store._conn.commit()
+        return store
+
+    def test_count_preview_all_meters(self):
+        store = self._make_store()
+        r = store.count_blocks_for_date_range("2026-03-01", "2026-03-02")
+        self.assertEqual(r["blocks"], 5)
+        self.assertEqual(r["dates"], 2)
+
+    def test_count_preview_single_meter(self):
+        store = self._make_store()
+        r = store.count_blocks_for_date_range("2026-03-01", "2026-03-01", "electricity_main")
+        self.assertEqual(r["blocks"], 2)
+        self.assertEqual(r["dates"], 1)
+
+    def test_count_preview_no_match(self):
+        store = self._make_store()
+        r = store.count_blocks_for_date_range("2026-04-01", "2026-04-30")
+        self.assertEqual(r["blocks"], 0)
+        self.assertEqual(r["dates"], 0)
+
+    def test_delete_all_meters(self):
+        store = self._make_store()
+        r = store.delete_blocks_for_date_range("2026-03-01", "2026-03-02")
+        self.assertEqual(r["deleted"], 5)
+        self.assertEqual(r["dates"], 2)
+        remaining = store._conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0]
+        self.assertEqual(remaining, 1, "Only Mar 3 block should remain")
+
+    def test_delete_single_meter(self):
+        store = self._make_store()
+        r = store.delete_blocks_for_date_range("2026-03-01", "2026-03-01", "ev_charger")
+        self.assertEqual(r["deleted"], 1)
+        remaining = store._conn.execute(
+            "SELECT COUNT(*) FROM blocks WHERE meter_id='ev_charger'"
+        ).fetchone()[0]
+        self.assertEqual(remaining, 0)
+        # Other meters untouched
+        main_count = store._conn.execute(
+            "SELECT COUNT(*) FROM blocks WHERE meter_id='electricity_main'"
+        ).fetchone()[0]
+        self.assertEqual(main_count, 5)
+
+    def test_delete_no_match_is_safe(self):
+        store = self._make_store()
+        r = store.delete_blocks_for_date_range("2026-05-01", "2026-05-31")
+        self.assertEqual(r["deleted"], 0)
+        total = store._conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0]
+        self.assertEqual(total, 6, "No blocks should have been removed")
+
+    def test_invalid_date_range_raises(self):
+        store = self._make_store()
+        with self.assertRaises(ValueError):
+            store.delete_blocks_for_date_range("2026-03-10", "2026-03-01")
+
+    def test_missing_dates_raises(self):
+        store = self._make_store()
+        with self.assertRaises(ValueError):
+            store.delete_blocks_for_date_range("", "2026-03-01")

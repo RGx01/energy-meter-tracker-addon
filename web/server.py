@@ -17,7 +17,7 @@ import os
 import threading
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, redirect, render_template, request, send_file, url_for
+from flask import Flask, Response, jsonify, make_response, redirect, render_template, request, send_file, url_for
 
 logger = logging.getLogger("server")
 
@@ -924,6 +924,16 @@ def config_history_page():
     return render_template("config_history.html", active="config_history")
 
 
+@app.route("/delete-blocks")
+def delete_blocks_page():
+    return render_template("delete_blocks.html", active="import")
+
+
+@app.route("/corrections")
+def corrections_page():
+    return render_template("corrections.html", active="import")
+
+
 # ── Chart file serving ────────────────────────────────────────────────────────
 
 @app.route("/charts/net_heatmap.html")
@@ -946,6 +956,54 @@ def serve_daily():
     resp.headers["Cache-Control"] = "no-cache, must-revalidate"
     resp.headers["Pragma"] = "no-cache"
     return resp
+
+
+# ── Lovelace-friendly chart endpoints ─────────────────────────────────────────
+# These endpoints serve the chart HTML with:
+#   - Aggressive no-cache headers so HA never fixes the URL in time
+#   - A meta refresh so the Lovelace web card auto-updates (the card's own
+#     refresh setting is unreliable in HA)
+# Use these URLs in Lovelace panel_iframe or webpage cards instead of the
+# plain /charts/*.html URLs.
+
+_LOVELACE_REFRESH = 130  # seconds
+
+def _serve_lovelace_chart(filename):
+    """Read chart HTML from disk, inject meta refresh + no-cache, return response."""
+    p = os.path.join(CHART_DIR, filename)
+    if not os.path.exists(p):
+        return "Chart not yet generated — visit the EMT Charts page first.", 404
+    with open(p, "r", encoding="utf-8") as f:
+        html = f.read()
+    # Inject meta refresh immediately after <head> (or <html> if no <head>)
+    refresh_tag = (
+        f'<meta http-equiv="refresh" content="{_LOVELACE_REFRESH}">\n'
+        f'<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">\n'
+        f'<meta http-equiv="Pragma" content="no-cache">\n'
+        f'<meta http-equiv="Expires" content="0">\n'
+    )
+    if "<head>" in html:
+        html = html.replace("<head>", "<head>\n" + refresh_tag, 1)
+    else:
+        html = refresh_tag + html
+    resp = make_response(html)
+    resp.headers["Content-Type"]  = "text/html; charset=utf-8"
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"]        = "no-cache"
+    resp.headers["Expires"]       = "0"
+    return resp
+
+
+@app.route("/lovelace/billing")
+def lovelace_billing():
+    """Billing chart — Lovelace-friendly URL with auto-refresh."""
+    return _serve_lovelace_chart("daily_usage.html")
+
+
+@app.route("/lovelace/heatmap")
+def lovelace_heatmap():
+    """Net energy heatmap — Lovelace-friendly URL with auto-refresh."""
+    return _serve_lovelace_chart("net_heatmap.html")
 
 
 @app.route("/api/charts/blocks-summary")
@@ -2064,6 +2122,121 @@ def api_import():
             if engine and hasattr(engine, 'resume_engine'):
                 engine.resume_engine()
         threading.Thread(target=delayed_resume, daemon=True).start()
+
+# ── Database maintenance ───────────────────────────────────────────────────────────────────
+
+@app.route("/api/db/vacuum", methods=["POST"])
+def api_db_vacuum():
+    """
+    Run VACUUM on the blocks database.
+    Pauses the engine during the operation to ensure exclusive DB access.
+    Returns { ok, size_before_kb, size_after_kb, saved_kb }.
+    """
+    import os
+    try:
+        import engine as _eng
+        store = _get_store()
+
+        # Measure before
+        db_path = store._conn.execute("PRAGMA database_list").fetchone()["file"]
+        size_before = os.path.getsize(db_path) if db_path and os.path.exists(db_path) else 0
+
+        # Check free pages — gives user an honest picture before we run
+        page_size  = store._conn.execute("PRAGMA page_size").fetchone()[0]
+        free_pages = store._conn.execute("PRAGMA freelist_count").fetchone()[0]
+        free_bytes = free_pages * page_size
+
+        # Pause engine, run VACUUM, resume
+        _eng.pause_engine()
+        try:
+            store._conn.execute("VACUUM")
+            store._conn.commit()
+        finally:
+            _eng.resume_engine()
+
+        size_after = os.path.getsize(db_path) if db_path and os.path.exists(db_path) else 0
+        saved = max(0, size_before - size_after)
+
+        logger.info(
+            "api_db_vacuum: complete — before=%d B after=%d B saved=%d B (free_pages=%d)",
+            size_before, size_after, saved, free_pages
+        )
+        return jsonify({
+            "ok":           True,
+            "size_before":  size_before,
+            "size_after":   size_after,
+            "saved":        saved,
+            "free_pages":   free_pages,
+            "free_bytes":   free_bytes,
+        })
+    except Exception as e:
+        try:
+            import engine as _eng
+            _eng.resume_engine()
+        except Exception:
+            pass
+        logger.error("api_db_vacuum: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+# ── Block deletion ────────────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/blocks/delete/preview", methods=["POST"])
+def api_blocks_delete_preview():
+    """
+    Preview how many blocks would be deleted for a date range.
+    Body: { from_date, to_date, meter_id? }
+    Returns: { blocks, dates }
+    """
+    try:
+        data      = request.get_json(force=True) or {}
+        from_date = data.get("from_date", "").strip()
+        to_date   = data.get("to_date", "").strip()
+        meter_id  = data.get("meter_id") or None
+        if not from_date or not to_date:
+            return jsonify({"error": "from_date and to_date required"}), 400
+        if from_date > to_date:
+            return jsonify({"error": "from_date must not be after to_date"}), 400
+        store = _get_store()
+        result = store.count_blocks_for_date_range(from_date, to_date, meter_id)
+        return jsonify(result)
+    except Exception as e:
+        logger.error("api_blocks_delete_preview: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/blocks/delete", methods=["POST"])
+def api_blocks_delete():
+    """
+    Delete blocks for a date range.
+    Body: { from_date, to_date, meter_id?, confirmed: true }
+    Returns: { deleted, dates }
+    """
+    try:
+        data      = request.get_json(force=True) or {}
+        from_date = data.get("from_date", "").strip()
+        to_date   = data.get("to_date", "").strip()
+        meter_id  = data.get("meter_id") or None
+        confirmed = data.get("confirmed", False)
+        if not from_date or not to_date:
+            return jsonify({"error": "from_date and to_date required"}), 400
+        if from_date > to_date:
+            return jsonify({"error": "from_date must not be after to_date"}), 400
+        if not confirmed:
+            return jsonify({"error": "confirmed must be true"}), 400
+        store = _get_store()
+        result = store.delete_blocks_for_date_range(from_date, to_date, meter_id)
+        logger.info(
+            "api_blocks_delete: deleted %d blocks across %d dates (%s\u2192%s meter=%s)",
+            result["deleted"], result["dates"], from_date, to_date, meter_id or "all"
+        )
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error("api_blocks_delete: %s", e)
+        return jsonify({"error": str(e)}), 500
+
 
 # ── Historical corrections ────────────────────────────────────────────────────
 
