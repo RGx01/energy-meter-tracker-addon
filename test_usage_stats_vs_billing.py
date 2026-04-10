@@ -16,7 +16,17 @@ sys.modules.setdefault("energy_engine_io", eio)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from block_store import BlockStore
-import energy_charts as ec
+
+# Always import the real energy_charts — not a stub that another test suite
+# may have injected into sys.modules when running combined test discovery.
+import importlib
+_ec_spec = importlib.util.spec_from_file_location(
+    "energy_charts_real",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "energy_charts.py")
+)
+_ec_mod = importlib.util.module_from_spec(_ec_spec)
+_ec_spec.loader.exec_module(_ec_mod)
+ec = _ec_mod
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -25,14 +35,10 @@ TZ = ZoneInfo("Europe/London")
 
 def make_store():
     store = BlockStore(":memory:")
-    store._conn.execute("""
-        INSERT INTO config_periods
-        (effective_from, effective_to, billing_day, block_minutes, timezone,
-         currency_symbol, currency_code, site_name, change_reason, full_config_json)
-        VALUES ('2026-01-01T00:00:00', NULL, 15, 30, 'Europe/London',
-                '£', 'GBP', 'Home', NULL, '{}')
-    """)
-    store._conn.commit()
+    store.insert_config_period({"meters": {"electricity_main": {"meta": {
+        "billing_day": 15, "block_minutes": 30, "timezone": "Europe/London",
+        "currency_symbol": "£", "currency_code": "GBP", "site": "Home",
+    }}}})
     return store, store._conn.execute(
         "SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
 
@@ -434,3 +440,178 @@ class TestBillingChartVsUsageStats(unittest.TestCase):
             msg="Billing chart and usage stats must agree on kWh for BST period")
         self.assertAlmostEqual(billing["standing"], usage["standing"], places=3,
             msg="Billing chart and usage stats must agree on standing charge for BST period")
+
+
+class TestBillSummaryMainImportRaw(unittest.TestCase):
+    """
+    Tests for the redesigned bill summary — verifies that main_import_raw
+    (total grid draw before sub-meter subtraction) and the sub-meter breakdown
+    are mathematically consistent:
+        sum(sub-meters) + remainder = main_import_raw total
+    """
+
+    def setUp(self):
+        self.store = BlockStore(":memory:")
+        self.store.insert_config_period({"meters": {
+            "electricity_main": {"meta": {
+                "billing_day": 1, "block_minutes": 30,
+                "timezone": "UTC", "currency_symbol": "£", "currency_code": "GBP",
+            }, "channels": {"import": {"read": "s.imp", "rate": "s.rate"},
+                            "export": {"read": "s.exp", "rate": "s.exp_rate"}}},
+            "ev_charger": {"meta": {"sub_meter": True, "parent_meter": "electricity_main",
+                                    "device": "Zappi EV Charger"},
+                           "channels": {"import": {"read": "s.ev", "rate": "s.rate"}}},
+            "house_battery": {"meta": {"sub_meter": True, "parent_meter": "electricity_main",
+                                       "device": "Solax Battery"},
+                              "channels": {"import": {"read": "s.bat", "rate": "s.rate"}}},
+        }})
+        self.cp = self.store._conn.execute(
+            "SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+
+    def _insert(self, block_start, main_imp, ev_imp, bat_imp, main_exp=0.0,
+                rate=0.07, exp_rate=0.12, sc=0.50):
+        """Insert one set of blocks for a given timestamp."""
+        ld = block_start[:10]
+        for meter_id, imp_kwh in [
+            ("electricity_main", main_imp),
+            ("ev_charger",       ev_imp),
+            ("house_battery",    bat_imp),
+        ]:
+            self.store._conn.execute("""
+                INSERT INTO blocks (
+                    block_start, block_end, local_date, local_year, local_month, local_day,
+                    meter_id, config_period_id, interpolated,
+                    imp_kwh, imp_kwh_grid, imp_kwh_remainder,
+                    imp_rate, imp_cost, exp_kwh, exp_rate, exp_cost, standing_charge)
+                VALUES (?,?,?,2026,3,1, ?,?,0,
+                        ?,NULL,NULL, ?,?,?,?,?,?)
+            """, (block_start, block_start, ld,
+                  meter_id, self.cp,
+                  imp_kwh, rate, round(imp_kwh * rate, 6),
+                  main_exp if meter_id == "electricity_main" else 0.0,
+                  exp_rate,
+                  round(main_exp * exp_rate, 6) if meter_id == "electricity_main" else 0.0,
+                  sc if meter_id == "electricity_main" else 0.0))
+        self.store._conn.commit()
+
+    def _summary(self):
+        blocks = self.store.get_blocks_for_local_date_range("2026-03-01", "2026-03-31")
+        return ec.calculate_billing_summary_for_period(
+            blocks, datetime(2026, 3, 1), datetime(2026, 4, 1))
+
+    def test_raw_equals_sub_plus_remainder(self):
+        """main_import_raw total must equal sub-meter sum + remainder."""
+        self._insert("2026-03-01T00:00:00", main_imp=10.0, ev_imp=4.0, bat_imp=3.0)
+        self._insert("2026-03-01T00:30:00", main_imp=8.0,  ev_imp=2.0, bat_imp=2.0)
+        s = self._summary()
+
+        raw_kwh = sum(d["kwh"] for d in s["main_import_raw"].values())
+
+        # sub-meter totals
+        sub_kwh = sum(
+            t["kwh"] for k, t in s["totals"].items()
+            if t.get("is_submeter") and "import" in k.lower()
+        )
+        # remainder (main meter post-subtraction)
+        rem_kwh = sum(
+            t["kwh"] for k, t in s["totals"].items()
+            if not t.get("is_submeter") and "import" in k.lower()
+        )
+
+        self.assertAlmostEqual(raw_kwh, sub_kwh + rem_kwh, places=4,
+            msg="main_import_raw must equal sub-meter sum + remainder")
+
+    def test_raw_total_matches_main_meter_blocks(self):
+        """main_import_raw kWh must match the raw sum of electricity_main imp_kwh from DB."""
+        self._insert("2026-03-01T00:00:00", main_imp=6.35, ev_imp=2.1, bat_imp=1.5)
+        self._insert("2026-03-02T00:00:00", main_imp=5.80, ev_imp=1.8, bat_imp=1.2)
+
+        db_total = self.store._conn.execute(
+            "SELECT SUM(imp_kwh) FROM blocks WHERE meter_id='electricity_main'"
+        ).fetchone()[0]
+
+        s = self._summary()
+        raw_kwh = sum(d["kwh"] for d in s["main_import_raw"].values())
+
+        self.assertAlmostEqual(raw_kwh, db_total, places=4,
+            msg="main_import_raw must match raw DB sum for electricity_main")
+
+    def test_raw_by_rate_correct(self):
+        """main_import_raw groups correctly by rate."""
+        # Two blocks at different rates
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year, local_month, local_day,
+                meter_id, config_period_id, interpolated,
+                imp_kwh, imp_rate, imp_cost, standing_charge)
+            VALUES ('2026-03-01T00:00:00','2026-03-01T00:00:00','2026-03-01',2026,3,1,
+                    'electricity_main',?,0, 5.0,0.0700,0.3500,0.50)
+        """, (self.cp,))
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year, local_month, local_day,
+                meter_id, config_period_id, interpolated,
+                imp_kwh, imp_rate, imp_cost, standing_charge)
+            VALUES ('2026-03-01T06:00:00','2026-03-01T06:00:00','2026-03-01',2026,3,1,
+                    'electricity_main',?,0, 2.0,0.3231,0.6462,0.00)
+        """, (self.cp,))
+        self.store._conn.commit()
+
+        s = self._summary()
+        raw = s["main_import_raw"]
+        self.assertAlmostEqual(raw[0.0700]["kwh"], 5.0, places=4)
+        self.assertAlmostEqual(raw[0.3231]["kwh"], 2.0, places=4)
+
+    def test_no_sub_meters_raw_equals_total(self):
+        """With no sub-meters, main_import_raw must equal the displayed Import total."""
+        # Insert only electricity_main blocks (no sub-meters in this store)
+        store2 = BlockStore(":memory:")
+        store2.insert_config_period({"meters": {"electricity_main": {"meta": {
+            "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
+            "currency_symbol": "£", "currency_code": "GBP",
+        }, "channels": {"import": {"read": "s.imp", "rate": "s.rate"}}}}})
+        cp2 = store2._conn.execute("SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+        for i, kwh in enumerate([3.0, 4.0, 5.0]):
+            ts = f'2026-03-01T{i:02d}:00:00'
+            store2._conn.execute("""
+                INSERT INTO blocks (block_start, block_end, local_date, local_year, local_month, local_day,
+                    meter_id, config_period_id, interpolated,
+                    imp_kwh, imp_rate, imp_cost, standing_charge)
+                VALUES (?,?,'2026-03-01',2026,3,1,
+                        'electricity_main',?,0, ?,0.07,?,0.50)
+            """, (ts, ts, cp2, kwh, round(kwh * 0.07, 4)))
+        store2._conn.commit()
+
+        blocks = store2.get_blocks_for_local_date_range("2026-03-01", "2026-03-31")
+        s = ec.calculate_billing_summary_for_period(
+            blocks, datetime(2026, 3, 1), datetime(2026, 4, 1))
+
+        raw_kwh  = sum(d["kwh"]  for d in s["main_import_raw"].values())
+        rem_kwh  = sum(t["kwh"]  for k, t in s["totals"].items()
+                       if not t.get("is_submeter") and "import" in k.lower())
+        self.assertAlmostEqual(raw_kwh, rem_kwh, places=4,
+            msg="With no sub-meters, raw must equal remainder")
+
+    def test_render_contains_total_grid_kwh(self):
+        """Rendered HTML must contain the total grid kWh figure."""
+        self._insert("2026-03-01T00:00:00", main_imp=10.0, ev_imp=4.0, bat_imp=3.0)
+        s = self._summary()
+        html = ec.render_billing_summary(s, currency="£")
+
+        raw_kwh = sum(d["kwh"] for d in s["main_import_raw"].values())
+        # The total row should contain the raw kWh formatted to 3dp
+        expected = f"{raw_kwh:.3f}"
+        self.assertIn(expected, html,
+            msg=f"Rendered HTML must contain total grid kWh {expected}")
+
+    def test_render_contains_submeter_device_labels(self):
+        """Rendered HTML must contain device labels for sub-meters."""
+        self._insert("2026-03-01T00:00:00", main_imp=10.0, ev_imp=4.0, bat_imp=3.0)
+        s = self._summary()
+        html = ec.render_billing_summary(s, currency="£")
+        self.assertIn("Zappi EV Charger", html,
+            msg="Rendered HTML must show EV charger device label")
+        self.assertIn("Solax Battery", html,
+            msg="Rendered HTML must show battery device label")
+        self.assertIn("House (remainder)", html,
+            msg="Rendered HTML must show house remainder label")
+        self.assertIn("Import — total grid", html,
+            msg="Rendered HTML must show total grid header")

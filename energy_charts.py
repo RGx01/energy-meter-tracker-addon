@@ -592,6 +592,7 @@ def get_all_year_periods(blocks, tz=None):
 def calculate_billing_summary_for_period(blocks, period_start, period_end):
     meter_summary  = defaultdict(lambda: defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "read_start": None, "read_end": None}))
     meter_totals   = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "read_start": None, "read_end": None})
+    main_import_raw = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0})  # rate -> totals before sub-meter subtraction
     standing_by_day = defaultdict(float)
     charged_days   = set()
     meter_meta     = {}   # display_key -> {site, device, mpan, tariff, is_submeter}
@@ -659,6 +660,9 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
                     if is_export:
                         cost = -abs(cost)
                     elif is_main_import:
+                        # Store raw total before sub-meter subtraction (for bill summary header)
+                        main_import_raw[rate]["kwh"]  += kwh
+                        main_import_raw[rate]["cost"] += cost
                         # Subtract sub-meter contribution at this rate from main import
                         kwh  = max(0.0, kwh  - sub_by_rate[rate]["kwh"])
                         cost = max(0.0, cost - sub_by_rate[rate]["cost"])
@@ -697,15 +701,25 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
     total_standing = sum(standing_by_day.values())
     total_cost = sum(t["cost"] for t in meter_totals.values()) + total_standing
 
+    # Collect main meter read_start / read_end for the raw import header
+    _main_key = next((k for k in meter_totals if "Electricity Main / Import" in k
+                      and not meter_totals[k].get("is_submeter")), None)
+    main_import_reads = {
+        "read_start": meter_totals[_main_key]["read_start"] if _main_key else None,
+        "read_end":   meter_totals[_main_key]["read_end"]   if _main_key else None,
+    }
+
     return {
-        "start":          period_start,
-        "end":            period_end,
-        "meters":         meter_summary,
-        "totals":         meter_totals,
-        "standing":       standing_by_day,
-        "total_standing": total_standing,
-        "total_cost":     total_cost,
-        "meter_meta":     meter_meta,
+        "start":             period_start,
+        "end":               period_end,
+        "meters":            meter_summary,
+        "totals":            meter_totals,
+        "main_import_raw":   dict(main_import_raw),
+        "main_import_reads": main_import_reads,
+        "standing":          standing_by_day,
+        "total_standing":    total_standing,
+        "total_cost":        total_cost,
+        "meter_meta":        meter_meta,
     }
 
 
@@ -713,13 +727,38 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
 # Billing summary renderer
 # ─────────────────────────────────────────────────────────────
 
+def _bill_rate_rows(channels, currency):
+    """Render rate breakdown rows for a channel dict {rate: {kwh, cost}}."""
+    rows = ""
+    for rate in sorted(channels):
+        d = channels[rate]
+        cost_val = d["cost"]
+        cost_str = f"({-cost_val:.2f})" if cost_val < 0 else f"{cost_val:.2f}"
+        rows += f"""
+            <tr>
+              <td></td><td>{rate:.4f}</td>
+              <td>{d['kwh']:.3f}</td><td>{cost_str}</td>
+            </tr>"""
+    return rows
+
+
+def _bill_total_row(kwh, cost):
+    cost_str = f"({-cost:.2f})" if cost < 0 else f"{cost:.2f}"
+    return f"""
+        <tr class="channel-total">
+          <td>Total</td><td></td><td>{kwh:.3f}</td><td>{cost_str}</td>
+        </tr>"""
+
+
 def render_billing_summary(summary, currency='£', site_name=None):
     if not summary:
         return ""
 
-    meter_meta = summary.get("meter_meta", {})
+    meter_meta       = summary.get("meter_meta", {})
+    main_import_raw  = summary.get("main_import_raw", {})
+    main_reads       = summary.get("main_import_reads", {})
 
-    # ── Site header — prefer passed site_name, fall back to block meta ──
+    # ── Site header ──
     if not site_name:
         site_name = next(
             (m.get("site") for m in meter_meta.values() if m.get("site") and not m.get("is_submeter")),
@@ -736,67 +775,114 @@ def render_billing_summary(summary, currency='£', site_name=None):
         {site_header}
     '''
 
-    for meter_name in sorted(summary["meters"]):
-        channels    = summary["meters"][meter_name]
-        totals      = summary["totals"].get(meter_name, {})
-        read_start  = totals.get("read_start")
-        read_end    = totals.get("read_end")
-        meta        = meter_meta.get(meter_name, {})
-        is_submeter = totals.get("is_submeter") or meta.get("is_submeter", False)
+    # ── Separate export, main import remainder, and sub-meter imports ──
+    export_keys    = sorted(k for k in summary["meters"] if k.endswith("/ Export"))
+    remainder_keys = sorted(k for k in summary["meters"]
+                            if k.endswith("/ Import")
+                            and not (summary["totals"].get(k) or {}).get("is_submeter"))
+    submeter_keys  = sorted(k for k in summary["meters"]
+                            if k.endswith("/ Import")
+                            and (summary["totals"].get(k) or {}).get("is_submeter"))
 
-        # Channel label: just "Import" or "Export" for all meters
-        channel_label = meter_name.split(" / ", 1)[-1]
-
-        # Suffix: MPAN for main meter, device name for sub-meters
-        if is_submeter and meta.get("device"):
-            suffix_html = f'&nbsp;&nbsp;|&nbsp;&nbsp;{meta["device"]}'
-        elif not is_submeter and meta.get("mpan"):
-            suffix_html = f'&nbsp;&nbsp;|&nbsp;&nbsp;MPAN: <span class="censored">{meta["mpan"]}</span>'
-        else:
-            suffix_html = ""
-        title_line = f'{channel_label}{suffix_html}'
-
-        # Line 2: meter reads (non-submeter only)
-        if not is_submeter and read_start is not None:
+    # ── Export section(s) ──
+    for meter_name in export_keys:
+        channels   = summary["meters"][meter_name]
+        totals     = summary["totals"].get(meter_name, {})
+        meta       = meter_meta.get(meter_name, {})
+        read_start = totals.get("read_start")
+        read_end   = totals.get("read_end")
+        mpan_html  = (f'&nbsp;&nbsp;|&nbsp;&nbsp;MPAN: <span class="censored">{meta["mpan"]}</span>'
+                      if meta.get("mpan") else "")
+        reads_html = ""
+        if read_start is not None:
             read_total = (read_end or 0.0) - (read_start or 0.0)
             reads_html = (f'<br><span class="reads">'
                           f'Start: <span class="censored">{read_start:.3f}</span>'
                           f'&nbsp;&nbsp;End: <span class="censored">{read_end:.3f}</span>'
-                          f'&nbsp;&nbsp;Total: {read_total:.3f} kWh'
-                          f'</span>')
-        else:
-            reads_html = ""
+                          f'&nbsp;&nbsp;Total: {read_total:.3f} kWh</span>')
+        html += f"""
+        <tr class="channel-title">
+          <td colspan="4">Export{mpan_html}{reads_html}</td>
+        </tr>
+        <tr class="channel-header">
+          <td></td><td>Rate ({currency}/kWh)</td><td>kWh</td><td>Cost ({currency})</td>
+        </tr>"""
+        html += _bill_rate_rows(channels, currency)
+        html += _bill_total_row(totals["kwh"], totals["cost"])
+
+    # ── Import — total grid (raw, before sub-meter subtraction) ──
+    if remainder_keys or submeter_keys:
+        # Build raw totals from main_import_raw
+        raw_kwh  = sum(d["kwh"]  for d in main_import_raw.values())
+        raw_cost = sum(d["cost"] for d in main_import_raw.values())
+
+        # Reads from main meter
+        read_start = main_reads.get("read_start")
+        read_end   = main_reads.get("read_end")
+        reads_html = ""
+        if read_start is not None:
+            read_total = (read_end or 0.0) - (read_start or 0.0)
+            reads_html = (f'<br><span class="reads">'
+                          f'Start: <span class="censored">{read_start:.3f}</span>'
+                          f'&nbsp;&nbsp;End: <span class="censored">{read_end:.3f}</span>'
+                          f'&nbsp;&nbsp;Total: {read_total:.3f} kWh</span>')
+
+        # MPAN from first remainder key meta
+        mpan_html = ""
+        if remainder_keys:
+            _meta = meter_meta.get(remainder_keys[0], {})
+            if _meta.get("mpan"):
+                mpan_html = f'&nbsp;&nbsp;|&nbsp;&nbsp;MPAN: <span class="censored">{_meta["mpan"]}</span>'
 
         html += f"""
         <tr class="channel-title">
-          <td colspan="4">{title_line}{reads_html}</td>
-        </tr>"""
-
-        html += f'''
+          <td colspan="4">Import — total grid{mpan_html}{reads_html}</td>
+        </tr>
         <tr class="channel-header">
           <td></td><td>Rate ({currency}/kWh)</td><td>kWh</td><td>Cost ({currency})</td>
+        </tr>"""
+        html += _bill_rate_rows(main_import_raw, currency)
+        html += _bill_total_row(raw_kwh, raw_cost)
+
+        # ── Sub-meter breakdown (indented) ──
+        if submeter_keys or remainder_keys:
+            html += '''
+        <tr class="submeter-breakdown-header">
+          <td colspan="4">Breakdown by meter</td>
         </tr>'''
 
-        for rate in sorted(channels):
-            d = channels[rate]
-            cost_val = d["cost"]
-            cost_str = f"({-cost_val:.2f})" if cost_val < 0 else f"{cost_val:.2f}"
-            html += f"""
-            <tr>
-              <td></td><td>{rate:.4f}</td>
-              <td>{d['kwh']:.3f}</td><td>{cost_str}</td>
-            </tr>"""
-
-        total_cost = totals["cost"]
-        total_cost_str = f"({-total_cost:.2f})" if total_cost < 0 else f"{total_cost:.2f}"
-        html += f"""
-        <tr class="channel-total">
-          <td>Total</td><td></td>
-          <td>{totals['kwh']:.3f}</td><td>{total_cost_str}</td>
+            # House remainder first
+            for meter_name in remainder_keys:
+                channels = summary["meters"][meter_name]
+                totals   = summary["totals"].get(meter_name, {})
+                html += f"""
+        <tr class="channel-title submeter-indent">
+          <td colspan="4">House (remainder)</td>
+        </tr>
+        <tr class="channel-header submeter-indent">
+          <td></td><td>Rate ({currency}/kWh)</td><td>kWh</td><td>Cost ({currency})</td>
         </tr>"""
+                html += _bill_rate_rows(channels, currency)
+                html += _bill_total_row(totals["kwh"], totals["cost"])
 
+            # Sub-meters
+            for meter_name in submeter_keys:
+                channels = summary["meters"][meter_name]
+                totals   = summary["totals"].get(meter_name, {})
+                meta     = meter_meta.get(meter_name, {})
+                label    = meta.get("device") or meter_name.split(" / ")[0].replace("(Sub-meter)", "").replace("(sub-meter)", "").strip()
+                html += f"""
+        <tr class="channel-title submeter-indent">
+          <td colspan="4">{label}</td>
+        </tr>
+        <tr class="channel-header submeter-indent">
+          <td></td><td>Rate ({currency}/kWh)</td><td>kWh</td><td>Cost ({currency})</td>
+        </tr>"""
+                html += _bill_rate_rows(channels, currency)
+                html += _bill_total_row(totals["kwh"], totals["cost"])
+
+    # ── Standing charge ──
     if summary["standing"]:
-        # Group days by rate to handle mid-period tariff changes
         rate_groups = {}
         for day_date, amount in sorted(summary["standing"].items()):
             rate = round(amount, 4)
@@ -1632,7 +1718,6 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"/>
 <meta http-equiv="Pragma" content="no-cache"/>
 <meta http-equiv="Expires" content="0"/>
-<meta http-equiv="refresh" content="130"/>
 <script>
 (function(){{
   var stored = localStorage.getItem('emt_chart_theme');
@@ -1861,6 +1946,25 @@ body {{
 .channel-header td {{ font-size: 11px; color: var(--muted); padding-bottom: 2px; }}
 .channel-total td  {{ padding-top: 2px; font-weight: 600; }}
 .standing td       {{ padding-top: 8px; }}
+.submeter-breakdown-header td {{
+  text-align: left;
+  padding-top: 10px;
+  padding-bottom: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-top: 1px solid var(--border);
+}}
+.submeter-indent td:first-child {{ padding-left: 12px; }}
+.channel-title.submeter-indent td {{
+  border-top: none;
+  padding-top: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}}
+.channel-header.submeter-indent td {{ padding-left: 12px; }}
 .grand-total td    {{
   padding-top: 8px;
   font-size: 14px;
@@ -2177,21 +2281,22 @@ body {{
 <script>
 // ── Mobile chart scaling ──────────────────────────────────
 var _MIN_CHART_W = 380; // px — below this we scale rather than reflow
-function _scaleChartEl(el) {{
+var _relayoutTimer = null;
+
+function _scaleChartEl(el, deferRelayout) {{
   var wrap = el.closest('.day-chart-wrap');
   if (!wrap) return;
-  var avail = wrap.offsetWidth;
+  // Use el.offsetWidth — the actual flex-computed chart container width
+  var avail = el.offsetWidth;
   if (avail < 1) return;
-  // In column layout (mobile), chart takes full width — no scaling needed
-  // In row layout (desktop), chart is flex:1 beside summary
   var isMobile = window.getComputedStyle(wrap).flexDirection === 'column';
   if (isMobile) {{
     el.style.transform = '';
     el.style.transformOrigin = '';
     el.style.width = '';
-    // Reduce tick density on narrow screens
-    if (el._fullData && avail < 480) {{
-      var skipEvery = avail < 320 ? 5 : 3; // show every 3rd or 5th hour
+    el.style.height = '';
+    if (!deferRelayout && el._fullData && avail < 480) {{
+      var skipEvery = avail < 320 ? 5 : 3;
       var vals = [], texts = [];
       el._fullLayout.xaxis.tickvals.forEach(function(v, i) {{
         if (i % skipEvery === 0) {{ vals.push(v); texts.push(el._fullLayout.xaxis.ticktext[i]); }}
@@ -2208,13 +2313,26 @@ function _scaleChartEl(el) {{
     el.style.transform = '';
     el.style.transformOrigin = '';
     el.style.width = '';
+    el.style.height = '';
+    // Plotly relayout deferred — batched after resize settles
+    if (!deferRelayout && window.Plotly && window._energyCharts && window._energyCharts[el.id]) {{
+      Plotly.relayout(el, {{autosize: true, width: avail}});
+    }}
   }}
 }}
 
 function _scaleDayCharts() {{
+  // Pass 1: CSS transforms only — instant, no Plotly calls
   document.querySelectorAll('.chart-container').forEach(function(el) {{
-    if (window._energyCharts && window._energyCharts[el.id]) _scaleChartEl(el);
+    if (window._energyCharts && window._energyCharts[el.id]) _scaleChartEl(el, true);
   }});
+  // Pass 2: Plotly relayouts — debounced, runs after resize animation settles
+  clearTimeout(_relayoutTimer);
+  _relayoutTimer = setTimeout(function() {{
+    document.querySelectorAll('.chart-container').forEach(function(el) {{
+      if (window._energyCharts && window._energyCharts[el.id]) _scaleChartEl(el, false);
+    }});
+  }}, 400);
 }}
 
 window.addEventListener('resize', _scaleDayCharts, {{passive: true}});
@@ -2483,6 +2601,19 @@ function showView(view) {{
   }}, {{passive:true}});
 }})();
 </script>
+
+<script>
+(function() {{
+  // Listen for resize notifications from the EMT parent page (charts.html).
+  // The parent's ResizeObserver detects the sidebar toggle and posts the
+  // new available width — we use it to relayout charts without reloading.
+  window.addEventListener('message', function(e) {{
+    if (!e.data || e.data.type !== 'emt-resize') return;
+    if (typeof _scaleDayCharts === 'function') _scaleDayCharts();
+    if (typeof scaleChart === 'function') scaleChart();
+  }});
+}})();
+</script>
 </body>
 </html>
 """
@@ -2689,7 +2820,6 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None, curren
     return f"""<html data-theme="light">
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<meta http-equiv="refresh" content="130">
 <script>
 (function(){{
   var stored = localStorage.getItem('emt_chart_theme');
@@ -2960,6 +3090,19 @@ window.addEventListener('message', function(e) {{
   }}
 }});
 Plotly.newPlot('heatmap', data, layout, {{responsive: false, scrollZoom: false, touchZoom: false, displayModeBar: false}}).then(scaleChart);
+</script>
+
+<script>
+(function() {{
+  // Listen for resize notifications from the EMT parent page (charts.html).
+  // The parent's ResizeObserver detects the sidebar toggle and posts the
+  // new available width — we use it to relayout charts without reloading.
+  window.addEventListener('message', function(e) {{
+    if (!e.data || e.data.type !== 'emt-resize') return;
+    if (typeof _scaleDayCharts === 'function') _scaleDayCharts();
+    if (typeof scaleChart === 'function') scaleChart();
+  }});
+}})();
 </script>
 </body>
 </html>"""

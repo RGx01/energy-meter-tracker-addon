@@ -258,25 +258,44 @@ function getChartHeight() {
 
 var _resizeTimer = null;
 var _suppressResize = false;
+var _resizeObserverW = 0;
 
 function resizeChartIframes() {
   if (_suppressResize) return;
-  // Update container heights immediately
   var h = getChartHeight();
   document.querySelectorAll('.chart-content-wrap').forEach(function(el) {
     el.style.height = h;
     var iframe = el.querySelector('iframe');
     if (iframe) iframe.style.height = h;
   });
-  // Only reload if the window size actually changed (real zoom/resize)
-  clearTimeout(_resizeTimer);
-  _resizeTimer = setTimeout(function() {
-    var activeTab  = document.querySelector('.chart-tab.active');
-    var activeName = activeTab && activeTab.textContent.indexOf('Daily') !== -1 ? 'daily' : 'heatmap';
-    chartsLoaded[activeName] = false;
-    loadChartContent(activeName, true);
-  }, 600);
 }
+
+// Use ResizeObserver on the chart container — catches HA sidebar open/close.
+// Posts the new width into the iframe via postMessage so the iframe can
+// relayout its Plotly charts without a full reload.
+(function() {
+  if (typeof ResizeObserver === 'undefined') return;
+  var target = document.querySelector('.main-content') || document.body;
+  var ro = new ResizeObserver(function(entries) {
+    var w = entries[0].contentRect.width;
+    if (Math.abs(w - _resizeObserverW) < 20) return;
+    _resizeObserverW = w;
+    if (_suppressResize) return;
+    resizeChartIframes();
+    // Notify the active chart iframe of its new available width
+    clearTimeout(_resizeTimer);
+    _resizeTimer = setTimeout(function() {
+      var activeId = document.querySelector('.chart-tab.active[data-chart="daily"]')
+                     ? 'chart-daily-content' : 'chart-heatmap-content';
+      var iframe = document.getElementById(activeId) &&
+                   document.getElementById(activeId).querySelector('iframe');
+      if (iframe && iframe.contentWindow) {
+        iframe.contentWindow.postMessage({ type: 'emt-resize', width: w }, '*');
+      }
+    }, 400);
+  });
+  ro.observe(target);
+})();
 
 window.addEventListener('resize', resizeChartIframes, { passive: true });
 
@@ -314,7 +333,7 @@ window.addEventListener('message', function(e) {
   if (e.data && e.data.type === 'suppressResize') {
     _suppressResize = true;
     clearTimeout(_resizeTimer);
-    setTimeout(function() { _suppressResize = false; }, 800);
+    setTimeout(function() { _suppressResize = false; }, 1000);
   }
   // Theme toggle from parent shell — reload active iframe chart with new theme
   if (e.data && e.data.type === 'emt-theme') {
@@ -339,6 +358,11 @@ async function loadChartContent(name, force) {
   var containerId = name === 'daily' ? 'chart-daily-content' : 'chart-heatmap-content';
   var el = document.getElementById(containerId);
   if (!el) return;
+  // Remove any non-iframe placeholder content (e.g. "Loading chart..." div)
+  // before fetching so it doesn't show alongside the new iframe
+  Array.from(el.children).forEach(function(child) {
+    if (child.tagName !== 'IFRAME') el.removeChild(child);
+  });
   try {
     var h = getChartHeight();
     var r = await fetch(apiUrl(endpoint) + '?t=' + Date.now());
@@ -358,8 +382,19 @@ async function loadChartContent(name, force) {
       iframe.style.cssText = 'width:100%;height:' + h + ';border:none;display:block;';
       iframe.srcdoc = data.html;
       el.style.height = h;
-      el.innerHTML = '';
-      el.appendChild(iframe);
+      var existing = el.querySelector('iframe');
+      if (existing) {
+        // Swap in-place: append hidden, remove old on load — no white flash
+        iframe.style.opacity = '0';
+        el.appendChild(iframe);
+        iframe.onload = function() {
+          if (existing.parentNode) existing.parentNode.removeChild(existing);
+          iframe.style.opacity = '1';
+        };
+      } else {
+        // First load — just append directly, no crossfade needed
+        el.appendChild(iframe);
+      }
       chartsLoaded[name] = true;
     } else {
       throw new Error('No html in response — keys: ' + Object.keys(data).join(', '));

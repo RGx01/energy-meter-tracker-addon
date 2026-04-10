@@ -1,5 +1,44 @@
 # Changelog
 
+## [2.2.0] — 2026-04-10
+
+### Added
+- **Bill summary redesign** — the Import section now shows total grid draw at the top,
+  matching what your supplier bills, with sub-meter breakdown (House remainder, EV charger,
+  Battery) indented beneath. Previously only the remainder was shown as "Import", making
+  supplier reconciliation require manual summing across sections.
+
+- **Delete Blocks** — new sub-page under Data Management (`/delete-blocks`) to permanently
+  delete blocks for a date range, optionally filtered to a single meter. Shows a block and
+  day count preview before requiring explicit confirmation. Cannot be undone.
+
+- **Historical Corrections** promoted to own page — moved from the Data Management page to
+  its own sub-page (`/corrections`) following the same pattern as Billing History under
+  Meter Config. Data Management topbar now has direct links to both sub-pages.
+
+- **Compact Database** — "Compact Now" button on the Data Management page runs `VACUUM`
+  on the blocks database. The engine is paused briefly during the operation to ensure
+  exclusive access. Reports size before and after so you can see how much space was
+  reclaimed. Most useful after bulk deletions; at ~40 KB/day growth it is rarely urgent.
+
+### Fixed
+- Date inputs in Delete Blocks and Historical Corrections now show `dd/mm/yyyy` format
+  hint in labels and use `lang="en-GB"` to encourage day-first display in supporting
+  browsers.
+
+- **Billing and heatmap chart flicker removed** — `<meta http-equiv="refresh">` has been
+  removed from generated chart HTML. The EMT charts page handles refresh cleanly via its
+  own 2-minute `setInterval` without reloading the iframe. Lovelace users should switch
+  to the dedicated `/lovelace/billing` and `/lovelace/heatmap` endpoints (see below).
+
+- **Lovelace-friendly chart endpoints** — `/lovelace/billing` and `/lovelace/heatmap`
+  serve the chart HTML with a 130-second meta refresh and aggressive no-cache headers
+  baked in at serve time. Use these URLs in Lovelace webpage cards instead of the raw
+  `/charts/*.html` URLs — they refresh reliably and never get stuck in the browser cache.
+  Documented in the Help page.
+
+---
+
 ## [2.1.9] — 2026-04-07
 
 ### Fixed

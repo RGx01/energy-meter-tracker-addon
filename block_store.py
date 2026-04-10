@@ -581,6 +581,63 @@ class BlockStore:
         return {"deleted": True, "blocks_reassigned": block_rows}
 
 
+    def delete_blocks_for_date_range(
+        self, from_date: str, to_date: str, meter_id: str | None = None
+    ) -> dict:
+        """
+        Delete all blocks whose local_date falls within [from_date, to_date] inclusive.
+
+        Optionally restricted to a single meter_id (deletes that meter's rows only).
+        When meter_id is None, ALL meters are deleted for the date range.
+
+        Returns {"deleted": N, "dates": N_distinct_dates}.
+        Raises ValueError on invalid inputs.
+        """
+        if not from_date or not to_date:
+            raise ValueError("from_date and to_date are required")
+        if from_date > to_date:
+            raise ValueError("from_date must not be after to_date")
+
+        where  = "local_date >= ? AND local_date <= ?"
+        params = [from_date, to_date]
+        if meter_id:
+            where  += " AND meter_id = ?"
+            params.append(meter_id)
+
+        # Count first so the caller can preview
+        cur = self._conn.execute(
+            f"SELECT COUNT(*) as n, COUNT(DISTINCT local_date) as d FROM blocks WHERE {where}",
+            params
+        )
+        row = cur.fetchone()
+        n_blocks = row["n"]
+        n_dates  = row["d"]
+
+        with self._conn:
+            self._conn.execute(f"DELETE FROM blocks WHERE {where}", params)
+
+        return {"deleted": n_blocks, "dates": n_dates}
+
+    def count_blocks_for_date_range(
+        self, from_date: str, to_date: str, meter_id: str | None = None
+    ) -> dict:
+        """
+        Preview how many blocks would be deleted for a given date range.
+        Returns {"blocks": N, "dates": N_distinct_dates}.
+        """
+        where  = "local_date >= ? AND local_date <= ?"
+        params = [from_date, to_date]
+        if meter_id:
+            where  += " AND meter_id = ?"
+            params.append(meter_id)
+        cur = self._conn.execute(
+            f"SELECT COUNT(*) as n, COUNT(DISTINCT local_date) as d FROM blocks WHERE {where}",
+            params
+        )
+        row = cur.fetchone()
+        return {"blocks": row["n"], "dates": row["d"]}
+
+
     def backup(self, dst_path: str) -> None:
         """Hot backup to dst_path using SQLite's online backup API."""
         dst = sqlite3.connect(dst_path)
