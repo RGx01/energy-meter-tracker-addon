@@ -7,8 +7,8 @@
       <a href="{{ url_for('import_page') }}" style="color:var(--muted);text-decoration:none;">Data Management</a>
       &nbsp;/
     </div>
-    <h2>Historical Corrections</h2>
-    <div class="sub">Correct rates and standing charges in the live database</div>
+    <h2>Delete Blocks</h2>
+    <div class="sub">Permanently remove blocks for a date range</div>
   </div>
   <div style="display:flex;gap:8px;">
     <button class="btn btn-secondary" id="btn-backup" onclick="doManualBackup()">💾 Backup Now</button>
@@ -22,84 +22,46 @@
 <div id="alert-error"   class="alert alert-danger"></div>
 
 <div class="card">
-  <div style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.7;">
-    Correct standing charges or tariff rates for specific blocks in the live database.
-    Rate corrections show a per-block preview before applying so you can verify exactly
-    which blocks will change. Always operates on the live <code style="font-family:var(--mono);font-size:12px;">blocks.db</code>.
+  <div style="font-size:13px;color:var(--muted);margin-bottom:20px;line-height:1.7;">
+    Permanently delete blocks for a date range from the live database.
+    Use this to remove bad data — e.g. a period affected by a sensor fault or gap fill error.
+    <strong style="color:var(--danger);">This cannot be undone.</strong>
+    Always take a backup first.
   </div>
 
-  <!-- Type -->
-  <div style="margin-bottom:14px;">
-    <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:6px;">Correction type</label>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;">
-      <button id="corr-type-standing" class="btn btn-primary" onclick="corrSetType('standing')" style="font-size:12px;">Standing Charge</button>
-      <button id="corr-type-rate-imp" class="btn" onclick="corrSetType('rate-import')" style="font-size:12px;">Import Rate</button>
-      <button id="corr-type-rate-exp" class="btn" onclick="corrSetType('rate-export')" style="font-size:12px;">Export Rate</button>
-    </div>
-  </div>
-
-  <!-- Date range -->
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;">
     <div>
-      <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">From date <span style="font-weight:400;">(dd/mm/yyyy, local)</span></label>
-      <input id="corr-from" type="date" lang="en-GB" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;font-family:inherit;">
+      <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:6px;">From date <span style="font-weight:400;">(dd/mm/yyyy)</span></label>
+      <input type="date" id="del-from-date" style="width:100%;" lang="en-GB">
     </div>
     <div>
-      <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">To date <span style="font-weight:400;">(dd/mm/yyyy, inclusive)</span></label>
-      <input id="corr-to" type="date" lang="en-GB" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;font-family:inherit;">
+      <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:6px;">To date <span style="font-weight:400;">(dd/mm/yyyy)</span></label>
+      <input type="date" id="del-to-date" style="width:100%;" lang="en-GB">
     </div>
   </div>
 
-  <!-- Time window (rate only) -->
-  <div id="corr-time-row" style="display:none;margin-bottom:14px;">
-    <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:6px;">
-      Time window <span style="font-weight:400;">(local time — leave blank to apply all day)</span>
-    </label>
-    <div style="display:flex;gap:8px;align-items:center;">
-      <input id="corr-from-time" type="time" placeholder="00:00"
-        style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;font-family:inherit;">
-      <span style="color:var(--muted);font-size:13px;">to</span>
-      <input id="corr-to-time" type="time" placeholder="24:00"
-        style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;font-family:inherit;">
-      <span style="font-size:11px;color:var(--muted);">end is exclusive</span>
-    </div>
-    <div style="font-size:11px;color:var(--muted);margin-top:4px;">
-      Useful for mid-day tariff changes or time-of-use rates (e.g. Economy 7 00:30–07:30).
-    </div>
-  </div>
-
-  <!-- Meter selector (rate only) -->
-  <div id="corr-meter-row" style="display:none;margin-bottom:14px;">
-    <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">Meter</label>
-    <select id="corr-meter"
-      style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;font-family:inherit;min-width:200px;">
-      <option value="all">All meters</option>
+  <div style="margin-bottom:14px;">
+    <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:6px;">Meter <span style="font-weight:400;">(optional — leave blank to delete all meters)</span></label>
+    <select id="del-meter-id" style="width:100%;">
+      <option value="">All meters</option>
     </select>
   </div>
 
-  <!-- Value -->
-  <div style="margin-bottom:14px;">
-    <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;" id="corr-value-label">New standing charge (£/day)</label>
-    <input id="corr-value" type="number" min="0" step="0.000001" placeholder="e.g. 0.245000"
-      style="width:200px;box-sizing:border-box;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;font-family:inherit;">
+  <button class="btn btn-secondary" onclick="deleteBlocksPreview()" style="margin-bottom:12px;">Preview</button>
+
+  <div id="del-preview" style="display:none;margin-bottom:12px;">
+    <div id="del-preview-text" style="font-size:13px;padding:10px 14px;background:var(--surface);border:1px solid var(--border);border-radius:6px;margin-bottom:10px;"></div>
+    <div id="del-confirm-row" style="display:none;">
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px;cursor:pointer;">
+        <input type="checkbox" id="del-confirm-check" onchange="document.getElementById('del-confirm-btn').disabled=!this.checked;">
+        I understand this is permanent and cannot be undone
+      </label>
+      <button class="btn btn-danger" id="del-confirm-btn" onclick="deleteBlocksApply()" disabled>Delete blocks</button>
+    </div>
   </div>
 
-  <!-- Recalc cost (rate only) -->
-  <div id="corr-recalc-row" style="display:none;margin-bottom:14px;">
-    <label style="font-size:12px;font-weight:600;color:var(--muted);display:flex;align-items:center;gap:8px;cursor:pointer;">
-      <input id="corr-recalc" type="checkbox" checked> Recalculate cost from corrected rate × kWh
-    </label>
-    <div style="font-size:11px;color:var(--muted);margin-top:4px;">Uncheck to update the rate value only without changing cost figures.</div>
-  </div>
-
-  <!-- Actions -->
-  <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
-    <button class="btn" onclick="corrPreview()" style="font-size:13px;">🔍 Preview</button>
-    <button class="btn" id="corr-apply-btn" onclick="corrApply()" style="font-size:13px;color:var(--danger);border-color:var(--danger);display:none;">✓ Apply correction</button>
-  </div>
-
-  <div id="corr-preview" style="display:none;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px 16px;font-size:13px;margin-bottom:12px;"></div>
-  <div id="corr-result"  style="display:none;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px 16px;font-size:13px;"></div>
+  <div id="del-success" class="alert alert-success" style="display:none;"></div>
+  <div id="del-error"   class="alert alert-danger"  style="display:none;"></div>
 </div>
 {% endblock %}
 
@@ -126,199 +88,111 @@ async function doManualBackup() {
   }
 }
 
-var _corrType = 'standing';
-
-function escHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
 document.addEventListener('DOMContentLoaded', function() {
-  // Load meters
   fetch(apiUrl('/api/corrections/meters'))
     .then(function(r) { return r.json(); })
     .then(function(d) {
-      var sel = document.getElementById('corr-meter');
-      var existing = Array.from(sel.options).map(function(o) { return o.value; });
+      var sel = document.getElementById('del-meter-id');
       (d.meters || []).forEach(function(m) {
-        if (!existing.includes(m)) {
-          var opt = document.createElement('option');
-          opt.value = m; opt.textContent = m;
-          sel.appendChild(opt);
-        }
+        var opt = document.createElement('option');
+        opt.value = m; opt.textContent = m;
+        sel.appendChild(opt);
       });
-    })
-    .catch(function() {});
-  // Load currency symbol
-  fetch(apiUrl('/api/config'))
-    .then(function(r) { return r.json(); })
-    .then(function(cfg) {
-      var sym = '£';
-      Object.values(cfg.meters || {}).forEach(function(m) {
-        if (!(m.meta || {}).sub_meter && (m.meta || {}).currency_symbol)
-          sym = m.meta.currency_symbol;
-      });
-      window._corrSym = sym;
-      corrSetType('standing');
     })
     .catch(function() {});
 });
 
-function corrSetType(t) {
-  _corrType = t;
-  var isRate = t !== 'standing';
-  var sym = window._corrSym || '£';
-  var labels = {
-    'standing':    'New standing charge (' + sym + '/day)',
-    'rate-import': 'New import rate (' + sym + '/kWh)',
-    'rate-export': 'New export rate (' + sym + '/kWh)',
-  };
-  document.getElementById('corr-value-label').textContent = labels[t] || '';
-  document.getElementById('corr-recalc-row').style.display  = isRate ? '' : 'none';
-  document.getElementById('corr-time-row').style.display    = isRate ? '' : 'none';
-  document.getElementById('corr-meter-row').style.display   = isRate ? '' : 'none';
-  ['corr-type-standing','corr-type-rate-imp','corr-type-rate-exp'].forEach(function(id) {
-    document.getElementById(id).className = 'btn';
-  });
-  var active = t === 'standing' ? 'corr-type-standing' : t === 'rate-import' ? 'corr-type-rate-imp' : 'corr-type-rate-exp';
-  document.getElementById(active).className = 'btn btn-primary';
-  document.getElementById('corr-preview').style.display   = 'none';
-  document.getElementById('corr-result').style.display    = 'none';
-  document.getElementById('corr-apply-btn').style.display = 'none';
-}
+function deleteBlocksPreview() {
+  var fromDate = document.getElementById('del-from-date').value;
+  var toDate   = document.getElementById('del-to-date').value;
+  var meterId  = document.getElementById('del-meter-id').value || null;
+  var errEl    = document.getElementById('del-error');
+  var prevEl   = document.getElementById('del-preview');
+  var prevText = document.getElementById('del-preview-text');
+  var confRow  = document.getElementById('del-confirm-row');
+  var confChk  = document.getElementById('del-confirm-check');
+  var confBtn  = document.getElementById('del-confirm-btn');
+  var succEl   = document.getElementById('del-success');
 
-function corrPreview() {
-  var from     = document.getElementById('corr-from').value;
-  var to       = document.getElementById('corr-to').value;
-  var value    = document.getElementById('corr-value').value;
-  var fromTime = _corrType !== 'standing' ? document.getElementById('corr-from-time').value : '';
-  var toTime   = _corrType !== 'standing' ? document.getElementById('corr-to-time').value   : '';
-  var meterId  = _corrType !== 'standing' ? document.getElementById('corr-meter').value      : 'all';
-  var prev     = document.getElementById('corr-preview');
-  var applyBtn = document.getElementById('corr-apply-btn');
+  errEl.style.display  = 'none';
+  succEl.style.display = 'none';
+  confChk.checked      = false;
+  confBtn.disabled     = true;
 
-  if (!from || !to || !value) { alert('Please fill in date range and new value.'); return; }
-  if (from > to) { alert('From date must be on or before To date.'); return; }
+  if (!fromDate || !toDate) {
+    errEl.textContent   = 'Please select both a from and to date.';
+    errEl.style.display = 'block';
+    prevEl.style.display = 'none';
+    return;
+  }
 
-  prev.style.display = 'block';
-  prev.innerHTML     = '<span style="color:var(--muted);">Checking…</span>';
-  applyBtn.style.display = 'none';
-
-  var body = {
-    type:      _corrType === 'standing' ? 'standing' : 'rate',
-    from_date: from, to_date: to, value: parseFloat(value),
-    channel:   _corrType === 'rate-export' ? 'export' : 'import',
-    from_time: fromTime, to_time: toTime, meter_id: meterId,
-  };
-
-  fetch(apiUrl('/api/corrections/preview'), {
+  fetch(apiUrl('/api/blocks/delete/preview'), {
     method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from_date: fromDate, to_date: toDate, meter_id: meterId })
   })
   .then(function(r) { return r.json(); })
   .then(function(d) {
-    if (d.error) { prev.innerHTML = '<span style="color:var(--danger);">' + escHtml(d.error) + '</span>'; return; }
-
-    if (_corrType === 'standing') {
-      if (!d.blocks) { prev.innerHTML = '<span style="color:var(--muted);">No blocks found in that date range.</span>'; return; }
-      var curRange = d.current_min === d.current_max ? d.current_min.toFixed(4) : d.current_min.toFixed(4) + ' – ' + d.current_max.toFixed(4);
-      prev.innerHTML = '<strong>' + d.blocks.toLocaleString() + ' blocks</strong> across <strong>' + d.days + ' local days</strong> will be updated.<br>Current standing charge: <strong>' + curRange + '</strong> → New value: <strong>' + parseFloat(value).toFixed(4) + '</strong>';
-      applyBtn.style.display = '';
+    if (d.error) {
+      errEl.textContent    = d.error;
+      errEl.style.display  = 'block';
+      prevEl.style.display = 'none';
       return;
     }
-
-    var blocks = d.blocks || [];
-    if (blocks.length === 0) { prev.innerHTML = '<span style="color:var(--muted);">No blocks found matching those filters.</span>'; return; }
-
-    var newVal = parseFloat(value);
-    var totalCurCost = 0, totalNewCost = 0;
-    blocks.forEach(function(b) { totalCurCost += b.current_cost; totalNewCost += b.new_cost; });
-
-    var sym = window._corrSym || '£';
-    var rows = blocks.map(function(b) {
-      var costChange = b.new_cost - b.current_cost;
-      var changeCol  = costChange >= 0 ? 'var(--danger)' : 'var(--success)';
-      var changeSign = costChange >= 0 ? '+' : '';
-      return '<tr style="border-bottom:1px solid var(--border);">' +
-        '<td style="padding:5px 8px;font-family:var(--mono);font-size:12px;">' + escHtml(b.display) + '</td>' +
-        '<td style="padding:5px 8px;font-size:12px;">' + escHtml(b.meter_id) + '</td>' +
-        '<td style="padding:5px 8px;text-align:right;font-size:12px;">' + b.kwh.toFixed(4) + '</td>' +
-        '<td style="padding:5px 8px;text-align:right;font-size:12px;">' + b.current_rate.toFixed(6) + '</td>' +
-        '<td style="padding:5px 8px;text-align:right;font-size:12px;color:var(--accent);">' + newVal.toFixed(6) + '</td>' +
-        '<td style="padding:5px 8px;text-align:right;font-size:12px;">' + sym + b.current_cost.toFixed(4) + '</td>' +
-        '<td style="padding:5px 8px;text-align:right;font-size:12px;">' + sym + b.new_cost.toFixed(4) + '</td>' +
-        '<td style="padding:5px 8px;text-align:right;font-size:12px;color:' + changeCol + ';">' + changeSign + sym + Math.abs(costChange).toFixed(4) + '</td>' +
-        '</tr>';
-    }).join('');
-
-    var totalChange = totalNewCost - totalCurCost;
-    var totalSign   = totalChange >= 0 ? '+' : '';
-    var totalCol    = totalChange >= 0 ? 'var(--danger)' : 'var(--success)';
-    var needsScroll = blocks.length > 10;
-
-    prev.innerHTML =
-      '<div style="margin-bottom:10px;font-size:13px;"><strong>' + blocks.length + ' blocks</strong> will be updated. Total cost change: <span style="color:' + totalCol + ';font-weight:600;">' + totalSign + sym + Math.abs(totalChange).toFixed(4) + '</span></div>' +
-      '<div style="' + (needsScroll ? 'max-height:300px;overflow-y:auto;' : '') + '">' +
-      '<table style="width:100%;border-collapse:collapse;">' +
-        '<thead><tr style="border-bottom:2px solid var(--border);">' +
-          '<th style="text-align:left;padding:5px 8px;font-size:11px;color:var(--muted);font-weight:600;">Block</th>' +
-          '<th style="text-align:left;padding:5px 8px;font-size:11px;color:var(--muted);font-weight:600;">Meter</th>' +
-          '<th style="text-align:right;padding:5px 8px;font-size:11px;color:var(--muted);font-weight:600;">kWh</th>' +
-          '<th style="text-align:right;padding:5px 8px;font-size:11px;color:var(--muted);font-weight:600;">Cur rate</th>' +
-          '<th style="text-align:right;padding:5px 8px;font-size:11px;color:var(--muted);font-weight:600;">New rate</th>' +
-          '<th style="text-align:right;padding:5px 8px;font-size:11px;color:var(--muted);font-weight:600;">Cur cost</th>' +
-          '<th style="text-align:right;padding:5px 8px;font-size:11px;color:var(--muted);font-weight:600;">New cost</th>' +
-          '<th style="text-align:right;padding:5px 8px;font-size:11px;color:var(--muted);font-weight:600;">Change</th>' +
-        '</tr></thead><tbody>' + rows + '</tbody></table></div>';
-
-    applyBtn.style.display = '';
+    prevEl.style.display = 'block';
+    if (d.blocks === 0) {
+      prevText.textContent  = 'No blocks found for the selected date range' + (meterId ? ' and meter' : '') + '.';
+      confRow.style.display = 'none';
+    } else {
+      var meterStr = meterId ? (' for ' + meterId) : ' across all meters';
+      prevText.innerHTML    = '<strong>' + d.blocks + ' blocks</strong> across <strong>' + d.dates + ' day' + (d.dates !== 1 ? 's' : '') + '</strong>' + meterStr + ' will be permanently deleted.';
+      confRow.style.display = 'block';
+    }
   })
-  .catch(function(e) { prev.innerHTML = '<span style="color:var(--danger);">Error: ' + escHtml(e.message) + '</span>'; });
+  .catch(function(e) {
+    errEl.textContent    = 'Preview failed: ' + e.message;
+    errEl.style.display  = 'block';
+    prevEl.style.display = 'none';
+  });
 }
 
-function corrApply() {
-  var from      = document.getElementById('corr-from').value;
-  var to        = document.getElementById('corr-to').value;
-  var value     = document.getElementById('corr-value').value;
-  var recalc    = _corrType !== 'standing' ? document.getElementById('corr-recalc').checked : false;
-  var fromTime  = _corrType !== 'standing' ? document.getElementById('corr-from-time').value : '';
-  var toTime    = _corrType !== 'standing' ? document.getElementById('corr-to-time').value   : '';
-  var meterId   = _corrType !== 'standing' ? document.getElementById('corr-meter').value      : 'all';
-  var result    = document.getElementById('corr-result');
-  var applyBtn  = document.getElementById('corr-apply-btn');
-  var typeLabel = _corrType === 'standing' ? 'standing charge' : (_corrType === 'rate-export' ? 'export rate' : 'import rate');
-  var timeDesc  = (fromTime || toTime) ? (' ' + (fromTime||'00:00') + '–' + (toTime||'end')) : '';
-  var meterDesc = (meterId && meterId !== 'all') ? (' for ' + meterId) : '';
+function deleteBlocksApply() {
+  var fromDate = document.getElementById('del-from-date').value;
+  var toDate   = document.getElementById('del-to-date').value;
+  var meterId  = document.getElementById('del-meter-id').value || null;
+  var confBtn  = document.getElementById('del-confirm-btn');
+  var errEl    = document.getElementById('del-error');
+  var succEl   = document.getElementById('del-success');
+  var prevEl   = document.getElementById('del-preview');
 
-  if (!confirm('Apply ' + typeLabel + ' correction' + meterDesc + ' on ' + from + (from !== to ? ' to ' + to : '') + timeDesc + '? This modifies the live database.')) return;
+  confBtn.disabled    = true;
+  errEl.style.display = 'none';
 
-  applyBtn.disabled    = true;
-  result.style.display = 'block';
-  result.innerHTML     = '<span style="color:var(--muted);">Applying…</span>';
-
-  var body = {
-    type: _corrType === 'standing' ? 'standing' : 'rate',
-    from_date: from, to_date: to, value: parseFloat(value),
-    channel: _corrType === 'rate-export' ? 'export' : 'import',
-    recalc_cost: recalc, from_time: fromTime, to_time: toTime, meter_id: meterId,
-  };
-
-  fetch(apiUrl('/api/corrections/apply'), {
+  fetch(apiUrl('/api/blocks/delete'), {
     method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from_date: fromDate, to_date: toDate, meter_id: meterId, confirmed: true })
   })
   .then(function(r) { return r.json(); })
   .then(function(d) {
-    applyBtn.disabled = false;
-    if (d.error) { result.innerHTML = '<span style="color:var(--danger);">Error: ' + escHtml(d.error) + '</span>'; return; }
-    result.innerHTML = '<span style="color:var(--accent);">✓ Updated <strong>' + d.updated_blocks.toLocaleString() + '</strong> blocks successfully.</span>';
-    applyBtn.style.display = 'none';
-    document.getElementById('corr-preview').style.display = 'none';
+    if (d.error) {
+      errEl.textContent    = d.error;
+      errEl.style.display  = 'block';
+      confBtn.disabled     = false;
+      return;
+    }
+    prevEl.style.display  = 'none';
+    succEl.textContent    = 'Deleted ' + d.deleted + ' blocks across ' + d.dates + ' day' + (d.dates !== 1 ? 's' : '') + '. Regenerate charts to reflect the changes.';
+    succEl.style.display  = 'block';
+    document.getElementById('del-from-date').value = '';
+    document.getElementById('del-to-date').value   = '';
+    document.getElementById('del-meter-id').value  = '';
+    document.getElementById('del-confirm-check').checked = false;
   })
   .catch(function(e) {
-    applyBtn.disabled = false;
-    result.innerHTML = '<span style="color:var(--danger);">Error: ' + escHtml(e.message) + '</span>';
+    errEl.textContent    = 'Delete failed: ' + e.message;
+    errEl.style.display  = 'block';
+    confBtn.disabled     = false;
   });
 }
 </script>
