@@ -787,6 +787,29 @@ function barRender() {
   var sw = document.getElementById('bar-standing-wrap');
   if (sw) sw.style.display = barMetric === 'cost' ? 'flex' : 'none';
 
+  // Normalise barDailyMonth before any rendering — barBuildSubBar would fix it
+  // later but barGetDataForPeriod is called first so it must be correct now.
+  if (barPeriod === 'daily') {
+    if (!barCalendar) {
+      // Billing mode: barDailyMonth must be a string bKey
+      var _allBKeys = [...new Set(barData.map(function(r){ return barBillingKey(r).bKey; }))].sort();
+      if (!barDailyMonth || typeof barDailyMonth !== 'string' || _allBKeys.indexOf(barDailyMonth) < 0) {
+        barDailyMonth = _allBKeys.length > 0 ? _allBKeys[_allBKeys.length - 1] : null;
+      }
+    } else {
+      // Calendar mode: barDailyMonth must be an object {year, month}
+      if (!barDailyMonth || typeof barDailyMonth !== 'object') {
+        if (typeof barDailyMonth === 'string') {
+          var _d = new Date(barDailyMonth + 'T00:00:00Z');
+          barDailyMonth = { year: _d.getUTCFullYear(), month: _d.getUTCMonth() + 1 };
+        } else {
+          var _now = new Date();
+          barDailyMonth = { year: _now.getFullYear(), month: _now.getMonth() + 1 };
+        }
+      }
+    }
+  }
+
   var pd = barGetDataForPeriod();
   var datasets = barGetDatasets(pd.labels, pd.aggList);
   var ctx = document.getElementById('barChart');
