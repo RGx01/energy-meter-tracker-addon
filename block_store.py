@@ -717,11 +717,7 @@ class BlockStore:
                          WHEN b.imp_kwh_grid      IS NOT NULL THEN b.imp_kwh_grid
                          ELSE b.imp_kwh
                        END
-                     ELSE
-                       CASE
-                         WHEN b.imp_kwh_grid IS NOT NULL THEN b.imp_kwh_grid
-                         ELSE b.imp_kwh
-                       END
+                     ELSE COALESCE(b.imp_kwh_grid, 0)
                    END
                  ), 0.0) as imp_kwh,
                  COALESCE(SUM(CASE WHEN m.is_sub_meter = 0 THEN b.imp_cost ELSE 0 END), 0.0) as imp_cost,
@@ -969,11 +965,7 @@ class BlockStore:
                          WHEN b.imp_kwh_grid      IS NOT NULL THEN b.imp_kwh_grid
                          ELSE b.imp_kwh
                        END
-                     ELSE  -- sub-meter: use grid portion, fallback to kwh
-                       CASE
-                         WHEN b.imp_kwh_grid IS NOT NULL THEN b.imp_kwh_grid
-                         ELSE b.imp_kwh
-                       END
+                     ELSE COALESCE(b.imp_kwh_grid, 0)  -- sub-meter: grid only, no raw fallback
                    END
                  ), 0.0) as import_kwh,
                  COALESCE(SUM(CASE WHEN m.is_sub_meter = 0 THEN b.exp_kwh  ELSE 0 END), 0.0) as export_kwh,

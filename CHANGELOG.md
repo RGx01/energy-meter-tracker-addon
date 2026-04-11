@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.2.2] — 2026-04-11
+
+### Fixed
+- **Billing totals kWh double-counting** — `get_billing_totals_for_local_date_range`
+  and `get_cumulative_totals` both fell back to raw `imp_kwh` for sub-meter blocks
+  where `imp_kwh_grid` was NULL, double-counting consumption already included in the
+  main meter total. Fixed to use `COALESCE(imp_kwh_grid, 0)` in both methods.
+
+- **Usage Stats calendar/billing toggle** — switching between billing and calendar
+  modes in daily view left the table stale and caused an empty chart on switching
+  back. Fixed by correctly handling `barDailyMonth` as either a string (billing mode)
+  or object (calendar mode) in `barGetDataForPeriod` and `barBuildSubBar`.
+
+---
+
 ## [2.2.1] — 2026-04-11
 
 ### Fixed
@@ -38,21 +53,21 @@
   exclusive access. Reports size before and after so you can see how much space was
   reclaimed. Most useful after bulk deletions; at ~40 KB/day growth it is rarely urgent.
 
-### Fixed
-- Date inputs in Delete Blocks and Historical Corrections now show `dd/mm/yyyy` format
-  hint in labels and use `lang="en-GB"` to encourage day-first display in supporting
-  browsers.
-
-- **Billing and heatmap chart flicker removed** — `<meta http-equiv="refresh">` has been
-  removed from generated chart HTML. The EMT charts page handles refresh cleanly via its
-  own 2-minute `setInterval` without reloading the iframe. Lovelace users should switch
-  to the dedicated `/lovelace/billing` and `/lovelace/heatmap` endpoints (see below).
-
 - **Lovelace-friendly chart endpoints** — `/lovelace/billing` and `/lovelace/heatmap`
   serve the chart HTML with a 130-second meta refresh and aggressive no-cache headers
   baked in at serve time. Use these URLs in Lovelace webpage cards instead of the raw
   `/charts/*.html` URLs — they refresh reliably and never get stuck in the browser cache.
   Documented in the Help page.
+
+### Fixed
+- Date inputs in Delete Blocks and Historical Corrections now show `dd/mm/yyyy` format
+  hint in labels and use `lang="en-GB"` to encourage day-first display in supporting
+  browsers.
+
+- **Chart flicker removed** — `<meta http-equiv="refresh">` removed from generated chart
+  HTML. The EMT charts page handles refresh cleanly via `setInterval` without reloading
+  the iframe. Lovelace users should use the dedicated `/lovelace/*` endpoints which have
+  the meta refresh injected at serve time.
 
 ---
 
