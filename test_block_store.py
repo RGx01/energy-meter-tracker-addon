@@ -1943,6 +1943,137 @@ class TestMigration(unittest.TestCase):
             os.unlink(path)
 
 
+
+class TestBillingTotalsSubMeterNullGrid(unittest.TestCase):
+    """Regression test: sub-meter with NULL imp_kwh_grid must not double-count."""
+
+    def setUp(self):
+        self.store = BlockStore(":memory:")
+        cfg = {"meters": {
+            "electricity_main": {"meta": {
+                "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
+                "currency_symbol": "£", "currency_code": "GBP",
+            }, "channels": {
+                "import": {"read": "s.imp", "rate": "s.rate"},
+            }},
+            "house_battery": {"meta": {
+                "sub_meter": True, "parent_meter": "electricity_main",
+            }, "channels": {
+                "import": {"read": "s.bat", "rate": "s.rate"},
+            }},
+        }}
+        self.store.insert_config_period(cfg)
+        self.cp = self.store._conn.execute(
+            "SELECT id FROM config_periods LIMIT 1"
+        ).fetchone()["id"]
+
+    def test_null_grid_no_fallback_to_raw_kwh(self):
+        """
+        Sub-meter with imp_kwh populated but imp_kwh_grid=NULL must NOT fall back
+        to imp_kwh — that would double-count since main meter imp_kwh already
+        includes sub-meter consumption. Only COALESCE(imp_kwh_grid, 0) is used.
+        """
+        # main: 13.0 kWh raw, 2.5 remainder
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year,
+            local_month, local_day, meter_id, config_period_id, interpolated,
+            imp_kwh, imp_kwh_remainder, imp_cost, standing_charge)
+            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','2026-03-01',
+            2026,3,1,'electricity_main',?,0, 13.0,2.5,1.17,0.5)
+        """, (self.cp,))
+        # battery: 10.5 kWh raw but imp_kwh_grid=NULL (older block)
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year,
+            local_month, local_day, meter_id, config_period_id, interpolated,
+            imp_kwh, imp_kwh_grid, imp_cost, standing_charge)
+            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','2026-03-01',
+            2026,3,1,'house_battery',?,0, 10.5,NULL,0.0,0.0)
+        """, (self.cp,))
+        self.store._conn.commit()
+
+        t = self.store.get_billing_totals_for_local_date_range('2026-03-01', '2026-03-01')
+
+        # 2.5 (main remainder) + 0 (battery NULL grid → 0) = 2.5, not 2.5+10.5=13.0
+        self.assertAlmostEqual(t["imp_kwh"], 2.5, places=3,
+            msg="Sub-meter NULL imp_kwh_grid must not fall back to imp_kwh")
+        self.assertNotAlmostEqual(t["imp_kwh"], 13.0, places=1,
+            msg="13.0 indicates double-counting bug")
+
+    def test_set_grid_is_included(self):
+        """Sub-meter with imp_kwh_grid set should be included in total."""
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year,
+            local_month, local_day, meter_id, config_period_id, interpolated,
+            imp_kwh, imp_kwh_remainder, imp_cost, standing_charge)
+            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','2026-03-01',
+            2026,3,1,'electricity_main',?,0, 13.0,2.5,1.17,0.5)
+        """, (self.cp,))
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year,
+            local_month, local_day, meter_id, config_period_id, interpolated,
+            imp_kwh, imp_kwh_grid, imp_cost, standing_charge)
+            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','2026-03-01',
+            2026,3,1,'house_battery',?,0, 10.5,10.5,0.0,0.0)
+        """, (self.cp,))
+        self.store._conn.commit()
+
+        t = self.store.get_billing_totals_for_local_date_range('2026-03-01', '2026-03-01')
+
+        # 2.5 remainder + 10.5 grid = 13.0 total grid draw
+        self.assertAlmostEqual(t["imp_kwh"], 13.0, places=3,
+            msg="Sub-meter with imp_kwh_grid set must be included in total")
+
+    def test_submeter_cost_included_when_grid_set(self):
+        """Sub-meter imp_cost must be included in billing totals when imp_kwh_grid is set."""
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year,
+            local_month, local_day, meter_id, config_period_id, interpolated,
+            imp_kwh, imp_kwh_remainder, imp_cost, standing_charge)
+            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','2026-03-01',
+            2026,3,1,'electricity_main',?,0, 13.0,2.5,1.17,0.5)
+        """, (self.cp,))
+        # Battery: 10.5 kWh grid, cost £0.73
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year,
+            local_month, local_day, meter_id, config_period_id, interpolated,
+            imp_kwh, imp_kwh_grid, imp_cost, standing_charge)
+            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','2026-03-01',
+            2026,3,1,'house_battery',?,0, 10.5,10.5,0.73,0.0)
+        """, (self.cp,))
+        self.store._conn.commit()
+
+        t = self.store.get_billing_totals_for_local_date_range('2026-03-01', '2026-03-01')
+
+        # Total cost = main (1.17) + battery (0.73) = 1.90
+        self.assertAlmostEqual(t["imp_cost"], 1.90, places=3,
+            msg="Sub-meter imp_cost must be included when imp_kwh_grid is set")
+
+    def test_submeter_cost_excluded_when_grid_null(self):
+        """Sub-meter imp_cost must NOT be included when imp_kwh_grid is NULL."""
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year,
+            local_month, local_day, meter_id, config_period_id, interpolated,
+            imp_kwh, imp_kwh_remainder, imp_cost, standing_charge)
+            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','2026-03-01',
+            2026,3,1,'electricity_main',?,0, 13.0,2.5,1.17,0.5)
+        """, (self.cp,))
+        # Battery: imp_kwh_grid=NULL (old block) — cost must not be included
+        self.store._conn.execute("""
+            INSERT INTO blocks (block_start, block_end, local_date, local_year,
+            local_month, local_day, meter_id, config_period_id, interpolated,
+            imp_kwh, imp_kwh_grid, imp_cost, standing_charge)
+            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','2026-03-01',
+            2026,3,1,'house_battery',?,0, 10.5,NULL,0.73,0.0)
+        """, (self.cp,))
+        self.store._conn.commit()
+
+        t = self.store.get_billing_totals_for_local_date_range('2026-03-01', '2026-03-01')
+
+        # Only main meter cost — battery has no imp_kwh_grid so excluded
+        self.assertAlmostEqual(t["imp_cost"], 1.17, places=3,
+            msg="Sub-meter imp_cost must be excluded when imp_kwh_grid is NULL")
+
+
 class TestBlockDeletion(unittest.TestCase):
     """Tests for delete_blocks_for_date_range and count_blocks_for_date_range."""
 
