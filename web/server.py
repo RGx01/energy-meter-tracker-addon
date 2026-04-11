@@ -750,8 +750,6 @@ def api_billing():
             if totals["imp_kwh"] > 0.001 or imp_cost > 0.001:
                 rows.append({"label": f"{label_imp} ({totals['imp_kwh']:.3f} kWh)",
                              "cost": imp_cost, "bold": True})
-                rows.append({"label": f"Grid Import ({totals['imp_kwh']:.3f} kWh)",
-                             "cost": imp_cost, "bold": False})
             if totals["exp_kwh"] > 0.001:
                 rows.append({"label": f"Grid Export ({totals['exp_kwh']:.3f} kWh)",
                              "cost": -exp_cost, "bold": False})
@@ -810,6 +808,24 @@ def api_billing():
         month_t = store.get_billing_totals_for_local_date_range(
             period_start_date.isoformat(), today_local_date
         )
+
+        # If today has no finalised blocks yet, today's standing charge won't be
+        # in the DB. Add it from the most recent known daily rate so "This Bill"
+        # always includes today rather than lagging by up to one block period.
+        today_has_sc = store._conn.execute(
+            "SELECT 1 FROM blocks WHERE local_date=? AND standing_charge > 0 LIMIT 1",
+            (today_local_date,)
+        ).fetchone()
+        if not today_has_sc:
+            # Get the most recent standing charge from any finalised block
+            last_sc_row = store._conn.execute(
+                "SELECT standing_charge FROM blocks WHERE standing_charge > 0 "
+                "ORDER BY block_start DESC LIMIT 1"
+            ).fetchone()
+            if last_sc_row:
+                month_t = dict(month_t)
+                month_t["standing"] = round(month_t["standing"] + last_sc_row["standing_charge"], 6)
+
         month_total, month_rows = _fmt_total(month_t, "Total Import", "Total Import")
 
         # Calendar year — from Jan 1 local to today local
@@ -817,6 +833,9 @@ def api_billing():
         year_t = store.get_billing_totals_for_local_date_range(
             year_start_date, today_local_date
         )
+        if not today_has_sc and last_sc_row:
+            year_t = dict(year_t)
+            year_t["standing"] = round(year_t["standing"] + last_sc_row["standing_charge"], 6)
         year_total, year_rows = _fmt_total(year_t, "Total Import", "Total Import")
 
         def fmt_rows(rows):
