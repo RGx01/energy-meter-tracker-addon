@@ -717,14 +717,14 @@ class BlockStore:
                          WHEN b.imp_kwh_grid      IS NOT NULL THEN b.imp_kwh_grid
                          ELSE b.imp_kwh
                        END
-                     ELSE
-                       CASE
-                         WHEN b.imp_kwh_grid IS NOT NULL THEN b.imp_kwh_grid
-                         ELSE b.imp_kwh
-                       END
+                     ELSE COALESCE(b.imp_kwh_grid, 0)
                    END
                  ), 0.0) as imp_kwh,
-                 COALESCE(SUM(CASE WHEN m.is_sub_meter = 0 THEN b.imp_cost ELSE 0 END), 0.0) as imp_cost,
+                 COALESCE(SUM(
+                   CASE WHEN m.is_sub_meter = 0 THEN b.imp_cost
+                        WHEN b.imp_kwh_grid IS NOT NULL THEN b.imp_cost
+                        ELSE 0 END
+                 ), 0.0) as imp_cost,
                  COALESCE(SUM(CASE WHEN m.is_sub_meter = 0 THEN b.exp_kwh  ELSE 0 END), 0.0) as exp_kwh,
                  COALESCE(SUM(CASE WHEN m.is_sub_meter = 0 THEN b.exp_cost ELSE 0 END), 0.0) as exp_cost
                FROM blocks b
@@ -736,16 +736,25 @@ class BlockStore:
         )
         row = cur.fetchone()
 
-        # Standing charge: once per local calendar day, main meter only
+        # Standing charge: once per local calendar day, from the first block of
+        # that day (main meter only). Matches calculate_billing_summary_for_period
+        # which also uses the first block's standing charge per day.
         cur2 = self._conn.execute(
             f"""SELECT SUM(daily_sc) as standing FROM (
-                 SELECT MIN(b.standing_charge) as daily_sc
+                 SELECT b.standing_charge as daily_sc
                  FROM blocks b
                  JOIN meters m
                    ON m.meter_id = b.meter_id
                   AND m.config_period_id = ({active_period_sq})
                  WHERE b.local_date >= ? AND b.local_date <= ?
                    AND m.is_sub_meter = 0
+                   AND b.block_start = (
+                     SELECT MIN(b2.block_start) FROM blocks b2
+                     JOIN meters m2 ON m2.meter_id = b2.meter_id
+                     AND m2.config_period_id = ({active_period_sq})
+                     WHERE b2.local_date = b.local_date
+                     AND m2.is_sub_meter = 0
+                   )
                  GROUP BY b.local_date
                )""",
             (first_local_date, last_local_date)
