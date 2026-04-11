@@ -32,6 +32,12 @@ Billing/Calendar period toggle, data table totals column, heatmap mobile fixes, 
 
 ---
 
+## In Development (unreleased — basis for 2.1.0)
+
+### SQLite & Billing History
+- **SQLite storage** — all blocks in an indexed database; automatic migration from `blocks.json`
+- **Billing History** — config periods tracked; billing charts use historically correct billing day and rates
+- **Billing period transitions** — truncation-only model; correct period boundaries in usage stats and live power
 - **Live Power performance** — instant page load with async billing cards; SQL aggregation replaces full block scans
 - **Historical Corrections** — bulk-update standing charge or import/export rates across a date range via the Import & Backup page
 - **Billing alignment** — kWh, cost and standing charge now agree between Billing chart, Usage Stats and Live Power including BST period boundaries
@@ -39,39 +45,53 @@ Billing/Calendar period toggle, data table totals column, heatmap mobile fixes, 
 
 ---
 
+## Planned
+
 ### 2.1.0 — Full SQLite: Single Source of Truth
 **Theme: One database file, fully relational, no JSON blobs**
 
 All state is now in `energy_meter.db`. Backup and restore is a single file copy. The schema is fully normalised — no JSON blobs anywhere.
 
-- `cumulative_totals.json`, `current_block.json`, `meters_config.json` eliminated as live state
-- `full_config_json`, `gap_marker`, `meter_channel_meta` blobs/tables replaced by normalised columns
-- `migrate_full_config_json()` — automatic upgrade from 2.0.x, idempotent
-- Historical Corrections enhanced — time-of-day window, per-meter targeting, per-block preview
+**What shipped:**
+- `cumulative_totals.json` eliminated — totals derived from `SELECT SUM(...)` on the blocks table
+- `current_block.json` eliminated — in-progress block state in `current_block` + `current_reads` tables
+- `meters_config.json` demoted to convenience export — authoritative config in normalised DB tables
+- `full_config_json` blob dropped from `config_periods` — replaced by `meters` and `meter_channels` tables
+- `gap_marker` blob dropped from `current_block` — replaced by `gap_detected_at` column and `is_gap_seed` rows in `current_reads`
+- `meter_channel_meta` EAV table dropped — `mpan` and `tariff` promoted to proper columns on `meter_channels`
+- `migrate_full_config_json()` — automatic upgrade from 2.0.x: four independent steps, safe to re-run, idempotent
+- Import & Backup page updated — file reference table and restore UI reflect single-file model
+- Historical Corrections enhanced — rate corrections now support time-of-day window (DST-aware), per-meter targeting, and per-block preview table before committing
 
-### 2.1.x — Gap Fill & Stability
-- Gap fill overhaul (4 bugs) — startup crash, silent skip, false sub-meter spike, wrong post-gap read
-- Chart auto-refresh tab detection fixed (`data-chart` attributes)
-- Standing charge corrections restricted to main meter rows only
-- Supplier field added to config periods and Billing History
+**Deprecations removed**
+
+| Artefact | Removed in |
+|----------|-----------|
+| `cumulative_totals.json` as live state | 2.1.0 |
+| `current_block.json` as live state | 2.1.0 |
+| `meters_config.json` as live state | 2.1.0 |
+| `full_config_json` blob column on `config_periods` | 2.1.0 |
+| `gap_marker` blob column on `current_block` | 2.1.0 |
+| `meter_channel_meta` key/value table | 2.1.0 |
+| `SQLITE_MIGRATION_PLAN.md` | 2.1.0 |
+
+> `migrate_json_to_sqlite()` is retained to support users upgrading directly from 1.x. It will be removed in 2.2.0 once the migration window closes.
+
+---
 
 ### 2.2.0 — Data Management
 **Theme: Give users control over their data**
 
-- **Bill summary redesign** — total grid draw shown at top matching supplier bill, sub-meter breakdown indented beneath
-- **Delete Blocks** — sub-page to permanently remove blocks for a date range with preview and confirmation
-- **Historical Corrections** — promoted to own sub-page under Data Management
-- **Compact Database** — VACUUM on demand with engine pause, reports size before/after
-- **Lovelace chart endpoints** — `/lovelace/billing` and `/lovelace/heatmap` with auto-refresh and no-cache headers
-- **Chart flicker fixed** — meta refresh removed from generated HTML; crossfade swap prevents blank flash on 2-minute refresh
-- `migrate_json_to_sqlite()` retained — removal deferred to 3.0.0
+With the DB as the single source of truth, data management operations are safe and atomic.
 
-### 2.2.1 — Bug Fix
-- **Billing totals double-counting** — sub-meter blocks with NULL `imp_kwh_grid` no longer fall back to raw `imp_kwh`, preventing double-counting in Live Power Today/Bill/Year cards
+- Stop / Start engine controls (pause recording without restarting the add-on)
+- Reset data wizard — guided flow: stop engine → backup → clear blocks → reconfigure → restart
+- Selective date range deletion (e.g. remove a period of bad data)
+- DB-to-DB migration tool (copy blocks between installs or from older DB files)
+- **Compact database** — "Compact" button on the Data Management page runs `VACUUM` on demand; rebuilds the file, reclaims free pages from deleted/updated rows; blocking operation so user-initiated only; DB grows at ~40 KB/day so compaction is never urgent but useful after bulk deletions or long history
+- Confirmation dialogs and safety checks throughout
 
 ---
-
-## Planned
 
 ### 2.3.0 — Meter Replacement
 **Theme: Handle real-world meter changes gracefully**

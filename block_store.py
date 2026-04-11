@@ -717,7 +717,11 @@ class BlockStore:
                          WHEN b.imp_kwh_grid      IS NOT NULL THEN b.imp_kwh_grid
                          ELSE b.imp_kwh
                        END
-                     ELSE COALESCE(b.imp_kwh_grid, 0)
+                     ELSE
+                       CASE
+                         WHEN b.imp_kwh_grid IS NOT NULL THEN b.imp_kwh_grid
+                         ELSE b.imp_kwh
+                       END
                    END
                  ), 0.0) as imp_kwh,
                  COALESCE(SUM(CASE WHEN m.is_sub_meter = 0 THEN b.imp_cost ELSE 0 END), 0.0) as imp_cost,

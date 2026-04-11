@@ -38,21 +38,21 @@
   exclusive access. Reports size before and after so you can see how much space was
   reclaimed. Most useful after bulk deletions; at ~40 KB/day growth it is rarely urgent.
 
-- **Lovelace-friendly chart endpoints** — `/lovelace/billing` and `/lovelace/heatmap`
-  serve the chart HTML with a 130-second meta refresh and aggressive no-cache headers
-  baked in at serve time. Use these URLs in Lovelace webpage cards instead of the raw
-  `/charts/*.html` URLs — they refresh reliably and never get stuck in the browser cache.
-  Documented in the Help page.
-
 ### Fixed
 - Date inputs in Delete Blocks and Historical Corrections now show `dd/mm/yyyy` format
   hint in labels and use `lang="en-GB"` to encourage day-first display in supporting
   browsers.
 
-- **Chart flicker removed** — `<meta http-equiv="refresh">` removed from generated chart
-  HTML. The EMT charts page handles refresh cleanly via `setInterval` without reloading
-  the iframe. Lovelace users should use the dedicated `/lovelace/*` endpoints which have
-  the meta refresh injected at serve time.
+- **Billing and heatmap chart flicker removed** — `<meta http-equiv="refresh">` has been
+  removed from generated chart HTML. The EMT charts page handles refresh cleanly via its
+  own 2-minute `setInterval` without reloading the iframe. Lovelace users should switch
+  to the dedicated `/lovelace/billing` and `/lovelace/heatmap` endpoints (see below).
+
+- **Lovelace-friendly chart endpoints** — `/lovelace/billing` and `/lovelace/heatmap`
+  serve the chart HTML with a 130-second meta refresh and aggressive no-cache headers
+  baked in at serve time. Use these URLs in Lovelace webpage cards instead of the raw
+  `/charts/*.html` URLs — they refresh reliably and never get stuck in the browser cache.
+  Documented in the Help page.
 
 ---
 
