@@ -688,7 +688,12 @@ function barGetDataForPeriod() {
     var filtered;
     if (barCalendar) {
       filtered = barData.filter(function(r){
-        var _dm = barDailyMonth ? barDailyMonth.slice(0,7) : null;
+        var _dm;
+        if (typeof barDailyMonth === 'object' && barDailyMonth) {
+          _dm = barDailyMonth.year + '-' + String(barDailyMonth.month).padStart(2,'0');
+        } else if (typeof barDailyMonth === 'string') {
+          _dm = barDailyMonth.slice(0,7);
+        }
         return _dm && (r.year + '-' + String(r.month).padStart(2,'0')) === _dm;
       });
     } else {
@@ -864,7 +869,8 @@ function barBuildSubBar() {
     if (!barCalendar) {
       // Billing mode: navigate between bKey values (billing period start dates)
       var allBKeys = [...new Set(barData.map(function(r){ return barBillingKey(r).bKey; }))].sort();
-      if (!barDailyMonth || allBKeys.indexOf(barDailyMonth) < 0) {
+      // barDailyMonth may be an object (from calendar mode) or a string not in allBKeys — reset if so
+      if (!barDailyMonth || typeof barDailyMonth !== 'string' || allBKeys.indexOf(barDailyMonth) < 0) {
         barDailyMonth = allBKeys.length > 0 ? allBKeys[allBKeys.length - 1] : null;
       }
       var curIdx = allBKeys.indexOf(barDailyMonth);
