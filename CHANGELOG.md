@@ -3,18 +3,17 @@
 ## [2.2.1] — 2026-04-11
 
 ### Fixed
-- **Billing totals incorrect kWh and cost** — two related bugs in
-  `get_billing_totals_for_local_date_range` affecting Today / This Bill / This Year
-  on the Live Power cards:
-  1. Sub-meter blocks with `imp_kwh_grid = NULL` fell back to raw `imp_kwh`,
-     double-counting consumption already included in the main meter total. Fixed to
-     use `COALESCE(imp_kwh_grid, 0)` — NULL means no recorded grid import.
-  2. Sub-meter `imp_cost` was excluded entirely from the total, causing the cost to
-     reflect only house consumption rather than total grid draw. Fixed to include
-     sub-meter `imp_cost` when `imp_kwh_grid IS NOT NULL` (same condition as kWh).
-  Root cause: the SQL was written before PASS 2 reliably stored `imp_kwh_grid` on
-  sub-meter blocks, so the fallback and exclusion logic predated the data it was
-  meant to handle.
+- **Billing totals incorrect kWh** — `get_billing_totals_for_local_date_range`
+  was falling back to raw `imp_kwh` for sub-meter blocks where `imp_kwh_grid` was
+  NULL, double-counting consumption already included in the main meter total. Fixed
+  to use `COALESCE(imp_kwh_grid, 0)` — NULL means no recorded grid import, not
+  missing data. Affected Today / This Bill / This Year totals on the Live Power cards.
+
+- **Standing charge incorrect on Live Power cards** — `get_billing_totals_for_local_date_range`
+  used `MIN(standing_charge)` per day, which picked 0 for days where the standing
+  charge sensor hadn't updated for the first block. Fixed to use `MAX(standing_charge)`
+  per day, matching the billing chart which takes the highest (correct) value recorded
+  for that day.
 
 ---
 
