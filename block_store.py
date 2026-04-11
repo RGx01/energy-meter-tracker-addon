@@ -736,10 +736,13 @@ class BlockStore:
         )
         row = cur.fetchone()
 
-        # Standing charge: once per local calendar day, main meter only
+        # Standing charge: once per local calendar day, main meter only.
+        # Use MAX(standing_charge) per day — this picks the correct daily rate
+        # even if early blocks in the day have sc=0 (sensor not yet updated)
+        # or if the rate changed during the day (takes the latest value).
         cur2 = self._conn.execute(
             f"""SELECT SUM(daily_sc) as standing FROM (
-                 SELECT MIN(b.standing_charge) as daily_sc
+                 SELECT MAX(b.standing_charge) as daily_sc
                  FROM blocks b
                  JOIN meters m
                    ON m.meter_id = b.meter_id
