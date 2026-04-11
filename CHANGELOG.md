@@ -1,6 +1,21 @@
 # Changelog
 
-## [2.2.0] — 2026-04-10
+## [2.2.1] — 2026-04-11
+
+### Fixed
+- **Billing totals double-counting** — `get_billing_totals_for_local_date_range` was
+  falling back to raw `imp_kwh` for sub-meter blocks where `imp_kwh_grid` was NULL,
+  double-counting consumption already included in the main meter total. Fixed to use
+  `COALESCE(imp_kwh_grid, 0)` for sub-meters — NULL means no recorded grid import.
+  Affected Today / This Bill / This Year totals on the Live Power cards. Root cause:
+  blocks written before PASS 2 reliably stored `imp_kwh_grid` had a NULL value that
+  the SQL incorrectly interpreted as a fallback signal rather than zero grid draw.
+
+
+
+---
+
+## [2.2.0] — 2026-04-11
 
 ### Added
 - **Bill summary redesign** — the Import section now shows total grid draw at the top,
@@ -21,22 +36,33 @@
   exclusive access. Reports size before and after so you can see how much space was
   reclaimed. Most useful after bulk deletions; at ~40 KB/day growth it is rarely urgent.
 
-### Fixed
-- Date inputs in Delete Blocks and Historical Corrections now show `dd/mm/yyyy` format
-  hint in labels and use `lang="en-GB"` to encourage day-first display in supporting
-  browsers.
-
-- **Billing and heatmap chart flicker removed** — `<meta http-equiv="refresh">` has been
-  removed from generated chart HTML. The EMT charts page handles refresh cleanly via its
-  own 2-minute `setInterval` without reloading the iframe. Lovelace users should switch
-  to the dedicated `/lovelace/billing` and `/lovelace/heatmap` endpoints (see below).
-
 - **Lovelace-friendly chart endpoints** — `/lovelace/billing` and `/lovelace/heatmap`
   serve the chart HTML with a 130-second meta refresh and aggressive no-cache headers
   baked in at serve time. Use these URLs in Lovelace webpage cards instead of the raw
   `/charts/*.html` URLs — they refresh reliably and never get stuck in the browser cache.
   Documented in the Help page.
 
+### Fixed
+- Date inputs in Delete Blocks and Historical Corrections now show `dd/mm/yyyy` format
+  hint in labels and use `lang="en-GB"` to encourage day-first display in supporting
+  browsers.
+
+- **Chart flicker removed** — `<meta http-equiv="refresh">` removed from generated chart
+  HTML. The EMT charts page handles refresh cleanly via `setInterval` without reloading
+  the iframe. Lovelace users should use the dedicated `/lovelace/*` endpoints which have
+  the meta refresh injected at serve time.
+
+- **Chart resize on HA sidebar toggle** — charts now resize correctly when the HA
+  sidebar is expanded or collapsed. A `ResizeObserver` in `charts.html` detects the
+  container width change and posts `emt-resize` into the chart iframe; the chart page
+  calls `_scaleDayCharts()` which applies CSS transforms immediately and batches
+  `Plotly.relayout` calls after a 400ms debounce so the sidebar animation completes
+  before redraw. Previously the chart would remain at the pre-toggle width until the
+  next scheduled 2-minute refresh.
+
+- **Chart loading white bar** — the "Loading chart..." placeholder div was not removed
+  before the fetch started, causing it to show alongside the new iframe during the
+  crossfade. Now cleared immediately when loading begins.
 ---
 
 ## [2.1.9] — 2026-04-07
