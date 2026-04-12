@@ -77,9 +77,9 @@
     cursor: pointer;
   " ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)" onclick="document.getElementById('file-input').click()">
     <div style="font-size:32px;margin-bottom:8px;">📂</div>
-    <div style="color:var(--text);font-size:14px;margin-bottom:4px;">Drop a backup zip or JSON files here, or click to browse</div>
+    <div style="color:var(--text);font-size:14px;margin-bottom:4px;">Drop a backup zip or blocks.db here, or click to browse</div>
     <div style="color:var(--muted);font-size:12px;">Accepts .zip backup archives or blocks.db</div>
-    <input type="file" id="file-input" multiple accept=".zip,.db,.json" style="display:none" onchange="onFileSelect(this.files)">
+    <input type="file" id="file-input" multiple accept=".zip,.db" style="display:none" onchange="onFileSelect(this.files)">
   </div>
 
   <div id="file-list" style="margin-bottom:20px;display:none;">
@@ -109,11 +109,7 @@
         <td style="padding:10px 0;color:var(--text);">Everything — blocks, config history, current block state. This is the only file you need to back up or restore.</td>
         <td style="padding:10px 0;color:var(--success);font-size:12px;">Safe alone — self-contained</td>
       </tr>
-      <tr style="border-bottom:1px solid var(--border);">
-        <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">blocks.json</td>
-        <td style="padding:10px 0;color:var(--text);">Legacy flat-file format from v1.x. Migrated automatically on import.</td>
-        <td style="padding:10px 0;color:var(--warning);font-size:12px;">Legacy — use blocks.db instead</td>
-      </tr>
+      
       <tr>
         <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">meters_config.json</td>
         <td style="padding:10px 0;color:var(--text);">Human-readable config export. Authoritative config is inside blocks.db — this file is written for reference only.</td>
@@ -141,7 +137,7 @@
 
 {% block scripts %}
 <script>
-const KNOWN_FILES = ['blocks.db','blocks.json','meters_config.json'];
+const KNOWN_FILES = ['blocks.db','meters_config.json'];
 let selectedFiles = {};
 let _restoreZip   = null;
 let _restoreFlat  = false;
@@ -165,7 +161,7 @@ async function onFileSelect(files) {
   for (const f of Array.from(files)) {
     if (f.name.endsWith('.zip')) {
       await extractZipToSelected(f);
-    } else if (f.name.endsWith('.json') || f.name.endsWith('.db')) {
+    } else if (f.name.endsWith('.db')) {
       selectedFiles[f.name] = f;
     }
   }
@@ -239,7 +235,6 @@ async function doImport() {
   const form = new FormData();
   const fieldMap = {
     'blocks.db':    'blocks',   // current format
-    'blocks.json':  'blocks',   // legacy format — server migrates automatically
     'meters_config.json': 'meters_config',  // convenience export — optional
   };
 
@@ -290,7 +285,6 @@ async function restoreFromFlat() {
 
     var riskMap = {
       'blocks.db':              { risk: 'success', note: 'Safe to restore alone — contains all data' },
-      'blocks.json':            { risk: 'warning', note: 'Legacy format — will be migrated to blocks.db on restore' },
       'meters_config.json':     { risk: 'muted',   note: 'Config export only — not required' },
       'current_block.json':     { risk: 'muted',   note: 'No longer used — will be ignored (state is now in blocks.db)' },
       'cumulative_totals.json': { risk: 'muted',   note: 'No longer used — will be ignored (totals derived from blocks)' },
