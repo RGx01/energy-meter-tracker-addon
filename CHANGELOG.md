@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.2.3] — 2026-04-12
+
+### Changed
+- **blocks.json import removed from UI** — dragging a `blocks.json` file into the
+  Import page is no longer supported. The manual upgrade path (placing `blocks.json`
+  on disk and letting the engine migrate it on startup) still works. Full removal
+  of `migrate_json_to_sqlite()` is scheduled for 3.0.0.
+
+---
+
 ## [2.2.2] — 2026-04-11
 
 ### Fixed
