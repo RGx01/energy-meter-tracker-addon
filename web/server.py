@@ -750,8 +750,6 @@ def api_billing():
             if totals["imp_kwh"] > 0.001 or imp_cost > 0.001:
                 rows.append({"label": f"{label_imp} ({totals['imp_kwh']:.3f} kWh)",
                              "cost": imp_cost, "bold": True})
-                rows.append({"label": f"Grid Import ({totals['imp_kwh']:.3f} kWh)",
-                             "cost": imp_cost, "bold": False})
             if totals["exp_kwh"] > 0.001:
                 rows.append({"label": f"Grid Export ({totals['exp_kwh']:.3f} kWh)",
                              "cost": -exp_cost, "bold": False})
@@ -810,6 +808,7 @@ def api_billing():
         month_t = store.get_billing_totals_for_local_date_range(
             period_start_date.isoformat(), today_local_date
         )
+
         month_total, month_rows = _fmt_total(month_t, "Total Import", "Total Import")
 
         # Calendar year — from Jan 1 local to today local
@@ -2047,9 +2046,8 @@ def api_regenerate_charts():
 @app.route("/api/import", methods=["POST"])
 def api_import():
     """
-    Accept uploaded JSON data files.
-    Expects multipart form with one or more of:
-      blocks, current_block, cumulative_totals, meters_config
+    Accept uploaded data files (blocks.db, meters_config.json).
+    blocks.json import removed in 2.2.2 — use blocks.db instead.
     Pauses the engine during import to prevent file conflicts.
     """
     import sys
@@ -2060,35 +2058,9 @@ def api_import():
             engine.pause_engine()
 
         imported = []
-        # Handle blocks import: write temp JSON then migrate into SQLite
-        blocks_file = request.files.get("blocks")
-        if blocks_file:
-            import tempfile
-            blocks_data = json.loads(blocks_file.read().decode("utf-8"))
-            # Write to a temp JSON file for migrate_json_to_sqlite
-            tmp_json = os.path.join(DATA_DIR, "blocks_import.json.tmp")
-            with open(tmp_json, "w") as out:
-                json.dump(blocks_data, out)
-            try:
-                from block_store import migrate_json_to_sqlite
-                cfg_path = os.path.join(DATA_DIR, "meters_config.json")
-                from energy_engine_io import load_json as _lj2
-                cfg = _lj2(cfg_path, {})
-                # Reset the store and migrate
-                db_path = os.path.join(DATA_DIR, "blocks.db")
-                if os.path.exists(db_path):
-                    os.remove(db_path)
-                global _store
-                _store = None  # force re-open
-                store = _get_store()
-                migrate_json_to_sqlite(tmp_json, store, cfg)
-                imported.append("blocks.db")
-                logger.info("server: imported blocks.json -> blocks.db (%d blocks)", len(blocks_data))
-            finally:
-                if os.path.exists(tmp_json):
-                    os.remove(tmp_json)
-
         # Handle remaining JSON files (current_block and cumulative_totals now in DB)
+        # blocks.json import removed in 2.2.2 — migrate_json_to_sqlite still runs at
+        # engine startup if blocks.json is present on disk (manual upgrade path).
         file_map = {
             "meters_config": "meters_config.json",
         }
