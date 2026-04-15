@@ -350,6 +350,7 @@ def _row_to_block(rows: list[sqlite3.Row]) -> dict:
             "meta": meta,
             "interpolated":   bool(row["interpolated"]),
             "standing_charge": row["standing_charge"] or 0.0,
+            "carbon_g":        row["carbon_g"],  # None when no CI data (pre-2.3.0)
             "channels":       {},
         }
 

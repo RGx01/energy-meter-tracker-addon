@@ -125,6 +125,43 @@ SCENARIOS = [
         "sub_meters":     False,
         "gap_day":        None,
     },
+    # ── CO₂ chart scenarios (2.4.0) ──────────────────────────
+    {
+        "name":           "CO₂ — 30min / 30 days / solar / sub-meters",
+        "days":           30,
+        "block_minutes":  30,
+        "scenario":       "solar",
+        "sub_meters":     True,
+        "gap_day":        None,
+        "co2":            True,
+    },
+    {
+        "name":           "CO₂ — 30min / 7 days / import only / no sub-meters",
+        "days":           7,
+        "block_minutes":  30,
+        "scenario":       "import_only",
+        "sub_meters":     False,
+        "gap_day":        None,
+        "co2":            True,
+    },
+    {
+        "name":           "CO₂ — 30min / 14 days / export only (all negative net)",
+        "days":           14,
+        "block_minutes":  30,
+        "scenario":       "export_only",
+        "sub_meters":     False,
+        "gap_day":        None,
+        "co2":            True,
+    },
+    {
+        "name":           "CO₂ — 30min / 30 days / mixed / sub-meters / with gap",
+        "days":           30,
+        "block_minutes":  30,
+        "scenario":       "mixed",
+        "sub_meters":     True,
+        "gap_day":        10,
+        "co2":            True,
+    },
 ]
 
 # ─────────────────────────────────────────────────────────────
@@ -132,11 +169,62 @@ SCENARIOS = [
 # ─────────────────────────────────────────────────────────────
 
 def upload_blocks(base_url, blocks_path):
+    """
+    Upload a blocks.db file to the add-on via /api/import.
+    blocks_path must be a SQLite DB file (not blocks.json).
+    """
     url = f"{base_url}/api/import"
     with open(blocks_path, "rb") as f:
-        resp = requests.post(url, files={"blocks": ("blocks.json", f, "application/json")}, timeout=30)
+        resp = requests.post(url, files={"blocks": ("blocks.db", f, "application/octet-stream")}, timeout=60)
     resp.raise_for_status()
     return resp.json()
+
+
+def generate_db(scenario_args, db_path):
+    """
+    Generate test data and write directly to a SQLite blocks.db file
+    via block_store, avoiding the blocks.json round-trip.
+    """
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from block_store import BlockStore
+    from test_data_generator import generate_blocks
+
+    store = BlockStore(db_path)
+    store.insert_config_period({"meters": {
+        "electricity_main": {"meta": {
+            "billing_day":    scenario_args["billing_day"],
+            "block_minutes":  scenario_args["block_minutes"],
+            "timezone":       "Europe/London",
+            "currency_symbol": "£",
+            "currency_code":  "GBP",
+            "site":           "Test Site",
+            "postcode_prefix": "DE1",
+        }},
+        **({"ev_charger": {"meta": {
+            "sub_meter": True, "parent_meter": "electricity_main",
+            "device": "Zappi EV Charger",
+            "billing_day": scenario_args["billing_day"],
+            "block_minutes": scenario_args["block_minutes"],
+            "timezone": "Europe/London",
+            "currency_symbol": "£", "currency_code": "GBP",
+        }}, "house_battery": {"meta": {
+            "sub_meter": True, "parent_meter": "electricity_main",
+            "device": "Solax Battery",
+            "billing_day": scenario_args["billing_day"],
+            "block_minutes": scenario_args["block_minutes"],
+            "timezone": "Europe/London",
+            "currency_symbol": "£", "currency_code": "GBP",
+        }}} if scenario_args.get("include_sub_meters") else {})
+    }})
+    cp_id = store._conn.execute(
+        "SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+
+    blocks = generate_blocks(**scenario_args)
+    count = store.append_blocks(blocks)
+    store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    store.close()
+    print(f"  Generated {len(blocks)} blocks ({count} meter-rows) → {db_path}")
 
 
 def regenerate_charts(base_url):
@@ -210,26 +298,35 @@ NEVER run against a production installation.
 
         print_banner(f"Test {i+1}/{total}: {scenario['name']}", "═")
 
-        # Generate dataset
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+        # Generate dataset directly as blocks.db
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
             tmp_path = tmp.name
+        os.unlink(tmp_path)  # generate_db creates the file itself
 
         log(f"  Generating {scenario['days']} days × {scenario['block_minutes']}min blocks...")
-        generate(
-            days=scenario["days"],
-            block_minutes=scenario["block_minutes"],
-            scenario=scenario["scenario"],
-            include_sub_meters=scenario["sub_meters"],
-            billing_day=1,
-            output_path=tmp_path,
-            rate=0.2450,
-            export_rate=0.1500,
-            standing_charge=0.5046,
-            gap_day=scenario["gap_day"],
-        )
+        try:
+            generate_db(
+                scenario_args={
+                    "days":             scenario["days"],
+                    "block_minutes":    scenario["block_minutes"],
+                    "scenario":         scenario["scenario"],
+                    "include_sub_meters": scenario["sub_meters"],
+                    "billing_day":      1,
+                    "rate":             0.2450,
+                    "export_rate":      0.1500,
+                    "standing_charge":  0.5046,
+                    "gap_day":          scenario["gap_day"],
+                },
+                db_path=tmp_path,
+            )
+        except Exception as e:
+            log(f"  ❌ Generation failed: {e}")
+            log(traceback.format_exc())
+            results.append({"name": scenario["name"], "result": "ERROR", "note": str(e)})
+            continue
 
-        # Upload
-        log("  Uploading blocks.json...")
+        # Upload blocks.db
+        log("  Uploading blocks.db...")
         try:
             upload_blocks(base_url, tmp_path)
             log("  ✅ Upload OK")
@@ -239,7 +336,8 @@ NEVER run against a production installation.
             results.append({"name": scenario["name"], "result": "ERROR", "note": str(e)})
             continue
         finally:
-            os.unlink(tmp_path)
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
         # Regenerate charts
         log("  Regenerating charts...")
@@ -252,8 +350,13 @@ NEVER run against a production installation.
             results.append({"name": scenario["name"], "result": "ERROR", "note": str(e)})
             continue
 
-        # Open browser
-        if heatmap_only:
+        # Open browser — CO₂ scenarios go to Usage Stats tab
+        if scenario.get("co2"):
+            url = f"{base_url}/charts?tab=usage_stats"
+            log("  ℹ️  CO₂ scenario: check Usage Stats → CO₂ toggle (kWh / Cost / CO₂ buttons)")
+            log("     Verify: net view (single bar), totals view (import above / export below)")
+            log("     Verify: data table columns match chart, gCO₂ / kgCO₂ auto-scaling")
+        elif heatmap_only:
             url = f"{base_url}/charts/net_heatmap.html"
         elif daily_only:
             url = f"{base_url}/charts/daily_usage.html"

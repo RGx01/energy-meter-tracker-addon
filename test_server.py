@@ -213,6 +213,12 @@ class TestRouteRegistration(unittest.TestCase):
     def test_api_carbon_registered(self):
         self.assertTrue(self._registered("api_carbon"))
 
+    def test_api_power_history_registered(self):
+        self.assertTrue(self._registered("api_power_history"))
+
+    def test_api_carbon_current_registered(self):
+        self.assertTrue(self._registered("api_carbon_current"))
+
     def test_api_config_get_registered(self):
         self.assertTrue(self._registered("api_get_config"))
 
@@ -355,7 +361,7 @@ class TestApiBlocksSummary(unittest.TestCase):
     def test_response_has_required_keys(self):
         r = self._get()
         data = r.get_json()
-        for key in ("currency", "rows", "meters", "export_color"):
+        for key in ("currency", "rows", "meters", "export_color", "has_postcode"):
             self.assertIn(key, data)
 
     def test_currency_from_config(self):
@@ -390,6 +396,239 @@ class TestApiBlocksSummary(unittest.TestCase):
         r = self._get()
         meter_ids = [m["id"] for m in r.get_json()["meters"]]
         self.assertIn("electricity_main", meter_ids)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /api/charts/blocks-summary — carbon_g fields (2.4.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApiBlocksSummaryCarbonG(unittest.TestCase):
+    """
+    Verifies that api_blocks_summary correctly populates carbon_g_net,
+    carbon_g_total, carbon_g_imp and carbon_g_exp on each row, and that
+    has_postcode is reflected correctly.
+    """
+
+    def _make_store_with_carbon(self, carbon_g=65.0, imp_kwh=2.0, exp_kwh=0.0,
+                                postcode="DE1"):
+        """Store with one block that has carbon_g set."""
+        cfg = {
+            "meters": {"electricity_main": {"meta": {
+                "billing_day": 1, "block_minutes": 30,
+                "timezone": "Europe/London",
+                "currency_symbol": "£", "currency_code": "GBP",
+                "postcode_prefix": postcode,
+            }, "channels": {
+                "import": {"read": "sensor.imp", "rate": "sensor.rate"},
+                "export": {"read": "sensor.exp", "rate": "sensor.exp_rate"},
+            }}}
+        }
+        store = BlockStore(":memory:")
+        store.insert_config_period(cfg)
+        cp_id = store.get_current_config_period_id()
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        bs = "2026-04-14T10:00:00"
+        be = "2026-04-14T10:30:00"
+        ld = (datetime.fromisoformat(bs)
+              .replace(tzinfo=ZoneInfo("UTC"))
+              .astimezone(ZoneInfo("Europe/London"))
+              .date().isoformat())
+        store._conn.execute("""
+            INSERT INTO blocks (
+                block_start, block_end, local_date, local_year, local_month, local_day,
+                meter_id, config_period_id, interpolated,
+                imp_kwh, imp_kwh_grid, imp_kwh_remainder,
+                imp_rate, imp_cost, imp_cost_remainder,
+                imp_read_start, imp_read_end,
+                exp_kwh, exp_rate, exp_cost,
+                exp_read_start, exp_read_end, standing_charge, carbon_g)
+            VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,NULL,NULL,NULL,?,NULL,?,NULL,NULL,?,?)
+        """, (bs, be, ld, int(ld[:4]), int(ld[5:7]), int(ld[8:10]),
+              "electricity_main", cp_id, 0,
+              imp_kwh, 0.49, exp_kwh, 0.0, 0.5, carbon_g))
+        store._conn.commit()
+        return store, cfg
+
+    def _get_rows(self, store, cfg):
+        eio.load_json = lambda path, default=None: cfg if "meters_config" in path else default
+        server._store = store
+        client = make_client(store=store)
+        r = client.get("/api/charts/blocks-summary")
+        self.assertEqual(r.status_code, 200)
+        return r.get_json()
+
+    def test_carbon_g_net_on_row(self):
+        """carbon_g_net present on row when block has carbon_g."""
+        store, cfg = self._make_store_with_carbon(carbon_g=65.0, imp_kwh=2.0, exp_kwh=0.0)
+        data = self._get_rows(store, cfg)
+        rows = data["rows"]
+        self.assertTrue(len(rows) > 0)
+        row = rows[0]
+        self.assertIn("carbon_g_net", row)
+        self.assertAlmostEqual(row["carbon_g_net"], 65.0, places=2)
+
+    def test_carbon_g_null_when_no_ci_data(self):
+        """carbon_g_net is None when block has NULL carbon_g."""
+        store, cfg = self._make_store_with_carbon(carbon_g=None)
+        data = self._get_rows(store, cfg)
+        rows = data["rows"]
+        self.assertTrue(len(rows) > 0)
+        self.assertIsNone(rows[0]["carbon_g_net"])
+
+    def test_carbon_g_imp_and_exp_on_pure_import(self):
+        """Pure import block: carbon_g_imp = carbon_g, carbon_g_exp = 0."""
+        store, cfg = self._make_store_with_carbon(carbon_g=65.0, imp_kwh=2.0, exp_kwh=0.0)
+        data = self._get_rows(store, cfg)
+        row = data["rows"][0]
+        m = row["meters"]["electricity_main"]
+        self.assertIn("carbon_g_imp", m)
+        self.assertIn("carbon_g_exp", m)
+        self.assertAlmostEqual(m["carbon_g_imp"], 65.0, places=2)
+        self.assertAlmostEqual(m["carbon_g_exp"], 0.0, places=2)
+
+    def test_carbon_g_imp_and_exp_on_pure_export(self):
+        """Pure export block: carbon_g_exp > 0, identity carbon_g_imp - carbon_g_exp = carbon_g_net."""
+        store, cfg = self._make_store_with_carbon(carbon_g=-33.0, imp_kwh=0.0, exp_kwh=1.5)
+        data = self._get_rows(store, cfg)
+        row = data["rows"][0]
+        m = row["meters"]["electricity_main"]
+        # Export carbon must be positive (shown below zero in chart)
+        self.assertGreaterEqual(m["carbon_g_exp"], 0.0,
+            msg="carbon_g_exp must be non-negative")
+        # Split identity: imp - exp = net
+        split_net = m["carbon_g_imp"] - m["carbon_g_exp"]
+        self.assertAlmostEqual(split_net, row["carbon_g_net"], places=2,
+            msg="carbon_g_imp - carbon_g_exp must equal carbon_g_net")
+
+    def test_carbon_g_split_identity(self):
+        """carbon_g_imp - carbon_g_exp = carbon_g_net for mixed import/export."""
+        store, cfg = self._make_store_with_carbon(carbon_g=-30.0, imp_kwh=0.5, exp_kwh=2.0)
+        data = self._get_rows(store, cfg)
+        row = data["rows"][0]
+        m = row["meters"]["electricity_main"]
+        net = row["carbon_g_net"]
+        split_net = m["carbon_g_imp"] - m["carbon_g_exp"]
+        self.assertAlmostEqual(split_net, net, places=2,
+            msg="carbon_g_imp - carbon_g_exp must equal carbon_g_net")
+
+    def test_has_postcode_true_when_configured(self):
+        """has_postcode is True when postcode_prefix is set."""
+        store, cfg = self._make_store_with_carbon(postcode="DE1")
+        data = self._get_rows(store, cfg)
+        self.assertTrue(data["has_postcode"])
+
+    def test_has_postcode_false_when_not_configured(self):
+        """has_postcode is False when no postcode_prefix."""
+        store, cfg = self._make_store_with_carbon(postcode="")
+        data = self._get_rows(store, cfg)
+        self.assertFalse(data["has_postcode"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /api/power/history and /api/carbon/current (2.3.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApiPowerHistory(unittest.TestCase):
+
+    def setUp(self):
+        self.store = _make_test_store()
+        self.client = make_client(store=self.store)
+
+    def test_returns_200(self):
+        r = self.client.get("/api/power/history")
+        self.assertEqual(r.status_code, 200)
+
+    def test_response_has_rows_key(self):
+        r = self.client.get("/api/power/history")
+        self.assertIn("rows", r.get_json())
+
+    def test_empty_when_no_data(self):
+        r = self.client.get("/api/power/history")
+        self.assertEqual(r.get_json()["rows"], [])
+
+    def test_returns_stored_rows(self):
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        self.store.append_power_history(now, -1.5, 115.0, -2.875)
+        r = self.client.get("/api/power/history")
+        rows = r.get_json()["rows"]
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["net_kw"], -1.5)
+        self.assertAlmostEqual(rows[0]["intensity"], 115.0)
+
+    def test_hours_param_accepted(self):
+        r = self.client.get("/api/power/history?hours=12")
+        self.assertEqual(r.status_code, 200)
+
+    def test_hours_param_clamped_at_48(self):
+        """hours > 48 is clamped to 48."""
+        r = self.client.get("/api/power/history?hours=200")
+        self.assertEqual(r.status_code, 200)
+
+    def test_row_has_required_fields(self):
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        self.store.append_power_history(now, 2.5, 180.0, 7.5)
+        rows = self.client.get("/api/power/history").get_json()["rows"]
+        self.assertTrue(len(rows) > 0)
+        for field in ("captured_at", "net_kw", "intensity", "carbon_gco2_min"):
+            self.assertIn(field, rows[0])
+
+    def test_rows_ordered_oldest_first(self):
+        self.store.append_power_history("2026-04-14T10:00:00", 1.0, 100.0)
+        self.store.append_power_history("2026-04-14T11:00:00", 2.0, 110.0)
+        rows = self.client.get("/api/power/history").get_json()["rows"]
+        self.assertEqual(len(rows), 2)
+        self.assertLess(rows[0]["captured_at"], rows[1]["captured_at"])
+
+
+class TestApiCarbonCurrent(unittest.TestCase):
+
+    def setUp(self):
+        self.store = _make_test_store()
+        eio.load_json = lambda path, default=None: MINIMAL_CONFIG if "meters_config" in path else default
+        self.client = make_client(store=self.store)
+
+    def test_returns_404_no_postcode(self):
+        """No postcode configured → 404."""
+        r = self.client.get("/api/carbon/current")
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.get_json()["error"], "no_postcode")
+
+    def _make_store_with_postcode(self, postcode="DE1"):
+        """Store whose DB config includes a postcode_prefix."""
+        store = BlockStore(":memory:")
+        store.insert_config_period({"meters": {"electricity_main": {"meta": {
+            "billing_day": 1, "block_minutes": 30,
+            "timezone": "Europe/London",
+            "currency_symbol": "£", "currency_code": "GBP",
+            "postcode_prefix": postcode,
+        }, "channels": {"import": {}, "export": {}}}}})
+        return store
+
+    def test_returns_404_no_data(self):
+        """Postcode configured in DB but no CI data → 404."""
+        store = self._make_store_with_postcode("DE1")
+        server._store = store
+        r = self.client.get("/api/carbon/current")
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.get_json()["error"], "no_data")
+
+    def test_returns_intensity_when_data_present(self):
+        """CI data in DB → 200 with intensity and ci_index."""
+        store = self._make_store_with_postcode("DE1")
+        server._store = store
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        store.upsert_carbon_intensity(now, "DE1", 138.0, "moderate")
+        r = self.client.get("/api/carbon/current")
+        self.assertEqual(r.status_code, 200)
+        data = r.get_json()
+        self.assertAlmostEqual(data["intensity"], 138.0)
+        self.assertEqual(data["ci_index"], "moderate")
+        self.assertEqual(data["postcode"], "DE1")
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -883,6 +1122,120 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /api/import — blocks.db import (regression test for silent drop bug)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApiImportBlocksDb(unittest.TestCase):
+    """
+    Regression tests for the api_import endpoint.
+    Previously blocks.db was silently ignored — only meters_config.json was written.
+    """
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.mkdtemp(prefix="emt_import_test_")
+        server.DATA_DIR = self.tmpdir
+        self.client = make_client()
+        server.DATA_DIR = self.tmpdir  # re-set after make_client resets it
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        server.DATA_DIR = "/tmp/emt_test_data"  # restore default
+
+    def _make_db_bytes(self):
+        """Create a minimal valid SQLite blocks.db as bytes."""
+        import tempfile, os
+        store = BlockStore(":memory:")
+        store.insert_config_period({"meters": {"electricity_main": {"meta": {
+            "billing_day": 15, "block_minutes": 30,
+            "timezone": "Europe/London",
+            "currency_symbol": "£", "currency_code": "GBP",
+            "postcode_prefix": "DE1",
+        }, "channels": {"import": {}, "export": {}}}}})
+        tmp = tempfile.mktemp(suffix=".db")
+        try:
+            store.backup(tmp)
+            with open(tmp, "rb") as f:
+                return f.read()
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    def test_blocks_db_accepted_in_import(self):
+        """blocks.db upload must appear in the imported list."""
+        import io
+        db_bytes = self._make_db_bytes()
+        data = {"blocks": (io.BytesIO(db_bytes), "blocks.db")}
+        r = self.client.post(
+            "/api/import",
+            data=data,
+            content_type="multipart/form-data"
+        )
+        self.assertEqual(r.status_code, 200)
+        result = r.get_json()
+        self.assertTrue(result.get("ok"), msg=f"Import failed: {result}")
+        self.assertTrue(
+            any("blocks.db" in f for f in result.get("imported", [])),
+            msg=f"blocks.db not in imported list: {result.get('imported')}"
+        )
+
+    def test_meters_config_not_written_when_db_imported(self):
+        """When blocks.db is imported, meters_config.json must come from the DB not the upload."""
+        import io
+        db_bytes = self._make_db_bytes()
+        # Upload both — meters_config should be ignored in favour of DB
+        cfg_bytes = b'{"meters": {"electricity_main": {"meta": {"billing_day": 1}}}}'.replace(b"'", b"'")
+        data = {
+            "blocks":        (io.BytesIO(db_bytes), "blocks.db"),
+            "meters_config": (io.BytesIO(cfg_bytes), "meters_config.json"),
+        }
+        r = self.client.post(
+            "/api/import",
+            data=data,
+            content_type="multipart/form-data"
+        )
+        result = r.get_json()
+        self.assertTrue(result.get("ok"), msg=f"Import failed: {result}")
+        # The imported list should contain blocks.db
+        self.assertTrue(
+            any("blocks.db" in f for f in result.get("imported", [])),
+            msg=f"blocks.db not in imported: {result.get('imported')}"
+        )
+
+    def test_meters_config_alone_still_works(self):
+        """Importing meters_config.json without blocks.db still succeeds."""
+        import io
+        cfg = {"meters": {"electricity_main": {"meta": {
+            "billing_day": 1, "block_minutes": 30,
+            "timezone": "Europe/London",
+            "currency_symbol": "£", "currency_code": "GBP",
+        }, "channels": {"import": {}, "export": {}}}}}
+        import json
+        cfg_bytes = json.dumps(cfg).encode()
+        data = {"meters_config": (io.BytesIO(cfg_bytes), "meters_config.json")}
+        r = self.client.post(
+            "/api/import",
+            data=data,
+            content_type="multipart/form-data"
+        )
+        result = r.get_json()
+        self.assertTrue(result.get("ok"), msg=f"Import failed: {result}")
+        self.assertIn("meters_config.json", result.get("imported", []))
+
+    def test_empty_import_returns_error(self):
+        """Importing nothing returns an error."""
+        r = self.client.post(
+            "/api/import",
+            data={},
+            content_type="multipart/form-data"
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("error", r.get_json())
+
+
 class TestApiCorrectionsEnhanced(unittest.TestCase):
     """Tests for the enhanced Historical Corrections endpoints."""
 
@@ -916,6 +1269,15 @@ class TestApiCorrectionsEnhanced(unittest.TestCase):
                   imp_kwh, imp_rate, imp_cost, exp_kwh, exp_rate, exp_cost, standing_charge)
                 VALUES (?,?,?,?,?,2026,3,20,0, ?,?,?,?,?,?,?)
             """, (bs, be, mid, cp_id, ld, ikwh, irate, icost, ekwh, erate, ecost, sc))
+        store._conn.commit()
+        # insert_config_period already inserts electricity_main via _write_meters.
+        # Add ev_charger as a sub-meter so the standing charge correction subquery
+        # (meter_id IN SELECT meter_id FROM meters WHERE is_sub_meter=0) correctly
+        # excludes it and only updates main meter rows.
+        store._conn.execute(
+            "INSERT OR IGNORE INTO meters (config_period_id, meter_id, is_sub_meter) VALUES (?,?,1)",
+            (cp_id, "ev_charger")
+        )
         store._conn.commit()
         return store
 
@@ -1039,9 +1401,12 @@ class TestApiCorrectionsEnhanced(unittest.TestCase):
             "value": 0.9999,
         })
         self.assertEqual(r.status_code, 200)
+        # Only main meter rows are updated — sub-meter standing_charge stays 0
         rows = store._conn.execute(
-            "SELECT standing_charge FROM blocks WHERE local_date='2026-03-20'"
+            """SELECT standing_charge FROM blocks
+               WHERE local_date='2026-03-20' AND meter_id='electricity_main'"""
         ).fetchall()
+        self.assertGreater(len(rows), 0)
         for row in rows:
             self.assertAlmostEqual(row["standing_charge"], 0.9999, places=4)
 

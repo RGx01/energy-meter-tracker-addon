@@ -107,6 +107,35 @@ def sub_meter_kwh(hour, block_minutes, device):
 
 
 # ─────────────────────────────────────────────────────────────
+# Carbon intensity simulation
+# ─────────────────────────────────────────────────────────────
+
+def carbon_intensity(hour, scenario):
+    """Simulate grid carbon intensity (gCO2/kWh) varying by time of day."""
+    base = 220
+    if 0 <= hour < 6:
+        base = 280   # overnight — more gas generation
+    elif 10 <= hour < 15:
+        base = 140   # midday — more solar/wind on grid
+    elif 17 <= hour < 21:
+        base = 260   # evening peak
+    return round(base + random.uniform(-20, 20), 1)
+
+
+def compute_carbon_g(imp_kwh, exp_kwh, hour, scenario, is_sub_meter=False):
+    """
+    Compute carbon_g for a block.
+    Main meter: (imp - exp) × intensity  (net, can be negative when exporting)
+    Sub-meter:   imp × intensity          (gross import only)
+    """
+    intensity = carbon_intensity(hour, scenario)
+    if is_sub_meter:
+        return round(imp_kwh * intensity, 4)
+    else:
+        return round((imp_kwh - exp_kwh) * intensity, 4)
+
+
+# ─────────────────────────────────────────────────────────────
 # Block builder
 # ─────────────────────────────────────────────────────────────
 
@@ -123,6 +152,8 @@ def make_block(start_dt, block_minutes, scenario, include_sub_meters,
 
     new_import_read = import_read + imp_kwh
     new_export_read = export_read + exp_kwh
+
+    main_carbon_g = compute_carbon_g(imp_kwh, exp_kwh, hour, scenario, is_sub_meter=False)
 
     meters = {
         "electricity_main": {
@@ -145,15 +176,17 @@ def make_block(start_dt, block_minutes, scenario, include_sub_meters,
                 }
             },
             "meta": {
-                "billing_day":   billing_day,
-                "block_minutes": block_minutes,
-                "site":          "Test Site",
-                "supplier":      "Test Supplier",
-                "timezone":      "Europe/London",
-                "type":          "electricity"
+                "billing_day":    billing_day,
+                "block_minutes":  block_minutes,
+                "site":           "Test Site",
+                "supplier":       "Test Supplier",
+                "timezone":       "Europe/London",
+                "type":           "electricity",
+                "postcode_prefix": "DE1",
             },
             "interpolated":    False,
-            "standing_charge": standing_charge if start_dt.hour == 0 and start_dt.minute == 0 else 0.0
+            "standing_charge": standing_charge if start_dt.hour == 0 and start_dt.minute == 0 else 0.0,
+            "carbon_g":        main_carbon_g,
         }
     }
 
@@ -171,6 +204,9 @@ def make_block(start_dt, block_minutes, scenario, include_sub_meters,
         meters["electricity_main"]["channels"]["import"]["kwh_remainder"]  = round(imp_remainder, 6)
         meters["electricity_main"]["channels"]["import"]["cost_remainder"] = round(imp_cost_remainder, 6)
 
+        ev_carbon_g  = compute_carbon_g(ev_kwh,  0, hour, scenario, is_sub_meter=True)
+        bat_carbon_g = compute_carbon_g(bat_kwh, 0, hour, scenario, is_sub_meter=True)
+
         meters["ev_charger"] = {
             "channels": {
                 "import": {
@@ -185,7 +221,8 @@ def make_block(start_dt, block_minutes, scenario, include_sub_meters,
                 "sub_meter":    True,
                 "parent_meter": "electricity_main"
             },
-            "interpolated": False
+            "interpolated": False,
+            "carbon_g":     ev_carbon_g,
         }
         meters["house_battery"] = {
             "channels": {
@@ -201,7 +238,8 @@ def make_block(start_dt, block_minutes, scenario, include_sub_meters,
                 "sub_meter":    True,
                 "parent_meter": "electricity_main"
             },
-            "interpolated": False
+            "interpolated": False,
+            "carbon_g":     bat_carbon_g,
         }
     else:
         # No sub-meters — kwh_total equals kwh (no sub-meter subtraction)
@@ -286,6 +324,39 @@ def generate(days, block_minutes, scenario, include_sub_meters,
     print(f"  Rate change: day {rate_change_day} ({rate} → {rate2} £/kWh)")
     if gap_day is not None:
         print(f"  Gap day:     day {gap_day}")
+
+
+def generate_blocks(days, block_minutes, scenario, include_sub_meters,
+                    billing_day, rate=0.2450, export_rate=0.1500,
+                    standing_charge=0.5046, gap_day=None, **kwargs):
+    """
+    Generate test blocks as a list of dicts (no file I/O).
+    Used by generate_db in test_harness to write directly to a BlockStore.
+    """
+    random.seed(42)
+    now   = datetime.now(timezone.utc).replace(tzinfo=None)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days - 1)
+    blocks       = []
+    import_read  = 10000.0
+    export_read  = 5000.0
+    current      = start
+    end_time     = now
+    rate_change_day = days // 2
+    rate2 = round(rate * 1.1, 4)
+    while current < end_time:
+        day_offset = (current.date() - start.date()).days
+        if gap_day is not None and day_offset == gap_day:
+            current += timedelta(minutes=block_minutes)
+            continue
+        current_rate = rate2 if day_offset >= rate_change_day else rate
+        block, import_read, export_read = make_block(
+            current, block_minutes, scenario, include_sub_meters,
+            import_read, export_read, billing_day,
+            current_rate, export_rate, standing_charge
+        )
+        blocks.append(block)
+        current += timedelta(minutes=block_minutes)
+    return blocks
 
 
 # ─────────────────────────────────────────────────────────────

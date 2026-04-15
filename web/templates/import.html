@@ -47,6 +47,34 @@
   </div>
 </div>
 
+<!-- ── Zip restore confirm modal ─────────────────────────────────────────────── -->
+<div id="zip-restore-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1001;overflow-y:auto;">
+  <div style="max-width:480px;margin:80px auto;padding:0 16px 60px;">
+    <div class="card" style="padding:28px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+        <h3 style="margin:0;font-size:15px;font-weight:600;">Restore from Zip</h3>
+        <button onclick="closeZipConfirm()" style="background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;">✕</button>
+      </div>
+
+      <div style="background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.3);border-radius:var(--radius);padding:12px 14px;margin-bottom:20px;font-size:13px;line-height:1.7;">
+        ⚠️ This will <strong>replace all current data</strong> with the contents of the selected zip. This cannot be undone.
+      </div>
+
+      <div id="zip-file-info" style="background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;margin-bottom:16px;font-size:13px;line-height:1.8;font-family:var(--mono);"></div>
+
+      <label style="display:flex;align-items:center;gap:10px;font-size:13px;margin-bottom:20px;cursor:pointer;">
+        <input type="checkbox" id="zip-backup-first" checked style="width:15px;height:15px;accent-color:var(--accent);">
+        <span>Create a backup of current data before restoring</span>
+      </label>
+
+      <div style="display:flex;gap:10px;justify-content:flex-end;">
+        <button class="btn btn-secondary" onclick="closeZipConfirm()">Cancel</button>
+        <button class="btn btn-primary" id="zip-confirm-btn" onclick="doZipRestore()">↩ Restore</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ── Backups ──────────────────────────────────────────────────────────────── -->
 <div class="card">
   <div class="card-title">💾 Backups</div>
@@ -157,10 +185,13 @@ function onDrop(e) {
   onFileSelect(e.dataTransfer.files);
 }
 
-async function onFileSelect(files) {
+let _pendingZipFile = null;
+
+function onFileSelect(files) {
   for (const f of Array.from(files)) {
     if (f.name.endsWith('.zip')) {
-      await extractZipToSelected(f);
+      showZipConfirm(f);
+      return;
     } else if (f.name.endsWith('.db')) {
       selectedFiles[f.name] = f;
     }
@@ -168,6 +199,62 @@ async function onFileSelect(files) {
   renderFileList();
 }
 
+function showZipConfirm(zipFile) {
+  _pendingZipFile = zipFile;
+  const sizeKb = (zipFile.size / 1024).toFixed(1);
+  document.getElementById('zip-file-info').innerHTML =
+    '<strong>File:</strong> ' + zipFile.name + '<br>' +
+    '<strong>Size:</strong> ' + sizeKb + ' KB';
+  document.getElementById('zip-restore-overlay').style.display = 'block';
+}
+
+function closeZipConfirm() {
+  _pendingZipFile = null;
+  document.getElementById('zip-restore-overlay').style.display = 'none';
+}
+
+async function doZipRestore() {
+  if (!_pendingZipFile) return;
+  const zipFile     = _pendingZipFile;
+  const backupFirst = document.getElementById('zip-backup-first').checked;
+  closeZipConfirm();
+  hideAlerts();
+
+  const statusEl = document.getElementById('alert-success');
+  statusEl.textContent = '⏳ Restoring… please wait.';
+  statusEl.classList.add('show');
+
+  try {
+    if (backupFirst) {
+      statusEl.textContent = '⏳ Creating backup of current data…';
+      try {
+        await fetch(apiUrl('/api/backup/create'), {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({label: 'pre_zip_restore'})
+        });
+      } catch(e) { /* backup failure non-fatal */ }
+    }
+
+    statusEl.textContent = '⏳ Restoring database…';
+    const form = new FormData();
+    form.append('zipfile', zipFile);
+    const r    = await fetch(apiUrl('/api/import/from-zip'), { method: 'POST', body: form });
+    const data = await r.json();
+
+    if (data.ok) {
+      statusEl.textContent = '✓ Restored successfully. Reloading…';
+      setTimeout(function() { window.location.reload(); }, 2500);
+    } else {
+      statusEl.classList.remove('show');
+      showError(data.error || 'Restore failed');
+    }
+  } catch(e) {
+    statusEl.classList.remove('show');
+    showError('Restore failed: ' + e.message);
+  }
+}
+// Legacy: extract zip contents for manual file selection (non-db files only)
 async function extractZipToSelected(zipFile) {
   try {
     const form = new FormData();
@@ -176,6 +263,7 @@ async function extractZipToSelected(zipFile) {
     const data = await r.json();
     if (data.files) {
       for (const [name, b64] of Object.entries(data.files)) {
+        if (name === 'blocks.db') continue;  // never round-trip binary DB through base64
         const bytes = atob(b64);
         const arr   = new Uint8Array(bytes.length);
         for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
@@ -254,7 +342,8 @@ async function doImport() {
     const data = await r.json();
     if (data.ok) {
       const el = document.getElementById('alert-success');
-      el.textContent = '✓ Imported: ' + data.imported.join(', ') + '. Restart the add-on to apply.';
+      el.textContent = '✓ Imported: ' + data.imported.join(', ') + '. Reloading…';
+      setTimeout(function() { window.location.reload(); }, 2500);
       el.classList.add('show');
       selectedFiles = {};
       renderFileList();
@@ -403,7 +492,8 @@ async function confirmRestore() {
     const data = await r.json();
     if (data.ok) {
       const el = document.getElementById('alert-success');
-      el.textContent = '✓ Restored: ' + checked.join(', ') + '. Restart the add-on to apply.';
+      el.textContent = '✓ Restored: ' + checked.join(', ') + '. Reloading…';
+      setTimeout(function() { window.location.reload(); }, 2500);
       el.classList.add('show');
     } else {
       showError(data.error || 'Restore failed');

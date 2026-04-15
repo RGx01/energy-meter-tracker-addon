@@ -210,6 +210,7 @@
     <div class="bar-seg" id="bar-metric-seg">
       <button class="bar-seg-btn active" onclick="barSetMetric('kwh',this)">kWh</button>
       <button class="bar-seg-btn"        onclick="barSetMetric('cost',this)" id="bar-cost-btn">Cost</button>
+      <button class="bar-seg-btn"        onclick="barSetMetric('co2',this)"  id="bar-co2-btn"  style="display:none">CO₂</button>
     </div>
     <div class="bar-seg" id="bar-view-seg">
       <button class="bar-seg-btn active" onclick="barSetView('totals',this)">Totals</button>
@@ -490,7 +491,7 @@ function barLoadState(availableYears) {
     if (!raw) return;
     var st = JSON.parse(raw);
     if (['daily','monthly','yearly'].indexOf(st.period) !== -1) barPeriod = st.period;
-    if (['kwh','cost'].indexOf(st.metric) !== -1)              barMetric = st.metric;
+    if (['kwh','cost','co2'].indexOf(st.metric) !== -1)       barMetric = st.metric;
     if (['totals','net'].indexOf(st.view) !== -1)              barView   = st.view;
     if (typeof st.calendar === 'boolean')                      barCalendar = st.calendar;
     // Restore daily month only if it has data
@@ -521,6 +522,11 @@ async function barInit() {
     barMeters      = json.meters  || [];
     barExportColor = json.export_color || '#ff7f0e';
     document.getElementById('bar-cost-btn').textContent = barCurrency + ' Cost';
+    // Show CO2 toggle only when a postcode is configured (CI data available)
+    var co2Btn = document.getElementById('bar-co2-btn');
+    if (co2Btn) co2Btn.style.display = json.has_postcode ? '' : 'none';
+    // If CO2 was saved but postcode no longer configured, fall back to kWh
+    if (barMetric === 'co2' && !json.has_postcode) barMetric = 'kwh';
     var now   = new Date();
     var years = [...new Set(barData.map(r => r.year))].sort();
     // Set defaults before loading saved state
@@ -571,12 +577,16 @@ function barGetYears() {
 function barVal(meterAgg, mid, isExport) {
   var m = meterAgg.meters[mid];
   if (!m) return 0;
-  if (barMetric === 'kwh') return isExport ? m.exp_kwh  : m.imp_kwh;
-  else                     return isExport ? m.exp_cost : m.imp_cost;
+  if (barMetric === 'kwh')  return isExport ? m.exp_kwh  : m.imp_kwh;
+  if (barMetric === 'cost') return isExport ? m.exp_cost : m.imp_cost;
+  // co2: main meter split into import (above) and export (below zero)
+  //       sub-meters show gross carbon_g (import only, no export)
+  if (isExport) return m.carbon_g_exp != null ? m.carbon_g_exp : 0;
+  return m.carbon_g_imp != null ? m.carbon_g_imp : (m.carbon_g || 0);
 }
 
 function barStandingVal(agg) {
-  if (!barIncStanding() || barMetric === 'kwh') return 0;
+  if (!barIncStanding() || barMetric === 'kwh' || barMetric === 'co2') return 0;
   return agg.standing || 0;
 }
 
@@ -585,11 +595,19 @@ function barGetDatasets(labels, aggList) {
     return [{
       label: 'Net',
       data: aggList.map(function(agg) {
+        if (barMetric === 'co2') {
+          var v = agg.carbon_g_net;
+          return v != null ? Math.round(v * 100) / 100 : null;
+        }
         var imp = barMetric === 'kwh' ? agg.imp_kwh  : (agg.imp_cost + barStandingVal(agg));
         var exp = barMetric === 'kwh' ? agg.exp_kwh  :  agg.exp_cost;
         return Math.round((imp - exp) * 1000) / 1000;
       }),
       backgroundColor: aggList.map(function(agg) {
+        if (barMetric === 'co2') {
+          var v = agg.carbon_g_net;
+          return (v == null || v >= 0) ? (barMeters[0] && barMeters[0].color || '#1f77b4') : barExportColor;
+        }
         var imp = barMetric === 'kwh' ? agg.imp_kwh : agg.imp_cost;
         var exp = barMetric === 'kwh' ? agg.exp_kwh : agg.exp_cost;
         return imp >= exp ? (barMeters[0] && barMeters[0].color || '#1f77b4') : barExportColor;
@@ -621,20 +639,40 @@ function barGetDatasets(labels, aggList) {
     });
   }
 
-  var hasExport = aggList.some(function(agg) {
-    return Object.values(agg.meters || {}).some(function(m) { return (barMetric==='kwh'?m.exp_kwh:m.exp_cost) > 0; });
-  });
-  if (hasExport) {
-    datasets.push({
-      label: 'Export',
-      data: aggList.map(function(agg) {
-        var total = Object.values(agg.meters || {}).reduce(function(s,m){ return s+(barMetric==='kwh'?m.exp_kwh:m.exp_cost); }, 0);
-        return -Math.round(total * 1000) / 1000;
-      }),
-      backgroundColor: barExportColor,
-      borderRadius: 3,
-      stack: 'main'   // same stack — export sits below zero on same axis
+  var hasExport;
+  if (barMetric === 'co2') {
+    // CO2 export: carbon offset from exporting — shown below zero like kWh export
+    hasExport = aggList.some(function(agg) {
+      return Object.values(agg.meters || {}).some(function(m) { return m.carbon_g_exp != null && m.carbon_g_exp > 0; });
     });
+    if (hasExport) {
+      datasets.push({
+        label: 'Export offset',
+        data: aggList.map(function(agg) {
+          var total = Object.values(agg.meters || {}).reduce(function(s,m){ return s+(m.carbon_g_exp||0); }, 0);
+          return -Math.round(total * 100) / 100;
+        }),
+        backgroundColor: barExportColor,
+        borderRadius: 3,
+        stack: 'main'
+      });
+    }
+  } else {
+    hasExport = aggList.some(function(agg) {
+      return Object.values(agg.meters || {}).some(function(m) { return (barMetric==='kwh'?m.exp_kwh:m.exp_cost) > 0; });
+    });
+    if (hasExport) {
+      datasets.push({
+        label: 'Export',
+        data: aggList.map(function(agg) {
+          var total = Object.values(agg.meters || {}).reduce(function(s,m){ return s+(barMetric==='kwh'?m.exp_kwh:m.exp_cost); }, 0);
+          return -Math.round(total * 1000) / 1000;
+        }),
+        backgroundColor: barExportColor,
+        borderRadius: 3,
+        stack: 'main'
+      });
+    }
   }
 
   return datasets;
@@ -642,20 +680,27 @@ function barGetDatasets(labels, aggList) {
 
 function barAggRows(filterFn) {
   var filtered = barData.filter(filterFn);
-  var result = { standing:0, imp_kwh:0, exp_kwh:0, imp_cost:0, exp_cost:0, meters:{} };
+  var result = { standing:0, imp_kwh:0, exp_kwh:0, imp_cost:0, exp_cost:0,
+                 carbon_g_net: null, carbon_g_total: null, meters:{} };
   filtered.forEach(function(row) {
     result.standing  += row.standing  || 0;
     result.imp_kwh   += row.imp_kwh   || 0;
     result.exp_kwh   += row.exp_kwh   || 0;
     result.imp_cost  += row.imp_cost  || 0;
     result.exp_cost  += row.exp_cost  || 0;
+    // carbon_g: NULL-aware — only accumulate when data exists (post-2.3.0 blocks)
+    if (row.carbon_g_net != null)   result.carbon_g_net   = (result.carbon_g_net   || 0) + row.carbon_g_net;
+    if (row.carbon_g_total != null) result.carbon_g_total = (result.carbon_g_total || 0) + row.carbon_g_total;
     Object.keys(row.meters || {}).forEach(function(mid) {
-      if (!result.meters[mid]) result.meters[mid] = {imp_kwh:0,imp_cost:0,exp_kwh:0,exp_cost:0};
+      if (!result.meters[mid]) result.meters[mid] = {imp_kwh:0,imp_cost:0,exp_kwh:0,exp_cost:0,carbon_g:null,carbon_g_imp:null,carbon_g_exp:null};
       var m = row.meters[mid];
       result.meters[mid].imp_kwh  += m.imp_kwh  || 0;
       result.meters[mid].imp_cost += m.imp_cost || 0;
       result.meters[mid].exp_kwh  += m.exp_kwh  || 0;
       result.meters[mid].exp_cost += m.exp_cost || 0;
+      if (m.carbon_g     != null) result.meters[mid].carbon_g     = (result.meters[mid].carbon_g     || 0) + m.carbon_g;
+      if (m.carbon_g_imp != null) result.meters[mid].carbon_g_imp = (result.meters[mid].carbon_g_imp || 0) + m.carbon_g_imp;
+      if (m.carbon_g_exp != null && m.carbon_g_exp !== undefined) result.meters[mid].carbon_g_exp = (result.meters[mid].carbon_g_exp || 0) + m.carbon_g_exp;
     });
   });
   // Round
@@ -664,6 +709,8 @@ function barAggRows(filterFn) {
   result.exp_kwh  = Math.round(result.exp_kwh  * 10000) / 10000;
   result.imp_cost = Math.round(result.imp_cost * 10000) / 10000;
   result.exp_cost = Math.round(result.exp_cost * 10000) / 10000;
+  if (result.carbon_g_net   != null) result.carbon_g_net   = Math.round(result.carbon_g_net   * 100) / 100;
+  if (result.carbon_g_total != null) result.carbon_g_total = Math.round(result.carbon_g_total * 100) / 100;
   return result;
 }
 
@@ -775,7 +822,18 @@ function barGetDataForPeriod() {
     }
   }
 }
+function barCo2Fmt(v, forCopy) {
+  // Auto-scale: gCO2 for small values, kgCO2 for large
+  if (v == null) return forCopy ? '' : '—';
+  var abs = Math.abs(v);
+  var sign = v < 0 ? '-' : '';
+  if (abs >= 10000) return sign + (abs / 1000).toFixed(2) + ' kgCO₂';
+  if (abs >= 1000)  return sign + (abs / 1000).toFixed(3) + ' kgCO₂';
+  return sign + abs.toFixed(0) + ' gCO₂';
+}
+
 function barYLabel(v) {
+  if (barMetric === 'co2') return barCo2Fmt(v);
   var sym = barMetric==='cost' ? barCurrency : '';
   var unit = barMetric==='kwh' ? ' kWh' : '';
   return (v<0?'-':'') + sym + Math.abs(v).toFixed(0) + unit;
@@ -786,6 +844,27 @@ function barRender() {
   // Show/hide standing charge toggle (cost mode only)
   var sw = document.getElementById('bar-standing-wrap');
   if (sw) sw.style.display = barMetric === 'cost' ? 'flex' : 'none';
+
+  // CO2 null notice — shown when CO2 selected but no data yet
+  var _co2Notice = document.getElementById('bar-co2-notice');
+  if (barMetric === 'co2') {
+    var _hasAnyCo2 = barData.some(function(r){ return r.carbon_g_net != null; });
+    if (!_hasAnyCo2) {
+      if (!_co2Notice) {
+        _co2Notice = document.createElement('div');
+        _co2Notice.id = 'bar-co2-notice';
+        _co2Notice.style.cssText = 'color:var(--muted);font-size:12px;padding:8px 0;';
+        _co2Notice.textContent = 'Carbon recording started in v2.3.0. Historical blocks show no data.';
+        var _wrap = document.getElementById('bar-chart-wrap');
+        if (_wrap && _wrap.parentNode) _wrap.parentNode.insertBefore(_co2Notice, _wrap);
+      }
+      _co2Notice.style.display = '';
+    } else {
+      if (_co2Notice) _co2Notice.style.display = 'none';
+    }
+  } else {
+    if (_co2Notice) _co2Notice.style.display = 'none';
+  }
 
   // Normalise barDailyMonth before any rendering — barBuildSubBar would fix it
   // later but barGetDataForPeriod is called first so it must be correct now.
@@ -835,21 +914,26 @@ function barRender() {
           callbacks: {
           label: function(c) {
             var v = c.raw;
+            if (barMetric === 'co2') return ' ' + c.dataset.label + ': ' + barCo2Fmt(v);
             var sym = barMetric==='cost' ? barCurrency : '';
             var unit = barMetric==='kwh' ? ' kWh' : '';
             return ' ' + c.dataset.label + ': ' + (v<0?'-':'') + sym + Math.abs(v).toFixed(barMetric==='cost'?2:3) + unit;
           },
           footer: function(items) {
             if (items.length === 0) return '';
-            var sym = barMetric==='cost' ? barCurrency : '';
-            var unit = barMetric==='kwh' ? ' kWh' : '';
             var idx = items[0].dataIndex;
             var agg = barGetDataForPeriod().aggList[idx];
             if (!agg) return '';
+            if (barMetric === 'co2') {
+              if (barView === 'net') return '';
+              var net = agg.carbon_g_net; var tot = agg.carbon_g_total;
+              return '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nNet: ' + barCo2Fmt(net) + '  Total: ' + barCo2Fmt(tot);
+            }
+            var sym = barMetric==='cost' ? barCurrency : '';
+            var unit = barMetric==='kwh' ? ' kWh' : '';
             var imp = barMetric === 'kwh' ? agg.imp_kwh : (agg.imp_cost + barStandingVal(agg));
             var exp = barMetric === 'kwh' ? agg.exp_kwh : agg.exp_cost;
             var net = imp - exp;
-            var total = imp + exp;
             var dp = barMetric === 'cost' ? 2 : 3;
             var netStr = (net < 0 ? '-' : '') + sym + Math.abs(net).toFixed(dp) + unit;
             var impStr = sym + imp.toFixed(dp) + unit;
@@ -877,7 +961,16 @@ function barBuildLegend() {
     return '<span style="display:flex;align-items:center;gap:5px;"><span class="bar-legend-dot" style="background:' + color + '"></span>' + label + '</span>';
   }
   if (barView === 'net') {
-    el.innerHTML = dot(barMeters[0]&&barMeters[0].color||'#1f77b4','Net import') + dot(barExportColor,'Net export');
+    if (barMetric === 'co2') {
+      el.innerHTML = dot(barMeters[0]&&barMeters[0].color||'#1f77b4','Net emitting') + dot(barExportColor,'Net offsetting');
+    } else {
+      el.innerHTML = dot(barMeters[0]&&barMeters[0].color||'#1f77b4','Net import') + dot(barExportColor,'Net export');
+    }
+    return;
+  }
+  if (barMetric === 'co2') {
+    barMeters.forEach(function(m) { el.innerHTML += dot(m.color, m.label + ' carbon'); });
+    el.innerHTML += dot(barExportColor, 'Export offset');
     return;
   }
   barMeters.forEach(function(m) { el.innerHTML += dot(m.color, m.label + ' import'); });
@@ -1010,6 +1103,7 @@ function barBuildSubBar() {
 }
 
 function barFmt(v, forCopy) {
+  if (barMetric === 'co2') return barCo2Fmt(v, forCopy);
   var sym = barMetric === 'cost' ? barCurrency : '';
   var unit = barMetric === 'kwh' ? ' kWh' : '';
   var abs = Math.abs(v);
@@ -1046,11 +1140,16 @@ function barBuildTable() {
   // Build column headers
   var cols = []; // [{key, label}]
   if (barView === 'net') {
-    cols.push({key:'net', label:'Net'});
+    cols.push({key:'net', label: barMetric==='co2' ? 'Net CO₂' : 'Net'});
   } else {
-    barMeters.forEach(function(m) { cols.push({key:'imp_'+m.id, label: m.label + ' import', mid: m.id, dir:'imp'}); });
-    if (barMetric === 'cost' && barIncStanding()) cols.push({key:'standing', label:'Standing charge'});
-    cols.push({key:'exp', label:'Export', dir:'exp'});
+    if (barMetric === 'co2') {
+      barMeters.forEach(function(m) { cols.push({key:'co2_imp_'+m.id, label: m.label + ' carbon', mid: m.id}); });
+      cols.push({key:'co2_exp', label:'Export offset'});
+    } else {
+      barMeters.forEach(function(m) { cols.push({key:'imp_'+m.id, label: m.label + ' import', mid: m.id, dir:'imp'}); });
+      if (barMetric === 'cost' && barIncStanding()) cols.push({key:'standing', label:'Standing charge'});
+      cols.push({key:'exp', label:'Export', dir:'exp'});
+    }
   }
 
   var sym = barMetric === 'cost' ? barCurrency : '';
@@ -1058,20 +1157,33 @@ function barBuildTable() {
 
   function cellVal(agg, col) {
     if (col.key === 'net') {
+      if (barMetric === 'co2') return agg.carbon_g_net != null ? agg.carbon_g_net : null;
       var imp = barMetric === 'kwh' ? agg.imp_kwh : (agg.imp_cost + barStandingVal(agg));
       var exp = barMetric === 'kwh' ? agg.exp_kwh : agg.exp_cost;
       return imp - exp;
     }
+    if (col.key === 'co2_total') return agg.carbon_g_total != null ? agg.carbon_g_total : null;
     if (col.key === 'standing') return barStandingVal(agg);
     if (col.key === 'exp') {
       var expVal = barMetric === 'kwh'
         ? Object.values(agg.meters||{}).reduce(function(s,m){return s+m.exp_kwh;},0)
         : Object.values(agg.meters||{}).reduce(function(s,m){return s+m.exp_cost;},0);
-      return -expVal; // negative: export is a credit against import
+      return -expVal;
     }
-    // per-meter import
+    // CO2 export offset column
+    if (col.key === 'co2_exp') {
+      var expCarbon = Object.values(agg.meters||{}).reduce(function(s,m){ return s+(m.carbon_g_exp||0); }, 0);
+      return expCarbon > 0 ? -expCarbon : null;
+    }
+    // per-meter (co2 import or kwh/cost import)
     var m = (agg.meters||{})[col.mid];
-    if (!m) return 0;
+    if (!m) return barMetric === 'co2' ? null : 0;
+    if (barMetric === 'co2') {
+      // main meter: use carbon_g_imp (import portion only)
+      // sub-meters: use carbon_g (gross import, no export)
+      var cgi = m.carbon_g_imp != null ? m.carbon_g_imp : m.carbon_g;
+      return cgi != null ? cgi : null;
+    }
     return barMetric === 'kwh' ? m.imp_kwh : m.imp_cost;
   }
 
@@ -1089,20 +1201,24 @@ function barBuildTable() {
     var agg = aggList[i];
     var rowTotal = 0;
     html += '<tr><td>' + barPeriodLabel(lbl, i, pd) + '</td>';
+    var _rowHasVal = false;
     cols.forEach(function(c) {
       var v = cellVal(agg, c);
-      colTotals[c.key] += v;
-      rowTotal += v;
-      html += '<td>' + barFmt(v) + '</td>';
+      if (v != null) {
+        colTotals[c.key] = (colTotals[c.key] || 0) + v;
+        rowTotal += v;
+        _rowHasVal = true;
+      }
+      html += '<td>' + (v != null ? barFmt(v) : '—') + '</td>';
     });
-    grandTotal += rowTotal;
-    html += '<td class="col-total">' + barFmt(rowTotal) + '</td>';
+    if (_rowHasVal) grandTotal += rowTotal;
+    html += '<td class="col-total">' + (_rowHasVal ? barFmt(rowTotal) : '—') + '</td>';
     html += '</tr>';
   });
 
   // Totals row
   html += '<tr><td>Total</td>';
-  cols.forEach(function(c){ html += '<td>' + barFmt(colTotals[c.key]) + '</td>'; });
+  cols.forEach(function(c){ html += '<td>' + (colTotals[c.key] != null ? barFmt(colTotals[c.key]) : '—') + '</td>'; });
   html += '<td class="col-total">' + barFmt(grandTotal) + '</td>';
   html += '</tr>';
 
