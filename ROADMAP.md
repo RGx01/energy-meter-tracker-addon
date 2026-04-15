@@ -30,70 +30,51 @@ Usage Stats chart (daily/monthly/yearly with sub-meter breakdown), global light/
 ### 1.6.x — Polish & Fixes
 Billing/Calendar period toggle, data table totals column, heatmap mobile fixes, light/dark mode fixes throughout.
 
----
+### 2.0.0 — SQLite & Billing History
+SQLite storage replacing blocks.json, config period history, billing-accurate charts and Live Power cards, fast SQL aggregation.
 
-## In Development (unreleased — basis for 2.1.0)
+### 2.1.0 — Full SQLite: Single Source of Truth
+All state in one DB file. Fully normalised schema — no JSON blobs. cumulative_totals.json, current_block.json and meters_config.json eliminated as live state. Enhanced Historical Corrections.
 
-### SQLite & Billing History
-- **SQLite storage** — all blocks in an indexed database; automatic migration from `blocks.json`
-- **Billing History** — config periods tracked; billing charts use historically correct billing day and rates
-- **Billing period transitions** — truncation-only model; correct period boundaries in usage stats and live power
-- **Live Power performance** — instant page load with async billing cards; SQL aggregation replaces full block scans
-- **Historical Corrections** — bulk-update standing charge or import/export rates across a date range via the Import & Backup page
-- **Billing alignment** — kWh, cost and standing charge now agree between Billing chart, Usage Stats and Live Power including BST period boundaries
-- **Config history fixes** — deleting the active period restores `meters_config.json` from the predecessor; restoring `meters_config.json` from backup syncs the active config period in the DB
+### 2.1.x — Stability
+Sub-meter billing accuracy, gap-fill reliability, startup crash fixes, colour consistency across charts.
+
+### 2.2.0 — Data Management
+Bill summary redesign, Delete Blocks page, Historical Corrections promoted to own page, Compact Database, Lovelace-friendly chart endpoints.
+
+### 2.2.x — Fixes
+Billing totals double-counting, Usage Stats billing/calendar toggle, blocks.json import removed from UI.
+
+### 2.3.0 — Carbon Intensity & Power History
+48-hour power history chart with kW/CO₂ toggle, hover tooltip, carbon intensity recording, `carbon_g` on blocks, `/api/power/history` and `/api/carbon/current` endpoints.
 
 ---
 
 ## Planned
 
-### 2.1.0 — Full SQLite: Single Source of Truth
-**Theme: One database file, fully relational, no JSON blobs**
+### 2.4.0 — Carbon Footprint Tracking
+**Theme: Understand and communicate your environmental impact**
 
-All state is now in `energy_meter.db`. Backup and restore is a single file copy. The schema is fully normalised — no JSON blobs anywhere.
+The `carbon_g` column has been recorded on every block since 2.3.0. This release surfaces that data across the UI, and improves the power history chart for high-resolution exploration.
 
-**What shipped:**
-- `cumulative_totals.json` eliminated — totals derived from `SELECT SUM(...)` on the blocks table
-- `current_block.json` eliminated — in-progress block state in `current_block` + `current_reads` tables
-- `meters_config.json` demoted to convenience export — authoritative config in normalised DB tables
-- `full_config_json` blob dropped from `config_periods` — replaced by `meters` and `meter_channels` tables
-- `gap_marker` blob dropped from `current_block` — replaced by `gap_detected_at` column and `is_gap_seed` rows in `current_reads`
-- `meter_channel_meta` EAV table dropped — `mpan` and `tariff` promoted to proper columns on `meter_channels`
-- `migrate_full_config_json()` — automatic upgrade from 2.0.x: four independent steps, safe to re-run, idempotent
-- Import & Backup page updated — file reference table and restore UI reflect single-file model
-- Historical Corrections enhanced — rate corrections now support time-of-day window (DST-aware), per-meter targeting, and per-block preview table before committing
+**Power history chart improvements:**
+- **Incremental polling** — `/api/power/history` gains a `?since=` parameter; the browser sends its last `captured_at` and only receives new rows, merging them into the existing dataset rather than replacing it on every 30-second refresh. Reduces payload from ~1.7 MB to a few KB per poll once the initial load is complete.
+- **Drag-to-zoom** — click and drag on the chart canvas to zoom into a time window; double-click or a reset button to return to the full 48-hour view. Particularly useful given the ~10-second resolution of the underlying data.
 
-**Deprecations removed**
+- **Daily / monthly / all-time carbon footprint** — `SUM(carbon_g)` aggregations in the same pattern as kWh and cost; grouped by `local_date`, `local_year`/`local_month`
+- **Usage Stats** — carbon tab or additional row alongside kWh and cost, switchable between daily/monthly/yearly views
+- **Bill summary** — total net carbon for the billing period shown alongside import cost
+- **Live Power cards** — Today / This Bill / This Year carbon totals
+- **NULL handling** — graceful display when `carbon_g` is NULL for pre-2.3.0 blocks; a note explains when recording began
+- **Back-fill tool** (optional) — fetch historical CI from National Grid API and apply `(imp_kwh - exp_kwh) × intensity` retroactively to older blocks; API does provide historical data so this is feasible
 
-| Artefact | Removed in |
-|----------|-----------|
-| `cumulative_totals.json` as live state | 2.1.0 |
-| `current_block.json` as live state | 2.1.0 |
-| `meters_config.json` as live state | 2.1.0 |
-| `full_config_json` blob column on `config_periods` | 2.1.0 |
-| `gap_marker` blob column on `current_block` | 2.1.0 |
-| `meter_channel_meta` key/value table | 2.1.0 |
-| `SQLITE_MIGRATION_PLAN.md` | 2.1.0 |
-
-> `migrate_json_to_sqlite()` is retained to support users upgrading directly from 1.x. It will be removed in 2.2.0 once the migration window closes.
+> Carbon figures are informational only and reflect grid carbon intensity at the time of consumption, not a certified emissions measurement.
 
 ---
 
-### 2.2.0 — Data Management
-**Theme: Give users control over their data**
-
-With the DB as the single source of truth, data management operations are safe and atomic.
-
-- Stop / Start engine controls (pause recording without restarting the add-on)
-- Reset data wizard — guided flow: stop engine → backup → clear blocks → reconfigure → restart
-- Selective date range deletion (e.g. remove a period of bad data)
-- DB-to-DB migration tool (copy blocks between installs or from older DB files)
-- **Compact database** — "Compact" button on the Data Management page runs `VACUUM` on demand; rebuilds the file, reclaims free pages from deleted/updated rows; blocking operation so user-initiated only; DB grows at ~40 KB/day so compaction is never urgent but useful after bulk deletions or long history
-- Confirmation dialogs and safety checks throughout
-
 ---
 
-### 2.3.0 — Meter Replacement
+### 2.5.0 — Meter Replacement
 **Theme: Handle real-world meter changes gracefully**
 
 When a physical meter is replaced, cumulative reads reset to zero, creating a discontinuity that produces garbled blocks. The engine already clips negative deltas to zero, so the damage is contained but the affected blocks are wrong.
@@ -117,23 +98,13 @@ When a physical meter is replaced, cumulative reads reset to zero, creating a di
 **What is NOT in scope:**
 - Automatic MPAN change detection — too fragile, typos cause cascading recalcs
 - Retroactive recovery of lost kWh — the reads from the old meter's final moments are gone
-- Sub-meter replacement — sub-meters use delta reads from session-based sensors (e.g. Zappi charge added) which reset naturally; the problem only exists for cumulative main meter reads
+- Sub-meter replacement — sub-meters use delta reads from session-based sensors which reset naturally; the problem only exists for cumulative main meter reads
 
 ---
 
-### 2.4.0 — High-Resolution Charting
-**Theme: See what's really happening within each block**
-
-Capture sensor data at full resolution (e.g. every 10 seconds) for charting, while keeping reconciliation blocks for billing accuracy. The `reads` table (populated since 2.1.0) is the data source.
-
-- High-res data already stored per sensor capture in the `reads` table
-- Configurable retention (default 7 days — storage is significant at 10s resolution)
-- Daily charts rendered from high-res data when available, falling back to block data for older periods
-- No impact on billing calculations — reconciliation blocks remain authoritative
-
 ---
 
-### 2.5.0 — Gas Meters
+### 2.6.0 — Gas Meters
 **Theme: Whole-home energy tracking**
 
 Extend the engine to support gas meter recording alongside electricity.
@@ -147,7 +118,7 @@ Extend the engine to support gas meter recording alongside electricity.
 
 ---
 
-### 2.6.0 — Charting Insights
+### 2.7.0 — Charting Insights
 **Theme: Understand your energy patterns**
 
 New analytical views. Planned after Gas Meters so insights can reflect whole-home consumption.

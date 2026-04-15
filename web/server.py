@@ -913,6 +913,61 @@ def api_carbon():
         return jsonify({"error": str(e), "type": type(e).__name__, "repr": repr(e)}), 500
 
 
+# ── Power history + carbon intensity ─────────────────────────────────────────
+
+@app.route("/api/power/history")
+def api_power_history():
+    """
+    Return rolling 48-hour net power and carbon intensity history.
+    Used by the Live Power rolling chart.
+    Returns: { rows: [{captured_at, net_kw, intensity}] }
+    """
+    try:
+        hours = min(int(request.args.get("hours", 48)), 48)
+        store = _get_store()
+        rows  = store.get_power_history(hours=hours)
+        return jsonify({"rows": rows})
+    except Exception as e:
+        logger.error("api_power_history: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/carbon/current")
+def api_carbon_current():
+    """
+    Return the current carbon intensity from the stored carbon_intensity table.
+    Falls back to the live National Grid API call if no stored data exists.
+    Returns: { intensity, ci_index, postcode, source } or { error }
+    """
+    try:
+        store    = _get_store()
+        cfg      = load_config()
+        postcode = None
+        for m_data in cfg.get("meters", {}).values():
+            meta = (m_data or {}).get("meta", {}) or {}
+            if not meta.get("sub_meter"):
+                postcode = meta.get("postcode_prefix", "").strip().upper()
+                break
+
+        if not postcode:
+            return jsonify({"error": "no_postcode"}), 404
+
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        row = store.get_nearest_carbon_intensity(now, postcode)
+        if row:
+            return jsonify({
+                "intensity": row["intensity"],
+                "ci_index":  row["ci_index"],
+                "postcode":  postcode,
+                "source":    "stored",
+            })
+        return jsonify({"error": "no_data", "postcode": postcode}), 404
+    except Exception as e:
+        logger.error("api_carbon_current: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/import")
 def import_page():
     return render_template("import.html", active="import")
