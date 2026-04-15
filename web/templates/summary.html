@@ -183,6 +183,84 @@
 .billing-row-label { color: var(--muted); }
 .billing-row-value { font-family: var(--mono); font-weight: 600; color: var(--text); }
 
+/* ── Rolling power chart ── */
+.power-history-card {
+  margin-bottom: 20px;
+}
+.power-history-wrap {
+  position: relative;
+  width: 100%;
+  height: 180px;
+}
+.power-history-wrap canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.ph-tooltip {
+  position: absolute;
+  pointer-events: none;
+  display: none;
+  background: var(--surface, #1a1d2e);
+  border: 1px solid var(--border, rgba(255,255,255,0.1));
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text, #e2e8f0);
+  white-space: nowrap;
+  z-index: 10;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+}
+.power-history-legend {
+  display: flex;
+  gap: 16px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--muted);
+  flex-wrap: wrap;
+}
+.power-history-legend span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.power-history-legend i {
+  display: inline-block;
+  width: 20px;
+  height: 2px;
+  border-radius: 1px;
+}
+
+/* ── Power history toggle ── */
+.ph-toggle {
+  display: flex;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-left: auto;
+}
+.ph-toggle button {
+  background: none;
+  border: none;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--muted);
+  cursor: pointer;
+  line-height: 1.4;
+  transition: background 0.15s, color 0.15s;
+}
+.ph-toggle button.active {
+  background: var(--accent, #7c6af7);
+  color: #fff;
+}
+.ph-toggle button:not(.active):hover {
+  background: var(--hover, rgba(255,255,255,0.06));
+  color: var(--text);
+}
+
 /* ── Carbon intensity ── */
 .carbon-card {
   background: var(--surface);
@@ -372,6 +450,34 @@
 
 </div>
 
+{% endif %}
+
+{% if has_power_sensor %}
+<!-- ── Rolling Power Chart ── -->
+<div class="card power-history-card">
+  <div class="card-title" style="display:flex;align-items:center;gap:12px;">
+    <span id="ph-title">📈 48-Hour Power History</span>
+    {% if has_postcode %}
+    <div class="ph-toggle" id="ph-toggle">
+      <button id="ph-btn-kw"  class="active" onclick="_phSetMode('kw')">kW</button>
+      <button id="ph-btn-co2" onclick="_phSetMode('co2')">CO₂</button>
+    </div>
+    {% endif %}
+  </div>
+  <div class="power-history-wrap">
+    <canvas id="power-history-canvas"></canvas>
+    <div class="ph-tooltip" id="ph-tooltip"></div>
+  </div>
+  <div class="power-history-legend" id="power-history-legend">
+    <span id="ph-legend-import"><i style="background:#ff6b6b;"></i>Importing</span>
+    <span id="ph-legend-export"><i style="background:#00d4aa;"></i>Exporting</span>
+    <span id="ph-legend-co2" style="display:none;">
+      <i style="background:linear-gradient(to right,#ff6b6b,#00d4aa);"></i>
+      Net carbon rate (gCO₂/min) — red = emitting, green = offsetting
+    </span>
+    <span id="power-history-status" style="margin-left:auto;font-size:11px;color:var(--muted);"></span>
+  </div>
+</div>
 {% endif %}
 
 <!-- ── Billing Summary ── -->
@@ -738,6 +844,488 @@ function loadCarbonAndSchedule() {
 }
 
 loadCarbonAndSchedule();
+{% endif %}
+
+{% if has_power_sensor %}
+// ── Rolling power history chart ──────────────────────────────────────────────
+var _phCanvas   = document.getElementById('power-history-canvas');
+var _phHasCI    = {{ 'true' if has_postcode else 'false' }};
+var _phData     = [];   // [{captured_at, net_kw, intensity, carbon_gco2_min}]
+var _phTimer    = null;
+var _phMode     = 'kw'; // 'kw' or 'co2'
+
+// Restore persisted mode (default kw)
+(function() {
+  try {
+    var saved = localStorage.getItem('emt_ph_mode');
+    if (saved === 'co2' && _phHasCI) _phMode = 'co2';
+  } catch(e) {}
+  _phApplyMode();
+})();
+
+function _phSetMode(mode) {
+  _phMode = mode;
+  try { localStorage.setItem('emt_ph_mode', mode); } catch(e) {}
+  _phApplyMode();
+  _phDraw();
+}
+
+function _phUpdateTitle() {
+  var el = document.getElementById('ph-title');
+  if (!el) return;
+  el.textContent = (_phMode === 'co2' && _phHasCI)
+    ? '☁️ 48-Hour Carbon Rate'
+    : '📈 48-Hour Power History';
+}
+
+function _phApplyMode() {
+  _phUpdateTitle();
+  // Toggle button active state
+  var btnKw  = document.getElementById('ph-btn-kw');
+  var btnCo2 = document.getElementById('ph-btn-co2');
+  if (btnKw)  btnKw.classList.toggle('active',  _phMode === 'kw');
+  if (btnCo2) btnCo2.classList.toggle('active', _phMode === 'co2');
+  // Legend items
+  var legImp = document.getElementById('ph-legend-import');
+  var legExp = document.getElementById('ph-legend-export');
+  var legCo2 = document.getElementById('ph-legend-co2');
+  var isCo2  = _phMode === 'co2';
+  if (legImp) legImp.style.display = isCo2 ? 'none' : '';
+  if (legExp) legExp.style.display = isCo2 ? 'none' : '';
+  if (legCo2) legCo2.style.display = isCo2 ? ''     : 'none';
+}
+
+function _phGetTheme() {
+  var isDark = document.documentElement.getAttribute('data-theme') !== 'light';
+  return {
+    grid:   isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.08)',
+    text:   isDark ? '#6b7080' : '#9ca3af',
+    zero:   isDark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.2)',
+    import: '#ff6b6b',
+    export: '#00d4aa',
+    bg:     isDark ? '#1a1d2e' : '#ffffff',
+  };
+}
+
+function _phDraw() {
+  if (!_phCanvas) return;
+  var dpr  = window.devicePixelRatio || 1;
+  var rect = _phCanvas.getBoundingClientRect();
+  var W    = rect.width  || 600;
+  var H    = rect.height || 180;
+  _phCanvas.width  = W * dpr;
+  _phCanvas.height = H * dpr;
+  var ctx = _phCanvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+
+  var th    = _phGetTheme();
+  var PAD_L = 42;
+  var PAD_T = 12;
+  var PAD_B = 24;
+  var CW    = W - PAD_L;
+  var CH    = H - PAD_T - PAD_B;
+
+  if (!_phData || _phData.length < 2) {
+    ctx.fillStyle = th.text;
+    ctx.font = '12px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Collecting data\u2026', W / 2, H / 2);
+    return;
+  }
+
+  var now   = Date.now();
+  var t0    = now - 48 * 3600 * 1000;
+  var tSpan = 48 * 3600 * 1000;
+
+  function tx(ts) {
+    var s = (ts && ts.slice(-1) !== 'Z') ? ts + 'Z' : ts;
+    return PAD_L + ((new Date(s).getTime() - t0) / tSpan) * CW;
+  }
+
+  // ── Shared helpers ────────────────────────────────────────────────────────
+  function drawGrid(yFn, ticks) {
+    ctx.strokeStyle = th.grid;
+    ctx.lineWidth   = 0.5;
+    ticks.forEach(function(v) {
+      var y = yFn(v);
+      ctx.beginPath(); ctx.moveTo(PAD_L, y); ctx.lineTo(PAD_L + CW, y); ctx.stroke();
+    });
+    for (var h = 0; h <= 48; h += 6) {
+      var x = PAD_L + (h / 48) * CW;
+      ctx.beginPath(); ctx.moveTo(x, PAD_T); ctx.lineTo(x, PAD_T + CH); ctx.stroke();
+    }
+    ctx.strokeStyle = th.zero;
+    ctx.lineWidth   = 1;
+    ctx.beginPath();
+    ctx.moveTo(PAD_L, yFn(0)); ctx.lineTo(PAD_L + CW, yFn(0));
+    ctx.stroke();
+  }
+
+  function drawTimeAxis() {
+    ctx.fillStyle = th.text;
+    ctx.font      = '10px sans-serif';
+    for (var h = 0; h <= 48; h += 6) {
+      var lx = PAD_L + (h / 48) * CW;
+      var lt = new Date(now - (48 - h) * 3600 * 1000);
+      var label = lt.getHours().toString().padStart(2, '0') + ':00';
+      if (h === 0 || lt.getDate() !== new Date(now - (48 - h + 6) * 3600000).getDate()) {
+        label = (lt.getMonth()+1) + '/' + lt.getDate();
+      }
+      // Right-align the last label, left-align the first, centre the rest
+      ctx.textAlign = h === 48 ? 'right' : h === 0 ? 'left' : 'center';
+      ctx.fillText(label, lx, PAD_T + CH + 14);
+    }
+  }
+
+  function drawNowMarker() {
+    ctx.strokeStyle = th.text;
+    ctx.lineWidth   = 1;
+    ctx.setLineDash([2, 3]);
+    ctx.beginPath();
+    ctx.moveTo(PAD_L + CW, PAD_T); ctx.lineTo(PAD_L + CW, PAD_T + CH);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  function drawYLabel(text, rotate) {
+    ctx.save();
+    if (rotate) {
+      ctx.translate(10, PAD_T + CH / 2);
+      ctx.rotate(-Math.PI / 2);
+    } else {
+      ctx.translate(W - 6, PAD_T + CH / 2);
+      ctx.rotate(Math.PI / 2);
+    }
+    ctx.textAlign = 'center';
+    ctx.fillStyle = th.text;
+    ctx.font      = '10px sans-serif';
+    ctx.fillText(text, 0, 0);
+    ctx.restore();
+  }
+
+  // ── kW mode ───────────────────────────────────────────────────────────────
+  function drawKw() {
+    // Independent extents but shared interval — interval derived from the larger side
+    var rawMax = 1, rawMin = -1;
+    _phData.forEach(function(r) {
+      var kw = r.net_kw || 0;
+      if (kw > 0) rawMax = Math.max(rawMax, kw);
+      if (kw < 0) rawMin = Math.min(rawMin, kw);
+    });
+    rawMax *= 1.1; rawMin *= 1.1;
+
+    // Nice round interval from the larger magnitude
+    function niceInterval(v) {
+      var mag = Math.pow(10, Math.floor(Math.log10(v)));
+      var norm = v / mag;
+      if (norm <= 1) return mag * 0.2;
+      if (norm <= 2) return mag * 0.5;
+      if (norm <= 5) return mag;
+      return mag * 2;
+    }
+    var interval = niceInterval(Math.max(rawMax, Math.abs(rawMin)));
+
+    // Extent on each side: smallest multiple of interval that covers the data
+    var maxKw = Math.ceil(rawMax / interval) * interval;
+    var minKw = -Math.ceil(Math.abs(rawMin) / interval) * interval;
+    var kwRange = maxKw - minKw;
+    function ty(kw) { return PAD_T + ((maxKw - kw) / kwRange) * CH; }
+
+    // Ticks: multiples of interval from 0 up to maxKw / down to minKw
+    var allTicks = [];
+    for (var t = 0; t <= maxKw + 1e-9; t = Math.round((t + interval) * 1e6) / 1e6)
+      allTicks.push(t);
+    for (var t = -interval; t >= minKw - 1e-9; t = Math.round((t - interval) * 1e6) / 1e6)
+      allTicks.push(t);
+
+    drawGrid(ty, allTicks);
+
+    ctx.fillStyle = th.text;
+    ctx.font      = '10px sans-serif';
+    ctx.textAlign = 'right';
+    allTicks.forEach(function(kw) {
+      ctx.fillText(kw.toFixed(1), PAD_L - 4, ty(kw) + 3);
+    });
+    drawYLabel('kW', true);
+    drawTimeAxis();
+
+    var zeroY = ty(0);
+
+    // Import fill
+    ctx.fillStyle = 'rgba(255,107,107,0.15)';
+    ctx.beginPath();
+    var started = false;
+    _phData.forEach(function(r) {
+      var x = tx(r.captured_at), y = ty(Math.max(0, r.net_kw || 0));
+      if (!started) { ctx.moveTo(x, zeroY); started = true; }
+      ctx.lineTo(x, y);
+    });
+    ctx.lineTo(tx(_phData[_phData.length-1].captured_at), zeroY);
+    ctx.closePath(); ctx.fill();
+
+    // Export fill
+    ctx.fillStyle = 'rgba(0,212,170,0.15)';
+    ctx.beginPath();
+    started = false;
+    _phData.forEach(function(r) {
+      var x = tx(r.captured_at), y = ty(Math.min(0, r.net_kw || 0));
+      if (!started) { ctx.moveTo(x, zeroY); started = true; }
+      ctx.lineTo(x, y);
+    });
+    ctx.lineTo(tx(_phData[_phData.length-1].captured_at), zeroY);
+    ctx.closePath(); ctx.fill();
+
+    // Line — colour by segment midpoint
+    _phData.forEach(function(r, i) {
+      if (i === 0) return;
+      var prev = _phData[i-1];
+      var mid  = ((prev.net_kw || 0) + (r.net_kw || 0)) / 2;
+      ctx.strokeStyle = mid >= 0 ? th.import : th.export;
+      ctx.lineWidth   = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(tx(prev.captured_at), ty(prev.net_kw || 0));
+      ctx.lineTo(tx(r.captured_at),    ty(r.net_kw    || 0));
+      ctx.stroke();
+    });
+
+    drawNowMarker();
+  }
+
+  // ── CO2 mode ──────────────────────────────────────────────────────────────
+  function drawCo2() {
+    var pts = _phData.filter(function(r) { return r.carbon_gco2_min != null; });
+
+    if (pts.length < 2) {
+      ctx.fillStyle = th.text;
+      ctx.font      = '12px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('No carbon data yet', W / 2, H / 2);
+      return;
+    }
+
+    var rawMaxCI = 10, rawMinCI = 0;
+    pts.forEach(function(r) {
+      var v = Math.max(-250, Math.min(250, r.carbon_gco2_min));
+      if (v > 0) rawMaxCI = Math.max(rawMaxCI, v);
+      if (v < 0) rawMinCI = Math.min(rawMinCI, v);
+    });
+    rawMaxCI *= 1.1; rawMinCI *= 1.1;
+
+    function niceIntervalCI(v) {
+      var mag = Math.pow(10, Math.floor(Math.log10(v)));
+      var norm = v / mag;
+      if (norm <= 1) return mag * 0.2;
+      if (norm <= 2) return mag * 0.5;
+      if (norm <= 5) return mag;
+      return mag * 2;
+    }
+    var ciInterval = niceIntervalCI(Math.max(rawMaxCI, Math.abs(rawMinCI) || 1));
+    var maxCI = Math.ceil(rawMaxCI / ciInterval) * ciInterval;
+    var minCI = rawMinCI < 0 ? -Math.ceil(Math.abs(rawMinCI) / ciInterval) * ciInterval : 0;
+    var ciRange = maxCI - minCI;
+
+    function clampCI(v) { return Math.max(-250, Math.min(250, v)); }
+    function ty(ci) { return PAD_T + CH - ((clampCI(ci) - minCI) / ciRange) * CH; }
+
+    // Ticks: multiples of ciInterval from 0 up/down to extents
+    var ticks = [];
+    for (var t = 0; t <= maxCI + 1e-9; t = Math.round((t + ciInterval) * 1e6) / 1e6)
+      ticks.push(t);
+    if (minCI < 0) {
+      for (var t = -ciInterval; t >= minCI - 1e-9; t = Math.round((t - ciInterval) * 1e6) / 1e6)
+        ticks.push(t);
+    }
+
+    drawGrid(ty, ticks);
+
+    ctx.font      = '10px sans-serif';
+    ctx.textAlign = 'right';
+    ticks.forEach(function(v) {
+      ctx.fillStyle = v > 0 ? 'rgba(255,107,107,0.9)'
+                    : v < 0 ? 'rgba(0,212,170,0.9)'
+                    : th.text;
+      ctx.fillText(v.toFixed(1), PAD_L - 4, ty(v) + 3);
+    });
+    drawYLabel('gCO\u2082/min', true);
+    drawTimeAxis();
+
+    var zeroY = ty(0);
+    var zeroFrac = Math.max(0, Math.min(1, (zeroY - PAD_T) / CH));
+    var grad = ctx.createLinearGradient(0, PAD_T, 0, PAD_T + CH);
+    grad.addColorStop(0,        'rgba(255,107,107,0.25)');
+    grad.addColorStop(zeroFrac, 'rgba(255,107,107,0.08)');
+    grad.addColorStop(zeroFrac, 'rgba(0,212,170,0.08)');
+    grad.addColorStop(1,        'rgba(0,212,170,0.25)');
+
+    ctx.save();
+    ctx.beginPath();
+    pts.forEach(function(r, i) {
+      var x = tx(r.captured_at), y = ty(r.carbon_gco2_min);
+      if (i === 0) ctx.moveTo(x, zeroY);
+      ctx.lineTo(x, y);
+    });
+    ctx.lineTo(tx(pts[pts.length-1].captured_at), zeroY);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+    ctx.restore();
+
+    ctx.lineWidth   = 1.5;
+    ctx.globalAlpha = 0.9;
+    pts.forEach(function(r, i) {
+      if (i === 0) return;
+      var prev = pts[i-1];
+      var mid  = (prev.carbon_gco2_min + r.carbon_gco2_min) / 2;
+      ctx.strokeStyle = mid >= 0 ? th.import : th.export;
+      ctx.beginPath();
+      ctx.moveTo(tx(prev.captured_at), ty(prev.carbon_gco2_min));
+      ctx.lineTo(tx(r.captured_at),    ty(r.carbon_gco2_min));
+      ctx.stroke();
+    });
+    ctx.globalAlpha = 1;
+
+    drawNowMarker();
+  }
+
+  // ── Dispatch ──────────────────────────────────────────────────────────────
+  if (_phMode === 'co2' && _phHasCI) {
+    drawCo2();
+  } else {
+    drawKw();
+  }
+}
+
+async function _phLoad() {
+  try {
+    var r = await fetch(apiUrl('/api/power/history'));
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json();
+    _phData = d.rows || [];
+    var statusEl = document.getElementById('power-history-status');
+    if (statusEl) {
+      statusEl.textContent = _phData.length > 0
+        ? _phData.length + ' readings'
+        : 'No data yet';
+    }
+    _phDraw();
+  } catch(e) {
+    var statusEl = document.getElementById('power-history-status');
+    if (statusEl) statusEl.textContent = 'Error loading history';
+  }
+}
+
+// Redraw on theme change
+window.addEventListener('message', function(e) {
+  if (e.data && e.data.type === 'emt-theme') _phDraw();
+});
+
+// Redraw on resize
+window.addEventListener('resize', function() {
+  clearTimeout(_phTimer);
+  _phTimer = setTimeout(_phDraw, 200);
+}, { passive: true });
+
+// Load immediately then refresh every 30s (synced with power poll cadence)
+_phLoad();
+setInterval(_phLoad, 30000);
+
+// ── Hover tooltip ────────────────────────────────────────────────────────────
+(function() {
+  var tip = document.getElementById('ph-tooltip');
+  if (!_phCanvas || !tip) return;
+
+  // Convert canvas-relative mouse X back to a UTC ms timestamp
+  function xToTime(mouseX) {
+    var rect = _phCanvas.getBoundingClientRect();
+    var dpr  = window.devicePixelRatio || 1;
+    var PAD_L_px = 42 * (rect.width / (_phCanvas.width / dpr));
+    var CW_px    = rect.width - PAD_L_px;
+    var frac = (mouseX - PAD_L_px) / CW_px;
+    var now  = Date.now();
+    return now - 48 * 3600 * 1000 + frac * 48 * 3600 * 1000;
+  }
+
+  // Find nearest data point to a UTC ms timestamp
+  function nearest(targetMs, rows) {
+    if (!rows || rows.length === 0) return null;
+    var best = null, bestDiff = Infinity;
+    rows.forEach(function(r) {
+      var s = (r.captured_at && r.captured_at.slice(-1) !== 'Z')
+              ? r.captured_at + 'Z' : r.captured_at;
+      var diff = Math.abs(new Date(s).getTime() - targetMs);
+      if (diff < bestDiff) { bestDiff = diff; best = r; }
+    });
+    return best;
+  }
+
+  _phCanvas.addEventListener('mousemove', function(e) {
+    if (!_phData || _phData.length === 0) return;
+    var rect    = _phCanvas.getBoundingClientRect();
+    var mouseX  = e.clientX - rect.left;
+    var mouseY  = e.clientY - rect.top;
+
+    // Only show tooltip over the data area
+    var PAD_L_px = 42 * (rect.width / (_phCanvas.width / (window.devicePixelRatio || 1)));
+    if (mouseX < PAD_L_px) { tip.style.display = 'none'; return; }
+
+    var rows = (_phMode === 'co2' && _phHasCI)
+      ? _phData.filter(function(r) { return r.carbon_gco2_min != null; })
+      : _phData;
+
+    var pt = nearest(xToTime(mouseX), rows);
+    if (!pt) { tip.style.display = 'none'; return; }
+
+    // Format local time from UTC captured_at
+    var s  = (pt.captured_at && pt.captured_at.slice(-1) !== 'Z')
+             ? pt.captured_at + 'Z' : pt.captured_at;
+    var dt = new Date(s);
+    var timeStr = dt.toLocaleDateString([], {month:'numeric', day:'numeric'})
+                + ' '
+                + dt.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+
+    var lines = ['<span style="color:var(--muted)">' + timeStr + '</span>'];
+
+    if (_phMode === 'co2' && _phHasCI) {
+      var co2 = pt.carbon_gco2_min;
+      var col = co2 >= 0 ? '#ff6b6b' : '#00d4aa';
+      var lbl = co2 >= 0 ? 'Emitting' : 'Offsetting';
+      lines.push('<span style="color:' + col + '">' + lbl + ' '
+               + Math.abs(co2).toFixed(2) + ' gCO₂/min</span>');
+      if (pt.intensity != null) {
+        lines.push('<span style="color:var(--muted)">Grid: ' + pt.intensity + ' gCO₂/kWh</span>');
+      }
+    } else {
+      var kw  = pt.net_kw || 0;
+      var col = kw >= 0 ? '#ff6b6b' : '#00d4aa';
+      var lbl = kw >= 0 ? 'Importing' : 'Exporting';
+      lines.push('<span style="color:' + col + '">' + lbl + ' '
+               + Math.abs(kw).toFixed(3) + ' kW</span>');
+      if (pt.intensity != null) {
+        lines.push('<span style="color:var(--muted)">CI: ' + pt.intensity + ' gCO₂/kWh</span>');
+      }
+    }
+
+    tip.innerHTML = lines.join('<br>');
+    tip.style.display = 'block';
+
+    // Position: follow mouse, flip left if near right edge
+    var tipW = tip.offsetWidth;
+    var tipH = tip.offsetHeight;
+    var MARGIN = 12;
+    var left = mouseX + MARGIN;
+    var top  = mouseY - tipH / 2;
+    if (left + tipW > rect.width - 4) left = mouseX - tipW - MARGIN;
+    if (top < 0) top = 0;
+    if (top + tipH > rect.height) top = rect.height - tipH;
+    tip.style.left = left + 'px';
+    tip.style.top  = top  + 'px';
+  });
+
+  _phCanvas.addEventListener('mouseleave', function() {
+    tip.style.display = 'none';
+  });
+})();
 {% endif %}
 </script>
 {% endblock %}

@@ -71,6 +71,7 @@ _read_queue:               list         = []
 _last_known_sensor_values: dict         = {}
 _engine_loop_lock:         asyncio.Lock = None   # initialised in setup()
 _engine_paused:            bool         = False
+_last_ci_fetch:            datetime | None = None   # UTC — last carbon intensity fetch
 
 
 def setup():
@@ -1001,6 +1002,40 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
                 block["totals"]["export_kwh"]  += channel["kwh"]
                 block["totals"]["export_cost"] += channel["cost"]
 
+    # ── PASS 3b — carbon footprint ───────────────────────────────────────
+    # Join to nearest carbon_intensity row and compute carbon_g for every meter.
+    try:
+        postcode = _get_postcode()
+        if postcode:
+            ci_row = _store.get_nearest_carbon_intensity(start, postcode)
+            if ci_row:
+                intensity = ci_row["intensity"]
+                for meter_name, meter_block in block["meters"].items():
+                    meta       = meter_block.get("meta", {}) or {}
+                    imp_ch     = meter_block.get("channels", {}).get("import")
+                    exp_ch     = meter_block.get("channels", {}).get("export")
+                    is_sub     = meta.get("sub_meter", False)
+                    if is_sub:
+                        # Sub-meter: gross import consumption only
+                        imp_kwh  = float((imp_ch or {}).get("kwh", 0.0) or 0.0)
+                        carbon_g = round(imp_kwh * intensity, 4)
+                    else:
+                        # Main meter: use kwh_total (full grid draw before sub-meter
+                        # subtraction) minus export. This is the actual carbon produced
+                        # by grid generation on our behalf regardless of how it was
+                        # distributed to sub-meters.
+                        imp_kwh  = float((imp_ch or {}).get("kwh_total",
+                                   (imp_ch or {}).get("kwh", 0.0)) or 0.0)
+                        exp_kwh  = float((exp_ch or {}).get("kwh", 0.0) or 0.0)
+                        carbon_g = round((imp_kwh - exp_kwh) * intensity, 4)
+                    meter_block["carbon_g"] = carbon_g
+                    logger.debug(
+                        "finalise_block: %s carbon_g=%.2f gCO2 (intensity=%.1f gCO2/kWh)",
+                        meter_name, carbon_g, intensity
+                    )
+    except Exception as e:
+        logger.warning("finalise_block: carbon_g computation failed: %s", e)
+
     append_block(block)
 
     # ── PASS 4 — update cumulative totals (derived from DB, no JSON file) ───
@@ -1112,6 +1147,106 @@ async def on_export_meter_update(entity_id: str, new_val: str, full_state: dict)
 # Engine loop  (replaces @time_trigger("period(now, 10s)"))
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _get_postcode() -> str | None:
+    """Return the postcode_prefix from the main meter config, or None."""
+    try:
+        cfg = load_config()
+        for m_data in cfg.get("meters", {}).values():
+            meta = (m_data or {}).get("meta", {}) or {}
+            if not meta.get("sub_meter"):
+                pc = meta.get("postcode_prefix", "").strip().upper()
+                return pc if pc else None
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_carbon_intensity(postcode: str) -> list:
+    """
+    Fetch current + 48hr forecast from National Grid API for the given postcode.
+    Returns list of {captured_at, intensity, ci_index} dicts.
+    Raises on HTTP/network error so caller can log appropriately.
+    """
+    import urllib.request
+    import urllib.error
+    import json as _json
+
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+    url = (f"https://api.carbonintensity.org.uk/regional/intensity"
+           f"/{now_iso}/fw48h/postcode/{postcode}")
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        data = _json.loads(resp.read())
+
+    slots = []
+    raw = data.get("data", [])
+    # Handle dict shape: {data: {regionid, postcode, data: [...]}}
+    if isinstance(raw, dict):
+        entries = raw.get("data", [])
+    elif isinstance(raw, list) and raw:
+        first = raw[0]
+        entries = first.get("data", []) if "data" in first else raw
+    else:
+        entries = []
+
+    for slot in entries:
+        intensity_obj = slot.get("intensity", {})
+        intensity_val = intensity_obj.get("forecast")
+        ci_index      = intensity_obj.get("index")
+        slot_from     = slot.get("from")
+        if slot_from and intensity_val is not None:
+            # Normalise to plain ISO (strip trailing Z)
+            captured_at = slot_from.replace("Z", "").replace("+00:00", "")
+            slots.append({
+                "captured_at": captured_at,
+                "intensity":   float(intensity_val),
+                "ci_index":    ci_index,
+            })
+
+    return slots
+
+
+async def _tick_carbon_intensity() -> float | None:
+    """
+    Fetch and store carbon intensity if 15 minutes have elapsed since last fetch.
+    Returns the current intensity (gCO2/kWh) or None.
+    """
+    global _last_ci_fetch
+    import urllib.error
+
+    postcode = _get_postcode()
+    if not postcode:
+        return None  # No postcode configured — fail silently
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    elapsed = (now - _last_ci_fetch).total_seconds() if _last_ci_fetch else None
+    if elapsed is not None and elapsed < 900:  # 15 minutes
+        # Not time yet — return current intensity from DB without fetching
+        row = _store.get_nearest_carbon_intensity(now.isoformat(), postcode)
+        return row["intensity"] if row else None
+
+    try:
+        slots = _fetch_carbon_intensity(postcode)
+        for slot in slots:
+            _store.upsert_carbon_intensity(
+                slot["captured_at"], postcode,
+                slot["intensity"], slot["ci_index"]
+            )
+        _store.prune_carbon_intensity(days=4)
+        _last_ci_fetch = now
+        logger.info("_tick_carbon_intensity: stored %d slots for %s", len(slots), postcode)
+    except urllib.error.HTTPError as e:
+        logger.warning("_tick_carbon_intensity: HTTP %s for postcode %s", e.code, postcode)
+    except urllib.error.URLError as e:
+        logger.warning("_tick_carbon_intensity: network error for postcode %s: %s", postcode, e)
+    except Exception as e:
+        logger.warning("_tick_carbon_intensity: unexpected error: %s", e)
+
+    # Return current intensity from DB regardless of fetch success/failure
+    row = _store.get_nearest_carbon_intensity(now.isoformat(), postcode)
+    return row["intensity"] if row else None
+
+
 async def engine_loop_task(ha: HAClient):
     """
     Runs forever, ticking every 10 seconds.
@@ -1221,6 +1356,45 @@ async def _engine_tick(ha: HAClient):
         updated_block["_last_checkpoint"] = now.isoformat()
         _store.save_current_block(updated_block)
 
+    # ── Carbon intensity + power history ──────────────────────────────────
+    try:
+        current_intensity = await _tick_carbon_intensity()
+    except Exception as _cie:
+        logger.warning("_engine_tick: CI fetch raised: %s", _cie)
+        current_intensity = None
+
+    # Write power history row every tick if a power sensor is configured
+    try:
+        cfg = load_config()
+        power_sensor = None
+        for m_data in cfg.get("meters", {}).values():
+            meta = (m_data or {}).get("meta", {}) or {}
+            if not meta.get("sub_meter"):
+                power_sensor = meta.get("power_sensor")
+                break
+        if power_sensor and ha:
+            raw_kw = ha.get_state(power_sensor)
+            if raw_kw not in (None, "unknown", "unavailable"):
+                net_kw = round(float(raw_kw), 3)
+
+                # Carbon rate: net_kw (kW) × intensity (gCO2/kWh) ÷ 60 = gCO2/min.
+                # Derived directly from the power sensor — the kWh sensor only updates
+                # every ~60s while the engine ticks every ~10s, so the read-delta approach
+                # produced zeros (sensor unchanged) and spikes (full 60s of kWh over a
+                # ~10s dt_min). The power sensor is already the correct instantaneous value.
+                carbon_gco2_min = None
+                if current_intensity is not None:
+                    try:
+                        carbon_gco2_min = round(net_kw * current_intensity / 60.0, 4)
+                    except Exception as _ce:
+                        logger.debug("_engine_tick: carbon_gco2_min skipped: %s", _ce)
+
+                _store.append_power_history(now.isoformat(), net_kw,
+                                            current_intensity, carbon_gco2_min)
+                _store.prune_power_history(hours=48)
+    except Exception as e:
+        logger.warning("_engine_tick: power_history write skipped: %s", e)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Startup  (replaces @time_trigger("startup"))
@@ -1256,9 +1430,23 @@ async def engine_startup(ha: HAClient):
     else:
         logger.warning("engine_startup: no main export sensor found in config")
 
+    # Subscribe power sensor to state changes so the cache stays current
+    # between restarts. No callback needed — ha_client updates the cache automatically.
+    for mid, mcfg in config.get("meters", {}).items():
+        if not mcfg.get("meta", {}).get("sub_meter", False):
+            ps = mcfg.get("meta", {}).get("power_sensor")
+            if ps:
+                ha.subscribe_state(ps, lambda entity_id, new_val, full_state: None)
+                logger.info("engine_startup: power sensor subscribed for cache: %s", ps)
+            break
+
     # Pre-load sensor states into ha_client cache
     sensors_to_preload = []
     for mcfg in config.get("meters", {}).values():
+        # Include power_sensor from meta (not in channels)
+        ps = mcfg.get("meta", {}).get("power_sensor")
+        if ps:
+            sensors_to_preload.append(ps)
         for ccfg in mcfg.get("channels", {}).values():
             for key in ("read", "rate", "standing_charge_sensor"):
                 eid = ccfg.get(key)
