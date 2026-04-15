@@ -43,8 +43,36 @@ def make_store():
         "SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
 
 
+def make_store_with_submeters():
+    """Store with electricity_main + ev_charger + house_battery sub-meters."""
+    store = BlockStore(":memory:")
+    store.insert_config_period({"meters": {
+        "electricity_main": {"meta": {
+            "billing_day": 15, "block_minutes": 30, "timezone": "Europe/London",
+            "currency_symbol": "£", "currency_code": "GBP", "site": "Home",
+            "postcode_prefix": "DE1",
+        }},
+        "ev_charger": {"meta": {
+            "sub_meter": True, "parent_meter": "electricity_main",
+            "device": "Zappi EV Charger",
+            "billing_day": 15, "block_minutes": 30, "timezone": "Europe/London",
+            "currency_symbol": "£", "currency_code": "GBP",
+        }},
+        "house_battery": {"meta": {
+            "sub_meter": True, "parent_meter": "electricity_main",
+            "device": "Solax Battery",
+            "billing_day": 15, "block_minutes": 30, "timezone": "Europe/London",
+            "currency_symbol": "£", "currency_code": "GBP",
+        }},
+    }})
+    cp_id = store._conn.execute(
+        "SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+    return store, cp_id
+
+
 def insert_block(store, cp_id, block_start_utc, imp_kwh, imp_cost,
-                 exp_kwh=0.0, exp_cost=0.0, standing=0.50):
+                 exp_kwh=0.0, exp_cost=0.0, standing=0.50, carbon_g=None,
+                 meter_id="electricity_main"):
     """Insert one block row; local_date derived from UTC start."""
     local_date = (datetime.fromisoformat(block_start_utc)
                   .replace(tzinfo=ZoneInfo("UTC"))
@@ -57,14 +85,14 @@ def insert_block(store, cp_id, block_start_utc, imp_kwh, imp_cost,
             imp_rate, imp_cost, imp_cost_remainder,
             imp_read_start, imp_read_end,
             exp_kwh, exp_rate, exp_cost,
-            exp_read_start, exp_read_end, standing_charge)
-        VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,NULL,NULL,NULL,?,NULL,?,NULL,NULL,?)
+            exp_read_start, exp_read_end, standing_charge, carbon_g)
+        VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,NULL,NULL,NULL,?,NULL,?,NULL,NULL,?,?)
     """, (block_start_utc,
           (datetime.fromisoformat(block_start_utc)+timedelta(minutes=30)).isoformat(),
           local_date,
           int(local_date[:4]), int(local_date[5:7]), int(local_date[8:10]),
-          "electricity_main", cp_id, 0,
-          imp_kwh, imp_cost, exp_kwh, exp_cost, standing))
+          meter_id, cp_id, 0,
+          imp_kwh, imp_cost, exp_kwh, exp_cost, standing, carbon_g))
     store._conn.commit()
 
 
@@ -73,7 +101,7 @@ def sim_usage_stats_day(store, local_date_str):
     Simulate what api_blocks_summary does for one local day:
     - fetch blocks by local_date
     - get standing from first block
-    - sum imp/exp kwh and cost from blocks directly
+    - sum imp/exp kwh, cost and carbon_g from blocks directly
     Returns dict matching the row structure.
     """
     blocks = store.get_blocks_for_local_date_range(local_date_str, local_date_str)
@@ -84,21 +112,59 @@ def sim_usage_stats_day(store, local_date_str):
     _first_meter = next(iter((blocks[0].get("meters") or {}).values()), {})
     standing = float(_first_meter.get("standing_charge") or 0.0)
     imp_kwh = imp_cost = exp_kwh = exp_cost = 0.0
+    carbon_g_net = None   # NULL until at least one non-NULL block seen
     for b in blocks:
         for mid, md in (b.get("meters") or {}).items():
+            meta = (md.get("meta") or {})
             ch_imp = (md.get("channels") or {}).get("import") or {}
             ch_exp = (md.get("channels") or {}).get("export") or {}
             imp_kwh  += float(ch_imp.get("kwh") or 0)
             imp_cost += float(ch_imp.get("cost") or 0)
             exp_kwh  += float(ch_exp.get("kwh") or 0)
             exp_cost += float(ch_exp.get("cost") or 0)
+            # carbon_g: accumulate for main meter only (net figure)
+            if not meta.get("sub_meter"):
+                cg = md.get("carbon_g")
+                if cg is not None:
+                    carbon_g_net = (carbon_g_net or 0.0) + float(cg)
+
+    # carbon_g_total = main net + sub-meter gross (no double-count)
+    # carbon_g_imp/exp back-calculated from average intensity implied by net carbon
+    sub_carbon = sum(
+        float(cg) for cg in [
+            _md.get("carbon_g") for _b in blocks
+            for _mid, _md in (_b.get("meters") or {}).items()
+            if (_md or {}).get("meta", {}).get("sub_meter") and _md.get("carbon_g") is not None
+        ]
+    )
+    carbon_g_total = round(carbon_g_net + sub_carbon, 4) if carbon_g_net is not None else None
+
+    # Back-calculate imp/exp split from net kWh and net carbon
+    main_imp = imp_kwh
+    main_exp = exp_kwh
+    if carbon_g_net is not None and (main_imp - main_exp) != 0:
+        _intensity = carbon_g_net / (main_imp - main_exp)
+        carbon_g_imp = round(main_imp * _intensity, 4)
+        carbon_g_exp = round(main_exp * abs(_intensity), 4)
+    elif carbon_g_net is not None and main_imp == 0:
+        carbon_g_imp = 0.0
+        carbon_g_exp = round(-carbon_g_net, 4)
+    elif carbon_g_net is not None:
+        carbon_g_imp = round(carbon_g_net, 4)
+        carbon_g_exp = 0.0
+    else:
+        carbon_g_imp = carbon_g_exp = None
 
     return {
-        "standing": round(standing, 4),
-        "imp_kwh":  round(imp_kwh, 4),
-        "imp_cost": round(imp_cost, 4),
-        "exp_kwh":  round(exp_kwh, 4),
-        "exp_cost": round(exp_cost, 4),
+        "standing":      round(standing, 4),
+        "imp_kwh":       round(imp_kwh, 4),
+        "imp_cost":      round(imp_cost, 4),
+        "exp_kwh":       round(exp_kwh, 4),
+        "exp_cost":      round(exp_cost, 4),
+        "carbon_g_net":  round(carbon_g_net, 4) if carbon_g_net is not None else None,
+        "carbon_g_total": carbon_g_total,
+        "carbon_g_imp":  carbon_g_imp,
+        "carbon_g_exp":  carbon_g_exp,
     }
 
 
@@ -111,12 +177,24 @@ def sum_daily_rows(rows):
     """Sum a list of day rows (as returned by sim_usage_stats_day)."""
     out = {"standing": 0.0, "imp_kwh": 0.0, "imp_cost": 0.0,
            "exp_kwh": 0.0, "exp_cost": 0.0}
+    carbon_net = None
     for r in rows:
         if r:
             for k in out:
-                out[k] += r[k]
+                out[k] += r.get(k, 0.0)
+            cg = r.get("carbon_g_net")
+            if cg is not None:
+                carbon_net = (carbon_net or 0.0) + cg
     for k in out:
         out[k] = round(out[k], 4)
+    out["carbon_g_net"] = round(carbon_net, 4) if carbon_net is not None else None
+    # Also sum carbon_g_total, imp, exp
+    for _ck in ("carbon_g_total", "carbon_g_imp", "carbon_g_exp"):
+        _ctot = None
+        for r in rows:
+            if r and r.get(_ck) is not None:
+                _ctot = (_ctot or 0.0) + r[_ck]
+        out[_ck] = round(_ctot, 4) if _ctot is not None else None
     return out
 
 
@@ -615,3 +693,248 @@ class TestBillSummaryMainImportRaw(unittest.TestCase):
             msg="Rendered HTML must show house remainder label")
         self.assertIn("Import — total grid", html,
             msg="Rendered HTML must show total grid header")
+
+class TestCarbonVsBlocks(unittest.TestCase):
+    """
+    carbon_g in Usage Stats rows must match direct SUM(carbon_g) from blocks.
+    Covers: basic aggregation, NULL handling, BST boundary, net vs sub-meter.
+    """
+
+    def setUp(self):
+        self.store, self.cp = make_store()
+
+    def _db_carbon(self, first_date, last_date, meter_id="electricity_main"):
+        row = self.store._conn.execute(
+            """SELECT SUM(carbon_g) as total FROM blocks
+               WHERE local_date >= ? AND local_date <= ? AND meter_id = ?""",
+            (first_date, last_date, meter_id)
+        ).fetchone()
+        val = row["total"]
+        return round(float(val), 4) if val is not None else None
+
+    def test_basic_carbon_g_aggregation(self):
+        """sim_usage_stats_day carbon_g_net matches direct DB SUM."""
+        insert_block(self.store, self.cp, "2026-01-15T00:00:00", 1.0, 0.245, carbon_g=-12.5)
+        insert_block(self.store, self.cp, "2026-01-15T00:30:00", 0.8, 0.196, carbon_g=-10.0)
+        row = sim_usage_stats_day(self.store, "2026-01-15")
+        db_total = self._db_carbon("2026-01-15", "2026-01-15")
+        self.assertIsNotNone(row["carbon_g_net"])
+        self.assertAlmostEqual(row["carbon_g_net"], -22.5, places=3)
+        self.assertAlmostEqual(row["carbon_g_net"], db_total, places=3)
+
+    def test_null_carbon_g_returns_none(self):
+        """Days with all NULL carbon_g return None, not 0."""
+        insert_block(self.store, self.cp, "2026-01-15T00:00:00", 1.0, 0.245, carbon_g=None)
+        insert_block(self.store, self.cp, "2026-01-15T00:30:00", 0.8, 0.196, carbon_g=None)
+        row = sim_usage_stats_day(self.store, "2026-01-15")
+        self.assertIsNone(row["carbon_g_net"],
+            msg="All NULL carbon_g blocks must return None not 0")
+
+    def test_partial_null_carbon_g(self):
+        """Mixed NULL/non-NULL: only non-NULL blocks contribute."""
+        insert_block(self.store, self.cp, "2026-01-15T00:00:00", 1.0, 0.245, carbon_g=None)
+        insert_block(self.store, self.cp, "2026-01-15T00:30:00", 0.8, 0.196, carbon_g=-10.0)
+        row = sim_usage_stats_day(self.store, "2026-01-15")
+        self.assertAlmostEqual(row["carbon_g_net"], -10.0, places=3)
+
+    def test_positive_carbon_g_importing(self):
+        """Importing blocks produce positive carbon_g."""
+        insert_block(self.store, self.cp, "2026-01-15T00:00:00", 2.0, 0.490, carbon_g=65.3)
+        insert_block(self.store, self.cp, "2026-01-15T00:30:00", 1.5, 0.368, carbon_g=48.9)
+        row = sim_usage_stats_day(self.store, "2026-01-15")
+        self.assertAlmostEqual(row["carbon_g_net"], 114.2, places=3)
+        self.assertAlmostEqual(row["carbon_g_net"], self._db_carbon("2026-01-15", "2026-01-15"), places=3)
+
+    def test_bst_block_carbon_g_on_correct_local_date(self):
+        """Block at 23:00 UTC = 00:00 BST next day: carbon_g lands on BST date."""
+        insert_block(self.store, self.cp, "2026-04-02T23:00:00", 0.5, 0.123, carbon_g=-8.5)
+        insert_block(self.store, self.cp, "2026-04-03T06:00:00", 1.0, 0.245, carbon_g=15.0)
+        row_apr2 = sim_usage_stats_day(self.store, "2026-04-02")
+        self.assertIsNone(row_apr2)
+        row_apr3 = sim_usage_stats_day(self.store, "2026-04-03")
+        self.assertIsNotNone(row_apr3)
+        self.assertAlmostEqual(row_apr3["carbon_g_net"], -8.5 + 15.0, places=3)
+        self.assertAlmostEqual(row_apr3["carbon_g_net"], self._db_carbon("2026-04-03", "2026-04-03"), places=3)
+
+    def test_multi_day_carbon_g_sum(self):
+        """sum_daily_rows aggregates carbon_g_net correctly across multiple days."""
+        for day in range(15, 18):
+            insert_block(self.store, self.cp, f"2026-01-{day:02d}T00:00:00", 2.0, 0.490, carbon_g=60.0)
+            insert_block(self.store, self.cp, f"2026-01-{day:02d}T00:30:00", 1.5, 0.368, carbon_g=45.0)
+        rows = [sim_usage_stats_day(self.store, f"2026-01-{d:02d}") for d in [15,16,17]]
+        totals = sum_daily_rows(rows)
+        self.assertAlmostEqual(totals["carbon_g_net"], 3 * (60.0 + 45.0), places=3)
+        self.assertAlmostEqual(totals["carbon_g_net"], self._db_carbon("2026-01-15", "2026-01-17"), places=3)
+
+    def test_carbon_g_null_propagates_through_sum(self):
+        """If all days have NULL carbon_g, sum_daily_rows returns None."""
+        for day in range(15, 18):
+            insert_block(self.store, self.cp, f"2026-01-{day:02d}T00:00:00", 2.0, 0.490, carbon_g=None)
+        rows = [sim_usage_stats_day(self.store, f"2026-01-{d:02d}") for d in [15,16,17]]
+        totals = sum_daily_rows(rows)
+        self.assertIsNone(totals["carbon_g_net"])
+
+    def test_net_carbon_can_be_negative(self):
+        """Net exporter days produce negative carbon_g_net."""
+        insert_block(self.store, self.cp, "2026-06-15T06:00:00", 0.1, 0.024, exp_kwh=2.5, carbon_g=-45.8)
+        insert_block(self.store, self.cp, "2026-06-15T06:30:00", 0.0, 0.000, exp_kwh=3.1, carbon_g=-56.9)
+        row = sim_usage_stats_day(self.store, "2026-06-15")
+        self.assertLess(row["carbon_g_net"], 0)
+        self.assertAlmostEqual(row["carbon_g_net"], -45.8 - 56.9, places=3)
+
+    def test_net_is_main_meter_only(self):
+        """carbon_g_net is main meter only — sub-meter carbon already included."""
+        self.store._conn.execute(
+            "INSERT OR IGNORE INTO meters (config_period_id, meter_id, is_sub_meter) VALUES (?,?,1)",
+            (self.cp, "ev_charger")
+        )
+        self.store._conn.commit()
+        insert_block(self.store, self.cp, "2026-06-15T06:00:00", 2.0, 0.490, carbon_g=65.0)
+        insert_block(self.store, self.cp, "2026-06-15T06:00:00", 1.5, 0.368, carbon_g=30.0, meter_id="ev_charger")
+        row = sim_usage_stats_day(self.store, "2026-06-15")
+        self.assertAlmostEqual(row["carbon_g_net"], 65.0, places=3,
+            msg="carbon_g_net must be main meter only, not main + sub")
+
+    def test_null_sub_meter_carbon_does_not_affect_net(self):
+        """Sub-meter with NULL carbon_g does not affect carbon_g_net."""
+        self.store._conn.execute(
+            "INSERT OR IGNORE INTO meters (config_period_id, meter_id, is_sub_meter) VALUES (?,?,1)",
+            (self.cp, "ev_charger")
+        )
+        self.store._conn.commit()
+        insert_block(self.store, self.cp, "2026-06-15T06:00:00", 2.0, 0.490, carbon_g=65.0)
+        insert_block(self.store, self.cp, "2026-06-15T06:00:00", 1.0, 0.245, carbon_g=None, meter_id="ev_charger")
+        row = sim_usage_stats_day(self.store, "2026-06-15")
+        self.assertAlmostEqual(row["carbon_g_net"], 65.0, places=3,
+            msg="NULL sub-meter carbon_g must not affect net")
+
+
+class TestSubMeterCarbonAccounting(unittest.TestCase):
+    """
+    Cross-check that carbon_g accounting is correct across the main meter
+    and sub-meters — verifying totals, remainder, imp/exp split identity,
+    and the no-double-count guarantee for the totals chart.
+
+    These are the UI cross-check tests: they verify that what the server
+    sends in api_blocks_summary matches what the DB actually contains.
+    """
+
+    def setUp(self):
+        self.store, self.cp = make_store_with_submeters()
+
+    def _db_carbon(self, local_date, meter_id="electricity_main"):
+        row = self.store._conn.execute(
+            "SELECT SUM(carbon_g) FROM blocks WHERE local_date=? AND meter_id=?",
+            (local_date, meter_id)
+        ).fetchone()
+        v = row[0]
+        return round(float(v), 4) if v is not None else None
+
+    def test_carbon_g_net_is_main_meter_only(self):
+        """carbon_g_net must equal DB SUM for main meter only — sub-meters excluded."""
+        insert_block(self.store, self.cp, "2026-06-15T06:00:00",
+                     2.0, 0.490, carbon_g=65.0)
+        insert_block(self.store, self.cp, "2026-06-15T06:00:00",
+                     1.5, 0.368, carbon_g=30.0, meter_id="ev_charger")
+        insert_block(self.store, self.cp, "2026-06-15T06:00:00",
+                     0.5, 0.123, carbon_g=10.0, meter_id="house_battery")
+
+        row = sim_usage_stats_day(self.store, "2026-06-15")
+        self.assertAlmostEqual(row["carbon_g_net"], 65.0, places=3,
+            msg="carbon_g_net must be main meter only")
+        self.assertAlmostEqual(row["carbon_g_net"],
+            self._db_carbon("2026-06-15", "electricity_main"), places=3,
+            msg="carbon_g_net must match DB SUM for main meter")
+
+    def test_carbon_g_total_equals_main_plus_submeters(self):
+        """carbon_g_total = main carbon_g + all sub-meter carbon_g (no double-count)."""
+        insert_block(self.store, self.cp, "2026-06-15T06:00:00",
+                     2.0, 0.490, carbon_g=65.0)
+        insert_block(self.store, self.cp, "2026-06-15T06:00:00",
+                     1.5, 0.368, carbon_g=30.0, meter_id="ev_charger")
+        insert_block(self.store, self.cp, "2026-06-15T06:00:00",
+                     0.5, 0.123, carbon_g=10.0, meter_id="house_battery")
+
+        row = sim_usage_stats_day(self.store, "2026-06-15")
+        expected_total = 65.0 + 30.0 + 10.0
+        self.assertAlmostEqual(row["carbon_g_total"], expected_total, places=3,
+            msg="carbon_g_total must equal main + all sub-meter carbon_g")
+
+    def test_carbon_g_total_not_double_counting(self):
+        """
+        carbon_g_total must NOT equal carbon_g_net + sub-meters if that would
+        mean adding sub-meter carbon twice. Main meter carbon_g already
+        accounts for sub-meter consumption (it is the full grid draw net of
+        export). carbon_g_total is main + sub-meter gross for the chart stacking.
+        """
+        insert_block(self.store, self.cp, "2026-06-15T06:00:00",
+                     3.0, 0.735, carbon_g=90.0)
+        insert_block(self.store, self.cp, "2026-06-15T06:00:00",
+                     1.5, 0.368, carbon_g=45.0, meter_id="ev_charger")
+
+        row = sim_usage_stats_day(self.store, "2026-06-15")
+        # Total should be 90 + 45 = 135, NOT 90 + 45 + 45 = 180
+        self.assertAlmostEqual(row["carbon_g_total"], 135.0, places=3,
+            msg="carbon_g_total must not double-count sub-meter carbon")
+        self.assertNotAlmostEqual(row["carbon_g_total"], 180.0, places=1,
+            msg="double-counting would give 180 — must be 135")
+
+    def test_carbon_g_imp_minus_exp_equals_net(self):
+        """carbon_g_imp - carbon_g_exp must equal carbon_g_net (identity)."""
+        # Mixed import/export day
+        insert_block(self.store, self.cp, "2026-06-15T06:00:00",
+                     0.5, 0.123, exp_kwh=2.0, carbon_g=-45.0)
+
+        row = sim_usage_stats_day(self.store, "2026-06-15")
+        self.assertIsNotNone(row["carbon_g_imp"])
+        self.assertIsNotNone(row["carbon_g_exp"])
+        split_net = row["carbon_g_imp"] - row["carbon_g_exp"]
+        self.assertAlmostEqual(split_net, row["carbon_g_net"], places=2,
+            msg="carbon_g_imp - carbon_g_exp must equal carbon_g_net")
+
+    def test_null_sub_meter_carbon_does_not_affect_net_or_total(self):
+        """Sub-meter with NULL carbon_g: net unchanged, total = main only."""
+        insert_block(self.store, self.cp, "2026-06-15T06:00:00",
+                     2.0, 0.490, carbon_g=65.0)
+        insert_block(self.store, self.cp, "2026-06-15T06:00:00",
+                     1.5, 0.368, carbon_g=None, meter_id="ev_charger")
+
+        row = sim_usage_stats_day(self.store, "2026-06-15")
+        self.assertAlmostEqual(row["carbon_g_net"], 65.0, places=3,
+            msg="NULL sub-meter must not affect net")
+        self.assertAlmostEqual(row["carbon_g_total"], 65.0, places=3,
+            msg="NULL sub-meter contributes 0 to total")
+
+    def test_multi_day_submeter_carbon_totals(self):
+        """sum_daily_rows correctly aggregates carbon across days with sub-meters."""
+        for day in range(15, 18):
+            insert_block(self.store, self.cp, f"2026-06-{day:02d}T06:00:00",
+                         2.0, 0.490, carbon_g=60.0)
+            insert_block(self.store, self.cp, f"2026-06-{day:02d}T06:00:00",
+                         1.0, 0.245, carbon_g=20.0, meter_id="ev_charger")
+
+        rows = [sim_usage_stats_day(self.store, f"2026-06-{d:02d}") for d in [15,16,17]]
+        totals = sum_daily_rows(rows)
+
+        self.assertAlmostEqual(totals["carbon_g_net"], 3 * 60.0, places=3,
+            msg="3-day net carbon = 3 × main meter")
+        self.assertAlmostEqual(totals["carbon_g_total"], 3 * (60.0 + 20.0), places=3,
+            msg="3-day total carbon = 3 × (main + ev_charger)")
+
+    def test_exporting_day_with_submeter_import(self):
+        """
+        Net exporter day: main meter carbon_g is negative (solar offsetting),
+        but EV charger still has positive import carbon.
+        carbon_g_net is negative, carbon_g_total reflects actual consumption.
+        """
+        insert_block(self.store, self.cp, "2026-06-15T12:00:00",
+                     0.1, 0.025, exp_kwh=3.0, carbon_g=-55.0)
+        insert_block(self.store, self.cp, "2026-06-15T12:00:00",
+                     1.5, 0.368, carbon_g=28.0, meter_id="ev_charger")
+
+        row = sim_usage_stats_day(self.store, "2026-06-15")
+        self.assertLess(row["carbon_g_net"], 0,
+            msg="Net exporter day must have negative carbon_g_net")
+        self.assertAlmostEqual(row["carbon_g_net"], -55.0, places=3)
+        self.assertAlmostEqual(row["carbon_g_total"], -55.0 + 28.0, places=3,
+            msg="Total = net exporting main + EV importing")

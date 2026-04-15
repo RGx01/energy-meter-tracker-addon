@@ -2139,122 +2139,161 @@ class TestBlockDeletion(unittest.TestCase):
         with self.assertRaises(ValueError):
             store.delete_blocks_for_date_range("", "2026-03-01")
 
-class TestCarbonIntensity(unittest.TestCase):
-    """Tests for carbon_intensity table methods."""
 
-    def _make_store(self):
-        store = BlockStore(":memory:")
-        store.insert_config_period({"meters": {"electricity_main": {"meta": {
-            "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
-            "currency_symbol": "£", "currency_code": "GBP",
-        }, "channels": {"import": {"read": "s.imp", "rate": "s.rate"}}}}})
-        return store
+# ─────────────────────────────────────────────────────────────────────────────
+# Carbon intensity (2.3.0+)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCarbonIntensity(unittest.TestCase):
+
+    def setUp(self):
+        self.store = BlockStore(":memory:")
 
     def test_upsert_and_retrieve(self):
-        store = self._make_store()
-        store.upsert_carbon_intensity("2026-04-13T12:00:00", "DE1", 180.0, "moderate")
-        row = store.get_nearest_carbon_intensity("2026-04-13T12:10:00", "DE1")
+        """Stored intensity can be retrieved as the nearest row."""
+        self.store.upsert_carbon_intensity("2026-04-14T12:00:00", "DE1", 138.0, "moderate")
+        row = self.store.get_nearest_carbon_intensity("2026-04-14T12:00:00", "DE1")
         self.assertIsNotNone(row)
-        self.assertAlmostEqual(row["intensity"], 180.0)
+        self.assertAlmostEqual(row["intensity"], 138.0)
         self.assertEqual(row["ci_index"], "moderate")
 
-    def test_upsert_overwrites(self):
-        store = self._make_store()
-        store.upsert_carbon_intensity("2026-04-13T12:00:00", "DE1", 180.0, "moderate")
-        store.upsert_carbon_intensity("2026-04-13T12:00:00", "DE1", 95.0, "low")
-        row = store.get_nearest_carbon_intensity("2026-04-13T12:00:00", "DE1")
+    def test_upsert_updates_existing(self):
+        """Upserting same timestamp/postcode updates the value."""
+        self.store.upsert_carbon_intensity("2026-04-14T12:00:00", "DE1", 138.0, "moderate")
+        self.store.upsert_carbon_intensity("2026-04-14T12:00:00", "DE1", 95.0, "low")
+        row = self.store.get_nearest_carbon_intensity("2026-04-14T12:00:00", "DE1")
         self.assertAlmostEqual(row["intensity"], 95.0)
         self.assertEqual(row["ci_index"], "low")
 
-    def test_nearest_picks_closest(self):
-        store = self._make_store()
-        store.upsert_carbon_intensity("2026-04-13T10:00:00", "DE1", 100.0, "low")
-        store.upsert_carbon_intensity("2026-04-13T12:00:00", "DE1", 250.0, "high")
-        # Block at 11:50 — closer to 12:00 than 10:00
-        row = store.get_nearest_carbon_intensity("2026-04-13T11:50:00", "DE1")
+    def test_nearest_picks_closest_timestamp(self):
+        """get_nearest picks the row closest in time."""
+        self.store.upsert_carbon_intensity("2026-04-14T10:00:00", "DE1", 100.0, "low")
+        self.store.upsert_carbon_intensity("2026-04-14T12:00:00", "DE1", 250.0, "high")
+        # Query at 11:50 — closer to 12:00
+        row = self.store.get_nearest_carbon_intensity("2026-04-14T11:50:00", "DE1")
         self.assertAlmostEqual(row["intensity"], 250.0)
-
-    def test_no_match_returns_none(self):
-        store = self._make_store()
-        row = store.get_nearest_carbon_intensity("2026-04-13T12:00:00", "DE1")
-        self.assertIsNone(row)
+        # Query at 10:10 — closer to 10:00
+        row = self.store.get_nearest_carbon_intensity("2026-04-14T10:10:00", "DE1")
+        self.assertAlmostEqual(row["intensity"], 100.0)
 
     def test_postcode_isolation(self):
-        store = self._make_store()
-        store.upsert_carbon_intensity("2026-04-13T12:00:00", "DE1", 180.0, "moderate")
-        store.upsert_carbon_intensity("2026-04-13T12:00:00", "SW1", 220.0, "high")
-        row = store.get_nearest_carbon_intensity("2026-04-13T12:00:00", "SW1")
-        self.assertAlmostEqual(row["intensity"], 220.0)
+        """Different postcodes don't interfere."""
+        self.store.upsert_carbon_intensity("2026-04-14T12:00:00", "DE1", 138.0, "moderate")
+        self.store.upsert_carbon_intensity("2026-04-14T12:00:00", "SW1", 220.0, "high")
+        de1 = self.store.get_nearest_carbon_intensity("2026-04-14T12:00:00", "DE1")
+        sw1 = self.store.get_nearest_carbon_intensity("2026-04-14T12:00:00", "SW1")
+        self.assertAlmostEqual(de1["intensity"], 138.0)
+        self.assertAlmostEqual(sw1["intensity"], 220.0)
+
+    def test_returns_none_when_no_data(self):
+        """No stored data → None."""
+        row = self.store.get_nearest_carbon_intensity("2026-04-14T12:00:00", "DE1")
+        self.assertIsNone(row)
 
     def test_prune_removes_old_rows(self):
-        store = self._make_store()
-        store.upsert_carbon_intensity("2020-01-01T00:00:00", "DE1", 300.0, "very-high")
-        store.upsert_carbon_intensity("2026-04-13T12:00:00", "DE1", 100.0, "low")
-        deleted = store.prune_carbon_intensity(days=4)
+        """Rows older than retention window are pruned."""
+        self.store.upsert_carbon_intensity("2020-01-01T00:00:00", "DE1", 300.0, "very-high")
+        self.store.upsert_carbon_intensity("2026-04-14T12:00:00", "DE1", 100.0, "low")
+        deleted = self.store.prune_carbon_intensity(days=4)
         self.assertEqual(deleted, 1)
-        remaining = store._conn.execute(
+        remaining = self.store._conn.execute(
             "SELECT COUNT(*) FROM carbon_intensity"
         ).fetchone()[0]
         self.assertEqual(remaining, 1)
 
+    def test_prune_preserves_recent_rows(self):
+        """Recent rows survive pruning."""
+        from datetime import datetime, timezone, timedelta
+        recent = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(tzinfo=None).isoformat()
+        self.store.upsert_carbon_intensity(recent, "DE1", 138.0, "moderate")
+        deleted = self.store.prune_carbon_intensity(days=4)
+        self.assertEqual(deleted, 0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Power history (2.3.0+)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TestPowerHistory(unittest.TestCase):
-    """Tests for power_history table methods."""
 
-    def _make_store(self):
-        store = BlockStore(":memory:")
-        store.insert_config_period({"meters": {"electricity_main": {"meta": {
-            "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
-            "currency_symbol": "£", "currency_code": "GBP",
-        }, "channels": {"import": {"read": "s.imp", "rate": "s.rate"}}}}})
-        return store
+    def setUp(self):
+        self.store = BlockStore(":memory:")
 
     def test_append_and_retrieve(self):
-        store = self._make_store()
-        store.append_power_history("2026-04-13T12:00:00", 2.5, 180.0, 5.5)
-        store.append_power_history("2026-04-13T12:00:10", 2.3, 180.0, 4.2)
-        rows = store.get_power_history(hours=48)
-        self.assertEqual(len(rows), 2)
+        """Appended row is returned by get_power_history."""
+        self.store.append_power_history("2026-04-14T12:00:00", 2.5, 180.0, 7.5)
+        rows = self.store.get_power_history(hours=48)
+        self.assertEqual(len(rows), 1)
         self.assertAlmostEqual(rows[0]["net_kw"], 2.5)
-        self.assertAlmostEqual(rows[0]["carbon_gco2_min"], 5.5)
-        self.assertAlmostEqual(rows[1]["net_kw"], 2.3)
+        self.assertAlmostEqual(rows[0]["intensity"], 180.0)
+        self.assertAlmostEqual(rows[0]["carbon_gco2_min"], 7.5)
 
-    def test_negative_net_kw_exporting(self):
-        store = self._make_store()
-        store.append_power_history("2026-04-13T12:00:00", -1.5, 95.0, -2.375)
-        rows = store.get_power_history(hours=48)
+    def test_negative_net_kw(self):
+        """Negative net_kw (exporting) is stored correctly."""
+        self.store.append_power_history("2026-04-14T12:00:00", -1.5, 115.0, -2.875)
+        rows = self.store.get_power_history(hours=48)
         self.assertAlmostEqual(rows[0]["net_kw"], -1.5)
-        self.assertAlmostEqual(rows[0]["carbon_gco2_min"], -2.375)
+        self.assertAlmostEqual(rows[0]["carbon_gco2_min"], -2.875)
 
-    def test_intensity_and_carbon_can_be_null(self):
-        store = self._make_store()
-        store.append_power_history("2026-04-13T12:00:00", 1.0, None, None)
-        rows = store.get_power_history(hours=48)
+    def test_null_intensity_stored(self):
+        """None intensity stored and returned as None."""
+        self.store.append_power_history("2026-04-14T12:00:00", 1.0, None, None)
+        rows = self.store.get_power_history(hours=48)
         self.assertIsNone(rows[0]["intensity"])
         self.assertIsNone(rows[0]["carbon_gco2_min"])
 
-    def test_upsert_overwrites(self):
-        store = self._make_store()
-        store.append_power_history("2026-04-13T12:00:00", 2.5, 180.0, 5.0)
-        store.append_power_history("2026-04-13T12:00:00", 3.0, 190.0, 6.0)
-        rows = store.get_power_history(hours=48)
+    def test_upsert_on_conflict(self):
+        """Duplicate captured_at updates the row."""
+        self.store.append_power_history("2026-04-14T12:00:00", 2.5, 180.0, 7.5)
+        self.store.append_power_history("2026-04-14T12:00:00", 3.0, 190.0, 9.5)
+        rows = self.store.get_power_history(hours=48)
         self.assertEqual(len(rows), 1)
         self.assertAlmostEqual(rows[0]["net_kw"], 3.0)
-        self.assertAlmostEqual(rows[0]["carbon_gco2_min"], 6.0)
+
+    def test_rows_ordered_oldest_first(self):
+        """get_power_history returns rows in ascending captured_at order."""
+        self.store.append_power_history("2026-04-14T12:00:30", 3.0, None)
+        self.store.append_power_history("2026-04-14T12:00:00", 1.0, None)
+        self.store.append_power_history("2026-04-14T12:00:20", 2.0, None)
+        rows = self.store.get_power_history(hours=48)
+        self.assertEqual(len(rows), 3)
+        self.assertLess(rows[0]["captured_at"], rows[1]["captured_at"])
+        self.assertLess(rows[1]["captured_at"], rows[2]["captured_at"])
 
     def test_prune_removes_old_rows(self):
-        store = self._make_store()
-        store.append_power_history("2020-01-01T00:00:00", 1.0, None)
-        store.append_power_history("2026-04-13T12:00:00", 2.0, 180.0)
-        deleted = store.prune_power_history(hours=48)
+        """Rows older than retention window are pruned."""
+        self.store.append_power_history("2020-01-01T00:00:00", 1.0, None)
+        self.store.append_power_history("2026-04-14T12:00:00", 2.0, 180.0)
+        deleted = self.store.prune_power_history(hours=48)
         self.assertEqual(deleted, 1)
-        rows = store.get_power_history(hours=48)
-        self.assertEqual(len(rows), 1)
+        remaining = self.store._conn.execute(
+            "SELECT COUNT(*) FROM power_history"
+        ).fetchone()[0]
+        self.assertEqual(remaining, 1)
 
-    def test_returns_oldest_first(self):
-        store = self._make_store()
-        store.append_power_history("2026-04-13T12:00:30", 3.0, None)
-        store.append_power_history("2026-04-13T12:00:00", 1.0, None)
-        store.append_power_history("2026-04-13T12:00:20", 2.0, None)
-        rows = store.get_power_history(hours=48)
-        self.assertEqual([r["net_kw"] for r in rows], [1.0, 2.0, 3.0])
+    def test_prune_preserves_recent_rows(self):
+        """Recent rows survive pruning."""
+        from datetime import datetime, timezone, timedelta
+        recent = (datetime.now(timezone.utc) - timedelta(minutes=10)).replace(tzinfo=None).isoformat()
+        self.store.append_power_history(recent, 1.5, 120.0)
+        deleted = self.store.prune_power_history(hours=48)
+        self.assertEqual(deleted, 0)
+
+    def test_hours_param_filters_results(self):
+        """get_power_history with hours=1 excludes rows older than 1 hour."""
+        self.store.append_power_history("2020-01-01T00:00:00", 1.0, None)
+        from datetime import datetime, timezone, timedelta
+        recent = (datetime.now(timezone.utc) - timedelta(minutes=30)).replace(tzinfo=None).isoformat()
+        self.store.append_power_history(recent, 2.0, 150.0)
+        rows = self.store.get_power_history(hours=1)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["net_kw"], 2.0)
+
+    def test_carbon_gco2_min_formula(self):
+        """Verify carbon_gco2_min = net_kw * intensity / 60 is consistent."""
+        net_kw = -1.5
+        intensity = 115.0
+        expected = round(net_kw * intensity / 60.0, 4)
+        self.store.append_power_history("2026-04-14T12:00:00", net_kw, intensity, expected)
+        rows = self.store.get_power_history(hours=48)
+        self.assertAlmostEqual(rows[0]["carbon_gco2_min"], expected, places=4)

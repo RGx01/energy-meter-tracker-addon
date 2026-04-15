@@ -96,6 +96,27 @@ def resume_engine():
     logger.info("engine: resumed")
 
 
+def reset_store():
+    """
+    Close the current BlockStore and reopen it from BLOCKS_DB_PATH.
+    Called after a DB restore/import so the engine picks up the new file.
+    Must be called while the engine is paused.
+    """
+    global _store
+    try:
+        if _store is not None:
+            try:
+                _store.close()
+            except Exception:
+                pass
+            _store = None
+        _store = open_block_store(BLOCKS_DB_PATH)
+        logger.info("engine: store reset — reopened %s", BLOCKS_DB_PATH)
+    except Exception as e:
+        logger.error("engine: reset_store failed: %s", e)
+        raise
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # IO helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1486,6 +1507,70 @@ async def engine_startup(ha: HAClient):
     # ── Open BlockStore (auto-migrate from blocks.json if needed) ────────
     global _store
     _store = open_block_store(BLOCKS_DB_PATH)
+
+    # ── First-thing-on-startup: checkpoint WAL (every start) ─────────────────
+    # Ensures all committed blocks are flushed from WAL into the main DB file.
+    # Cheap and always safe — runs on every startup.
+    try:
+        _store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        logger.info("engine_startup: WAL checkpoint complete")
+    except Exception as _wce:
+        logger.warning("engine_startup: WAL checkpoint failed: %s", _wce)
+
+    # ── Upgrade backup (once per version) ────────────────────────────────────
+    # In versions prior to 2.4.0, backups could miss recent blocks due to the
+    # WAL not being checkpointed. On first startup of a new version we create a
+    # safety backup so users have a complete snapshot before any new data is
+    # written. Runs once per version — not on every restart.
+    try:
+        import zipfile as _zf, glob as _gl
+        from datetime import datetime as _dt2
+
+        # Read current app version from config.yaml
+        _ver_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+        _cur_ver  = "unknown"
+        if os.path.exists(_ver_path):
+            with open(_ver_path) as _vf:
+                for _vl in _vf:
+                    if _vl.strip().startswith("version:"):
+                        _cur_ver = _vl.split(":", 1)[1].strip().strip('"')
+                        break
+
+        # Check what version last created a startup backup
+        _ver_file = os.path.join(DATA_DIR, ".last_startup_backup_version")
+        _last_ver = ""
+        if os.path.exists(_ver_file):
+            with open(_ver_file) as _vff:
+                _last_ver = _vff.read().strip()
+
+        if _cur_ver != _last_ver:
+            _bk_dir = f"{SHARE_BACKUP_DIR}/backups"
+            ensure_dir(_bk_dir)
+            _bk_ts   = _dt2.utcnow().strftime("%Y%m%dT%H%M%S")
+            _bk_path = f"{_bk_dir}/{_bk_ts}_upgrade_{_cur_ver}.zip"
+            with _zf.ZipFile(_bk_path, "w", _zf.ZIP_DEFLATED) as _bkz:
+                _store.backup(BLOCKS_DB_PATH + ".upgrade_bak")
+                _bkz.write(BLOCKS_DB_PATH + ".upgrade_bak", "blocks.db")
+                os.remove(BLOCKS_DB_PATH + ".upgrade_bak")
+                _cfg_src = os.path.join(DATA_DIR, "meters_config.json")
+                if os.path.exists(_cfg_src):
+                    _bkz.write(_cfg_src, "meters_config.json")
+            # Keep only the 20 most recent zips
+            _all_zips = sorted(_gl.glob(f"{_bk_dir}/*.zip"))
+            for _old_zip in _all_zips[:-20]:
+                try: os.remove(_old_zip)
+                except Exception: pass
+            # Record this version so we don't backup again until next upgrade
+            with open(_ver_file, "w") as _vfw:
+                _vfw.write(_cur_ver)
+            logger.info(
+                "engine_startup: upgrade backup created for v%s: %s",
+                _cur_ver, os.path.basename(_bk_path)
+            )
+        else:
+            logger.info("engine_startup: no upgrade detected (v%s), skipping upgrade backup", _cur_ver)
+    except Exception as _sbe:
+        logger.warning("engine_startup: upgrade backup failed: %s", _sbe)
 
     # Migrate full_config_json → normalised tables (2.0→2.1 one-time upgrade)
     try:
