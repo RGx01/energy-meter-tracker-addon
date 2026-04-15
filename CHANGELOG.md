@@ -1,5 +1,83 @@
 # Changelog
 
+## [2.4.0] — 2026-04-16
+
+### Added
+- **Carbon footprint in Usage Stats** — a third CO₂ metric alongside kWh and Cost in
+  the Usage Stats chart. Shows net carbon (gCO₂) in net view and import/export carbon
+  split in totals view, mirroring the kWh breakdown. Auto-scales between gCO₂ and kgCO₂.
+  Only visible when a postcode prefix is configured. Pre-2.3.0 blocks show `—` in the
+  data table (no CI data available). The CO₂ toggle is hidden when no postcode is set.
+
+- **`carbon_g` in block dicts** — `_row_to_block` now includes `carbon_g` when
+  reconstructing blocks from the database, making it available to the API layer.
+  Previously `carbon_g` was stored in the DB but never surfaced in block dicts.
+
+- **`has_postcode` in `/api/charts/blocks-summary`** — the response now includes a
+  `has_postcode` boolean so the UI can conditionally show the CO₂ metric toggle.
+
+- **`carbon_g_imp` / `carbon_g_exp` split on main meter** — Usage Stats totals mode
+  shows import carbon above the zero line and export carbon offset below, matching the
+  kWh totals view. Back-calculated from average intensity implied by the net `carbon_g`.
+
+### Fixed
+- **DB restore silently ignoring `blocks.db`** — the `/api/import` endpoint accepted
+  `blocks.db` uploads but never wrote the file to disk — only `meters_config.json` was
+  processed. The field was missing from `file_map`. Restoring from a zip therefore always
+  left the old database in place with no error reported.
+
+- **Restore failing with "malformed" error** — when restoring `blocks.db` via either
+  `/api/backup/restore` or `/api/import/from-zip`, the engine was never paused before
+  the file was overwritten. The engine's open WAL connection remained active, causing
+  SQLite to declare the newly written file "malformed" on next open. The corruption
+  recovery handler then renamed the restored DB to `.corrupt` and created a fresh
+  empty one — silently destroying the restore. Fixed by pausing the engine, flushing
+  the WAL, closing all store connections, and removing WAL/SHM files before writing
+  the restored file.
+
+- **`meters_config.json` overwriting restored DB config** — when a backup zip (which
+  contains both `blocks.db` and `meters_config.json`) was restored, the sync logic
+  pushed the flat JSON file back into the DB, overwriting the restored DB's full config
+  period history with a single-period snapshot. Fixed: when `blocks.db` is restored,
+  the DB is always authoritative — `meters_config.json` is written from the DB, never
+  the reverse.
+
+- **Engine store not reset after restore** — the web server's `_store` was set to `None`
+  after restore but the engine's own `_store` was not. On the next engine tick it continued
+  using the old connection, seeing the old data. Fixed by calling `engine.reset_store()`
+  which closes and reopens the engine's connection from the new DB file.
+
+### Changed
+- **Zip restore flow** — dropping a backup zip on the Data Management page now shows a
+  confirmation modal with the filename, size, and an optional "back up current data first"
+  checkbox (checked by default) before proceeding. The restore is handled entirely
+  server-side via `/api/import/from-zip` — no base64 round-trip through the browser,
+  which previously corrupted binary DB files.
+
+- **No restart required after restore** — the engine is paused, the DB replaced, and
+  the engine store reset and resumed without requiring an add-on restart. The page
+  reloads automatically after 2.5 seconds.
+
+### Hardening
+- **WAL checkpoint before backup** — `_create_backup_zip` now uses the engine's store
+  connection and runs `PRAGMA wal_checkpoint(TRUNCATE)` before copying. This ensures
+  the backup captures a fully consistent snapshot. In practice SQLite's auto-checkpoint
+  means recent data is almost always already in the main file, but this makes it
+  explicit and guaranteed.
+
+- **WAL checkpoint on every startup** — `PRAGMA wal_checkpoint(TRUNCATE)` runs at the
+  start of `engine_startup` before any new blocks are written. Cheap and ensures the
+  DB is always fully flushed after any unclean shutdown.
+
+- **Upgrade safety backup** — on the first startup after a version change, the engine
+  creates a `*_upgrade_2.4.0.zip` in the backup list before recording any new data.
+  Runs once per version by comparing against a `.last_startup_backup_version` marker
+  file. Provides a complete snapshot at the point of upgrade as a precautionary
+  safety net.
+
+---
+
+
 ## [2.3.0] — 2026-04-14
 
 ### Added
