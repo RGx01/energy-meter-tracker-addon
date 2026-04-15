@@ -37,8 +37,21 @@ A Home Assistant add-on that records your electricity usage in precise configura
 - Interpolates precisely to the boundary timestamp so block deltas are billing-accurate
 - Tracks sub-meters (EV charger, home battery, heat pump) and distributes grid consumption across them
 - Fills gaps automatically if the add-on restarts mid-session
+- Tracks your carbon footprint per billing period using real-time UK grid intensity data (🇬🇧 UK only, postcode required)
 - Publishes four cumulative sensors back to Home Assistant
 - Serves a local web UI on port 8099 for configuration, charts, live power and data management
+
+## What's new in 2.4.0
+
+- **🌿 Carbon footprint in Usage Stats** — a CO₂ metric alongside kWh and Cost in the Usage Stats chart. Totals view shows import carbon stacked above zero and export carbon offset below, exactly mirroring the kWh breakdown. Net view shows a single net carbon bar, negative on days where you exported more than you imported. Auto-scales between gCO₂ and kgCO₂. Requires a postcode prefix in Meter Config.
+- **🔄 Reliable backup and restore** — the restore flow now correctly handles all cases: the engine is paused before any file is written, the WAL is flushed so no recent data is missed, and the engine store is reset and resumed without requiring an add-on restart. Dropping a backup zip on the Data Management page now shows a confirmation step with an optional pre-restore backup before proceeding.
+- **🛡️ Safer backups** — backups now force a WAL checkpoint before copying, ensuring the zip always contains a complete and current snapshot. An upgrade safety backup is created automatically on first start after each version update.
+
+## What's new in 2.3.0
+
+- **🌿 Carbon intensity recording** — the engine fetches grid carbon intensity from the National Grid API every 15 minutes (🇬🇧 UK only, requires postcode prefix). Stored per reconciliation period with a 4-day rolling window.
+- **📊 Carbon footprint per block** — every recorded block now stores a `carbon_g` value: net carbon in grams CO₂ for that period, calculated as `(import − export) kWh × grid intensity`. Negative on periods where you export more than you import.
+- **📈 48-hour power history chart** — the Live Power page now shows a rolling 48-hour chart of net grid power and carbon rate. Toggle between kW and gCO₂/min views. Hover for a tooltip showing local time, power and current grid intensity.
 
 ## What's new in 2.2.0
 
@@ -159,7 +172,7 @@ A half-hour heatmap showing net grid flow (import − export) for every reconcil
 
 ### Usage Stats
 
-Import and export broken down by day, month or year with sub-meter stacking. Switch between kWh and cost, and between Totals and Net views. A data table below the chart mirrors exactly what the chart shows, with a copy-to-clipboard button for exporting to Excel or Google Sheets.
+Import and export broken down by day, month or year with sub-meter stacking. Switch between kWh, cost and CO₂ (🇬🇧 UK only), and between Totals and Net views. A data table below the chart mirrors exactly what the chart shows, with a copy-to-clipboard button for exporting to Excel or Google Sheets.
 
 Billing mode groups data by your billing periods (respecting billing day changes). Calendar mode groups by calendar month.
 
@@ -175,7 +188,8 @@ It provides:
 
 - **Live power gauge** — shows net grid flow with asymmetric import/export scales derived from your usage history; colour reflects carbon intensity (UK) or import magnitude (global)
 - **Billing cards** — Today, This Bill and This Year with full sub-meter breakdown; figures match the Billing chart exactly; This Bill uses your billing history to show the correct period even if your billing day has changed
-- **Carbon intensity** (🇬🇧 UK only) — add your outward postcode prefix (e.g. `DE1`) in Meter Config to enable a 48-hour forecast strip from the National Grid API
+- **Carbon intensity forecast** (🇬🇧 UK only) — add your outward postcode prefix (e.g. `DE1`) in Meter Config to enable a 48-hour forecast strip from the National Grid API
+- **48-hour power history chart** — rolling chart of net grid power at ~10-second resolution. Toggle between kW and gCO₂/min views. Hover for local time, power and current grid intensity. Import shown in red, export in green.
 
 ### Configuring Live Power
 
@@ -185,6 +199,36 @@ In Meter Config → main meter card:
 |-------|-------------|
 | Power Sensor | Live power in kW — e.g. `sensor.smart_meter_electricity_power` |
 | Postcode Prefix | 🇬🇧 UK only — outward postcode with district, e.g. `DE1`, `SW1A`, `M1` |
+
+## Carbon Footprint Tracking
+
+> 🇬🇧 UK only — requires a postcode prefix in Meter Config.
+
+Energy Meter Tracker records the carbon footprint of your electricity use alongside your kWh and cost data.
+
+### How it works
+
+At the end of each reconciliation period, the add-on calculates the net carbon footprint of that period:
+
+```
+carbon (gCO₂) = (import kWh − export kWh) × grid intensity (gCO₂/kWh)
+```
+
+The grid intensity comes from the National Grid ESO API, fetched every 15 minutes for your postcode area and stored locally. It reflects the actual mix of generation on the grid at that moment — more gas generation means higher intensity, more wind and solar means lower.
+
+The result is **negative** when you export more than you import — your solar generation is displacing carbon-intensive grid electricity, so your net contribution is a carbon offset rather than a carbon cost.
+
+### What the numbers mean
+
+- **gCO₂/min on the Live Power gauge** — the instantaneous carbon rate of your current grid draw. If you are drawing 2 kW from a grid running at 200 gCO₂/kWh, your household is responsible for about 6.7 gCO₂ every minute. Negative means you are offsetting. This is updated every time your power sensor updates (~10 seconds) so it reflects real-time conditions.
+
+- **CO₂ in Usage Stats** — the sum of all per-period carbon figures for the selected date range. Totals view shows import carbon stacked above zero and export carbon offset below, so you can see both your gross consumption and how much your solar export reduces it. Net view shows the balance. Sub-meters show their gross import carbon separately so you can see how much of your total footprint each device accounts for.
+
+### Methodology note
+
+We use **average grid intensity** — the carbon embedded in a typical kWh drawn from the grid at that moment, based on the actual generation mix. This is the standard approach used by the Carbon Trust and most household carbon calculators, and it's what the National Grid ESO API provides. It is not the same as marginal intensity (what additional generator would run if you used one more kWh), which is more appropriate for demand-response decisions but is not publicly available in real time. For personal carbon tracking and comparing the impact of behaviour changes — shifting EV charging to low-carbon windows, for example — average intensity is the right tool.
+
+Historical blocks recorded before 2.3.0, or before a postcode was configured, have no carbon data and show `—` in the Usage Stats table.
 
 ## Billing History
 
@@ -233,7 +277,7 @@ All blocks are stored in a SQLite database (`energy_meter.db`) in the add-on's d
 
 > ⚠️ **Uninstalling wipes `/data/`**. Always ensure a recent backup exists in `/share/` before uninstalling.
 
-> ℹ️ There is no automatic pre-upgrade backup in supervised mode. Your most recent `/share` backup and the automatic zip before the last config save are your safety net. Create a manual backup from the Data Management page before upgrading if you want extra assurance.
+> ℹ️ On first start after each version upgrade, the add-on automatically creates a safety backup zip (labelled `_upgrade_x.x.x`) before recording any new data. This is visible in the backup list on the Data Management page. You can also create a manual backup at any time from the same page.
 
 ### Migrating from 1.x
 
