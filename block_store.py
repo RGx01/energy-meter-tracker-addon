@@ -23,7 +23,7 @@ all required PRAGMAs and ensures the schema exists before returning.
 import json
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -126,6 +126,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     exp_read_start   REAL,
     exp_read_end     REAL,
     standing_charge  REAL    NOT NULL DEFAULT 0,
+    carbon_g         REAL,               -- net gCO2 for this block (NULL if no CI data)
     FOREIGN KEY (config_period_id) REFERENCES config_periods(id),
     UNIQUE (block_start, meter_id)
 );
@@ -182,6 +183,30 @@ CREATE TABLE IF NOT EXISTS current_reads (
 
 CREATE INDEX IF NOT EXISTS idx_current_reads_meter ON current_reads (meter_id, channel, channel_type);
 CREATE INDEX IF NOT EXISTS idx_current_reads_time  ON current_reads (captured_at);
+
+-- Carbon intensity samples from National Grid API (15-min cadence, ~4-day retention).
+-- postcode stored per row so config changes don't invalidate historical data.
+CREATE TABLE IF NOT EXISTS carbon_intensity (
+    captured_at   TEXT NOT NULL,      -- UTC ISO, 30-min API slot boundary
+    postcode      TEXT NOT NULL,
+    intensity     REAL,               -- gCO2/kWh forecast
+    ci_index      TEXT,               -- very-low/low/moderate/high/very-high
+    PRIMARY KEY (captured_at, postcode)
+);
+
+CREATE INDEX IF NOT EXISTS idx_carbon_intensity_time ON carbon_intensity (captured_at);
+
+-- High-resolution net power history (engine-tick cadence ~10s, 48hr retention).
+-- Only written when a power sensor is configured. intensity is denormalised from
+-- the nearest carbon_intensity row at capture time.
+CREATE TABLE IF NOT EXISTS power_history (
+    captured_at      TEXT PRIMARY KEY,  -- UTC ISO
+    net_kw           REAL NOT NULL,     -- positive = importing, negative = exporting
+    intensity        REAL,              -- gCO2/kWh at capture time, NULL if no postcode
+    carbon_gco2_min  REAL               -- net carbon rate gCO2/min from meter reads, NULL if unavailable
+);
+
+CREATE INDEX IF NOT EXISTS idx_power_history_time ON power_history (captured_at);
 """
 
 
@@ -250,6 +275,8 @@ def _block_rows(block: dict, config_period_id: int, tz_name: str) -> list[dict]:
             "exp_read_end":      exp.get("read_end"),
             # standing charge on main meter import
             "standing_charge":   float(meter_block.get("standing_charge") or 0),
+            # carbon footprint (NULL if no CI data available)
+            "carbon_g":          meter_block.get("carbon_g"),
         })
     return rows
 
@@ -446,11 +473,16 @@ class BlockStore:
         _cp_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(config_periods)").fetchall()}
         _mc_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(meter_channels)").fetchall()}
 
+        _b_cols  = {r[1] for r in self._conn.execute("PRAGMA table_info(blocks)").fetchall()}
+        _ph_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(power_history)").fetchall()} if self._conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='power_history'").fetchone() else set()
+
         for _col, _tbl, _defn, _col_set in [
-            ("v2x_capable", "meters",         "INTEGER DEFAULT 0", _m_cols),
-            ("supplier",    "config_periods",  "TEXT",              _cp_cols),
-            ("mpan",        "meter_channels",  "TEXT",              _mc_cols),
-            ("tariff",      "meter_channels",  "TEXT",              _mc_cols),
+            ("v2x_capable",      "meters",         "INTEGER DEFAULT 0", _m_cols),
+            ("supplier",         "config_periods",  "TEXT",              _cp_cols),
+            ("mpan",             "meter_channels",  "TEXT",              _mc_cols),
+            ("tariff",           "meter_channels",  "TEXT",              _mc_cols),
+            ("carbon_g",         "blocks",          "REAL",              _b_cols),
+            ("carbon_gco2_min",  "power_history",   "REAL",              _ph_cols),
         ]:
             if _col not in _col_set:
                 try:
@@ -478,6 +510,83 @@ class BlockStore:
                 (str(SCHEMA_VERSION),)
             )
             self._conn.commit()
+
+    # ── Carbon intensity ─────────────────────────────────────────────────────
+
+    def upsert_carbon_intensity(self, captured_at: str, postcode: str,
+                                 intensity: float | None, ci_index: str | None) -> None:
+        """Store a carbon intensity sample. captured_at should be the 30-min slot boundary."""
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO carbon_intensity (captured_at, postcode, intensity, ci_index)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(captured_at, postcode) DO UPDATE SET
+                       intensity = excluded.intensity,
+                       ci_index  = excluded.ci_index""",
+                (captured_at, postcode, intensity, ci_index)
+            )
+
+    def get_nearest_carbon_intensity(self, block_start: str, postcode: str) -> dict | None:
+        """Return the nearest carbon_intensity row to block_start for the given postcode."""
+        row = self._conn.execute(
+            """SELECT captured_at, intensity, ci_index
+               FROM carbon_intensity
+               WHERE postcode = ?
+               ORDER BY ABS(strftime('%s', captured_at) - strftime('%s', ?))
+               LIMIT 1""",
+            (postcode, block_start)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def prune_carbon_intensity(self, days: int = 4) -> int:
+        """Delete carbon_intensity rows older than `days` days. Returns rows deleted."""
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                  - timedelta(days=days)).isoformat()
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM carbon_intensity WHERE captured_at < ?", (cutoff,)
+            )
+        return cur.rowcount
+
+    # ── Power history ─────────────────────────────────────────────────────────
+
+    def append_power_history(self, captured_at: str, net_kw: float,
+                              intensity: float | None,
+                              carbon_gco2_min: float | None = None) -> None:
+        """Append a power history row. Only call when power sensor is available."""
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO power_history (captured_at, net_kw, intensity, carbon_gco2_min)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(captured_at) DO UPDATE SET
+                       net_kw          = excluded.net_kw,
+                       intensity       = excluded.intensity,
+                       carbon_gco2_min = excluded.carbon_gco2_min""",
+                (captured_at, net_kw, intensity, carbon_gco2_min)
+            )
+
+    def prune_power_history(self, hours: int = 48) -> int:
+        """Delete power_history rows older than `hours` hours. Returns rows deleted."""
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                  - timedelta(hours=hours)).isoformat()
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM power_history WHERE captured_at < ?", (cutoff,)
+            )
+        return cur.rowcount
+
+    def get_power_history(self, hours: int = 48) -> list:
+        """Return power_history rows for the last `hours` hours, oldest first."""
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                  - timedelta(hours=hours)).isoformat()
+        rows = self._conn.execute(
+            """SELECT captured_at, net_kw, intensity, carbon_gco2_min
+               FROM power_history
+               WHERE captured_at >= ?
+               ORDER BY captured_at ASC""",
+            (cutoff,)
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def close(self) -> None:
         try:
@@ -1525,7 +1634,7 @@ class BlockStore:
                 imp_read_start, imp_read_end,
                 exp_kwh, exp_rate, exp_cost,
                 exp_read_start, exp_read_end,
-                standing_charge
+                standing_charge, carbon_g
             ) VALUES (
                 :block_start, :block_end,
                 :local_date, :local_year, :local_month, :local_day,
@@ -1535,7 +1644,7 @@ class BlockStore:
                 :imp_read_start, :imp_read_end,
                 :exp_kwh, :exp_rate, :exp_cost,
                 :exp_read_start, :exp_read_end,
-                :standing_charge
+                :standing_charge, :carbon_g
             )
         """
         with self._conn:
