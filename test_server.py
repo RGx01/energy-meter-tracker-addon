@@ -530,6 +530,13 @@ class TestApiBlocksSummaryCarbonG(unittest.TestCase):
 
 class TestApiPowerHistory(unittest.TestCase):
 
+    @staticmethod
+    def _ts(offset_hours=1):
+        """Return a UTC ISO timestamp offset_hours ago — always within 48h window."""
+        from datetime import datetime, timezone, timedelta
+        return (datetime.now(timezone.utc).replace(tzinfo=None)
+                - timedelta(hours=offset_hours)).strftime("%Y-%m-%dT%H:%M:%S")
+
     def setUp(self):
         self.store = _make_test_store()
         self.client = make_client(store=self.store)
@@ -575,8 +582,8 @@ class TestApiPowerHistory(unittest.TestCase):
             self.assertIn(field, rows[0])
 
     def test_rows_ordered_oldest_first(self):
-        self.store.append_power_history("2026-04-14T10:00:00", 1.0, 100.0)
-        self.store.append_power_history("2026-04-14T11:00:00", 2.0, 110.0)
+        self.store.append_power_history(self._ts(3), 1.0, 100.0)
+        self.store.append_power_history(self._ts(2), 2.0, 110.0)
         rows = self.client.get("/api/power/history").get_json()["rows"]
         self.assertEqual(len(rows), 2)
         self.assertLess(rows[0]["captured_at"], rows[1]["captured_at"])
