@@ -1221,8 +1221,13 @@ def api_blocks_summary():
                 except Exception:
                     continue
 
-            # ── Main meter carbon_g ──
-            main_carbon_g = None
+            # ── Main meter carbon_g + raw kWh for intensity back-calculation ──
+            # raw_main_imp/exp_kwh are from the actual block channel kWh — the same
+            # values used by the engine to compute carbon_g. We need these (not the
+            # billing summary remainder) to correctly back-calculate intensity.
+            main_carbon_g     = None
+            raw_main_imp_kwh  = 0.0
+            raw_main_exp_kwh  = 0.0
             for b in day_blocks:
                 for mid, md in (b.get("meters") or {}).items():
                     if (md or {}).get("meta", {}).get("sub_meter"):
@@ -1230,12 +1235,19 @@ def api_blocks_summary():
                     cg = md.get("carbon_g")
                     if cg is not None:
                         main_carbon_g = (main_carbon_g or 0.0) + float(cg)
+                    ch_imp = ((md.get("channels") or {}).get("import") or {})
+                    ch_exp = ((md.get("channels") or {}).get("export") or {})
+                    raw_main_imp_kwh += float(ch_imp.get("kwh") or 0)
+                    raw_main_exp_kwh += float(ch_exp.get("kwh") or 0)
 
             _sub_carbon_for_remainder = sum(
                 float(st["carbon_g"]) for st in sub_totals.values()
                 if st["carbon_g"] is not None and st["carbon_g"] != 0.0
             )
-            _main_carbon_remainder = (main_carbon_g - _sub_carbon_for_remainder) if main_carbon_g is not None else None
+            # Remainder uses carbon_g_imp (always positive) not carbon_g_net
+            # so the house bar is never negative even on solar export days.
+            # We compute it after meters_out is assembled below.
+            _main_carbon_remainder = None  # set after carbon_g_imp is computed
 
             # ── Assemble meters_out ──
             meters_out = {"electricity_main": {
@@ -1243,21 +1255,31 @@ def api_blocks_summary():
                 "imp_cost": round(main_imp_cost, 4),
                 "exp_kwh":  round(main_exp_kwh,  4),
                 "exp_cost": round(main_exp_cost, 4),
-                "carbon_g": round(_main_carbon_remainder, 4) if _main_carbon_remainder is not None else None,
-                # Split carbon into import/export for totals chart
+                "carbon_g": None,  # set below after carbon_g_imp is computed
+                # Split carbon using raw block kWh and abs(intensity).
+                # raw_main_imp/exp_kwh match what the engine used to compute carbon_g,
+                # giving a correct intensity back-calculation. Both values are always
+                # positive — the chart negates carbon_g_exp to show it below zero.
+                # This ensures house remainder = carbon_g_imp - sub_carbon >= 0.
                 "carbon_g_imp": (
                     None if main_carbon_g is None else
-                    round(main_carbon_g, 4) if main_exp_kwh == 0 else
-                    0.0 if main_imp_kwh == 0 else
-                    round(main_imp_kwh * (main_carbon_g / (main_imp_kwh - main_exp_kwh)), 4)
+                    round(abs(main_carbon_g), 4) if raw_main_exp_kwh == 0 else  # pure import
+                    0.0 if raw_main_imp_kwh == 0 else                            # pure export
+                    round(raw_main_imp_kwh * abs(main_carbon_g / (raw_main_imp_kwh - raw_main_exp_kwh)), 4)
                 ),
                 "carbon_g_exp": (
                     None if main_carbon_g is None else
-                    0.0 if main_exp_kwh == 0 else
-                    round(-main_carbon_g, 4) if main_imp_kwh == 0 else
-                    round(main_exp_kwh * abs(main_carbon_g / (main_imp_kwh - main_exp_kwh)), 4)
+                    0.0 if raw_main_exp_kwh == 0 else                            # pure import
+                    round(abs(main_carbon_g), 4) if raw_main_imp_kwh == 0 else  # pure export
+                    round(raw_main_exp_kwh * abs(main_carbon_g / (raw_main_imp_kwh - raw_main_exp_kwh)), 4)
                 ),
             }}
+            # Now set main meter carbon_g (remainder) using carbon_g_imp so it's always >= 0
+            _cg_imp = meters_out["electricity_main"].get("carbon_g_imp")
+            if _cg_imp is not None:
+                _main_carbon_remainder = round(_cg_imp - _sub_carbon_for_remainder, 4)
+            meters_out["electricity_main"]["carbon_g"] = _main_carbon_remainder
+
             for mid, st in sub_totals.items():
                 meters_out[mid] = {
                     "imp_kwh":  round(st["imp_kwh"],  4),
