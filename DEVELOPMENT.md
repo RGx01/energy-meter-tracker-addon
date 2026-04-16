@@ -150,17 +150,19 @@ If the engine restarts after an outage, `detect_gap()` counts missing windows be
 
 ```
 /data/energy_meter_tracker/
-    energy_meter.db          — SQLite database (blocks + config_periods)
-    current_block.json       — in-progress block with live reads
-    cumulative_totals.json   — running totals for HA sensors
-    meters_config.json       — meter and channel configuration
+    blocks.db                      — SQLite database (all state since 2.1.0)
+    meters_config.json             — convenience export only (not authoritative)
+    .last_startup_backup_version   — tracks last version that created an upgrade backup
 
 /share/energy_meter_tracker_backup/
-    energy_meter.db          — copied after every finalise
-    meters_config.json       — copied after every finalise
+    blocks.db                      — copied after every block finalise
+    meters_config.json             — copied after every block finalise
     backups/
-        YYYYMMDDTHHMMSS_label.zip   — zip snapshots (20 max)
+        YYYYMMDDTHHMMSS_label.zip  — zip snapshots (20 max, pruned automatically)
+        YYYYMMDDTHHMMSS_upgrade_x.x.x.zip — created once on first startup per version
 ```
+
+`blocks.db` is the single source of truth for all state including meter config, config periods, blocks, current in-progress block state, carbon intensity, and power history. `meters_config.json` is written for human readability but never read back as authoritative state.
 
 ---
 
@@ -170,23 +172,39 @@ Tests use Python's built-in `unittest` — no external dependencies needed.
 
 ```bash
 cd /addons/energy_meter_tracker
-python3 -m unittest test_engine -v      # 56 engine tests
-python3 -m unittest test_block_store -v # 68 block store + billing tests
-python3 -m unittest test_server -v      # 50 server/API tests
+python3 -m unittest discover -v   # ~330 tests across all files
 ```
 
-Or run all at once:
+Or run individual suites:
 ```bash
-python3 -m unittest discover -v
+python3 -m unittest test_engine -v
+python3 -m unittest test_block_store -v
+python3 -m unittest test_server -v
+python3 -m unittest test_usage_stats_vs_billing -v
 ```
 
 ### Test coverage
 
-- `test_engine.py` — `floor_to_hh`, `interpolate_value`, `detect_gap`, `compute_channel`, `select_opening_read`, `select_closing_read`, gap marker helpers, `build_gap_blocks`, `extract_last_reads`
-- `test_block_store.py` — SQLite schema, block insertion, `get_blocks_for_range`, config period CRUD, `delete_config_period` (block reassignment), `get_billing_totals_for_range` (SQL vs block-method comparison, BST boundary)
-- `test_server.py` — all API endpoints, billing accuracy, config history CRUD
+- `test_engine.py` — block engine logic: `floor_to_hh`, `interpolate_value`, `detect_gap`, `compute_channel`, `select_opening_read`, `select_closing_read`, gap marker helpers, `build_gap_blocks`, `extract_last_reads`
+- `test_block_store.py` — SQLite schema, block insertion, config period CRUD, billing totals, carbon intensity, power history
+- `test_server.py` — all API endpoints, billing accuracy, config history CRUD, carbon API, power history API, blocks.db import regression
+- `test_usage_stats_vs_billing.py` — cross-checks that Usage Stats aggregations match direct DB queries: kWh, cost, carbon, sub-meter accounting, carbon identity (`carbon_g_imp - carbon_g_exp = carbon_g_net`), avg intensity
 
-When adding new logic, add corresponding tests. All test files use module stubs so they run without HA, Flask or filesystem access.
+All test files use in-memory SQLite (`:memory:`) and module stubs so they run without HA, Flask or filesystem access. No test modifies any real data file.
+
+### Visual / UI tests (test harness)
+
+The test harness generates realistic synthetic data and uploads it to a running add-on instance for visual verification:
+
+```bash
+cd /addons/energy_meter_tracker
+pip install requests
+python3 test_harness.py --url http://192.168.x.x:8099
+```
+
+The harness cycles through 15 scenarios (various block sizes, scenarios, sub-meter configs and CO₂ scenarios) and opens the Charts page for manual pass/fail judgement. Results are saved to `test_results.json`.
+
+> ⚠️ The harness **replaces all data** on the target instance. Always back up first and only run against a development instance.
 
 ---
 
@@ -252,3 +270,6 @@ Allowing periods to be extended (e.g. moving the transition date later) would ma
 - **V2G export** — V2X-capable EV export to grid is flagged but not broken down by sub-meter.
 - **Ingress** — currently supported via a WSGI middleware. Full Ingress with sidebar toggle works.
 - **Config reload** — sensor subscriptions re-register on config save but the engine does not watch the config file for changes.
+- **Carbon — UK only** — carbon intensity data comes from the National Grid ESO API which is UK-specific. Non-UK installations will not see carbon data.
+- **Carbon — average not marginal intensity** — we use grid average intensity (what the National Grid API provides) not marginal intensity. This is standard for household carbon tracking but not suitable for formal carbon accounting.
+- **Usage Stats iframe sizing** — the heatmap chart occasionally renders at incorrect width on first load due to a race between iframe layout and Plotly initialisation. It self-corrects on the next resize event or block finalise. A full fix requires eliminating the iframe pattern for the heatmap.

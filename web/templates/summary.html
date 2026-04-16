@@ -853,6 +853,21 @@ var _phHasCI    = {{ 'true' if has_postcode else 'false' }};
 var _phData     = [];   // [{captured_at, net_kw, intensity, carbon_gco2_min}]
 var _phTimer    = null;
 var _phMode     = 'kw'; // 'kw' or 'co2'
+var _phZoomT0   = null; // null = default (now - 48h)
+var _phZoomSpan = null; // null = default (48h)
+
+function _phGetWindow() {
+  var now    = Date.now();
+  var t0     = _phZoomT0   !== null ? _phZoomT0   : now - 48 * 3600 * 1000;
+  var tSpan  = _phZoomSpan !== null ? _phZoomSpan : 48 * 3600 * 1000;
+  return { t0: t0, tSpan: tSpan };
+}
+
+function _phResetZoom() {
+  _phZoomT0   = null;
+  _phZoomSpan = null;
+  _phDraw();
+}
 
 // Restore persisted mode (default kw)
 (function() {
@@ -934,9 +949,10 @@ function _phDraw() {
     return;
   }
 
+  var _win  = _phGetWindow();
   var now   = Date.now();
-  var t0    = now - 48 * 3600 * 1000;
-  var tSpan = 48 * 3600 * 1000;
+  var t0    = _win.t0;
+  var tSpan = _win.tSpan;
 
   function tx(ts) {
     var s = (ts && ts.slice(-1) !== 'Z') ? ts + 'Z' : ts;
@@ -1094,7 +1110,7 @@ function _phDraw() {
 
   // ── CO2 mode ──────────────────────────────────────────────────────────────
   function drawCo2() {
-    var pts = _phData.filter(function(r) { return r.carbon_gco2_min != null; });
+    var pts = _phData.filter(function(r) { return r.carbon_gco2_min != null && r.carbon_gco2_min !== 0; });
 
     if (pts.length < 2) {
       ctx.fillStyle = th.text;
@@ -1241,9 +1257,19 @@ setInterval(_phLoad, 30000);
     var dpr  = window.devicePixelRatio || 1;
     var PAD_L_px = 42 * (rect.width / (_phCanvas.width / dpr));
     var CW_px    = rect.width - PAD_L_px;
-    var frac = (mouseX - PAD_L_px) / CW_px;
-    var now  = Date.now();
-    return now - 48 * 3600 * 1000 + frac * 48 * 3600 * 1000;
+    var frac = Math.max(0, Math.min(1, (mouseX - PAD_L_px) / CW_px));
+    var win  = _phGetWindow();
+    return win.t0 + frac * win.tSpan;
+  }
+
+  // Convert UTC ms timestamp back to canvas X
+  function timeToX(ms) {
+    var rect = _phCanvas.getBoundingClientRect();
+    var dpr  = window.devicePixelRatio || 1;
+    var PAD_L_px = 42 * (rect.width / (_phCanvas.width / dpr));
+    var CW_px    = rect.width - PAD_L_px;
+    var win  = _phGetWindow();
+    return PAD_L_px + ((ms - win.t0) / win.tSpan) * CW_px;
   }
 
   // Find nearest data point to a UTC ms timestamp
@@ -1270,7 +1296,7 @@ setInterval(_phLoad, 30000);
     if (mouseX < PAD_L_px) { tip.style.display = 'none'; return; }
 
     var rows = (_phMode === 'co2' && _phHasCI)
-      ? _phData.filter(function(r) { return r.carbon_gco2_min != null; })
+      ? _phData.filter(function(r) { return r.carbon_gco2_min != null && r.carbon_gco2_min !== 0; })
       : _phData;
 
     var pt = nearest(xToTime(mouseX), rows);
@@ -1324,6 +1350,65 @@ setInterval(_phLoad, 30000);
 
   _phCanvas.addEventListener('mouseleave', function() {
     tip.style.display = 'none';
+  });
+
+  // ── Drag zoom ───────────────────────────────────────────────────────────
+  var _dragStart = null;
+  var _dragOverlay = null;
+
+  _phCanvas.addEventListener('mousedown', function(e) {
+    if (e.button !== 0) return;
+    var rect = _phCanvas.getBoundingClientRect();
+    var mouseX = e.clientX - rect.left;
+    var dpr = window.devicePixelRatio || 1;
+    var PAD_L_px = 42 * (rect.width / (_phCanvas.width / dpr));
+    if (mouseX < PAD_L_px) return;
+    _dragStart = { x: mouseX, t: xToTime(mouseX) };
+    // Create drag selection overlay
+    _dragOverlay = document.createElement('div');
+    _dragOverlay.style.cssText = 'position:absolute;top:0;height:100%;background:rgba(0,212,170,0.15);border:1px solid rgba(0,212,170,0.5);pointer-events:none;z-index:10;';
+    _dragOverlay.style.left = mouseX + 'px';
+    _dragOverlay.style.width = '0px';
+    _phCanvas.parentElement.style.position = 'relative';
+    _phCanvas.parentElement.appendChild(_dragOverlay);
+    e.preventDefault();
+  });
+
+  window.addEventListener('mousemove', function(e) {
+    if (!_dragStart || !_dragOverlay) return;
+    var rect = _phCanvas.getBoundingClientRect();
+    var mouseX = e.clientX - rect.left;
+    var left  = Math.min(_dragStart.x, mouseX);
+    var width = Math.abs(mouseX - _dragStart.x);
+    _dragOverlay.style.left  = left + 'px';
+    _dragOverlay.style.width = width + 'px';
+  });
+
+  window.addEventListener('mouseup', function(e) {
+    if (!_dragStart) return;
+    var rect = _phCanvas.getBoundingClientRect();
+    var mouseX = e.clientX - rect.left;
+    var endT   = xToTime(mouseX);
+    var startT = _dragStart.t;
+    if (_dragOverlay && _dragOverlay.parentElement) {
+      _dragOverlay.parentElement.removeChild(_dragOverlay);
+    }
+    _dragOverlay = null;
+    _dragStart   = null;
+    // Only zoom if drag was meaningful (>10px)
+    var pxDiff = Math.abs(timeToX(endT) - timeToX(startT));
+    if (pxDiff < 10) return;
+    var t0New   = Math.min(startT, endT);
+    var spanNew = Math.abs(endT - startT);
+    if (spanNew < 60 * 1000) return; // minimum 1 minute window
+    _phZoomT0   = t0New;
+    _phZoomSpan = spanNew;
+    _phDraw();
+  });
+
+  // Double-click to reset zoom
+  _phCanvas.addEventListener('dblclick', function() {
+    _phResetZoom();
   });
 })();
 {% endif %}

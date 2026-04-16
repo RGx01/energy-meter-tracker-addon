@@ -2609,8 +2609,12 @@ function showView(view) {{
   // new available width — we use it to relayout charts without reloading.
   window.addEventListener('message', function(e) {{
     if (!e.data || e.data.type !== 'emt-resize') return;
+    var w = e.data.width || window.innerWidth;
     if (typeof _scaleDayCharts === 'function') _scaleDayCharts();
-    if (typeof scaleChart === 'function') scaleChart();
+    // Use parent-provided width directly — window.innerWidth inside an iframe
+    // can lag behind the actual rendered width during layout passes, causing
+    // Plotly to scale to a stale value.
+    if (typeof scaleChart === 'function') scaleChart(w);
   }});
 }})();
 </script>
@@ -2656,21 +2660,58 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None, curren
     slots = 1440 // block_minutes
 
     # ───── Build day → slots ─────
-    days = defaultdict(lambda: [0.0] * slots)
+    days          = defaultdict(lambda: [0.0] * slots)    # net kWh
+    days_carbon   = defaultdict(lambda: [None] * slots)   # gCO₂ per slot (None = no CI data)
+    days_intensity = defaultdict(lambda: [None] * slots)  # gCO₂/kWh per slot (None = no CI data or net=0)
+
     for block in sorted([b for b in blocks if b and b.get("start")], key=lambda b: b["start"]):
         try:
-            start = _parse_block_start(block["start"], _tz)
-            day = start.date().isoformat()
+            start    = _parse_block_start(block["start"], _tz)
+            day      = start.date().isoformat()
             hh_index = (start.hour * 60 + start.minute) // block_minutes
-            totals = block.get("totals", {}) or {}
-            net = _f(totals.get("import_kwh")) - _f(totals.get("export_kwh"))
+            totals   = block.get("totals", {}) or {}
+            net      = _f(totals.get("import_kwh")) - _f(totals.get("export_kwh"))
             days[day][hh_index] = net
+
+            # Carbon data from main meter block
+            for mid, md in (block.get("meters") or {}).items():
+                if (md or {}).get("meta", {}).get("sub_meter"):
+                    continue
+                cg = md.get("carbon_g")
+                if cg is None:
+                    break
+                cg = float(cg)
+                days_carbon[day][hh_index] = cg
+                # Intensity only meaningful when net != 0
+                if net != 0:
+                    days_intensity[day][hh_index] = round(abs(cg / net), 1)
+                break
         except Exception:
             continue
 
-    sorted_days = sorted(days.keys())
-    heatmap_data = [days[d] for d in sorted_days]
-    daily_totals = [sum(row) for row in heatmap_data]
+    sorted_days    = sorted(days.keys())
+    heatmap_data   = [days[d] for d in sorted_days]
+    daily_totals   = [sum(row) for row in heatmap_data]
+
+    # Carbon datasets
+    carbon_data    = [days_carbon[d]    for d in sorted_days]
+    intensity_data = [days_intensity[d] for d in sorted_days]
+
+    # Daily carbon totals (sum of non-None slots)
+    daily_carbon_totals = [
+        sum(v for v in row if v is not None) if any(v is not None for v in row) else None
+        for row in carbon_data
+    ]
+
+    # 95th percentile of non-null intensities for scale anchoring
+    all_intensities = [v for row in intensity_data for v in row if v is not None]
+    if all_intensities:
+        all_intensities_sorted = sorted(all_intensities)
+        p95_idx = max(0, int(len(all_intensities_sorted) * 0.95) - 1)
+        intensity_max = all_intensities_sorted[p95_idx]
+        intensity_max = max(intensity_max, 50)  # floor at 50 gCO₂/kWh
+    else:
+        intensity_max = 300  # fallback if no CI data
 
     # ───── X axis labels & ranges ─────
     x_labels = []
@@ -2816,6 +2857,21 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None, curren
     totals_cs_dark_json  = json.dumps(totals_colorscale_dark)
     weekend_z_json   = json.dumps(weekend_z)
     x_tickvals_json  = json.dumps(x_tickvals)
+    # Carbon datasets
+    carbon_z_json        = json.dumps(carbon_data)
+    intensity_z_json     = json.dumps(intensity_data)
+    daily_carbon_json    = json.dumps(daily_carbon_totals)
+    intensity_max_json   = json.dumps(intensity_max)
+    # Totals min/max for each metric (needed for per-metric colorscale anchoring)
+    kwh_tot_min_json     = json.dumps(tot_min)
+    kwh_tot_max_json     = json.dumps(tot_max)
+    # Carbon totals min/max
+    _dc_flat = [v for v in daily_carbon_totals if v is not None]
+    co2_tot_min = min(_dc_flat) if _dc_flat else -1
+    co2_tot_max = max(_dc_flat) if _dc_flat else 1
+    if co2_tot_min == co2_tot_max: co2_tot_max += 1
+    co2_tot_min_json = json.dumps(co2_tot_min)
+    co2_tot_max_json = json.dumps(co2_tot_max)
 
     return f"""<html data-theme="light">
 <head>
@@ -2852,7 +2908,51 @@ function _getThemeColours() {{
     --scroll-guard-pill: rgba(255,255,255,0.15);
   }}
   html {{ scroll-padding-top: 80px; }}
-html, body {{ margin:0; padding:0; overflow:hidden; touch-action: none; background:var(--bg); color:var(--text); height:100%; }}
+html, body {{ margin:0; padding:0; overflow:hidden; touch-action: none; background:var(--bg); color:var(--text); height:100%;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px; }}
+  #hm-nav {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    background: var(--surface);
+    padding: 8px 12px;
+    border-radius: 0 0 8px 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    margin-bottom: 8px;
+    position: sticky;
+    top: 0;
+    z-index: 200;
+    box-sizing: border-box;
+  }}
+  #hm-nav-left {{ display:flex; align-items:center; gap:4px; }}
+  #hm-nav-right {{ display:flex; align-items:center; gap:4px; }}
+  .hm-metric-btn {{
+    font-size: 12px;
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    transition: all 0.15s;
+  }}
+  .hm-metric-btn.active {{
+    background: rgba(0,212,170,0.15);
+    color: var(--accent, #00d4aa);
+    border-color: var(--accent, #00d4aa);
+  }}
+  .hm-theme-btn {{
+    font-size: 13px;
+    padding: 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    opacity: 0.85;
+  }}
   #outer {{ width:{heatmap_width}px; transform-origin: top left; position: relative; min-height: 100vh; }}
   #scroll {{
     width:{heatmap_width}px;
@@ -2893,13 +2993,17 @@ html, body {{ margin:0; padding:0; overflow:hidden; touch-action: none; backgrou
 <body>
 <div id="outer">
   <div id="scroll">
-      <div id="heatmap" style="width:{heatmap_width}px;height:{heatmap_height}px;"></div>
+    <div id="hm-nav">
+      <div id="hm-nav-left"><!-- metric buttons injected by JS --></div>
+      <div id="hm-nav-right"></div>
+    </div>
+    <div id="heatmap" style="width:{heatmap_width}px;height:{heatmap_height}px;"></div>
   </div>
   <div id="scroll-guard"></div>
 </div>
 <script>
-function scaleChart() {{
-  var vw = window.innerWidth;
+function scaleChart(overrideW) {{
+  var vw = overrideW || window.innerWidth;
   var vh = window.innerHeight;
   var cw = {heatmap_width};
   var isMobile = vw <= 768 || (vh <= 500 && vw > vh);
@@ -2910,11 +3014,13 @@ function scaleChart() {{
   if (guard) guard.classList.toggle('visible', isMobile);
   var guardW = 0; // guard now on left over y-axis labels, doesn't reduce chart width
   var availW = vw - guardW;
+  var nav = document.getElementById('hm-nav');
   if (availW < cw) {{
     var scale = availW / cw;
     outer.style.transform = 'scale(' + scale + ')';
     outer.style.transformOrigin = 'top left';
     outer.style.width = cw + 'px';
+    // nav is inside #scroll, scaled via #outer transform — no separate scaling needed
     if (isMobile) {{
       // After scaling, visual height = layout height * scale.
       // To make the chart fill vh visually, set layout height = vh / scale.
@@ -2931,6 +3037,7 @@ function scaleChart() {{
     outer.style.transformOrigin = '';
     outer.style.width = '';
     outer.style.height = '';
+    // nav clear not needed — inside #scroll
     var scrollH = Math.min({n_rows}, {visible_rows}) * {row_height} + {margin_t} + {margin_b};
     scroll.style.height = scrollH + 'px';
   }}
@@ -2944,7 +3051,17 @@ document.addEventListener('touchmove', function(e) {{
   if (e.touches.length > 1) {{ e.preventDefault(); }}
 }}, {{ passive: false }});
 window.addEventListener('resize', scaleChart);
-scaleChart();
+// Don't call scaleChart() synchronously — window.innerWidth may be 0 or stale
+// if the iframe hasn't been assigned its final dimensions yet. Instead poll
+// with rAF until we get a stable non-zero width, then scale.
+(function _waitForWidth(attempts) {{
+  var vw = window.innerWidth;
+  if (vw > 0) {{
+    scaleChart();
+  }} else if (attempts < 20) {{
+    requestAnimationFrame(function() {{ _waitForWidth(attempts + 1); }});
+  }}
+}})(0);
 </script>
 <script>
 function _hmGetTheme() {{
@@ -2978,6 +3095,204 @@ function _hmWeekendCs() {{
     ? [[0,'rgba(0,0,0,0)'],[1,'rgba(0,0,0,0.15)']]
     : [[0,'rgba(0,0,0,0)'],[1,'rgba(0,0,0,0.10)']];
 }}
+// ── Carbon / intensity datasets ──
+var CARBON_Z      = {carbon_z_json};
+var INTENSITY_Z   = {intensity_z_json};
+var DAILY_CARBON  = {daily_carbon_json};
+var INTENSITY_MAX = {intensity_max_json};
+var KWH_Z         = {z_json};
+var KWH_TOTALS    = {totals_json};
+var KWH_TOT_MIN   = {kwh_tot_min_json};
+var KWH_TOT_MAX   = {kwh_tot_max_json};
+var CO2_TOT_MIN   = {co2_tot_min_json};
+var CO2_TOT_MAX   = {co2_tot_max_json};
+
+// ── Metric state ──
+var _hmMetric = localStorage.getItem('emt_hm_metric') || 'kwh';  // 'kwh' | 'co2' | 'intensity'
+
+function _hmHasCo2() {{
+  return CARBON_Z.some(function(row) {{ return row.some(function(v) {{ return v !== null; }}); }});
+}}
+
+// ── Colorscale builders ──
+function _hmCo2Cs(dark) {{
+  // gCO₂: green (offset) → white (zero) → red (emitting)
+  var bg = dark ? '#1a1d27' : 'white';
+  var flat = CARBON_Z.reduce(function(a,r){{return a.concat(r);}}, []).filter(function(v){{return v!==null;}});
+  if (!flat.length) return [[0,'#1a6632'],[0.5, bg],[1,'#cc0000']];
+  var mn = Math.min.apply(null, flat), mx = Math.max.apply(null, flat);
+  if (mn >= 0) return [[0, bg],[0.5,'#ff9966'],[1,'#cc0000']];
+  if (mx <= 0) return [[0,'#1a6632'],[0.5,'#66bb88'],[1, bg]];
+  var wp = Math.max(0.01, Math.min(0.99, (0 - mn) / (mx - mn)));
+  return [
+    [0, '#1a6632'], [round2(wp*0.5), '#66bb88'], [round2(wp), bg],
+    [round2(wp + (1-wp)*0.5), '#ff9966'], [1, '#cc0000']
+  ];
+}}
+function _hmIntensityCs(dark) {{
+  // gCO₂/kWh: green (clean) → yellow → red (dirty)
+  return [[0,'#1a6632'],[0.25,'#52b788'],[0.5,'#f9c74f'],[0.75,'#f3722c'],[1,'#cc0000']];
+}}
+function round2(v) {{ return Math.round(v * 100) / 100; }}
+
+// ── Active dataset getters ──
+function _hmGetZ() {{
+  if (_hmMetric === 'co2')       return CARBON_Z;
+  if (_hmMetric === 'intensity') return INTENSITY_Z;
+  return KWH_Z;
+}}
+function _hmGetTotals() {{
+  if (_hmMetric === 'co2')       return DAILY_CARBON;
+  if (_hmMetric === 'intensity') return null;
+  return KWH_TOTALS;
+}}
+function _hmGetZmin() {{
+  if (_hmMetric === 'intensity') return 0;
+  var flat = _hmGetZ().reduce(function(a,r){{return a.concat(r);}}, []).filter(function(v){{return v!==null;}});
+  return flat.length ? Math.min.apply(null, flat) : 0;
+}}
+function _hmGetZmax() {{
+  if (_hmMetric === 'intensity') return INTENSITY_MAX;
+  var flat = _hmGetZ().reduce(function(a,r){{return a.concat(r);}}, []).filter(function(v){{return v!==null;}});
+  return flat.length ? Math.max.apply(null, flat) : 1;
+}}
+function _hmGetActiveCs() {{
+  var dark = document.documentElement.getAttribute('data-theme') !== 'light';
+  if (_hmMetric === 'co2')       return _hmCo2Cs(dark);
+  if (_hmMetric === 'intensity') return _hmIntensityCs(dark);
+  return _hmGetCs();  // existing kWh colorscale
+}}
+function _hmGetHoverSuffix() {{
+  if (_hmMetric === 'co2')       return ' gCO₂';
+  if (_hmMetric === 'intensity') return ' gCO₂/kWh';
+  return ' kWh';
+}}
+function _hmGetTotLabel() {{
+  if (_hmMetric === 'co2')       return 'Daily CO₂';
+  if (_hmMetric === 'intensity') return '';
+  return 'Daily Total';
+}}
+
+function _hmGetTotMin() {{
+  if (_hmMetric === 'co2') return CO2_TOT_MIN;
+  return KWH_TOT_MIN;
+}}
+
+function _hmGetTotMax() {{
+  if (_hmMetric === 'co2') return CO2_TOT_MAX;
+  return KWH_TOT_MAX;
+}}
+
+function _hmGetTotColorscale() {{
+  // For kWh: use the pre-computed totals colorscale (different scale from heatmap)
+  // For CO2: use the co2 colorscale anchored to daily totals range
+  var dark = document.documentElement.getAttribute('data-theme') !== 'light';
+  if (_hmMetric === 'co2') return _hmCo2Cs(dark);
+  return _hmGetTotCs();  // existing kWh totals colorscale
+}}
+
+function _hmGetChartTitle() {{
+  if (_hmMetric === 'co2')       return 'Carbon Flow (gCO₂ per slot)';
+  if (_hmMetric === 'intensity') return 'Grid Carbon Intensity (gCO₂/kWh)';
+  return 'Net Energy Flow';
+}}
+
+function _hmApplyMetric() {{
+  var dark     = document.documentElement.getAttribute('data-theme') !== 'light';
+  var tc       = _hmGetTheme();
+  var z        = _hmGetZ();
+  var totals   = _hmGetTotals();
+  var cs       = _hmGetActiveCs();
+  var suffix   = _hmGetHoverSuffix();
+  var totLabel = _hmGetTotLabel();
+
+  // Compute zmin/zmax from non-null values only
+  var flat = z.reduce(function(a,r){{return a.concat(r);}}, []).filter(function(v){{return v!==null;}});
+  var zmin = flat.length ? Math.min.apply(null, flat) : -1;
+  var zmax = flat.length ? Math.max.apply(null, flat) : 1;
+  if (_hmMetric === 'intensity') {{
+    zmin = 0;
+    zmax = INTENSITY_MAX;
+  }} else {{
+    // Ensure range spans zero for symmetric colorscale
+    if (zmin >= 0) zmin = -0.001;  // force zero anchor
+    if (zmax <= 0) zmax =  0.001;
+    if (zmin === zmax) zmax = zmin + 1;
+  }}
+
+  // Rebuild trace 0 (heatmap) with new data
+  var newData = [
+    {{
+      z: z,
+      x: {x_json},
+      y: {y_json},
+      customdata: {customdata_json},
+      type: 'heatmap',
+      colorscale: cs,
+      zmin: zmin, zmax: zmax, zmid: _hmMetric === 'intensity' ? undefined : 0,
+      xgap: 1, ygap: 1, showscale: false,
+      hovertemplate: 'Date: %{{customdata.date}}<br>Time: %{{customdata.time}}<br>' + suffix.trim() + ': %{{z:.1f}}' + suffix + '<extra></extra>'
+    }},
+    totals && _hmMetric !== 'intensity' ? {{
+      x: totals,
+      y: {y_json},
+      type: 'bar', xaxis: 'x2', orientation: 'h',
+      visible: true,
+      marker: {{
+        color: totals,
+        colorscale: _hmGetTotColorscale(),
+        cmin: _hmGetTotMin(), cmax: _hmGetTotMax(), cmid: 0
+      }},
+      hovertemplate: totLabel + ': %{{x:.1f}}' + suffix + '<extra></extra>'
+    }} : {{
+      x: KWH_TOTALS, y: {y_json},
+      type: 'bar', xaxis: 'x2', orientation: 'h',
+      visible: false,
+      marker: {{color: KWH_TOTALS, colorscale: _hmGetTotCs(),
+               cmin: KWH_TOT_MIN, cmax: KWH_TOT_MAX, cmid: 0}},
+      hovertemplate: ''
+    }},
+    {{
+      z: {weekend_z_json},
+      x: {x_json},
+      y: {y_json},
+      type: 'heatmap',
+      colorscale: _hmWeekendCs(),
+      zmin: 0, zmax: 1,
+      showscale: false,
+      hoverinfo: 'skip'
+    }}
+  ];
+
+  // Use Plotly.react for a clean full-data update (avoids restyle quirks)
+  // Use live layout from the DOM so annotations/shapes are preserved
+  var _liveLayout = document.getElementById('heatmap').layout || layout;
+  // Update title to match current metric
+  _liveLayout.title = _liveLayout.title || {{}};
+  _liveLayout.title.text = _hmGetChartTitle();
+  Plotly.react('heatmap', newData, _liveLayout).then(function() {{
+    if (totals && _hmMetric !== 'intensity') {{
+      Plotly.relayout('heatmap', {{'xaxis2.title.text': totLabel}});
+    }} else {{
+      Plotly.relayout('heatmap', {{'xaxis2.title.text': ''}});
+    }}
+  }});
+
+  // Update metric toggle button states via CSS class
+  ['kwh','co2','intensity'].forEach(function(m) {{
+    var btn = document.getElementById('hm-metric-' + m);
+    if (btn) {{
+      btn.classList.toggle('active', _hmMetric === m);
+    }}
+  }});
+}}
+
+function _hmSetMetric(m) {{
+  _hmMetric = m;
+  localStorage.setItem('emt_hm_metric', m);
+  _hmApplyMetric();
+}}
+
 var data = [
 {{
   z: {z_json},
@@ -3032,11 +3347,32 @@ var _annotations = {annotations_json};
 _annotations.forEach(function(a) {{ if (a.font) a.font.color = _hmTc.monthC; }});
 layout.annotations = _annotations;
 
-// Theme toggle button
+// ── Populate sticky nav bar ──
+var _hmMetricTitles = {{
+  'kwh':       'Net kWh per slot (import − export)',
+  'co2':       'Net carbon per slot — red=emitting, green=offsetting',
+  'intensity': 'Grid carbon intensity where you had net flow (gCO₂/kWh) — green=clean, red=dirty. White=no grid interaction.'
+}};
+var _hmNavLeft = document.getElementById('hm-nav-left');
+[['kwh','kWh'],['co2','gCO₂'],['intensity','gCO₂/kWh']].forEach(function(pair) {{
+  var m = pair[0], label = pair[1];
+  var btn = document.createElement('button');
+  btn.id = 'hm-metric-' + m;
+  btn.className = 'hm-metric-btn' + (m === _hmMetric ? ' active' : '');
+  btn.textContent = label;
+  btn.title = _hmMetricTitles[m];
+  if (!_hmHasCo2() && m !== 'kwh') btn.style.display = 'none';
+  btn.onclick = function() {{ _hmSetMetric(m); }};
+  if (_hmNavLeft) _hmNavLeft.appendChild(btn);
+}});
+
+// Theme toggle button in nav right
+var _hmNavRight = document.getElementById('hm-nav-right');
 var _hmToggleBtn = document.createElement('button');
 _hmToggleBtn.id = 'hm-theme-btn';
+_hmToggleBtn.className = 'hm-theme-btn';
 _hmToggleBtn.textContent = document.documentElement.getAttribute('data-theme') === 'light' ? '\u2600' : '\u263e';
-_hmToggleBtn.style.cssText = 'position:absolute;top:6px;right:6px;z-index:200;background:var(--surface);border:1px solid var(--border);color:var(--muted);border-radius:6px;padding:3px 8px;font-size:13px;cursor:pointer;opacity:0.85;';
+if (_hmNavRight) _hmNavRight.appendChild(_hmToggleBtn);
 _hmToggleBtn.onclick = function() {{
   var current = document.documentElement.getAttribute('data-theme');
   var next = current === 'light' ? 'dark' : 'light';
@@ -3066,7 +3402,7 @@ _hmToggleBtn.onclick = function() {{
   Plotly.restyle('heatmap', {{colorscale: [_hmGetCs()]}}, [0]);
   Plotly.restyle('heatmap', {{'marker.colorscale': [_hmGetTotCs()]}}, [1]);
 }};
-document.body.appendChild(_hmToggleBtn);
+// _hmToggleBtn already appended to #hm-nav-right above
 
 window.addEventListener('message', function(e) {{
   if (e.data && e.data.type === 'emt-theme') {{
@@ -3089,7 +3425,17 @@ window.addEventListener('message', function(e) {{
     Plotly.restyle('heatmap', {{'marker.colorscale': [_hmGetTotCs()]}}, [1]);
   }}
 }});
-Plotly.newPlot('heatmap', data, layout, {{responsive: false, scrollZoom: false, touchZoom: false, displayModeBar: false}}).then(scaleChart);
+Plotly.newPlot('heatmap', data, layout, {{responsive: false, scrollZoom: false, touchZoom: false, displayModeBar: false}}).then(function() {{
+  // Defer scaleChart and metric apply to the next animation frame so the
+  // iframe has its final layout dimensions before Plotly measures the container.
+  // Without this, window.innerWidth can reflect a stale/transitioning width.
+  requestAnimationFrame(function() {{
+    scaleChart();
+    // Apply metric state after chart is ready — always run to set button states
+    // and ensure totals colorscale is consistent on initial kWh load too
+    _hmApplyMetric();
+  }});
+}});
 </script>
 
 <script>

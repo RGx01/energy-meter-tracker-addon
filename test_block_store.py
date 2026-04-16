@@ -2219,9 +2219,16 @@ class TestPowerHistory(unittest.TestCase):
     def setUp(self):
         self.store = BlockStore(":memory:")
 
+    @staticmethod
+    def _ts(offset_hours=1):
+        """Return a UTC ISO timestamp offset_hours ago — always within 48h window."""
+        from datetime import datetime, timezone, timedelta
+        return (datetime.now(timezone.utc).replace(tzinfo=None)
+                - timedelta(hours=offset_hours)).strftime("%Y-%m-%dT%H:%M:%S")
+
     def test_append_and_retrieve(self):
         """Appended row is returned by get_power_history."""
-        self.store.append_power_history("2026-04-14T12:00:00", 2.5, 180.0, 7.5)
+        self.store.append_power_history(self._ts(3), 2.5, 180.0, 7.5)
         rows = self.store.get_power_history(hours=48)
         self.assertEqual(len(rows), 1)
         self.assertAlmostEqual(rows[0]["net_kw"], 2.5)
@@ -2230,31 +2237,31 @@ class TestPowerHistory(unittest.TestCase):
 
     def test_negative_net_kw(self):
         """Negative net_kw (exporting) is stored correctly."""
-        self.store.append_power_history("2026-04-14T12:00:00", -1.5, 115.0, -2.875)
+        self.store.append_power_history(self._ts(3), -1.5, 115.0, -2.875)
         rows = self.store.get_power_history(hours=48)
         self.assertAlmostEqual(rows[0]["net_kw"], -1.5)
         self.assertAlmostEqual(rows[0]["carbon_gco2_min"], -2.875)
 
     def test_null_intensity_stored(self):
         """None intensity stored and returned as None."""
-        self.store.append_power_history("2026-04-14T12:00:00", 1.0, None, None)
+        self.store.append_power_history(self._ts(3), 1.0, None, None)
         rows = self.store.get_power_history(hours=48)
         self.assertIsNone(rows[0]["intensity"])
         self.assertIsNone(rows[0]["carbon_gco2_min"])
 
     def test_upsert_on_conflict(self):
         """Duplicate captured_at updates the row."""
-        self.store.append_power_history("2026-04-14T12:00:00", 2.5, 180.0, 7.5)
-        self.store.append_power_history("2026-04-14T12:00:00", 3.0, 190.0, 9.5)
+        self.store.append_power_history(self._ts(3), 2.5, 180.0, 7.5)
+        self.store.append_power_history(self._ts(3), 3.0, 190.0, 9.5)
         rows = self.store.get_power_history(hours=48)
         self.assertEqual(len(rows), 1)
         self.assertAlmostEqual(rows[0]["net_kw"], 3.0)
 
     def test_rows_ordered_oldest_first(self):
         """get_power_history returns rows in ascending captured_at order."""
-        self.store.append_power_history("2026-04-14T12:00:30", 3.0, None)
-        self.store.append_power_history("2026-04-14T12:00:00", 1.0, None)
-        self.store.append_power_history("2026-04-14T12:00:20", 2.0, None)
+        self.store.append_power_history(self._ts(1), 3.0, None)
+        self.store.append_power_history(self._ts(3), 1.0, None)
+        self.store.append_power_history(self._ts(2), 2.0, None)
         rows = self.store.get_power_history(hours=48)
         self.assertEqual(len(rows), 3)
         self.assertLess(rows[0]["captured_at"], rows[1]["captured_at"])
@@ -2263,7 +2270,7 @@ class TestPowerHistory(unittest.TestCase):
     def test_prune_removes_old_rows(self):
         """Rows older than retention window are pruned."""
         self.store.append_power_history("2020-01-01T00:00:00", 1.0, None)
-        self.store.append_power_history("2026-04-14T12:00:00", 2.0, 180.0)
+        self.store.append_power_history(self._ts(3), 2.0, 180.0)
         deleted = self.store.prune_power_history(hours=48)
         self.assertEqual(deleted, 1)
         remaining = self.store._conn.execute(
@@ -2294,6 +2301,6 @@ class TestPowerHistory(unittest.TestCase):
         net_kw = -1.5
         intensity = 115.0
         expected = round(net_kw * intensity / 60.0, 4)
-        self.store.append_power_history("2026-04-14T12:00:00", net_kw, intensity, expected)
+        self.store.append_power_history(self._ts(3), net_kw, intensity, expected)
         rows = self.store.get_power_history(hours=48)
         self.assertAlmostEqual(rows[0]["carbon_gco2_min"], expected, places=4)
