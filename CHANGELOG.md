@@ -3,6 +3,22 @@
 ## [2.4.1] — 2026-04-16
 
 ### Fixed
+- **Blue (house) bar negative on solar export days** — the house remainder carbon
+  was computed as `main_carbon_g - sub_carbon` where `main_carbon_g` is the net
+  figure (import − export) × intensity. On a net export day `main_carbon_g` is
+  negative, making the remainder more negative still when sub-meter carbon is
+  subtracted. Fixed: the remainder is now computed from `carbon_g_imp` (import
+  carbon only, always positive) minus sub-meter carbon. The export offset is
+  shown separately as a grey bar below zero.
+
+- **`carbon_g_imp`/`carbon_g_exp` using wrong kWh values for intensity** — the
+  back-calculated intensity used `main_imp_kwh`/`main_exp_kwh` from the billing
+  summary which uses `imp_kwh_remainder` (house only, sub-meters stripped). But
+  `carbon_g` in the engine is computed from the raw full-meter `imp_kwh`. This
+  mismatch produced incorrect intensities. Fixed: raw block channel kWh are now
+  accumulated directly from day_blocks for the main meter and used in the intensity
+  calculation, matching what the engine used when computing `carbon_g`.
+
 - **CO₂ totals chart showing incorrect bar heights** — the blue (house/grid) bar in
   Usage Stats CO₂ totals view was showing the full main meter net carbon rather than
   the house remainder (main minus sub-meters). This made the chart appear to
