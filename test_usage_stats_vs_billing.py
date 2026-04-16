@@ -128,16 +128,11 @@ def sim_usage_stats_day(store, local_date_str):
                 if cg is not None:
                     carbon_g_net = (carbon_g_net or 0.0) + float(cg)
 
-    # carbon_g_total = main net + sub-meter gross (no double-count)
-    # carbon_g_imp/exp back-calculated from average intensity implied by net carbon
-    sub_carbon = sum(
-        float(cg) for cg in [
-            _md.get("carbon_g") for _b in blocks
-            for _mid, _md in (_b.get("meters") or {}).items()
-            if (_md or {}).get("meta", {}).get("sub_meter") and _md.get("carbon_g") is not None
-        ]
-    )
-    carbon_g_total = round(carbon_g_net + sub_carbon, 4) if carbon_g_net is not None else None
+    # carbon_g_total = main_carbon_g (already includes sub-meter consumption)
+    # Do NOT add sub-meter carbon on top — that would double-count.
+    # The main meter (imp-exp) × intensity already captures all grid consumption
+    # including what went to sub-meters.
+    carbon_g_total = round(carbon_g_net, 4) if carbon_g_net is not None else None
 
     # Back-calculate imp/exp split from net kWh and net carbon
     main_imp = imp_kwh
@@ -846,8 +841,8 @@ class TestSubMeterCarbonAccounting(unittest.TestCase):
             self._db_carbon("2026-06-15", "electricity_main"), places=3,
             msg="carbon_g_net must match DB SUM for main meter")
 
-    def test_carbon_g_total_equals_main_plus_submeters(self):
-        """carbon_g_total = main carbon_g + all sub-meter carbon_g (no double-count)."""
+    def test_carbon_g_total_equals_main_carbon_g(self):
+        """carbon_g_total = main_carbon_g only — sub-meters already included in main."""
         insert_block(self.store, self.cp, "2026-06-15T06:00:00",
                      2.0, 0.490, carbon_g=65.0)
         insert_block(self.store, self.cp, "2026-06-15T06:00:00",
@@ -856,16 +851,16 @@ class TestSubMeterCarbonAccounting(unittest.TestCase):
                      0.5, 0.123, carbon_g=10.0, meter_id="house_battery")
 
         row = sim_usage_stats_day(self.store, "2026-06-15")
-        expected_total = 65.0 + 30.0 + 10.0
-        self.assertAlmostEqual(row["carbon_g_total"], expected_total, places=3,
-            msg="carbon_g_total must equal main + all sub-meter carbon_g")
+        # main_carbon_g = 65.0 — this already includes EV and battery consumption
+        # carbon_g_total must NOT be 65+30+10=105 (double-count)
+        self.assertAlmostEqual(row["carbon_g_total"], 65.0, places=3,
+            msg="carbon_g_total must equal main_carbon_g only, not main+sub")
 
     def test_carbon_g_total_not_double_counting(self):
         """
-        carbon_g_total must NOT equal carbon_g_net + sub-meters if that would
-        mean adding sub-meter carbon twice. Main meter carbon_g already
-        accounts for sub-meter consumption (it is the full grid draw net of
-        export). carbon_g_total is main + sub-meter gross for the chart stacking.
+        carbon_g_total must equal main_carbon_g only — not main + sub.
+        The main meter (imp-exp) × intensity already captures all grid consumption
+        including what went to sub-meters. Adding sub-meter carbon again double-counts.
         """
         insert_block(self.store, self.cp, "2026-06-15T06:00:00",
                      3.0, 0.735, carbon_g=90.0)
@@ -873,11 +868,11 @@ class TestSubMeterCarbonAccounting(unittest.TestCase):
                      1.5, 0.368, carbon_g=45.0, meter_id="ev_charger")
 
         row = sim_usage_stats_day(self.store, "2026-06-15")
-        # Total should be 90 + 45 = 135, NOT 90 + 45 + 45 = 180
-        self.assertAlmostEqual(row["carbon_g_total"], 135.0, places=3,
-            msg="carbon_g_total must not double-count sub-meter carbon")
-        self.assertNotAlmostEqual(row["carbon_g_total"], 180.0, places=1,
-            msg="double-counting would give 180 — must be 135")
+        # Total must be 90 (main only), NOT 90+45=135 (double-count)
+        self.assertAlmostEqual(row["carbon_g_total"], 90.0, places=3,
+            msg="carbon_g_total must be main_carbon_g only")
+        self.assertNotAlmostEqual(row["carbon_g_total"], 135.0, places=1,
+            msg="adding sub-meters again would give 135 — that is the double-count bug")
 
     def test_carbon_g_imp_minus_exp_equals_net(self):
         """carbon_g_imp - carbon_g_exp must equal carbon_g_net (identity)."""
@@ -918,8 +913,36 @@ class TestSubMeterCarbonAccounting(unittest.TestCase):
 
         self.assertAlmostEqual(totals["carbon_g_net"], 3 * 60.0, places=3,
             msg="3-day net carbon = 3 × main meter")
-        self.assertAlmostEqual(totals["carbon_g_total"], 3 * (60.0 + 20.0), places=3,
-            msg="3-day total carbon = 3 × (main + ev_charger)")
+        self.assertAlmostEqual(totals["carbon_g_total"], 3 * 60.0, places=3,
+            msg="3-day total carbon = 3 × main_carbon_g (sub-meters already included)")
+
+    def test_carbon_g_total_equals_main_carbon_g(self):
+        """
+        Regression test for 2.4.1: carbon_g_total must equal main_carbon_g,
+        not main_carbon_g + sub_carbon. The main meter already includes
+        sub-meter consumption in its (imp-exp) × intensity calculation.
+        """
+        self.store._conn.execute(
+            "INSERT OR IGNORE INTO meters (config_period_id, meter_id, is_sub_meter) VALUES (?,?,1)",
+            (self.cp, "ev_charger")
+        )
+        self.store._conn.commit()
+
+        insert_block(self.store, self.cp, "2026-04-16T00:00:00",
+                     2.9, 0.25, carbon_g=249.4)
+        insert_block(self.store, self.cp, "2026-04-16T00:00:00",
+                     2.75, 0.24, carbon_g=236.5, meter_id="ev_charger")
+
+        row = sim_usage_stats_day(self.store, "2026-04-16")
+        # main_carbon_g = 249.4 (already includes EV consumption)
+        # sub_carbon = 236.5
+        # carbon_g_total MUST be 249.4, NOT 249.4 + 236.5 = 485.9
+        self.assertAlmostEqual(row["carbon_g_net"], 249.4, places=2,
+            msg="carbon_g_net must be main meter net")
+        self.assertAlmostEqual(row["carbon_g_total"], 249.4, places=2,
+            msg="carbon_g_total must equal main_carbon_g, not main+sub (double-count)")
+        self.assertNotAlmostEqual(row["carbon_g_total"], 485.9, places=0,
+            msg="double-counting would give 485.9 — this is the 2.4.1 regression")
 
     def test_exporting_day_with_submeter_import(self):
         """
@@ -936,5 +959,5 @@ class TestSubMeterCarbonAccounting(unittest.TestCase):
         self.assertLess(row["carbon_g_net"], 0,
             msg="Net exporter day must have negative carbon_g_net")
         self.assertAlmostEqual(row["carbon_g_net"], -55.0, places=3)
-        self.assertAlmostEqual(row["carbon_g_total"], -55.0 + 28.0, places=3,
-            msg="Total = net exporting main + EV importing")
+        self.assertAlmostEqual(row["carbon_g_total"], -55.0, places=3,
+            msg="Total = main_carbon_g only (EV carbon already in main meter figure)")
