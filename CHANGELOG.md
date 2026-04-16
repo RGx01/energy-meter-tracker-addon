@@ -1,5 +1,60 @@
 # Changelog
 
+## [2.5.0] — 2026-04-16
+
+### Added
+- **Heatmap metric toggle** — the Net Energy Heatmap now has a floating toolbar with
+  three metric modes: kWh (existing), gCO₂ (carbon flow per slot — red when emitting,
+  green when offsetting), and gCO₂/kWh (grid carbon intensity — green→yellow→red).
+  The toggle only appears when carbon data exists. Selected mode persists across
+  sessions. The intensity colour scale is anchored to the 95th percentile of your
+  recorded intensities so contrast is always meaningful as the grid decarbonises.
+
+- **Usage Stats effective intensity column** — when in CO₂ mode, the data table gains
+  an "Avg intensity" column showing the weighted average grid carbon intensity
+  (gCO₂/kWh) for each period. Calculated as SUM(|carbon_g|) / SUM(|net_kwh|) across
+  blocks with carbon data, matching the heatmap's per-slot intensity exactly when
+  aggregated. The totals row shows the weighted average across the full period.
+
+- **`avg_intensity` in `api/charts/blocks-summary`** — each day row now includes a
+  weighted average grid intensity (gCO₂/kWh), enabling the consistency cross-check
+  between the heatmap and Usage Stats.
+
+- **Usage Stats auto-refresh** — the Usage Stats chart now re-fetches data if it is
+  older than 5 minutes, rather than relying on a one-shot `barInited` flag. Switching
+  tabs or navigating away and back within the TTL window still uses the cached data
+  (no unnecessary fetches), but data will refresh at the same cadence as block finalise.
+
+- **Power history drag zoom** — drag horizontally on the 48-hour power history chart
+  to zoom into a specific time window. Double-click to reset to the full 48-hour view.
+  Works alongside the existing hover tooltip.
+
+- **Tab buttons in topbar** — the Billing / Heatmaps / Usage Stats tab buttons have
+  moved from the content area into the topbar, freeing vertical space and following
+  the same pattern as other pages (Meter Config, Data Management). The tab is now
+  always visible without scrolling.
+
+- **Floating toolbars** — Usage Stats and Heatmaps now have a sticky floating toolbar
+  matching the billing chart's period-nav style (surface background, drop shadow,
+  border-radius on bottom). The Usage Stats toolbar sticks to the top of the content
+  area as you scroll through the data table. The Heatmap toolbar sticks within the
+  heatmap scroll container. Both use CSS classes rather than inline styles for active
+  state, matching the billing chart pattern exactly.
+
+- **Fixed page scroll** — all pages (Meter Config, Charts, Live Power, Data Management,
+  Help, Logs) now have a fixed topbar with only the content area below it scrolling.
+  Previously the entire page including the topbar scrolled. The topbar is now always
+  visible. This required `body: overflow: hidden`, `.main: height: 100vh`, and
+  `.content: overflow-y: auto` in the base template.
+
+### Fixed
+- **Power history tests using stale timestamps** — `TestPowerHistory` and
+  `TestApiPowerHistory` used hardcoded April 14 timestamps which fell outside the
+  48-hour retention window as time passed, causing silent test failures. Fixed by
+  using relative timestamps (now − N hours) that always stay within the window.
+
+---
+
 ## [2.4.1] — 2026-04-16
 
 ### Fixed

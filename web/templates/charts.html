@@ -5,8 +5,77 @@
   .chart-tabs {
     display: flex;
     gap: 8px;
-    margin-bottom: 20px;
+    margin-bottom: 0;
   }
+  /* When chart-tabs is in topbar, reduce padding to fit */
+  .topbar .chart-tabs {
+    margin-bottom: 0;
+  }
+
+  /* Mobile topbar collapse */
+  #topbar-toggle {
+    display: none;
+  }
+  @media (max-width: 768px), (max-height: 500px) and (orientation: landscape) {
+    #topbar-toggle {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      width: 100%;
+      padding: 4px 12px;
+      background: var(--surface);
+      border: none;
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 11px;
+      cursor: pointer;
+      font-family: var(--sans);
+      margin-top: -1px;
+    }
+    #topbar-toggle .toggle-chevron {
+      font-size: 9px;
+      transition: transform 0.2s;
+    }
+    .topbar-collapsed .topbar {
+      display: none;
+    }
+    .topbar-collapsed #topbar-toggle .toggle-chevron {
+      transform: rotate(180deg);
+    }
+  }
+
+  @media (max-width: 768px), (max-height: 500px) and (orientation: landscape) {
+    /* Hide subtitle — saves vertical space */
+    .topbar .sub { display: none; }
+    /* Compact topbar */
+    .topbar { padding: 8px 12px; gap: 6px; flex-wrap: nowrap; align-items: center; }
+    /* Icon-only tab buttons — small and square */
+    .chart-tabs { gap: 4px; }
+    .topbar .chart-tab { padding: 6px 8px; font-size: 20px; min-width: 44px; justify-content: center; }
+    .topbar .chart-tab .tab-label { display: none; }
+    /* Regenerate — icon only */
+    .topbar .btn-regen-text { display: none; }
+    .topbar .btn-secondary { padding: 6px 10px; min-width: 36px; }
+    /* Compact floating toolbar — single row */
+    .bar-toolbar {
+      padding: 5px 8px;
+      gap: 4px;
+      top: -16px;
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    .bar-toolbar-left { gap: 3px; flex-wrap: nowrap; }
+    .bar-toolbar-right { flex-shrink: 0; }
+    .bar-seg { flex-shrink: 0; }
+    .bar-seg-btn { padding: 3px 7px; font-size: 11px; }
+    /* Standing charge label shorter on mobile */
+    #bar-standing-wrap span { display: none; }
+    #bar-standing-wrap::after { content: "SC"; font-size: 11px; color: var(--muted); }
+  }
+
   .chart-tab {
     padding: 8px 20px;
     border-radius: var(--radius);
@@ -21,6 +90,35 @@
   }
   .chart-tab:hover { background: rgba(255,255,255,0.05); color: var(--text); }
   .chart-tab.active { background: rgba(0,212,170,0.1); color: var(--accent); border-color: var(--accent); }
+
+  /* Usage Stats floating toolbar — matches billing chart period-nav style */
+  /* position:sticky works because .content is the scroll container */
+  .bar-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    background: var(--surface);
+    padding: 8px 12px;
+    border-radius: 0 0 8px 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+    position: sticky;
+    top: -28px; /* .content has padding-top:28px; this cancels it so bar sticks at viewport top */
+    z-index: 100;
+  }
+  .bar-toolbar-left {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .bar-toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
 
   /* Bar chart controls */
   .bar-seg {
@@ -110,14 +208,41 @@
     overflow: hidden;
     border: 1px solid var(--border);
   }
+  /* Iframe-based charts (billing, heatmap) fill the full content height */
+  #chart-daily, #chart-heatmap {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+  }
+  #chart-daily .chart-content-wrap,
+  #chart-heatmap .chart-content-wrap {
+    flex: 1;
+    min-height: 0;
+  }
+  /* Content area flex column so iframe charts can fill remaining height */
+  .content {
+    display: flex;
+    flex-direction: column;
+  }
+  /* Usage Stats (#chart-bar) grows with content — no fixed height */
+  #chart-bar {
+    flex: none;
+  }
   #chart-bar {
     background: var(--surface);
+    overflow: visible; /* needed for position:sticky on .bar-toolbar */
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
   }
   .chart-frame-wrap iframe {
     width: 100%;
-    height: calc(100vh - 220px);
+    height: 100%;  /* fill the content-wrap which is sized by getChartHeight() */
     border: none;
     display: block;
+  }
+  .chart-content-wrap {
+    height: 100%;
   }
   .chart-placeholder {
     display: flex;
@@ -139,11 +264,21 @@
     <h2>Charts</h2>
     <div class="sub">Billing, net energy heatmap and usage stats</div>
   </div>
-  <button class="btn btn-secondary" onclick="regenerate()">↺ Regenerate Charts</button>
+  <div class="chart-tabs" style="margin-bottom:0;">
+    <button class="chart-tab active" data-chart="daily"   onclick="showChart('daily', this)" title="Billing">📊<span class="tab-label"> Billing</span></button>
+    <button class="chart-tab"        data-chart="heatmap" onclick="showChart('heatmap', this)" title="Heatmaps">🔥<span class="tab-label"> Heatmaps</span></button>
+    <button class="chart-tab"        data-chart="bar"     onclick="showChart('bar', this)" title="Usage Stats">📈<span class="tab-label"> Usage Stats</span></button>
+  </div>
+  <button class="btn btn-secondary" onclick="regenerate()" title="Regenerate Charts">↺<span class="btn-regen-text"> Regenerate Charts</span></button>
 </div>
 {% endblock %}
 
 {% block content %}
+<button id="topbar-toggle" onclick="toggleTopbar()" aria-label="Toggle chart controls">
+  <span class="toggle-chevron">▼</span>
+  <span id="topbar-toggle-label">Usage Stats</span>
+  <span class="toggle-chevron">▼</span>
+</button>
 
 <div id="alert-success" class="alert alert-success">✓ Charts regenerated successfully.</div>
 <div id="alert-error"   class="alert alert-danger"></div>
@@ -158,11 +293,7 @@
 </div>
 {% endif %}
 
-<div class="chart-tabs">
-  <button class="chart-tab active" data-chart="daily"   onclick="showChart('daily', this)">📊 Billing</button>
-  <button class="chart-tab"        data-chart="heatmap" onclick="showChart('heatmap', this)">🔥 Net Heatmap</button>
-  <button class="chart-tab"        data-chart="bar"     onclick="showChart('bar', this)">📈 Usage Stats</button>
-</div>
+
 
 <!-- Daily usage chart -->
 <div id="chart-daily" class="chart-frame-wrap">
@@ -194,52 +325,56 @@
 </div>
 
 <!-- Import / Export bar chart -->
-<div id="chart-bar" class="chart-frame-wrap" style="display:none; padding: 24px;">
+<div id="chart-bar" class="chart-frame-wrap" style="display:none;">
 
-  <!-- Controls -->
-  <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; align-items:center;">
-    <div class="bar-seg" id="bar-period-seg">
-      <button class="bar-seg-btn active" onclick="barSetPeriod('daily',this)">Daily</button>
-      <button class="bar-seg-btn"        onclick="barSetPeriod('monthly',this)">Monthly</button>
-      <button class="bar-seg-btn"        onclick="barSetPeriod('yearly',this)">Yearly</button>
+  <!-- Floating toolbar — matches billing chart period-nav pattern -->
+  <div class="bar-toolbar">
+    <div class="bar-toolbar-left">
+      <div class="bar-seg" id="bar-period-seg">
+        <button class="bar-seg-btn active" onclick="barSetPeriod('daily',this)">Daily</button>
+        <button class="bar-seg-btn"        onclick="barSetPeriod('monthly',this)">Monthly</button>
+        <button class="bar-seg-btn"        onclick="barSetPeriod('yearly',this)">Yearly</button>
+      </div>
+      <div class="bar-seg" id="bar-cal-seg">
+        <button class="bar-seg-btn active" onclick="barSetCalendar(false,this)">Billing</button>
+        <button class="bar-seg-btn"        onclick="barSetCalendar(true,this)">Calendar</button>
+      </div>
+      <div class="bar-seg" id="bar-metric-seg">
+        <button class="bar-seg-btn active" onclick="barSetMetric('kwh',this)">kWh</button>
+        <button class="bar-seg-btn"        onclick="barSetMetric('cost',this)" id="bar-cost-btn">Cost</button>
+        <button class="bar-seg-btn"        onclick="barSetMetric('co2',this)"  id="bar-co2-btn"  style="display:none">CO₂</button>
+      </div>
+      <div class="bar-seg" id="bar-view-seg">
+        <button class="bar-seg-btn active" onclick="barSetView('totals',this)">Totals</button>
+        <button class="bar-seg-btn"        onclick="barSetView('net',this)">Net</button>
+      </div>
+      <label id="bar-standing-wrap" style="display:none; align-items:center; gap:6px; font-size:12px; color:var(--muted); cursor:pointer;">
+        <input type="checkbox" id="bar-standing-cb" onchange="barSaveState(); barRender();" style="width:14px;height:14px;accent-color:var(--accent);cursor:pointer;">
+        Inc. standing charge
+      </label>
     </div>
-    <div class="bar-seg" id="bar-cal-seg">
-      <button class="bar-seg-btn active" onclick="barSetCalendar(false,this)">Billing</button>
-      <button class="bar-seg-btn"        onclick="barSetCalendar(true,this)">Calendar</button>
+    <div class="bar-toolbar-right">
+      <button class="bar-seg-btn" id="bar-theme-btn" onclick="barToggleTheme()" title="Toggle light/dark" style="border:0.5px solid var(--border); border-radius:var(--radius); padding:5px 10px; font-size:14px;">&#9790;</button>
     </div>
-    <div class="bar-seg" id="bar-metric-seg">
-      <button class="bar-seg-btn active" onclick="barSetMetric('kwh',this)">kWh</button>
-      <button class="bar-seg-btn"        onclick="barSetMetric('cost',this)" id="bar-cost-btn">Cost</button>
-      <button class="bar-seg-btn"        onclick="barSetMetric('co2',this)"  id="bar-co2-btn"  style="display:none">CO₂</button>
-    </div>
-    <div class="bar-seg" id="bar-view-seg">
-      <button class="bar-seg-btn active" onclick="barSetView('totals',this)">Totals</button>
-      <button class="bar-seg-btn"        onclick="barSetView('net',this)">Net</button>
-    </div>
-    <label id="bar-standing-wrap" style="display:none; align-items:center; gap:6px; font-size:12px; color:var(--muted); cursor:pointer;">
-      <input type="checkbox" id="bar-standing-cb" onchange="barSaveState(); barRender();" style="width:14px;height:14px;accent-color:var(--accent);cursor:pointer;">
-      Inc. standing charge
-    </label>
-    <button class="bar-seg-btn" id="bar-theme-btn" onclick="barToggleTheme()" title="Toggle light/dark" style="margin-left:auto; border:0.5px solid var(--border); border-radius:var(--radius); padding:5px 10px; font-size:14px;">&#9790;</button>
   </div>
 
   <!-- Period navigator (daily) / year selector (monthly+yearly) -->
-  <div id="bar-sub-bar" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:16px; min-height:28px;"></div>
+  <div id="bar-sub-bar" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:16px; min-height:28px; padding: 0 24px;"></div>
 
   <!-- Legend -->
-  <div id="bar-legend" style="display:flex; gap:16px; margin-bottom:12px; font-size:12px; color:var(--muted); flex-wrap:wrap;"></div>
+  <div id="bar-legend" style="display:flex; gap:16px; margin-bottom:12px; font-size:12px; color:var(--muted); flex-wrap:wrap; padding: 0 24px;"></div>
 
   <!-- Chart canvas -->
-  <div id="bar-chart-wrap" style="position:relative; width:100%; max-width:100%; overflow:hidden; height:360px;">
+  <div id="bar-chart-wrap" style="position:relative; width:100%; max-width:100%; overflow:hidden; height:360px; padding: 0 24px; box-sizing:border-box;">
     <canvas id="barChart" style="max-width:100%;"></canvas>
   </div>
 
   <!-- Tabular view -->
-  <div style="display:flex; align-items:center; justify-content:space-between; margin-top:28px; margin-bottom:10px;">
+  <div style="display:flex; align-items:center; justify-content:space-between; margin-top:28px; margin-bottom:10px; padding: 0 24px;">
     <span style="font-size:12px; font-weight:500; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em;">Data table</span>
     <button class="btn btn-secondary btn-sm" onclick="barCopyTable()" id="bar-copy-btn">⎘ Copy to clipboard</button>
   </div>
-  <div style="overflow-x:auto;">
+  <div style="overflow-x:auto; padding: 0 24px 24px 24px;">
     <table id="bar-table" style="width:100%; border-collapse:collapse; font-size:12px; font-family:var(--mono);">
     </table>
   </div>
@@ -253,8 +388,18 @@
 var chartsLoaded = {};
 var _activeChart = 'daily';
 function getChartHeight() {
+  // Measure the actual available content height rather than using a hardcoded offset.
+  // The topbar is now sticky/fixed so the content area is the scroll container.
+  var contentEl = document.querySelector('.content');
+  if (contentEl) {
+    var h = contentEl.clientHeight;
+    if (h > 100) return Math.max(h, 350) + 'px';
+  }
+  // Fallback: viewport minus topbar height
+  var tb = document.querySelector('.topbar');
+  var tbH = tb ? tb.getBoundingClientRect().height : 72;
   var isMobile = window.innerWidth <= 768 || (window.innerHeight <= 500 && window.innerWidth > window.innerHeight);
-  return Math.max(window.innerHeight - (isMobile ? 80 : 220), 350) + 'px';
+  return Math.max(window.innerHeight - tbH - (isMobile ? 16 : 32), 350) + 'px';
 }
 
 var _resizeTimer = null;
@@ -353,6 +498,56 @@ window.addEventListener('message', function(e) {
   }
 });
 
+// Pending html waiting to be injected once chart container becomes visible
+var _pendingHtml = {};
+
+function _injectChartHtml(name, html) {
+  var containerId = name === 'daily' ? 'chart-daily-content' : 'chart-heatmap-content';
+  var outerEl = document.getElementById(name === 'daily' ? 'chart-daily' : 'chart-heatmap');
+  var el = document.getElementById(containerId);
+  if (!el) return;
+
+  // If the outer container is hidden, defer injection until it is shown.
+  // Setting srcdoc while display:none means window.innerWidth inside the
+  // iframe is 0, causing Plotly to render at the wrong width.
+  if (outerEl && outerEl.style.display === 'none') {
+    _pendingHtml[name] = html;
+    return;
+  }
+
+  var h = getChartHeight();
+  var iframe = document.createElement('iframe');
+  iframe.className = 'chart-iframe';
+  iframe.style.cssText = 'width:100%;height:' + h + ';border:none;display:block;';
+  el.style.height = h;
+  function _nudgeIframe(ifrm) {
+    // Send the actual container width to the iframe after it loads so
+    // scaleChart inside uses the correct value rather than window.innerWidth
+    // which may still be settling at load time.
+    var _w = (document.querySelector('.main-content') || document.body).getBoundingClientRect().width;
+    if (ifrm.contentWindow) {
+      ifrm.contentWindow.postMessage({ type: 'emt-resize', width: _w }, '*');
+    }
+  }
+  var existing = el.querySelector('iframe');
+  if (existing) {
+    iframe.style.opacity = '0';
+    el.appendChild(iframe);
+    iframe.onload = function() {
+      if (existing.parentNode) existing.parentNode.removeChild(existing);
+      iframe.style.opacity = '1';
+      _nudgeIframe(iframe);
+    };
+  } else {
+    el.appendChild(iframe);
+    iframe.onload = function() { _nudgeIframe(iframe); };
+  }
+  // Set srcdoc after appending so iframe has correct dimensions
+  iframe.srcdoc = html;
+  chartsLoaded[name] = true;
+  delete _pendingHtml[name];
+}
+
 async function loadChartContent(name, force) {
   if (chartsLoaded[name] && !force) return;
   var endpoint = name === 'daily' ? '/api/charts/daily' : '/api/charts/heatmap';
@@ -360,43 +555,18 @@ async function loadChartContent(name, force) {
   var el = document.getElementById(containerId);
   if (!el) return;
   // Remove any non-iframe placeholder content (e.g. "Loading chart..." div)
-  // before fetching so it doesn't show alongside the new iframe
   Array.from(el.children).forEach(function(child) {
     if (child.tagName !== 'IFRAME') el.removeChild(child);
   });
   try {
-    var h = getChartHeight();
     var r = await fetch(apiUrl(endpoint) + '?t=' + Date.now());
-    if (!r.ok) {
-      throw new Error('HTTP ' + r.status + ' ' + r.statusText);
-    }
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText);
     var text = await r.text();
     var data;
-    try {
-      data = JSON.parse(text);
-    } catch(parseErr) {
-      throw new Error('JSON parse failed: ' + parseErr.message + ' — response starts: ' + text.substring(0, 120));
-    }
+    try { data = JSON.parse(text); }
+    catch(parseErr) { throw new Error('JSON parse failed: ' + parseErr.message); }
     if (data.html) {
-      var iframe = document.createElement('iframe');
-      iframe.className = 'chart-iframe';
-      iframe.style.cssText = 'width:100%;height:' + h + ';border:none;display:block;';
-      iframe.srcdoc = data.html;
-      el.style.height = h;
-      var existing = el.querySelector('iframe');
-      if (existing) {
-        // Swap in-place: append hidden, remove old on load — no white flash
-        iframe.style.opacity = '0';
-        el.appendChild(iframe);
-        iframe.onload = function() {
-          if (existing.parentNode) existing.parentNode.removeChild(existing);
-          iframe.style.opacity = '1';
-        };
-      } else {
-        // First load — just append directly, no crossfade needed
-        el.appendChild(iframe);
-      }
-      chartsLoaded[name] = true;
+      _injectChartHtml(name, data.html);
     } else {
       throw new Error('No html in response — keys: ' + Object.keys(data).join(', '));
     }
@@ -417,6 +587,20 @@ setInterval(function() {
   }
 }, 120000);
 
+function toggleTopbar() {
+  var main = document.querySelector('.main');
+  if (!main) return;
+  main.classList.toggle('topbar-collapsed');
+  try { localStorage.setItem('emt_topbar_collapsed',
+    main.classList.contains('topbar-collapsed') ? '1' : '0'); } catch(e) {}
+}
+
+function updateToggleLabel(name) {
+  var labels = { daily: 'Billing', heatmap: 'Heatmaps', bar: 'Usage Stats' };
+  var el = document.getElementById('topbar-toggle-label');
+  if (el) el.textContent = labels[name] || name;
+}
+
 function showChart(name, btn) {
   _suppressResize = true;
   document.querySelectorAll('.chart-tab').forEach(b => b.classList.remove('active'));
@@ -425,10 +609,20 @@ function showChart(name, btn) {
   document.getElementById('chart-heatmap').style.display = name === 'heatmap' ? 'block' : 'none';
   document.getElementById('chart-bar').style.display     = name === 'bar'     ? 'block' : 'none';
   _activeChart = name;
-  if (name === 'bar') { barInit(); }
-  else { loadChartContent(name); }
+  if (name === 'bar') {
+    barInit();
+  } else {
+    // Flush any pending html that was deferred because container was hidden
+    if (_pendingHtml[name]) {
+      _injectChartHtml(name, _pendingHtml[name]);
+    } else {
+      loadChartContent(name);
+    }
+  }
   try { localStorage.setItem('emt_chart_tab', name); } catch(e) {}
+  updateToggleLabel(name);
   setTimeout(function() { _suppressResize = false; }, 200);
+  // Note: emt-resize is sent via _injectChartHtml's onload — no need to send here
 }
 
 async function regenerate() {
@@ -460,6 +654,8 @@ var barDailyMonth = null;  // now a bKey string e.g. "2026-04-15"
 var barActiveYears = null;
 var barChartInstance = null;
 var barInited = false;
+var barLastFetch = 0;        // timestamp of last successful fetch
+var BAR_TTL_MS = 5 * 60 * 1000;  // re-fetch if data older than 5 minutes
 var barMeters = [];       // [{id, label, color, is_sub}]
 var barExportColor = '#ff7f0e';
 
@@ -511,7 +707,8 @@ function barLoadState(availableYears) {
 }
 
 async function barInit() {
-  if (barInited && barData) { barRender(); return; }
+  var now = Date.now();
+  if (barInited && barData && (now - barLastFetch) < BAR_TTL_MS) { barRender(); return; }
   try {
     var r = await fetch(apiUrl('/api/charts/blocks-summary'));
     var json = await r.json();
@@ -544,9 +741,17 @@ async function barInit() {
     // Sync control UI to restored state
     barSyncUI();
     barInited = true;
+    barLastFetch = Date.now();
+    // Clear any previous transient error
+    var _prevErr = document.getElementById('bar-load-error');
+    if (_prevErr) _prevErr.remove();
     barRender();
   } catch(e) {
-    document.getElementById('chart-bar').innerHTML += '<div style="color:var(--danger);padding:20px;">Failed to load data: ' + e.message + '</div>';
+    var _errDiv = document.createElement('div');
+    _errDiv.id = 'bar-load-error';
+    _errDiv.style.cssText = 'color:var(--danger);padding:20px;';
+    _errDiv.textContent = 'Failed to load data: ' + e.message;
+    document.getElementById('chart-bar').appendChild(_errDiv);
   }
 }
 
@@ -681,7 +886,9 @@ function barGetDatasets(labels, aggList) {
 function barAggRows(filterFn) {
   var filtered = barData.filter(filterFn);
   var result = { standing:0, imp_kwh:0, exp_kwh:0, imp_cost:0, exp_cost:0,
-                 carbon_g_net: null, carbon_g_total: null, meters:{} };
+                 carbon_g_net: null, carbon_g_total: null, avg_intensity: null, meters:{} };
+  // For avg_intensity: accumulate numerator/denominator for weighted average
+  var _aiCarbon = 0, _aiKwh = 0, _aiHasData = false;
   filtered.forEach(function(row) {
     result.standing  += row.standing  || 0;
     result.imp_kwh   += row.imp_kwh   || 0;
@@ -691,6 +898,13 @@ function barAggRows(filterFn) {
     // carbon_g: NULL-aware — only accumulate when data exists (post-2.3.0 blocks)
     if (row.carbon_g_net != null)   result.carbon_g_net   = (result.carbon_g_net   || 0) + row.carbon_g_net;
     if (row.carbon_g_total != null) result.carbon_g_total = (result.carbon_g_total || 0) + row.carbon_g_total;
+    // avg_intensity: weighted average using abs(carbon_g) / abs(net_kwh)
+    if (row.avg_intensity != null && row.carbon_g_net != null) {
+      var absKwh = Math.abs((row.imp_kwh || 0) - (row.exp_kwh || 0));
+      _aiCarbon += Math.abs(row.carbon_g_net);
+      _aiKwh    += absKwh;
+      _aiHasData = true;
+    }
     Object.keys(row.meters || {}).forEach(function(mid) {
       if (!result.meters[mid]) result.meters[mid] = {imp_kwh:0,imp_cost:0,exp_kwh:0,exp_cost:0,carbon_g:null,carbon_g_imp:null,carbon_g_exp:null};
       var m = row.meters[mid];
@@ -711,6 +925,7 @@ function barAggRows(filterFn) {
   result.exp_cost = Math.round(result.exp_cost * 10000) / 10000;
   if (result.carbon_g_net   != null) result.carbon_g_net   = Math.round(result.carbon_g_net   * 100) / 100;
   if (result.carbon_g_total != null) result.carbon_g_total = Math.round(result.carbon_g_total * 100) / 100;
+  if (_aiHasData && _aiKwh > 0) result.avg_intensity = Math.round((_aiCarbon / _aiKwh) * 10) / 10;
   return result;
 }
 
@@ -1162,10 +1377,12 @@ function barBuildTable() {
   var cols = []; // [{key, label}]
   if (barView === 'net') {
     cols.push({key:'net', label: barMetric==='co2' ? 'Net CO₂' : 'Net'});
+    if (barMetric === 'co2') cols.push({key:'avg_intensity', label:'Avg intensity'});
   } else {
     if (barMetric === 'co2') {
       barMeters.forEach(function(m) { cols.push({key:'co2_imp_'+m.id, label: m.label + ' carbon', mid: m.id}); });
       cols.push({key:'co2_exp', label:'Export offset'});
+      cols.push({key:'avg_intensity', label:'Avg intensity'});
     } else {
       barMeters.forEach(function(m) { cols.push({key:'imp_'+m.id, label: m.label + ' import', mid: m.id, dir:'imp'}); });
       if (barMetric === 'cost' && barIncStanding()) cols.push({key:'standing', label:'Standing charge'});
@@ -1184,6 +1401,7 @@ function barBuildTable() {
       return imp - exp;
     }
     if (col.key === 'co2_total') return agg.carbon_g_total != null ? agg.carbon_g_total : null;
+    if (col.key === 'avg_intensity') return agg.avg_intensity != null ? agg.avg_intensity : null;
     if (col.key === 'standing') return barStandingVal(agg);
     if (col.key === 'exp') {
       var expVal = barMetric === 'kwh'
@@ -1225,12 +1443,20 @@ function barBuildTable() {
     var _rowHasVal = false;
     cols.forEach(function(c) {
       var v = cellVal(agg, c);
-      if (v != null) {
-        colTotals[c.key] = (colTotals[c.key] || 0) + v;
-        rowTotal += v;
-        _rowHasVal = true;
+      var fmtd;
+      if (c.key === 'avg_intensity') {
+        // Intensity is not summed into row total and shows as gCO₂/kWh
+        fmtd = v != null ? (Math.round(v * 10) / 10) + ' gCO₂/kWh' : '—';
+        if (v != null) _rowHasVal = true;
+      } else {
+        if (v != null) {
+          colTotals[c.key] = (colTotals[c.key] || 0) + v;
+          rowTotal += v;
+          _rowHasVal = true;
+        }
+        fmtd = v != null ? barFmt(v) : '—';
       }
-      html += '<td>' + (v != null ? barFmt(v) : '—') + '</td>';
+      html += '<td>' + fmtd + '</td>';
     });
     if (_rowHasVal) grandTotal += rowTotal;
     html += '<td class="col-total">' + (_rowHasVal ? barFmt(rowTotal) : '—') + '</td>';
@@ -1238,8 +1464,29 @@ function barBuildTable() {
   });
 
   // Totals row
+  // For avg_intensity: compute weighted average across all aggs rather than summing
+  var _totalIntensityCarbon = 0, _totalIntensityKwh = 0;
+  if (colTotals['avg_intensity'] !== undefined) {
+    aggList.forEach(function(agg) {
+      if (agg.avg_intensity != null && agg.carbon_g_net != null) {
+        var absKwh = agg.imp_kwh > 0 || agg.exp_kwh > 0
+          ? Math.abs(agg.imp_kwh - agg.exp_kwh) : 0;
+        _totalIntensityCarbon += Math.abs(agg.carbon_g_net || 0);
+        _totalIntensityKwh   += absKwh;
+      }
+    });
+  }
   html += '<tr><td>Total</td>';
-  cols.forEach(function(c){ html += '<td>' + (colTotals[c.key] != null ? barFmt(colTotals[c.key]) : '—') + '</td>'; });
+  cols.forEach(function(c) {
+    if (c.key === 'avg_intensity') {
+      var _ai = _totalIntensityKwh > 0
+        ? Math.round((_totalIntensityCarbon / _totalIntensityKwh) * 10) / 10
+        : null;
+      html += '<td>' + (_ai != null ? _ai + ' gCO₂/kWh' : '—') + '</td>';
+    } else {
+      html += '<td>' + (colTotals[c.key] != null ? barFmt(colTotals[c.key]) : '—') + '</td>';
+    }
+  });
   html += '<td class="col-total">' + barFmt(grandTotal) + '</td>';
   html += '</tr>';
 
@@ -1322,16 +1569,35 @@ if (!window.Chart) {
 }
 
 document.addEventListener('DOMContentLoaded', function() {
-  var saved = null;
-  try { saved = localStorage.getItem('emt_chart_tab'); } catch(e) {}
-  var tabs = document.querySelectorAll('.chart-tab');
-  if (saved === 'heatmap') { showChart('heatmap', tabs[1]); }
-  else if (saved === 'bar') { showChart('bar', tabs[2]); }
-  else { loadChartContent('daily'); }
-  // Sync theme toggle icon
+  // Sync theme toggle icon immediately
   var theme = document.documentElement.getAttribute('data-theme') || 'dark';
   var btn = document.getElementById('bar-theme-btn');
   if (btn) btn.textContent = theme === 'dark' ? '\u263e' : '\u2600';
+
+  // Note: toolbar sticks within .content scroll area — no topbar offset needed
+
+  // Restore collapsed state on mobile/landscape
+  try {
+    var _isMobile = window.innerWidth <= 768 ||
+                    (window.innerHeight <= 500 && window.innerWidth > window.innerHeight);
+    if (_isMobile && localStorage.getItem('emt_topbar_collapsed') === '1') {
+      var main = document.querySelector('.main');
+      if (main) main.classList.add('topbar-collapsed');
+    }
+  } catch(e) {}
+
+  // Defer chart load to let the page layout (including HA sidebar animation)
+  // settle before we measure container dimensions or inject iframes.
+  // DOMContentLoaded fires before the sidebar animation completes (~300ms),
+  // so we wait 350ms — enough for layout to be stable without feeling slow.
+  setTimeout(function() {
+    var saved = null;
+    try { saved = localStorage.getItem('emt_chart_tab'); } catch(e) {}
+    var tabs = document.querySelectorAll('.chart-tab');
+    if (saved === 'heatmap') { showChart('heatmap', tabs[1]); }
+    else if (saved === 'bar') { showChart('bar', tabs[2]); }
+    else { loadChartContent('daily'); updateToggleLabel('daily'); }
+  }, 350);
 });
 
 // Refresh the active chart whenever the page becomes visible again

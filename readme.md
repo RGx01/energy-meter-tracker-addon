@@ -41,6 +41,18 @@ A Home Assistant add-on that records your electricity usage in precise configura
 - Publishes four cumulative sensors back to Home Assistant
 - Serves a local web UI on port 8099 for configuration, charts, live power and data management
 
+## What's new in 2.5.0
+
+- **🗺️ Heatmap metric toggle** — the Net Energy Heatmap (now called Heatmaps) gains two new views alongside the existing kWh view: gCO₂ shows the carbon flow per slot (red when emitting, green when offsetting solar); gCO₂/kWh shows the grid carbon intensity at each slot (green→yellow→red). The intensity scale anchors to the 95th percentile of your recorded data so the contrast remains meaningful as the grid decarbonises. Only visible when carbon data exists.
+
+- **📊 Effective intensity in Usage Stats** — a new "Avg intensity" column in the CO₂ data table shows the weighted average grid carbon intensity (gCO₂/kWh) for each period. This is the same figure as the heatmap intensity view when aggregated, giving a consistent cross-check between the two charts. The totals row shows the weighted average across the full selected period.
+
+- **📈 Power history drag zoom** — drag horizontally on the 48-hour power history chart to zoom into a specific window. Double-click to reset to the full 48-hour view.
+
+- **🔄 Usage Stats auto-refresh** — Usage Stats data now refreshes automatically if it is older than 5 minutes. Previously it only fetched once per session.
+
+- **🖥️ UI improvements** — tab buttons (Billing / Heatmaps / Usage Stats) moved into the topbar alongside Regenerate Charts. Usage Stats and Heatmaps now have floating sticky toolbars matching the billing chart pattern. All pages now have a fixed topbar with only the content area scrolling.
+
 ## What's new in 2.4.0
 
 - **🌿 Carbon footprint in Usage Stats** — a CO₂ metric alongside kWh and Cost in the Usage Stats chart. Totals view shows import carbon stacked above zero and export carbon offset below, exactly mirroring the kWh breakdown. Net view shows a single net carbon bar, negative on days where you exported more than you imported. Auto-scales between gCO₂ and kgCO₂. Requires a postcode prefix in Meter Config.
@@ -164,15 +176,23 @@ Access the UI at `http://<your-ha-ip>:8099`
 
 The daily billing chart shows import, export and sub-meter consumption for each day, with accurate cost calculations matching the engine's billing logic. Billing periods, standing charges and rate changes are all handled correctly. If your billing day has changed, each period uses the billing day that was active at the time.
 
-### Net Energy Heatmap
+### Heatmaps
 
-A half-hour heatmap showing net grid flow (import − export) for every reconciliation period. Colour-coded from red (import) through white to blue (export), making it easy to spot patterns — overnight EV charging, solar export windows, evening peaks.
+A half-hour grid showing every reconciliation period. Toggle between three views using the floating toolbar:
+
+- **kWh** — net grid flow (import − export). Red = importing, blue = exporting. Spot overnight EV charging, solar export windows and evening peaks.
+- **gCO₂** — net carbon flow per slot. Red = emitting, green = offsetting. Shows the carbon cost of your consumption and the benefit of solar export.
+- **gCO₂/kWh** — grid carbon intensity at each slot where you had net flow. Green = clean grid, red = dirty. White = no grid interaction. Useful for identifying the best windows to shift flexible loads like EV charging.
+
+The gCO₂ and gCO₂/kWh views require a postcode prefix in Meter Config and only appear once carbon data exists (from 2.3.0 onwards).
 
 ![Net energy heatmap](screenshots/heatmap.png)
 
 ### Usage Stats
 
 Import and export broken down by day, month or year with sub-meter stacking. Switch between kWh, cost and CO₂ (🇬🇧 UK only), and between Totals and Net views. A data table below the chart mirrors exactly what the chart shows, with a copy-to-clipboard button for exporting to Excel or Google Sheets.
+
+In CO₂ mode the data table includes an **Avg intensity** column showing the weighted average grid carbon intensity (gCO₂/kWh) for each period — the same figure the Heatmaps gCO₂/kWh view shows when aggregated across the day.
 
 Billing mode groups data by your billing periods (respecting billing day changes). Calendar mode groups by calendar month.
 

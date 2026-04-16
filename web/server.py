@@ -1222,14 +1222,15 @@ def api_blocks_summary():
                     continue
 
             # ── Main meter carbon_g — accumulated per block ──
-            # Also accumulate carbon_g_imp and carbon_g_exp per block using abs(intensity)
-            # so both are always positive. This is done per-block to handle days where
-            # some blocks have NULL carbon_g (e.g. pre-2.3.0 overnight import) mixed
-            # with blocks that have carbon data. Using day totals would inflate the
-            # denominator with NULL-carbon kWh and produce wrong intensities.
+            # Also accumulate carbon_g_imp, carbon_g_exp and avg_intensity per block
+            # using abs(intensity). Done per-block to handle days where some blocks
+            # have NULL carbon_g (e.g. pre-2.3.0 overnight import blocks) — using day
+            # totals would inflate the denominator and produce wrong intensities.
             main_carbon_g    = None
             _cg_imp_total    = None   # SUM(imp_kwh × |intensity|) across blocks with CI
             _cg_exp_total    = None   # SUM(exp_kwh × |intensity|) across blocks with CI
+            _ci_abs_carbon   = 0.0    # for avg_intensity: SUM(abs(carbon_g))
+            _ci_abs_net_kwh  = 0.0    # for avg_intensity: SUM(abs(net_kwh))
             for b in day_blocks:
                 for mid, md in (b.get("meters") or {}).items():
                     if (md or {}).get("meta", {}).get("sub_meter"):
@@ -1248,12 +1249,20 @@ def api_blocks_summary():
                         b_intensity = abs(cg / b_net)
                         _cg_imp_total = (_cg_imp_total or 0.0) + b_imp * b_intensity
                         _cg_exp_total = (_cg_exp_total or 0.0) + b_exp * b_intensity
+                        _ci_abs_carbon  += abs(cg)
+                        _ci_abs_net_kwh += abs(b_net)
                     elif b_exp == 0:
-                        # Pure import block (no export): all carbon is import carbon
+                        # Pure import block: all carbon is import carbon
                         _cg_imp_total = (_cg_imp_total or 0.0) + abs(cg)
+                        _ci_abs_carbon  += abs(cg)
+                        _ci_abs_net_kwh += b_imp
                     else:
-                        # Pure export block (no import): all carbon is export carbon
+                        # Pure export block: all carbon is export carbon
                         _cg_exp_total = (_cg_exp_total or 0.0) + abs(cg)
+                        _ci_abs_carbon  += abs(cg)
+                        _ci_abs_net_kwh += b_exp
+            # Weighted average intensity for the day (gCO₂/kWh)
+            _avg_intensity = round(_ci_abs_carbon / _ci_abs_net_kwh, 1) if _ci_abs_net_kwh > 0 else None
 
             _sub_carbon_for_remainder = sum(
                 float(st["carbon_g"]) for st in sub_totals.values()
@@ -1318,6 +1327,7 @@ def api_blocks_summary():
                 "exp_cost": round(main_exp_cost, 4),
                 "carbon_g_net":   round(main_carbon_g, 4) if main_carbon_g is not None else None,
                 "carbon_g_total": round(main_carbon_g, 4) if main_carbon_g is not None else None,  # main already includes sub-meters
+                "avg_intensity":  _avg_intensity,  # gCO₂/kWh weighted average for the day
             })
 
         all_meter_ids = [m for m in meter_colors if m != "electricity_main_export"]
