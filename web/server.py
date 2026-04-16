@@ -1293,7 +1293,7 @@ def api_blocks_summary():
                 "imp_cost": round(main_imp_cost + sum(m["imp_cost"] for mid,m in meters_out.items() if mid != "electricity_main"), 4),
                 "exp_cost": round(main_exp_cost, 4),
                 "carbon_g_net":   round(main_carbon_g, 4) if main_carbon_g is not None else None,
-                "carbon_g_total": round(main_carbon_g + _sub_carbon_for_remainder, 4) if main_carbon_g is not None else None,
+                "carbon_g_total": round(main_carbon_g, 4) if main_carbon_g is not None else None,  # main already includes sub-meters
             })
 
         all_meter_ids = [m for m in meter_colors if m != "electricity_main_export"]

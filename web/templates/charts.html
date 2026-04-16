@@ -579,10 +579,10 @@ function barVal(meterAgg, mid, isExport) {
   if (!m) return 0;
   if (barMetric === 'kwh')  return isExport ? m.exp_kwh  : m.imp_kwh;
   if (barMetric === 'cost') return isExport ? m.exp_cost : m.imp_cost;
-  // co2: main meter split into import (above) and export (below zero)
-  //       sub-meters show gross carbon_g (import only, no export)
+  // co2 totals mode: main meter shows remainder (carbon_g), sub-meters show gross
+  // carbon_g_imp/exp are only used for the export-offset dataset below zero
   if (isExport) return m.carbon_g_exp != null ? m.carbon_g_exp : 0;
-  return m.carbon_g_imp != null ? m.carbon_g_imp : (m.carbon_g || 0);
+  return m.carbon_g != null ? m.carbon_g : 0;
 }
 
 function barStandingVal(agg) {
@@ -822,15 +822,34 @@ function barGetDataForPeriod() {
     }
   }
 }
+var _barCo2Unit = 'g';  // 'g' or 'kg' — set once per render based on max value
+
+function barCo2SetUnit(aggList) {
+  // Determine unit from the largest absolute CO2 value across all datasets/meters
+  var maxAbs = 0;
+  aggList.forEach(function(agg) {
+    if (agg.carbon_g_net   != null) maxAbs = Math.max(maxAbs, Math.abs(agg.carbon_g_net));
+    if (agg.carbon_g_total != null) maxAbs = Math.max(maxAbs, Math.abs(agg.carbon_g_total));
+    Object.values(agg.meters || {}).forEach(function(m) {
+      if (m.carbon_g_imp != null) maxAbs = Math.max(maxAbs, Math.abs(m.carbon_g_imp));
+      if (m.carbon_g_exp != null) maxAbs = Math.max(maxAbs, Math.abs(m.carbon_g_exp));
+      if (m.carbon_g     != null) maxAbs = Math.max(maxAbs, Math.abs(m.carbon_g));
+    });
+  });
+  _barCo2Unit = maxAbs >= 1000 ? 'kg' : 'g';
+}
+
 function barCo2Fmt(v, forCopy) {
-  // Auto-scale: gCO2 for small values, kgCO2 for large
+  // Format using the unit determined for this render — consistent across all values
   if (v == null) return forCopy ? '' : '—';
   var abs = Math.abs(v);
   var sign = v < 0 ? '-' : '';
-  if (abs >= 10000) return sign + (abs / 1000).toFixed(2) + ' kgCO₂';
-  if (abs >= 1000)  return sign + (abs / 1000).toFixed(3) + ' kgCO₂';
+  if (_barCo2Unit === 'kg') {
+    return sign + (abs / 1000).toFixed(abs >= 10000 ? 2 : 3) + ' kgCO₂';
+  }
   return sign + abs.toFixed(0) + ' gCO₂';
 }
+
 
 function barYLabel(v) {
   if (barMetric === 'co2') return barCo2Fmt(v);
@@ -890,6 +909,8 @@ function barRender() {
   }
 
   var pd = barGetDataForPeriod();
+  // Set consistent CO2 unit for this render before building datasets or labels
+  if (barMetric === 'co2') barCo2SetUnit(pd.aggList);
   var datasets = barGetDatasets(pd.labels, pd.aggList);
   var ctx = document.getElementById('barChart');
   var wrap = document.getElementById('bar-chart-wrap');

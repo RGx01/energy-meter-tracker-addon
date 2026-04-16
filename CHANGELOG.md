@@ -1,5 +1,31 @@
 # Changelog
 
+## [2.4.1] — 2026-04-16
+
+### Fixed
+- **CO₂ totals chart showing incorrect bar heights** — the blue (house/grid) bar in
+  Usage Stats CO₂ totals view was showing the full main meter net carbon rather than
+  the house remainder (main minus sub-meters). This made the chart appear to
+  triple-count consumption — the house bar included the EV and battery carbon which
+  were then also shown separately as their own bars. Fixed: the blue bar now shows
+  only the house remainder, matching exactly how kWh totals handles the main meter.
+
+- **CO₂ totals stacked total double-counting sub-meters** — `carbon_g_total` in the
+  API response was computed as `main_carbon_g + sub_carbon` rather than just
+  `main_carbon_g`. Since `main_carbon_g` already includes sub-meter consumption
+  (it is the full grid net carbon), adding sub-meter carbon again produced a total
+  nearly double the correct figure. Fixed: `carbon_g_total = main_carbon_g`.
+
+- **Mixed CO₂ units within a single chart render** — the CO₂ formatter was scaling
+  each value independently (gCO₂ or kgCO₂ based on its own magnitude), so different
+  bars, the y-axis and the data table could show different units for the same render.
+  A day with large EV charging would show the EV bar as "1.710 kgCO₂" while the
+  battery showed "875 gCO₂" making them appear inconsistent. Fixed: the unit is now
+  determined once per render from the largest value in the dataset and applied
+  consistently to all labels, axis ticks and table values.
+
+---
+
 ## [2.4.0] — 2026-04-16
 
 ### Added
