@@ -960,17 +960,60 @@ function _phDraw() {
   }
 
   // ── Shared helpers ────────────────────────────────────────────────────────
+
+  // Pick a nice time tick interval based on the visible span
+  function niceTimeInterval(spanMs) {
+    var m = spanMs / 60000; // span in minutes
+    if (m <=    5) return  1 * 60000;   //  1 min ticks
+    if (m <=   15) return  2 * 60000;   //  2 min ticks
+    if (m <=   30) return  5 * 60000;   //  5 min ticks
+    if (m <=   90) return 10 * 60000;   // 10 min ticks
+    if (m <=  240) return 30 * 60000;   // 30 min ticks
+    if (m <=  720) return  1 * 3600000; //  1 hr ticks
+    if (m <= 1440) return  2 * 3600000; //  2 hr ticks
+    if (m <= 2880) return  6 * 3600000; //  6 hr ticks
+    return 12 * 3600000;                // 12 hr ticks
+  }
+
+  // Format a timestamp as HH:MM
+  function fmtTime(ts) {
+    var d = new Date(ts);
+    return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+  }
+
+  // Format a timestamp — show date if it's midnight or a date boundary
+  function fmtTick(ts, prevTs) {
+    var d = new Date(ts);
+    var isDateChange = prevTs !== null && new Date(prevTs).getDate() !== d.getDate();
+    if ((d.getHours() === 0 && d.getMinutes() === 0) || isDateChange) {
+      return (d.getMonth()+1) + '/' + d.getDate();
+    }
+    return fmtTime(ts);
+  }
+
+  // Generate aligned time tick timestamps within the window
+  function getTimeTicks() {
+    var intervalMs = niceTimeInterval(tSpan);
+    var ticks = [];
+    var first = Math.ceil(t0 / intervalMs) * intervalMs;
+    for (var ts = first; ts <= t0 + tSpan; ts += intervalMs) {
+      ticks.push(ts);
+    }
+    return ticks;
+  }
+
   function drawGrid(yFn, ticks) {
+    var timeTicks = getTimeTicks();
     ctx.strokeStyle = th.grid;
     ctx.lineWidth   = 0.5;
     ticks.forEach(function(v) {
       var y = yFn(v);
       ctx.beginPath(); ctx.moveTo(PAD_L, y); ctx.lineTo(PAD_L + CW, y); ctx.stroke();
     });
-    for (var h = 0; h <= 48; h += 6) {
-      var x = PAD_L + (h / 48) * CW;
+    timeTicks.forEach(function(ts) {
+      var x = PAD_L + ((ts - t0) / tSpan) * CW;
       ctx.beginPath(); ctx.moveTo(x, PAD_T); ctx.lineTo(x, PAD_T + CH); ctx.stroke();
-    }
+    });
     ctx.strokeStyle = th.zero;
     ctx.lineWidth   = 1;
     ctx.beginPath();
@@ -979,19 +1022,33 @@ function _phDraw() {
   }
 
   function drawTimeAxis() {
+    var timeTicks = getTimeTicks();
+    var intervalMs = niceTimeInterval(tSpan);
+    var minGapPx = 36; // minimum pixels between labels to avoid overlap
     ctx.fillStyle = th.text;
     ctx.font      = '10px sans-serif';
-    for (var h = 0; h <= 48; h += 6) {
-      var lx = PAD_L + (h / 48) * CW;
-      var lt = new Date(now - (48 - h) * 3600 * 1000);
-      var label = lt.getHours().toString().padStart(2, '0') + ':00';
-      if (h === 0 || lt.getDate() !== new Date(now - (48 - h + 6) * 3600000).getDate()) {
-        label = (lt.getMonth()+1) + '/' + lt.getDate();
-      }
-      // Right-align the last label, left-align the first, centre the rest
-      ctx.textAlign = h === 48 ? 'right' : h === 0 ? 'left' : 'center';
-      ctx.fillText(label, lx, PAD_T + CH + 14);
-    }
+
+    // Always draw start label (left edge)
+    ctx.textAlign = 'left';
+    ctx.fillText(fmtTime(t0), PAD_L, PAD_T + CH + 14);
+
+    // Always draw end label (right edge)
+    ctx.textAlign = 'right';
+    ctx.fillText(fmtTime(t0 + tSpan), PAD_L + CW, PAD_T + CH + 14);
+
+    // Draw interior ticks, skip any too close to edges or each other
+    var lastX = PAD_L + minGapPx;
+    timeTicks.forEach(function(ts, i) {
+      var x = PAD_L + ((ts - t0) / tSpan) * CW;
+      // Skip if too close to left edge, right edge, or previous label
+      if (x < PAD_L + minGapPx) return;
+      if (x > PAD_L + CW - minGapPx) return;
+      if (x - lastX < minGapPx) return;
+      lastX = x;
+      var label = fmtTick(ts, i === 0 ? null : timeTicks[i - 1]);
+      ctx.textAlign = 'center';
+      ctx.fillText(label, x, PAD_T + CH + 14);
+    });
   }
 
   function drawNowMarker() {
@@ -1021,14 +1078,31 @@ function _phDraw() {
   }
 
   // ── kW mode ───────────────────────────────────────────────────────────────
-  function drawKw() {
+  function drawKw(winT0, winTSpan) {
     // Independent extents but shared interval — interval derived from the larger side
-    var rawMax = 1, rawMin = -1;
+    // Only consider points within the visible window so zoom rescales the Y axis
+    var rawMax = 0, rawMin = 0;
+    var _visCount = 0;
     _phData.forEach(function(r) {
+      var s = r.captured_at;
+      var ts = new Date((s && s.slice(-1) !== 'Z') ? s + 'Z' : s).getTime();
+      if (isNaN(ts) || ts < winT0 || ts > winT0 + winTSpan) return;
+      _visCount++;
       var kw = r.net_kw || 0;
-      if (kw > 0) rawMax = Math.max(rawMax, kw);
-      if (kw < 0) rawMin = Math.min(rawMin, kw);
+      rawMax = Math.max(rawMax, kw);
+      rawMin = Math.min(rawMin, kw);
     });
+    // Fallback to full dataset if nothing visible (shouldn't happen)
+    if (_visCount === 0) {
+      _phData.forEach(function(r) {
+        var kw = r.net_kw || 0;
+        rawMax = Math.max(rawMax, kw);
+        rawMin = Math.min(rawMin, kw);
+      });
+    }
+    // Ensure at least a 1kW range
+    if (rawMax < 1) rawMax = 1;
+    if (rawMin > -1) rawMin = -1;
     rawMax *= 1.1; rawMin *= 1.1;
 
     // Nice round interval from the larger magnitude
@@ -1065,6 +1139,8 @@ function _phDraw() {
     });
     drawYLabel('kW', true);
     drawTimeAxis();
+
+
 
     var zeroY = ty(0);
 
@@ -1110,7 +1186,12 @@ function _phDraw() {
 
   // ── CO2 mode ──────────────────────────────────────────────────────────────
   function drawCo2() {
-    var pts = _phData.filter(function(r) { return r.carbon_gco2_min != null && r.carbon_gco2_min !== 0; });
+    var pts = _phData.filter(function(r) {
+      if (r.carbon_gco2_min == null || r.carbon_gco2_min === 0) return false;
+      var s = r.captured_at;
+      var ts = new Date((s && s.slice(-1) !== 'Z') ? s + 'Z' : s).getTime();
+      return ts >= t0 && ts <= t0 + tSpan;
+    });
 
     if (pts.length < 2) {
       ctx.fillStyle = th.text;
@@ -1205,10 +1286,12 @@ function _phDraw() {
   }
 
   // ── Dispatch ──────────────────────────────────────────────────────────────
+  // Pre-compute visible Y extents and pass explicitly to avoid any closure issues
+  var _visT0 = t0, _visTSpan = tSpan;
   if (_phMode === 'co2' && _phHasCI) {
     drawCo2();
   } else {
-    drawKw();
+    drawKw(_visT0, _visTSpan);
   }
 }
 

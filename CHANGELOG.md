@@ -1,33 +1,43 @@
 # Changelog
 
-## [2.5.1] — 2026-04-17
+## [2.5.2] — 2026-04-17
 
 ### Fixed
-- **Usage Stats toolbar over hamburger menu** — the floating toolbar was rendering above
-  the HA ingress hamburger on mobile. Fixed by reducing `z-index` to `9`, below the HA
-  chrome.
+- **Power history zoom rescales axes** — when zoomed, both the Y axis and X axis now
+  rescale to the visible window. Y scale is computed only from data points within the
+  zoom window. X axis uses a smart tick interval (1 min to 12 hr) chosen based on the
+  zoom span, always anchors labels at the start and end of the window, and skips
+  overlapping interior labels.
 
-- **Orientation change leaves billing chart inconsistent** — rotating between portrait
-  and landscape left the billing/heatmap iframes rendering at the wrong dimensions.
-  The orientation change handler now forces a full reload of the active iframe chart
-  after layout settles (600ms), same as switching tabs.
+---
+
+## [2.5.1] — 2026-04-17
+
+### Added
+- **Power history touch zoom** — the drag-to-zoom on the 48-hour power history chart
+  now works on touchscreen devices. Drag horizontally to zoom, double-tap to reset.
+  Uses `{ passive: false }` to prevent page scroll during chart interaction.
+
+- **Mobile topbar collapse** — a drawer handle strip sits between the topbar and chart
+  content on mobile and landscape. Shows the active tab name with chevrons. Tap to
+  collapse the topbar entirely for maximum chart space, tap again to restore. State
+  persists across sessions via localStorage.
+
+### Fixed
+- **Usage Stats toolbar over hamburger menu** — the floating toolbar `z-index` reduced
+  to `9`, below the HA ingress chrome.
+
+- **Orientation change leaves chart inconsistent** — rotating between portrait and
+  landscape now forces a full reload of the active iframe chart after layout settles
+  (600ms), eliminating the stale dimensions that required switching pages to recover.
 
 - **Billing chart landscape real estate** — on mobile landscape the `period-nav` toolbar
   is now `position: static` so it scrolls off, giving the chart full viewport height.
   Portrait behaviour is unchanged.
 
-- **Power history touch zoom** — the drag-to-zoom on the 48-hour power history chart
-  now works on touchscreen devices. Drag horizontally to zoom, double-tap to reset.
-  Uses `{ passive: false }` to prevent page scroll during chart interaction.
-
 - **Billing/heatmap chart fills available height** — charts now measure `.content`
   element height directly rather than using a hardcoded `window.innerHeight - 220px`
-  offset, correctly filling the content area after the topbar was made sticky.
-
-- **Mobile topbar collapse** — added a drawer handle strip between the topbar and chart
-  content on mobile and landscape. Shows the active tab name with chevrons. Tap to
-  collapse the topbar entirely for maximum chart space, tap again to restore. State
-  persists across sessions.
+  offset, correctly filling the content area now that the topbar is sticky.
 
 ---
 
