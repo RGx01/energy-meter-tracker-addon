@@ -2199,6 +2199,12 @@ body {{
   flex: 1 1 0;
   min-width: 0;
 }}
+/* ── Landscape mobile — let period-nav scroll off for more chart space ── */
+@media (max-height: 500px) and (orientation: landscape) {{
+  .period-nav {{
+    position: static;
+  }}
+}}
 /* ── Mobile responsive ────────────────────────── */
 @media (max-width: 600px) {{
   .period-nav {{

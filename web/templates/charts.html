@@ -62,7 +62,6 @@
     .bar-toolbar {
       padding: 5px 8px;
       gap: 4px;
-      top: -16px;
       flex-wrap: nowrap;
       overflow-x: auto;
       -webkit-overflow-scrolling: touch;
@@ -104,9 +103,6 @@
     box-shadow: 0 2px 8px rgba(0,0,0,0.4);
     margin-bottom: 16px;
     flex-wrap: wrap;
-    position: sticky;
-    top: -28px; /* .content has padding-top:28px; this cancels it so bar sticks at viewport top */
-    z-index: 100;
   }
   .bar-toolbar-left {
     display: flex;
@@ -224,16 +220,13 @@
   .content {
     display: flex;
     flex-direction: column;
-  }
-  /* Usage Stats (#chart-bar) grows with content — no fixed height */
-  #chart-bar {
-    flex: none;
+    padding: 0; /* charts fill edge-to-edge — no surrounding padding */
   }
   #chart-bar {
     background: var(--surface);
-    overflow: visible; /* needed for position:sticky on .bar-toolbar */
     border-radius: var(--radius);
     border: 1px solid var(--border);
+    overflow: visible; /* override chart-frame-wrap overflow:hidden — allows content to scroll in .content */
   }
   .chart-frame-wrap iframe {
     width: 100%;
@@ -280,11 +273,11 @@
   <span class="toggle-chevron">▼</span>
 </button>
 
-<div id="alert-success" class="alert alert-success">✓ Charts regenerated successfully.</div>
-<div id="alert-error"   class="alert alert-danger"></div>
+<div id="alert-success" class="alert alert-success" style="margin: 8px 16px 0;">✓ Charts regenerated successfully.</div>
+<div id="alert-error"   class="alert alert-danger"   style="margin: 8px 16px 0;"></div>
 
 {% if block_count == 0 %}
-<div style="background:rgba(180,83,9,0.1);border:1px solid rgba(180,83,9,0.4);border-radius:var(--radius);padding:16px 20px;margin-bottom:20px;display:flex;align-items:center;gap:14px;">
+<div style="background:rgba(180,83,9,0.1);border:1px solid rgba(180,83,9,0.4);border-radius:var(--radius);padding:16px 20px;margin:16px 16px 0;display:flex;align-items:center;gap:14px;">
   <span style="font-size:24px;">⚠️</span>
   <div>
     <div style="font-weight:600;margin-bottom:4px;">No data blocks loaded</div>
@@ -388,8 +381,7 @@
 var chartsLoaded = {};
 var _activeChart = 'daily';
 function getChartHeight() {
-  // Measure the actual available content height rather than using a hardcoded offset.
-  // The topbar is now sticky/fixed so the content area is the scroll container.
+  // .content has padding:0 on the charts page so clientHeight = full usable height
   var contentEl = document.querySelector('.content');
   if (contentEl) {
     var h = contentEl.clientHeight;
@@ -398,8 +390,7 @@ function getChartHeight() {
   // Fallback: viewport minus topbar height
   var tb = document.querySelector('.topbar');
   var tbH = tb ? tb.getBoundingClientRect().height : 72;
-  var isMobile = window.innerWidth <= 768 || (window.innerHeight <= 500 && window.innerWidth > window.innerHeight);
-  return Math.max(window.innerHeight - tbH - (isMobile ? 16 : 32), 350) + 'px';
+  return Math.max(window.innerHeight - tbH, 350) + 'px';
 }
 
 var _resizeTimer = null;
@@ -447,16 +438,26 @@ window.addEventListener('resize', resizeChartIframes, { passive: true });
 
 // On orientation change, force a full bar chart redraw after layout settles
 var _orientTimer = null;
-window.addEventListener('orientationchange', function() {
+function _handleOrientationChange() {
   clearTimeout(_orientTimer);
   _orientTimer = setTimeout(function() {
+    // Usage Stats — destroy and redraw Chart.js instance
     if (document.getElementById('chart-bar').style.display !== 'none' && barInited) {
       if (barChartInstance) { barChartInstance.destroy(); barChartInstance = null; }
       barRender();
     }
     resizeChartIframes();
-  }, 500);
-}, { passive: true });
+    // Force reload of active iframe chart — orientation change requires fresh render
+    // since Plotly/billing chart bakes dimensions at load time
+    var activeName = _activeChart;
+    if (activeName === 'daily' || activeName === 'heatmap') {
+      chartsLoaded[activeName] = false;  // mark stale
+      loadChartContent(activeName, true); // force fresh load at new dimensions
+    }
+  }, 600); // wait for browser to complete orientation layout
+}
+
+window.addEventListener('orientationchange', _handleOrientationChange, { passive: true });
 
 // Also handle resize-based orientation change (some browsers fire resize not orientationchange)
 var _lastOrientation = window.innerWidth > window.innerHeight ? 'landscape' : 'portrait';
@@ -464,13 +465,7 @@ window.addEventListener('resize', function() {
   var current = window.innerWidth > window.innerHeight ? 'landscape' : 'portrait';
   if (current !== _lastOrientation) {
     _lastOrientation = current;
-    clearTimeout(_orientTimer);
-    _orientTimer = setTimeout(function() {
-      if (document.getElementById('chart-bar').style.display !== 'none' && barInited) {
-        if (barChartInstance) { barChartInstance.destroy(); barChartInstance = null; }
-        barRender();
-      }
-    }, 500);
+    _handleOrientationChange();
   }
 }, { passive: true });
 
