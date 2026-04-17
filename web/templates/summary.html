@@ -1410,6 +1410,74 @@ setInterval(_phLoad, 30000);
   _phCanvas.addEventListener('dblclick', function() {
     _phResetZoom();
   });
+
+  // ── Touch drag zoom ──────────────────────────────────────────────────────
+  var _touchDragStart = null;
+  var _touchDragOverlay = null;
+  var _lastTapTime = 0;
+
+  _phCanvas.addEventListener('touchstart', function(e) {
+    // Double-tap to reset zoom
+    var now = Date.now();
+    if (now - _lastTapTime < 300) {
+      _phResetZoom();
+      _lastTapTime = 0;
+      e.preventDefault();
+      return;
+    }
+    _lastTapTime = now;
+
+    if (e.touches.length !== 1) return;
+    var touch = e.touches[0];
+    var rect = _phCanvas.getBoundingClientRect();
+    var touchX = touch.clientX - rect.left;
+    var dpr = window.devicePixelRatio || 1;
+    var PAD_L_px = 42 * (rect.width / (_phCanvas.width / dpr));
+    if (touchX < PAD_L_px) return;
+    _touchDragStart = { x: touchX, t: xToTime(touchX) };
+    _touchDragOverlay = document.createElement('div');
+    _touchDragOverlay.style.cssText = 'position:absolute;top:0;height:100%;background:rgba(0,212,170,0.15);border:1px solid rgba(0,212,170,0.5);pointer-events:none;z-index:10;';
+    _touchDragOverlay.style.left = touchX + 'px';
+    _touchDragOverlay.style.width = '0px';
+    _phCanvas.parentElement.style.position = 'relative';
+    _phCanvas.parentElement.appendChild(_touchDragOverlay);
+    e.preventDefault();
+  }, { passive: false });
+
+  _phCanvas.addEventListener('touchmove', function(e) {
+    if (!_touchDragStart || !_touchDragOverlay) return;
+    if (e.touches.length !== 1) return;
+    var touch = e.touches[0];
+    var rect = _phCanvas.getBoundingClientRect();
+    var touchX = touch.clientX - rect.left;
+    var left  = Math.min(_touchDragStart.x, touchX);
+    var width = Math.abs(touchX - _touchDragStart.x);
+    _touchDragOverlay.style.left  = left + 'px';
+    _touchDragOverlay.style.width = width + 'px';
+    e.preventDefault();
+  }, { passive: false });
+
+  _phCanvas.addEventListener('touchend', function(e) {
+    if (!_touchDragStart) return;
+    var touch = e.changedTouches[0];
+    var rect = _phCanvas.getBoundingClientRect();
+    var touchX = touch.clientX - rect.left;
+    var endT   = xToTime(touchX);
+    var startT = _touchDragStart.t;
+    if (_touchDragOverlay && _touchDragOverlay.parentElement) {
+      _touchDragOverlay.parentElement.removeChild(_touchDragOverlay);
+    }
+    _touchDragOverlay = null;
+    _touchDragStart   = null;
+    var pxDiff = Math.abs(timeToX(endT) - timeToX(startT));
+    if (pxDiff < 10) return;
+    var t0New   = Math.min(startT, endT);
+    var spanNew = Math.abs(endT - startT);
+    if (spanNew < 60 * 1000) return;
+    _phZoomT0   = t0New;
+    _phZoomSpan = spanNew;
+    _phDraw();
+  }, { passive: false });
 })();
 {% endif %}
 </script>
