@@ -2192,8 +2192,10 @@ class TestCarbonIntensity(unittest.TestCase):
 
     def test_prune_removes_old_rows(self):
         """Rows older than retention window are pruned."""
+        from datetime import datetime, timezone, timedelta
+        recent = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(tzinfo=None).isoformat()
         self.store.upsert_carbon_intensity("2020-01-01T00:00:00", "DE1", 300.0, "very-high")
-        self.store.upsert_carbon_intensity("2026-04-14T12:00:00", "DE1", 100.0, "low")
+        self.store.upsert_carbon_intensity(recent, "DE1", 100.0, "low")
         deleted = self.store.prune_carbon_intensity(days=4)
         self.assertEqual(deleted, 1)
         remaining = self.store._conn.execute(
