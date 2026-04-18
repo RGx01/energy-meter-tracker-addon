@@ -1063,9 +1063,12 @@ function barCo2Fmt(v, forCopy) {
 
 function barYLabel(v) {
   if (barMetric === 'co2') return barCo2Fmt(v);
-  var sym = barMetric==='cost' ? barCurrency : '';
-  var unit = barMetric==='kwh' ? ' kWh' : '';
-  return (v<0?'-':'') + sym + Math.abs(v).toFixed(0) + unit;
+  var sym  = barMetric === 'cost' ? barCurrency : '';
+  var unit = barMetric === 'kwh'  ? ' kWh' : '';
+  // Use 1 decimal for cost so Chart.js half-unit ticks don't duplicate
+  // e.g. -1.0 and -1.5 both showing as "-£1"
+  var dp = barMetric === 'cost' ? 1 : 0;
+  return (v < 0 ? '-' : '') + sym + Math.abs(v).toFixed(dp) + unit;
 }
 
 function barRender() {
@@ -1176,7 +1179,9 @@ function barRender() {
       },
       scales: {
         x: { stacked: true, grid: { display: false }, ticks: { font:{size:11}, color:barGetTheme().axisC, autoSkip: true, maxRotation: 45 } },
-        y: { stacked: true, grid: { color:barGetTheme().gridC }, ticks: { font:{size:11}, color:barGetTheme().axisC, callback: barYLabel } }
+        y: { stacked: true, grid: { color:barGetTheme().gridC },
+             ticks: { font:{size:11}, color:barGetTheme().axisC, callback: barYLabel, maxTicksLimit: 8 },
+             grace: '2%' }
       }
     }
   });
