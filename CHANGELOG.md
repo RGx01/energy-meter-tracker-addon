@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.5.3] — 2026-04-18
+
+### Fixed
+- **Usage Stats Y axis duplicate labels** — cost mode was using `.toFixed(0)` for axis
+  labels so Chart.js ticks at 0.5 intervals (e.g. -1.0 and -1.5) both rendered as
+  `-£1`, producing duplicate labels. Fixed to use 1 decimal place for cost labels.
+  `maxTicksLimit: 8` and `grace: 2%` added to prevent over-generation of ticks and
+  reduce excess headroom above/below the data.
+
+- **Stale test timestamp** — `test_prune_removes_old_rows` in `test_block_store.py`
+  used a hardcoded `2026-04-14` date which has now passed the 4-day pruning window,
+  causing the test to fail. Fixed to use a relative timestamp (1 hour ago).
+
+---
+
 ## [2.5.2] — 2026-04-17
 
 ### Fixed
