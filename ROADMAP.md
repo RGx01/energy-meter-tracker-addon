@@ -61,16 +61,54 @@ Heatmap metric toggle (kWh / gCO₂ / gCO₂/kWh). Effective intensity column in
 
 ## Planned
 
-### 2.6.0 — Carbon Footprint Insights
-**Theme: Make carbon data meaningful at the billing period level**
+### 2.6.0 — Carbon Insights
+**Theme: Make per-block carbon data meaningful — something most energy monitors can't do**
 
-Building on per-block `carbon_g` data collected since 2.3.0, surface carbon insights users can act on.
+EMT records actual grid carbon intensity at the time of every half-hour block. This enables genuine per-period carbon accounting rather than monthly-total × national-average estimation. 2.6.0 surfaces this as a dedicated **Insights** page.
 
-- Carbon footprint per billing period with year-on-year comparison
-- Solar offset story — "your export displaced X kgCO₂, equivalent to Y miles of driving"
-- EV charging carbon efficiency — % of charging in low-carbon windows
-- Billing period effective intensity vs grid average
-- Relatable equivalent comparisons (car miles, flights, tree-months)
+#### Page structure
+
+A narrative page (not chart-first) in the sidebar between Charts and Live Power. Cards with headlines, supporting numbers and equivalences. The page adapts based on configured meters — sections that aren't relevant are silently omitted.
+
+#### Billing period carbon summary (all users)
+The foundation card — works regardless of equipment:
+- Carbon imported (kgCO₂) for the billing period
+- Carbon offset by export (kgCO₂) — zero if no solar
+- Net carbon position (imported − offset)
+- Effective intensity (gCO₂/kWh) vs grid average for the same period
+- Verdict: "You beat the grid average" / "You were X% above the grid average"
+
+A small bar chart shows net carbon per billing period as history accumulates — trend over time.
+
+#### Solar offset story (solar users)
+- Export displaced X kgCO₂ from the grid this period
+- Equivalent comparisons: miles not driven (@ 180 gCO₂/mile UK average petrol), hours of kettle use, tree-days of absorption
+- Self-consumption ratio: % of solar generation consumed directly vs exported
+- Best and worst carbon days of the period
+
+#### EV charging carbon (EV sub-meter users)
+- Total EV charging carbon this period
+- % of sessions charged during below-average intensity windows
+- Average charging intensity vs grid average — "you beat the grid X% of the time"
+- Estimated saving vs unmanaged flat-rate charging (assumes worst-case peak intensity)
+
+#### Battery carbon efficiency (battery sub-meter users)
+- Average charge intensity vs average discharge intensity
+- Net carbon cost/benefit of battery cycling this period
+- Number of days battery was carbon-positive (charged clean, discharged dirty)
+
+#### Cadence
+- **Billing period summary** — generated when a period closes, persisted for history browsing
+- **Current period** — live provisional estimate, refreshed on each block finalise, clearly marked provisional
+- No real-time updates — insights are retrospective at billing period granularity
+
+#### Qualified judgements
+All claims state their basis. Footnotes on each card: data source (National Grid ESO half-hourly), equivalence assumptions (UK petrol car gCO₂/mile etc.), and a note that export offset assumes displaced generation at grid average intensity (conservative).
+
+#### Build order
+1. Billing period carbon summary card + bar chart trend — works for everyone
+2. Solar offset story
+3. EV and battery cards
 
 ---
 

@@ -2107,6 +2107,55 @@ def api_backup_restore():
             except Exception: pass
 
 
+@app.route("/api/storage-info")
+def api_storage_info():
+    """Return DB size, disk usage, growth rate and runway prediction."""
+    import shutil as _shutil
+    store = _get_store()
+    db_path = os.path.join(DATA_DIR, "blocks.db")
+
+    # DB and disk sizes
+    db_bytes  = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+    try:
+        du = _shutil.disk_usage(DATA_DIR)
+        disk_total = du.total
+        disk_free  = du.free
+        disk_used  = du.used
+    except Exception:
+        disk_total = disk_free = disk_used = 0
+
+    # Growth rate — oldest block to now
+    growth_mb_per_day  = None
+    runway_days        = None
+    days_of_data       = None
+    try:
+        row = store._conn.execute(
+            "SELECT MIN(block_start) FROM blocks"
+        ).fetchone()
+        if row and row[0]:
+            from datetime import datetime, timezone
+            oldest = datetime.fromisoformat(row[0]).replace(tzinfo=timezone.utc)
+            now    = datetime.now(timezone.utc)
+            days_of_data = max((now - oldest).total_seconds() / 86400, 1)
+            growth_mb_per_day = (db_bytes / 1024 / 1024) / days_of_data
+            if growth_mb_per_day > 0:
+                runway_days = int((disk_free / 1024 / 1024) / growth_mb_per_day)
+    except Exception:
+        pass
+
+    return jsonify({
+        "db_bytes":         db_bytes,
+        "db_mb":            round(db_bytes / 1024 / 1024, 2),
+        "disk_total_mb":    round(disk_total / 1024 / 1024, 1),
+        "disk_free_mb":     round(disk_free / 1024 / 1024, 1),
+        "disk_used_mb":     round(disk_used / 1024 / 1024, 1),
+        "disk_free_pct":    round(disk_free / disk_total * 100, 1) if disk_total else 0,
+        "days_of_data":     round(days_of_data, 1) if days_of_data else None,
+        "growth_mb_per_day": round(growth_mb_per_day, 4) if growth_mb_per_day else None,
+        "runway_days":      runway_days,
+    })
+
+
 @app.route("/api/import/extract-zip", methods=["POST"])
 def api_import_extract_zip():
     """Extract JSON files from an uploaded zip and return them as base64."""

@@ -65,6 +65,9 @@
       flex-wrap: nowrap;
       overflow-x: auto;
       -webkit-overflow-scrolling: touch;
+      position: sticky;
+      top: 0; /* .content has padding:0 on charts page */
+      z-index: 9;
     }
     .bar-toolbar-left { gap: 3px; flex-wrap: nowrap; }
     .bar-toolbar-right { flex-shrink: 0; }
@@ -103,6 +106,9 @@
     box-shadow: 0 2px 8px rgba(0,0,0,0.4);
     margin-bottom: 16px;
     flex-wrap: wrap;
+    position: sticky;
+    top: 0; /* .content has padding:0 on charts page */
+    z-index: 9;
   }
   .bar-toolbar-left {
     display: flex;

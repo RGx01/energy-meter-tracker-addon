@@ -224,6 +224,20 @@ In Meter Config → main meter card:
 
 > 🇬🇧 UK only — requires a postcode prefix in Meter Config.
 
+### Why EMT carbon data is different
+
+Most smart home energy monitors estimate your carbon footprint by multiplying your monthly kWh total by a national average intensity figure — a single number applied to everything you consumed or exported over the month. EMT does something fundamentally different.
+
+**EMT records the actual grid carbon intensity at the time of every half-hour block.** This means your carbon data reflects what was genuinely on the grid when you consumed or exported — not a yearly average, not a monthly approximation. At 30-minute resolution across every billing period, EMT can tell you:
+
+- Not just how much carbon your home used, but **when** it used it
+- Whether your consumption pattern **beat the grid average** or not
+- How much your solar export **actually displaced** — at the intensity that was on the grid at that moment, not a blended average
+- Whether your EV charging happened during **clean or dirty** grid periods
+- Whether your battery charged at a **lower intensity than it discharged** — the true test of whether battery cycling reduces your carbon footprint
+
+This is the same approach used in academic demand-response research and by grid operators — applied to a home energy monitor. The granularity makes insights possible that simply aren't available from tools that work at monthly resolution.
+
 Energy Meter Tracker records the carbon footprint of your electricity use alongside your kWh and cost data.
 
 ### How it works

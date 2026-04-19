@@ -149,6 +149,40 @@
 
 
 <!-- ── Database maintenance ──────────────────────────────────────────────────── -->
+<div class="card" id="storage-card">
+  <div class="card-title">💽 Storage</div>
+  <div id="storage-loading" style="font-size:13px;color:var(--muted);">Loading…</div>
+  <div id="storage-info" style="display:none;">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">Database size</div>
+        <div id="si-db-size" style="font-size:20px;font-weight:600;color:var(--text);font-family:var(--mono);"></div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">Disk free</div>
+        <div id="si-disk-free" style="font-size:20px;font-weight:600;color:var(--text);font-family:var(--mono);"></div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">Growth rate</div>
+        <div id="si-growth" style="font-size:20px;font-weight:600;color:var(--text);font-family:var(--mono);"></div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">Estimated runway</div>
+        <div id="si-runway" style="font-size:20px;font-weight:600;font-family:var(--mono);"></div>
+      </div>
+    </div>
+    <!-- Disk usage bar -->
+    <div style="margin-bottom:4px;display:flex;justify-content:space-between;font-size:11px;color:var(--muted);">
+      <span id="si-bar-label"></span>
+      <span id="si-bar-pct"></span>
+    </div>
+    <div style="height:6px;border-radius:3px;background:var(--border);overflow:hidden;">
+      <div id="si-bar-fill" style="height:100%;border-radius:3px;background:var(--accent);transition:width 0.4s;"></div>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-top:8px;" id="si-note"></div>
+  </div>
+</div>
+
 <div class="card">
   <div class="card-title">🗜️ Compact Database</div>
   <div style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.7;">
@@ -636,6 +670,66 @@ document.addEventListener('DOMContentLoaded', function() {
 // ── Historical Corrections ─────────────────────────────────────────────────
 
 // ── Database compaction ────────────────────────────────────────────────────
+async function loadStorageInfo() {
+  try {
+    var r = await fetch(apiUrl('/api/storage-info'));
+    var d = await r.json();
+
+    function fmtMb(mb) {
+      if (mb >= 1024) return (mb / 1024).toFixed(2) + ' GB';
+      return mb.toFixed(1) + ' MB';
+    }
+
+    function fmtRunway(days) {
+      if (!days) return '—';
+      if (days > 365 * 2) return '> ' + Math.floor(days / 365) + ' years';
+      if (days > 365)     return '~' + (days / 365).toFixed(1) + ' years';
+      if (days > 60)      return '~' + Math.round(days / 30) + ' months';
+      return days + ' days';
+    }
+
+    document.getElementById('si-db-size').textContent  = fmtMb(d.db_mb);
+    document.getElementById('si-disk-free').textContent = fmtMb(d.disk_free_mb);
+    document.getElementById('si-growth').textContent    = d.growth_mb_per_day
+      ? (d.growth_mb_per_day < 0.1
+          ? (d.growth_mb_per_day * 1024).toFixed(1) + ' KB/day'
+          : d.growth_mb_per_day.toFixed(2) + ' MB/day')
+      : '—';
+
+    var runway = fmtRunway(d.runway_days);
+    var runwayEl = document.getElementById('si-runway');
+    runwayEl.textContent = runway;
+    // Colour runway: green > 2yr, amber 6mo-2yr, red < 6mo
+    runwayEl.style.color = !d.runway_days ? 'var(--muted)'
+      : d.runway_days > 730  ? 'var(--success)'
+      : d.runway_days > 180  ? 'var(--warning)'
+      : 'var(--danger)';
+
+    // Disk bar
+    var usedPct = 100 - d.disk_free_pct;
+    document.getElementById('si-bar-fill').style.width  = usedPct + '%';
+    document.getElementById('si-bar-fill').style.background =
+      usedPct > 90 ? 'var(--danger)' : usedPct > 75 ? 'var(--warning)' : 'var(--accent)';
+    document.getElementById('si-bar-label').textContent =
+      fmtMb(d.disk_used_mb) + ' used of ' + fmtMb(d.disk_total_mb);
+    document.getElementById('si-bar-pct').textContent = d.disk_free_pct + '% free';
+
+    // Note
+    if (d.days_of_data) {
+      document.getElementById('si-note').textContent =
+        'Based on ' + Math.round(d.days_of_data) + ' days of data. ' +
+        'Runway estimate assumes current growth rate continues.';
+    }
+
+    document.getElementById('storage-loading').style.display = 'none';
+    document.getElementById('storage-info').style.display    = 'block';
+  } catch(e) {
+    document.getElementById('storage-loading').textContent = 'Failed to load storage info.';
+  }
+}
+
+loadStorageInfo();
+
 async function doVacuum() {
   var btn    = document.getElementById('btn-vacuum');
   var result = document.getElementById('vacuum-result');
