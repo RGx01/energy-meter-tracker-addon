@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.5.4] — 2026-04-19
+
+### Added
+- **Storage monitoring** — new Storage card on the Data Management page showing
+  database size, disk free, growth rate (MB/day) and estimated runway. Runway is
+  colour-coded green (>2 years), amber (6 months–2 years), red (<6 months). A disk
+  usage bar shows used vs total with percentage free. Estimate is based on actual
+  days of data recorded and assumes current growth rate continues.
+
+### Fixed
+- **Usage Stats floating toolbar** — `position: sticky` was removed in 2.5.2 when
+  fixing billing chart landscape space (the two were unrelated). Restored with the
+  correct `top: 0` offset now that `.content` has `padding: 0` on the Charts page.
+  Works on both desktop and mobile.
+
+---
+
 ## [2.5.3] — 2026-04-18
 
 ### Fixed
