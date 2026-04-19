@@ -64,51 +64,65 @@ Heatmap metric toggle (kWh / gCO₂ / gCO₂/kWh). Effective intensity column in
 ### 2.6.0 — Carbon Insights
 **Theme: Make per-block carbon data meaningful — something most energy monitors can't do**
 
-EMT records actual grid carbon intensity at the time of every half-hour block. This enables genuine per-period carbon accounting rather than monthly-total × national-average estimation. 2.6.0 surfaces this as a dedicated **Insights** page.
+EMT records actual grid carbon intensity at the time of every half-hour block. This enables genuine per-period carbon accounting rather than monthly-total × national-average estimation. 2.6.0 surfaces this as a dedicated **Insights** page, backed by a new **Settings** page for assumption management.
 
-#### Page structure
+#### New pages
 
-A narrative page (not chart-first) in the sidebar between Charts and Live Power. Cards with headlines, supporting numbers and equivalences. The page adapts based on configured meters — sections that aren't relevant are silently omitted.
+**Insights** — sidebar between Charts and Live Power. Narrative cards with headlines, supporting numbers and equivalences. Adapts based on configured meters — sections irrelevant to the installation are silently omitted. Each card cites its data sources and links to Settings for assumption overrides.
 
-#### Billing period carbon summary (all users)
-The foundation card — works regardless of equipment:
-- Carbon imported (kgCO₂) for the billing period
-- Carbon offset by export (kgCO₂) — zero if no solar
-- Net carbon position (imported − offset)
+**Settings** — sidebar above Help. Initially contains carbon methodology assumptions with cited defaults and user overrides. Extensible — future releases will add display preferences and other application-level settings. Assumptions stored in a new `settings` key-value table in `blocks.db`.
+
+#### Settings — initial assumptions
+
+| Assumption | Default | Source |
+|---|---|---|
+| Petrol car gCO₂/mile | 180 g | BEIS/DESNZ 2023 GHG conversion factors |
+| Diesel car gCO₂/mile | 168 g | BEIS/DESNZ 2023 |
+| Electric kettle rating | 3.0 kW | UK standard |
+| Tree CO₂ absorption/year | 21 kg | Woodland Trust |
+| Flight LHR→NYC gCO₂/passenger | 670 kg | BEIS 2023 (economy, radiative forcing) |
+| Export displacement | Grid average intensity | National Grid ESO — conservative |
+
+All assumptions show their citation in the Insights page footnotes. Overridden values note the custom figure alongside the original cited default.
+
+#### Insights cards
+
+**Billing period carbon summary (all users)**
+- Carbon imported (kgCO₂), carbon offset by export (kgCO₂), net position
 - Effective intensity (gCO₂/kWh) vs grid average for the same period
 - Verdict: "You beat the grid average" / "You were X% above the grid average"
+- Bar chart trend across billing periods as history accumulates
 
-A small bar chart shows net carbon per billing period as history accumulates — trend over time.
-
-#### Solar offset story (solar users)
-- Export displaced X kgCO₂ from the grid this period
-- Equivalent comparisons: miles not driven (@ 180 gCO₂/mile UK average petrol), hours of kettle use, tree-days of absorption
-- Self-consumption ratio: % of solar generation consumed directly vs exported
+**Solar offset story (solar users)**
+- Export displaced X kgCO₂ — with equivalences (miles not driven, kettle hours, tree-days)
+- Self-consumption ratio: % of generation consumed directly vs exported
 - Best and worst carbon days of the period
 
-#### EV charging carbon (EV sub-meter users)
-- Total EV charging carbon this period
-- % of sessions charged during below-average intensity windows
-- Average charging intensity vs grid average — "you beat the grid X% of the time"
-- Estimated saving vs unmanaged flat-rate charging (assumes worst-case peak intensity)
+**EV charging carbon (EV sub-meter)**
+- Total EV charging carbon, % of sessions in below-average intensity windows
+- Average charging intensity vs grid average
+- Estimated saving vs unmanaged flat-rate charging
 
-#### Battery carbon efficiency (battery sub-meter users)
+**Battery carbon efficiency (battery sub-meter)**
 - Average charge intensity vs average discharge intensity
-- Net carbon cost/benefit of battery cycling this period
-- Number of days battery was carbon-positive (charged clean, discharged dirty)
+- Net carbon cost/benefit of cycling this period
+- Days battery was carbon-positive (charged clean, discharged dirty)
 
 #### Cadence
-- **Billing period summary** — generated when a period closes, persisted for history browsing
-- **Current period** — live provisional estimate, refreshed on each block finalise, clearly marked provisional
-- No real-time updates — insights are retrospective at billing period granularity
+- **Closed periods** — computed on demand, cached. Definitive.
+- **Current period** — live provisional estimate, refreshed on block finalise. Clearly marked provisional.
 
-#### Qualified judgements
-All claims state their basis. Footnotes on each card: data source (National Grid ESO half-hourly), equivalence assumptions (UK petrol car gCO₂/mile etc.), and a note that export offset assumes displaced generation at grid average intensity (conservative).
+#### Data layer
+- `api/insights/billing-period` — aggregates carbon figures for a period from existing block data
+- `api/settings` GET/POST — reads and writes the `settings` table
+- `settings` table in `blocks.db` — simple key-value, JSON values
 
 #### Build order
-1. Billing period carbon summary card + bar chart trend — works for everyone
-2. Solar offset story
-3. EV and battery cards
+1. Settings page + `settings` table + `api/settings`
+2. `api/insights/billing-period` endpoint
+3. Insights page — billing period summary card + trend chart
+4. Solar offset card
+5. EV and battery cards
 
 ---
 
