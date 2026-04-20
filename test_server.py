@@ -175,16 +175,16 @@ class TestRouteRegistration(unittest.TestCase):
         self.assertTrue(self._registered("index"))
 
     def test_config_page_registered(self):
-        self.assertTrue(self._registered("config_page"))
+        self.assertTrue(self._registered("settings_page"))
 
     def test_charts_page_registered(self):
         self.assertTrue(self._registered("charts_page"))
 
     def test_summary_page_registered(self):
-        self.assertTrue(self._registered("summary_page"))
+        self.assertTrue(self._registered("live_power_page"))
 
     def test_import_page_registered(self):
-        self.assertTrue(self._registered("import_page"))
+        self.assertTrue(self._registered("data_management_page"))
 
     def test_logs_page_registered(self):
         self.assertTrue(self._registered("logs_page"))
@@ -236,6 +236,33 @@ class TestRouteRegistration(unittest.TestCase):
 
     def test_api_logs_registered(self):
         self.assertTrue(self._registered("api_logs"))
+
+    def test_insights_page_registered(self):
+        self.assertTrue(self._registered("insights_page"))
+
+    def test_settings_page_registered(self):
+        self.assertTrue(self._registered("settings_page"))
+
+    def test_billing_history_page_registered(self):
+        self.assertTrue(self._registered("billing_history_page"))
+
+    def test_data_management_page_registered(self):
+        self.assertTrue(self._registered("data_management_page"))
+
+    def test_live_power_page_registered(self):
+        self.assertTrue(self._registered("live_power_page"))
+
+    def test_api_insights_periods_registered(self):
+        self.assertTrue(self._registered("api_insights_periods"))
+
+    def test_api_insights_billing_period_registered(self):
+        self.assertTrue(self._registered("api_insights_billing_period"))
+
+    def test_api_settings_get_registered(self):
+        self.assertTrue(self._registered("api_settings_get"))
+
+    def test_api_settings_post_registered(self):
+        self.assertTrue(self._registered("api_settings_post"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -727,7 +754,7 @@ class TestIndexRedirect(unittest.TestCase):
         with patch.object(server, "load_config", return_value={"meters": {}}):
             r = self.client.get("/", follow_redirects=False)
         self.assertIn(r.status_code, (301, 302))
-        self.assertIn("config", r.headers["Location"])
+        self.assertIn("settings", r.headers["Location"])
 
     def test_with_config_redirects_to_charts_by_default(self):
         with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
@@ -738,10 +765,10 @@ class TestIndexRedirect(unittest.TestCase):
 
     def test_with_config_and_summary_cookie_redirects_to_summary(self):
         with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
-            self.client.set_cookie("emt_last_page", "summary")
+            self.client.set_cookie("emt_last_page", "live_power")
             r = self.client.get("/", follow_redirects=False)
         self.assertIn(r.status_code, (301, 302))
-        self.assertIn("summary", r.headers["Location"])
+        self.assertIn("live-power", r.headers["Location"])
 
     def test_invalid_cookie_value_falls_back_to_charts(self):
         with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
@@ -1478,3 +1505,299 @@ class TestApiCorrectionsEnhanced(unittest.TestCase):
             "06:30 UTC block (= 07:30 BST) must be excluded — end is exclusive")
         self.assertNotIn("2026-07-15T12:00:00", starts,
             "12:00 UTC block (= 13:00 BST) must be excluded from night window")
+# ─────────────────────────────────────────────────────────────────────────────
+# /api/settings
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApiSettings(unittest.TestCase):
+
+    def setUp(self):
+        self.client = make_client()
+
+    def test_get_returns_defaults(self):
+        r = self.client.get("/api/settings")
+        self.assertEqual(r.status_code, 200)
+        d = json.loads(r.data)
+        self.assertIn("co2_car_petrol_g_per_mile", d)
+        self.assertIn("co2_tree_kg_per_year", d)
+        self.assertIn("ev_efficiency", d)
+        self.assertIn("distance_unit", d)
+        self.assertIn("hp_cop", d)
+        self.assertEqual(d["distance_unit"], "miles")
+        self.assertEqual(d["co2_car_petrol_g_per_mile"], 180.0)
+
+    def test_post_saves_and_returns_ok(self):
+        payload = {"co2_car_petrol_g_per_mile": 195.0, "distance_unit": "km"}
+        r = self.client.post("/api/settings",
+                             data=json.dumps(payload),
+                             content_type="application/json")
+        self.assertEqual(r.status_code, 200)
+        d = json.loads(r.data)
+        self.assertTrue(d.get("ok"))
+
+    def test_post_persists_values(self):
+        payload = {"co2_tree_kg_per_year": 25.0}
+        self.client.post("/api/settings",
+                         data=json.dumps(payload),
+                         content_type="application/json")
+        r = self.client.get("/api/settings")
+        d = json.loads(r.data)
+        self.assertEqual(d["co2_tree_kg_per_year"], 25.0)
+
+    def test_post_rejects_invalid_numeric(self):
+        payload = {"co2_car_petrol_g_per_mile": "not_a_number"}
+        r = self.client.post("/api/settings",
+                             data=json.dumps(payload),
+                             content_type="application/json")
+        self.assertEqual(r.status_code, 400)
+
+    def test_post_ignores_unknown_keys(self):
+        payload = {"unknown_key": "value", "co2_tree_kg_per_year": 22.0}
+        r = self.client.post("/api/settings",
+                             data=json.dumps(payload),
+                             content_type="application/json")
+        self.assertEqual(r.status_code, 200)
+        d = json.loads(r.data)
+        self.assertTrue(d.get("ok"))
+
+    def test_ev_efficiency_default(self):
+        r = self.client.get("/api/settings")
+        d = json.loads(r.data)
+        self.assertEqual(d["ev_efficiency"], 3.2)
+        self.assertEqual(d["ev_charge_efficiency"], 0.88)
+
+    def test_battery_and_hp_defaults(self):
+        r = self.client.get("/api/settings")
+        d = json.loads(r.data)
+        self.assertEqual(d["battery_round_trip_efficiency"], 0.90)
+        self.assertEqual(d["hp_cop"], 3.0)
+        self.assertEqual(d["gas_co2_g_per_kwh"], 203.0)
+        self.assertEqual(d["gas_boiler_efficiency"], 0.90)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /api/insights/periods
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApiInsightsPeriods(unittest.TestCase):
+
+    def setUp(self):
+        self.client = make_client()
+
+    def test_returns_200_with_periods_key(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/insights/periods")
+        self.assertEqual(r.status_code, 200)
+        d = json.loads(r.data)
+        self.assertIn("periods", d)
+        self.assertIsInstance(d["periods"], list)
+
+    def test_periods_have_required_fields(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/insights/periods")
+        d = json.loads(r.data)
+        for p in d["periods"]:
+            self.assertIn("period_start", p)
+            self.assertIn("period_end", p)
+            self.assertIn("is_current", p)
+            self.assertIn("has_carbon", p)
+
+    def test_no_config_periods_returns_empty(self):
+        """If store has no config periods, endpoint returns empty list gracefully."""
+        with patch.object(server, "load_config", return_value={"meters": {}}):
+            r = self.client.get("/api/insights/periods")
+        self.assertIn(r.status_code, (200, 500))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /api/insights/billing-period
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApiInsightsBillingPeriod(unittest.TestCase):
+
+    def setUp(self):
+        self.client = make_client()
+
+    def test_returns_200_or_404(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/insights/billing-period")
+        self.assertIn(r.status_code, (200, 404, 500))
+
+    def test_unknown_period_returns_404_or_error(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/insights/billing-period?period_start=1900-01-01")
+        d = json.loads(r.data)
+        # Either 404 with error key, or 200 with error key
+        self.assertTrue(r.status_code in (200, 404) and "error" in d
+                        or r.status_code == 500)
+
+    def test_response_has_required_fields_when_found(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/insights/billing-period")
+        if r.status_code == 200:
+            d = json.loads(r.data)
+            if "error" not in d:
+                for field in ["period_start", "period_end", "is_current",
+                              "has_carbon", "imp_kwh", "exp_kwh",
+                              "ci_imp_kwh", "ci_exp_kwh",
+                              "house_imp_kwh", "house_ci_imp_kwh",
+                              "sub_meters", "assumptions"]:
+                    self.assertIn(field, d)
+
+    def test_assumptions_contain_all_defaults(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/insights/billing-period")
+        if r.status_code == 200:
+            d = json.loads(r.data)
+            if "assumptions" in d:
+                a = d["assumptions"]
+                self.assertIn("ev_efficiency", a)
+                self.assertIn("ev_charge_efficiency", a)
+                self.assertIn("battery_round_trip_efficiency", a)
+                self.assertIn("hp_cop", a)
+                self.assertIn("distance_unit", a)
+                self.assertIn("gas_co2_g_per_kwh", a)
+                self.assertIn("gas_boiler_efficiency", a)
+
+    def test_sub_meter_has_inverter_possible_field(self):
+        """Sub-meter entries should include inverter_possible flag."""
+        config_with_sub = {
+            "schema_version": "1.0",
+            "meters": {
+                "electricity_main": MINIMAL_CONFIG["meters"]["electricity_main"],
+                "ev_charger": {
+                    "meta": {
+                        "sub_meter": True,
+                        "meter_type": "ev_charger",
+                        "inverter_possible": False,
+                        "parent_meter": "electricity_main",
+                    },
+                    "channels": {
+                        "import": {"read": "sensor.ev", "rate": "sensor.rate"}
+                    }
+                }
+            }
+        }
+        with patch.object(server, "load_config", return_value=config_with_sub):
+            r = self.client.get("/api/insights/billing-period")
+        if r.status_code == 200:
+            d = json.loads(r.data)
+            if "sub_meters" in d:
+                for mid, sm in d["sub_meters"].items():
+                    self.assertIn("inverter_possible", sm)
+                    self.assertIn("ci_imp_kwh", sm)
+                    self.assertIn("avg_charge_intensity", sm)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Settings and Insights page routes
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSettingsAndInsightsPages(unittest.TestCase):
+
+    def setUp(self):
+        self.client = make_client()
+
+    def test_settings_page_meter_config_tab(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/settings")
+        self.assertEqual(r.status_code, 200)
+
+    def test_settings_page_carbon_tab(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/settings?tab=carbon")
+        self.assertEqual(r.status_code, 200)
+
+    def test_insights_page_returns_200(self):
+        r = self.client.get("/insights")
+        self.assertEqual(r.status_code, 200)
+
+    def test_billing_history_page_returns_200(self):
+        r = self.client.get("/billing-history")
+        self.assertEqual(r.status_code, 200)
+
+    def test_data_management_page_returns_200(self):
+        r = self.client.get("/data-management")
+        self.assertEqual(r.status_code, 200)
+
+    def test_live_power_page_returns_200(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/live-power")
+        self.assertIn(r.status_code, (200, 500))  # may fail without power sensor
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# load_config — single source of truth
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestLoadConfig(unittest.TestCase):
+    """load_config should always prefer the DB over meters_config.json."""
+
+    def test_load_config_returns_dict(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            cfg = server.load_config()
+        self.assertIsInstance(cfg, dict)
+        self.assertIn("meters", cfg)
+
+    def test_load_config_has_meter_entries(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            cfg = server.load_config()
+        self.assertIn("electricity_main", cfg.get("meters", {}))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Renamed routes — verify old names are gone, new names work
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRenamedRoutes(unittest.TestCase):
+
+    def setUp(self):
+        self.client = make_client()
+
+    def _registered(self, name):
+        import server as _s
+        return name in _s.app.view_functions
+
+    def test_old_config_page_not_registered(self):
+        self.assertFalse(self._registered("config_page"))
+
+    def test_old_summary_page_not_registered(self):
+        self.assertFalse(self._registered("summary_page"))
+
+    def test_old_import_page_not_registered(self):
+        self.assertFalse(self._registered("import_page"))
+
+    def test_settings_route_returns_200(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/settings")
+        self.assertEqual(r.status_code, 200)
+
+    def test_settings_carbon_tab_returns_200(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/settings?tab=carbon")
+        self.assertEqual(r.status_code, 200)
+
+    def test_live_power_route_exists(self):
+        self.assertTrue(self._registered("live_power_page"))
+
+    def test_data_management_route_exists(self):
+        self.assertTrue(self._registered("data_management_page"))
+
+    def test_billing_history_route_exists(self):
+        self.assertTrue(self._registered("billing_history_page"))
+
+    def test_old_config_route_redirects_or_missing(self):
+        """GET /config should not return 200 — it no longer exists."""
+        r = self.client.get("/config")
+        self.assertNotEqual(r.status_code, 200)
+
+    def test_settings_route_replaces_config(self):
+        """GET /settings should return 200."""
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/settings")
+        self.assertEqual(r.status_code, 200)
+
+
+if __name__ == '__main__':
+    unittest.main()

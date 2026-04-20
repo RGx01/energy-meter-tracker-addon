@@ -371,7 +371,7 @@
 <div class="card" style="text-align:center;padding:32px;margin-bottom:20px;">
   <div style="font-size:32px;margin-bottom:12px;">⚡</div>
   <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No power sensor configured</div>
-  <div style="color:var(--muted);font-size:13px;">Add a power sensor in <a href="{{ url_for('config_page') }}" style="color:var(--accent);">Meter Config</a> to enable the live power gauge.</div>
+  <div style="color:var(--muted);font-size:13px;">Add a power sensor in <a href="{{ url_for('settings_page') }}" style="color:var(--accent);">Meter Config</a> to enable the live power gauge.</div>
 </div>
 {% else %}
 <div class="summary-grid">
@@ -443,7 +443,7 @@
       <div class="carbon-time-labels" id="carbon-time-labels"></div>
     </div>
     <div id="carbon-error" style="display:none;color:var(--muted);font-size:13px;">
-      Could not load forecast. Check your postcode prefix in <a href="{{ url_for('config_page') }}" style="color:var(--accent);">Meter Config</a>.
+      Could not load forecast. Check your postcode prefix in <a href="{{ url_for('settings_page') }}" style="color:var(--accent);">Meter Config</a>.
     </div>
   </div>
   {% endif %}

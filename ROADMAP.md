@@ -57,98 +57,151 @@ Blue bar shows house remainder not full main meter net carbon. `carbon_g_total` 
 ### 2.5.0 — Carbon Heatmaps & UI Polish
 Heatmap metric toggle (kWh / gCO₂ / gCO₂/kWh). Effective intensity column in Usage Stats CO₂ mode. Power history drag zoom. Usage Stats auto-refresh TTL. Tab buttons in topbar. Floating toolbars. Fixed topbar across all pages.
 
+### 2.5.x — Stability & Mobile
+Touch zoom, mobile topbar collapse, orientation fixes, billing landscape fix, chart height fix, Y axis duplicate labels, stale test timestamp, storage monitoring card.
+
 ---
 
 ## Planned
 
-### 2.6.0 — Carbon Insights
-**Theme: Make per-block carbon data meaningful — something most energy monitors can't do**
+### 2.6.0 — Carbon Insights & Navigation Refactor *(in development)*
+**Theme: Make per-block carbon data meaningful and surface it in a dedicated Insights page**
 
-EMT records actual grid carbon intensity at the time of every half-hour block. This enables genuine per-period carbon accounting rather than monthly-total × national-average estimation. 2.6.0 surfaces this as a dedicated **Insights** page, backed by a new **Settings** page for assumption management.
+EMT records actual grid carbon intensity at the time of every block. 2.6.0 surfaces this as a dedicated **Insights** page backed by a **Settings** page for assumption management, and refactors the navigation to reflect the evolved UI.
 
-#### New pages
+#### Navigation refactor
+- Sidebar renamed and restructured: ⚙️ Settings | 📊 Charts | 🌿 Insights | ⚡ Live Power | 🗄️ Data Management | 📋 Logs | 📖 Help
+- **Settings** absorbs Meter Config as its default tab, with a 🌿 Carbon tab for assumptions
+- Meter Config sub-bar: Wizard | Refresh | Billing History actions
+- All routes renamed for clarity: `/config` → `/settings`, `/import` → `/data-management`, `/summary` → `/live-power`, `/config-history` → `/billing-history`
+- Templates renamed to match: `meter_config.html`, `live_power.html`, `data_management.html`, `billing_history.html`
+- `blocks.db` confirmed as sole source of truth — `load_config()` in both `server.py` and `engine.py` never falls back to `meters_config.json` when `blocks.db` exists
 
-**Insights** — sidebar between Charts and Live Power. Narrative cards with headlines, supporting numbers and equivalences. Adapts based on configured meters — sections irrelevant to the installation are silently omitted. Each card cites its data sources and links to Settings for assumption overrides.
+#### Settings page
+- ⚙️ Meter Config tab — existing Meter Config content, unchanged
+- 🌿 Carbon tab — carbon equivalence assumptions with citations, export displacement methodology, EV/battery/heat pump assumptions, distance unit (miles/km)
+- Postcode prompt inline if not configured
+- Assumptions stored in `settings` key in `store_meta` table (no schema change)
 
-**Settings** — sidebar above Help. Initially contains carbon methodology assumptions with cited defaults and user overrides. Extensible — future releases will add display preferences and other application-level settings. Assumptions stored in a new `settings` key-value table in `blocks.db`.
-
-#### Settings — initial assumptions
-
+#### Settings — assumptions
 | Assumption | Default | Source |
 |---|---|---|
-| Petrol car gCO₂/mile | 180 g | BEIS/DESNZ 2023 GHG conversion factors |
+| Petrol car gCO₂/mile | 180 g | BEIS/DESNZ 2023 |
 | Diesel car gCO₂/mile | 168 g | BEIS/DESNZ 2023 |
-| Electric kettle rating | 3.0 kW | UK standard |
-| Tree CO₂ absorption/year | 21 kg | Woodland Trust |
-| Flight LHR→NYC gCO₂/passenger | 670 kg | BEIS 2023 (economy, radiative forcing) |
-| Export displacement | Grid average intensity | National Grid ESO — conservative |
+| Tree CO₂/year | 21 kg | Woodland Trust |
+| Flight LHR→NYC | 670 kgCO₂ | BEIS 2023 (economy, RF) |
+| Distance unit | miles | — |
+| EV efficiency | 3.2 miles/kWh | UK average |
+| EV charge efficiency | 88% | IEA 2022, Type 2 AC |
+| Battery round-trip | 90% | Li-ion home battery |
+| Heat pump SCOP | 3.0 | Typical air-source |
+| Gas boiler efficiency | 90% | Modern condensing |
+| Gas gCO₂/kWh | 203 g | BEIS/DESNZ 2023 |
+| Export displacement | Grid average | National Grid ESO |
 
-All assumptions show their citation in the Insights page footnotes. Overridden values note the custom figure alongside the original cited default.
+#### Insights page — Period view
+Cards adapt based on configured meters. Irrelevant cards are silently omitted.
 
-#### Insights cards
+**Carbon Summary** — net kgCO₂, effective intensity vs grid average, import/export split, equivalences (car miles, tree days, flight %), billing period trend chart (inline SVG, click-to-navigate).
 
-**Billing period carbon summary (all users)**
-- Carbon imported (kgCO₂), carbon offset by export (kgCO₂), net position
-- Effective intensity (gCO₂/kWh) vs grid average for the same period
-- Verdict: "You beat the grid average" / "You were X% above the grid average"
-- Bar chart trend across billing periods as history accumulates
+**House Consumption** — grid import minus EV and battery charging. Baseline load — lighting and appliances. % of total import.
 
-**Solar offset story (solar users)**
-- Export displaced X kgCO₂ — with equivalences (miles not driven, kettle hours, tree-days)
-- Self-consumption ratio: % of generation consumed directly vs exported
-- Best and worst carbon days of the period
+**Solar Export Offset** — export displaced X kgCO₂. Equivalences. Note that export may include battery discharge.
 
-**EV charging carbon (EV sub-meter)**
-- Total EV charging carbon, % of sessions in below-average intensity windows
-- Average charging intensity vs grid average
-- Estimated saving vs unmanaged flat-rate charging
+**EV Charging** — total carbon, average charge intensity vs grid average, estimated distance (using efficiency + charge efficiency assumptions), gCO₂/mile vs petrol/diesel comparison.
 
-**Battery carbon efficiency (battery sub-meter)**
-- Average charge intensity vs average discharge intensity
-- Net carbon cost/benefit of cycling this period
-- Days battery was carbon-positive (charged clean, discharged dirty)
+**Battery Charging Behaviour** — average charge intensity vs grid average, estimated carbon saving if charged cleaner than average. Honest note: cannot split export between solar and battery without additional metering.
 
-#### Cadence
-- **Closed periods** — computed on demand, cached. Definitive.
-- **Current period** — live provisional estimate, refreshed on block finalise. Clearly marked provisional.
+**Heat Pump** — electricity used, heat delivered (kWh × COP), carbon vs equivalent gas boiler, % cleaner, grid crossover intensity.
+
+#### Insights navigation architecture
+- 🌿 Carbon tab (active) | Usage tab (hidden, placeholder for 2.7.0)
+- Period selector: prev/next arrows in topbar, label shows billing period dates
+- Trend chart: inline SVG bar chart, click any bar to navigate to that period
+- Three states: no postcode → collecting data → full insights
 
 #### Data layer
-- `api/insights/billing-period` — aggregates carbon figures for a period from existing block data
-- `api/settings` GET/POST — reads and writes the `settings` table
-- `settings` table in `blocks.db` — simple key-value, JSON values
+- `GET /api/insights/periods` — list all billing periods with carbon summary
+- `GET /api/insights/billing-period?period_start=YYYY-MM-DD` — full carbon breakdown including sub-meter avg charge intensity and house remainder
+- `GET/POST /api/settings` — reads/writes `settings` table
+- Meter type detection: `meta.meter_type` key first, falls back to meter ID keywords (ev, charger, battery, heat, pump)
 
-#### Build order
-1. Settings page + `settings` table + `api/settings`
-2. `api/insights/billing-period` endpoint
-3. Insights page — billing period summary card + trend chart
-4. Solar offset card
-5. EV and battery cards
+#### Help page additions
+- Cost sensor setup guide — standard variable, Economy 7, Octopus Go, IOG template, Agile (API), no-cost-data scenario
 
 ---
 
-### 2.7.0 — Meter Replacement
+### 2.7.0 — Carbon Insights: Comparisons
+**Theme: Longitudinal carbon analysis — understand trends over time**
+
+With 12+ months of per-block carbon data, meaningful comparisons become possible. This release adds comparison views to the Insights page.
+
+#### Insights navigation expansion
+The Insights topbar Carbon tab gains sub-navigation:
+
+| View | Description |
+|---|---|
+| **Period** | Existing detail view for one billing period (2.6.0) |
+| **Month** | Current billing period vs previous period + same period last year |
+| **Year** | Annual summary — all billing periods aggregated |
+
+#### Month comparison view
+- Side-by-side: selected period vs previous period vs same period last year (where available)
+- Delta cards: carbon ↑↓, intensity ↑↓, EV carbon ↑↓, house consumption ↑↓
+- "Your carbon was X% lower than this time last year"
+- Grid intensity delta: "The grid was X gCO₂/kWh cleaner than last year" — separates your behaviour from grid improvement
+
+#### Year summary view
+- Total carbon for the year, breakdown by category (house, EV, battery, solar offset)
+- Best and worst billing period for carbon intensity
+- Trend chart showing all periods in the year
+- Year-on-year comparison card (requires 2 years of data)
+- "Annual carbon report" exportable summary
+
+#### Year-on-year
+- Year selector: [2025] [2026▼]
+- Same metrics as month comparison but at annual scale
+- Highlights grid decarbonisation contribution vs behaviour change contribution
+
+#### Data layer additions
+- `GET /api/insights/year-summary?year=YYYY` — aggregate all periods in a year
+- `GET /api/insights/compare?period_a=YYYY-MM-DD&period_b=YYYY-MM-DD` — delta between two periods
+
+---
+
+### 2.8.0 — Meter Replacement
 **Theme: Handle real-world meter changes gracefully**
 
 When a physical meter is replaced, cumulative reads reset to zero. The engine clips negative deltas to zero but affected blocks are wrong. Explicit user-triggered correction flow via Billing History with preview and confirmation.
 
 ---
 
-### 2.8.0 — Gas Meters
+### 2.9.0 — Gas Meters
 **Theme: Whole-home energy tracking**
 
 Extend the engine to support gas meter recording alongside electricity. Requires a design spike — gas uses m³/ft³ with calorific value conversion, different billing periods, and slower sensor updates.
 
 ---
 
-### 2.9.0 — Charting Insights
+### 2.10.0 — Cost Sensor Guidance & Tariff Templates
+**Theme: Lower the barrier for users without API cost sensors**
+
+- Help page: step-by-step cost sensor setup guide for standard variable, Economy 7, Octopus Go, IOG, Agile
+- IOG template: normalised HA template handling 6-hour rolling cheap window resetting at noon
+- Tariff template library in UI: select your tariff type, get a copy-pasteable HA template
+
+---
+
+### 3.0.0 — Charting Insights
 **Theme: Understand your energy patterns**
 
-- Cost forecasting — projected bill based on current period rate
 - Peak demand analysis — highest consumption periods and times of day
 - Solar self-consumption ratio (requires solar generation sub-meter)
 - Tariff optimisation hints (Agile, Go charging windows)
 - Day-of-week and seasonal consumption patterns
+- Cost forecasting — projected bill based on current period rate
 
+---
 
 ## Longer Term / Unscheduled
 
@@ -156,6 +209,7 @@ Extend the engine to support gas meter recording alongside electricity. Requires
 - **V2G / V2X export** — breakdown of EV-to-grid export by device
 - **Multiple batteries / inverters** — better support for complex hybrid systems
 - **Multi-dwelling / multi-site** — support for properties with more than one grid connection
+- **Usage Insights** — non-carbon insights: peak times, highest consumption days, standing charge as % of bill
 - **HACS / community distribution** — evaluate distribution channels beyond the add-on store
 
 ---
@@ -166,5 +220,6 @@ Extend the engine to support gas meter recording alongside electricity. Requires
 - Billing accuracy is never compromised by new features
 - Breaking changes (data format, config schema) require a migration path and deprecation notice
 - The reconciliation block is the authoritative unit — higher-resolution features are additive, not replacements
+- `blocks.db` is the single source of truth — no other file takes precedence when the DB exists
 - User data is never deleted without explicit confirmation
 - Migration tools are maintained for at least one full minor release after the migration they support

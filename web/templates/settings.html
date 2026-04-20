@@ -1,0 +1,414 @@
+{% extends "base.html" %}
+
+{% block topbar %}
+<div class="topbar">
+  <div>
+    <h2>Settings</h2>
+    <div class="sub">Configure your meters and carbon assumptions</div>
+  </div>
+  <div class="settings-tabs">
+    <a href="{{ url_for('settings_page') }}" class="settings-tab">⚙️ Meter Config</a>
+    <a href="{{ url_for('settings_page') }}?tab=carbon" class="settings-tab active">🌿 Carbon</a>
+  </div>
+  <button class="btn btn-primary" id="btn-save" onclick="saveSettings()">💾 Save</button>
+</div>
+{% endblock %}
+
+{% block content %}
+<style>
+  .setting-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+    padding: 14px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .setting-row:last-child { border-bottom: none; }
+  .setting-label { flex:1; min-width:0; }
+  .setting-name { font-size:13px; font-weight:600; color:var(--text); margin-bottom:3px; }
+  .setting-cite { font-size:11px; color:var(--muted); line-height:1.6; }
+  .setting-cite a { color:var(--accent); text-decoration:none; }
+  .setting-cite a:hover { text-decoration:underline; }
+  .setting-input { display:flex; align-items:center; gap:8px; flex-shrink:0; }
+  .setting-field {
+    width: 90px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    font-family: var(--mono);
+    text-align: right;
+  }
+  .setting-field:focus { outline:none; border-color:var(--accent); }
+  .setting-unit { font-size:12px; color:var(--muted); white-space:nowrap; }
+  .postcode-prompt {
+    background: rgba(0,212,170,0.06);
+    border: 1px solid rgba(0,212,170,0.25);
+    border-radius: var(--radius);
+    padding: 20px 24px;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+    flex-wrap: wrap;
+  }
+  .postcode-prompt-text { font-size:13px; color:var(--text); line-height:1.6; }
+  .postcode-prompt-text small { display:block; color:var(--muted); font-size:11px; margin-top:3px; }
+  .postcode-input-row { display:flex; gap:8px; align-items:center; flex-shrink:0; }
+  .postcode-field {
+    width: 120px;
+    padding: 7px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    font-family: var(--mono);
+    text-transform: uppercase;
+  }
+  .postcode-field:focus { outline:none; border-color:var(--accent); }
+</style>
+
+<div id="alert-success" class="alert alert-success">✓ Saved.</div>
+<div id="alert-error"   class="alert alert-danger"></div>
+
+<!-- ── Carbon settings ───────────────────────────────────────────────────── -->
+
+  <div class="postcode-prompt" id="postcode-prompt" style="display:none;">
+    <div class="postcode-prompt-text">
+      Carbon intensity tracking requires a postcode prefix.
+      <small>🇬🇧 UK only — first part of your postcode (e.g. DE1, SW1, M1). Used to fetch grid carbon intensity from the National Grid ESO API.</small>
+    </div>
+    <div class="postcode-input-row">
+      <input type="text" id="postcode-input" class="postcode-field"
+             placeholder="e.g. DE1" maxlength="6"
+             onkeydown="if(event.key==='Enter') savePostcode()">
+      <button class="btn btn-primary" onclick="savePostcode()">Save</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Carbon Equivalence Assumptions</div>
+    <div style="font-size:13px; color:var(--muted); margin-bottom:20px; line-height:1.7;">
+      Used by the Insights page to translate carbon figures into relatable comparisons.
+      Defaults are from published sources — override if you have more accurate figures.
+    </div>
+    <div class="setting-row">
+      <div class="setting-label">
+        <div class="setting-name">Petrol car — gCO₂ per mile</div>
+        <div class="setting-cite">Default: 180 g/mile —
+          <a href="https://www.gov.uk/government/publications/greenhouse-gas-reporting-conversion-factors-2023" target="_blank" rel="noopener">BEIS/DESNZ 2023 GHG conversion factors</a>
+        </div>
+      </div>
+      <div class="setting-input">
+        <input type="number" id="co2_car_petrol_g_per_mile" class="setting-field" min="1" max="1000" step="1" placeholder="180">
+        <span class="setting-unit">gCO₂/mile</span>
+      </div>
+    </div>
+    <div class="setting-row">
+      <div class="setting-label">
+        <div class="setting-name">Diesel car — gCO₂ per mile</div>
+        <div class="setting-cite">Default: 168 g/mile —
+          <a href="https://www.gov.uk/government/publications/greenhouse-gas-reporting-conversion-factors-2023" target="_blank" rel="noopener">BEIS/DESNZ 2023 GHG conversion factors</a>
+        </div>
+      </div>
+      <div class="setting-input">
+        <input type="number" id="co2_car_diesel_g_per_mile" class="setting-field" min="1" max="1000" step="1" placeholder="168">
+        <span class="setting-unit">gCO₂/mile</span>
+      </div>
+    </div>
+    <div class="setting-row">
+      <div class="setting-label">
+        <div class="setting-name">Tree CO₂ absorption per year</div>
+        <div class="setting-cite">Default: 21 kg/year —
+          <a href="https://www.woodlandtrust.org.uk/trees-woods-and-wildlife/british-trees/tree-facts/" target="_blank" rel="noopener">Woodland Trust estimate</a>
+          for a mature broadleaf tree. Varies by species and age.
+        </div>
+      </div>
+      <div class="setting-input">
+        <input type="number" id="co2_tree_kg_per_year" class="setting-field" min="1" max="200" step="1" placeholder="21">
+        <span class="setting-unit">kgCO₂/year</span>
+      </div>
+    </div>
+    <div class="setting-row">
+      <div class="setting-label">
+        <div class="setting-name">Flight LHR → NYC — kgCO₂ per passenger</div>
+        <div class="setting-cite">Default: 670 kg —
+          <a href="https://www.gov.uk/government/publications/greenhouse-gas-reporting-conversion-factors-2023" target="_blank" rel="noopener">BEIS 2023</a>,
+          economy class, radiative forcing included.
+        </div>
+      </div>
+      <div class="setting-input">
+        <input type="number" id="co2_flight_lhr_nyc_kg" class="setting-field" min="1" max="5000" step="1" placeholder="670">
+        <span class="setting-unit">kgCO₂</span>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-label">
+        <div class="setting-name">Distance unit</div>
+        <div class="setting-cite">Used for car equivalences and EV efficiency. Choose miles or kilometres.</div>
+      </div>
+      <div class="setting-input">
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+          <input type="radio" name="distance_unit" value="miles" id="dist_miles"> Miles
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+          <input type="radio" name="distance_unit" value="km" id="dist_km"> Kilometres
+        </label>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-label">
+        <div class="setting-name">EV efficiency</div>
+        <div class="setting-cite">
+          Default: 3.2 miles/kWh (UK average — verify against your car's trip computer or manufacturer spec).
+          Used to estimate distance driven per kWh charged.
+        </div>
+      </div>
+      <div class="setting-input">
+        <input type="number" id="ev_efficiency" class="setting-field" min="0.5" max="10" step="0.1" placeholder="3.2">
+        <span class="setting-unit" id="ev-unit-label">miles/kWh</span>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-label">
+        <div class="setting-name">EV charge efficiency (AC→DC)</div>
+        <div class="setting-cite">
+          Default: 88% — typical Type 2 AC home charger (IEA EV charging infrastructure report 2022).
+          The car draws more from the wall than goes into the battery. Used to calculate usable energy and distance.
+        </div>
+      </div>
+      <div class="setting-input">
+        <input type="number" id="ev_charge_efficiency" class="setting-field" min="0.5" max="1" step="0.01" placeholder="0.88">
+        <span class="setting-unit">0–1</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Battery assumptions -->
+  <div class="card">
+    <div class="card-title">🔋 Battery Assumptions</div>
+    <div class="setting-row">
+      <div class="setting-label">
+        <div class="setting-name">Battery round-trip efficiency</div>
+        <div class="setting-cite">
+          Default: 90% — typical Li-ion home battery (Powerwall 2: 90%, Solax: 89–93%).
+          Accounts for AC→DC charge losses and DC→AC discharge losses combined.
+          Used to calculate usable energy stored and carbon cost of cycling.
+        </div>
+      </div>
+      <div class="setting-input">
+        <input type="number" id="battery_round_trip_efficiency" class="setting-field" min="0.5" max="1" step="0.01" placeholder="0.90">
+        <span class="setting-unit">0–1</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Heat pump assumptions -->
+  <div class="card">
+    <div class="card-title">♨️ Heat Pump Assumptions</div>
+    <div style="font-size:13px; color:var(--muted); margin-bottom:20px; line-height:1.7;">
+      Used to compare heat pump carbon vs an equivalent gas boiler. Override with your
+      heat pump's measured seasonal COP if available from your controller.
+    </div>
+    <div class="setting-row">
+      <div class="setting-label">
+        <div class="setting-name">Seasonal COP (SCOP)</div>
+        <div class="setting-cite">
+          Default: 3.0 — typical air-source heat pump seasonal average. Varies 2.5–4.5 by model and climate.
+          SCOP averages across the whole heating season, not a single operating point.
+        </div>
+      </div>
+      <div class="setting-input">
+        <input type="number" id="hp_cop" class="setting-field" min="1" max="6" step="0.1" placeholder="3.0">
+        <span class="setting-unit">COP</span>
+      </div>
+    </div>
+    <div class="setting-row">
+      <div class="setting-label">
+        <div class="setting-name">Gas boiler efficiency</div>
+        <div class="setting-cite">Default: 90% — typical modern condensing boiler.</div>
+      </div>
+      <div class="setting-input">
+        <input type="number" id="gas_boiler_efficiency" class="setting-field" min="0.5" max="1" step="0.01" placeholder="0.90">
+        <span class="setting-unit">0–1</span>
+      </div>
+    </div>
+    <div class="setting-row">
+      <div class="setting-label">
+        <div class="setting-name">Gas — gCO₂ per kWh</div>
+        <div class="setting-cite">Default: 203 g/kWh —
+          <a href="https://www.gov.uk/government/publications/greenhouse-gas-reporting-conversion-factors-2023"
+             target="_blank" rel="noopener">BEIS/DESNZ 2023 GHG conversion factors</a>.
+        </div>
+      </div>
+      <div class="setting-input">
+        <input type="number" id="gas_co2_g_per_kwh" class="setting-field" min="1" max="500" step="1" placeholder="203">
+        <span class="setting-unit">gCO₂/kWh</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Export Carbon Offset Methodology</div>
+    <div style="font-size:13px; color:var(--muted); margin-bottom:20px; line-height:1.7;">
+      When you export solar electricity, it displaces carbon from other grid generation. The carbon saved depends on what your export replaced.
+    </div>
+    <div class="setting-row" style="align-items:flex-start;">
+      <div class="setting-label">
+        <div class="setting-name">Displacement intensity method</div>
+        <div class="setting-cite">
+          <strong>Grid average (recommended)</strong> — your export displaced generation at the current grid average intensity. Conservative and standard. Marginal intensity is not publicly available in real time.
+        </div>
+      </div>
+      <div class="setting-input" style="flex-direction:column; align-items:flex-start; gap:10px;">
+        <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
+          <input type="radio" name="co2_export_method" value="grid_average" id="method_grid_avg"> Grid average (recommended)
+        </label>
+        <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
+          <input type="radio" name="co2_export_method" value="custom" id="method_custom"> Custom fixed intensity
+        </label>
+        <div id="custom-intensity-wrap" style="display:none; margin-left:24px;">
+          <div style="display:flex; align-items:center; gap:8px;">
+            <input type="number" id="co2_export_custom_intensity" class="setting-field" min="1" max="1000" step="1" placeholder="200" style="width:100px;">
+            <span class="setting-unit">gCO₂/kWh</span>
+          </div>
+          <div style="font-size:11px; color:var(--muted); margin-top:4px;">Fixed intensity for all export displacement calculations.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+
+
+async function checkPostcode() {
+  try {
+    var r   = await fetch(apiUrl('/api/config'));
+    var cfg = await r.json();
+    var hasPostcode = false;
+    for (var mid in (cfg.meters || {})) {
+      if (((cfg.meters[mid].meta) || {}).postcode_prefix) { hasPostcode = true; break; }
+    }
+    document.getElementById('postcode-prompt').style.display = hasPostcode ? 'none' : 'flex';
+  } catch(e) {}
+}
+
+async function savePostcode() {
+  var val = (document.getElementById('postcode-input').value || '').trim().toUpperCase();
+  if (!val) return;
+  try {
+    var r   = await fetch(apiUrl('/api/config'));
+    var cfg = await r.json();
+    for (var mid in (cfg.meters || {})) {
+      if (!((cfg.meters[mid].meta) || {}).sub_meter) {
+        cfg.meters[mid].meta = cfg.meters[mid].meta || {};
+        cfg.meters[mid].meta.postcode_prefix = val;
+        break;
+      }
+    }
+    var sr = await fetch(apiUrl('/api/config'), {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(cfg)
+    });
+    var sd = await sr.json();
+    if (sd.ok) {
+      document.getElementById('postcode-prompt').style.display = 'none';
+      showSuccess('Postcode saved. Carbon intensity recording will begin on the next block.');
+    } else { showError(sd.error || 'Save failed'); }
+  } catch(e) { showError('Save failed: ' + e.message); }
+}
+
+function updateEvUnitLabel(unit) {
+  var lbl = document.getElementById('ev-unit-label');
+  if (lbl) lbl.textContent = (unit === 'km' ? 'km' : 'miles') + '/kWh';
+}
+
+async function loadSettings() {
+  try {
+    var r = await fetch(apiUrl('/api/settings'));
+    var d = await r.json();
+    ['co2_car_petrol_g_per_mile','co2_car_diesel_g_per_mile',
+     'co2_tree_kg_per_year','co2_flight_lhr_nyc_kg',
+     'ev_efficiency','ev_charge_efficiency',
+     'battery_round_trip_efficiency',
+     'hp_cop','gas_boiler_efficiency','gas_co2_g_per_kwh'].forEach(function(k) {
+      var el = document.getElementById(k);
+      if (el && d[k] != null) el.value = d[k];
+    });
+    var distUnit = d.distance_unit || 'miles';
+    document.getElementById(distUnit === 'km' ? 'dist_km' : 'dist_miles').checked = true;
+    updateEvUnitLabel(distUnit);
+    document.querySelectorAll('input[name="distance_unit"]').forEach(function(r) {
+      r.addEventListener('change', function() { updateEvUnitLabel(this.value); });
+    });
+    var method = d.co2_export_method || 'grid_average';
+    document.getElementById(method === 'custom' ? 'method_custom' : 'method_grid_avg').checked = true;
+    toggleCustom(method === 'custom');
+    var ci = document.getElementById('co2_export_custom_intensity');
+    if (ci && d.co2_export_custom_intensity != null) ci.value = d.co2_export_custom_intensity;
+  } catch(e) {}
+}
+
+function toggleCustom(show) {
+  document.getElementById('custom-intensity-wrap').style.display = show ? 'block' : 'none';
+}
+document.querySelectorAll('input[name="co2_export_method"]').forEach(function(r) {
+  r.addEventListener('change', function() { toggleCustom(this.value === 'custom'); });
+});
+
+async function saveSettings() {
+  document.getElementById('btn-save').disabled = true;
+  var payload = {};
+  ['co2_car_petrol_g_per_mile','co2_car_diesel_g_per_mile',
+   'co2_tree_kg_per_year','co2_flight_lhr_nyc_kg',
+   'ev_efficiency','ev_charge_efficiency',
+   'battery_round_trip_efficiency',
+   'hp_cop','gas_boiler_efficiency','gas_co2_g_per_kwh'].forEach(function(k) {
+    var el = document.getElementById(k);
+    if (el && el.value !== '') payload[k] = parseFloat(el.value);
+  });
+  var dr = document.querySelector('input[name="distance_unit"]:checked');
+  if (dr) payload.distance_unit = dr.value;
+  var mr = document.querySelector('input[name="co2_export_method"]:checked');
+  if (mr) payload.co2_export_method = mr.value;
+  if (payload.co2_export_method === 'custom') {
+    var ci = document.getElementById('co2_export_custom_intensity');
+    if (ci && ci.value !== '') payload.co2_export_custom_intensity = parseFloat(ci.value);
+  }
+  try {
+    var r = await fetch(apiUrl('/api/settings'), {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    var d = await r.json();
+    if (d.ok) showSuccess('Settings saved.');
+    else showError(d.error || 'Save failed');
+  } catch(e) { showError('Save failed: ' + e.message); }
+  document.getElementById('btn-save').disabled = false;
+}
+
+function showSuccess(msg) {
+  var el = document.getElementById('alert-success');
+  el.textContent = '✓ ' + msg;
+  el.classList.add('show');
+  setTimeout(function() { el.classList.remove('show'); }, 3000);
+}
+function showError(msg) {
+  document.getElementById('alert-error').textContent = msg;
+  document.getElementById('alert-error').classList.add('show');
+}
+
+checkPostcode();
+loadSettings();
+</script>
+{% endblock %}

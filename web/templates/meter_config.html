@@ -4,15 +4,22 @@
 {% block topbar %}
 <div class="topbar">
   <div>
-    <h2>Meter Configuration</h2>
-    <div class="sub">Configure your main meter and sub-meters</div>
+    <h2>Settings</h2>
+    <div class="sub">Configure your meters and carbon assumptions</div>
   </div>
-  <div style="display:flex;gap:8px;">
-    <button class="btn btn-secondary" id="btn-wizard">✦ Setup Wizard</button>
-    <button class="btn btn-secondary" id="btn-refresh">↺ Refresh Entities</button>
-    <a href="{{ url_for('config_history_page') }}" class="btn btn-secondary">🕓 Billing History</a>
-    <button class="btn btn-primary" id="btn-save">💾 Save Config</button>
+  <div class="settings-tabs">
+    <a href="{{ url_for('settings_page') }}" class="settings-tab active">⚙️ Meter Config</a>
+    <a href="{{ url_for('settings_page') }}?tab=carbon" class="settings-tab">🌿 Carbon</a>
   </div>
+  <button class="btn btn-primary" id="btn-save">💾 Save Config</button>
+</div>
+{% endblock %}
+
+{% block subbar %}
+<div class="settings-subbar">
+  <button class="btn btn-secondary" id="btn-wizard">✦ Setup Wizard</button>
+  <button class="btn btn-secondary" id="btn-refresh">↺ Refresh Entities</button>
+  <a href="{{ url_for('billing_history_page') }}" class="btn btn-secondary">🕓 Billing History</a>
 </div>
 {% endblock %}
 

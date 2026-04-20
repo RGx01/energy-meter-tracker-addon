@@ -389,7 +389,58 @@ class TestAppendBlock(unittest.TestCase):
             store2.append_block(make_block("2026-03-01T00:00:00"))
         store2.close()
 
-    def test_append_blocks_bulk(self):
+    def test_append_block_replace_overwrites_existing(self):
+        """append_block_replace must overwrite a zero block, unlike INSERT OR IGNORE."""
+        zero_block = make_block("2026-03-01T00:00:00", imp_kwh=0.0, exp_kwh=0.0)
+        self.store.append_block(zero_block)
+        self.assertEqual(self.store.count_blocks(), 1)
+
+        # Now replace with a block that has real data
+        real_block = make_block("2026-03-01T00:00:00", imp_kwh=1.23, exp_kwh=0.45)
+        self.store.append_block_replace(real_block)
+        self.assertEqual(self.store.count_blocks(), 1, "Should still be 1 block")
+
+        blocks = self.store.get_all_blocks()
+        ch = blocks[0]["meters"]["electricity_main"]["channels"]["import"]
+        self.assertAlmostEqual(
+            ch["kwh"], 1.23, places=3,
+            msg="append_block_replace must overwrite zero block with real data"
+        )
+
+    def test_append_block_replace_inserts_when_absent(self):
+        """append_block_replace also inserts when no block exists at that start."""
+        block = make_block("2026-03-01T00:00:00", imp_kwh=0.5)
+        self.store.append_block_replace(block)
+        self.assertEqual(self.store.count_blocks(), 1)
+
+    def test_append_block_ignore_skips_existing(self):
+        """Confirm original append_block still ignores duplicates (regression guard)."""
+        first = make_block("2026-03-01T00:00:00", imp_kwh=1.23)
+        self.store.append_block(first)
+        second = make_block("2026-03-01T00:00:00", imp_kwh=9.99)
+        self.store.append_block(second)
+        blocks = self.store.get_all_blocks()
+        ch = blocks[0]["meters"]["electricity_main"]["channels"]["import"]
+        self.assertAlmostEqual(ch["kwh"], 1.23, places=3,
+            msg="Original append_block must ignore duplicate, not overwrite")
+
+    def test_get_last_block_before(self):
+        """get_last_block_before returns the last finalised block before given start."""
+        for i, start in enumerate(["2026-03-01T00:00:00", "2026-03-01T00:30:00",
+                                   "2026-03-01T01:00:00"]):
+            self.store.append_block(make_block(start, imp_kwh=float(i + 1)))
+
+        result = self.store.get_last_block_before("2026-03-01T01:00:00")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["start"], "2026-03-01T00:30:00")
+
+    def test_get_last_block_before_none_when_no_earlier_blocks(self):
+        """get_last_block_before returns None if all blocks are at or after anchor."""
+        self.store.append_block(make_block("2026-03-01T01:00:00"))
+        result = self.store.get_last_block_before("2026-03-01T01:00:00")
+        self.assertIsNone(result)
+
+
         blocks = [
             make_block((datetime(2026, 3, 1) + timedelta(minutes=30 * i)).isoformat())
             for i in range(48)
@@ -1192,6 +1243,47 @@ class TestCurrentBlock(unittest.TestCase):
         self.assertAlmostEqual(
             pre["electricity_main"]["import"]["value"], 27999.9, places=3
         )
+
+    def test_gap_marker_last_block_start_roundtrip(self):
+        """gap_last_block_start is persisted and restored correctly."""
+        block = self._make_block()
+        block["_gap_marker"] = {
+            "detected_at": "2026-04-05T00:05:00",
+            "pre_reads": {
+                "electricity_main": {"import": {"ts": "2026-04-04T23:55:00", "value": 27999.9}}
+            },
+            "last_known_rates": {
+                "electricity_main": {"import": {"ts": "2026-04-04T23:55:00", "value": 0.245}}
+            },
+            "last_block_start": "2026-04-04T23:50:00",
+        }
+        self.store.save_current_block(block)
+
+        # Verify stored in column
+        row = self.store._conn.execute(
+            "SELECT gap_last_block_start FROM current_block WHERE id=1"
+        ).fetchone()
+        self.assertEqual(row["gap_last_block_start"], "2026-04-04T23:50:00")
+
+        # Verify full roundtrip
+        loaded = self.store.load_current_block()
+        self.assertEqual(
+            loaded["_gap_marker"]["last_block_start"], "2026-04-04T23:50:00"
+        )
+
+    def test_gap_marker_last_block_start_none_when_absent(self):
+        """If last_block_start not set, roundtrip returns None not KeyError."""
+        block = self._make_block()
+        block["_gap_marker"] = {
+            "detected_at": "2026-04-05T00:05:00",
+            "pre_reads": {
+                "electricity_main": {"import": {"ts": "2026-04-04T23:55:00", "value": 27999.9}}
+            },
+            "last_known_rates": {},
+        }
+        self.store.save_current_block(block)
+        loaded = self.store.load_current_block()
+        self.assertIsNone(loaded["_gap_marker"]["last_block_start"])
 
     def test_no_gap_marker_absent(self):
         block = self._make_block()

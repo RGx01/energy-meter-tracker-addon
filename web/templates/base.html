@@ -165,6 +165,35 @@
       flex-shrink: 0; /* never compress — always full height */
     }
 
+    .settings-tabs {
+      display: flex;
+      gap: 8px;
+    }
+    .settings-tab {
+      padding: 7px 16px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--muted);
+      font-size: 13px;
+      font-family: var(--sans);
+      cursor: pointer;
+      text-decoration: none;
+      transition: all 0.15s;
+    }
+    .settings-tab:hover { background: rgba(255,255,255,0.05); color: var(--text); }
+    .settings-tab.active { background: rgba(0,212,170,0.1); color: var(--accent); border-color: var(--accent); }
+
+    .settings-subbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 32px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
     .topbar h2 {
       font-size: 16px;
       font-weight: 600;
@@ -391,18 +420,21 @@
       <p>Home Assistant Add-on</p>
     </div>
     <nav>
-      <a href="{{ url_for('config_page') }}"  class="{{ 'active' if active in ('config', 'config_history') }}">
-        <span class="nav-icon">⚙️</span> Meter Config
+      <a href="{{ url_for('settings_page') }}"  class="{{ 'active' if active == 'settings' }}">
+        <span class="nav-icon">⚙️</span> Settings
       </a>
       <a href="{{ url_for('charts_page') }}"  class="{{ 'active' if active == 'charts' }}">
         <span class="nav-icon">📊</span> Charts
       </a>
+      <a href="{{ url_for('insights_page') }}" class="{{ 'active' if active == 'insights' }}">
+        <span class="nav-icon">🌿</span> Insights
+      </a>
       {% if has_power_sensor %}
-      <a href="{{ url_for('summary_page') }}" class="{{ 'active' if active == 'summary' }}">
+      <a href="{{ url_for('live_power_page') }}" class="{{ 'active' if active == 'live_power' }}">
         <span class="nav-icon">⚡</span> Live Power
       </a>
       {% endif %}
-      <a href="{{ url_for('import_page') }}"  class="{{ 'active' if active == 'import' }}">
+      <a href="{{ url_for('data_management_page') }}"  class="{{ 'active' if active == 'data_management' }}">
         <span class="nav-icon">🗄️</span> Data Management
       </a>
       <a href="{{ url_for('logs_page') }}"    class="{{ 'active' if active == 'logs' }}">
@@ -424,6 +456,7 @@
       <button class="hamburger" onclick="toggleSidebar()">&#9776;</button>
     </div>
     {% block topbar %}{% endblock %}
+    {% block subbar %}{% endblock %}
     <div class="content">
       {% block content %}{% endblock %}
     </div>

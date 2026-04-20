@@ -475,6 +475,30 @@ class TestBuildGapBlocks(unittest.TestCase):
         self.assertEqual(len(blocks), 1)
         self.assertEqual(blocks[0]["totals"]["import_kwh"], 0.0)
 
+    def test_missing_post_read_uses_last_known_rate(self):
+        """If post_read is missing for a channel, the block gets rate from
+        last_known_rates rather than defaulting to 0.0."""
+        # Only export has a post read — import is missing
+        pre   = {"electricity_main": {
+            "import": read(1000.0, "2026-01-01T09:15:00"),
+            "export": read(500.0,  "2026-01-01T09:15:00"),
+        }}
+        post  = {"electricity_main": {
+            # import post read absent — simulates only export sensor firing
+            "export": read(501.0,  "2026-01-01T10:15:00"),
+        }}
+        rates = {"electricity_main": {
+            "import": {"ts": "2026-01-01T09:00:00", "value": 0.3582},
+            "export": {"ts": "2026-01-01T09:00:00", "value": 0.0},
+        }}
+        blocks = engine.build_gap_blocks(self.window, pre, post, rates, self.config)
+        self.assertEqual(len(blocks), 1)
+        ch = blocks[0]["meters"]["electricity_main"]["channels"]["import"]
+        self.assertAlmostEqual(ch["rate"], 0.3582, places=4,
+            msg="Missing post_read channel must use last_known_rates rate, not 0.0")
+        self.assertEqual(ch["kwh"], 0.0,
+            msg="Missing post_read channel must have zero kWh")
+
     def test_multiple_windows(self):
         windows = [
             (dt("2026-01-01T09:30:00"), dt("2026-01-01T10:00:00")),
