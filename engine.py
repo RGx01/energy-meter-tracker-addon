@@ -206,11 +206,13 @@ def detect_currency_symbol(unit_of_measurement: str) -> str:
 
 def load_config() -> dict:
     """
-    Load meter configuration from the normalised DB tables.
-    Falls back to meters_config.json only before the DB is open (startup)
-    or if no config period exists yet (fresh install).
+    Load meter configuration from the normalised DB (blocks.db) config_periods table.
+    The DB is the single source of truth. meters_config.json is only used before
+    the DB is open at startup on a truly fresh install with no DB file.
     """
     global _store
+    db_exists = os.path.exists(os.path.join(DATA_DIR, "blocks.db"))
+
     if _store is not None:
         try:
             cp = _store._conn.execute(
@@ -219,9 +221,24 @@ def load_config() -> dict:
             ).fetchone()
             if cp:
                 return _store.config_from_db(cp["id"])
+            # DB open but no config period — fresh DB
+            if db_exists:
+                logger.warning("load_config: DB open but no active config period")
+                return {"meters": {}}
         except Exception as _e:
-            logger.warning("load_config: DB read failed, falling back to file: %s", _e)
-    # Pre-startup fallback — DB not open yet or fresh install
+            logger.error("load_config: DB read failed: %s", _e)
+            if db_exists:
+                logger.error("load_config: DB exists — not falling back to JSON")
+                return {"meters": {}}
+
+    # Pre-startup: DB not open yet
+    if db_exists:
+        # DB exists but store not open yet — don't use stale JSON
+        logger.warning("load_config: store not open, DB exists — returning empty config")
+        return {"meters": {}}
+
+    # True fresh install: no DB, use meters_config.json
+    logger.info("load_config: no DB found, loading from meters_config.json")
     return load_json(CONFIG_PATH, {"meters": {}})
 
 
@@ -575,9 +592,13 @@ def compute_channel(channel: dict, parent_rates=None, is_sub_meter: bool = False
         total_kwh  += delta
         total_cost += delta * current_rate
 
+    # Store weighted average rate (total_cost / total_kwh) so the chart rate
+    # line reflects actual blended cost rather than always showing the last
+    # (typically standard) rate. Falls back to last rate if kwh is zero.
+    display_rate = round(total_cost / total_kwh, 6) if total_kwh > 0 else corrected_rates[-1]["value"]
     return {
         "kwh":        total_kwh,
-        "rate":       corrected_rates[-1]["value"],
+        "rate":       display_rate,
         "cost":       total_cost,
         "read_start": reads[0]["value"],
         "read_end":   reads[-1]["value"],

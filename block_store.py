@@ -566,6 +566,35 @@ class BlockStore:
                 (captured_at, net_kw, intensity, carbon_gco2_min)
             )
 
+    # ── Settings ──────────────────────────────────────────────────────────────
+
+    def get_settings(self) -> dict:
+        """Return all settings as a dict. Missing keys return defaults."""
+        import json as _json
+        row = self._conn.execute(
+            "SELECT value FROM store_meta WHERE key = 'settings'"
+        ).fetchone()
+        if row and row['value']:
+            try:
+                return _json.loads(row['value'])
+            except Exception:
+                pass
+        return {}
+
+    def save_settings(self, settings: dict) -> None:
+        """Persist settings dict to store_meta."""
+        import json as _json
+        self._conn.execute(
+            "INSERT INTO store_meta (key, value) VALUES ('settings', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_json.dumps(settings),)
+        )
+        self._conn.commit()
+
+    def get_setting(self, key: str, default=None):
+        """Return a single setting value by key."""
+        return self.get_settings().get(key, default)
+
     def prune_power_history(self, hours: int = 48) -> int:
         """Delete power_history rows older than `hours` hours. Returns rows deleted."""
         cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)

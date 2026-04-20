@@ -132,6 +132,46 @@ def _run():
     serve(app, host="0.0.0.0", port=8099, threads=4)
 
 
+# ── Settings defaults ─────────────────────────────────────────────────────────
+
+# Carbon assumption defaults with citations.
+# Stored in store_meta['settings'] as JSON; missing keys fall back to these.
+SETTINGS_DEFAULTS = {
+    # ── Equivalence factors ────────────────────────────────────────────────
+    "co2_car_petrol_g_per_mile":   180.0,  # BEIS/DESNZ 2023 GHG conversion factors
+    "co2_car_diesel_g_per_mile":   168.0,  # BEIS/DESNZ 2023 GHG conversion factors
+    "co2_tree_kg_per_year":          21.0, # Woodland Trust estimate
+    "co2_flight_lhr_nyc_kg":        670.0, # BEIS 2023 (economy, radiative forcing)
+    # ── Display ────────────────────────────────────────────────────────────
+    "distance_unit":              "miles", # miles | km
+    # ── Export methodology ─────────────────────────────────────────────────
+    "co2_export_method":       "grid_average",  # grid_average | custom
+    "co2_export_custom_intensity":  200.0, # gCO₂/kWh — only if method=custom
+    # ── EV ─────────────────────────────────────────────────────────────────
+    "ev_efficiency":                  3.2, # miles/kWh or km/kWh (distance_unit)
+    "ev_charge_efficiency":          0.88, # AC→DC charge efficiency (IEA 2022, typical Type 2)
+    # ── Battery ────────────────────────────────────────────────────────────
+    "battery_round_trip_efficiency": 0.90, # round-trip AC→DC→AC (typical Li-ion home battery)
+    # ── Heat pump ──────────────────────────────────────────────────────────
+    "hp_cop":                         3.0, # seasonal COP (SCOP) — override with manufacturer spec
+    "gas_co2_g_per_kwh":            203.0, # BEIS/DESNZ 2023 GHG conversion factors
+    "gas_boiler_efficiency":         0.90, # typical modern condensing boiler
+}
+
+SETTINGS_NUMERIC = {
+    "co2_car_petrol_g_per_mile",
+    "co2_car_diesel_g_per_mile",
+    "co2_tree_kg_per_year",
+    "co2_flight_lhr_nyc_kg",
+    "co2_export_custom_intensity",
+    "ev_efficiency",
+    "ev_charge_efficiency",
+    "battery_round_trip_efficiency",
+    "hp_cop",
+    "gas_co2_g_per_kwh",
+    "gas_boiler_efficiency",
+}
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def config_path():
@@ -200,10 +240,13 @@ def _rebuild_config_period_chain(store):
 
 def load_config():
     """
-    Load meter configuration from the normalised DB tables.
-    Falls back to meters_config.json only for fresh installs before any
-    config period exists.
+    Load meter configuration from the normalised DB (blocks.db) config_periods table.
+    The DB is the single source of truth — meters_config.json is only used as a
+    last resort for a truly fresh install where blocks.db does not yet exist.
     """
+    db_path = os.path.join(DATA_DIR, "blocks.db") if DATA_DIR else None
+    db_exists = db_path and os.path.exists(db_path)
+
     try:
         store = _get_store()
         cp = store._conn.execute(
@@ -212,12 +255,22 @@ def load_config():
         ).fetchone()
         if cp:
             return store.config_from_db(cp["id"])
-    except Exception:
-        pass
-    # Fallback: fresh install only
+        # DB exists but no config period yet — fresh DB, not a JSON fallback scenario
+        if db_exists:
+            logger.warning("load_config: blocks.db exists but no active config period found")
+            return {"schema_version": "1.0", "meters": {}}
+    except Exception as e:
+        logger.error("load_config: failed to read config from DB: %s", e)
+        # Only fall back to JSON if no DB exists at all
+        if db_exists:
+            logger.error("load_config: DB exists but config read failed — returning empty config")
+            return {"schema_version": "1.0", "meters": {}}
+
+    # True fresh install: no DB yet, try meters_config.json
     p = config_path()
     if not os.path.exists(p):
         return {"schema_version": "1.0", "meters": {}}
+    logger.info("load_config: no DB found, loading from meters_config.json")
     with open(p) as f:
         return json.load(f)
 
@@ -314,17 +367,29 @@ def index():
     cfg = load_config()
     if cfg.get("meters"):
         last = request.cookies.get("emt_last_page", "charts")
-        valid = {"charts", "summary", "import", "logs", "help", "config"}
-        if last not in valid:
-            last = "charts"
+        # Map old cookie values to new page names for backwards compatibility
+        page_map = {
+            "charts":   "charts",
+            "summary":  "live_power",
+            "import":   "data_management",
+            "logs":     "logs",
+            "help":     "help",
+            "config":   "settings",
+            # new names
+            "live_power":     "live_power",
+            "data_management": "data_management",
+            "settings":       "settings",
+            "insights":       "insights",
+        }
+        last = page_map.get(last, "charts")
         return redirect(url_for(last + "_page"))
-    return redirect(url_for("config_page"))
+    return redirect(url_for("settings_page"))
 
 
 @app.route("/api/last-page", methods=["POST"])
 def api_set_last_page():
     page = request.get_json(force=True).get("page", "charts")
-    valid = {"charts", "summary", "import", "logs", "help", "config"}
+    valid = {"charts", "live_power", "data_management", "logs", "help", "settings", "insights"}
     if page not in valid:
         page = "charts"
     resp = jsonify({"ok": True})
@@ -332,15 +397,7 @@ def api_set_last_page():
     return resp
 
 
-@app.route("/config")
-def config_page():
-    cfg = load_config()
-    try:
-        has_data = _get_store().count_blocks() > 0
-    except Exception:
-        has_data = False
-    tz_select_html = '<select class="js-meta" data-key="timezone"><option value="UTC">UTC</option><option value="Europe/London">Europe/London (UK)</option><option value="Europe/Dublin">Europe/Dublin (Ireland)</option><option value="Europe/Lisbon">Europe/Lisbon (Portugal)</option><option value="Europe/Paris">Europe/Paris (France, Belgium, Netherlands)</option><option value="Europe/Berlin">Europe/Berlin (Germany, Austria)</option><option value="Europe/Amsterdam">Europe/Amsterdam</option><option value="Europe/Rome">Europe/Rome (Italy)</option><option value="Europe/Madrid">Europe/Madrid (Spain)</option><option value="Europe/Stockholm">Europe/Stockholm (Sweden, Norway, Denmark)</option><option value="Europe/Helsinki">Europe/Helsinki (Finland)</option><option value="Europe/Warsaw">Europe/Warsaw (Poland)</option><option value="Europe/Athens">Europe/Athens (Greece)</option><option value="Europe/Istanbul">Europe/Istanbul (Turkey)</option><option value="Europe/Moscow">Europe/Moscow (Russia)</option><option value="America/New_York">America/New_York (US Eastern)</option><option value="America/Chicago">America/Chicago (US Central)</option><option value="America/Denver">America/Denver (US Mountain)</option><option value="America/Los_Angeles">America/Los_Angeles (US Pacific)</option><option value="America/Toronto">America/Toronto (Canada Eastern)</option><option value="America/Vancouver">America/Vancouver (Canada Pacific)</option><option value="America/Sao_Paulo">America/Sao_Paulo (Brazil)</option><option value="Asia/Dubai">Asia/Dubai (UAE)</option><option value="Asia/Kolkata">Asia/Kolkata (India)</option><option value="Asia/Singapore">Asia/Singapore</option><option value="Asia/Tokyo">Asia/Tokyo (Japan)</option><option value="Asia/Shanghai">Asia/Shanghai (China)</option><option value="Australia/Sydney">Australia/Sydney</option><option value="Australia/Perth">Australia/Perth</option><option value="Pacific/Auckland">Pacific/Auckland (New Zealand)</option></select>'
-    return render_template("config.html", config=cfg, active="config", tz_select_html=tz_select_html, has_data=has_data)
+
 
 
 @app.route("/static/logo.png")
@@ -485,8 +542,8 @@ def _format_billing(summary, cfg, currency):
 # Cache for gauge scale — recomputed at most every 30 minutes
 _gauge_cache = {"ts": None, "max_imp": 10, "max_exp": 5, "rate_low": 0.10, "rate_high": 0.25}
 
-@app.route("/summary")
-def summary_page():
+@app.route("/live-power")
+def live_power_page():
     from datetime import datetime
     from zoneinfo import ZoneInfo
     from energy_engine_io import load_json as _load_json
@@ -574,8 +631,8 @@ def summary_page():
     has_power_sensor = bool(main_meta.get("power_sensor"))
 
     return render_template(
-        "summary.html",
-        active="summary",
+        "live_power.html",
+        active="live_power",
         currency=currency,
         today_total=today_total,
         today_rows=today_rows,
@@ -968,24 +1025,24 @@ def api_carbon_current():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/import")
-def import_page():
-    return render_template("import.html", active="import")
+@app.route("/data-management")
+def data_management_page():
+    return render_template("data_management.html", active="data_management")
 
 
-@app.route("/config-history")
-def config_history_page():
-    return render_template("config_history.html", active="config_history")
+@app.route("/billing-history")
+def billing_history_page():
+    return render_template("billing_history.html", active="settings")
 
 
 @app.route("/delete-blocks")
 def delete_blocks_page():
-    return render_template("delete_blocks.html", active="import")
+    return render_template("delete_blocks.html", active="data_management")
 
 
 @app.route("/corrections")
 def corrections_page():
-    return render_template("corrections.html", active="import")
+    return render_template("corrections.html", active="data_management")
 
 
 # ── Chart file serving ────────────────────────────────────────────────────────
@@ -2105,6 +2162,337 @@ def api_backup_restore():
         if _eng_fin and hasattr(_eng_fin, "resume_engine"):
             try: _eng_fin.resume_engine()
             except Exception: pass
+
+
+@app.route("/insights")
+def insights_page():
+    return render_template("insights.html", active="insights")
+
+
+@app.route("/settings")
+def settings_page():
+    tab = request.args.get("tab", "meter-config")
+    if tab == "carbon":
+        return render_template("settings.html", active="settings")
+    # Default: Meter Config tab
+    store = _get_store()
+    cfg   = load_config()
+    tz_select_html = '<select class="js-meta" data-key="timezone"><option value="UTC">UTC</option><option value="Europe/London">Europe/London (UK)</option><option value="Europe/Dublin">Europe/Dublin (Ireland)</option><option value="Europe/Lisbon">Europe/Lisbon (Portugal)</option><option value="Europe/Paris">Europe/Paris (France, Belgium, Netherlands)</option><option value="Europe/Berlin">Europe/Berlin (Germany, Austria)</option><option value="Europe/Amsterdam">Europe/Amsterdam</option><option value="Europe/Rome">Europe/Rome (Italy)</option><option value="Europe/Madrid">Europe/Madrid (Spain)</option><option value="Europe/Stockholm">Europe/Stockholm (Sweden, Norway, Denmark)</option><option value="Europe/Helsinki">Europe/Helsinki (Finland)</option><option value="Europe/Warsaw">Europe/Warsaw (Poland)</option><option value="Europe/Athens">Europe/Athens (Greece)</option><option value="Europe/Istanbul">Europe/Istanbul (Turkey)</option><option value="Europe/Moscow">Europe/Moscow (Russia)</option><option value="America/New_York">America/New_York (US Eastern)</option><option value="America/Chicago">America/Chicago (US Central)</option><option value="America/Denver">America/Denver (US Mountain)</option><option value="America/Los_Angeles">America/Los_Angeles (US Pacific)</option><option value="America/Toronto">America/Toronto (Canada Eastern)</option><option value="America/Vancouver">America/Vancouver (Canada Pacific)</option><option value="America/Sao_Paulo">America/Sao_Paulo (Brazil)</option><option value="Asia/Dubai">Asia/Dubai (UAE)</option><option value="Asia/Kolkata">Asia/Kolkata (India)</option><option value="Asia/Singapore">Asia/Singapore</option><option value="Asia/Tokyo">Asia/Tokyo (Japan)</option><option value="Asia/Shanghai">Asia/Shanghai (China)</option><option value="Australia/Sydney">Australia/Sydney</option><option value="Australia/Perth">Australia/Perth</option><option value="Pacific/Auckland">Pacific/Auckland (New Zealand)</option></select>'
+    has_data = bool(store.get_all_blocks())
+    return render_template(
+        "meter_config.html",
+        config=cfg,
+        active="settings",
+        tz_select_html=tz_select_html,
+        has_data=has_data
+    )
+
+
+@app.route("/api/settings", methods=["GET"])
+def api_settings_get():
+    """Return current settings merged with defaults."""
+    store = _get_store()
+    saved = store.get_settings()
+    # Merge saved over defaults — any missing key falls back to default
+    result = dict(SETTINGS_DEFAULTS)
+    result.update(saved)
+    return jsonify(result)
+
+
+@app.route("/api/settings", methods=["POST"])
+def api_settings_post():
+    """Save settings. Only known keys accepted."""
+    store = _get_store()
+    data = request.get_json(force=True) or {}
+    saved = store.get_settings()
+    for key in SETTINGS_DEFAULTS:
+        if key in data:
+            val = data[key]
+            # Numeric fields
+            if key in SETTINGS_NUMERIC:
+                try:
+                    val = float(val)
+                    if val <= 0:
+                        return jsonify({"error": f"{key} must be positive"}), 400
+                except (TypeError, ValueError):
+                    return jsonify({"error": f"{key} must be a number"}), 400
+            saved[key] = val
+    store.save_settings(saved)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/insights/periods")
+def api_insights_periods():
+    """Return list of all billing periods with basic carbon summary for each."""
+    try:
+        import energy_charts as _ec
+        from zoneinfo import ZoneInfo as _ZI
+        from datetime import datetime, timezone
+        store   = _get_store()
+        cfg     = load_config()
+        tz_name = "Europe/London"
+        for mid, md in (cfg.get("meters") or {}).items():
+            tz_name = (md.get("meta") or {}).get("timezone", "Europe/London")
+            break
+        periods = _ec.get_billing_periods_from_config_periods(
+            store.get_config_periods(), tz=_ZI(tz_name)
+        )
+        now_local = datetime.now(_ZI(tz_name)).replace(tzinfo=None)  # periods are naive local datetimes
+        result = []
+        for (ps, pe) in periods:
+            is_current = ps <= now_local < pe
+            ps_iso = ps.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+            pe_iso = pe.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+            rows = store._conn.execute("""
+                SELECT
+                    SUM(CASE WHEN carbon_g IS NOT NULL THEN imp_kwh ELSE 0 END) AS imp_kwh_ci,
+                    SUM(CASE WHEN carbon_g IS NOT NULL THEN exp_kwh ELSE 0 END) AS exp_kwh_ci,
+                    SUM(CASE WHEN carbon_g IS NOT NULL THEN carbon_g ELSE 0 END) AS carbon_g_net,
+                    COUNT(CASE WHEN carbon_g IS NOT NULL THEN 1 END) AS ci_blocks,
+                    COUNT(*) AS total_blocks
+                FROM blocks
+                WHERE meter_id NOT IN (
+                    SELECT meter_id FROM meters WHERE is_sub_meter = 1
+                )
+                AND block_start >= ? AND block_start < ?
+            """, (ps_iso, pe_iso)).fetchone()
+            r = dict(rows) if rows else {}
+            result.append({
+                "period_start":  ps.date().isoformat(),
+                "period_end":    pe.date().isoformat(),
+                "is_current":    is_current,
+                "has_carbon":    (r.get("ci_blocks") or 0) > 0,
+                "carbon_g_net":  r.get("carbon_g_net"),
+            })
+        return jsonify({"periods": result})
+    except Exception as e:
+        logger.exception("api_insights_periods failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/insights/billing-period")
+def api_insights_billing_period():
+    """
+    Full carbon insights for a billing period.
+    Query params: period_start=YYYY-MM-DD (local date of period start).
+    If omitted, returns the most recent period.
+    """
+    try:
+        import energy_charts as _ec
+        from zoneinfo import ZoneInfo as _ZI
+        from datetime import datetime, timezone
+        store   = _get_store()
+        cfg     = load_config()
+        tz_name = "Europe/London"
+        for mid, md in (cfg.get("meters") or {}).items():
+            tz_name = (md.get("meta") or {}).get("timezone", "Europe/London")
+            break
+        tz = _ZI(tz_name)
+
+        periods = _ec.get_billing_periods_from_config_periods(
+            store.get_config_periods(), tz=tz
+        )
+        if not periods:
+            return jsonify({"error": "No billing periods found"}), 404
+
+        # Find requested period
+        requested  = request.args.get("period_start")
+        now_local  = datetime.now(tz).replace(tzinfo=None)  # periods are naive local datetimes
+        target_ps = target_pe = None
+        for (ps, pe) in periods:
+            if requested:
+                if ps.date().isoformat() == requested:
+                    target_ps, target_pe = ps, pe
+                    break
+            else:
+                target_ps, target_pe = ps, pe  # last one wins = most recent
+
+        if not target_ps:
+            return jsonify({"error": "Billing period not found"}), 404
+
+        is_current = target_ps <= now_local < target_pe
+        ps_iso = target_ps.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+        pe_iso = target_pe.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+
+        # Get meter config for sub-meter classification
+        meters_cfg = cfg.get("meters") or {}
+        sub_meter_ids = {
+            mid for mid, md in meters_cfg.items()
+            if (md.get("meta") or {}).get("sub_meter")
+        }
+
+        def _meter_type(mid, md):
+            """Resolve meter type from meta key or fall back to meter ID keywords."""
+            explicit = (md.get("meta") or {}).get("meter_type", "")
+            if explicit:
+                return explicit
+            mid_l = mid.lower()
+            if any(k in mid_l for k in ("ev", "charger")):      return "ev_charger"
+            if any(k in mid_l for k in ("battery", "batt")):    return "battery"
+            if any(k in mid_l for k in ("heat", "pump")):       return "heat_pump"
+            if any(k in mid_l for k in ("solar", "pv", "inv")): return "inverter"
+            return "unknown"
+
+        # Fetch blocks for this period using range query (efficient)
+        from datetime import datetime as _dt
+        _ps_dt = _dt.fromisoformat(ps_iso)
+        _pe_dt = _dt.fromisoformat(pe_iso)
+        period_blocks = store.get_blocks_for_range(_ps_dt, _pe_dt)
+
+        # ── Main meter aggregation ─────────────────────────────────────────────
+        main_imp_kwh = main_exp_kwh = 0.0
+        main_ci_imp_kwh = main_ci_exp_kwh = 0.0  # kWh only from CI blocks
+        cg_imp = cg_exp = cg_net = 0.0
+        ci_kwh_weighted = ci_duration = 0.0
+        eff_carbon = eff_kwh = 0.0
+        has_carbon = False
+        block_minutes = 30
+        if meters_cfg:
+            first_mid = next(iter(meters_cfg))
+            block_minutes = int((meters_cfg[first_mid].get("meta") or {}).get("block_minutes", 30) or 30)
+
+        for block in period_blocks:
+            for mid, md in (block.get("meters") or {}).items():
+                if mid in sub_meter_ids:
+                    continue
+                ch_imp = ((md.get("channels") or {}).get("import") or {})
+                ch_exp = ((md.get("channels") or {}).get("export") or {})
+                b_imp  = float(ch_imp.get("kwh") or 0)
+                b_exp  = float(ch_exp.get("kwh") or 0)
+                b_net  = b_imp - b_exp
+                main_imp_kwh += b_imp
+                main_exp_kwh += b_exp
+
+                cg = md.get("carbon_g")
+                if cg is None:
+                    continue
+                cg = float(cg)
+                has_carbon = True
+                cg_net += cg
+                main_ci_imp_kwh += b_imp
+                main_ci_exp_kwh += b_exp
+
+                if b_net != 0:
+                    b_intensity = abs(cg / b_net)
+                    cg_imp += b_imp * b_intensity
+                    cg_exp += b_exp * b_intensity
+                elif b_imp > 0:
+                    cg_imp += abs(cg)
+                else:
+                    cg_exp += abs(cg)
+
+                if b_net != 0:
+                    b_intensity = abs(cg / b_net)
+                    ci_kwh_weighted += b_intensity * block_minutes
+                    ci_duration     += block_minutes
+                    eff_carbon += abs(cg)
+                    eff_kwh    += abs(b_net)
+
+        effective_intensity = round(eff_carbon / eff_kwh, 1) if eff_kwh > 0 else None
+        grid_avg_intensity  = round(ci_kwh_weighted / ci_duration, 1) if ci_duration > 0 else None
+
+        # ── Sub-meter aggregation ──────────────────────────────────────────────
+        sub_totals = {}
+        # Track total sub-meter import for house remainder calculation
+        total_sub_imp_kwh   = 0.0
+        total_sub_carbon_g  = 0.0
+        for block in period_blocks:
+            for mid, md in (block.get("meters") or {}).items():
+                if mid not in sub_meter_ids:
+                    continue
+                if mid not in sub_totals:
+                    _m_meta = (meters_cfg.get(mid, {}).get("meta") or {})
+                    sub_totals[mid] = {
+                        "imp_kwh":            0.0,
+                        "carbon_g":           0.0,
+                        "ci_blocks":          0,
+                        "ci_imp_kwh":         0.0,  # kWh only from blocks with CI data
+                        "total_blocks":       0,
+                        "meter_type":         _meter_type(mid, meters_cfg.get(mid, {})),
+                        "inverter_possible":  bool(_m_meta.get("inverter_possible")),
+                        # For charging intensity: weighted sum of intensity × kwh
+                        "ci_kwh_weighted":    0.0,
+                        "ci_kwh_duration":    0.0,
+                    }
+                ch_imp = ((md.get("channels") or {}).get("import") or {})
+                b_imp  = float(ch_imp.get("kwh") or 0)
+                sub_totals[mid]["imp_kwh"]      += b_imp
+                sub_totals[mid]["total_blocks"]  += 1
+                total_sub_imp_kwh += b_imp
+                cg = md.get("carbon_g")
+                if cg is not None:
+                    cg_f = float(cg)
+                    sub_totals[mid]["carbon_g"]   += cg_f
+                    sub_totals[mid]["ci_blocks"]  += 1
+                    sub_totals[mid]["ci_imp_kwh"] += b_imp  # kWh only from CI blocks
+                    total_sub_carbon_g += cg_f
+                    # Derive charging intensity for this block
+                    if b_imp > 0.001:
+                        b_intensity = abs(cg_f / b_imp)
+                        sub_totals[mid]["ci_kwh_weighted"] += b_intensity * b_imp
+                        sub_totals[mid]["ci_kwh_duration"] += b_imp
+
+        # Compute weighted average charging intensity per sub-meter
+        for mid, st in sub_totals.items():
+            if st["ci_kwh_duration"] > 0:
+                st["avg_charge_intensity"] = round(
+                    st["ci_kwh_weighted"] / st["ci_kwh_duration"], 1
+                )
+            else:
+                st["avg_charge_intensity"] = None
+            # Clean up internal accumulators before sending to client
+            del st["ci_kwh_weighted"]
+            del st["ci_kwh_duration"]
+
+        # ── House remainder ────────────────────────────────────────────────────
+        house_imp_kwh    = max(0.0, main_imp_kwh - total_sub_imp_kwh)
+        house_ci_imp_kwh = max(0.0, main_ci_imp_kwh - sum(
+            st.get("ci_imp_kwh", 0.0) for st in sub_totals.values()
+        ))
+        house_carbon_g   = max(0.0, cg_imp - total_sub_carbon_g) if has_carbon else None
+
+        # ── Settings ──────────────────────────────────────────────────────────
+        settings = store.get_settings()
+        merged   = dict(SETTINGS_DEFAULTS)
+        merged.update(settings)
+
+        # ── Carbon coverage ────────────────────────────────────────────────────
+        total_blocks = sum(
+            1 for b in period_blocks
+            for mid in (b.get("meters") or {})
+            if mid not in sub_meter_ids
+        )
+        ci_blocks = sum(
+            1 for b in period_blocks
+            for mid, md in (b.get("meters") or {}).items()
+            if mid not in sub_meter_ids and md.get("carbon_g") is not None
+        )
+        coverage_pct = round(ci_blocks / total_blocks * 100, 1) if total_blocks else 0
+
+        return jsonify({
+            "period_start":         target_ps.date().isoformat(),
+            "period_end":           target_pe.date().isoformat(),
+            "is_current":           is_current,
+            "has_carbon":           has_carbon,
+            "carbon_coverage_pct":  coverage_pct,
+            "imp_kwh":              round(main_imp_kwh, 3),
+            "exp_kwh":              round(main_exp_kwh, 3),
+            "ci_imp_kwh":           round(main_ci_imp_kwh, 3),
+            "ci_exp_kwh":           round(main_ci_exp_kwh, 3),
+            "carbon_g_imp":         round(cg_imp, 1) if has_carbon else None,
+            "carbon_g_exp":         round(cg_exp, 1) if has_carbon else None,
+            "carbon_g_net":         round(cg_net, 1) if has_carbon else None,
+            "effective_intensity":  effective_intensity,
+            "grid_avg_intensity":   grid_avg_intensity,
+            "sub_meters":           sub_totals,
+            "house_imp_kwh":        round(house_imp_kwh, 3),
+            "house_ci_imp_kwh":     round(house_ci_imp_kwh, 3),
+            "house_carbon_g":       round(house_carbon_g, 1) if house_carbon_g is not None else None,
+            "assumptions":          merged,
+        })
+    except Exception as e:
+        logger.exception("api_insights_billing_period failed")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/storage-info")
