@@ -1892,7 +1892,7 @@ def api_backup_list():
     try:
         zips = sorted(glob.glob(f"{SHARE_BACKUP_DIR}/backups/*.zip"), reverse=True)
         # Check for flat files from last finalise
-        primary = ["blocks.db", "meters_config.json"]
+        primary = ["blocks.db"]
         legacy  = ["blocks.json"]   # written by 1.x/2.0.x, no longer updated
         flat_files = []
         for fname in primary + legacy:
@@ -1925,7 +1925,7 @@ def api_backup_restore():
         zipname   = data.get("zip", "")
         selected  = data.get("files", None)
         from_flat = data.get("from_flat", False)
-        known     = {"blocks.db", "blocks.json", "meters_config.json"}
+        known     = {"blocks.db", "blocks.json"}
 
         if not from_flat:
             if not zipname or "/" in zipname or "\\" in zipname:
@@ -2073,82 +2073,16 @@ def api_backup_restore():
             except Exception as _mig_e:
                 logger.warning("api_backup_restore: schema migration failed: %s", _mig_e)
 
-        # ── Sync meters_config.json ↔ active config period ─────────────────
-        try:
-            import json as _json2
-            from energy_engine_io import load_json as _lj_sync, save_json_atomic as _sja_sync
-            cfg_path = os.path.join(DATA_DIR, "meters_config.json")
-            store_sync = _get_store()
-
-            if "blocks.db" in restored:
-                active_cp = store_sync._conn.execute(
-                    "SELECT id FROM config_periods WHERE effective_to IS NULL "
-                    "ORDER BY effective_from DESC LIMIT 1"
-                ).fetchone()
-                if active_cp:
-                    db_cfg = store_sync.config_from_db(active_cp["id"])
-                    if db_cfg.get("meters"):
-                        _sja_sync(cfg_path, db_cfg)
-                        logger.info(
-                            "api_backup_restore: meters_config.json written "
-                            "from active config period in restored DB"
-                        )
-                        restored.append("meters_config.json (synced from restored blocks.db)")
-
-            elif "meters_config.json" in restored and "blocks.db" not in restored:
-                # meters_config.json only (no DB) — push file into normalised tables.
-                restored_cfg = _lj_sync(cfg_path, {})
-                if restored_cfg:
-                    active_cp = store_sync._conn.execute(
-                        "SELECT id FROM config_periods WHERE effective_to IS NULL "
-                        "ORDER BY effective_from DESC LIMIT 1"
-                    ).fetchone()
-                    if active_cp:
-                        main_meta = {}
-                        for md in restored_cfg.get("meters", {}).values():
-                            if not (md.get("meta") or {}).get("sub_meter"):
-                                main_meta = md.get("meta") or {}
-                                break
-                        period_id = active_cp["id"]
-                        store_sync._conn.execute(
-                            """UPDATE config_periods
-                               SET billing_day     = ?,
-                                   block_minutes   = ?,
-                                   timezone        = ?,
-                                   currency_symbol = ?,
-                                   currency_code   = ?,
-                                   site_name       = ?,
-                                   supplier        = ?
-                               WHERE id = ?""",
-                            (
-                                int(main_meta.get("billing_day") or 1),
-                                int(main_meta.get("block_minutes") or 30),
-                                main_meta.get("timezone", "UTC"),
-                                main_meta.get("currency_symbol", "£"),
-                                main_meta.get("currency_code", "GBP"),
-                                main_meta.get("site"),
-                                main_meta.get("supplier"),
-                                period_id,
-                            )
-                        )
-                        old_mids = [r["id"] for r in store_sync._conn.execute(
-                            "SELECT id FROM meters WHERE config_period_id=?", (period_id,)
-                        ).fetchall()]
-                        for mid in old_mids:
-                            store_sync._conn.execute(
-                                "DELETE FROM meter_channels WHERE meter_id=?", (mid,))
-                        store_sync._conn.execute(
-                            "DELETE FROM meters WHERE config_period_id=?", (period_id,))
-                        store_sync._write_meters(restored_cfg, period_id)
-                        store_sync._conn.commit()
-                        logger.info(
-                            "api_backup_restore: active config period updated "
-                            "from restored meters_config.json"
-                        )
-                        restored.append("config_periods (synced from meters_config.json)")
-
-        except Exception as _sync_e:
-            logger.warning("api_backup_restore: config sync failed: %s", _sync_e)
+        # Re-run engine_startup so gap detection runs against the restored DB.
+        # resume_engine() alone just unpauses the tick loop — it doesn't detect
+        # the session gap between the backup timestamp and now. engine_startup()
+        # reads the last finalised block, detects the gap, sets a gap marker and
+        # fills missing blocks as soon as the first live sensor read arrives.
+        import asyncio as _asyncio_r
+        from engine import engine_startup as _engine_startup_r
+        if _event_loop and _event_loop.is_running() and _ha_client:
+            _asyncio_r.run_coroutine_threadsafe(_engine_startup_r(_ha_client), _event_loop)
+            logger.info("api_backup_restore: engine_startup scheduled for gap detection")
 
         return jsonify({"ok": True, "restored": restored})
     except Exception as e:
@@ -2552,7 +2486,7 @@ def api_import_extract_zip():
         zf_file = request.files.get("zipfile")
         if not zf_file:
             return jsonify({"error": "No zip file provided"}), 400
-        known = {"blocks.db", "blocks.json", "meters_config.json"}
+        known = {"blocks.db", "blocks.json"}
         files = {}
         with zipfile.ZipFile(zf_file.stream, "r") as zf:
             for name in zf.namelist():
@@ -2560,7 +2494,7 @@ def api_import_extract_zip():
                 if basename in known:
                     files[basename] = base64.b64encode(zf.read(name)).decode("utf-8")
         if not files:
-            return jsonify({"error": "No recognised JSON files found in zip"}), 400
+            return jsonify({"error": "No recognised files found in zip"}), 400
         logger.info("api_import_extract_zip: extracted %s", list(files.keys()))
         return jsonify({"files": files})
     except Exception as e:
@@ -2581,13 +2515,15 @@ def api_backup_flat_info():
     """
     from datetime import datetime as _dt
     # Primary files — written by current engine
-    primary = ["blocks.db", "meters_config.json"]
+    primary = ["blocks.db"]
     # Legacy files — may be present from older versions, no longer written
     legacy  = ["blocks.json"]
 
     files = {}
     for fname in primary + legacy:
         fpath = f"{SHARE_BACKUP_DIR}/{fname}"
+        if fname == "meters_config.json":
+            continue  # no longer a restore target — config lives inside blocks.db
         if os.path.exists(fpath):
             mtime = os.path.getmtime(fpath)
             size  = os.path.getsize(fpath)
@@ -2614,7 +2550,7 @@ def api_import_extract_zip_by_name():
         zip_path = f"{SHARE_BACKUP_DIR}/backups/{zipname}"
         if not os.path.exists(zip_path):
             return jsonify({"error": "Backup not found"}), 404
-        known = {"blocks.db", "blocks.json", "meters_config.json"}
+        known = {"blocks.db", "blocks.json"}
         files = {}
         with zipfile.ZipFile(zip_path, "r") as zf:
             for name in zf.namelist():
@@ -2638,7 +2574,7 @@ def _create_backup_zip(label="backup"):
     os.makedirs(backup_dir, exist_ok=True)
     timestamp = _dt.utcnow().strftime("%Y%m%dT%H%M%S")
     zip_path  = f"{backup_dir}/{timestamp}_{label}.zip"
-    files = ["meters_config.json"]  # current_block and cumulative_totals now in DB
+    files = []  # blocks.db is the only file needed — config is inside it
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         # Backup blocks DB using SQLite online backup API into a temp file
         import tempfile
@@ -2730,7 +2666,7 @@ def api_import_from_zip():
         if engine and hasattr(engine, "pause_engine"):
             engine.pause_engine()
 
-        known    = {"blocks.db", "blocks.json", "meters_config.json"}
+        known    = {"blocks.db", "blocks.json"}
         imported = []
 
         # Auto-backup before overwriting
@@ -2787,42 +2723,16 @@ def api_import_from_zip():
         if not imported:
             return jsonify({"error": "No blocks.db found in zip"}), 400
 
-        # ── Post-import sync: write meters_config.json from restored DB ─────
-        # Use direct sqlite3 — NOT _get_store() — to avoid the BlockStore
-        # corruption-recovery handler nuking the just-restored file.
-        # Also remove any -wal/-shm files left by the engine before opening.
+        # ── Post-import: remove WAL/SHM and reset engine store ───────────────
+        # No need to write meters_config.json — engine_startup reads config
+        # directly from the restored DB on next start.
         if "blocks.db" in imported:
-            try:
-                import sqlite3 as _sq3
-                _dest = os.path.join(DATA_DIR, "blocks.db")
-                # Remove WAL/SHM files so BlockStore opens cleanly
-                for _ext in ("-wal", "-shm"):
-                    _f = _dest + _ext
-                    if os.path.exists(_f):
-                        try: os.remove(_f)
-                        except Exception: pass
-                # Switch journal mode to DELETE so next open isn't in WAL
-                _raw = _sq3.connect(_dest)
-                _raw.execute("PRAGMA journal_mode=DELETE")
-                _raw.close()
-                # Now open via BlockStore to read config
-                from block_store import BlockStore as _BS
-                _bs = _BS(_dest)
-                _acp = _bs._conn.execute(
-                    "SELECT id FROM config_periods WHERE effective_to IS NULL "
-                    "ORDER BY effective_from DESC LIMIT 1"
-                ).fetchone()
-                if _acp:
-                    db_cfg = _bs.config_from_db(_acp["id"])
-                    if db_cfg.get("meters"):
-                        from energy_engine_io import save_json_atomic as _sja_fz
-                        cfg_path = os.path.join(DATA_DIR, "meters_config.json")
-                        _sja_fz(cfg_path, db_cfg)
-                        imported.append("meters_config.json (synced from DB)")
-                        logger.info("api_import_from_zip: wrote meters_config.json from restored DB")
-                _bs.close()
-            except Exception as _se:
-                logger.warning("api_import_from_zip: post-sync failed: %s", _se)
+            _dest = os.path.join(DATA_DIR, "blocks.db")
+            for _ext in ("-wal", "-shm"):
+                _f = _dest + _ext
+                if os.path.exists(_f):
+                    try: os.remove(_f)
+                    except Exception: pass
 
         # Reset engine store so it reopens from the new DB file
         import sys as _sys
@@ -2892,57 +2802,25 @@ def api_import():
                 logger.error("server: blocks.db import failed: %s", _dbe)
                 raise
 
-        # ── meters_config.json ────────────────────────────────────────────────
-        # Only write the config file when blocks.db is NOT being restored —
-        # when the DB is restored it is authoritative and we write the config
-        # FROM the DB below, not from the uploaded file.
-        cfg_file = request.files.get("meters_config")
-        if cfg_file and "blocks.db" not in imported:
-            data = json.loads(cfg_file.read().decode("utf-8"))
-            dest = os.path.join(DATA_DIR, "meters_config.json")
-            tmp  = dest + ".tmp"
-            with open(tmp, "w") as out:
-                json.dump(data, out, indent=2)
-            os.replace(tmp, dest)
-            imported.append("meters_config.json")
-            logger.info("server: imported meters_config.json")
+        # ── meters_config.json upload ignored — config lives in blocks.db ───
+        # If a meters_config.json is uploaded alongside blocks.db, ignore it.
+        # The DB is authoritative; engine_startup reads config from it on next start.
 
         if not imported:
             if engine and hasattr(engine, 'resume_engine'):
                 engine.resume_engine()
             return jsonify({"error": "No files received"}), 400
 
-        # ── Post-import sync: DB → meters_config.json ─────────────────────────
+        # ── Post-import: close stores so engine reopens from new DB ──────────
         if "blocks.db" in imported:
-            try:
-                import sqlite3 as _sq3i
-                _dest_i = os.path.join(DATA_DIR, "blocks.db")
-                for _ext in ("-wal", "-shm"):
-                    _fi = _dest_i + _ext
-                    if os.path.exists(_fi):
-                        try: os.remove(_fi)
-                        except Exception: pass
-                _rawi = _sq3i.connect(_dest_i)
-                _rawi.execute("PRAGMA journal_mode=DELETE")
-                _rawi.close()
-                from block_store import BlockStore as _BSi
-                _bsi = _BSi(_dest_i)
-                _acpi = _bsi._conn.execute(
-                    "SELECT id FROM config_periods WHERE effective_to IS NULL "
-                    "ORDER BY effective_from DESC LIMIT 1"
-                ).fetchone()
-                if _acpi:
-                    db_cfg = _bsi.config_from_db(_acpi["id"])
-                    if db_cfg.get("meters"):
-                        from energy_engine_io import save_json_atomic as _sja_imp
-                        cfg_path = os.path.join(DATA_DIR, "meters_config.json")
-                        _sja_imp(cfg_path, db_cfg)
-                        imported.append("meters_config.json (synced from imported blocks.db)")
-                        logger.info("server: api_import wrote meters_config.json from restored DB")
-                _bsi.close()
-            except Exception as _se:
-                logger.warning("server: api_import post-sync failed: %s", _se)
-
+            # Remove WAL/SHM files left by running engine
+            import sqlite3 as _sq3i
+            _dest_i = os.path.join(DATA_DIR, "blocks.db")
+            for _ext in ("-wal", "-shm"):
+                _fi = _dest_i + _ext
+                if os.path.exists(_fi):
+                    try: os.remove(_fi)
+                    except Exception: pass
             # Reset engine store and web store so both reopen from new DB
             import sys as _sys2
             _eng2 = _sys2.modules.get("engine")

@@ -4,6 +4,14 @@
 
 ### Added
 
+- **`get_last_block_before(block_start)`** — new `BlockStore` method returning the most recently finalised block strictly before a given start timestamp. Used by gap detection to avoid catch-up zero blocks.
+
+- **`append_block_replace(block)`** — new `BlockStore` method using `INSERT OR REPLACE` instead of `INSERT OR IGNORE`. Used by gap fill to ensure catch-up zero blocks are always overwritten.
+
+- **`gap_last_block_start` column on `current_block`** — persists the start of the last finalised block at gap detection time so the gap fill tick can use it as the anchor regardless of what catch-up rollovers have written to the DB in the interim.
+
+- **Gap fill diagnostics logging** — `engine_startup` and gap fill now log `current_block.start`, `last_block start/end`, channel rates, `pre_reads`, `last_rates`, `post_reads`, `gap_anchor_ts`, and `missing_windows` first/last at INFO level to aid diagnosis of restore issues.
+
 - **Insights page** — new sidebar entry 🌿 between Charts and Live Power. Billing period carbon analysis with narrative cards. Period selector (prev/next) in topbar. Click any trend chart bar to navigate directly to that period.
 
 - **Carbon Summary card** — net kgCO₂ for the billing period, effective intensity vs grid average, import/export split, car/tree/flight equivalences, inline SVG trend chart across all periods, coverage warning when CI data is below 95%.
@@ -52,6 +60,20 @@
 
 - **Debug WARNING logs removed** from insights endpoints.
 
+- **Config not persisting after restore** — `engine_startup` previously called `load_config()` before opening the block store. With `_store=None` and `blocks.db` already present, `load_config()` returned `{}`, causing the startup config sync to reset scalar fields (billing day, timezone, etc.) to defaults and wipe sensor subscriptions. Fixed by opening the store before calling `load_config()` and removing the dangerous startup config sync entirely — the DB is authoritative.
+
+- **Import rate zero across all gap fill blocks** — when only the export sensor fires before the first tick after a restore (the common case), `post_reads` has no import channel entry. `build_gap_blocks` hit the "missing reads" branch and hardcoded `rate=0.0`. Fixed: the missing-reads branch now uses `last_known_rates` as a fallback so the rate is preserved even when no post-read is available.
+
+- **Unfinalised current_block window excluded from gap fill** — the gap anchor was derived from `pre_ts` (the last read timestamp), which put `detect_gap`'s `last_block_end` one block *after* the unfinalised current_block window, silently skipping it. Fixed by storing `last_block_start` in the gap marker (persisted to a new `gap_last_block_start` column on `current_block`) and using it as the anchor so the unfinalised window is always included in `missing_windows`.
+
+- **Zero-rate/zero-kWh blocks from catch-up rollovers not overwritten** — after restore, `ensure_correct_block` fires during `engine_startup` and writes zero-read catch-up blocks via `INSERT OR IGNORE`. Gap fill then silently skipped them. Fixed: gap fill now uses `INSERT OR REPLACE` (`append_block_replace`) so catch-up zero blocks are overwritten with interpolated data.
+
+- **Zero-rate blocks from catch-up rollovers contaminating last_known_rates** — `engine_startup` gap detection called `get_last_block()` which uses `MAX(block_start)`. After restore, catch-up rollovers fire during startup and write zero-rate blocks; by the time gap detection ran, `get_last_block()` returned one of those zero-rate blocks, infecting `last_known_rates` with `rate=0.0`. Fixed: gap detection now uses `get_last_block_before(current_block.start)` to always find the real last block from the restored DB.
+
+- **`meters_config.json` appearing in restore UI and backup zips** — removed from all known sets in zip extraction endpoints, from backup creation, from restore sync logic, and marked "No longer needed" in the data management UI.
+
+- **Backup filenames use UTC time** — backup zip filenames (e.g. `20260420T082255_manual.zip`) reflect UTC, not local time. This is consistent with how all block timestamps are stored internally. (Note for users in non-UTC timezones: the filename timestamp will differ from local clock time.)
+
 ### Templates removed (old names no longer served)
 
 - `config.html` — replaced by `meter_config.html`
@@ -60,7 +82,6 @@
 - `config_history.html` — replaced by `billing_history.html`
 
 ---
-
 
 ## [2.5.4] — 2026-04-19
 
@@ -308,7 +329,6 @@
   safety net.
 
 ---
-
 
 ## [2.3.0] — 2026-04-14
 

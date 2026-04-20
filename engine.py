@@ -129,6 +129,10 @@ def append_block(block: dict):
     get_store().append_block(block)
 
 
+def append_block_replace(block: dict):
+    get_store().append_block_replace(block)
+
+
 def io_save_file(path: str, content: str):
     save_file(path, content)
 
@@ -379,13 +383,16 @@ def _rate_value(rate_entry) -> float:
     return float(rate_entry or 0.0)
 
 
-def set_gap_marker(block: dict, pre_reads: dict, last_known_rates: dict):
+def set_gap_marker(block: dict, pre_reads: dict, last_known_rates: dict,
+                   last_block_start: str | None = None):
     block["_gap_marker"] = {
         "detected_at":      datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         "pre_reads":        pre_reads,
         "last_known_rates": last_known_rates,
+        "last_block_start": last_block_start,
     }
-    logger.info("set_gap_marker: stored at %s", block["_gap_marker"]["detected_at"])
+    logger.info("set_gap_marker: stored at %s last_block_start=%s",
+                block["_gap_marker"]["detected_at"], last_block_start)
 
 
 def clear_gap_marker(block: dict):
@@ -424,8 +431,19 @@ def read_sensor(ha: HAClient, entity_id: str, use_cache: bool = True) -> float |
 # Block rollover
 # ─────────────────────────────────────────────────────────────────────────────
 
-def ensure_correct_block(ha: HAClient, current_block: dict, now: datetime) -> dict:
+def ensure_correct_block(ha: HAClient, current_block: dict, now: datetime,
+                         last_known_rates: dict | None = None) -> dict:
     start, end = get_block_window(now, block_minutes=int(get_block_minutes()))
+
+    # Reload from store — a concurrent tick (e.g. gap fill) may have saved
+    # a more recent current_block since the caller loaded theirs.
+    fresh = _store.load_current_block()
+    if fresh and fresh.get("start"):
+        fresh_start = datetime.fromisoformat(fresh["start"])
+        if fresh_start != datetime.fromisoformat(current_block.get("start", "")):
+            logger.info("ensure_correct_block: current_block updated by concurrent tick (%s → %s), using fresh",
+                        current_block.get("start"), fresh["start"])
+            current_block = fresh
 
     if not current_block or not current_block.get("start"):
         logger.info("Creating first block %s", iso(start))
@@ -476,7 +494,12 @@ def ensure_correct_block(ha: HAClient, current_block: dict, now: datetime) -> di
         pre_reads, last_rates = extract_last_reads(current_block)
         set_gap_marker(current_block, pre_reads, last_rates)
 
-    finalise_block(ha, block_data=current_block)
+    # Skip chart regeneration during catch-up rollovers (more than one block
+    # behind now). Charts are expensive; we only need them current, not for
+    # every historical block we roll through after a gap or restore.
+    catching_up = (start - existing_start).total_seconds() > int(get_block_minutes()) * 60
+    finalise_block(ha, block_data=current_block, interpolated=catching_up,
+                   last_known_rates=last_known_rates)
 
     new_block = _store.load_current_block()
     if not new_block or not new_block.get("start"):
@@ -706,8 +729,9 @@ def build_gap_blocks(
 
                 if not pre_read or not post_read:
                     logger.warning("build_gap_blocks: missing reads for %s/%s", meter_name, channel_name)
+                    _fallback_rate = _rate_value(last_known_rates.get(meter_name, {}).get(channel_name, 0.0))
                     meter_block["channels"][channel_name] = {
-                        "kwh": 0.0, "rate": 0.0, "cost": 0.0,
+                        "kwh": 0.0, "rate": _fallback_rate, "cost": 0.0,
                         "read_start": 0.0, "read_end": 0.0, "interpolated": True,
                     }
                     continue
@@ -846,7 +870,8 @@ def generate_charts(store: "BlockStore"):
 # Block finalise
 # ─────────────────────────────────────────────────────────────────────────────
 
-def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: bool = False):
+def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: bool = False,
+                   last_known_rates: dict | None = None):
     cb = block_data if block_data is not None else _store.load_current_block()
 
     if not cb or not cb.get("meters"):
@@ -899,6 +924,13 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
             valid_rates = [r for r in rates if r["ts"] < boundary_iso]
             if not valid_rates and rates:
                 valid_rates = [rates[0]]
+            # Fallback to last_known_rates when no live rates are available
+            # (e.g. after a restore where stale reads were cleared)
+            if not valid_rates and last_known_rates:
+                _fallback = last_known_rates.get(meter_name, {}).get(channel_name)
+                if _fallback:
+                    _rate_val = _rate_value(_fallback)
+                    valid_rates = [{"ts": start, "value": _rate_val}]
 
             reads = channel.get("reads", [])
 
@@ -1341,6 +1373,7 @@ async def _engine_tick(ha: HAClient):
         capture_samples(ha, current_block, now)
 
     # Deferred gap filling
+    _post_gap_rates = None  # set if gap fill runs, used as rate fallback for orphan block
     if has_gap_marker(current_block):
         has_real_read = False
         post_reads    = {}
@@ -1363,6 +1396,9 @@ async def _engine_tick(ha: HAClient):
             marker     = current_block["_gap_marker"]
             pre_reads  = marker["pre_reads"]
             last_rates = marker["last_known_rates"]
+            logger.info("gap fill: pre_reads=%s", pre_reads)
+            logger.info("gap fill: last_rates=%s", last_rates)
+            logger.info("gap fill: post_reads=%s", post_reads)
 
             pre_ts = None
             for meter_reads in pre_reads.values():
@@ -1371,7 +1407,19 @@ async def _engine_tick(ha: HAClient):
                         if not pre_ts or read["ts"] > pre_ts:
                             pre_ts = read["ts"]
 
-            missing_windows = detect_gap(pre_ts, now, block_minutes=block_minutes)
+            # Use last_block_start stored in the gap marker as the anchor.
+            # This is the start of the last finalised block, so detect_gap
+            # computes last_block_end = last_block_start + block_minutes,
+            # which equals last_block.end — correctly including the unfinalised
+            # current_block window in missing_windows.
+            gap_anchor_ts = marker.get("last_block_start") or pre_ts
+
+            logger.info("gap fill: pre_ts=%s gap_anchor_ts=%s now=%s", pre_ts, gap_anchor_ts, now)
+            missing_windows = detect_gap(gap_anchor_ts, now, block_minutes=block_minutes)
+            logger.info("gap fill: missing_windows count=%s first=%s last=%s",
+                        len(missing_windows) if missing_windows else 0,
+                        missing_windows[0] if missing_windows else None,
+                        missing_windows[-1] if missing_windows else None)
 
             if missing_windows:
                 config     = load_config()
@@ -1379,7 +1427,7 @@ async def _engine_tick(ha: HAClient):
                     missing_windows, pre_reads, post_reads, last_rates, config
                 )
                 for gb in gap_blocks:
-                    append_block(gb)
+                    append_block_replace(gb)
 
                 engine_totals = _store.get_cumulative_totals()
                 await update_ha_sensors(ha, engine_totals)
@@ -1388,10 +1436,17 @@ async def _engine_tick(ha: HAClient):
                 logger.warning("gap fill: no missing windows found, clearing marker")
 
             clear_gap_marker(current_block)
+            # Preserve last_known_rates for catch-up rollover rate fallback
+            _post_gap_rates = last_rates
+            # Reset current_block to the current window so the next restart
+            # doesn't try to catch up through blocks already written by gap fill.
+            block_minutes_now = int(get_block_minutes())
+            gap_start, gap_end = get_block_window(now, block_minutes=block_minutes_now)
+            current_block = create_block(gap_start, gap_end, block_minutes=block_minutes_now)
             _store.save_current_block(current_block)
 
     # Block lifecycle
-    updated_block = ensure_correct_block(ha, current_block, now)
+    updated_block = ensure_correct_block(ha, current_block, now, last_known_rates=_post_gap_rates)
     block_changed = updated_block.get("start") != current_block.get("start")
 
     if block_changed or periodic_checkpoint or near_boundary:
@@ -1448,7 +1503,24 @@ async def engine_startup(ha: HAClient):
     Registers state triggers, detects session gaps, generates startup charts.
     Replaces @time_trigger("startup").
     """
-    config = load_config()
+    # ── Open BlockStore FIRST so load_config() reads from the live DB ────
+    # This must happen before load_config() — if _store is None and blocks.db
+    # exists, load_config() deliberately returns {} to avoid stale JSON reads.
+    # Opening the store here ensures config is always read from the DB on startup,
+    # including after a restore where the DB file has been replaced.
+    global _store
+    _store = open_block_store(BLOCKS_DB_PATH)
+
+    # ── Checkpoint WAL immediately after opening ──────────────────────────
+    # Ensures all committed blocks are flushed from WAL into the main DB file.
+    # Cheap and always safe — runs on every startup.
+    try:
+        _store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        logger.info("engine_startup: WAL checkpoint complete")
+    except Exception as _wce:
+        logger.warning("engine_startup: WAL checkpoint failed: %s", _wce)
+
+    config = load_config()  # now reads from the open store ✓
 
     # ── Register state triggers from config ─────────────────────────────
     main_import_sensor = None
@@ -1525,19 +1597,6 @@ async def engine_startup(ha: HAClient):
     except Exception as _e:
         logger.warning("engine_startup: could not write meters_config.json export: %s", _e)
 
-    # ── Open BlockStore (auto-migrate from blocks.json if needed) ────────
-    global _store
-    _store = open_block_store(BLOCKS_DB_PATH)
-
-    # ── First-thing-on-startup: checkpoint WAL (every start) ─────────────────
-    # Ensures all committed blocks are flushed from WAL into the main DB file.
-    # Cheap and always safe — runs on every startup.
-    try:
-        _store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        logger.info("engine_startup: WAL checkpoint complete")
-    except Exception as _wce:
-        logger.warning("engine_startup: WAL checkpoint failed: %s", _wce)
-
     # ── Upgrade backup (once per version) ────────────────────────────────────
     # In versions prior to 2.4.0, backups could miss recent blocks due to the
     # WAL not being checkpointed. On first startup of a new version we create a
@@ -1603,44 +1662,6 @@ async def engine_startup(ha: HAClient):
     except Exception as _me:
         logger.warning("engine_startup: full_config_json migration failed: %s", _me)
 
-    # Sync startup config (possibly with freshly detected currency) to DB.
-    # Rewrites the normalised meter rows for the active period — handles
-    # both 2.0→2.1 upgrades (meters table was empty) and currency detection.
-    try:
-        active_id = _store.get_current_config_period_id()
-        if active_id is not None:
-            main_meta_sync = {}
-            for _m in config.get("meters", {}).values():
-                if not (_m.get("meta") or {}).get("sub_meter"):
-                    main_meta_sync = _m.get("meta") or {}
-                    break
-            with _store._conn:
-                _store._conn.execute(
-                    """UPDATE config_periods
-                       SET billing_day     = ?,
-                           block_minutes   = ?,
-                           timezone        = ?,
-                           currency_symbol = ?,
-                           currency_code   = ?,
-                           site_name       = ?,
-                           supplier        = ?
-                       WHERE id = ?""",
-                    (
-                        int(main_meta_sync.get("billing_day") or 1),
-                        int(main_meta_sync.get("block_minutes") or 30),
-                        main_meta_sync.get("timezone", "UTC"),
-                        main_meta_sync.get("currency_symbol", "£"),
-                        main_meta_sync.get("currency_code", "GBP"),
-                        main_meta_sync.get("site"),
-                        main_meta_sync.get("supplier"),
-                        active_id,
-                    )
-                )
-                _store._write_meters(config, active_id)
-            logger.info("engine_startup: active config period synced to normalised tables")
-    except Exception as _sync_e:
-        logger.warning("engine_startup: config sync to DB failed: %s", _sync_e)
-
     if _store.get_current_config_period_id() is None:
         # Fresh DB — check if blocks.json exists to migrate
         if os.path.exists(BLOCKS_PATH):
@@ -1689,17 +1710,41 @@ async def engine_startup(ha: HAClient):
             logger.warning("engine_startup: could not rename current_block.json: %s", _cbe)
 
     # ── Session gap detection ────────────────────────────────────────────
-    last_block = _store.get_last_block()
+    # Use the last block BEFORE current_block.start to avoid zero-rate catch-up
+    # blocks (written by ensure_correct_block before this startup completes)
+    # from contaminating the gap detection and last_known_rates.
+    _cb_for_gap = _store.load_current_block()
+    _cb_start   = _cb_for_gap.get("start") if _cb_for_gap else None
+    last_block  = _store.get_last_block_before(_cb_start) if _cb_start else _store.get_last_block()
+    logger.info("engine_startup: gap detection — current_block.start=%s", _cb_start)
     if last_block:
-        last_block_end = last_block.get("end")
-        if last_block_end:
-            missing_windows = detect_gap(last_block_end, datetime.now(timezone.utc).replace(tzinfo=None))
+        logger.info("engine_startup: gap detection — last_block start=%s end=%s",
+                    last_block.get("start"), last_block.get("end"))
+        for _m, _md in last_block.get("meters", {}).items():
+            for _ch, _chd in _md.get("channels", {}).items():
+                logger.info("engine_startup: gap detection — last_block %s/%s rate=%s read_end=%s",
+                            _m, _ch, _chd.get("rate"), _chd.get("read_end"))
+    else:
+        logger.warning("engine_startup: gap detection — no last_block found")
+    if last_block:
+        # Use the START of the last finalised block as the gap anchor so that
+        # the unfinalised current_block window is included in gap fill.
+        # detect_gap computes last_block_end = floor(anchor) + block_minutes,
+        # so passing block start gives last_block_end = last_block.end,
+        # covering the current_block window and everything after it.
+        last_block_start = last_block.get("start")
+        if last_block_start:
+            missing_windows = detect_gap(last_block_start, datetime.now(timezone.utc).replace(tzinfo=None))
             if missing_windows:
                 logger.warning(
                     "engine_startup: session gap detected — %d missing blocks", len(missing_windows)
                 )
+                logger.info("engine_startup: gap windows first=%s last=%s",
+                            missing_windows[0], missing_windows[-1])
                 current_block        = _store.load_current_block()
                 pre_reads, last_rates = extract_last_reads(last_block)
+                logger.info("engine_startup: pre_reads=%s", pre_reads)
+                logger.info("engine_startup: last_rates=%s", last_rates)
                 # Clear stale reads from before the restart — if we leave them in,
                 # the sub-meter's channel reads will span the restart gap, producing
                 # a false large delta on the first post-restart block (e.g. 10 kWh
@@ -1710,7 +1755,8 @@ async def engine_startup(ha: HAClient):
                     for channel in (meter_data.get("channels") or {}).values():
                         channel["reads"] = []
                         channel["rates"] = []
-                set_gap_marker(current_block, pre_reads, last_rates)
+                set_gap_marker(current_block, pre_reads, last_rates,
+                               last_block_start=last_block_start)
                 _store.save_current_block(current_block)
                 logger.info("engine_startup: gap marker set, stale reads cleared, will fill on first capture")
             else:
