@@ -316,6 +316,16 @@
           <div class="insight-metric-value" id="bat-vs-grid"></div>
           <div class="insight-metric-unit">gCO₂/kWh</div>
         </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Effective intensity</div>
+          <div class="insight-metric-value" id="bat-effective-int"></div>
+          <div class="insight-metric-unit">gCO₂/kWh usable</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Lost to inefficiency</div>
+          <div class="insight-metric-value" id="bat-carbon-lost"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
       </div>
       <div class="insight-equiv" id="bat-equiv"></div>
       <div class="insight-footnote">
@@ -323,6 +333,10 @@
         sub-meter records grid import only — solar contribution to charging is not captured
         here (it appears as reduced main meter import instead). The key question is whether
         grid charging was timed to cleaner periods.<br>
+        <strong>Effective intensity</strong> adjusts the charge intensity for round-trip losses
+        (charge intensity ÷ round-trip efficiency) — this is the true carbon cost per usable kWh
+        delivered by the battery. <strong>Lost to inefficiency</strong> is the carbon attributable
+        to heat losses during the charge/discharge cycle (total carbon × loss fraction).<br>
         Battery discharge carbon (to house or export) cannot be separated without
         generation-side metering.
         <a href="{{ url_for('settings_page') }}?tab=carbon">Edit assumptions →</a>
@@ -578,6 +592,15 @@ function renderInsights(d) {
     document.getElementById('bat-intensity').textContent = bat_int != null ? Math.round(bat_int) : '—';
     document.getElementById('bat-vs-grid').textContent  = grid_avg != null ? Math.round(grid_avg) : '—';
 
+    var rte = a.battery_roundtrip_efficiency || 0.85;
+    if (bat_int != null) {
+      document.getElementById('bat-effective-int').textContent = Math.round(bat_int / rte);
+    } else {
+      document.getElementById('bat-effective-int').textContent = '—';
+    }
+    var carbon_lost = bat_kg > 0 ? (bat_kg * (1 - rte)) : 0;
+    document.getElementById('bat-carbon-lost').textContent = carbon_lost > 0 ? carbon_lost.toFixed(2) : '—';
+
     var batLines = [];
     if (bat_int != null && grid_avg != null) {
       var bat_diff = bat_int - grid_avg;
@@ -605,6 +628,10 @@ function renderInsights(d) {
     }
     batLines.push('<em>Note: export may include battery discharge — we cannot split solar vs battery ' +
       'export without additional metering.</em>');
+    if (bat.carbon_g > 0) {
+      var batEquivStr = equivLines(bat.carbon_g, a);
+      if (batEquivStr) batLines.push(batEquivStr);
+    }
     document.getElementById('bat-equiv').innerHTML = batLines.join('<br>');
   }
 
@@ -656,6 +683,10 @@ function renderInsights(d) {
     if (hp.inverter_possible) {
       hpLines.push('<em>⚠ This heat pump is marked as inverter-capable. Carbon shown assumes ' +
         'full grid draw — actual carbon may be lower if solar or battery contributed.</em>');
+    }
+    if (hp.carbon_g > 0) {
+      var hpEquivStr = equivLines(hp.carbon_g, a);
+      if (hpEquivStr) hpLines.push(hpEquivStr);
     }
     document.getElementById('hp-equiv').innerHTML = hpLines.join('<br>');
   }
@@ -732,6 +763,10 @@ function renderInsights(d) {
     if (ev.inverter_possible) {
       evLines.push('<em>⚠ This EV charger is marked as inverter-capable. Carbon shown assumes ' +
         'full grid draw — actual carbon may be lower if solar or battery contributed.</em>');
+    }
+    if (ev.carbon_g > 0) {
+      var evEquivStr = equivLines(ev.carbon_g, a);
+      if (evEquivStr) evLines.push(evEquivStr);
     }
     evEquiv.innerHTML = evLines.join('<br>');
   }
