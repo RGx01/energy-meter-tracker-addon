@@ -4,14 +4,6 @@
 
 ### Added
 
-- **`get_last_block_before(block_start)`** — new `BlockStore` method returning the most recently finalised block strictly before a given start timestamp. Used by gap detection to avoid catch-up zero blocks.
-
-- **`append_block_replace(block)`** — new `BlockStore` method using `INSERT OR REPLACE` instead of `INSERT OR IGNORE`. Used by gap fill to ensure catch-up zero blocks are always overwritten.
-
-- **`gap_last_block_start` column on `current_block`** — persists the start of the last finalised block at gap detection time so the gap fill tick can use it as the anchor regardless of what catch-up rollovers have written to the DB in the interim.
-
-- **Gap fill diagnostics logging** — `engine_startup` and gap fill now log `current_block.start`, `last_block start/end`, channel rates, `pre_reads`, `last_rates`, `post_reads`, `gap_anchor_ts`, and `missing_windows` first/last at INFO level to aid diagnosis of restore issues.
-
 - **Insights page** — new sidebar entry 🌿 between Charts and Live Power. Billing period carbon analysis with narrative cards. Period selector (prev/next) in topbar. Click any trend chart bar to navigate directly to that period.
 
 - **Carbon Summary card** — net kgCO₂ for the billing period, effective intensity vs grid average, import/export split, car/tree/flight equivalences, inline SVG trend chart across all periods, coverage warning when CI data is below 95%.
@@ -50,19 +42,19 @@
 
 - **Templates renamed** — `config.html` → `meter_config.html`, `import.html` → `data_management.html`, `summary.html` → `live_power.html`, `config_history.html` → `billing_history.html`.
 
-- **`load_config()` — single source of truth** — both `server.py` and `engine.py` now never fall back to `meters_config.json` when `blocks.db` exists. Fixes incorrect config (site name, block_minutes, timezone) when swapping a database between environments. DB is always authoritative.
-
 - **Settings page** renders `meter_config.html` by default (`?tab=carbon` for the Carbon tab). Meter Config sub-bar (Wizard, Refresh, Billing History) moved below the topbar using the new subbar block.
+
+- **Sub-meter rate sensor wording** — label changed from "pre-filled from main meter" to "default: one-time copy from main meter at setup — update here if your sub-meter has a different rate or you retrospectively change rates". Clarifies this is not a live link.
 
 ### Fixed
 
 - **Insights carbon/kWh consistency** — all carbon figures and their accompanying kWh use CI-covered blocks only (`ci_imp_kwh`). Previously total-period kWh was mixed with partial-period carbon, producing misleadingly low intensity figures and incorrect mileage estimates.
 
-- **Debug WARNING logs removed** from insights endpoints.
-
 - **Upgrade from 1.x.x / 2.0.x (Docker) showed wizard and lost sensor config** — when upgrading from any version that stored data in `blocks.json` and config in `meters_config.json` (all 1.x.x and 2.0.x releases), the auto-migration to SQLite correctly migrated all block data but created an empty `config_periods` row because `load_config()` returns `{}` when `config_periods` is empty — a chicken-and-egg problem. The wizard then appeared as if it were a fresh install, and users with no prior DB thought their data was gone. Fixed in two places: (1) `migrate_json_to_sqlite` now explicitly reads `meters_config.json` directly before creating the config period, bypassing `load_config()`; (2) a post-startup repair step detects an empty `config_periods` row and populates it from `meters_config.json` if present — so existing installs that already migrated blocks but got an empty config period will self-heal on next restart without any user action.
 
 - **Config not persisting after restore** — `engine_startup` previously called `load_config()` before opening the block store. With `_store=None` and `blocks.db` already present, `load_config()` returned `{}`, causing the startup config sync to reset scalar fields (billing day, timezone, etc.) to defaults and wipe sensor subscriptions. Fixed by opening the store before calling `load_config()` and removing the dangerous startup config sync entirely — the DB is authoritative.
+
+- **`load_config()` — DB always authoritative** — both `server.py` and `engine.py` no longer fall back to `meters_config.json` when `blocks.db` exists. Previously a stale JSON file could override the DB config when swapping databases between environments.
 
 - **Import rate zero across all gap fill blocks** — when only the export sensor fires before the first tick after a restore (the common case), `post_reads` has no import channel entry. `build_gap_blocks` hit the "missing reads" branch and hardcoded `rate=0.0`. Fixed: the missing-reads branch now uses `last_known_rates` as a fallback so the rate is preserved even when no post-read is available.
 
@@ -74,7 +66,7 @@
 
 - **`meters_config.json` appearing in restore UI and backup zips** — removed from all known sets in zip extraction endpoints, from backup creation, from restore sync logic, and marked "No longer needed" in the data management UI.
 
-- **Backup filenames use UTC time** — backup zip filenames (e.g. `20260420T082255_manual.zip`) reflect UTC, not local time. This is consistent with how all block timestamps are stored internally. (Note for users in non-UTC timezones: the filename timestamp will differ from local clock time.)
+- **Stale `url_for('import_page')` references** — fixed in `charts.html`, `corrections.html`, `delete_blocks.html`, and `help.html`. Route was renamed to `data_management_page` in 2.6.0 but template references were not updated, causing 500 errors on those pages.
 
 ### Templates removed (old names no longer served)
 
