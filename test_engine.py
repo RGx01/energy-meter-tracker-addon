@@ -359,6 +359,28 @@ class TestComputeChannelSub(unittest.TestCase):
         self.assertGreater(result["cost"], 0.0)
         self.assertAlmostEqual(result["kwh"], 0.5)
 
+    def test_sub_meter_rate_is_last_not_weighted_average(self):
+        """Sub-meter display rate must be the last rate in the block, not a
+        weighted average. This ensures sub-meters always show the same rate
+        as the main meter at the same point in time — consistent with the
+        intent of capturing the rate as close to block end as possible."""
+        ch = {
+            "reads": [
+                read(100.0, "2026-01-01T05:00:00"),
+                read(100.1, "2026-01-01T05:30:00"),  # small amount at off-peak
+                read(100.2, "2026-01-01T06:00:00"),  # tiny amount at peak
+            ],
+            "rates": [
+                rate(0.0549, "2026-01-01T05:00:00"),  # off-peak
+                rate(0.3231, "2026-01-01T06:00:00"),  # peak — tariff boundary
+            ]
+        }
+        result = engine.compute_channel(ch, is_sub_meter=True)
+        # Display rate must be the last rate (0.3231), not a weighted average
+        # A weighted average would be ~0.189 — the bug we fixed
+        self.assertAlmostEqual(result["rate"], 0.3231, places=4,
+            msg="Sub-meter rate must be last rate in block, not weighted average")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # select_opening_read / select_closing_read

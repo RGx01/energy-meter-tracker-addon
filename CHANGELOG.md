@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.6.1] — 2026-04-21
+
+### Added
+
+- **Logo theme toggle** — clicking the Energy Meter Tracker logo in the top-left sidebar now toggles between light and dark mode, identical to the existing button in the bottom right. The logo adapts visually in light mode via CSS filter inversion.
+
+### Fixed
+
+- **Sub-meter display rate used weighted average instead of last rate** — at tariff boundaries (e.g. Octopus off-peak → peak transition) a sub-meter block that recorded a tiny amount of kWh spanning both sides of the boundary would compute a weighted average rate (e.g. `£0.189`) rather than using the last rate in the block (e.g. `£0.323`). This caused the sub-meter rate line on charts to show an anomalous mid-point value while the main meter showed the correct end-of-block rate. All meters now consistently use the last captured rate in the block, which is the intent — capturing the rate as close to block end as possible to account for any API lag from remote rate providers.
+
+- **Net bar colour wrong when standing charge tips a day positive** — on the Net billing chart with "Inc. Standing Charge" enabled, days where the standing charge pushed a net-credit day into net-cost showed the bar above zero in the credit colour (grey) rather than the cost colour (blue). The bar height calculation correctly included the standing charge but the colour check did not. Fixed by including `barStandingVal(agg)` in the colour check to match the bar height calculation exactly.
+
+- **Session gap detection silently failing on non-30-minute block setups** — `detect_gap` was always called with the default `block_minutes=30` during startup gap detection, regardless of the actual configured block size. On 5-minute or 15-minute block setups, window boundaries were computed in 30-minute increments, causing the gap to evaluate to zero or far fewer missing windows than actually existed — `no session gap detected` was logged when up to 90 minutes of data was missing. Fixed by reading `block_minutes` from the last block's own meta before calling `detect_gap`. This particularly affects users outside the UK where 5-minute smart meter data is common.
+
+---
+
 ## [2.6.0] — 2026-04-20
 
 ### Added

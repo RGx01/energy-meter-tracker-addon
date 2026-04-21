@@ -97,6 +97,10 @@
       width: 160px;
       height: auto;
       display: block;
+      transition: filter 0.3s ease;
+    }
+    [data-theme="light"] .sidebar-brand img.logo {
+      filter: invert(1) hue-rotate(150deg);
     }
 
     .sidebar-brand p {
@@ -415,7 +419,7 @@
 
   <aside class="sidebar" id="sidebar">
     <div class="sidebar-brand">
-      <img class="logo" src="{{ url_for('serve_logo') }}" alt="Energy Meter Tracker" onerror="this.style.display='none';this.nextElementSibling.style.display='block'">
+      <img class="logo" src="{{ url_for('serve_logo') }}" alt="Energy Meter Tracker" title="Toggle light/dark mode" style="cursor:pointer;" onclick="globalToggleTheme()" onerror="this.style.display='none';this.nextElementSibling.style.display='block'">
       <span style="display:none;font-family:var(--mono);font-size:12px;font-weight:600;color:var(--accent);letter-spacing:0.08em;text-transform:uppercase;">Energy Meter<br>Tracker</span>
       <p>Home Assistant Add-on</p>
     </div>
