@@ -59,6 +59,22 @@ def import_kwh(hour, block_minutes, scenario):
             base = 0.06
         return max(0.0, base * block_minutes / 30 + random.uniform(-0.01, 0.01))
 
+    elif scenario == "marginal_solar":
+        # Deliberately marginal — small import, just enough that exp_cost > imp_cost
+        # (net credit without standing charge) but exp_cost < imp_cost + standing_charge
+        # (net cost with it). No randomness — deterministic edge case for testing.
+        if 0 <= t < 6:
+            base = 0.02
+        elif 6 <= t < 9:
+            base = 0.06
+        elif 10 <= t < 15:
+            base = 0.0   # solar covers demand midday
+        elif 17 <= t < 22:
+            base = 0.08
+        else:
+            base = 0.02
+        return max(0.0, base * block_minutes / 30)
+
     elif scenario == "export_only":
         return 0.0
 
@@ -85,6 +101,15 @@ def export_kwh(hour, block_minutes, scenario):
     elif scenario == "mixed":
         if 10 <= t < 15:
             return max(0.0, 0.2 * block_minutes / 30 + random.uniform(-0.01, 0.01))
+        return 0.0
+
+    elif scenario == "marginal_solar":
+        # Export calibrated so daily exp_cost just exceeds imp_cost but not
+        # imp_cost + standing_charge (rate=0.2450, export_rate=0.1500, SC=0.5046).
+        # daily imp_cost ≈ £0.39, daily exp_cost ≈ £0.84 → net credit £0.45 without SC,
+        # net cost £0.06 with SC. Deterministic — no randomness.
+        if 9 <= t < 16:
+            return max(0.0, 0.40 * block_minutes / 30)
         return 0.0
 
     return 0.0
@@ -370,7 +395,7 @@ if __name__ == "__main__":
     parser.add_argument("--block-minutes",   type=int,   default=30, choices=[5, 15, 30],
                         help="Block size in minutes (default: 30)")
     parser.add_argument("--scenario",        type=str,   default="import_only",
-                        choices=["import_only", "solar", "mixed", "export_only"],
+                        choices=["import_only", "solar", "mixed", "export_only", "marginal_solar"],
                         help="Usage scenario (default: import_only)")
     parser.add_argument("--sub-meters",      action="store_true",
                         help="Include EV charger and battery sub-meters")

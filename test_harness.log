@@ -12,55 +12,7 @@ NEVER run against a production installation.
 
 
 ════════════════════════════════════════════════════════════
-  Test 1/15: 30min / 90 days / solar / sub-meters
-════════════════════════════════════════════════════════════
-  Generating 90 days × 30min blocks...
-  Uploading blocks.db...
-  ✅ Upload OK
-  Regenerating charts...
-  ✅ Charts regenerated
-  Opening: http://192.168.20.16:8099/charts
-  → Open in browser: http://192.168.20.16:8099/charts
-
-
-════════════════════════════════════════════════════════════
-  Test 2/15: 30min / 7 days / import only
-════════════════════════════════════════════════════════════
-  Generating 7 days × 30min blocks...
-  Uploading blocks.db...
-  ✅ Upload OK
-  Regenerating charts...
-  ✅ Charts regenerated
-  Opening: http://192.168.20.16:8099/charts
-  → Open in browser: http://192.168.20.16:8099/charts
-
-
-════════════════════════════════════════════════════════════
-  Test 3/15: 30min / 1 day / solar
-════════════════════════════════════════════════════════════
-  Generating 1 days × 30min blocks...
-  Uploading blocks.db...
-  ✅ Upload OK
-  Regenerating charts...
-  ✅ Charts regenerated
-  Opening: http://192.168.20.16:8099/charts
-  → Open in browser: http://192.168.20.16:8099/charts
-
-
-════════════════════════════════════════════════════════════
-  Test 4/15: 30min / 31 days / export only
-════════════════════════════════════════════════════════════
-  Generating 31 days × 30min blocks...
-  Uploading blocks.db...
-  ✅ Upload OK
-  Regenerating charts...
-  ✅ Charts regenerated
-  Opening: http://192.168.20.16:8099/charts
-  → Open in browser: http://192.168.20.16:8099/charts
-
-
-════════════════════════════════════════════════════════════
-  Test 5/15: 30min / 14 days / mixed / with gap
+  Test 12/16: Net bar colour — 30min / 14 days / marginal solar / standing charge
 ════════════════════════════════════════════════════════════
   Generating 14 days × 30min blocks...
   Uploading blocks.db...
@@ -72,79 +24,7 @@ NEVER run against a production installation.
 
 
 ════════════════════════════════════════════════════════════
-  Test 6/15: 15min / 7 days / solar
-════════════════════════════════════════════════════════════
-  Generating 7 days × 15min blocks...
-  Uploading blocks.db...
-  ✅ Upload OK
-  Regenerating charts...
-  ✅ Charts regenerated
-  Opening: http://192.168.20.16:8099/charts
-  → Open in browser: http://192.168.20.16:8099/charts
-
-
-════════════════════════════════════════════════════════════
-  Test 7/15: 15min / 31 days / mixed / sub-meters
-════════════════════════════════════════════════════════════
-  Generating 31 days × 15min blocks...
-  Uploading blocks.db...
-  ✅ Upload OK
-  Regenerating charts...
-  ✅ Charts regenerated
-  Opening: http://192.168.20.16:8099/charts
-  → Open in browser: http://192.168.20.16:8099/charts
-
-
-════════════════════════════════════════════════════════════
-  Test 8/15: 5min / 2 days / solar
-════════════════════════════════════════════════════════════
-  Generating 2 days × 5min blocks...
-  Uploading blocks.db...
-  ✅ Upload OK
-  Regenerating charts...
-  ✅ Charts regenerated
-  Opening: http://192.168.20.16:8099/charts
-  → Open in browser: http://192.168.20.16:8099/charts
-
-
-════════════════════════════════════════════════════════════
-  Test 9/15: 5min / 7 days / import only
-════════════════════════════════════════════════════════════
-  Generating 7 days × 5min blocks...
-  Uploading blocks.db...
-  ✅ Upload OK
-  Regenerating charts...
-  ✅ Charts regenerated
-  Opening: http://192.168.20.16:8099/charts
-  → Open in browser: http://192.168.20.16:8099/charts
-
-
-════════════════════════════════════════════════════════════
-  Test 10/15: 5min / 7 days / mixed / sub-meters
-════════════════════════════════════════════════════════════
-  Generating 7 days × 5min blocks...
-  Uploading blocks.db...
-  ✅ Upload OK
-  Regenerating charts...
-  ✅ Charts regenerated
-  Opening: http://192.168.20.16:8099/charts
-  → Open in browser: http://192.168.20.16:8099/charts
-
-
-════════════════════════════════════════════════════════════
-  Test 11/15: 5min / 2 days / export only
-════════════════════════════════════════════════════════════
-  Generating 2 days × 5min blocks...
-  Uploading blocks.db...
-  ✅ Upload OK
-  Regenerating charts...
-  ✅ Charts regenerated
-  Opening: http://192.168.20.16:8099/charts
-  → Open in browser: http://192.168.20.16:8099/charts
-
-
-════════════════════════════════════════════════════════════
-  Test 12/15: CO₂ — 30min / 30 days / solar / sub-meters
+  Test 13/16: CO₂ — 30min / 30 days / solar / sub-meters
 ════════════════════════════════════════════════════════════
   Generating 30 days × 30min blocks...
   Uploading blocks.db...
@@ -158,71 +38,14 @@ NEVER run against a production installation.
   → Open in browser: http://192.168.20.16:8099/charts?tab=usage_stats
 
 
-════════════════════════════════════════════════════════════
-  Test 13/15: CO₂ — 30min / 7 days / import only / no sub-meters
-════════════════════════════════════════════════════════════
-  Generating 7 days × 30min blocks...
-  Uploading blocks.db...
-  ✅ Upload OK
-  Regenerating charts...
-  ✅ Charts regenerated
-  ℹ️  CO₂ scenario: check Usage Stats → CO₂ toggle (kWh / Cost / CO₂ buttons)
-     Verify: net view (single bar), totals view (import above / export below)
-     Verify: data table columns match chart, gCO₂ / kgCO₂ auto-scaling
-  Opening: http://192.168.20.16:8099/charts?tab=usage_stats
-  → Open in browser: http://192.168.20.16:8099/charts?tab=usage_stats
-
-
-════════════════════════════════════════════════════════════
-  Test 14/15: CO₂ — 30min / 14 days / export only (all negative net)
-════════════════════════════════════════════════════════════
-  Generating 14 days × 30min blocks...
-  Uploading blocks.db...
-  ✅ Upload OK
-  Regenerating charts...
-  ✅ Charts regenerated
-  ℹ️  CO₂ scenario: check Usage Stats → CO₂ toggle (kWh / Cost / CO₂ buttons)
-     Verify: net view (single bar), totals view (import above / export below)
-     Verify: data table columns match chart, gCO₂ / kgCO₂ auto-scaling
-  Opening: http://192.168.20.16:8099/charts?tab=usage_stats
-  → Open in browser: http://192.168.20.16:8099/charts?tab=usage_stats
-
-
-════════════════════════════════════════════════════════════
-  Test 15/15: CO₂ — 30min / 30 days / mixed / sub-meters / with gap
-════════════════════════════════════════════════════════════
-  Generating 30 days × 30min blocks...
-  Uploading blocks.db...
-  ✅ Upload OK
-  Regenerating charts...
-  ✅ Charts regenerated
-  ℹ️  CO₂ scenario: check Usage Stats → CO₂ toggle (kWh / Cost / CO₂ buttons)
-     Verify: net view (single bar), totals view (import above / export below)
-     Verify: data table columns match chart, gCO₂ / kgCO₂ auto-scaling
-  Opening: http://192.168.20.16:8099/charts?tab=usage_stats
-  → Open in browser: http://192.168.20.16:8099/charts?tab=usage_stats
-
+Aborted.
 
 ════════════════════════════════════════════════════════════
   Test Summary
 ════════════════════════════════════════════════════════════
-  ✅ PASS   30min / 90 days / solar / sub-meters
-  ✅ PASS   30min / 7 days / import only
-  ✅ PASS   30min / 1 day / solar
-  ✅ PASS   30min / 31 days / export only
-  ✅ PASS   30min / 14 days / mixed / with gap
-  ✅ PASS   15min / 7 days / solar
-  ✅ PASS   15min / 31 days / mixed / sub-meters
-  ✅ PASS   5min / 2 days / solar
-  ✅ PASS   5min / 7 days / import only
-  ✅ PASS   5min / 7 days / mixed / sub-meters
-  ✅ PASS   5min / 2 days / export only
-  ✅ PASS   CO₂ — 30min / 30 days / solar / sub-meters
-  ✅ PASS   CO₂ — 30min / 7 days / import only / no sub-meters
-  ✅ PASS   CO₂ — 30min / 14 days / export only (all negative net)
-  ✅ PASS   CO₂ — 30min / 30 days / mixed / sub-meters / with gap
+  ✅ PASS   Net bar colour — 30min / 14 days / marginal solar / standing charge
 
-  Passed: 15  Failed: 0  Skipped: 0  Errors: 0
+  Passed: 1  Failed: 0  Skipped: 0  Errors: 0
 
   Results saved to test_results.json
   Log saved to /addons/energy_meter_tracker/test_harness.log
