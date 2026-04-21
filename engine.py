@@ -615,10 +615,10 @@ def compute_channel(channel: dict, parent_rates=None, is_sub_meter: bool = False
         total_kwh  += delta
         total_cost += delta * current_rate
 
-    # Store weighted average rate (total_cost / total_kwh) so the chart rate
-    # line reflects actual blended cost rather than always showing the last
-    # (typically standard) rate. Falls back to last rate if kwh is zero.
-    display_rate = round(total_cost / total_kwh, 6) if total_kwh > 0 else corrected_rates[-1]["value"]
+    # Use the last rate in the block — consistent with main meter behaviour.
+    # This captures the rate as close to the end of the block as possible,
+    # accounting for any API lag from remote rate providers.
+    display_rate = corrected_rates[-1]["value"]
     return {
         "kwh":        total_kwh,
         "rate":       display_rate,
@@ -1769,7 +1769,15 @@ async def engine_startup(ha: HAClient):
         # covering the current_block window and everything after it.
         last_block_start = last_block.get("start")
         if last_block_start:
-            missing_windows = detect_gap(last_block_start, datetime.now(timezone.utc).replace(tzinfo=None))
+            # Derive block_minutes from the last block meta, falling back to config
+            # then global default. Critical for non-30min setups.
+            _lb_bm = int(
+                (last_block.get("meters") or {})
+                .get("electricity_main", {})
+                .get("meta", {})
+                .get("block_minutes") or get_block_minutes()
+            )
+            missing_windows = detect_gap(last_block_start, datetime.now(timezone.utc).replace(tzinfo=None), block_minutes=_lb_bm)
             if missing_windows:
                 logger.warning(
                     "engine_startup: session gap detected — %d missing blocks", len(missing_windows)

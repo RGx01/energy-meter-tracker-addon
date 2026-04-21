@@ -125,6 +125,18 @@ SCENARIOS = [
         "sub_meters":     False,
         "gap_day":        None,
     },
+    # ── Net bar colour regression (2.6.1) ────────────────────
+    # Deterministic marginal_solar scenario — daily export credit just exceeds
+    # import cost but not import cost + standing charge. Verifies bars are blue
+    # (not grey) above zero when inc. standing charge is enabled.
+    {
+        "name":           "Net bar colour — 30min / 14 days / marginal solar / standing charge",
+        "days":           14,
+        "block_minutes":  30,
+        "scenario":       "marginal_solar",
+        "sub_meters":     False,
+        "gap_day":        None,
+    },
     # ── CO₂ chart scenarios (2.4.0) ──────────────────────────
     {
         "name":           "CO₂ — 30min / 30 days / solar / sub-meters",
@@ -191,16 +203,23 @@ def generate_db(scenario_args, db_path):
     from test_data_generator import generate_blocks
 
     store = BlockStore(db_path)
+    has_export = scenario_args.get("scenario") in ("solar", "mixed", "export_only", "marginal_solar")
     store.insert_config_period({"meters": {
-        "electricity_main": {"meta": {
-            "billing_day":    scenario_args["billing_day"],
-            "block_minutes":  scenario_args["block_minutes"],
-            "timezone":       "Europe/London",
-            "currency_symbol": "£",
-            "currency_code":  "GBP",
-            "site":           "Test Site",
-            "postcode_prefix": "DE1",
-        }},
+        "electricity_main": {
+            "meta": {
+                "billing_day":    scenario_args["billing_day"],
+                "block_minutes":  scenario_args["block_minutes"],
+                "timezone":       "Europe/London",
+                "currency_symbol": "£",
+                "currency_code":  "GBP",
+                "site":           "Test Site",
+                "postcode_prefix": "DE1",
+            },
+            "channels": {
+                "import": {"read": "sensor.test_import", "rate": "sensor.test_rate"},
+                **({"export": {"read": "sensor.test_export", "rate": "sensor.test_export_rate"}} if has_export else {}),
+            },
+        },
         **({"ev_charger": {"meta": {
             "sub_meter": True, "parent_meter": "electricity_main",
             "device": "Zappi EV Charger",
@@ -314,7 +333,7 @@ NEVER run against a production installation.
                     "billing_day":      1,
                     "rate":             0.2450,
                     "export_rate":      0.1500,
-                    "standing_charge":  0.5046,
+                    "standing_charge":  scenario.get("standing_charge", 0.5046),
                     "gap_day":          scenario["gap_day"],
                 },
                 db_path=tmp_path,

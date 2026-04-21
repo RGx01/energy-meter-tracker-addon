@@ -814,7 +814,7 @@ function barGetDatasets(labels, aggList) {
           var v = agg.carbon_g_net;
           return (v == null || v >= 0) ? (barMeters[0] && barMeters[0].color || '#1f77b4') : barExportColor;
         }
-        var imp = barMetric === 'kwh' ? agg.imp_kwh : agg.imp_cost;
+        var imp = barMetric === 'kwh' ? agg.imp_kwh : (agg.imp_cost + barStandingVal(agg));
         var exp = barMetric === 'kwh' ? agg.exp_kwh : agg.exp_cost;
         return imp >= exp ? (barMeters[0] && barMeters[0].color || '#1f77b4') : barExportColor;
       }),
