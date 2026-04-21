@@ -262,12 +262,24 @@
     <code>/share/energy_meter_tracker_backup/</code> using SQLite's online backup API — no risk of
     a corrupted mid-write copy. A zip snapshot is also created automatically before every config
     save, and manually on demand from the
-    <a href="{{ url_for('import_page') }}" style="color:var(--accent);">Data Management page</a>.
+    <a href="{{ url_for('data_management_page') }}" style="color:var(--accent);">Data Management page</a>.
   </p>
   <div class="warn-box">
     ⚠️ <strong>Uninstalling the add-on will wipe <code>/data/</code>.</strong> Always ensure you
     have a recent backup in <code>/share/</code> before uninstalling. Updating the add-on
     (without uninstalling) preserves your data.
+  </div>
+  <div class="warn-box" style="margin-top:10px;">
+    ⚠️ <strong>Switching from a store add-on to a local add-on (or vice versa) will start with a fresh empty database.</strong>
+    Even if the slug is identical, HA's supervisor stores data in separate directories —
+    <code>local_</code> add-ons get a different path from store add-ons. Your existing data is
+    not lost but it will not be picked up automatically. The safe migration process is:
+    <ol style="margin-top:8px;margin-bottom:0;padding-left:20px;">
+      <li>Take a manual backup zip from the Data Management page <em>before</em> switching.</li>
+      <li>Install the new version and complete initial setup if prompted.</li>
+      <li>Go to Data Management and restore from the backup zip.</li>
+      <li>Uninstall the old version once you have confirmed data is intact.</li>
+    </ol>
   </div>
 </div>
 

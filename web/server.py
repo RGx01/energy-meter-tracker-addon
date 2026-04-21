@@ -132,6 +132,46 @@ def _run():
     serve(app, host="0.0.0.0", port=8099, threads=4)
 
 
+# ── Settings defaults ─────────────────────────────────────────────────────────
+
+# Carbon assumption defaults with citations.
+# Stored in store_meta['settings'] as JSON; missing keys fall back to these.
+SETTINGS_DEFAULTS = {
+    # ── Equivalence factors ────────────────────────────────────────────────
+    "co2_car_petrol_g_per_mile":   180.0,  # BEIS/DESNZ 2023 GHG conversion factors
+    "co2_car_diesel_g_per_mile":   168.0,  # BEIS/DESNZ 2023 GHG conversion factors
+    "co2_tree_kg_per_year":          21.0, # Woodland Trust estimate
+    "co2_flight_lhr_nyc_kg":        670.0, # BEIS 2023 (economy, radiative forcing)
+    # ── Display ────────────────────────────────────────────────────────────
+    "distance_unit":              "miles", # miles | km
+    # ── Export methodology ─────────────────────────────────────────────────
+    "co2_export_method":       "grid_average",  # grid_average | custom
+    "co2_export_custom_intensity":  200.0, # gCO₂/kWh — only if method=custom
+    # ── EV ─────────────────────────────────────────────────────────────────
+    "ev_efficiency":                  3.2, # miles/kWh or km/kWh (distance_unit)
+    "ev_charge_efficiency":          0.88, # AC→DC charge efficiency (IEA 2022, typical Type 2)
+    # ── Battery ────────────────────────────────────────────────────────────
+    "battery_round_trip_efficiency": 0.90, # round-trip AC→DC→AC (typical Li-ion home battery)
+    # ── Heat pump ──────────────────────────────────────────────────────────
+    "hp_cop":                         3.0, # seasonal COP (SCOP) — override with manufacturer spec
+    "gas_co2_g_per_kwh":            203.0, # BEIS/DESNZ 2023 GHG conversion factors
+    "gas_boiler_efficiency":         0.90, # typical modern condensing boiler
+}
+
+SETTINGS_NUMERIC = {
+    "co2_car_petrol_g_per_mile",
+    "co2_car_diesel_g_per_mile",
+    "co2_tree_kg_per_year",
+    "co2_flight_lhr_nyc_kg",
+    "co2_export_custom_intensity",
+    "ev_efficiency",
+    "ev_charge_efficiency",
+    "battery_round_trip_efficiency",
+    "hp_cop",
+    "gas_co2_g_per_kwh",
+    "gas_boiler_efficiency",
+}
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def config_path():
@@ -200,10 +240,13 @@ def _rebuild_config_period_chain(store):
 
 def load_config():
     """
-    Load meter configuration from the normalised DB tables.
-    Falls back to meters_config.json only for fresh installs before any
-    config period exists.
+    Load meter configuration from the normalised DB (blocks.db) config_periods table.
+    The DB is the single source of truth — meters_config.json is only used as a
+    last resort for a truly fresh install where blocks.db does not yet exist.
     """
+    db_path = os.path.join(DATA_DIR, "blocks.db") if DATA_DIR else None
+    db_exists = db_path and os.path.exists(db_path)
+
     try:
         store = _get_store()
         cp = store._conn.execute(
@@ -212,12 +255,22 @@ def load_config():
         ).fetchone()
         if cp:
             return store.config_from_db(cp["id"])
-    except Exception:
-        pass
-    # Fallback: fresh install only
+        # DB exists but no config period yet — fresh DB, not a JSON fallback scenario
+        if db_exists:
+            logger.warning("load_config: blocks.db exists but no active config period found")
+            return {"schema_version": "1.0", "meters": {}}
+    except Exception as e:
+        logger.error("load_config: failed to read config from DB: %s", e)
+        # Only fall back to JSON if no DB exists at all
+        if db_exists:
+            logger.error("load_config: DB exists but config read failed — returning empty config")
+            return {"schema_version": "1.0", "meters": {}}
+
+    # True fresh install: no DB yet, try meters_config.json
     p = config_path()
     if not os.path.exists(p):
         return {"schema_version": "1.0", "meters": {}}
+    logger.info("load_config: no DB found, loading from meters_config.json")
     with open(p) as f:
         return json.load(f)
 
@@ -314,17 +367,29 @@ def index():
     cfg = load_config()
     if cfg.get("meters"):
         last = request.cookies.get("emt_last_page", "charts")
-        valid = {"charts", "summary", "import", "logs", "help", "config"}
-        if last not in valid:
-            last = "charts"
+        # Map old cookie values to new page names for backwards compatibility
+        page_map = {
+            "charts":   "charts",
+            "summary":  "live_power",
+            "import":   "data_management",
+            "logs":     "logs",
+            "help":     "help",
+            "config":   "settings",
+            # new names
+            "live_power":     "live_power",
+            "data_management": "data_management",
+            "settings":       "settings",
+            "insights":       "insights",
+        }
+        last = page_map.get(last, "charts")
         return redirect(url_for(last + "_page"))
-    return redirect(url_for("config_page"))
+    return redirect(url_for("settings_page"))
 
 
 @app.route("/api/last-page", methods=["POST"])
 def api_set_last_page():
     page = request.get_json(force=True).get("page", "charts")
-    valid = {"charts", "summary", "import", "logs", "help", "config"}
+    valid = {"charts", "live_power", "data_management", "logs", "help", "settings", "insights"}
     if page not in valid:
         page = "charts"
     resp = jsonify({"ok": True})
@@ -332,15 +397,7 @@ def api_set_last_page():
     return resp
 
 
-@app.route("/config")
-def config_page():
-    cfg = load_config()
-    try:
-        has_data = _get_store().count_blocks() > 0
-    except Exception:
-        has_data = False
-    tz_select_html = '<select class="js-meta" data-key="timezone"><option value="UTC">UTC</option><option value="Europe/London">Europe/London (UK)</option><option value="Europe/Dublin">Europe/Dublin (Ireland)</option><option value="Europe/Lisbon">Europe/Lisbon (Portugal)</option><option value="Europe/Paris">Europe/Paris (France, Belgium, Netherlands)</option><option value="Europe/Berlin">Europe/Berlin (Germany, Austria)</option><option value="Europe/Amsterdam">Europe/Amsterdam</option><option value="Europe/Rome">Europe/Rome (Italy)</option><option value="Europe/Madrid">Europe/Madrid (Spain)</option><option value="Europe/Stockholm">Europe/Stockholm (Sweden, Norway, Denmark)</option><option value="Europe/Helsinki">Europe/Helsinki (Finland)</option><option value="Europe/Warsaw">Europe/Warsaw (Poland)</option><option value="Europe/Athens">Europe/Athens (Greece)</option><option value="Europe/Istanbul">Europe/Istanbul (Turkey)</option><option value="Europe/Moscow">Europe/Moscow (Russia)</option><option value="America/New_York">America/New_York (US Eastern)</option><option value="America/Chicago">America/Chicago (US Central)</option><option value="America/Denver">America/Denver (US Mountain)</option><option value="America/Los_Angeles">America/Los_Angeles (US Pacific)</option><option value="America/Toronto">America/Toronto (Canada Eastern)</option><option value="America/Vancouver">America/Vancouver (Canada Pacific)</option><option value="America/Sao_Paulo">America/Sao_Paulo (Brazil)</option><option value="Asia/Dubai">Asia/Dubai (UAE)</option><option value="Asia/Kolkata">Asia/Kolkata (India)</option><option value="Asia/Singapore">Asia/Singapore</option><option value="Asia/Tokyo">Asia/Tokyo (Japan)</option><option value="Asia/Shanghai">Asia/Shanghai (China)</option><option value="Australia/Sydney">Australia/Sydney</option><option value="Australia/Perth">Australia/Perth</option><option value="Pacific/Auckland">Pacific/Auckland (New Zealand)</option></select>'
-    return render_template("config.html", config=cfg, active="config", tz_select_html=tz_select_html, has_data=has_data)
+
 
 
 @app.route("/static/logo.png")
@@ -485,8 +542,8 @@ def _format_billing(summary, cfg, currency):
 # Cache for gauge scale — recomputed at most every 30 minutes
 _gauge_cache = {"ts": None, "max_imp": 10, "max_exp": 5, "rate_low": 0.10, "rate_high": 0.25}
 
-@app.route("/summary")
-def summary_page():
+@app.route("/live-power")
+def live_power_page():
     from datetime import datetime
     from zoneinfo import ZoneInfo
     from energy_engine_io import load_json as _load_json
@@ -574,8 +631,8 @@ def summary_page():
     has_power_sensor = bool(main_meta.get("power_sensor"))
 
     return render_template(
-        "summary.html",
-        active="summary",
+        "live_power.html",
+        active="live_power",
         currency=currency,
         today_total=today_total,
         today_rows=today_rows,
@@ -968,24 +1025,24 @@ def api_carbon_current():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/import")
-def import_page():
-    return render_template("import.html", active="import")
+@app.route("/data-management")
+def data_management_page():
+    return render_template("data_management.html", active="data_management")
 
 
-@app.route("/config-history")
-def config_history_page():
-    return render_template("config_history.html", active="config_history")
+@app.route("/billing-history")
+def billing_history_page():
+    return render_template("billing_history.html", active="settings")
 
 
 @app.route("/delete-blocks")
 def delete_blocks_page():
-    return render_template("delete_blocks.html", active="import")
+    return render_template("delete_blocks.html", active="data_management")
 
 
 @app.route("/corrections")
 def corrections_page():
-    return render_template("corrections.html", active="import")
+    return render_template("corrections.html", active="data_management")
 
 
 # ── Chart file serving ────────────────────────────────────────────────────────
@@ -1835,7 +1892,7 @@ def api_backup_list():
     try:
         zips = sorted(glob.glob(f"{SHARE_BACKUP_DIR}/backups/*.zip"), reverse=True)
         # Check for flat files from last finalise
-        primary = ["blocks.db", "meters_config.json"]
+        primary = ["blocks.db"]
         legacy  = ["blocks.json"]   # written by 1.x/2.0.x, no longer updated
         flat_files = []
         for fname in primary + legacy:
@@ -1868,7 +1925,7 @@ def api_backup_restore():
         zipname   = data.get("zip", "")
         selected  = data.get("files", None)
         from_flat = data.get("from_flat", False)
-        known     = {"blocks.db", "blocks.json", "meters_config.json"}
+        known     = {"blocks.db", "blocks.json"}
 
         if not from_flat:
             if not zipname or "/" in zipname or "\\" in zipname:
@@ -2016,82 +2073,16 @@ def api_backup_restore():
             except Exception as _mig_e:
                 logger.warning("api_backup_restore: schema migration failed: %s", _mig_e)
 
-        # ── Sync meters_config.json ↔ active config period ─────────────────
-        try:
-            import json as _json2
-            from energy_engine_io import load_json as _lj_sync, save_json_atomic as _sja_sync
-            cfg_path = os.path.join(DATA_DIR, "meters_config.json")
-            store_sync = _get_store()
-
-            if "blocks.db" in restored:
-                active_cp = store_sync._conn.execute(
-                    "SELECT id FROM config_periods WHERE effective_to IS NULL "
-                    "ORDER BY effective_from DESC LIMIT 1"
-                ).fetchone()
-                if active_cp:
-                    db_cfg = store_sync.config_from_db(active_cp["id"])
-                    if db_cfg.get("meters"):
-                        _sja_sync(cfg_path, db_cfg)
-                        logger.info(
-                            "api_backup_restore: meters_config.json written "
-                            "from active config period in restored DB"
-                        )
-                        restored.append("meters_config.json (synced from restored blocks.db)")
-
-            elif "meters_config.json" in restored and "blocks.db" not in restored:
-                # meters_config.json only (no DB) — push file into normalised tables.
-                restored_cfg = _lj_sync(cfg_path, {})
-                if restored_cfg:
-                    active_cp = store_sync._conn.execute(
-                        "SELECT id FROM config_periods WHERE effective_to IS NULL "
-                        "ORDER BY effective_from DESC LIMIT 1"
-                    ).fetchone()
-                    if active_cp:
-                        main_meta = {}
-                        for md in restored_cfg.get("meters", {}).values():
-                            if not (md.get("meta") or {}).get("sub_meter"):
-                                main_meta = md.get("meta") or {}
-                                break
-                        period_id = active_cp["id"]
-                        store_sync._conn.execute(
-                            """UPDATE config_periods
-                               SET billing_day     = ?,
-                                   block_minutes   = ?,
-                                   timezone        = ?,
-                                   currency_symbol = ?,
-                                   currency_code   = ?,
-                                   site_name       = ?,
-                                   supplier        = ?
-                               WHERE id = ?""",
-                            (
-                                int(main_meta.get("billing_day") or 1),
-                                int(main_meta.get("block_minutes") or 30),
-                                main_meta.get("timezone", "UTC"),
-                                main_meta.get("currency_symbol", "£"),
-                                main_meta.get("currency_code", "GBP"),
-                                main_meta.get("site"),
-                                main_meta.get("supplier"),
-                                period_id,
-                            )
-                        )
-                        old_mids = [r["id"] for r in store_sync._conn.execute(
-                            "SELECT id FROM meters WHERE config_period_id=?", (period_id,)
-                        ).fetchall()]
-                        for mid in old_mids:
-                            store_sync._conn.execute(
-                                "DELETE FROM meter_channels WHERE meter_id=?", (mid,))
-                        store_sync._conn.execute(
-                            "DELETE FROM meters WHERE config_period_id=?", (period_id,))
-                        store_sync._write_meters(restored_cfg, period_id)
-                        store_sync._conn.commit()
-                        logger.info(
-                            "api_backup_restore: active config period updated "
-                            "from restored meters_config.json"
-                        )
-                        restored.append("config_periods (synced from meters_config.json)")
-
-        except Exception as _sync_e:
-            logger.warning("api_backup_restore: config sync failed: %s", _sync_e)
+        # Re-run engine_startup so gap detection runs against the restored DB.
+        # resume_engine() alone just unpauses the tick loop — it doesn't detect
+        # the session gap between the backup timestamp and now. engine_startup()
+        # reads the last finalised block, detects the gap, sets a gap marker and
+        # fills missing blocks as soon as the first live sensor read arrives.
+        import asyncio as _asyncio_r
+        from engine import engine_startup as _engine_startup_r
+        if _event_loop and _event_loop.is_running() and _ha_client:
+            _asyncio_r.run_coroutine_threadsafe(_engine_startup_r(_ha_client), _event_loop)
+            logger.info("api_backup_restore: engine_startup scheduled for gap detection")
 
         return jsonify({"ok": True, "restored": restored})
     except Exception as e:
@@ -2105,6 +2096,342 @@ def api_backup_restore():
         if _eng_fin and hasattr(_eng_fin, "resume_engine"):
             try: _eng_fin.resume_engine()
             except Exception: pass
+
+
+@app.route("/insights")
+def insights_page():
+    return render_template("insights.html", active="insights")
+
+
+@app.route("/settings")
+def settings_page():
+    tab = request.args.get("tab", "meter-config")
+    if tab == "carbon":
+        return render_template("settings.html", active="settings")
+    # Default: Meter Config tab
+    store = _get_store()
+    cfg   = load_config()
+    tz_select_html = '<select class="js-meta" data-key="timezone"><option value="UTC">UTC</option><option value="Europe/London">Europe/London (UK)</option><option value="Europe/Dublin">Europe/Dublin (Ireland)</option><option value="Europe/Lisbon">Europe/Lisbon (Portugal)</option><option value="Europe/Paris">Europe/Paris (France, Belgium, Netherlands)</option><option value="Europe/Berlin">Europe/Berlin (Germany, Austria)</option><option value="Europe/Amsterdam">Europe/Amsterdam</option><option value="Europe/Rome">Europe/Rome (Italy)</option><option value="Europe/Madrid">Europe/Madrid (Spain)</option><option value="Europe/Stockholm">Europe/Stockholm (Sweden, Norway, Denmark)</option><option value="Europe/Helsinki">Europe/Helsinki (Finland)</option><option value="Europe/Warsaw">Europe/Warsaw (Poland)</option><option value="Europe/Athens">Europe/Athens (Greece)</option><option value="Europe/Istanbul">Europe/Istanbul (Turkey)</option><option value="Europe/Moscow">Europe/Moscow (Russia)</option><option value="America/New_York">America/New_York (US Eastern)</option><option value="America/Chicago">America/Chicago (US Central)</option><option value="America/Denver">America/Denver (US Mountain)</option><option value="America/Los_Angeles">America/Los_Angeles (US Pacific)</option><option value="America/Toronto">America/Toronto (Canada Eastern)</option><option value="America/Vancouver">America/Vancouver (Canada Pacific)</option><option value="America/Sao_Paulo">America/Sao_Paulo (Brazil)</option><option value="Asia/Dubai">Asia/Dubai (UAE)</option><option value="Asia/Kolkata">Asia/Kolkata (India)</option><option value="Asia/Singapore">Asia/Singapore</option><option value="Asia/Tokyo">Asia/Tokyo (Japan)</option><option value="Asia/Shanghai">Asia/Shanghai (China)</option><option value="Australia/Sydney">Australia/Sydney</option><option value="Australia/Perth">Australia/Perth</option><option value="Pacific/Auckland">Pacific/Auckland (New Zealand)</option></select>'
+    has_data = bool(store.get_all_blocks())
+    return render_template(
+        "meter_config.html",
+        config=cfg,
+        active="settings",
+        tz_select_html=tz_select_html,
+        has_data=has_data
+    )
+
+
+@app.route("/api/settings", methods=["GET"])
+def api_settings_get():
+    """Return current settings merged with defaults."""
+    store = _get_store()
+    saved = store.get_settings()
+    # Merge saved over defaults — any missing key falls back to default
+    result = dict(SETTINGS_DEFAULTS)
+    result.update(saved)
+    return jsonify(result)
+
+
+@app.route("/api/settings", methods=["POST"])
+def api_settings_post():
+    """Save settings. Only known keys accepted."""
+    store = _get_store()
+    data = request.get_json(force=True) or {}
+    saved = store.get_settings()
+    for key in SETTINGS_DEFAULTS:
+        if key in data:
+            val = data[key]
+            # Numeric fields
+            if key in SETTINGS_NUMERIC:
+                try:
+                    val = float(val)
+                    if val <= 0:
+                        return jsonify({"error": f"{key} must be positive"}), 400
+                except (TypeError, ValueError):
+                    return jsonify({"error": f"{key} must be a number"}), 400
+            saved[key] = val
+    store.save_settings(saved)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/insights/periods")
+def api_insights_periods():
+    """Return list of all billing periods with basic carbon summary for each."""
+    try:
+        import energy_charts as _ec
+        from zoneinfo import ZoneInfo as _ZI
+        from datetime import datetime, timezone
+        store   = _get_store()
+        cfg     = load_config()
+        tz_name = "Europe/London"
+        for mid, md in (cfg.get("meters") or {}).items():
+            tz_name = (md.get("meta") or {}).get("timezone", "Europe/London")
+            break
+        periods = _ec.get_billing_periods_from_config_periods(
+            store.get_config_periods(), tz=_ZI(tz_name)
+        )
+        now_local = datetime.now(_ZI(tz_name)).replace(tzinfo=None)  # periods are naive local datetimes
+        result = []
+        for (ps, pe) in periods:
+            is_current = ps <= now_local < pe
+            ps_iso = ps.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+            pe_iso = pe.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+            rows = store._conn.execute("""
+                SELECT
+                    SUM(CASE WHEN carbon_g IS NOT NULL THEN imp_kwh ELSE 0 END) AS imp_kwh_ci,
+                    SUM(CASE WHEN carbon_g IS NOT NULL THEN exp_kwh ELSE 0 END) AS exp_kwh_ci,
+                    SUM(CASE WHEN carbon_g IS NOT NULL THEN carbon_g ELSE 0 END) AS carbon_g_net,
+                    COUNT(CASE WHEN carbon_g IS NOT NULL THEN 1 END) AS ci_blocks,
+                    COUNT(*) AS total_blocks
+                FROM blocks
+                WHERE meter_id NOT IN (
+                    SELECT meter_id FROM meters WHERE is_sub_meter = 1
+                )
+                AND block_start >= ? AND block_start < ?
+            """, (ps_iso, pe_iso)).fetchone()
+            r = dict(rows) if rows else {}
+            result.append({
+                "period_start":  ps.date().isoformat(),
+                "period_end":    pe.date().isoformat(),
+                "is_current":    is_current,
+                "has_carbon":    (r.get("ci_blocks") or 0) > 0,
+                "carbon_g_net":  r.get("carbon_g_net"),
+            })
+        return jsonify({"periods": result})
+    except Exception as e:
+        logger.exception("api_insights_periods failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/insights/billing-period")
+def api_insights_billing_period():
+    """
+    Full carbon insights for a billing period.
+    Query params: period_start=YYYY-MM-DD (local date of period start).
+    If omitted, returns the most recent period.
+    """
+    try:
+        import energy_charts as _ec
+        from zoneinfo import ZoneInfo as _ZI
+        from datetime import datetime, timezone
+        store   = _get_store()
+        cfg     = load_config()
+        tz_name = "Europe/London"
+        for mid, md in (cfg.get("meters") or {}).items():
+            tz_name = (md.get("meta") or {}).get("timezone", "Europe/London")
+            break
+        tz = _ZI(tz_name)
+
+        periods = _ec.get_billing_periods_from_config_periods(
+            store.get_config_periods(), tz=tz
+        )
+        if not periods:
+            return jsonify({"error": "No billing periods found"}), 404
+
+        # Find requested period
+        requested  = request.args.get("period_start")
+        now_local  = datetime.now(tz).replace(tzinfo=None)  # periods are naive local datetimes
+        target_ps = target_pe = None
+        for (ps, pe) in periods:
+            if requested:
+                if ps.date().isoformat() == requested:
+                    target_ps, target_pe = ps, pe
+                    break
+            else:
+                target_ps, target_pe = ps, pe  # last one wins = most recent
+
+        if not target_ps:
+            return jsonify({"error": "Billing period not found"}), 404
+
+        is_current = target_ps <= now_local < target_pe
+        ps_iso = target_ps.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+        pe_iso = target_pe.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+
+        # Get meter config for sub-meter classification
+        meters_cfg = cfg.get("meters") or {}
+        sub_meter_ids = {
+            mid for mid, md in meters_cfg.items()
+            if (md.get("meta") or {}).get("sub_meter")
+        }
+
+        def _meter_type(mid, md):
+            """Resolve meter type from meta key or fall back to meter ID keywords."""
+            explicit = (md.get("meta") or {}).get("meter_type", "")
+            if explicit:
+                return explicit
+            mid_l = mid.lower()
+            if any(k in mid_l for k in ("ev", "charger")):      return "ev_charger"
+            if any(k in mid_l for k in ("battery", "batt")):    return "battery"
+            if any(k in mid_l for k in ("heat", "pump")):       return "heat_pump"
+            if any(k in mid_l for k in ("solar", "pv", "inv")): return "inverter"
+            return "unknown"
+
+        # Fetch blocks for this period using range query (efficient)
+        from datetime import datetime as _dt
+        _ps_dt = _dt.fromisoformat(ps_iso)
+        _pe_dt = _dt.fromisoformat(pe_iso)
+        period_blocks = store.get_blocks_for_range(_ps_dt, _pe_dt)
+
+        # ── Main meter aggregation ─────────────────────────────────────────────
+        main_imp_kwh = main_exp_kwh = 0.0
+        main_ci_imp_kwh = main_ci_exp_kwh = 0.0  # kWh only from CI blocks
+        cg_imp = cg_exp = cg_net = 0.0
+        ci_kwh_weighted = ci_duration = 0.0
+        eff_carbon = eff_kwh = 0.0
+        has_carbon = False
+        block_minutes = 30
+        if meters_cfg:
+            first_mid = next(iter(meters_cfg))
+            block_minutes = int((meters_cfg[first_mid].get("meta") or {}).get("block_minutes", 30) or 30)
+
+        for block in period_blocks:
+            for mid, md in (block.get("meters") or {}).items():
+                if mid in sub_meter_ids:
+                    continue
+                ch_imp = ((md.get("channels") or {}).get("import") or {})
+                ch_exp = ((md.get("channels") or {}).get("export") or {})
+                b_imp  = float(ch_imp.get("kwh") or 0)
+                b_exp  = float(ch_exp.get("kwh") or 0)
+                b_net  = b_imp - b_exp
+                main_imp_kwh += b_imp
+                main_exp_kwh += b_exp
+
+                cg = md.get("carbon_g")
+                if cg is None:
+                    continue
+                cg = float(cg)
+                has_carbon = True
+                cg_net += cg
+                main_ci_imp_kwh += b_imp
+                main_ci_exp_kwh += b_exp
+
+                if b_net != 0:
+                    b_intensity = abs(cg / b_net)
+                    cg_imp += b_imp * b_intensity
+                    cg_exp += b_exp * b_intensity
+                elif b_imp > 0:
+                    cg_imp += abs(cg)
+                else:
+                    cg_exp += abs(cg)
+
+                if b_net != 0:
+                    b_intensity = abs(cg / b_net)
+                    ci_kwh_weighted += b_intensity * block_minutes
+                    ci_duration     += block_minutes
+                    eff_carbon += abs(cg)
+                    eff_kwh    += abs(b_net)
+
+        effective_intensity = round(eff_carbon / eff_kwh, 1) if eff_kwh > 0 else None
+        grid_avg_intensity  = round(ci_kwh_weighted / ci_duration, 1) if ci_duration > 0 else None
+        avg_export_intensity = round(cg_exp / main_ci_exp_kwh, 1) if main_ci_exp_kwh > 0 else None
+
+        # ── Sub-meter aggregation ──────────────────────────────────────────────
+        sub_totals = {}
+        # Track total sub-meter import for house remainder calculation
+        total_sub_imp_kwh   = 0.0
+        total_sub_carbon_g  = 0.0
+        for block in period_blocks:
+            for mid, md in (block.get("meters") or {}).items():
+                if mid not in sub_meter_ids:
+                    continue
+                if mid not in sub_totals:
+                    _m_meta = (meters_cfg.get(mid, {}).get("meta") or {})
+                    sub_totals[mid] = {
+                        "imp_kwh":            0.0,
+                        "carbon_g":           0.0,
+                        "ci_blocks":          0,
+                        "ci_imp_kwh":         0.0,  # kWh only from blocks with CI data
+                        "total_blocks":       0,
+                        "meter_type":         _meter_type(mid, meters_cfg.get(mid, {})),
+                        "inverter_possible":  bool(_m_meta.get("inverter_possible")),
+                        # For charging intensity: weighted sum of intensity × kwh
+                        "ci_kwh_weighted":    0.0,
+                        "ci_kwh_duration":    0.0,
+                    }
+                ch_imp = ((md.get("channels") or {}).get("import") or {})
+                b_imp  = float(ch_imp.get("kwh") or 0)
+                sub_totals[mid]["imp_kwh"]      += b_imp
+                sub_totals[mid]["total_blocks"]  += 1
+                total_sub_imp_kwh += b_imp
+                cg = md.get("carbon_g")
+                if cg is not None:
+                    cg_f = float(cg)
+                    sub_totals[mid]["carbon_g"]   += cg_f
+                    sub_totals[mid]["ci_blocks"]  += 1
+                    sub_totals[mid]["ci_imp_kwh"] += b_imp  # kWh only from CI blocks
+                    total_sub_carbon_g += cg_f
+                    # Derive charging intensity for this block
+                    if b_imp > 0.001:
+                        b_intensity = abs(cg_f / b_imp)
+                        sub_totals[mid]["ci_kwh_weighted"] += b_intensity * b_imp
+                        sub_totals[mid]["ci_kwh_duration"] += b_imp
+
+        # Compute weighted average charging intensity per sub-meter
+        for mid, st in sub_totals.items():
+            if st["ci_kwh_duration"] > 0:
+                st["avg_charge_intensity"] = round(
+                    st["ci_kwh_weighted"] / st["ci_kwh_duration"], 1
+                )
+            else:
+                st["avg_charge_intensity"] = None
+            # Clean up internal accumulators before sending to client
+            del st["ci_kwh_weighted"]
+            del st["ci_kwh_duration"]
+
+        # ── House remainder ────────────────────────────────────────────────────
+        house_imp_kwh    = max(0.0, main_imp_kwh - total_sub_imp_kwh)
+        house_ci_imp_kwh = max(0.0, main_ci_imp_kwh - sum(
+            st.get("ci_imp_kwh", 0.0) for st in sub_totals.values()
+        ))
+        house_carbon_g   = max(0.0, cg_imp - total_sub_carbon_g) if has_carbon else None
+        house_avg_intensity = round(house_carbon_g / house_ci_imp_kwh, 1) \
+            if house_carbon_g and house_ci_imp_kwh > 0 else None
+
+        # ── Settings ──────────────────────────────────────────────────────────
+        settings = store.get_settings()
+        merged   = dict(SETTINGS_DEFAULTS)
+        merged.update(settings)
+
+        # ── Carbon coverage ────────────────────────────────────────────────────
+        total_blocks = sum(
+            1 for b in period_blocks
+            for mid in (b.get("meters") or {})
+            if mid not in sub_meter_ids
+        )
+        ci_blocks = sum(
+            1 for b in period_blocks
+            for mid, md in (b.get("meters") or {}).items()
+            if mid not in sub_meter_ids and md.get("carbon_g") is not None
+        )
+        coverage_pct = round(ci_blocks / total_blocks * 100, 1) if total_blocks else 0
+
+        return jsonify({
+            "period_start":         target_ps.date().isoformat(),
+            "period_end":           target_pe.date().isoformat(),
+            "is_current":           is_current,
+            "has_carbon":           has_carbon,
+            "carbon_coverage_pct":  coverage_pct,
+            "imp_kwh":              round(main_imp_kwh, 3),
+            "exp_kwh":              round(main_exp_kwh, 3),
+            "ci_imp_kwh":           round(main_ci_imp_kwh, 3),
+            "ci_exp_kwh":           round(main_ci_exp_kwh, 3),
+            "carbon_g_imp":         round(cg_imp, 1) if has_carbon else None,
+            "carbon_g_exp":         round(cg_exp, 1) if has_carbon else None,
+            "carbon_g_net":         round(cg_net, 1) if has_carbon else None,
+            "effective_intensity":  effective_intensity,
+            "avg_export_intensity": avg_export_intensity,
+            "grid_avg_intensity":   grid_avg_intensity,
+            "sub_meters":           sub_totals,
+            "house_imp_kwh":        round(house_imp_kwh, 3),
+            "house_ci_imp_kwh":     round(house_ci_imp_kwh, 3),
+            "house_carbon_g":       round(house_carbon_g, 1) if house_carbon_g is not None else None,
+            "house_avg_intensity":  house_avg_intensity,
+            "assumptions":          merged,
+        })
+    except Exception as e:
+        logger.exception("api_insights_billing_period failed")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/storage-info")
@@ -2164,7 +2491,7 @@ def api_import_extract_zip():
         zf_file = request.files.get("zipfile")
         if not zf_file:
             return jsonify({"error": "No zip file provided"}), 400
-        known = {"blocks.db", "blocks.json", "meters_config.json"}
+        known = {"blocks.db", "blocks.json"}
         files = {}
         with zipfile.ZipFile(zf_file.stream, "r") as zf:
             for name in zf.namelist():
@@ -2172,7 +2499,7 @@ def api_import_extract_zip():
                 if basename in known:
                     files[basename] = base64.b64encode(zf.read(name)).decode("utf-8")
         if not files:
-            return jsonify({"error": "No recognised JSON files found in zip"}), 400
+            return jsonify({"error": "No recognised files found in zip"}), 400
         logger.info("api_import_extract_zip: extracted %s", list(files.keys()))
         return jsonify({"files": files})
     except Exception as e:
@@ -2193,13 +2520,15 @@ def api_backup_flat_info():
     """
     from datetime import datetime as _dt
     # Primary files — written by current engine
-    primary = ["blocks.db", "meters_config.json"]
+    primary = ["blocks.db"]
     # Legacy files — may be present from older versions, no longer written
     legacy  = ["blocks.json"]
 
     files = {}
     for fname in primary + legacy:
         fpath = f"{SHARE_BACKUP_DIR}/{fname}"
+        if fname == "meters_config.json":
+            continue  # no longer a restore target — config lives inside blocks.db
         if os.path.exists(fpath):
             mtime = os.path.getmtime(fpath)
             size  = os.path.getsize(fpath)
@@ -2226,7 +2555,7 @@ def api_import_extract_zip_by_name():
         zip_path = f"{SHARE_BACKUP_DIR}/backups/{zipname}"
         if not os.path.exists(zip_path):
             return jsonify({"error": "Backup not found"}), 404
-        known = {"blocks.db", "blocks.json", "meters_config.json"}
+        known = {"blocks.db", "blocks.json"}
         files = {}
         with zipfile.ZipFile(zip_path, "r") as zf:
             for name in zf.namelist():
@@ -2250,7 +2579,7 @@ def _create_backup_zip(label="backup"):
     os.makedirs(backup_dir, exist_ok=True)
     timestamp = _dt.utcnow().strftime("%Y%m%dT%H%M%S")
     zip_path  = f"{backup_dir}/{timestamp}_{label}.zip"
-    files = ["meters_config.json"]  # current_block and cumulative_totals now in DB
+    files = []  # blocks.db is the only file needed — config is inside it
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         # Backup blocks DB using SQLite online backup API into a temp file
         import tempfile
@@ -2342,7 +2671,7 @@ def api_import_from_zip():
         if engine and hasattr(engine, "pause_engine"):
             engine.pause_engine()
 
-        known    = {"blocks.db", "blocks.json", "meters_config.json"}
+        known    = {"blocks.db", "blocks.json"}
         imported = []
 
         # Auto-backup before overwriting
@@ -2399,42 +2728,16 @@ def api_import_from_zip():
         if not imported:
             return jsonify({"error": "No blocks.db found in zip"}), 400
 
-        # ── Post-import sync: write meters_config.json from restored DB ─────
-        # Use direct sqlite3 — NOT _get_store() — to avoid the BlockStore
-        # corruption-recovery handler nuking the just-restored file.
-        # Also remove any -wal/-shm files left by the engine before opening.
+        # ── Post-import: remove WAL/SHM and reset engine store ───────────────
+        # No need to write meters_config.json — engine_startup reads config
+        # directly from the restored DB on next start.
         if "blocks.db" in imported:
-            try:
-                import sqlite3 as _sq3
-                _dest = os.path.join(DATA_DIR, "blocks.db")
-                # Remove WAL/SHM files so BlockStore opens cleanly
-                for _ext in ("-wal", "-shm"):
-                    _f = _dest + _ext
-                    if os.path.exists(_f):
-                        try: os.remove(_f)
-                        except Exception: pass
-                # Switch journal mode to DELETE so next open isn't in WAL
-                _raw = _sq3.connect(_dest)
-                _raw.execute("PRAGMA journal_mode=DELETE")
-                _raw.close()
-                # Now open via BlockStore to read config
-                from block_store import BlockStore as _BS
-                _bs = _BS(_dest)
-                _acp = _bs._conn.execute(
-                    "SELECT id FROM config_periods WHERE effective_to IS NULL "
-                    "ORDER BY effective_from DESC LIMIT 1"
-                ).fetchone()
-                if _acp:
-                    db_cfg = _bs.config_from_db(_acp["id"])
-                    if db_cfg.get("meters"):
-                        from energy_engine_io import save_json_atomic as _sja_fz
-                        cfg_path = os.path.join(DATA_DIR, "meters_config.json")
-                        _sja_fz(cfg_path, db_cfg)
-                        imported.append("meters_config.json (synced from DB)")
-                        logger.info("api_import_from_zip: wrote meters_config.json from restored DB")
-                _bs.close()
-            except Exception as _se:
-                logger.warning("api_import_from_zip: post-sync failed: %s", _se)
+            _dest = os.path.join(DATA_DIR, "blocks.db")
+            for _ext in ("-wal", "-shm"):
+                _f = _dest + _ext
+                if os.path.exists(_f):
+                    try: os.remove(_f)
+                    except Exception: pass
 
         # Reset engine store so it reopens from the new DB file
         import sys as _sys
@@ -2504,57 +2807,25 @@ def api_import():
                 logger.error("server: blocks.db import failed: %s", _dbe)
                 raise
 
-        # ── meters_config.json ────────────────────────────────────────────────
-        # Only write the config file when blocks.db is NOT being restored —
-        # when the DB is restored it is authoritative and we write the config
-        # FROM the DB below, not from the uploaded file.
-        cfg_file = request.files.get("meters_config")
-        if cfg_file and "blocks.db" not in imported:
-            data = json.loads(cfg_file.read().decode("utf-8"))
-            dest = os.path.join(DATA_DIR, "meters_config.json")
-            tmp  = dest + ".tmp"
-            with open(tmp, "w") as out:
-                json.dump(data, out, indent=2)
-            os.replace(tmp, dest)
-            imported.append("meters_config.json")
-            logger.info("server: imported meters_config.json")
+        # ── meters_config.json upload ignored — config lives in blocks.db ───
+        # If a meters_config.json is uploaded alongside blocks.db, ignore it.
+        # The DB is authoritative; engine_startup reads config from it on next start.
 
         if not imported:
             if engine and hasattr(engine, 'resume_engine'):
                 engine.resume_engine()
             return jsonify({"error": "No files received"}), 400
 
-        # ── Post-import sync: DB → meters_config.json ─────────────────────────
+        # ── Post-import: close stores so engine reopens from new DB ──────────
         if "blocks.db" in imported:
-            try:
-                import sqlite3 as _sq3i
-                _dest_i = os.path.join(DATA_DIR, "blocks.db")
-                for _ext in ("-wal", "-shm"):
-                    _fi = _dest_i + _ext
-                    if os.path.exists(_fi):
-                        try: os.remove(_fi)
-                        except Exception: pass
-                _rawi = _sq3i.connect(_dest_i)
-                _rawi.execute("PRAGMA journal_mode=DELETE")
-                _rawi.close()
-                from block_store import BlockStore as _BSi
-                _bsi = _BSi(_dest_i)
-                _acpi = _bsi._conn.execute(
-                    "SELECT id FROM config_periods WHERE effective_to IS NULL "
-                    "ORDER BY effective_from DESC LIMIT 1"
-                ).fetchone()
-                if _acpi:
-                    db_cfg = _bsi.config_from_db(_acpi["id"])
-                    if db_cfg.get("meters"):
-                        from energy_engine_io import save_json_atomic as _sja_imp
-                        cfg_path = os.path.join(DATA_DIR, "meters_config.json")
-                        _sja_imp(cfg_path, db_cfg)
-                        imported.append("meters_config.json (synced from imported blocks.db)")
-                        logger.info("server: api_import wrote meters_config.json from restored DB")
-                _bsi.close()
-            except Exception as _se:
-                logger.warning("server: api_import post-sync failed: %s", _se)
-
+            # Remove WAL/SHM files left by running engine
+            import sqlite3 as _sq3i
+            _dest_i = os.path.join(DATA_DIR, "blocks.db")
+            for _ext in ("-wal", "-shm"):
+                _fi = _dest_i + _ext
+                if os.path.exists(_fi):
+                    try: os.remove(_fi)
+                    except Exception: pass
             # Reset engine store and web store so both reopen from new DB
             import sys as _sys2
             _eng2 = _sys2.modules.get("engine")

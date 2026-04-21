@@ -164,6 +164,7 @@ CREATE TABLE IF NOT EXISTS current_block (
     block_end       TEXT,       -- UTC ISO — current block window end
     last_checkpoint TEXT,       -- UTC ISO — last capture timestamp
     gap_detected_at TEXT,       -- UTC ISO — when gap was detected, NULL if no gap
+    gap_last_block_start TEXT,  -- UTC ISO — start of last finalised block before gap
     interpolated    INTEGER NOT NULL DEFAULT 0
 );
 
@@ -566,6 +567,35 @@ class BlockStore:
                 (captured_at, net_kw, intensity, carbon_gco2_min)
             )
 
+    # ── Settings ──────────────────────────────────────────────────────────────
+
+    def get_settings(self) -> dict:
+        """Return all settings as a dict. Missing keys return defaults."""
+        import json as _json
+        row = self._conn.execute(
+            "SELECT value FROM store_meta WHERE key = 'settings'"
+        ).fetchone()
+        if row and row['value']:
+            try:
+                return _json.loads(row['value'])
+            except Exception:
+                pass
+        return {}
+
+    def save_settings(self, settings: dict) -> None:
+        """Persist settings dict to store_meta."""
+        import json as _json
+        self._conn.execute(
+            "INSERT INTO store_meta (key, value) VALUES ('settings', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_json.dumps(settings),)
+        )
+        self._conn.commit()
+
+    def get_setting(self, key: str, default=None):
+        """Return a single setting value by key."""
+        return self.get_settings().get(key, default)
+
     def prune_power_history(self, hours: int = 48) -> int:
         """Delete power_history rows older than `hours` hours. Returns rows deleted."""
         cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
@@ -896,23 +926,27 @@ class BlockStore:
         """
         block_start     = block.get("start")
         block_end       = block.get("end")
-        last_checkpoint = block.get("_last_checkpoint")
-        gap_marker      = block.get("_gap_marker")
-        gap_detected_at = (gap_marker or {}).get("detected_at") if gap_marker else None
-        interpolated    = 1 if block.get("interpolated") else 0
+        last_checkpoint      = block.get("_last_checkpoint")
+        gap_marker           = block.get("_gap_marker")
+        gap_detected_at      = (gap_marker or {}).get("detected_at") if gap_marker else None
+        gap_last_block_start = (gap_marker or {}).get("last_block_start") if gap_marker else None
+        interpolated         = 1 if block.get("interpolated") else 0
 
         with self._conn:
             self._conn.execute(
                 """INSERT INTO current_block
-                       (id, block_start, block_end, last_checkpoint, gap_detected_at, interpolated)
-                   VALUES (1, ?, ?, ?, ?, ?)
+                       (id, block_start, block_end, last_checkpoint, gap_detected_at,
+                        gap_last_block_start, interpolated)
+                   VALUES (1, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
-                       block_start     = excluded.block_start,
-                       block_end       = excluded.block_end,
-                       last_checkpoint = excluded.last_checkpoint,
-                       gap_detected_at = excluded.gap_detected_at,
-                       interpolated    = excluded.interpolated""",
-                (block_start, block_end, last_checkpoint, gap_detected_at, interpolated)
+                       block_start          = excluded.block_start,
+                       block_end            = excluded.block_end,
+                       last_checkpoint      = excluded.last_checkpoint,
+                       gap_detected_at      = excluded.gap_detected_at,
+                       gap_last_block_start = excluded.gap_last_block_start,
+                       interpolated         = excluded.interpolated""",
+                (block_start, block_end, last_checkpoint, gap_detected_at,
+                 gap_last_block_start, interpolated)
             )
 
             # Replace all current_reads with the rolling buffer + gap seed rows
@@ -1032,6 +1066,7 @@ class BlockStore:
                 "detected_at":      row["gap_detected_at"],
                 "pre_reads":        dict(pre_reads),
                 "last_known_rates": dict(last_known_rates),
+                "last_block_start": row["gap_last_block_start"],
             }
 
         return block
@@ -1475,7 +1510,22 @@ class BlockStore:
                     "migrate_full_config_json: is_gap_seed add failed: %s", _e
                 )
 
-        # ── Step 2b: gap_marker blob → gap_detected_at + is_gap_seed rows ────
+        # ── Step 2b: gap_last_block_start column on current_block ────────────
+        cb_cols_check = [r[1] for r in self._conn.execute(
+            "PRAGMA table_info(current_block)"
+        ).fetchall()]
+        if "gap_last_block_start" not in cb_cols_check:
+            try:
+                with self._conn:
+                    self._conn.execute(
+                        "ALTER TABLE current_block "
+                        "ADD COLUMN gap_last_block_start TEXT"
+                    )
+                logger.info("migrate: added gap_last_block_start to current_block")
+            except Exception as _e:
+                logger.warning("migrate: gap_last_block_start add failed: %s", _e)
+
+        # ── Step 2c: gap_marker blob → gap_detected_at + is_gap_seed rows ────
         cb_cols = [r[1] for r in self._conn.execute(
             "PRAGMA table_info(current_block)"
         ).fetchall()]
@@ -1651,7 +1701,50 @@ class BlockStore:
         with self._conn:
             self._conn.executemany(sql, rows)
 
-    # ── Read ──────────────────────────────────────────────────────────────
+    def _insert_block_rows_replace(self, rows: list[dict]) -> None:
+        """Like _insert_block_rows but uses INSERT OR REPLACE to overwrite
+        existing blocks. Used by gap fill to correct zero/bad blocks in the DB."""
+        if not rows:
+            return
+        sql = """
+            INSERT OR REPLACE INTO blocks (
+                block_start, block_end,
+                local_date, local_year, local_month, local_day,
+                meter_id, config_period_id, interpolated,
+                imp_kwh, imp_kwh_grid, imp_kwh_remainder,
+                imp_rate, imp_cost, imp_cost_remainder,
+                imp_read_start, imp_read_end,
+                exp_kwh, exp_rate, exp_cost,
+                exp_read_start, exp_read_end,
+                standing_charge, carbon_g
+            ) VALUES (
+                :block_start, :block_end,
+                :local_date, :local_year, :local_month, :local_day,
+                :meter_id, :config_period_id, :interpolated,
+                :imp_kwh, :imp_kwh_grid, :imp_kwh_remainder,
+                :imp_rate, :imp_cost, :imp_cost_remainder,
+                :imp_read_start, :imp_read_end,
+                :exp_kwh, :exp_rate, :exp_cost,
+                :exp_read_start, :exp_read_end,
+                :standing_charge, :carbon_g
+            )
+        """
+        with self._conn:
+            self._conn.executemany(sql, rows)
+
+    def append_block_replace(self, block: dict,
+                             config_period_id: Optional[int] = None) -> None:
+        """Insert a finalised block, replacing any existing block at the same
+        (block_start, meter_id, config_period_id). Used by gap fill."""
+        period_id = config_period_id or self.get_current_config_period_id()
+        if period_id is None:
+            raise RuntimeError(
+                "BlockStore.append_block_replace: no config period exists."
+            )
+        cp = self.get_config_period(period_id)
+        tz_name = cp["timezone"] if cp else "UTC"
+        rows = _block_rows(block, period_id, tz_name)
+        self._insert_block_rows_replace(rows)
 
     def _select_blocks(self, where: str, params: tuple) -> list[dict]:
         sql = f"""
@@ -1673,6 +1766,33 @@ class BlockStore:
     def get_all_blocks(self) -> list[dict]:
         """Full export — used by chart generation during transition phase."""
         return self._select_blocks("", ())
+
+    def get_last_block_before(self, block_start: str) -> Optional[dict]:
+        """Return the most recently finalised block before the given block_start.
+        Used by engine_startup to avoid catching up zero-rate blocks written
+        by ensure_correct_block before startup completes."""
+        cur = self._conn.execute(
+            """
+            SELECT b.*, cp.billing_day, cp.block_minutes, cp.timezone,
+                   cp.currency_symbol, cp.currency_code, cp.effective_from,
+                   m.is_sub_meter, m.parent_meter_id, m.device_label,
+                   m.inverter_possible, m.power_sensor, m.postcode_prefix,
+                   m.v2x_capable
+            FROM blocks b
+            JOIN config_periods cp ON b.config_period_id = cp.id
+            LEFT JOIN meters m ON m.meter_id = b.meter_id
+                               AND m.config_period_id = b.config_period_id
+            WHERE b.block_start = (
+                SELECT MAX(block_start) FROM blocks WHERE block_start < ?
+            )
+            ORDER BY b.meter_id
+            """,
+            (block_start,)
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return None
+        return _row_to_block(rows)
 
     def get_last_block(self) -> Optional[dict]:
         """Return the most recently finalised block (by block_start)."""

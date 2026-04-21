@@ -4,15 +4,22 @@
 {% block topbar %}
 <div class="topbar">
   <div>
-    <h2>Meter Configuration</h2>
-    <div class="sub">Configure your main meter and sub-meters</div>
+    <h2>Settings</h2>
+    <div class="sub">Configure your meters and carbon assumptions</div>
   </div>
-  <div style="display:flex;gap:8px;">
-    <button class="btn btn-secondary" id="btn-wizard">✦ Setup Wizard</button>
-    <button class="btn btn-secondary" id="btn-refresh">↺ Refresh Entities</button>
-    <a href="{{ url_for('config_history_page') }}" class="btn btn-secondary">🕓 Billing History</a>
-    <button class="btn btn-primary" id="btn-save">💾 Save Config</button>
+  <div class="settings-tabs">
+    <a href="{{ url_for('settings_page') }}" class="settings-tab active">⚙️ Meter Config</a>
+    <a href="{{ url_for('settings_page') }}?tab=carbon" class="settings-tab">🌿 Carbon</a>
   </div>
+  <button class="btn btn-primary" id="btn-save">💾 Save Config</button>
+</div>
+{% endblock %}
+
+{% block subbar %}
+<div class="settings-subbar">
+  <button class="btn btn-secondary" id="btn-wizard">✦ Setup Wizard</button>
+  <button class="btn btn-secondary" id="btn-refresh">↺ Refresh Entities</button>
+  <a href="{{ url_for('billing_history_page') }}" class="btn btn-secondary">🕓 Billing History</a>
 </div>
 {% endblock %}
 
@@ -474,7 +481,7 @@ function buildSubCard(meterId, meter) {
       '<span class="channel-label label-import">Import</span>' +
       '<div class="form-group"><label>Read Sensor — cumulative kWh</label>' +
         buildEntityInput(meterId+'__import__read', imp.read||'', meterId, 'import', 'read') + '</div>' +
-      '<div class="form-group"><label>Rate Sensor ' + (mainImportRate ? '(pre-filled from main meter)' : '') + '</label>' +
+      '<div class="form-group"><label>Rate Sensor ' + (mainImportRate ? '(default: one-time copy from main meter at setup — update here if your sub-meter has a different rate or you retrospectively change rates)' : '') + '</label>' +
         buildEntityInput(meterId+'__import__rate', rateVal, meterId, 'import', 'rate') + '</div>' +
     '</div>';
 
@@ -897,7 +904,7 @@ function wizStepSubSensors() {
   var impRate = wiz.data.importRate || '';
 
   var html = '<h3 style="margin:0 0 6px;">Sub-meter Sensors</h3>' +
-    '<p style="color:var(--muted);font-size:13px;margin:0 0 20px;">Map sensors for each device. Rate is pre-filled from your main import meter.</p>';
+    '<p style="color:var(--muted);font-size:13px;margin:0 0 20px;">Map sensors for each device. Rate is copied once from your main import meter at setup time. Update here if your sub-meter has a different rate, or if you retrospectively change the main meter rate sensor.</p>';
 
   wiz.devices.forEach(function(devId) {
     if (!wiz.data.subMeters[devId]) wiz.data.subMeters[devId] = { read: '', rate: impRate, name: '' };
@@ -910,7 +917,7 @@ function wizStepSubSensors() {
         '<input id="wiz-sub-' + devId + '-name" type="text" value="' + esc(sd.name) + '" placeholder="e.g. Tesla Charger"></div>' +
       '<div class="form-group"><label>Read Sensor — cumulative kWh</label>' +
         buildWizEntity('wiz-sub-' + devId + '-read', sd.read) + '</div>' +
-      '<div class="form-group"><label>Rate Sensor ' + (impRate ? '(pre-filled from main meter)' : '') + '</label>' +
+      '<div class="form-group"><label>Rate Sensor ' + (impRate ? '(default: one-time copy from main meter at setup — update here if your sub-meter has a different rate or you retrospectively change rates)' : '') + '</label>' +
         buildWizEntity('wiz-sub-' + devId + '-rate', sd.rate || impRate) + '</div>' +
     '</div>';
   });

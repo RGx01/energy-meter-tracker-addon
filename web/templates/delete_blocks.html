@@ -4,7 +4,7 @@
 <div class="topbar">
   <div>
     <div style="font-size:12px;color:var(--muted);margin-bottom:2px;">
-      <a href="{{ url_for('import_page') }}" style="color:var(--muted);text-decoration:none;">Data Management</a>
+      <a href="{{ url_for('data_management_page') }}" style="color:var(--muted);text-decoration:none;">Data Management</a>
       &nbsp;/
     </div>
     <h2>Delete Blocks</h2>
@@ -12,7 +12,7 @@
   </div>
   <div style="display:flex;gap:8px;">
     <button class="btn btn-secondary" id="btn-backup" onclick="doManualBackup()">💾 Backup Now</button>
-    <a href="{{ url_for('import_page') }}" class="btn btn-secondary">← Data Management</a>
+    <a href="{{ url_for('data_management_page') }}" class="btn btn-secondary">← Data Management</a>
   </div>
 </div>
 {% endblock %}

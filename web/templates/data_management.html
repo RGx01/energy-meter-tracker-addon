@@ -138,11 +138,7 @@
         <td style="padding:10px 0;color:var(--success);font-size:12px;">Safe alone — self-contained</td>
       </tr>
       
-      <tr>
-        <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">meters_config.json</td>
-        <td style="padding:10px 0;color:var(--text);">Human-readable config export. Authoritative config is inside blocks.db — this file is written for reference only.</td>
-        <td style="padding:10px 0;color:var(--muted);font-size:12px;">Export only — not required</td>
-      </tr>
+
     </tbody>
   </table>
 </div>
@@ -199,7 +195,7 @@
 
 {% block scripts %}
 <script>
-const KNOWN_FILES = ['blocks.db','meters_config.json'];
+const KNOWN_FILES = ['blocks.db'];
 let selectedFiles = {};
 let _restoreZip   = null;
 let _restoreFlat  = false;
@@ -356,8 +352,7 @@ async function doImport() {
   hideAlerts();
   const form = new FormData();
   const fieldMap = {
-    'blocks.db':    'blocks',   // current format
-    'meters_config.json': 'meters_config',  // convenience export — optional
+    'blocks.db': 'blocks',
   };
 
   let hasKnown = false;
@@ -367,7 +362,7 @@ async function doImport() {
   });
 
   if (!hasKnown) {
-    showError('No recognised files selected. Expected: ' + Object.keys(fieldMap).join(', '));
+    showError('No recognised files selected. Please select blocks.db.');
     return;
   }
 
@@ -407,8 +402,8 @@ async function restoreFromFlat() {
     });
 
     var riskMap = {
-      'blocks.db':              { risk: 'success', note: 'Safe to restore alone — contains all data' },
-      'meters_config.json':     { risk: 'muted',   note: 'Config export only — not required' },
+      'blocks.db':              { risk: 'success', note: 'Safe to restore alone — contains all config, blocks and settings' },
+      'meters_config.json':     { risk: 'muted',   note: 'No longer needed — config is stored inside blocks.db' },
       'current_block.json':     { risk: 'muted',   note: 'No longer used — will be ignored (state is now in blocks.db)' },
       'cumulative_totals.json': { risk: 'muted',   note: 'No longer used — will be ignored (totals derived from blocks)' },
     };
@@ -420,7 +415,7 @@ async function restoreFromFlat() {
       return '<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;' +
              'background:var(--bg);border-radius:var(--radius);border:1px solid var(--border);margin-bottom:6px;cursor:pointer;">' +
         '<input type="checkbox" class="restore-cb" data-file="' + name + '"' +
-               ((['current_block.json','cumulative_totals.json'].includes(name)) ? '' : ' checked') +
+               ((['meters_config.json','current_block.json','cumulative_totals.json'].includes(name)) ? '' : ' checked') +
                ' style="margin-top:2px;width:15px;height:15px;accent-color:var(--accent);" ' +
                'onchange="checkRestoreMismatch()">' +
         '<div>' +
@@ -464,9 +459,9 @@ async function restoreFromZip(zipName) {
 
   // Build checkbox list
   const riskMap = {
-    'blocks.db':              { risk: 'success', note: 'Safe to restore alone — contains all data' },
+    'blocks.db':              { risk: 'success', note: 'Safe to restore alone — contains all config, blocks and settings' },
     'blocks.json':            { risk: 'warning', note: 'Legacy format — will be migrated to blocks.db on restore' },
-    'meters_config.json':     { risk: 'muted',   note: 'Config export only — not required' },
+    'meters_config.json':     { risk: 'muted',   note: 'No longer needed — config is stored inside blocks.db' },
     'current_block.json':     { risk: 'muted',   note: 'No longer used — will be ignored (state is now in blocks.db)' },
     'cumulative_totals.json': { risk: 'muted',   note: 'No longer used — will be ignored (totals derived from blocks)' },
   };
@@ -478,7 +473,7 @@ async function restoreFromZip(zipName) {
                            background:var(--bg);border-radius:var(--radius);
                            border:1px solid var(--border);margin-bottom:6px;cursor:pointer;">
       <input type="checkbox" class="restore-cb" data-file="${name}"
-             ${(['current_block.json','cumulative_totals.json'].includes(name)) ? '' : 'checked'}
+             ${(['meters_config.json','current_block.json','cumulative_totals.json'].includes(name)) ? '' : 'checked'}
              style="margin-top:2px;width:15px;height:15px;accent-color:var(--accent);"
              onchange="checkRestoreMismatch()">
       <div>

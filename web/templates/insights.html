@@ -1,0 +1,1119 @@
+{% extends "base.html" %}
+
+{% block topbar %}
+<div class="topbar">
+  <div>
+    <h2>Insights</h2>
+    <div class="sub">Energy and carbon analysis by billing period</div>
+  </div>
+  <div class="insights-tabs">
+    <button class="insights-tab active" data-tab="carbon" onclick="showInsightTab('carbon', this)">🌿 Carbon</button>
+  </div>
+  <div id="period-nav" style="display:none; align-items:center; gap:8px;">
+    <button class="btn btn-secondary" id="btn-prev" onclick="navPeriod(-1)">←</button>
+    <span id="period-label" style="font-size:13px; font-weight:600; min-width:160px; text-align:center;"></span>
+    <button class="btn btn-secondary" id="btn-next" onclick="navPeriod(1)">→</button>
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+<style>
+  .insights-tabs { display:flex; gap:8px; }
+  .insights-tab {
+    padding: 7px 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: transparent;
+    color: var(--muted);
+    font-size: 13px;
+    font-family: var(--sans);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .insights-tab:hover { background: rgba(255,255,255,0.05); color: var(--text); }
+  .insights-tab.active { background: rgba(0,212,170,0.1); color: var(--accent); border-color: var(--accent); }
+
+  .insight-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 20px;
+    margin-bottom: 12px;
+  }
+  .insight-card-title {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }
+  .insight-headline {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text);
+    font-family: var(--mono);
+    margin-bottom: 2px;
+  }
+  .insight-sub {
+    font-size: 13px;
+    color: var(--muted);
+    margin-bottom: 12px;
+    line-height: 1.5;
+  }
+  .insight-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .insight-metric {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 9px 12px;
+  }
+  .insight-metric-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:3px; }
+  .insight-metric-value { font-size:18px; font-weight:600; font-family:var(--mono); color:var(--text); display:inline; }
+  .insight-metric-unit  { font-size:11px; color:var(--muted); margin-left:3px; display:inline; }
+  .insight-verdict {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    border-radius: var(--radius);
+    font-size: 13px;
+    font-weight: 500;
+    margin-bottom: 10px;
+  }
+  .insight-verdict.positive { background:rgba(26,122,60,0.12); color:var(--success); border:1px solid rgba(26,122,60,0.25); }
+  .insight-verdict.neutral  { background:rgba(180,83,9,0.08);  color:var(--warning); border:1px solid rgba(180,83,9,0.2); }
+  .insight-verdict.negative { background:rgba(192,57,43,0.08); color:var(--danger);  border:1px solid rgba(192,57,43,0.2); }
+  .insight-equiv {
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.6;
+    border-top: 1px solid var(--border);
+    padding-top: 10px;
+    margin-top: 4px;
+  }
+  .insight-equiv strong { color: var(--text); }
+  .insight-footnote {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+    line-height: 1.6;
+  }
+  .insight-footnote a { color:var(--accent); text-decoration:none; }
+  .insight-footnote a:hover { text-decoration:underline; }
+  .coverage-warn { font-size:12px; color:var(--warning); margin-top:6px; }
+  #trend-wrap { margin-top:12px; border-top:1px solid var(--border); padding-top:10px; }
+
+  /* Postcode prompt */
+  .postcode-prompt {
+    background: rgba(0,212,170,0.06);
+    border: 1px solid rgba(0,212,170,0.25);
+    border-radius: var(--radius);
+    padding: 16px 20px;
+    margin-bottom: 12px;
+  }
+  .postcode-prompt h3 { font-size:15px; font-weight:600; margin-bottom:6px; }
+  .postcode-prompt p  { font-size:13px; color:var(--muted); line-height:1.6; margin-bottom:12px; }
+  .postcode-input-row { display:flex; gap:8px; align-items:center; }
+  .postcode-field {
+    width: 130px;
+    padding: 7px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    font-family: var(--mono);
+    text-transform: uppercase;
+  }
+  .postcode-field:focus { outline:none; border-color:var(--accent); }
+</style>
+
+<div id="insights-loading" style="text-align:center; padding:60px; color:var(--muted); font-size:13px;">
+  Loading…
+</div>
+
+<!-- ── Carbon tab ─────────────────────────────────────────────────────────── -->
+<div id="tab-carbon" style="display:none;">
+
+  <!-- No postcode state -->
+  <div id="no-postcode" style="display:none;">
+    <div class="postcode-prompt">
+      <h3>🌿 Enable Carbon Insights</h3>
+      <p>
+        Carbon insights require a postcode prefix to fetch grid carbon intensity data
+        from the National Grid ESO API (🇬🇧 UK only).<br>
+        EMT records the actual grid intensity at the time of every half-hour block —
+        enabling genuine per-period carbon accounting rather than monthly estimates.
+      </p>
+      <div class="postcode-input-row">
+        <input type="text" id="postcode-input" class="postcode-field"
+               placeholder="e.g. DE1" maxlength="6"
+               onkeydown="if(event.key==='Enter') savePostcode()">
+        <button class="btn btn-primary" onclick="savePostcode()">Enable carbon tracking</button>
+      </div>
+      <div id="postcode-error" style="font-size:12px; color:var(--danger); margin-top:8px; display:none;"></div>
+    </div>
+    <div class="insight-card" style="text-align:center; padding:32px;">
+      <div style="font-size:13px; color:var(--muted); line-height:1.7;">
+        Once a postcode is saved, carbon intensity recording begins on the next block finalise
+        (~30 minutes). Carbon insights will appear after your first full billing period with data.
+      </div>
+    </div>
+  </div>
+
+  <!-- No carbon data yet -->
+  <div id="no-carbon" style="display:none;">
+    <div class="insight-card" style="text-align:center; padding:48px 32px;">
+      <div style="font-size:48px; margin-bottom:16px;">🌿</div>
+      <div style="font-size:16px; font-weight:600; margin-bottom:8px;">Collecting carbon data</div>
+      <div style="font-size:13px; color:var(--muted); max-width:440px; margin:0 auto; line-height:1.7;">
+        Carbon intensity is being recorded. Insights will appear once you have data covering
+        at least one billing period. Check back soon.
+      </div>
+    </div>
+  </div>
+
+  <!-- Carbon insights body -->
+  <div id="insights-body" style="display:none;">
+
+    <!-- Summary card -->
+    <div class="insight-card" id="card-summary">
+      <div class="insight-card-title">🌍 Carbon Summary</div>
+      <div class="insight-headline" id="sum-net-headline"></div>
+      <div class="insight-sub"     id="sum-net-sub"></div>
+      <div id="sum-verdict" class="insight-verdict"></div>
+      <div class="insight-grid">
+        <div class="insight-metric">
+          <div class="insight-metric-label">Grid carbon imported</div>
+          <div class="insight-metric-value" id="sum-imp"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+        <div class="insight-metric" id="sum-exp-wrap">
+          <div class="insight-metric-label">Export offset</div>
+          <div class="insight-metric-value" id="sum-exp"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Your intensity</div>
+          <div class="insight-metric-value" id="sum-eff-int"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Grid average</div>
+          <div class="insight-metric-value" id="sum-grid-int"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Grid import (CI blocks)</div>
+          <div class="insight-metric-value" id="sum-ci-imp-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric" id="sum-ci-exp-wrap">
+          <div class="insight-metric-label">Grid export (CI blocks)</div>
+          <div class="insight-metric-value" id="sum-ci-exp-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+      </div>
+      <div class="insight-equiv"   id="sum-equiv"></div>
+      <div class="coverage-warn"   id="sum-coverage"></div>
+      <div id="trend-wrap">
+        <div style="font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); margin-bottom:10px;">Net carbon per billing period</div>
+        <div id="trend-chart" style="width:100%; overflow-x:auto;"></div>
+      </div>
+      <div class="insight-footnote">
+        Carbon intensity from <a href="https://carbonintensity.org.uk" target="_blank" rel="noopener">National Grid ESO</a>
+        half-hourly regional API. Both figures are derived from recorded intensity at the time of each block.<br><br>
+        <strong>Your intensity vs grid average</strong> — your effective intensity is weighted by how much you consumed
+        or exported in each slot. The grid average is weighted equally across all slots. The comparison is only
+        shown when you have solar, an EV or a battery — for import-only households without flexible loads the
+        two figures will be nearly identical and the comparison adds little. A meaningful difference indicates
+        your consumption pattern was skewed toward cleaner or dirtier grid periods than average.<br><br>
+        Export offset assumes displaced generation at grid average intensity (conservative —
+        <a href="{{ url_for('settings_page') }}?tab=carbon">edit in Settings</a>).
+      </div>
+    </div>
+
+    <!-- Solar card -->
+    <div class="insight-card" id="card-solar" style="display:none;">
+      <div class="insight-card-title">☀️ Solar Export Offset</div>
+      <div class="insight-headline" id="sol-headline"></div>
+      <div class="insight-sub"     id="sol-sub"></div>
+      <div class="insight-grid">
+        <div class="insight-metric">
+          <div class="insight-metric-label">Export offset</div>
+          <div class="insight-metric-value" id="sol-offset"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Export kWh</div>
+          <div class="insight-metric-value" id="sol-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Avg export intensity</div>
+          <div class="insight-metric-value" id="sol-intensity"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">vs grid average</div>
+          <div class="insight-metric-value" id="sol-vs-grid"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+      </div>
+      <div class="insight-equiv" id="sol-equiv"></div>
+      <div class="insight-verdict" id="sol-verdict" style="display:none;"></div>
+      <div class="insight-footnote">
+        Calculated using actual grid intensity at the time of each export block.
+        <a href="{{ url_for('settings_page') }}?tab=carbon">Edit assumptions →</a>
+      </div>
+    </div>
+
+    
+<!-- House card -->
+    <div class="insight-card" id="card-house" style="display:none;">
+      <div class="insight-card-title">🏠 House Consumption (direct from grid)</div>
+      <div class="insight-headline" id="house-headline"></div>
+      <div class="insight-sub"     id="house-sub"></div>
+      <div class="insight-grid">
+        <div class="insight-metric">
+          <div class="insight-metric-label">House import</div>
+          <div class="insight-metric-value" id="house-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric" id="house-carbon-wrap">
+          <div class="insight-metric-label">House carbon</div>
+          <div class="insight-metric-value" id="house-carbon"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Avg intensity</div>
+          <div class="insight-metric-value" id="house-intensity"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">vs grid average</div>
+          <div class="insight-metric-value" id="house-vs-grid"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+        <div class="insight-metric" id="house-pct-wrap">
+          <div class="insight-metric-label">% of grid import</div>
+          <div class="insight-metric-value" id="house-pct"></div>
+          <div class="insight-metric-unit">% of total</div>
+        </div>
+      </div>
+      <div class="insight-equiv" id="house-equiv"></div>
+      <div class="insight-verdict" id="house-verdict" style="display:none;"></div>
+      <div class="insight-footnote">
+        Grid import attributable directly to the house, excluding EV and battery charging.
+        Any electricity the battery discharged into the house is not captured here — that energy
+        was already accounted for when the battery charged from the grid. Battery export vs
+        house usage cannot be separated without generation-side metering.
+        <a href="{{ url_for('settings_page') }}?tab=carbon">Edit assumptions →</a>
+      </div>
+    </div>
+
+    
+<!-- Battery card -->
+    <div class="insight-card" id="card-battery" style="display:none;">
+      <div class="insight-card-title">🔋 Battery Charging Behaviour</div>
+      <div class="insight-headline" id="bat-headline"></div>
+      <div class="insight-sub"     id="bat-sub"></div>
+      <div class="insight-grid">
+        <div class="insight-metric">
+          <div class="insight-metric-label">Grid carbon to charge</div>
+          <div class="insight-metric-value" id="bat-carbon"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Energy charged</div>
+          <div class="insight-metric-value" id="bat-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Avg charge intensity</div>
+          <div class="insight-metric-value" id="bat-intensity"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">vs grid average</div>
+          <div class="insight-metric-value" id="bat-vs-grid"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Effective intensity</div>
+          <div class="insight-metric-value" id="bat-effective-int"></div>
+          <div class="insight-metric-unit">gCO₂/kWh usable</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Lost to inefficiency</div>
+          <div class="insight-metric-value" id="bat-carbon-lost"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+      </div>
+      <div class="insight-equiv" id="bat-equiv"></div>
+      <div class="insight-footnote">
+        Carbon shown is the cost of grid energy used to charge the battery. The battery
+        sub-meter records grid import only — solar contribution to charging is not captured
+        here (it appears as reduced main meter import instead). The key question is whether
+        grid charging was timed to cleaner periods.<br>
+        <strong>Effective intensity</strong> adjusts the charge intensity for round-trip losses
+        (charge intensity ÷ round-trip efficiency) — this is the true carbon cost per usable kWh
+        delivered by the battery. <strong>Lost to inefficiency</strong> is the carbon attributable
+        to heat losses during the charge/discharge cycle (total carbon × loss fraction).<br>
+        Battery discharge carbon (to house or export) cannot be separated without
+        generation-side metering.
+        <a href="{{ url_for('settings_page') }}?tab=carbon">Edit assumptions →</a>
+      </div>
+    </div>
+
+    
+<!-- Heat pump card -->
+    <div class="insight-card" id="card-hp" style="display:none;">
+      <div class="insight-card-title">♨️ Heat Pump Carbon</div>
+      <div class="insight-headline" id="hp-headline"></div>
+      <div class="insight-sub"     id="hp-sub"></div>
+      <div class="insight-grid">
+        <div class="insight-metric">
+          <div class="insight-metric-label">HP carbon</div>
+          <div class="insight-metric-value" id="hp-carbon"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Electricity used</div>
+          <div class="insight-metric-value" id="hp-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Heat delivered</div>
+          <div class="insight-metric-value" id="hp-heat"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">vs gas boiler</div>
+          <div class="insight-metric-value" id="hp-vs-gas"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+      </div>
+      <div class="insight-equiv" id="hp-equiv"></div>
+      <div class="insight-footnote">
+        Heat delivered = electricity × COP. Gas equivalent = heat ÷ boiler efficiency × gas carbon factor.
+        Crossover intensity shown is the grid intensity above which gas becomes cleaner than your heat pump.
+        <a href="{{ url_for('settings_page') }}?tab=carbon">Edit assumptions →</a>
+      </div>
+    </div>
+
+  
+<!-- EV card -->
+    <div class="insight-card" id="card-ev" style="display:none;">
+      <div class="insight-card-title">🔌 EV Charging Carbon</div>
+      <div class="insight-headline" id="ev-headline"></div>
+      <div class="insight-sub"     id="ev-sub"></div>
+      <div class="insight-grid">
+        <div class="insight-metric">
+          <div class="insight-metric-label">EV carbon</div>
+          <div class="insight-metric-value" id="ev-carbon"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">AC from grid</div>
+          <div class="insight-metric-value" id="ev-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Usable DC stored</div>
+          <div class="insight-metric-value" id="ev-dc-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Avg intensity</div>
+          <div class="insight-metric-value" id="ev-intensity"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Effective intensity</div>
+          <div class="insight-metric-value" id="ev-effective-int"></div>
+          <div class="insight-metric-unit">gCO₂/kWh usable DC</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Lost to charging loss</div>
+          <div class="insight-metric-value" id="ev-carbon-lost"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+      </div>
+      <div class="insight-equiv" id="ev-equiv"></div>
+      <div class="insight-footnote">
+        EV carbon based on sub-meter AC import × grid intensity at time of charging.
+        Mileage: AC import × charge efficiency (AC→DC loss) × EV efficiency (miles/kWh battery).
+        Efficiency figure should be from your trip computer or manufacturer spec — not derived
+        from wall/smart meter energy, which would double-count the charging loss.<br>
+        <strong>Effective intensity</strong> adjusts the charge intensity for AC→DC charging losses
+        (charge intensity ÷ charge efficiency) — the true carbon cost per usable kWh stored in the battery.
+        <strong>Lost to charging loss</strong> is the carbon attributable to heat losses during charging
+        (total carbon × loss fraction).
+        <a href="{{ url_for('settings_page') }}?tab=carbon">Edit assumptions →</a>
+      </div>
+    </div>
+
+    
+    </div><!-- /insights-body -->
+</div><!-- /tab-carbon -->
+
+<script>
+var _periods   = [];
+var _periodIdx = 0;
+var _trendChart = null;
+
+function showInsightTab(name, btn) {
+  document.querySelectorAll('.insights-tab').forEach(function(b) { b.classList.remove('active'); });
+  btn.classList.add('active');
+  document.getElementById('tab-carbon').style.display = name === 'carbon' ? 'block' : 'none';
+}
+
+// ── Formatting ──────────────────────────────────────────────────────────────
+function fmtKg(g) {
+  if (g == null) return '—';
+  var kg = Math.abs(g) / 1000;
+  return kg >= 10 ? kg.toFixed(1) : kg.toFixed(2);
+}
+function fmtInt(v) { return v != null ? Math.round(v) : '—'; }
+function fmtKwh(v) { return v != null ? v.toFixed(1) : '—'; }
+
+function periodLabel(p) {
+  var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  var s = new Date(p.period_start + 'T12:00:00Z');
+  var e = new Date(p.period_end   + 'T12:00:00Z');
+  return MONTHS[s.getUTCMonth()] + ' ' + s.getUTCDate() + ' – ' +
+         MONTHS[e.getUTCMonth()] + ' ' + e.getUTCDate() + ' ' + e.getUTCFullYear();
+}
+
+// ── Equivalences ────────────────────────────────────────────────────────────
+function equivLines(carbon_g, a) {
+  if (!carbon_g || carbon_g <= 0) return '';
+  var kg  = carbon_g / 1000;
+  var isKm = (a.distance_unit === 'km');
+  var distLabel = isKm ? 'km' : 'miles';
+  // Convert gCO2/mile to gCO2/km if needed
+  var petrol_g_per_dist = isKm
+    ? (a.co2_car_petrol_g_per_mile || 180) / 1.60934
+    : (a.co2_car_petrol_g_per_mile || 180);
+  var car_dist   = Math.round(kg * 1000 / petrol_g_per_dist);
+  var tree_days  = Math.round(kg / ((a.co2_tree_kg_per_year || 21) / 365));
+  var flight_pct = (kg / (a.co2_flight_lhr_nyc_kg || 670) * 100).toFixed(1);
+  var lines = [];
+  if (car_dist > 0)   lines.push('🚗 Equivalent to <strong>' + car_dist.toLocaleString() + ' ' + distLabel + '</strong> in a petrol car');
+  if (tree_days > 0)  lines.push('🌳 A tree would absorb this in <strong>' + tree_days + ' days</strong>');
+  if (flight_pct > 0) lines.push('✈️ <strong>' + flight_pct + '%</strong> of a return flight LHR→NYC per passenger');
+  return lines.join(' &nbsp;·&nbsp; ');
+}
+
+// ── Render ──────────────────────────────────────────────────────────────────
+function renderInsights(d) {
+  document.getElementById('insights-loading').style.display = 'none';
+  document.getElementById('insights-body').style.display    = 'none';
+  document.getElementById('no-carbon').style.display        = 'none';
+  ['card-house','card-solar','card-ev','card-battery','card-hp'].forEach(function(id) {
+    document.getElementById(id).style.display = 'none';
+  });
+
+  if (!d.has_carbon) {
+    document.getElementById('no-carbon').style.display = 'block';
+    return;
+  }
+
+  document.getElementById('insights-body').style.display = 'block';
+  var a = d.assumptions;
+
+  // Summary
+  var net_kg = d.carbon_g_net / 1000;
+  document.getElementById('sum-net-headline').textContent =
+    (net_kg < 0 ? '−' : '') + Math.abs(net_kg).toFixed(2) + ' kgCO₂';
+  document.getElementById('sum-net-sub').textContent =
+    'Net carbon ' + (net_kg < 0 ? 'offset' : 'emitted') + ' this billing period.';
+
+  var verdict = document.getElementById('sum-verdict');
+  var hasFlexible = d.exp_kwh > 0.1 || Object.values(d.sub_meters || {}).some(function(m) {
+    return ['ev_charger','ev','battery','inverter'].includes(m.meter_type) && m.imp_kwh > 0.1;
+  });
+  if (d.effective_intensity != null && d.grid_avg_intensity != null && hasFlexible) {
+    var diff = d.effective_intensity - d.grid_avg_intensity;
+    var pct  = Math.abs(Math.round(diff / d.grid_avg_intensity * 100));
+    if (Math.abs(diff) < 5) {
+      verdict.className = 'insight-verdict neutral';
+      verdict.textContent = '≈ Your consumption pattern matched the grid average intensity this period.';
+    } else if (diff < 0) {
+      verdict.className = 'insight-verdict positive';
+      verdict.textContent = '✓ Your consumption was weighted toward cleaner grid periods — ' + pct + '% below the grid average intensity.';
+    } else {
+      verdict.className = 'insight-verdict negative';
+      verdict.textContent = '↑ Your consumption was weighted toward dirtier grid periods — ' + pct + '% above the grid average intensity. Shifting flexible loads (EV, battery) to lower-intensity windows could help.';
+    }
+    verdict.style.display = '';
+  } else {
+    verdict.style.display = 'none';
+  }
+
+  document.getElementById('sum-imp').textContent = fmtKg(d.carbon_g_imp);
+  if (d.exp_kwh > 0.01) {
+    document.getElementById('sum-exp').textContent = fmtKg(d.carbon_g_exp);
+  } else {
+    document.getElementById('sum-exp-wrap').style.display = 'none';
+  }
+  document.getElementById('sum-eff-int').textContent  = fmtInt(d.effective_intensity);
+  document.getElementById('sum-grid-int').textContent = fmtInt(d.grid_avg_intensity);
+  document.getElementById('sum-ci-imp-kwh').textContent = d.ci_imp_kwh != null ? fmtKwh(d.ci_imp_kwh) : '—';
+  if (d.ci_exp_kwh > 0.01) {
+    document.getElementById('sum-ci-exp-kwh').textContent = fmtKwh(d.ci_exp_kwh);
+  } else {
+    document.getElementById('sum-ci-exp-wrap').style.display = 'none';
+  }
+  document.getElementById('sum-equiv').innerHTML = equivLines(Math.max(0, d.carbon_g_net), a);
+
+  if (d.carbon_coverage_pct < 95) {
+    document.getElementById('sum-coverage').textContent =
+      '⚠ Carbon data covers ' + d.carbon_coverage_pct + '% of blocks — some blocks predate carbon recording.';
+  }
+
+  // ── Render in display order: solar, house, battery, hp, ev ─────────────────
+
+  // Solar
+  if (d.exp_kwh > 0.1 && d.carbon_g_exp > 0) {
+    document.getElementById('card-solar').style.display = 'block';
+    var off_kg = d.carbon_g_exp / 1000;
+    document.getElementById('sol-headline').textContent =
+      d.avg_export_intensity != null
+        ? Math.round(d.avg_export_intensity) + ' gCO₂/kWh avg export intensity'
+        : off_kg.toFixed(2) + ' kgCO₂ offset';
+    document.getElementById('sol-sub').textContent = 'Your solar export displaced this much carbon from the grid.';
+    document.getElementById('sol-offset').textContent = off_kg.toFixed(2);
+    document.getElementById('sol-kwh').textContent    = fmtKwh(d.ci_exp_kwh > 0 ? d.ci_exp_kwh : d.exp_kwh);
+    document.getElementById('sol-intensity').textContent = d.avg_export_intensity != null ? Math.round(d.avg_export_intensity) : '—';
+    document.getElementById('sol-vs-grid').textContent   = d.grid_avg_intensity   != null ? Math.round(d.grid_avg_intensity)   : '—';
+    // Solar verdict — higher export intensity = better (displaced dirtier generation)
+    var has_battery = Object.values(d.sub_meters || {}).some(function(s) {
+      return ['battery','inverter'].includes(s.meter_type) && s.imp_kwh > 0.1;
+    });
+    if (d.avg_export_intensity != null && d.grid_avg_intensity != null) {
+      var sol_diff = d.avg_export_intensity - d.grid_avg_intensity;
+      var sol_pct  = Math.abs(Math.round(sol_diff / d.grid_avg_intensity * 100));
+      var solV = document.getElementById('sol-verdict');
+      solV.style.display = '';
+      if (sol_pct < 10) {
+        solV.className = 'insight-verdict neutral';
+        if (has_battery) {
+          solV.innerHTML = 'Your export matched the grid average intensity. If your battery can be scheduled to export, you could store solar during clean periods and export from the battery when the grid is dirtier to increase your offset.';
+        } else {
+          solV.innerHTML = 'Your export matched the grid average intensity — timing follows generation so there is little you can directly control.';
+        }
+      } else if (sol_diff > 0) {
+        solV.className = 'insight-verdict positive';
+        if (has_battery) {
+          solV.innerHTML = '✓ You exported during dirtier-than-average periods — displacing ' + sol_pct + '% more carbon than average. Good battery export timing.';
+        } else {
+          solV.innerHTML = '✓ You exported during dirtier-than-average periods — displacing ' + sol_pct + '% more carbon than average.';
+        }
+      } else {
+        solV.className = 'insight-verdict neutral';
+        if (has_battery) {
+          solV.innerHTML = 'Export was weighted toward cleaner grid periods — displacing ' + sol_pct + '% less carbon than average. You could increase your offset by storing solar generation during clean periods and scheduling your battery to export when the grid is dirtier.';
+        } else {
+          solV.innerHTML = 'Export was weighted toward cleaner grid periods — displacing ' + sol_pct + '% less carbon than average. Solar export timing follows generation so this is not something you can directly control.';
+        }
+      }
+    }
+    document.getElementById('sol-equiv').innerHTML    = equivLines(d.carbon_g_exp, a);
+  }
+
+  // House remainder
+  if (d.house_ci_imp_kwh > 0.1 || d.house_imp_kwh > 0.1) {
+    var house_kg   = d.house_carbon_g != null ? d.house_carbon_g / 1000 : null;
+    // Use CI kWh alongside carbon for consistent pairing
+    var house_kwh_display = d.house_ci_imp_kwh > 0 ? d.house_ci_imp_kwh : d.house_imp_kwh;
+    var house_pct  = d.ci_imp_kwh > 0
+      ? Math.round(d.house_ci_imp_kwh / d.ci_imp_kwh * 100)
+      : (d.imp_kwh > 0 ? Math.round(d.house_imp_kwh / d.imp_kwh * 100) : null);
+    document.getElementById('card-house').style.display = 'block';
+    document.getElementById('house-headline').textContent =
+      d.house_avg_intensity != null
+        ? Math.round(d.house_avg_intensity) + ' gCO₂/kWh avg intensity'
+        : fmtKwh(house_kwh_display) + ' kWh';
+    document.getElementById('house-sub').textContent =
+      'Grid import attributable to house loads (excluding EV and battery charging)' +
+      (d.house_ci_imp_kwh > 0 && d.house_ci_imp_kwh < d.house_imp_kwh
+        ? ' — showing kWh with carbon data only.' : '.');
+    document.getElementById('house-kwh').textContent      = fmtKwh(house_kwh_display);
+    document.getElementById('house-pct').textContent      = house_pct != null ? house_pct + '%' : '—';
+    document.getElementById('house-intensity').textContent = d.house_avg_intensity != null ? Math.round(d.house_avg_intensity) : '—';
+    document.getElementById('house-vs-grid').textContent   = d.grid_avg_intensity  != null ? Math.round(d.grid_avg_intensity)  : '—';
+    // House verdict — lower intensity = better (consumed during cleaner periods)
+    if (d.house_avg_intensity != null && d.grid_avg_intensity != null) {
+      var house_diff = d.house_avg_intensity - d.grid_avg_intensity;
+      var house_pct  = Math.abs(Math.round(house_diff / d.grid_avg_intensity * 100));
+      var houseV = document.getElementById('house-verdict');
+      houseV.style.display = '';
+      if (house_pct < 10) {
+        houseV.className = 'insight-verdict neutral';
+        houseV.innerHTML = 'Your house consumption matched the grid average intensity — timing had little effect.';
+      } else if (house_diff < 0) {
+        houseV.className = 'insight-verdict positive';
+        houseV.innerHTML = '✓ Your house loads ran during cleaner-than-average periods — <strong>' + house_pct + '% below</strong> the grid average intensity.';
+      } else {
+        houseV.className = 'insight-verdict negative';
+        houseV.innerHTML = 'Your house loads ran during dirtier-than-average periods — <strong>' + house_pct + '% above</strong> the grid average.';
+      }
+    }
+    if (house_kg != null) {
+      document.getElementById('house-carbon').textContent = house_kg.toFixed(2);
+    } else {
+      document.getElementById('house-carbon-wrap').style.display = 'none';
+    }
+    document.getElementById('house-equiv').innerHTML =
+      house_kg != null ? equivLines(d.house_carbon_g, a) : '';
+  }
+
+  // Battery
+  var bat_sub = Object.entries(d.sub_meters || {}).find(function(e) {
+    return ['battery','inverter'].includes(e[1].meter_type);
+  });
+  if (bat_sub && bat_sub[1].imp_kwh > 0.1) {
+    var bat     = bat_sub[1];
+    var bat_kg  = bat.carbon_g / 1000;
+    var bat_int = bat.avg_charge_intensity;
+    var grid_avg = d.grid_avg_intensity;
+
+    document.getElementById('card-battery').style.display = 'block';
+    document.getElementById('bat-headline').textContent   =
+      bat_int != null
+        ? Math.round(bat_int) + ' gCO₂/kWh avg charge intensity'
+        : fmtKwh(bat.imp_kwh) + ' kWh charged';
+    document.getElementById('bat-sub').textContent =
+      'How cleanly your battery charged from the grid this period.';
+    var ci_kwh_bat = bat.ci_imp_kwh || 0;
+    document.getElementById('bat-carbon').textContent   = bat_kg.toFixed(2);
+    document.getElementById('bat-kwh').textContent      = ci_kwh_bat > 0 ? fmtKwh(ci_kwh_bat) : fmtKwh(bat.imp_kwh);
+    document.getElementById('bat-intensity').textContent = bat_int != null ? Math.round(bat_int) : '—';
+    document.getElementById('bat-vs-grid').textContent  = grid_avg != null ? Math.round(grid_avg) : '—';
+
+    var rte = a.battery_roundtrip_efficiency || 0.85;
+    if (bat_int != null) {
+      document.getElementById('bat-effective-int').textContent = Math.round(bat_int / rte);
+    } else {
+      document.getElementById('bat-effective-int').textContent = '—';
+    }
+    var carbon_lost = bat_kg > 0 ? (bat_kg * (1 - rte)) : 0;
+    document.getElementById('bat-carbon-lost').textContent = carbon_lost > 0 ? carbon_lost.toFixed(2) : '—';
+
+    var batLines = [];
+    if (bat_int != null && grid_avg != null) {
+      var bat_diff = bat_int - grid_avg;
+      var bat_pct  = Math.abs(Math.round(bat_diff / grid_avg * 100));
+      if (Math.abs(bat_pct) < 10) {
+        batLines.push('Your battery charged at roughly the grid average intensity this period.');
+      } else if (bat_diff < 0) {
+        batLines.push('✓ Your battery preferentially charged during cleaner grid periods — <strong>' +
+          bat_pct + '% below</strong> the grid average intensity. Good load-shifting behaviour.');
+        // Estimate carbon saving vs charging at grid average
+        // Use ci_imp_kwh (only kWh with CI data) to match the intensity figures
+        var ci_bat_kwh = bat.ci_imp_kwh || 0;
+        var saving_g = (grid_avg - bat_int) * ci_bat_kwh;
+        if (saving_g > 100 && ci_bat_kwh > 0) {
+          var bat_ci_pct = bat.imp_kwh > 0 ? Math.round(ci_bat_kwh / bat.imp_kwh * 100) : 0;
+          batLines.push('Estimated saving vs charging at grid average: <strong>' +
+            (saving_g / 1000).toFixed(2) + ' kgCO₂</strong>' +
+            (bat_ci_pct < 80 ? ' (' + bat_ci_pct + '% carbon coverage — estimate)' : '') + '.');
+        }
+      } else {
+        batLines.push('Your battery charged during dirtier-than-average grid periods — <strong>' +
+          bat_pct + '% above</strong> the grid average. Shifting charging to overnight or high-renewable ' +
+          'windows could reduce this.');
+      }
+    }
+    batLines.push('<em>Note: export may include battery discharge — we cannot split solar vs battery ' +
+      'export without additional metering.</em>');
+    if (bat.carbon_g > 0) {
+      var batEquivStr = equivLines(bat.carbon_g, a);
+      if (batEquivStr) batLines.push(batEquivStr);
+    }
+    document.getElementById('bat-equiv').innerHTML = batLines.join('<br>');
+  }
+
+  // Heat pump
+  var hp_sub = Object.entries(d.sub_meters || {}).find(function(e) {
+    return e[1].meter_type === 'heat_pump';
+  });
+  if (hp_sub && hp_sub[1].imp_kwh > 0.1) {
+    var hp         = hp_sub[1];
+    var cop        = a.hp_cop || 3.0;
+    var gas_co2    = a.gas_co2_g_per_kwh || 203.0;
+    var boiler_eff = a.gas_boiler_efficiency || 0.90;
+    var hp_kg      = hp.carbon_g / 1000;
+    var crossover  = Math.round((gas_co2 / boiler_eff) * cop);
+
+    // Heat delivered: use total kWh for display (best available estimate)
+    var heat_kwh_total = hp.imp_kwh * cop;
+
+    // Gas comparison: use ci_imp_kwh only to match the carbon figure
+    var ci_hp_kwh  = hp.ci_imp_kwh || 0;
+    var hp_ci_pct  = hp.imp_kwh > 0 ? Math.round(ci_hp_kwh / hp.imp_kwh * 100) : 0;
+    var heat_kwh_ci = ci_hp_kwh * cop;
+    var gas_kwh_needed = heat_kwh_ci / boiler_eff;
+    var gas_kg     = gas_kwh_needed * gas_co2 / 1000;
+    var saving_kg  = gas_kg - hp_kg;
+    var cleaner_pct = gas_kg > 0 ? Math.round(saving_kg / gas_kg * 100) : null;
+
+    document.getElementById('card-hp').style.display   = 'block';
+    document.getElementById('hp-headline').textContent  =
+      hp.avg_charge_intensity != null
+        ? Math.round(hp.avg_charge_intensity) + ' gCO₂/kWh avg intensity'
+        : hp_kg.toFixed(2) + ' kgCO₂';
+    document.getElementById('hp-sub').textContent       = 'Carbon from heat pump electricity use this period.';
+    var ci_kwh_hp = hp.ci_imp_kwh || 0;
+    document.getElementById('hp-carbon').textContent    = hp_kg.toFixed(2);
+    document.getElementById('hp-kwh').textContent       = ci_kwh_hp > 0 ? fmtKwh(ci_kwh_hp) : fmtKwh(hp.imp_kwh);
+    document.getElementById('hp-heat').textContent      = fmtKwh(ci_kwh_hp > 0 ? ci_kwh_hp * cop : heat_kwh_total);
+    document.getElementById('hp-vs-gas').textContent    = gas_kg > 0 ? gas_kg.toFixed(2) : '—';
+
+    var hpLines = [];
+    if (hp_ci_pct >= 80 && gas_kg > 0 && cleaner_pct != null) {
+      hpLines.push(
+        saving_kg > 0
+          ? '✓ Your heat pump saved <strong>' + saving_kg.toFixed(1) + ' kgCO₂</strong> vs an equivalent gas boiler — <strong>' + cleaner_pct + '% cleaner</strong>.'
+          : '↑ Your heat pump produced more carbon than an equivalent gas boiler this period.'
+      );
+    } else if (hp.carbon_g > 0) {
+      hpLines.push('<em>Carbon coverage ' + hp_ci_pct + '% — gas comparison needs more data to be reliable.</em>');
+    }
+    hpLines.push('Grid crossover intensity: <strong>' + crossover + ' gCO₂/kWh</strong> — above this, a gas boiler would be cleaner. ' +
+      'The UK grid rarely exceeds 400 gCO₂/kWh, so your heat pump is almost always cleaner than gas.');
+    if (hp.inverter_possible) {
+      hpLines.push('<em>⚠ This heat pump is marked as inverter-capable. Carbon shown assumes ' +
+        'full grid draw — actual carbon may be lower if solar or battery contributed.</em>');
+    }
+    if (hp.carbon_g > 0) {
+      var hpEquivStr = equivLines(hp.carbon_g, a);
+      if (hpEquivStr) hpLines.push(hpEquivStr);
+    }
+    document.getElementById('hp-equiv').innerHTML = hpLines.join('<br>');
+  }
+
+  // EV
+  var ev_sub = Object.entries(d.sub_meters || {}).find(function(e) {
+    return ['ev_charger','ev'].includes(e[1].meter_type);
+  });
+  if (ev_sub && ev_sub[1].imp_kwh > 0.1) {
+    var ev = ev_sub[1];
+    var ev_kg  = ev.carbon_g / 1000;
+    var ev_ci_kwh = ev.ci_imp_kwh || 0;
+    var ev_int = ev_ci_kwh > 0 ? Math.round(ev.carbon_g / ev_ci_kwh) : null;
+    document.getElementById('card-ev').style.display = 'block';
+    document.getElementById('ev-headline').textContent =
+      ev.avg_charge_intensity != null
+        ? Math.round(ev.avg_charge_intensity) + ' gCO₂/kWh avg charge intensity'
+        : ev_kg.toFixed(2) + ' kgCO₂';
+    document.getElementById('ev-sub').textContent = 'Carbon attributable to EV charging this period.';
+    var ci_kwh_ev  = ev.ci_imp_kwh || 0;
+    var charge_eff_display = a.ev_charge_efficiency || 0.88;
+    var dc_kwh     = ci_kwh_ev > 0
+      ? ci_kwh_ev * charge_eff_display
+      : ev.imp_kwh * charge_eff_display;
+    document.getElementById('ev-carbon').textContent    = ev_kg.toFixed(2);
+    document.getElementById('ev-kwh').textContent       = ci_kwh_ev > 0 ? fmtKwh(ci_kwh_ev) : fmtKwh(ev.imp_kwh);
+    document.getElementById('ev-dc-kwh').textContent    = fmtKwh(dc_kwh);
+    document.getElementById('ev-intensity').textContent = ev_int != null ? Math.round(ev_int) : '—';
+
+    var charge_eff = a.ev_charge_efficiency || 0.88;
+    if (ev_int != null) {
+      document.getElementById('ev-effective-int').textContent = Math.round(ev_int / charge_eff);
+    } else {
+      document.getElementById('ev-effective-int').textContent = '—';
+    }
+    var ev_carbon_lost = ev_kg > 0 ? (ev_kg * (1 - charge_eff)) : 0;
+    document.getElementById('ev-carbon-lost').textContent = ev_carbon_lost > 0 ? ev_carbon_lost.toFixed(2) : '—';
+    var evEquiv = document.getElementById('ev-equiv');
+    var evLines = [];
+    // EV vs grid average intensity
+    if (ev_int != null && d.grid_avg_intensity != null) {
+      var ev_diff = ev_int - d.grid_avg_intensity;
+      var ev_pct  = Math.abs(Math.round(ev_diff / d.grid_avg_intensity * 100));
+      if (ev_pct < 10) {
+        evLines.push('Your EV charging intensity matched the grid average.');
+      } else if (ev_diff < 0) {
+        evLines.push('✓ Charged at <strong>' + ev_pct + '% below</strong> the grid average — good off-peak timing.');
+      } else {
+        evLines.push('Charged at <strong>' + ev_pct + '% above</strong> the grid average — shifting to low-carbon windows could help.');
+      }
+    }
+    // EV mileage and per-mile carbon comparison
+    var effic         = a.ev_efficiency || 3.2;
+    var isKm          = (a.distance_unit === 'km');
+    var distLabel     = isKm ? 'km' : 'miles';
+    var petrol_g_per_dist = isKm
+      ? (a.co2_car_petrol_g_per_mile || 180) / 1.60934
+      : (a.co2_car_petrol_g_per_mile || 180);
+    var charge_eff = a.ev_charge_efficiency || 0.88;
+
+    // Mileage from CI kWh (consistent with carbon data)
+    var ci_kwh   = ev.ci_imp_kwh || 0;
+    var ev_dist_total = ci_kwh * charge_eff * effic;
+
+    // Per-mile carbon uses same ci_kwh as mileage — consistent denominator
+    var ci_pct    = ev.imp_kwh > 0 ? Math.round(ci_kwh / ev.imp_kwh * 100) : 0;
+    var ev_dist_ci = ev_dist_total;  // same calculation
+
+    if (ev_dist_total > 1) {
+      evLines.push('🚗 Estimated <strong>' + Math.round(ev_dist_total).toLocaleString() +
+        ' ' + distLabel + '</strong> this period (' + effic + ' ' + distLabel +
+        '/kWh battery after ' + Math.round(charge_eff * 100) + '% charge efficiency).');
+      if (ci_pct >= 80 && ev_dist_ci > 1 && ev.carbon_g > 0) {
+        var ev_g_per_dist = ev.carbon_g / ev_dist_ci;
+        var cleaner_pct   = Math.round((1 - ev_g_per_dist / petrol_g_per_dist) * 100);
+        evLines.push('Carbon intensity: <strong>' + Math.round(ev_g_per_dist) +
+          ' gCO₂/' + distLabel + '</strong> — ' +
+          (cleaner_pct > 0
+            ? '<strong>' + cleaner_pct + '% cleaner</strong> than petrol (' + Math.round(petrol_g_per_dist) + ' gCO₂/' + distLabel + ')'
+            : Math.abs(cleaner_pct) + '% dirtier than petrol this period'));
+      } else if (ev.carbon_g > 0) {
+        evLines.push('<em>Carbon coverage ' + ci_pct + '% of charging kWh — per-mile carbon ' +
+          'comparison needs more data to be reliable.</em>');
+      }
+    }
+    if (ev.inverter_possible) {
+      evLines.push('<em>⚠ This EV charger is marked as inverter-capable. Carbon shown assumes ' +
+        'full grid draw — actual carbon may be lower if solar or battery contributed.</em>');
+    }
+    if (ev.carbon_g > 0) {
+      var evEquivStr = equivLines(ev.carbon_g, a);
+      if (evEquivStr) evLines.push(evEquivStr);
+    }
+    evEquiv.innerHTML = evLines.join('<br>');
+  }
+
+  renderTrend();
+}
+
+// ── Trend chart (inline SVG — no external dependency) ───────────────────────
+function _trendNavTo(idx) {
+  if (idx < 0 || idx >= _periods.length || idx === _periodIdx) return;
+  _periodIdx = idx;
+  loadPeriod();
+}
+
+function renderTrend() {
+  var wrap = document.getElementById('trend-chart');
+  if (!wrap || _periods.length === 0) return;
+
+  var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  var values = _periods.map(function(p) {
+    return p.carbon_g_net != null ? +(p.carbon_g_net / 1000) : null;
+  });
+  var labels = _periods.map(function(p) {
+    var d = new Date(p.period_start + 'T12:00:00Z');
+    return MONTHS[d.getUTCMonth()] + " '" + String(d.getUTCFullYear()).slice(2);
+  });
+
+  var validValues = values.filter(function(v) { return v != null; });
+  if (validValues.length === 0) return;
+
+  var maxAbs = Math.max.apply(null, validValues.map(Math.abs));
+  if (maxAbs === 0) maxAbs = 1;
+
+  var W = Math.max(wrap.clientWidth || 600, 300);
+  var H = 100;
+  var PAD_L = 38, PAD_R = 8, PAD_T = 8, PAD_B = 28;
+  var chartW = W - PAD_L - PAD_R;
+  var chartH = H - PAD_T - PAD_B;
+  var n = values.length;
+  var barW = Math.max(4, Math.floor(chartW / n) - 2);
+  var zeroY = PAD_T + chartH / 2;  // zero line in middle if mixed pos/neg
+
+  // Determine if all values same sign
+  var hasNeg = validValues.some(function(v) { return v < 0; });
+  var hasPos = validValues.some(function(v) { return v > 0; });
+  var baseline, scale;
+  if (!hasNeg) {
+    // All positive — zero at bottom
+    baseline = PAD_T + chartH;
+    scale = chartH / maxAbs;
+  } else if (!hasPos) {
+    // All negative — zero at top
+    baseline = PAD_T;
+    scale = chartH / maxAbs;
+  } else {
+    // Mixed
+    baseline = zeroY;
+    scale = (chartH / 2) / maxAbs;
+  }
+
+  var isDark = document.documentElement.getAttribute('data-theme') !== 'light';
+  var mutedC = isDark ? '#4a5060' : '#999aaa';
+  var textC  = isDark ? '#6b7080' : '#666677';
+
+  var svgParts = ['<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '">'];
+
+  // Zero line
+  svgParts.push('<line x1="' + PAD_L + '" y1="' + baseline + '" x2="' + (W - PAD_R) +
+    '" y2="' + baseline + '" stroke="' + mutedC + '" stroke-width="1"/>');
+
+  // Y axis labels
+  var yLabel = maxAbs >= 10 ? Math.round(maxAbs) : maxAbs.toFixed(1);
+  svgParts.push('<text x="' + (PAD_L - 4) + '" y="' + (PAD_T + 4) +
+    '" text-anchor="end" font-size="9" fill="' + textC + '">' + yLabel + '</text>');
+  svgParts.push('<text x="' + (PAD_L - 4) + '" y="' + (baseline + 4) +
+    '" text-anchor="end" font-size="9" fill="' + textC + '">0</text>');
+
+  // Bars
+  for (var i = 0; i < n; i++) {
+    var v = values[i];
+    var x = PAD_L + Math.round(i * chartW / n) + Math.round((chartW / n - barW) / 2);
+    var isCurrent = (i === _periodIdx);
+
+    if (v == null) {
+      // No data placeholder
+      svgParts.push('<rect x="' + x + '" y="' + (baseline - 2) + '" width="' + barW +
+        '" height="4" rx="2" fill="' + mutedC + '" opacity="0.3"' +
+        (i !== _periodIdx ? ' style="cursor:pointer;" onclick="_trendNavTo(' + i + ')"' : '') + '>');
+      svgParts.push('<title>' + labels[i] + ': no carbon data' +
+        (i !== _periodIdx ? ' — click to view' : '') + '</title></rect>');
+    } else {
+      var barH = Math.max(2, Math.abs(v) * scale);
+      var barY = v >= 0 ? (baseline - barH) : baseline;
+      var col = v < 0
+        ? (isCurrent ? '#1a7a3c' : 'rgba(26,122,60,0.45)')
+        : (isCurrent ? '#c0392b' : 'rgba(192,57,43,0.45)');
+      var clickable = (i !== _periodIdx);
+      svgParts.push('<rect x="' + x + '" y="' + barY + '" width="' + barW +
+        '" height="' + barH + '" rx="2" fill="' + col + '"' +
+        (clickable ? ' style="cursor:pointer;" onclick="_trendNavTo(' + i + ')"' : '') + '>');
+      svgParts.push('<title>' + labels[i] + ': ' + v.toFixed(2) + ' kgCO₂' +
+        (clickable ? ' — click to view' : ' — current view') + '</title>');
+      svgParts.push('</rect>');
+    }
+
+    // X label — show every period if few, else alternate
+    if (n <= 6 || i % 2 === 0 || i === n - 1) {
+      svgParts.push('<text x="' + (x + barW / 2) + '" y="' + (H - 6) +
+        '" text-anchor="middle" font-size="9" fill="' + textC + '">' + labels[i] + '</text>');
+    }
+  }
+
+  svgParts.push('</svg>');
+  wrap.innerHTML = svgParts.join('');
+}
+
+// ── Period nav ───────────────────────────────────────────────────────────────
+function navPeriod(dir) {
+  var next = _periodIdx + dir;
+  if (next < 0 || next >= _periods.length) return;
+  _periodIdx = next;
+  loadPeriod();
+}
+
+function updatePeriodNav() {
+  var p = _periods[_periodIdx];
+  document.getElementById('period-label').textContent =
+    periodLabel(p) + (p.is_current ? ' (current)' : '');
+  document.getElementById('btn-prev').disabled = (_periodIdx === 0);
+  document.getElementById('btn-next').disabled = (_periodIdx === _periods.length - 1);
+}
+
+async function loadPeriod() {
+  document.getElementById('insights-body').style.display = 'none';
+  document.getElementById('no-carbon').style.display     = 'none';
+  document.getElementById('insights-loading').style.display = 'block';
+  updatePeriodNav();
+  var p = _periods[_periodIdx];
+  try {
+    var r = await fetch(apiUrl('/api/insights/billing-period?period_start=' + p.period_start));
+    var d = await r.json();
+    if (d.error) throw new Error(d.error);
+    document.getElementById('insights-loading').style.display = 'none';
+    renderInsights(d);
+  } catch(e) {
+    document.getElementById('insights-loading').textContent = 'Failed to load insights: ' + e.message;
+  }
+}
+
+// ── Postcode ─────────────────────────────────────────────────────────────────
+async function savePostcode() {
+  var val = (document.getElementById('postcode-input').value || '').trim().toUpperCase();
+  var errEl = document.getElementById('postcode-error');
+  errEl.style.display = 'none';
+  if (!val) return;
+  try {
+    var r   = await fetch(apiUrl('/api/config'));
+    var cfg = await r.json();
+    for (var mid in (cfg.meters || {})) {
+      if (!((cfg.meters[mid].meta) || {}).sub_meter) {
+        cfg.meters[mid].meta = cfg.meters[mid].meta || {};
+        cfg.meters[mid].meta.postcode_prefix = val;
+        break;
+      }
+    }
+    var sr = await fetch(apiUrl('/api/config'), {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(cfg)
+    });
+    var sd = await sr.json();
+    if (sd.ok) {
+      document.getElementById('no-postcode').style.display = 'none';
+      document.getElementById('no-carbon').style.display   = 'block';
+    } else {
+      errEl.textContent = sd.error || 'Save failed';
+      errEl.style.display = 'block';
+    }
+  } catch(e) {
+    errEl.textContent = 'Save failed: ' + e.message;
+    errEl.style.display = 'block';
+  }
+}
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+async function initInsights() {
+  try {
+    // Check postcode first
+    var cr  = await fetch(apiUrl('/api/config'));
+    var cfg = await cr.json();
+    var hasPostcode = false;
+    for (var mid in (cfg.meters || {})) {
+      if (((cfg.meters[mid].meta) || {}).postcode_prefix) { hasPostcode = true; break; }
+    }
+
+    document.getElementById('insights-loading').style.display = 'none';
+    document.getElementById('tab-carbon').style.display       = 'block';
+
+    if (!hasPostcode) {
+      document.getElementById('no-postcode').style.display = 'block';
+      return;
+    }
+
+    // Load periods
+    var pr = await fetch(apiUrl('/api/insights/periods'));
+    var d  = await pr.json();
+    if (d.error) throw new Error(d.error);
+    _periods = (d.periods || []).filter(function(p) { return p.has_carbon; });
+
+    if (_periods.length === 0) {
+      document.getElementById('no-carbon').style.display = 'block';
+      return;
+    }
+
+    _periodIdx = _periods.length - 1;
+    document.getElementById('period-nav').style.display = 'flex';
+    loadPeriod();
+
+  } catch(e) {
+    document.getElementById('insights-loading').textContent = 'Failed to load: ' + e.message;
+  }
+}
+
+initInsights();
+</script>
+{% endblock %}
