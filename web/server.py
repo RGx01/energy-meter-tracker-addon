@@ -2324,6 +2324,7 @@ def api_insights_billing_period():
 
         effective_intensity = round(eff_carbon / eff_kwh, 1) if eff_kwh > 0 else None
         grid_avg_intensity  = round(ci_kwh_weighted / ci_duration, 1) if ci_duration > 0 else None
+        avg_export_intensity = round(cg_exp / main_ci_exp_kwh, 1) if main_ci_exp_kwh > 0 else None
 
         # ── Sub-meter aggregation ──────────────────────────────────────────────
         sub_totals = {}
@@ -2384,6 +2385,8 @@ def api_insights_billing_period():
             st.get("ci_imp_kwh", 0.0) for st in sub_totals.values()
         ))
         house_carbon_g   = max(0.0, cg_imp - total_sub_carbon_g) if has_carbon else None
+        house_avg_intensity = round(house_carbon_g / house_ci_imp_kwh, 1) \
+            if house_carbon_g and house_ci_imp_kwh > 0 else None
 
         # ── Settings ──────────────────────────────────────────────────────────
         settings = store.get_settings()
@@ -2417,11 +2420,13 @@ def api_insights_billing_period():
             "carbon_g_exp":         round(cg_exp, 1) if has_carbon else None,
             "carbon_g_net":         round(cg_net, 1) if has_carbon else None,
             "effective_intensity":  effective_intensity,
+            "avg_export_intensity": avg_export_intensity,
             "grid_avg_intensity":   grid_avg_intensity,
             "sub_meters":           sub_totals,
             "house_imp_kwh":        round(house_imp_kwh, 3),
             "house_ci_imp_kwh":     round(house_ci_imp_kwh, 3),
             "house_carbon_g":       round(house_carbon_g, 1) if house_carbon_g is not None else None,
+            "house_avg_intensity":  house_avg_intensity,
             "assumptions":          merged,
         })
     except Exception as e:

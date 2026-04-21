@@ -1522,8 +1522,33 @@ async def engine_startup(ha: HAClient):
 
     config = load_config()  # now reads from the open store ✓
 
+    # ── Repair empty config period from meters_config.json (post-JSON migration) ─
+    # If config_periods exists but has no meters (e.g. migration ran with empty config),
+    # try to load meters_config.json and update the config period with it.
+    if not config.get("meters") and os.path.exists(CONFIG_PATH):
+        _json_config = load_json(CONFIG_PATH, {})
+        if _json_config.get("meters"):
+            logger.info(
+                "engine_startup: config_periods has no meters — repairing from meters_config.json"
+            )
+            try:
+                cp_id = _store.get_current_config_period_id()
+                if cp_id:
+                    _store._write_meters(_json_config, cp_id)
+                    logger.info(
+                        "engine_startup: config repaired — %d meter(s) written to period %d",
+                        len(_json_config.get("meters", {})), cp_id
+                    )
+                else:
+                    _store.insert_config_period(_json_config)
+                    logger.info(
+                        "engine_startup: config repaired — new period created from meters_config.json"
+                    )
+                config = load_config()
+            except Exception as _cre:
+                logger.warning("engine_startup: config repair failed: %s", _cre)
+
     # ── Register state triggers from config ─────────────────────────────
-    main_import_sensor = None
     main_export_sensor = None
 
     for mid, mcfg in config.get("meters", {}).items():
@@ -1664,9 +1689,18 @@ async def engine_startup(ha: HAClient):
 
     if _store.get_current_config_period_id() is None:
         # Fresh DB — check if blocks.json exists to migrate
+        # Always try to load config from meters_config.json for migration,
+        # since load_config() returns {} when config_periods is empty.
+        _migration_config = load_json(CONFIG_PATH, {})
+        if not _migration_config.get("meters"):
+            _migration_config = config  # fall back to whatever load_config returned
+        else:
+            logger.info(
+                "engine_startup: loaded meter config from meters_config.json for migration"
+            )
         if os.path.exists(BLOCKS_PATH):
             logger.info("engine_startup: blocks.json found — running auto-migration to SQLite")
-            migrated = migrate_json_to_sqlite(BLOCKS_PATH, _store, config)
+            migrated = migrate_json_to_sqlite(BLOCKS_PATH, _store, _migration_config)
             logger.info("engine_startup: migration complete — %d blocks migrated", migrated)
             # Rename blocks.json so it's preserved but no longer used
             migrated_path = BLOCKS_PATH + ".migrated"
@@ -1678,7 +1712,7 @@ async def engine_startup(ha: HAClient):
         elif os.path.exists(BLOCKS_PATH + ".migrated"):
             # DB was deleted but migrated source still exists — re-migrate from it
             logger.info("engine_startup: blocks.json.migrated found — re-migrating to fresh DB")
-            migrated = migrate_json_to_sqlite(BLOCKS_PATH + ".migrated", _store, config)
+            migrated = migrate_json_to_sqlite(BLOCKS_PATH + ".migrated", _store, _migration_config)
             logger.info("engine_startup: re-migration complete — %d blocks migrated", migrated)
         else:
             # Brand new install — create initial config period
