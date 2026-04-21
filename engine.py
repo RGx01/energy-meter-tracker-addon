@@ -1549,6 +1549,7 @@ async def engine_startup(ha: HAClient):
                 logger.warning("engine_startup: config repair failed: %s", _cre)
 
     # ── Register state triggers from config ─────────────────────────────
+    main_import_sensor = None
     main_export_sensor = None
 
     for mid, mcfg in config.get("meters", {}).items():
