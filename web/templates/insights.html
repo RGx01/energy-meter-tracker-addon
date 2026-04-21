@@ -212,6 +212,16 @@
           <div class="insight-metric-value" id="sum-grid-int"></div>
           <div class="insight-metric-unit">gCO₂/kWh</div>
         </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Grid import (CI blocks)</div>
+          <div class="insight-metric-value" id="sum-ci-imp-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric" id="sum-ci-exp-wrap">
+          <div class="insight-metric-label">Grid export (CI blocks)</div>
+          <div class="insight-metric-value" id="sum-ci-exp-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
       </div>
       <div class="insight-equiv"   id="sum-equiv"></div>
       <div class="coverage-warn"   id="sum-coverage"></div>
@@ -248,8 +258,19 @@
           <div class="insight-metric-value" id="sol-kwh"></div>
           <div class="insight-metric-unit">kWh</div>
         </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Avg export intensity</div>
+          <div class="insight-metric-value" id="sol-intensity"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">vs grid average</div>
+          <div class="insight-metric-value" id="sol-vs-grid"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
       </div>
       <div class="insight-equiv" id="sol-equiv"></div>
+      <div class="insight-verdict" id="sol-verdict" style="display:none;"></div>
       <div class="insight-footnote">
         Calculated using actual grid intensity at the time of each export block.
         <a href="{{ url_for('settings_page') }}?tab=carbon">Edit assumptions →</a>
@@ -273,6 +294,16 @@
           <div class="insight-metric-value" id="house-carbon"></div>
           <div class="insight-metric-unit">kgCO₂</div>
         </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Avg intensity</div>
+          <div class="insight-metric-value" id="house-intensity"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">vs grid average</div>
+          <div class="insight-metric-value" id="house-vs-grid"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
         <div class="insight-metric" id="house-pct-wrap">
           <div class="insight-metric-label">% of grid import</div>
           <div class="insight-metric-value" id="house-pct"></div>
@@ -280,6 +311,7 @@
         </div>
       </div>
       <div class="insight-equiv" id="house-equiv"></div>
+      <div class="insight-verdict" id="house-verdict" style="display:none;"></div>
       <div class="insight-footnote">
         Grid import attributable directly to the house, excluding EV and battery charging.
         Any electricity the battery discharged into the house is not captured here — that energy
@@ -406,13 +438,27 @@
           <div class="insight-metric-value" id="ev-intensity"></div>
           <div class="insight-metric-unit">gCO₂/kWh</div>
         </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Effective intensity</div>
+          <div class="insight-metric-value" id="ev-effective-int"></div>
+          <div class="insight-metric-unit">gCO₂/kWh usable DC</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Lost to charging loss</div>
+          <div class="insight-metric-value" id="ev-carbon-lost"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
       </div>
       <div class="insight-equiv" id="ev-equiv"></div>
       <div class="insight-footnote">
         EV carbon based on sub-meter AC import × grid intensity at time of charging.
         Mileage: AC import × charge efficiency (AC→DC loss) × EV efficiency (miles/kWh battery).
         Efficiency figure should be from your trip computer or manufacturer spec — not derived
-        from wall/smart meter energy, which would double-count the charging loss.
+        from wall/smart meter energy, which would double-count the charging loss.<br>
+        <strong>Effective intensity</strong> adjusts the charge intensity for AC→DC charging losses
+        (charge intensity ÷ charge efficiency) — the true carbon cost per usable kWh stored in the battery.
+        <strong>Lost to charging loss</strong> is the carbon attributable to heat losses during charging
+        (total carbon × loss fraction).
         <a href="{{ url_for('settings_page') }}?tab=carbon">Edit assumptions →</a>
       </div>
     </div>
@@ -523,6 +569,12 @@ function renderInsights(d) {
   }
   document.getElementById('sum-eff-int').textContent  = fmtInt(d.effective_intensity);
   document.getElementById('sum-grid-int').textContent = fmtInt(d.grid_avg_intensity);
+  document.getElementById('sum-ci-imp-kwh').textContent = d.ci_imp_kwh != null ? fmtKwh(d.ci_imp_kwh) : '—';
+  if (d.ci_exp_kwh > 0.01) {
+    document.getElementById('sum-ci-exp-kwh').textContent = fmtKwh(d.ci_exp_kwh);
+  } else {
+    document.getElementById('sum-ci-exp-wrap').style.display = 'none';
+  }
   document.getElementById('sum-equiv').innerHTML = equivLines(Math.max(0, d.carbon_g_net), a);
 
   if (d.carbon_coverage_pct < 95) {
@@ -536,10 +588,47 @@ function renderInsights(d) {
   if (d.exp_kwh > 0.1 && d.carbon_g_exp > 0) {
     document.getElementById('card-solar').style.display = 'block';
     var off_kg = d.carbon_g_exp / 1000;
-    document.getElementById('sol-headline').textContent = off_kg.toFixed(2) + ' kgCO₂ offset';
+    document.getElementById('sol-headline').textContent =
+      d.avg_export_intensity != null
+        ? Math.round(d.avg_export_intensity) + ' gCO₂/kWh avg export intensity'
+        : off_kg.toFixed(2) + ' kgCO₂ offset';
     document.getElementById('sol-sub').textContent = 'Your solar export displaced this much carbon from the grid.';
     document.getElementById('sol-offset').textContent = off_kg.toFixed(2);
     document.getElementById('sol-kwh').textContent    = fmtKwh(d.ci_exp_kwh > 0 ? d.ci_exp_kwh : d.exp_kwh);
+    document.getElementById('sol-intensity').textContent = d.avg_export_intensity != null ? Math.round(d.avg_export_intensity) : '—';
+    document.getElementById('sol-vs-grid').textContent   = d.grid_avg_intensity   != null ? Math.round(d.grid_avg_intensity)   : '—';
+    // Solar verdict — higher export intensity = better (displaced dirtier generation)
+    var has_battery = Object.values(d.sub_meters || {}).some(function(s) {
+      return ['battery','inverter'].includes(s.meter_type) && s.imp_kwh > 0.1;
+    });
+    if (d.avg_export_intensity != null && d.grid_avg_intensity != null) {
+      var sol_diff = d.avg_export_intensity - d.grid_avg_intensity;
+      var sol_pct  = Math.abs(Math.round(sol_diff / d.grid_avg_intensity * 100));
+      var solV = document.getElementById('sol-verdict');
+      solV.style.display = '';
+      if (sol_pct < 10) {
+        solV.className = 'insight-verdict neutral';
+        if (has_battery) {
+          solV.innerHTML = 'Your export matched the grid average intensity. If your battery can be scheduled to export, you could store solar during clean periods and export from the battery when the grid is dirtier to increase your offset.';
+        } else {
+          solV.innerHTML = 'Your export matched the grid average intensity — timing follows generation so there is little you can directly control.';
+        }
+      } else if (sol_diff > 0) {
+        solV.className = 'insight-verdict positive';
+        if (has_battery) {
+          solV.innerHTML = '✓ You exported during dirtier-than-average periods — displacing ' + sol_pct + '% more carbon than average. Good battery export timing.';
+        } else {
+          solV.innerHTML = '✓ You exported during dirtier-than-average periods — displacing ' + sol_pct + '% more carbon than average.';
+        }
+      } else {
+        solV.className = 'insight-verdict neutral';
+        if (has_battery) {
+          solV.innerHTML = 'Export was weighted toward cleaner grid periods — displacing ' + sol_pct + '% less carbon than average. You could increase your offset by storing solar generation during clean periods and scheduling your battery to export when the grid is dirtier.';
+        } else {
+          solV.innerHTML = 'Export was weighted toward cleaner grid periods — displacing ' + sol_pct + '% less carbon than average. Solar export timing follows generation so this is not something you can directly control.';
+        }
+      }
+    }
     document.getElementById('sol-equiv').innerHTML    = equivLines(d.carbon_g_exp, a);
   }
 
@@ -553,13 +642,34 @@ function renderInsights(d) {
       : (d.imp_kwh > 0 ? Math.round(d.house_imp_kwh / d.imp_kwh * 100) : null);
     document.getElementById('card-house').style.display = 'block';
     document.getElementById('house-headline').textContent =
-      fmtKwh(house_kwh_display) + ' kWh';
+      d.house_avg_intensity != null
+        ? Math.round(d.house_avg_intensity) + ' gCO₂/kWh avg intensity'
+        : fmtKwh(house_kwh_display) + ' kWh';
     document.getElementById('house-sub').textContent =
       'Grid import attributable to house loads (excluding EV and battery charging)' +
       (d.house_ci_imp_kwh > 0 && d.house_ci_imp_kwh < d.house_imp_kwh
         ? ' — showing kWh with carbon data only.' : '.');
-    document.getElementById('house-kwh').textContent    = fmtKwh(house_kwh_display);
-    document.getElementById('house-pct').textContent    = house_pct != null ? house_pct + '%' : '—';
+    document.getElementById('house-kwh').textContent      = fmtKwh(house_kwh_display);
+    document.getElementById('house-pct').textContent      = house_pct != null ? house_pct + '%' : '—';
+    document.getElementById('house-intensity').textContent = d.house_avg_intensity != null ? Math.round(d.house_avg_intensity) : '—';
+    document.getElementById('house-vs-grid').textContent   = d.grid_avg_intensity  != null ? Math.round(d.grid_avg_intensity)  : '—';
+    // House verdict — lower intensity = better (consumed during cleaner periods)
+    if (d.house_avg_intensity != null && d.grid_avg_intensity != null) {
+      var house_diff = d.house_avg_intensity - d.grid_avg_intensity;
+      var house_pct  = Math.abs(Math.round(house_diff / d.grid_avg_intensity * 100));
+      var houseV = document.getElementById('house-verdict');
+      houseV.style.display = '';
+      if (house_pct < 10) {
+        houseV.className = 'insight-verdict neutral';
+        houseV.innerHTML = 'Your house consumption matched the grid average intensity — timing had little effect.';
+      } else if (house_diff < 0) {
+        houseV.className = 'insight-verdict positive';
+        houseV.innerHTML = '✓ Your house loads ran during cleaner-than-average periods — <strong>' + house_pct + '% below</strong> the grid average intensity.';
+      } else {
+        houseV.className = 'insight-verdict negative';
+        houseV.innerHTML = 'Your house loads ran during dirtier-than-average periods — <strong>' + house_pct + '% above</strong> the grid average.';
+      }
+    }
     if (house_kg != null) {
       document.getElementById('house-carbon').textContent = house_kg.toFixed(2);
     } else {
@@ -605,7 +715,7 @@ function renderInsights(d) {
     if (bat_int != null && grid_avg != null) {
       var bat_diff = bat_int - grid_avg;
       var bat_pct  = Math.abs(Math.round(bat_diff / grid_avg * 100));
-      if (Math.abs(bat_diff) < 5) {
+      if (Math.abs(bat_pct) < 10) {
         batLines.push('Your battery charged at roughly the grid average intensity this period.');
       } else if (bat_diff < 0) {
         batLines.push('✓ Your battery preferentially charged during cleaner grid periods — <strong>' +
@@ -660,7 +770,10 @@ function renderInsights(d) {
     var cleaner_pct = gas_kg > 0 ? Math.round(saving_kg / gas_kg * 100) : null;
 
     document.getElementById('card-hp').style.display   = 'block';
-    document.getElementById('hp-headline').textContent  = hp_kg.toFixed(2) + ' kgCO₂';
+    document.getElementById('hp-headline').textContent  =
+      hp.avg_charge_intensity != null
+        ? Math.round(hp.avg_charge_intensity) + ' gCO₂/kWh avg intensity'
+        : hp_kg.toFixed(2) + ' kgCO₂';
     document.getElementById('hp-sub').textContent       = 'Carbon from heat pump electricity use this period.';
     var ci_kwh_hp = hp.ci_imp_kwh || 0;
     document.getElementById('hp-carbon').textContent    = hp_kg.toFixed(2);
@@ -701,7 +814,10 @@ function renderInsights(d) {
     var ev_ci_kwh = ev.ci_imp_kwh || 0;
     var ev_int = ev_ci_kwh > 0 ? Math.round(ev.carbon_g / ev_ci_kwh) : null;
     document.getElementById('card-ev').style.display = 'block';
-    document.getElementById('ev-headline').textContent = ev_kg.toFixed(2) + ' kgCO₂';
+    document.getElementById('ev-headline').textContent =
+      ev.avg_charge_intensity != null
+        ? Math.round(ev.avg_charge_intensity) + ' gCO₂/kWh avg charge intensity'
+        : ev_kg.toFixed(2) + ' kgCO₂';
     document.getElementById('ev-sub').textContent = 'Carbon attributable to EV charging this period.';
     var ci_kwh_ev  = ev.ci_imp_kwh || 0;
     var charge_eff_display = a.ev_charge_efficiency || 0.88;
@@ -712,13 +828,22 @@ function renderInsights(d) {
     document.getElementById('ev-kwh').textContent       = ci_kwh_ev > 0 ? fmtKwh(ci_kwh_ev) : fmtKwh(ev.imp_kwh);
     document.getElementById('ev-dc-kwh').textContent    = fmtKwh(dc_kwh);
     document.getElementById('ev-intensity').textContent = ev_int != null ? Math.round(ev_int) : '—';
+
+    var charge_eff = a.ev_charge_efficiency || 0.88;
+    if (ev_int != null) {
+      document.getElementById('ev-effective-int').textContent = Math.round(ev_int / charge_eff);
+    } else {
+      document.getElementById('ev-effective-int').textContent = '—';
+    }
+    var ev_carbon_lost = ev_kg > 0 ? (ev_kg * (1 - charge_eff)) : 0;
+    document.getElementById('ev-carbon-lost').textContent = ev_carbon_lost > 0 ? ev_carbon_lost.toFixed(2) : '—';
     var evEquiv = document.getElementById('ev-equiv');
     var evLines = [];
     // EV vs grid average intensity
     if (ev_int != null && d.grid_avg_intensity != null) {
       var ev_diff = ev_int - d.grid_avg_intensity;
       var ev_pct  = Math.abs(Math.round(ev_diff / d.grid_avg_intensity * 100));
-      if (Math.abs(ev_diff) < 5) {
+      if (ev_pct < 10) {
         evLines.push('Your EV charging intensity matched the grid average.');
       } else if (ev_diff < 0) {
         evLines.push('✓ Charged at <strong>' + ev_pct + '% below</strong> the grid average — good off-peak timing.');
