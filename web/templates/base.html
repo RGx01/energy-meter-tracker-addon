@@ -89,12 +89,12 @@
     }
 
     .sidebar-brand {
-      padding: 24px 20px 20px;
+      padding: 20px 16px 16px;
       border-bottom: 1px solid var(--border);
     }
 
     .sidebar-brand img.logo {
-      width: 160px;
+      width: 180px;
       height: auto;
       display: block;
       transition: filter 0.3s ease;
@@ -448,10 +448,8 @@
         <span class="nav-icon">📖</span> Help
       </a>
     </nav>
-    <div class="sidebar-footer" style="display:flex; align-items:center; justify-content:space-between;">
+    <div class="sidebar-footer">
       <span>{% if app_version %}v{{ app_version }} &middot; {% endif %}port 8099</span>
-      <button id="global-theme-btn" onclick="globalToggleTheme()" title="Toggle light/dark mode"
-        style="background:transparent; border:1px solid var(--border); border-radius:var(--radius); color:var(--muted); padding:2px 8px; font-size:14px; cursor:pointer; line-height:1.4;">&#9790;</button>
     </div>
   </aside>
 

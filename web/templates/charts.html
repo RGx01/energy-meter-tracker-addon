@@ -353,7 +353,7 @@
       </label>
     </div>
     <div class="bar-toolbar-right">
-      <button class="bar-seg-btn" id="bar-theme-btn" onclick="barToggleTheme()" title="Toggle light/dark" style="border:0.5px solid var(--border); border-radius:var(--radius); padding:5px 10px; font-size:14px;">&#9790;</button>
+      
     </div>
   </div>
 
@@ -718,7 +718,7 @@ async function barInit() {
     barCurrency    = json.currency || '£';
     barBillingDay  = json.billing_day || 1;
     barMeters      = json.meters  || [];
-    barExportColor = json.export_color || '#ff7f0e';
+    barExportColor = json.export_color || '#ff7f0e';  // palette colour for export/credit bars
     document.getElementById('bar-cost-btn').textContent = barCurrency + ' Cost';
     // Show CO2 toggle only when a postcode is configured (CI data available)
     var co2Btn = document.getElementById('bar-co2-btn');
