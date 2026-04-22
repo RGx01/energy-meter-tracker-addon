@@ -7,7 +7,7 @@
     <div class="sub">Energy and carbon analysis by billing period</div>
   </div>
   <div class="insights-tabs">
-    <button class="insights-tab active" data-tab="carbon" onclick="showInsightTab('carbon', this)">🌿 Carbon</button>
+    <button class="insights-tab active" data-tab="carbon" onclick="showInsightTab('carbon', this)">🌿 <span class="insights-tab-label">Carbon</span></button>
   </div>
   <div id="period-nav" style="display:none; align-items:center; gap:8px;">
     <button class="btn btn-secondary" id="btn-prev" onclick="navPeriod(-1)">←</button>
@@ -15,6 +15,20 @@
     <button class="btn btn-secondary" id="btn-next" onclick="navPeriod(1)">→</button>
   </div>
 </div>
+{% endblock %}
+
+{% block head %}
+<style>
+  @media (max-width: 768px), (max-height: 500px) and (orientation: landscape) {
+    .topbar .sub { display: none; }
+    .topbar { padding: 8px 12px; gap: 6px; flex-wrap: nowrap; align-items: center; }
+    .insights-tab { padding: 6px 10px; font-size: 18px; }
+    .insights-tab-label { display: none; }
+    #period-nav { gap: 4px !important; }
+    #period-label { font-size: 11px !important; min-width: 0 !important; }
+    .btn-secondary { padding: 6px 8px; min-width: 32px; }
+  }
+</style>
 {% endblock %}
 
 {% block content %}
@@ -213,12 +227,12 @@
           <div class="insight-metric-unit">gCO₂/kWh</div>
         </div>
         <div class="insight-metric">
-          <div class="insight-metric-label">Grid import (CI blocks)</div>
+          <div class="insight-metric-label">Grid import</div>
           <div class="insight-metric-value" id="sum-ci-imp-kwh"></div>
           <div class="insight-metric-unit">kWh</div>
         </div>
         <div class="insight-metric" id="sum-ci-exp-wrap">
-          <div class="insight-metric-label">Grid export (CI blocks)</div>
+          <div class="insight-metric-label">Grid export</div>
           <div class="insight-metric-value" id="sum-ci-exp-kwh"></div>
           <div class="insight-metric-unit">kWh</div>
         </div>

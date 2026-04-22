@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.6.2] — 2026-04-22
+
+### Added
+
+- **GitHub Wiki link in Help page** — new "Further Reading & Support" section at the bottom of the Help page linking to the GitHub wiki (sensor requirements, integration guides), issues, and repository.
+
+### Changed
+
+- **Theme toggle consolidated to logo** — the `☾` toggle buttons in the sidebar footer and charts toolbar have been removed. The logo in the top-left of the sidebar is now the sole theme toggle, consistent across all pages. The heatmap iframe theme sync is preserved so theme changes propagate correctly into generated charts.
+
+- **Logo size increased** — logo width increased from 160px to 180px with sidebar brand padding adjusted to fit cleanly within the sidebar without changing its width.
+
+- **Insights mobile topbar** — subtitle hidden on mobile, Carbon tab collapses to emoji-only, period navigation compacts to fit a single row. Consistent with the charts page mobile pattern.
+
+- **Insights metric labels simplified** — "Grid import (CI blocks)" and "Grid export (CI blocks)" shortened to "Grid import" and "Grid export". The footnote already explains the CI-only basis.
+
+---
+
 ## [2.6.1] — 2026-04-21
 
 ### Added
