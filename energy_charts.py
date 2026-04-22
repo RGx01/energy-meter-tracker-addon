@@ -1502,7 +1502,6 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     <button class="view-btn" data-view="vs-prev"        onclick="showView('vs-prev')">vs Prev</button>
     <button class="view-btn vs-year-btn" data-view="vs-year" onclick="showView('vs-year')">vs Last Year</button>
     <button class="view-btn censor-btn" id="censor-toggle" onclick="toggleCensor()" title="Blur sensitive info">&#128065; Censor</button>
-    <button class="view-btn" id="theme-toggle" onclick="toggleTheme()" title="Toggle light/dark mode">&#9790;</button>
   </div>
 </div>"""
 
@@ -3372,12 +3371,12 @@ var _hmNavLeft = document.getElementById('hm-nav-left');
   if (_hmNavLeft) _hmNavLeft.appendChild(btn);
 }});
 
-// Theme toggle button in nav right
+// Theme sync — button hidden, theme driven by parent page logo click
 var _hmNavRight = document.getElementById('hm-nav-right');
 var _hmToggleBtn = document.createElement('button');
 _hmToggleBtn.id = 'hm-theme-btn';
 _hmToggleBtn.className = 'hm-theme-btn';
-_hmToggleBtn.textContent = document.documentElement.getAttribute('data-theme') === 'light' ? '\u2600' : '\u263e';
+_hmToggleBtn.style.display = 'none';
 if (_hmNavRight) _hmNavRight.appendChild(_hmToggleBtn);
 _hmToggleBtn.onclick = function() {{
   var current = document.documentElement.getAttribute('data-theme');
