@@ -1,5 +1,34 @@
 # Changelog
 
+## [2.6.3] — 2026-04-23
+
+### Added
+
+- **Usage Stats data table — scrollable on desktop** — `#chart-bar` converted to a viewport-filling flex column. Chart is `flex-shrink:0` and stays pinned above the table. Table wrapper is `flex:1; min-height:0` and scrolls independently. On mobile natural page scroll is preserved.
+
+- **Usage Stats data table — sticky column headers and totals row** — column headers stick at the top while scrolling. Totals row moved from the bottom of `<tbody>` to a second `<thead>` row, pinned just below the column headers so it is always visible.
+
+- **Usage Stats data table — sortable date column** — clicking the Period column header toggles ascending/descending sort with a ↑/↓ indicator. Defaults to newest first. Preference persisted in localStorage.
+
+- **Usage Stats data table — alternate row shading** — odd/even rows use `var(--surface)` / `var(--bg)` for zebra striping that works in both light and dark mode.
+
+- **Usage Stats data table — colour dots in column headers** — each column that maps to a specific meter or direction (import, export, standing charge) shows a coloured dot matching the chart legend. Columns with no single colour (Period, Total, Net, Avg intensity) show no dot.
+
+- **Billing chart — day chart order toggle** — "↓ Newest first / ↑ Oldest first" button added to the billing chart toolbar. Reverses the order of day charts within the displayed billing period. Useful for comparing against a PDF utility bill. Preference persisted in localStorage and restored on page load. The period dropdown navigator is unaffected.
+
+- **Heatmap — fills available desktop viewport** — scroll height was hardcoded to 31 rows. Now calculates maximum height from `window.innerHeight` so the heatmap uses all available vertical space on desktop.
+
+- **Heatmap — larger metric toggle buttons on mobile** — kWh/CO₂/gCO₂/kWh toggle buttons were very small touch targets on mobile. Added `@media (max-width: 600px)` override: `min-height: 40px`, larger padding, `min-width: 64px`.
+
+### Fixed
+
+- **Carbon intensity fetched after catch-up block finalisation** — on the first engine tick after a restart or rebuild, `ensure_correct_block` finalised all catch-up blocks before `_tick_carbon_intensity` had run. Those blocks were assigned carbon values from pre-restart CI data which could be stale. Fixed by moving the CI fetch to run before the block lifecycle in every tick.
+
+
+- **Deprecated architecture values in config.yaml** — `armhf` and `armv7` removed from `arch` list. Supported architectures are now `aarch64` and `amd64` only.
+
+---
+
 ## [2.6.2] — 2026-04-22
 
 ### Added

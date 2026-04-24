@@ -9,8 +9,6 @@
 
 ![Supports aarch64 Architecture][aarch64-shield]
 ![Supports amd64 Architecture][amd64-shield]
-![Supports armhf Architecture][armhf-shield]
-![Supports armv7 Architecture][armv7-shield]
 
 [releases-shield]: https://img.shields.io/github/release/RGx01/energy-meter-tracker-addon.svg
 [releases]: https://github.com/RGx01/energy-meter-tracker-addon/releases
@@ -23,8 +21,6 @@
 [maintenance-shield]: https://img.shields.io/maintenance/yes/2026.svg
 [aarch64-shield]: https://img.shields.io/badge/aarch64-yes-green.svg
 [amd64-shield]: https://img.shields.io/badge/amd64-yes-green.svg
-[armhf-shield]: https://img.shields.io/badge/armhf-yes-green.svg
-[armv7-shield]: https://img.shields.io/badge/armv7-yes-green.svg
 
 A Home Assistant add-on that records your electricity usage in precise configurable intervals — matching your energy supplier's meter reconciliation period for accurate billing.
 
@@ -141,13 +137,13 @@ Access the UI at `http://<your-ha-ip>:8099`
 
 | Page | Description |
 |------|-------------|
-| Meter Config | Configure main meter, sub-meters, sensors, power sensor and postcode |
-| Billing History | View, edit and add config periods; record billing day / address / supplier changes |
-| Charts | Billing chart, net energy heatmap and usage stats |
+| ⚙️ Settings | Meter Config tab (main meter, sub-meters, sensors, postcode) and Carbon tab (assumption overrides for insights calculations) |
+| 📊 Charts | Billing chart, net energy heatmap and usage stats |
+| 🌿 Insights | Carbon analysis by billing period — house consumption, solar offset, EV mileage, battery behaviour, heat pump vs gas |
 | ⚡ Live Power | Live power gauge, billing cards and carbon intensity forecast |
-| Data Management | Backups, restore, imports and historical corrections |
-| Logs | Live add-on log viewer |
-| Help | Full reference documentation |
+| 🗄️ Data Management | Backups, restore, historical corrections and block deletion |
+| 📋 Logs | Live add-on log viewer |
+| 📖 Help | Full reference documentation and links to the GitHub wiki |
 
 ## Charts
 
@@ -254,7 +250,7 @@ These are compatible with the HA Energy dashboard and Utility Meter integrations
 
 ### Storage
 
-All blocks are stored in a SQLite database (`energy_meter.db`) in the add-on's data directory. After every block finalise, the database and config are also copied to `/share/energy_meter_tracker_backup/`. Zip snapshots are created automatically before every config save and are accessible from the Data Management page.
+All blocks are stored in a SQLite database (`blocks.db`) in the add-on's data directory. After every block finalise, the database and config are also copied to `/share/energy_meter_tracker_backup/`. Zip snapshots are created automatically before every config save and are accessible from the Data Management page.
 
 | Event | `/data/` | `/share/energy_meter_tracker_backup/` |
 |-------|----------|---------------------------------------|
@@ -278,8 +274,23 @@ The volume mount is **essential** — without it all data is lost when the conta
 -v /path/to/data:/data/energy_meter_tracker
 ```
 
-> ⚠️ **Before upgrading**, always create a manual backup from the Import & Backup page and copy it off the host.
+> ⚠️ **Before upgrading**, always create a manual backup from the Data Management page and copy it off the host.
+
+## Supported Hardware
+
+| Architecture | Supported |
+|---|---|
+| amd64 | ✅ |
+| aarch64 | ✅ |
+
+## Documentation & Support
+
+- 📖 [GitHub Wiki](https://github.com/RGx01/energy-meter-tracker-addon/wiki) — sensor requirements, integration guides, known limitations
+- 🐛 [GitHub Issues](https://github.com/RGx01/energy-meter-tracker-addon/issues) — bug reports and feature requests
+- 💬 [Community Forum](https://community.home-assistant.io/t/energy-meter-tracker/995674) — discussion and help
 
 ## Disclaimer
+
+Energy Meter Tracker is for informational use only. It cannot replicate your supplier's authoritative Half-Hourly reconciliation. Do not use this data for billing disputes or formal energy accounting.
 
 Energy Meter Tracker is for informational use only. It cannot replicate your supplier's authoritative Half-Hourly reconciliation. Do not use this data for billing disputes or formal energy accounting.

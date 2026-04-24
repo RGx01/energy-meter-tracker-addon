@@ -171,6 +171,14 @@
     font-family: var(--sans);
   }
   .bar-legend-dot { width:10px; height:10px; border-radius:2px; display:inline-block; margin-right:4px; }
+  #bar-table-wrap { min-height: 0; }
+  #bar-table thead th { position: sticky; top: 0; background: var(--surface); z-index: 1; }
+  #bar-table thead tr.totals-row td { position: sticky; top: 33px; background: var(--surface); z-index: 1; font-weight: 600; color: var(--text); border-top: 1px solid var(--border); border-bottom: 2px solid var(--border); }
+  @media (max-width: 768px) {
+    #chart-bar { height: auto !important; overflow: visible !important; }
+    #bar-table-wrap { flex: none !important; overflow-y: visible !important; }
+    #bar-chart-wrap { height: 240px !important; }
+  }
   #bar-table th, #bar-table td {
     padding: 6px 10px;
     text-align: right;
@@ -186,13 +194,10 @@
     background: var(--bg);
     position: sticky;
     top: 0;
+    vertical-align: middle;
+    white-space: nowrap;
   }
-  #bar-table tr:last-child td {
-    border-bottom: none;
-    font-weight: 500;
-    border-top: 2px solid var(--border);
-    color: var(--text);
-  }
+  #bar-table th .bar-legend-dot { vertical-align: middle; display: inline-block; position: relative; top: -1px; }
   #bar-table td { color: var(--muted); }
   #bar-table td.col-total {
     font-weight: 500;
@@ -202,7 +207,9 @@
   #bar-table th.col-total {
     border-left: 2px solid var(--border);
   }
-  #bar-table tr:hover td { background: rgba(255,255,255,0.03); }
+  #bar-table tbody tr:nth-child(even) td { background: var(--bg); }
+  #bar-table tbody tr:nth-child(odd) td { background: var(--surface); }
+  #bar-table tr:hover td { background: rgba(127,127,127,0.1) !important; }
 
   .chart-frame-wrap {
     background: white;
@@ -324,10 +331,10 @@
 </div>
 
 <!-- Import / Export bar chart -->
-<div id="chart-bar" class="chart-frame-wrap" style="display:none;">
+<div id="chart-bar" class="chart-frame-wrap" style="display:none; flex-direction:column; height:calc(100vh - 56px); overflow:hidden;">
 
   <!-- Floating toolbar — matches billing chart period-nav pattern -->
-  <div class="bar-toolbar">
+  <div class="bar-toolbar" style="flex-shrink:0;">
     <div class="bar-toolbar-left">
       <div class="bar-seg" id="bar-period-seg">
         <button class="bar-seg-btn active" onclick="barSetPeriod('daily',this)">Daily</button>
@@ -358,22 +365,22 @@
   </div>
 
   <!-- Period navigator (daily) / year selector (monthly+yearly) -->
-  <div id="bar-sub-bar" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:16px; min-height:28px; padding: 0 24px;"></div>
+  <div id="bar-sub-bar" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:16px; min-height:28px; padding: 0 24px; flex-shrink:0;"></div>
 
   <!-- Legend -->
-  <div id="bar-legend" style="display:flex; gap:16px; margin-bottom:12px; font-size:12px; color:var(--muted); flex-wrap:wrap; padding: 0 24px;"></div>
+  <div id="bar-legend" style="display:flex; gap:16px; margin-bottom:12px; font-size:12px; color:var(--muted); flex-wrap:wrap; padding: 0 24px; flex-shrink:0;"></div>
 
   <!-- Chart canvas -->
-  <div id="bar-chart-wrap" style="position:relative; width:100%; max-width:100%; overflow:hidden; height:360px; padding: 0 24px; box-sizing:border-box;">
+  <div id="bar-chart-wrap" style="position:relative; width:100%; max-width:100%; overflow:hidden; height:300px; padding: 0 24px; box-sizing:border-box; flex-shrink:0;">
     <canvas id="barChart" style="max-width:100%;"></canvas>
   </div>
 
   <!-- Tabular view -->
-  <div style="display:flex; align-items:center; justify-content:space-between; margin-top:28px; margin-bottom:10px; padding: 0 24px;">
+  <div style="display:flex; align-items:center; justify-content:space-between; margin-top:12px; margin-bottom:8px; padding: 0 24px; flex-shrink:0;">
     <span style="font-size:12px; font-weight:500; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em;">Data table</span>
     <button class="btn btn-secondary btn-sm" onclick="barCopyTable()" id="bar-copy-btn">⎘ Copy to clipboard</button>
   </div>
-  <div style="overflow-x:auto; padding: 0 24px 24px 24px;">
+  <div id="bar-table-wrap" style="overflow-x:auto; overflow-y:auto; padding: 0 24px 24px 24px; flex:1; min-height:0;">
     <table id="bar-table" style="width:100%; border-collapse:collapse; font-size:12px; font-family:var(--mono);">
     </table>
   </div>
@@ -608,7 +615,7 @@ function showChart(name, btn) {
   btn.classList.add('active');
   document.getElementById('chart-daily').style.display   = name === 'daily'   ? 'block' : 'none';
   document.getElementById('chart-heatmap').style.display = name === 'heatmap' ? 'block' : 'none';
-  document.getElementById('chart-bar').style.display     = name === 'bar'     ? 'block' : 'none';
+  document.getElementById('chart-bar').style.display     = name === 'bar'     ? 'flex' : 'none';
   _activeChart = name;
   if (name === 'bar') {
     barInit();
@@ -645,6 +652,7 @@ async function regenerate() {
 
 // ── Usage Stats Bar Chart ─────────────────────────────────────────────────────
 var barData = null;
+var barSortDesc = (localStorage.getItem('emt_bar_sort_desc') !== 'false'); // default newest first
 var barCurrency = '£';
 var barPeriod = 'daily';
 var barMetric = 'kwh';
@@ -1386,13 +1394,13 @@ function barBuildTable() {
     if (barMetric === 'co2') cols.push({key:'avg_intensity', label:'Avg intensity'});
   } else {
     if (barMetric === 'co2') {
-      barMeters.forEach(function(m) { cols.push({key:'co2_imp_'+m.id, label: m.label + ' carbon', mid: m.id}); });
-      cols.push({key:'co2_exp', label:'Export offset'});
+      barMeters.forEach(function(m) { cols.push({key:'co2_imp_'+m.id, label: m.label + ' carbon', mid: m.id, color: m.color}); });
+      cols.push({key:'co2_exp', label:'Export offset', color: barExportColor});
       cols.push({key:'avg_intensity', label:'Avg intensity'});
     } else {
-      barMeters.forEach(function(m) { cols.push({key:'imp_'+m.id, label: m.label + ' import', mid: m.id, dir:'imp'}); });
-      if (barMetric === 'cost' && barIncStanding()) cols.push({key:'standing', label:'Standing charge'});
-      cols.push({key:'exp', label:'Export', dir:'exp'});
+      barMeters.forEach(function(m) { cols.push({key:'imp_'+m.id, label: m.label + ' import', mid: m.id, dir:'imp', color: m.color}); });
+      if (barMetric === 'cost' && barIncStanding()) cols.push({key:'standing', label:'Standing charge', color:'#4b5563'});
+      cols.push({key:'exp', label:'Export', dir:'exp', color: barExportColor});
     }
   }
 
@@ -1433,16 +1441,25 @@ function barBuildTable() {
   }
 
   // Build HTML — add Total column header
-  var html = '<thead><tr><th>Period</th>';
-  cols.forEach(function(c){ html += '<th>' + c.label + '</th>'; });
+  var html = '<thead><tr><th style="cursor:pointer;user-select:none;" onclick="barToggleSort()">Period ' + (barSortDesc ? '↓' : '↑') + '</th>';
+  cols.forEach(function(c){
+    var dotHtml = c.color ? '<span class="bar-legend-dot" style="background:' + c.color + ';margin-right:5px;"></span>' : '';
+    html += '<th>' + dotHtml + c.label + '</th>';
+  });
   html += '<th class="col-total">Total</th>';
-  html += '</tr></thead><tbody>';
+  html += '</tr>';
+  // Totals header row — built after data rows, inserted into thead
+  var _totalsHtml = '';
+  html += '</thead><tbody>';
+  var rowIndices = labels.map(function(_,i){return i;});
+  if (barSortDesc) rowIndices = rowIndices.slice().reverse();
 
   var colTotals = {};
   cols.forEach(function(c){ colTotals[c.key] = 0; });
   var grandTotal = 0;
 
-  labels.forEach(function(lbl, i) {
+  rowIndices.forEach(function(i) {
+    var lbl = labels[i];
     var agg = aggList[i];
     var rowTotal = 0;
     html += '<tr><td>' + barPeriodLabel(lbl, i, pd) + '</td>';
@@ -1482,22 +1499,31 @@ function barBuildTable() {
       }
     });
   }
-  html += '<tr><td>Total</td>';
+  // Build totals as second thead row for sticky visibility
+  _totalsHtml = '<tr class="totals-row"><td style="font-weight:600;">Totals</td>';
   cols.forEach(function(c) {
     if (c.key === 'avg_intensity') {
       var _ai = _totalIntensityKwh > 0
         ? Math.round((_totalIntensityCarbon / _totalIntensityKwh) * 10) / 10
         : null;
-      html += '<td>' + (_ai != null ? _ai + ' gCO₂/kWh' : '—') + '</td>';
+      _totalsHtml += '<td>' + (_ai != null ? _ai + ' gCO₂/kWh' : '—') + '</td>';
     } else {
-      html += '<td>' + (colTotals[c.key] != null ? barFmt(colTotals[c.key]) : '—') + '</td>';
+      _totalsHtml += '<td>' + (colTotals[c.key] != null ? barFmt(colTotals[c.key]) : '—') + '</td>';
     }
   });
-  html += '<td class="col-total">' + barFmt(grandTotal) + '</td>';
-  html += '</tr>';
+  _totalsHtml += '<td class="col-total">' + barFmt(grandTotal) + '</td>';
+  _totalsHtml += '</tr>';
 
   html += '</tbody>';
+  // Insert totals row as second row in thead
+  html = html.replace('</tr></thead>', '</tr>' + _totalsHtml + '</thead>');
   tbl.innerHTML = html;
+}
+
+function barToggleSort() {
+  barSortDesc = !barSortDesc;
+  localStorage.setItem('emt_bar_sort_desc', barSortDesc ? 'true' : 'false');
+  barBuildTable();
 }
 
 function barCopyTable() {
