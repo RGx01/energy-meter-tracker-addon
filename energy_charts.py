@@ -1424,7 +1424,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     dropdown_options = []
     for ps in period_sections_display:
         s_str = ps["start"].strftime("%d %b %Y")
-        e_str = (ps["end"] - timedelta(seconds=1)).strftime("%d %b %Y")
+        e_str = (ps["end"] - timedelta(days=1)).strftime("%d %b %Y")
         cost  = ps["summary"]["total_cost"]
         label = f"{s_str} → {e_str}  |  {currency}{cost:.2f}"
         if ps["is_current"]:
@@ -1502,6 +1502,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     <button class="view-btn" data-view="vs-prev"        onclick="showView('vs-prev')">vs Prev</button>
     <button class="view-btn vs-year-btn" data-view="vs-year" onclick="showView('vs-year')">vs Last Year</button>
     <button class="view-btn censor-btn" id="censor-toggle" onclick="toggleCensor()" title="Blur sensitive info">&#128065; Censor</button>
+    <button class="view-btn" id="sort-toggle" onclick="toggleSortOrder()" title="Toggle period order">↓ Newest first</button>
   </div>
 </div>"""
 
@@ -1532,7 +1533,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         charts_open = is_current or is_prev
 
         s_str      = ps["start"].strftime("%d %b %Y")
-        e_str      = (ps["end"] - timedelta(seconds=1)).strftime("%d %b %Y")
+        e_str      = (ps["end"] - timedelta(days=1)).strftime("%d %b %Y")
         bill_total = ps["summary"]["total_cost"]
         ph         = f"{s_str} &rarr; {e_str}"   # period heading shorthand
 
@@ -2276,7 +2277,9 @@ body {{
 
 {dropdown_html}
 
+<div id="period-sections-wrap" data-asc="0">
 {''.join(sections_html_parts)}
+</div>
 {''.join(calmonth_html_parts)}
 {''.join(quarter_html_parts)}
 {''.join(year_html_parts)}
@@ -2545,6 +2548,25 @@ function toggleCensor() {{
   sessionStorage.setItem('energyCensor', on ? '1' : '0');
 }}
 
+function toggleSortOrder() {{
+  var asc = localStorage.getItem('emt_bill_sort_asc') === '1';
+  var nowAsc = !asc;
+  localStorage.setItem('emt_bill_sort_asc', nowAsc ? '1' : '0');
+
+  // Reverse day charts within each period section
+  document.querySelectorAll('.day-charts-body').forEach(function(body) {{
+    var children = Array.from(body.children);
+    children.reverse().forEach(function(c) {{ body.appendChild(c); }});
+  }});
+
+  // Update button
+  var btn = document.getElementById('sort-toggle');
+  if (btn) {{
+    btn.classList.toggle('active', nowAsc);
+    btn.textContent = nowAsc ? '↑ Oldest first' : '↓ Newest first';
+  }}
+}}
+
 function showView(view) {{
   sessionStorage.setItem('energyView', view);
   document.querySelectorAll('.view-btn').forEach(function(b) {{
@@ -2564,6 +2586,15 @@ function showView(view) {{
   showView(savedView);
   // Restore censor
   if (sessionStorage.getItem('energyCensor')==='1') toggleCensor();
+  // Restore sort order button state and day chart order
+  if (localStorage.getItem('emt_bill_sort_asc') === '1') {{
+    document.querySelectorAll('.day-charts-body').forEach(function(body) {{
+      var children = Array.from(body.children);
+      children.reverse().forEach(function(c) {{ body.appendChild(c); }});
+    }});
+    var btn = document.getElementById('sort-toggle');
+    if (btn) {{ btn.classList.add('active'); btn.textContent = '↑ Oldest first'; }}
+  }}
   // Listen for theme changes from parent shell
   window.addEventListener('message', function(e) {{
     if (e.data && e.data.type === 'emt-theme') {{
@@ -2836,7 +2867,7 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None, curren
     ]
 
     # ───── Sizing ─────
-    visible_rows   = 31
+    visible_rows   = 366  # effectively unlimited — JS caps to viewport height dynamically
     row_height     = 20
     col_width      = 20 * block_minutes // 30   # 20px@30min, 10px@15min, 3px@5min
     n_cols         = slots
@@ -2943,6 +2974,14 @@ html, body {{ margin:0; padding:0; overflow:hidden; touch-action: none; backgrou
     cursor: pointer;
     transition: all 0.15s;
   }}
+  @media (max-width: 600px) {{
+    .hm-metric-btn {{
+      font-size: 14px;
+      padding: 8px 14px;
+      min-width: 64px;
+      min-height: 40px;
+    }}
+  }}
   .hm-metric-btn.active {{
     background: rgba(0,212,170,0.15);
     color: var(--accent, #00d4aa);
@@ -3034,8 +3073,9 @@ function scaleChart(overrideW) {{
       scroll.style.height = targetH + 'px';
     }} else {{
       outer.style.height = 'auto';
-      var scrollH = Math.min({n_rows}, {visible_rows}) * {row_height} + {margin_t} + {margin_b};
-      scroll.style.height = scrollH + 'px';
+      var scrollH = {n_rows} * {row_height} + {margin_t} + {margin_b};
+      var maxH = Math.floor((window.innerHeight - 120) / {row_height}) * {row_height} + {margin_t} + {margin_b};
+      scroll.style.height = Math.min(scrollH, maxH) + 'px';
     }}
   }} else {{
     outer.style.transform = '';
@@ -3043,8 +3083,9 @@ function scaleChart(overrideW) {{
     outer.style.width = '';
     outer.style.height = '';
     // nav clear not needed — inside #scroll
-    var scrollH = Math.min({n_rows}, {visible_rows}) * {row_height} + {margin_t} + {margin_b};
-    scroll.style.height = scrollH + 'px';
+    var scrollH = {n_rows} * {row_height} + {margin_t} + {margin_b};
+    var maxH = Math.floor((window.innerHeight - 120) / {row_height}) * {row_height} + {margin_t} + {margin_b};
+    scroll.style.height = Math.min(scrollH, maxH) + 'px';
   }}
   // Never relayout Plotly height — cells must stay square at their natural row_height
 }}

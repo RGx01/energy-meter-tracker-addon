@@ -1445,6 +1445,14 @@ async def _engine_tick(ha: HAClient):
             current_block = create_block(gap_start, gap_end, block_minutes=block_minutes_now)
             _store.save_current_block(current_block)
 
+    # ── Carbon intensity — fetch BEFORE block lifecycle so catch-up blocks ──
+    # ── have fresh CI data when finalise_block computes carbon_g           ──
+    try:
+        current_intensity = await _tick_carbon_intensity()
+    except Exception as _cie:
+        logger.warning("_engine_tick: CI fetch raised: %s", _cie)
+        current_intensity = None
+
     # Block lifecycle
     updated_block = ensure_correct_block(ha, current_block, now, last_known_rates=_post_gap_rates)
     block_changed = updated_block.get("start") != current_block.get("start")
@@ -1452,13 +1460,6 @@ async def _engine_tick(ha: HAClient):
     if block_changed or periodic_checkpoint or near_boundary:
         updated_block["_last_checkpoint"] = now.isoformat()
         _store.save_current_block(updated_block)
-
-    # ── Carbon intensity + power history ──────────────────────────────────
-    try:
-        current_intensity = await _tick_carbon_intensity()
-    except Exception as _cie:
-        logger.warning("_engine_tick: CI fetch raised: %s", _cie)
-        current_intensity = None
 
     # Write power history row every tick if a power sensor is configured
     try:
