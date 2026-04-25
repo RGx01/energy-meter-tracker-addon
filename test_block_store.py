@@ -1832,7 +1832,8 @@ class TestMigration(unittest.TestCase):
         conn.execute("""CREATE TABLE meters (
             id INTEGER PRIMARY KEY AUTOINCREMENT, meter_id TEXT NOT NULL,
             is_sub_meter INTEGER NOT NULL DEFAULT 0, device_label TEXT,
-            parent_meter_id TEXT, config_period_id INTEGER NOT NULL)""")
+            parent_meter_id TEXT, config_period_id INTEGER NOT NULL,
+            UNIQUE (config_period_id, meter_id))""")
         conn.execute("""CREATE TABLE current_block (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             block_start TEXT, block_end TEXT, last_checkpoint TEXT,
