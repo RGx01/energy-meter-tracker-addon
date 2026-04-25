@@ -680,7 +680,11 @@ def _build_soc_response(soc_sensors, ha_client):
                 if v not in (None, "unknown", "unavailable"):
                     fv = float(v)
                     # Auto-scale: if value > 100 assume W, convert to kW
-                    power_kw = round(fv / 1000.0 if abs(fv) > 100 else fv, 3)
+                    fv = fv / 1000.0 if abs(fv) > 100 else fv
+                    # Invert if sensor convention is positive=charging, negative=discharging
+                    if info.get("power_invert"):
+                        fv = -fv
+                    power_kw = round(fv, 3)
         except (ValueError, TypeError):
             pass
         result[m_id] = {
@@ -717,10 +721,11 @@ def api_power():
                 bat_sensor = ((m_data.get("channels") or {}).get("import") or {}).get("read")
                 if meta.get("soc_sensor") or meta.get("inverter_power_sensor"):
                     soc_sensors[m_id] = {
-                        "soc_entity":   meta.get("soc_sensor"),
-                        "power_entity": meta.get("inverter_power_sensor"),
-                        "label":        meta.get("device") or m_id,
-                        "type":         "battery",
+                        "soc_entity":    meta.get("soc_sensor"),
+                        "power_entity":  meta.get("inverter_power_sensor"),
+                        "power_invert":  bool(meta.get("inverter_power_invert", False)),
+                        "label":         meta.get("device") or m_id,
+                        "type":          "battery",
                     }
             elif _is_meter_type(meta, m_id, "ev"):
                 ev_sensor = ((m_data.get("channels") or {}).get("import") or {}).get("read")

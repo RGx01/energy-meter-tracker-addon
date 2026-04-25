@@ -24,8 +24,8 @@
 {% endblock %}
 
 {% block content %}
-<div id="alert-success" class="alert alert-success">✓ Configuration saved. The engine will pick up changes within 10 seconds.</div>
-<div id="alert-error" class="alert alert-danger"></div>
+<div id="alert-success" class="alert alert-success" style="position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:999;min-width:320px;text-align:center;box-shadow:0 4px 12px rgba(0,0,0,0.3);">✓ Configuration saved. The engine will pick up changes within 10 seconds.</div>
+<div id="alert-error" class="alert alert-danger" style="position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:999;min-width:320px;text-align:center;box-shadow:0 4px 12px rgba(0,0,0,0.3);"></div>
 
 <!-- ── Main Meter ─────────────────────────────────────────────────────────── -->
 <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;">
@@ -256,10 +256,19 @@ document.addEventListener('DOMContentLoaded', function() {
   document.addEventListener('visibilitychange', function() {
     if (document.hidden) {
       _hiddenAt = Date.now();
-    } else if (_hiddenAt && (Date.now() - _hiddenAt) > 3000) {
-      // Only reload if the page was hidden for more than 3 seconds
-      // (avoids reloading on brief tab switches)
-      window.location.reload();
+    } else if (_hiddenAt) {
+      // Only reload if a DB restore happened while we were away
+      var restored = sessionStorage.getItem('emt_db_restored');
+      if (restored && parseInt(restored) > _hiddenAt) {
+        sessionStorage.removeItem('emt_db_restored');
+        // Don't reload if wizard is open — would lose all wizard state
+        var wizardOpen = document.getElementById('wizard-overlay') &&
+                         document.getElementById('wizard-overlay').style.display !== 'none';
+        if (!wizardOpen) {
+          window.location.reload();
+        }
+      }
+      _hiddenAt = null;
     }
   });
   document.getElementById('btn-wizard-empty').addEventListener('click', startWizard);
@@ -531,6 +540,10 @@ function buildSubCard(meterId, meter) {
         '<div class="form-group" style="grid-column:1/-1;margin-bottom:16px;">' +
           '<label>Inverter Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — shows live kW below SoC dial)</span></label>' +
           buildEntityInput(meterId + '__inverter_power__inverter_power_sensor', meta.inverter_power_sensor||'', meterId, 'inverter_power', 'inverter_power_sensor', true) +
+          '<div class="checkbox-row" style="margin-top:8px;">' +
+            '<input type="checkbox" id="inv-invert-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="inverter_power_invert" ' + (meta.inverter_power_invert ? 'checked' : '') + '>' +
+            '<label for="inv-invert-' + meterId + '">Invert sensor value <span style="color:var(--muted);font-weight:400;">— tick if positive = charging, negative = discharging</span></label>' +
+          '</div>' +
           '<small style="color:var(--muted);">Live inverter power in W or kW. ⓘ Informational only — not recorded in blocks or used in calculations.</small>' +
         '</div>'
       : '') +

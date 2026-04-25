@@ -75,7 +75,8 @@ CREATE TABLE IF NOT EXISTS meters (
     inverter_possible  INTEGER DEFAULT 0,  -- battery / inverter capable
     power_sensor       TEXT,               -- HA entity_id (main meter only)
     postcode_prefix    TEXT,               -- UK carbon intensity (main meter only)
-    v2x_capable        INTEGER DEFAULT 0,  -- V2G / bidirectional charging capable
+    v2x_capable             INTEGER DEFAULT 0,  -- V2G / bidirectional charging capable
+    inverter_power_invert   INTEGER DEFAULT 0,  -- negate inverter power sensor value
     soc_sensor         TEXT,               -- HA entity_id for battery SoC % (informational)
     inverter_power_sensor TEXT,            -- HA entity_id for inverter power W/kW (informational)
     device_power_sensor TEXT,              -- HA entity_id for EV/heat pump power W/kW (informational)
@@ -366,6 +367,8 @@ def _row_to_block(rows: list[sqlite3.Row]) -> dict:
                     meta["meter_type"] = row["meter_type"]
                 if row["inverter_power_sensor"]:
                     meta["inverter_power_sensor"] = row["inverter_power_sensor"]
+                if row["inverter_power_invert"]:
+                    meta["inverter_power_invert"] = True
                 if row["device_power_sensor"]:
                     meta["device_power_sensor"] = row["device_power_sensor"]
             except IndexError:
@@ -505,11 +508,16 @@ class BlockStore:
         _ph_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(power_history)").fetchall()} if self._conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='power_history'").fetchone() else set()
 
         for _col, _tbl, _defn, _col_set in [
-            ("v2x_capable",           "meters",         "INTEGER DEFAULT 0", _m_cols),
-            ("meter_type",            "meters",         "TEXT",              _m_cols),
-            ("soc_sensor",            "meters",         "TEXT",              _m_cols),
-            ("inverter_power_sensor", "meters",         "TEXT",              _m_cols),
-            ("device_power_sensor",   "meters",         "TEXT",              _m_cols),
+            ("protected",            "meters",         "INTEGER DEFAULT 0",  _m_cols),
+            ("inverter_possible",    "meters",         "INTEGER DEFAULT 0",  _m_cols),
+            ("power_sensor",         "meters",         "TEXT",               _m_cols),
+            ("postcode_prefix",      "meters",         "TEXT",               _m_cols),
+            ("v2x_capable",          "meters",         "INTEGER DEFAULT 0",  _m_cols),
+            ("inverter_power_invert","meters",         "INTEGER DEFAULT 0",  _m_cols),
+            ("meter_type",           "meters",         "TEXT",               _m_cols),
+            ("soc_sensor",           "meters",         "TEXT",               _m_cols),
+            ("inverter_power_sensor","meters",         "TEXT",               _m_cols),
+            ("device_power_sensor",  "meters",         "TEXT",               _m_cols),
             ("supplier",              "config_periods",  "TEXT",              _cp_cols),
             ("mpan",             "meter_channels",  "TEXT",              _mc_cols),
             ("tariff",           "meter_channels",  "TEXT",              _mc_cols),
@@ -1267,7 +1275,8 @@ class BlockStore:
             v2x         = 1 if meta.get("v2x_capable") else 0
             meter_type  = meta.get("meter_type")
             soc_s       = meta.get("soc_sensor")
-            inv_pwr_s   = meta.get("inverter_power_sensor")
+            inv_pwr_s    = meta.get("inverter_power_sensor")
+            inv_invert   = 1 if meta.get("inverter_power_invert") else 0
             dev_pwr_s   = meta.get("device_power_sensor")
 
             cur = self._conn.execute(
@@ -1275,24 +1284,26 @@ class BlockStore:
                        (config_period_id, meter_id, is_sub_meter, parent_meter_id,
                         device_label, protected, inverter_possible,
                         power_sensor, postcode_prefix, v2x_capable,
-                        meter_type, soc_sensor, inverter_power_sensor, device_power_sensor)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        meter_type, soc_sensor, inverter_power_sensor, inverter_power_invert,
+                        device_power_sensor)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(config_period_id, meter_id) DO UPDATE SET
-                       is_sub_meter          = excluded.is_sub_meter,
-                       parent_meter_id       = excluded.parent_meter_id,
-                       device_label          = excluded.device_label,
-                       protected             = excluded.protected,
-                       inverter_possible     = excluded.inverter_possible,
-                       power_sensor          = excluded.power_sensor,
-                       postcode_prefix       = excluded.postcode_prefix,
-                       v2x_capable           = excluded.v2x_capable,
-                       meter_type            = excluded.meter_type,
-                       soc_sensor            = excluded.soc_sensor,
-                       inverter_power_sensor = excluded.inverter_power_sensor,
-                       device_power_sensor   = excluded.device_power_sensor""",
+                       is_sub_meter            = excluded.is_sub_meter,
+                       parent_meter_id         = excluded.parent_meter_id,
+                       device_label            = excluded.device_label,
+                       protected               = excluded.protected,
+                       inverter_possible       = excluded.inverter_possible,
+                       power_sensor            = excluded.power_sensor,
+                       postcode_prefix         = excluded.postcode_prefix,
+                       v2x_capable             = excluded.v2x_capable,
+                       meter_type              = excluded.meter_type,
+                       soc_sensor              = excluded.soc_sensor,
+                       inverter_power_sensor   = excluded.inverter_power_sensor,
+                       inverter_power_invert   = excluded.inverter_power_invert,
+                       device_power_sensor     = excluded.device_power_sensor""",
                 (period_id, meter_id, is_sub, parent, device,
                  protected, inv_poss, power_s, postcode, v2x,
-                 meter_type, soc_s, inv_pwr_s, dev_pwr_s)
+                 meter_type, soc_s, inv_pwr_s, inv_invert, dev_pwr_s)
             )
             meter_row_id = cur.lastrowid or self._conn.execute(
                 "SELECT id FROM meters WHERE config_period_id=? AND meter_id=?",
@@ -1372,6 +1383,8 @@ class BlockStore:
                     meta["soc_sensor"] = m["soc_sensor"]
                 if m["inverter_power_sensor"]:
                     meta["inverter_power_sensor"] = m["inverter_power_sensor"]
+                if m["inverter_power_invert"]:
+                    meta["inverter_power_invert"] = True
                 if m["device_power_sensor"]:
                     meta["device_power_sensor"] = m["device_power_sensor"]
             except IndexError:
@@ -1864,7 +1877,7 @@ class BlockStore:
                    cp.currency_symbol, cp.currency_code, cp.effective_from,
                    m.is_sub_meter, m.parent_meter_id, m.device_label,
                    m.inverter_possible, m.power_sensor, m.postcode_prefix,
-                   m.v2x_capable, m.meter_type, m.soc_sensor, m.inverter_power_sensor, m.device_power_sensor
+                   m.v2x_capable, m.meter_type, m.soc_sensor, m.inverter_power_sensor, m.inverter_power_invert, m.device_power_sensor
             FROM blocks b
             JOIN config_periods cp ON b.config_period_id = cp.id
             LEFT JOIN meters m ON m.meter_id = b.meter_id
@@ -1889,7 +1902,7 @@ class BlockStore:
                    cp.currency_symbol, cp.currency_code, cp.effective_from,
                    m.is_sub_meter, m.parent_meter_id, m.device_label,
                    m.inverter_possible, m.power_sensor, m.postcode_prefix,
-                   m.v2x_capable, m.meter_type, m.soc_sensor, m.inverter_power_sensor, m.device_power_sensor
+                   m.v2x_capable, m.meter_type, m.soc_sensor, m.inverter_power_sensor, m.inverter_power_invert, m.device_power_sensor
             FROM blocks b
             JOIN config_periods cp ON b.config_period_id = cp.id
             LEFT JOIN meters m ON m.meter_id = b.meter_id
@@ -1914,7 +1927,7 @@ class BlockStore:
                    cp.currency_symbol, cp.currency_code, cp.effective_from,
                    m.is_sub_meter, m.parent_meter_id, m.device_label,
                    m.inverter_possible, m.power_sensor, m.postcode_prefix,
-                   m.v2x_capable, m.meter_type, m.soc_sensor, m.inverter_power_sensor, m.device_power_sensor
+                   m.v2x_capable, m.meter_type, m.soc_sensor, m.inverter_power_sensor, m.inverter_power_invert, m.device_power_sensor
             FROM blocks b
             JOIN config_periods cp ON b.config_period_id = cp.id
             LEFT JOIN meters m ON m.meter_id = b.meter_id
