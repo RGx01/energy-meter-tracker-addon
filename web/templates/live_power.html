@@ -5,10 +5,10 @@
 /* ── Summary page ── */
 .summary-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 20px;
   margin-bottom: 20px;
-  align-items: start;
+  align-items: stretch;
   min-width: 0;
 }
 
@@ -25,7 +25,126 @@
   overflow: hidden;
 }
 
-/* power-card no longer spans full width */
+/* ── SoC dial card ── */
+.soc-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* ── Battery icon ── */
+.battery-icon-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  justify-content: center;
+}
+
+.battery-icon {
+  position: relative;
+  width: 80px;
+  height: 34px;
+  border: 2px solid var(--muted);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.battery-icon::after {
+  content: '';
+  position: absolute;
+  right: -7px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 5px;
+  height: 14px;
+  background: var(--muted);
+  border-radius: 0 2px 2px 0;
+}
+
+.battery-fill {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  border-radius: 2px;
+  transition: width 0.5s ease, background 0.5s ease;
+}
+
+.battery-pct {
+  font-size: 22px;
+  font-weight: 700;
+  font-family: var(--mono);
+  line-height: 1;
+}
+
+/* ── Inverter gauge (compact semicircle) ── */
+.inv-gauge-wrap {
+  position: relative;
+  width: 100%;
+  max-width: 180px;
+  height: 100px;
+}
+
+.inv-gauge-wrap svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.inv-gauge-value {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  text-align: center;
+  white-space: nowrap;
+}
+
+.inv-gauge-kw {
+  font-size: 20px;
+  font-weight: 700;
+  font-family: var(--mono);
+  color: var(--text);
+  line-height: 1;
+}
+
+.inv-gauge-unit {
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 1px;
+}
+
+.soc-power-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--bg);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.soc-power-label {
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.soc-power-value {
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 14px;
+  color: #7c6af7;
+}
 
 /* ── Gauge ── */
 .gauge-wrap {
@@ -345,6 +464,9 @@
 }
 
 @media (max-width: 1100px) {
+  .summary-grid { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+}
+@media (max-width: 600px) {
   .summary-grid { grid-template-columns: 1fr; }
 }
 
@@ -408,24 +530,15 @@
       </div>
     </div>
 
-    <div class="power-rows" style="width:100%;">
-      <div class="power-row">
-        <div class="power-row-label">
-          <div class="power-row-dot" style="background:#ff6b6b;"></div>
-          Grid Import
-        </div>
-        <div class="power-row-value import" id="import-kw">— kW</div>
-      </div>
-      <div class="power-row">
-        <div class="power-row-label">
-          <div class="power-row-dot" style="background:#00d4aa;"></div>
-          Grid Export
-        </div>
-        <div class="power-row-value export" id="export-kw">— kW</div>
-      </div>
+    <div id="power-status" style="font-size:13px;font-weight:600;padding:6px 16px;border-radius:20px;background:var(--bg);border:1px solid var(--border);color:var(--muted);">—</div>
 
-    </div>
+    <!-- Hidden elements retained for JS compatibility -->
+    <span id="import-kw" style="display:none;"></span>
+    <span id="export-kw" style="display:none;"></span>
   </div>
+
+  <!-- Battery SoC cards — rendered dynamically by updatePower() -->
+  <div id="soc-cards-container" style="display:contents;"></div>
 
   {% if has_postcode %}
   <!-- Carbon intensity card -->
@@ -615,7 +728,22 @@ function updatePower() {
       if (impEl) impEl.textContent = fmtKw(imp);
       if (expEl) expEl.textContent = fmtKw(exp);
 
+      // Status indicator
+      var statusEl = document.getElementById('power-status');
+      if (statusEl) {
+        if (net > 0) {
+          statusEl.textContent = '🔴 Importing ' + fmtKw(imp);
+          statusEl.style.color = '#ff6b6b';
+          statusEl.style.borderColor = '#ff6b6b';
+        } else {
+          statusEl.textContent = '🟢 Exporting ' + fmtKw(exp);
+          statusEl.style.color = '#00d4aa';
+          statusEl.style.borderColor = '#00d4aa';
+        }
+      }
 
+      // Battery SoC cards
+      updateSocCards(d.soc_sensors || {});
     })
     .catch(function(err) {
       if (statusDot)  { statusDot.className = 'status-dot stale'; }
@@ -623,6 +751,221 @@ function updatePower() {
       console.error('Power poll error', err);
     });
 }
+
+function socColour(pct) {
+  if (pct === null || pct === undefined) return '#6b7080';
+  if (pct >= 60) return '#22c55e';
+  if (pct >= 20) return '#f59e0b';
+  return '#ef4444';
+}
+
+var _invMaxKw = {};  // per-meter inverter gauge scale, keyed by meter_id
+function _getInvMax(mid) { return _invMaxKw[mid] || 5.0; }
+function _setInvMax(mid, kw) { _invMaxKw[mid] = Math.max(_getInvMax(mid), kw); }
+
+function setInvGauge(meterId, pkw) {
+  var INV_ARC_LEN = 283;  // same as main gauge r=90
+  var centre = INV_ARC_LEN / 2;  // 141.5
+  var arc    = document.getElementById('inv-arc-' + meterId);
+  var needle = document.getElementById('inv-needle-' + meterId);
+  var kwEl   = document.getElementById('inv-kw-' + meterId);
+  var dirEl  = document.getElementById('inv-dir-' + meterId);
+  if (!arc) return;
+
+  // Determine if this is a bidirectional (battery/V2X) or unidirectional gauge
+  var cardEl  = document.getElementById('soc-card-' + meterId);
+  var cardType = cardEl ? cardEl.getAttribute('data-type') : 'battery';
+  var v2x      = cardEl && cardEl.getAttribute('data-v2x') === 'true';
+  var bidir    = cardType === 'battery' || v2x;
+
+  if (pkw === null || pkw === undefined) {
+    arc.style.strokeDasharray  = '0 ' + INV_ARC_LEN;
+    arc.style.strokeDashoffset = bidir ? centre : INV_ARC_LEN;
+    if (kwEl)   kwEl.textContent = '—';
+    if (dirEl)  dirEl.textContent = 'kW';
+    if (needle) needle.setAttribute('transform', bidir ? 'rotate(0 110 110)' : 'rotate(-90 110 110)');
+    return;
+  }
+
+  // Scale capped at per-meter max — set from 48hr history on first load
+  var absKw = Math.abs(pkw);
+  if (absKw > _getInvMax(meterId)) _setInvMax(meterId, Math.ceil(absKw));  // safety fallback only
+
+  var col, label, arcLen, angle;
+
+  if (bidir) {
+    // Bidirectional — 0 at centre, fills left (discharge) or right (charge)
+    var frac = Math.max(-1, Math.min(1, pkw / _getInvMax(meterId)));
+    angle  = frac * 90;
+    arcLen = Math.abs(frac) * centre;
+    if (pkw >= 0) {
+      col   = '#7c6af7';
+      label = 'Charging';
+      arc.style.strokeDasharray  = arcLen + ' ' + (INV_ARC_LEN - arcLen);
+      arc.style.strokeDashoffset = centre;
+    } else {
+      col   = '#00d4aa';
+      label = 'Discharging';
+      arc.style.strokeDasharray  = arcLen + ' ' + (INV_ARC_LEN - arcLen);
+      arc.style.strokeDashoffset = -(centre - arcLen);
+    }
+  } else {
+    // Unidirectional — 0 at left edge, fills rightward, needle sweeps -90° to +90°
+    var frac = Math.max(0, Math.min(1, Math.abs(pkw) / _getInvMax(meterId)));
+    angle  = -90 + frac * 180;  // -90° (left) to +90° (right)
+    arcLen = frac * INV_ARC_LEN;
+    col   = '#7c6af7';
+    label = 'Charging';
+    arc.style.strokeDasharray  = arcLen + ' ' + (INV_ARC_LEN - arcLen);
+    arc.style.strokeDashoffset = INV_ARC_LEN - arcLen;  // start from left
+  }
+
+  arc.style.stroke = col;
+  if (needle) needle.setAttribute('transform', 'rotate(' + angle + ' 110 110)');
+  if (kwEl)  { kwEl.textContent = fmtKw(Math.abs(pkw)); kwEl.style.color = col; }
+  if (dirEl) { dirEl.textContent = label; }
+
+  // Update scale labels
+  var lMax = document.getElementById('inv-max-l-' + meterId);
+  var rMax = document.getElementById('inv-max-r-' + meterId);
+  if (bidir) {
+    if (lMax) lMax.textContent = fmtKw(_getInvMax(meterId));
+    if (rMax) rMax.textContent = fmtKw(_getInvMax(meterId));
+  } else {
+    if (lMax) lMax.textContent = '0';
+    if (rMax) rMax.textContent = fmtKw(_getInvMax(meterId));
+  }
+}
+
+function buildSocCard(meterId, info) {
+  var label   = info.label || meterId;
+  var type    = info.type || 'battery';
+  var isBatt  = type === 'battery';
+  var isEV    = type === 'ev';
+  var v2x     = info.v2x || false;
+  var icon    = isBatt ? '🔋' : (isEV ? '🚗' : '♨️');
+
+  // Left SVG label — only battery and V2X EV can discharge
+  var leftLabel  = (isBatt || v2x) ? 'Discharging' : '';
+
+  // Battery icon + SoC — only for battery type
+  var battSection = '';
+  if (isBatt) {
+    var pct    = info.soc;
+    var col    = socColour(pct);
+    var pctVal = pct !== null && pct !== undefined ? Math.max(0, Math.min(100, pct)) : 0;
+    var fillW  = pct !== null ? pctVal + '%' : '0%';
+    var pctStr = pct !== null && pct !== undefined ? Math.round(pct) + '%' : '—';
+    battSection =
+      '<div class="battery-icon-wrap">' +
+        '<div class="battery-icon" id="batt-icon-' + meterId + '">' +
+          '<div class="battery-fill" id="batt-fill-' + meterId + '" style="width:' + fillW + ';background:' + col + ';"></div>' +
+        '</div>' +
+        '<div class="battery-pct" id="batt-pct-' + meterId + '" style="color:' + col + ';">' + pctStr + '</div>' +
+      '</div>';
+  }
+
+  // Power gauge — shown when power_entity configured
+  var gaugeSection = '';
+  if (info.power_entity) {
+    var gaugeLabel = isBatt ? '⚡ Inverter' : (isEV ? '⚡ Charger' : '⚡ Heat Pump');
+    var bidir = isBatt || v2x;
+    var initOffset = bidir ? '141.5' : '283';
+    var initRotate = bidir ? 'rotate(0 110 110)' : 'rotate(-90 110 110)';
+    var zeroMarkerX1 = bidir ? '110' : '20';
+    var zeroMarkerX2 = bidir ? '110' : '20';
+    var zeroMarkerY1 = bidir ? '24' : '110';
+    var zeroMarkerY2 = bidir ? '36' : '98';
+    var zeroLabel = bidir ? '0' : '';
+    gaugeSection =
+      '<div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;align-self:flex-start;margin-top:4px;">' + gaugeLabel + '</div>' +
+      '<div class="inv-gauge-wrap">' +
+        '<svg viewBox="0 0 220 120" xmlns="http://www.w3.org/2000/svg">' +
+          '<path d="M 20 110 A 90 90 0 0 1 200 110" fill="none" stroke="#2a2d3a" stroke-width="14" stroke-linecap="round"/>' +
+          '<line x1="' + zeroMarkerX1 + '" y1="' + zeroMarkerY1 + '" x2="' + zeroMarkerX2 + '" y2="' + zeroMarkerY2 + '" stroke="#6b7080" stroke-width="2"/>' +
+          '<path id="inv-arc-' + meterId + '" d="M 20 110 A 90 90 0 0 1 200 110" fill="none" stroke="#7c6af7" stroke-width="14" stroke-linecap="round"' +
+            ' stroke-dasharray="0 283" stroke-dashoffset="' + initOffset + '" transform-origin="110 110"/>' +
+          '<line id="inv-needle-' + meterId + '" x1="110" y1="110" x2="110" y2="30"' +
+            ' stroke="#e8eaf0" stroke-width="2" stroke-linecap="round" transform="' + initRotate + '"/>' +
+          '<circle cx="110" cy="110" r="5" fill="#e8eaf0"/>' +
+          '<text x="18" y="125" font-size="10" fill="#6b7080" text-anchor="middle">' + leftLabel + '</text>' +
+          '<text x="202" y="125" font-size="10" fill="#6b7080" text-anchor="middle">Charging</text>' +
+          '<text x="110" y="18" font-size="10" fill="#6b7080" text-anchor="middle">' + zeroLabel + '</text>' +
+          '<text x="18" y="136" font-size="9" fill="#6b7080" text-anchor="middle" id="inv-max-l-' + meterId + '"></text>' +
+          '<text x="202" y="136" font-size="9" fill="#6b7080" text-anchor="middle" id="inv-max-r-' + meterId + '"></text>' +
+        '</svg>' +
+        '<div class="inv-gauge-value">' +
+          '<div class="inv-gauge-kw" id="inv-kw-' + meterId + '">—</div>' +
+          '<div class="inv-gauge-unit" id="inv-dir-' + meterId + '">kW</div>' +
+        '</div>' +
+      '</div>';
+  }
+
+  return '<div class="soc-card" id="soc-card-' + meterId + '" data-type="' + type + '" data-v2x="' + v2x + '">' +
+    '<div class="card-title" style="font-size:12px;align-self:flex-start;">' + icon + ' ' + label + '</div>' +
+    battSection +
+    gaugeSection +
+  '</div>';
+}
+
+function updateSocCards(socSensors) {
+  var container = document.getElementById('soc-cards-container');
+  if (!container) return;
+
+  Object.keys(socSensors).forEach(function(mid) {
+    var info = socSensors[mid];
+    var existing = document.getElementById('soc-card-' + mid);
+    // Force rebuild if type has changed or data-type is missing (old card)
+    if (existing && existing.getAttribute('data-type') !== (info.type || 'battery')) {
+      existing.remove();
+      existing = null;
+    }
+    if (!existing) {
+      var tmp = document.createElement('div');
+      tmp.innerHTML = buildSocCard(mid, info);
+      container.appendChild(tmp.firstChild);
+      // Initialise gauge arc after DOM insertion
+      if (info.power_entity) {
+        setTimeout(function() { setInvGauge(mid, info.power_kw); }, 0);
+        // Fetch history to set gauge scale
+        fetch(apiUrl('/api/sub-meter/history?meter_id=' + encodeURIComponent(mid)))
+          .then(function(r) { return r.json(); })
+          .then(function(d) {
+            if (d.max_kw) {
+              _setInvMax(mid, Math.ceil(d.max_kw));
+            }
+            setInvGauge(mid, info.power_kw);
+          })
+          .catch(function() {});
+      }
+    } else {
+      // Update battery fill — only for battery type cards
+      var cardEl = document.getElementById('soc-card-' + mid);
+      var cardType = cardEl ? cardEl.getAttribute('data-type') : 'battery';
+      if (cardType === 'battery') {
+        var pct = info.soc;
+        var col = socColour(pct);
+        var pctVal = pct !== null && pct !== undefined ? Math.max(0, Math.min(100, pct)) : 0;
+        var fill = document.getElementById('batt-fill-' + mid);
+        var pctEl = document.getElementById('batt-pct-' + mid);
+        if (fill) { fill.style.width = (pct !== null ? pctVal + '%' : '0%'); fill.style.background = col; }
+        if (pctEl) { pctEl.style.color = col; pctEl.textContent = pct !== null && pct !== undefined ? Math.round(pct) + '%' : '—'; }
+      }
+
+      // Update power gauge
+      if (info.power_entity) {
+        setInvGauge(mid, info.power_kw);
+      }
+    }
+  });
+
+  // Remove cards for meters no longer in response
+  container.querySelectorAll('.soc-card').forEach(function(card) {
+    var mid = card.id.replace('soc-card-', '');
+    if (!socSensors[mid]) card.remove();
+  });
+}
+
 
 // Set gauge scale labels
 (function() {
@@ -633,6 +976,9 @@ function updatePower() {
 })();
 
 // Poll immediately then every 5 seconds
+// Stagger initial API calls to avoid saturating the Waitress thread pool.
+// updatePower is immediate (drives the live gauge).
+// Billing, carbon and power history are deferred slightly.
 updatePower();
 pollTimer = setInterval(updatePower, 5000);
 
@@ -724,7 +1070,8 @@ function scheduleBillingRefresh() {
 }
 
 // Load billing immediately on page load, then schedule future refreshes
-refreshBilling();
+// Billing — defer 300ms so power gauge renders first
+setTimeout(function() { refreshBilling(); }, 300);
 
 // ── Carbon intensity ──
 var CARBON_COLOURS = {
@@ -843,7 +1190,8 @@ function loadCarbonAndSchedule() {
     });
 }
 
-loadCarbonAndSchedule();
+// Carbon — defer 600ms to avoid competing with power + billing on first load
+setTimeout(function() { loadCarbonAndSchedule(); }, 600);
 {% endif %}
 
 {% if has_power_sensor %}
@@ -1326,7 +1674,8 @@ window.addEventListener('resize', function() {
 }, { passive: true });
 
 // Load immediately then refresh every 30s (synced with power poll cadence)
-_phLoad();
+// Power history — defer 900ms
+setTimeout(function() { _phLoad(); }, 900);
 setInterval(_phLoad, 30000);
 
 // ── Hover tooltip ────────────────────────────────────────────────────────────

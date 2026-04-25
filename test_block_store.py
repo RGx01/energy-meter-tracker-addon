@@ -2398,3 +2398,240 @@ class TestPowerHistory(unittest.TestCase):
         self.store.append_power_history(self._ts(3), net_kw, intensity, expected)
         rows = self.store.get_power_history(hours=48)
         self.assertAlmostEqual(rows[0]["carbon_gco2_min"], expected, places=4)
+
+class TestSubMeterHistory(unittest.TestCase):
+    """Tests for sub_meter_history table — SoC and power history for Live Power gauges."""
+
+    def setUp(self):
+        self.store = open_block_store(":memory:")
+        self.store.insert_config_period(EXAMPLE_CONFIG)
+
+    def tearDown(self):
+        self.store.close()
+
+    def _ts(self, minutes_ago: int) -> str:
+        from datetime import datetime, timezone, timedelta
+        return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).replace(tzinfo=None).isoformat()
+
+    def test_append_and_retrieve(self):
+        """append_sub_meter_history stores a row retrievable by get_sub_meter_history."""
+        ts = self._ts(10)
+        self.store.append_sub_meter_history(ts, "house_battery", 83.5, -3.0)
+        rows = self.store.get_sub_meter_history("house_battery", hours=48)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["soc_pct"], 83.5)
+        self.assertAlmostEqual(rows[0]["inverter_kw"], -3.0)
+
+    def test_null_soc_stored(self):
+        """soc_pct can be None when only inverter power is available."""
+        ts = self._ts(5)
+        self.store.append_sub_meter_history(ts, "house_battery", None, 2.5)
+        rows = self.store.get_sub_meter_history("house_battery", hours=48)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["soc_pct"])
+        self.assertAlmostEqual(rows[0]["inverter_kw"], 2.5)
+
+    def test_null_power_stored(self):
+        """inverter_kw can be None when only SoC is available."""
+        ts = self._ts(5)
+        self.store.append_sub_meter_history(ts, "house_battery", 47.0, None)
+        rows = self.store.get_sub_meter_history("house_battery", hours=48)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["soc_pct"], 47.0)
+        self.assertIsNone(rows[0]["inverter_kw"])
+
+    def test_meter_id_isolation(self):
+        """get_sub_meter_history only returns rows for the requested meter."""
+        ts1 = self._ts(10)
+        ts2 = self._ts(5)
+        self.store.append_sub_meter_history(ts1, "house_battery", 80.0, -2.0)
+        self.store.append_sub_meter_history(ts2, "ev_charger", None, 7.4)
+        batt_rows = self.store.get_sub_meter_history("house_battery", hours=48)
+        ev_rows   = self.store.get_sub_meter_history("ev_charger",    hours=48)
+        self.assertEqual(len(batt_rows), 1)
+        self.assertEqual(len(ev_rows),   1)
+        self.assertAlmostEqual(batt_rows[0]["soc_pct"], 80.0)
+        self.assertAlmostEqual(ev_rows[0]["inverter_kw"], 7.4)
+
+    def test_rows_ordered_oldest_first(self):
+        """get_sub_meter_history returns rows in ascending captured_at order."""
+        # Insert newest first — i minutes ago, SoC = i*10 (older = lower SoC)
+        for i in range(5, 0, -1):
+            self.store.append_sub_meter_history(self._ts(i), "house_battery", float(i * 10), None)
+        rows = self.store.get_sub_meter_history("house_battery", hours=48)
+        # Oldest first means highest i first → highest SoC first (50, 40, 30, 20, 10)
+        # Verify timestamps are ascending (captured_at ISO strings sort lexicographically)
+        timestamps = [r["captured_at"] for r in rows]
+        self.assertEqual(timestamps, sorted(timestamps))
+
+    def test_prune_removes_old_rows(self):
+        """prune_sub_meter_history deletes rows older than the specified hours."""
+        old_ts = "2020-01-01T00:00:00"
+        self.store.append_sub_meter_history(old_ts, "house_battery", 50.0, None)
+        recent_ts = self._ts(30)
+        self.store.append_sub_meter_history(recent_ts, "house_battery", 60.0, None)
+        deleted = self.store.prune_sub_meter_history(hours=48)
+        self.assertEqual(deleted, 1)
+        rows = self.store.get_sub_meter_history("house_battery", hours=48)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["soc_pct"], 60.0)
+
+    def test_prune_preserves_recent_rows(self):
+        """prune_sub_meter_history does not delete rows within the window."""
+        for i in [5, 10, 20]:
+            self.store.append_sub_meter_history(self._ts(i), "house_battery", float(i), None)
+        deleted = self.store.prune_sub_meter_history(hours=48)
+        self.assertEqual(deleted, 0)
+        rows = self.store.get_sub_meter_history("house_battery", hours=48)
+        self.assertEqual(len(rows), 3)
+
+    def test_hours_param_filters_results(self):
+        """get_sub_meter_history with hours=1 excludes rows older than 1 hour."""
+        old_ts = "2020-01-01T00:00:00"
+        self.store.append_sub_meter_history(old_ts, "house_battery", 40.0, None)
+        recent_ts = self._ts(30)
+        self.store.append_sub_meter_history(recent_ts, "house_battery", 75.0, None)
+        rows = self.store.get_sub_meter_history("house_battery", hours=1)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["soc_pct"], 75.0)
+
+
+class TestMeterTypePersistence(unittest.TestCase):
+    """Tests that meter_type and sensor fields persist through write/read roundtrip."""
+
+    BATTERY_CONFIG = {
+        "meters": {
+            "electricity_main": {
+                "meta": {
+                    "site": "Test Home",
+                    "timezone": "Europe/London",
+                    "billing_day": 1,
+                    "block_minutes": 30,
+                    "currency_symbol": "£",
+                    "currency_code": "GBP",
+                },
+                "channels": {
+                    "import": {"sensor": "sensor.import"},
+                    "export": {"sensor": "sensor.export"},
+                },
+            },
+            "sub_meter_battery_001": {
+                "meta": {
+                    "sub_meter": True,
+                    "meter_type": "battery",
+                    "device": "House Battery",
+                    "parent_meter": "electricity_main",
+                    "soc_sensor": "sensor.battery_soc",
+                    "inverter_power_sensor": "sensor.battery_power",
+                    "device_power_sensor": None,
+                    "v2x_capable": False,
+                },
+                "channels": {
+                    "import": {"sensor": "sensor.battery_import"},
+                },
+            },
+        }
+    }
+
+    EV_CONFIG = {
+        "meters": {
+            "electricity_main": {
+                "meta": {
+                    "site": "Test Home",
+                    "timezone": "Europe/London",
+                    "billing_day": 1,
+                    "block_minutes": 30,
+                    "currency_symbol": "£",
+                    "currency_code": "GBP",
+                },
+                "channels": {
+                    "import": {"sensor": "sensor.import"},
+                    "export": {"sensor": "sensor.export"},
+                },
+            },
+            "sub_meter_ev_001": {
+                "meta": {
+                    "sub_meter": True,
+                    "meter_type": "ev",
+                    "device": "Zappi EV Charger",
+                    "parent_meter": "electricity_main",
+                    "device_power_sensor": "sensor.zappi_power",
+                    "v2x_capable": True,
+                },
+                "channels": {
+                    "import": {"sensor": "sensor.zappi"},
+                },
+            },
+        }
+    }
+
+    def setUp(self):
+        self.store = open_block_store(":memory:")
+
+    def tearDown(self):
+        self.store.close()
+
+    def test_meter_type_battery_roundtrip(self):
+        """meter_type='battery' persists through insert and config_from_db."""
+        self.store.insert_config_period(self.BATTERY_CONFIG)
+        pid = self.store.get_current_config_period_id()
+        restored = self.store.config_from_db(pid)
+        sub = restored["meters"]["sub_meter_battery_001"]["meta"]
+        self.assertEqual(sub.get("meter_type"), "battery")
+
+    def test_soc_sensor_roundtrip(self):
+        """soc_sensor persists through insert and config_from_db."""
+        self.store.insert_config_period(self.BATTERY_CONFIG)
+        pid = self.store.get_current_config_period_id()
+        restored = self.store.config_from_db(pid)
+        sub = restored["meters"]["sub_meter_battery_001"]["meta"]
+        self.assertEqual(sub.get("soc_sensor"), "sensor.battery_soc")
+
+    def test_inverter_power_sensor_roundtrip(self):
+        """inverter_power_sensor persists through insert and config_from_db."""
+        self.store.insert_config_period(self.BATTERY_CONFIG)
+        pid = self.store.get_current_config_period_id()
+        restored = self.store.config_from_db(pid)
+        sub = restored["meters"]["sub_meter_battery_001"]["meta"]
+        self.assertEqual(sub.get("inverter_power_sensor"), "sensor.battery_power")
+
+    def test_inverter_possible_auto_set_for_battery(self):
+        """inverter_possible is True in DB when meter_type='battery'."""
+        self.store.insert_config_period(self.BATTERY_CONFIG)
+        pid = self.store.get_current_config_period_id()
+        row = self.store._conn.execute(
+            "SELECT inverter_possible FROM meters WHERE meter_id = 'sub_meter_battery_001'"
+        ).fetchone()
+        self.assertEqual(row["inverter_possible"], 1)
+
+    def test_meter_type_ev_roundtrip(self):
+        """meter_type='ev' persists through insert and config_from_db."""
+        self.store.insert_config_period(self.EV_CONFIG)
+        pid = self.store.get_current_config_period_id()
+        restored = self.store.config_from_db(pid)
+        sub = restored["meters"]["sub_meter_ev_001"]["meta"]
+        self.assertEqual(sub.get("meter_type"), "ev")
+
+    def test_device_power_sensor_roundtrip(self):
+        """device_power_sensor persists through insert and config_from_db."""
+        self.store.insert_config_period(self.EV_CONFIG)
+        pid = self.store.get_current_config_period_id()
+        restored = self.store.config_from_db(pid)
+        sub = restored["meters"]["sub_meter_ev_001"]["meta"]
+        self.assertEqual(sub.get("device_power_sensor"), "sensor.zappi_power")
+
+    def test_v2x_capable_roundtrip(self):
+        """v2x_capable=True persists through insert and config_from_db."""
+        self.store.insert_config_period(self.EV_CONFIG)
+        pid = self.store.get_current_config_period_id()
+        restored = self.store.config_from_db(pid)
+        sub = restored["meters"]["sub_meter_ev_001"]["meta"]
+        self.assertTrue(sub.get("v2x_capable"))
+
+    def test_inverter_possible_not_auto_set_for_ev(self):
+        """inverter_possible is NOT auto-set for EV type meters."""
+        self.store.insert_config_period(self.EV_CONFIG)
+        row = self.store._conn.execute(
+            "SELECT inverter_possible FROM meters WHERE meter_id = 'sub_meter_ev_001'"
+        ).fetchone()
+        self.assertEqual(row["inverter_possible"], 0)

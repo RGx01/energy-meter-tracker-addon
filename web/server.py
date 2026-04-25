@@ -652,6 +652,47 @@ def live_power_page():
     )
 
 
+def _is_meter_type(meta: dict, meter_id: str, expected_type: str) -> bool:
+    """Check if a meter is of the given type using only the explicit meter_type field.
+    No keyword fallback — meter_type must be explicitly set via the config UI (2.7.0+).
+    """
+    return (meta.get('meter_type') or '').lower() == expected_type
+
+
+def _build_soc_response(soc_sensors, ha_client):
+    """Safely build SoC sensor readings dict for the live power API response."""
+    result = {}
+    for m_id, info in soc_sensors.items():
+        soc_val = None
+        power_kw = None
+        try:
+            if ha_client and info.get("soc_entity"):
+                v = ha_client.get_state(info["soc_entity"])
+                if v not in (None, "unknown", "unavailable"):
+                    soc_val = round(float(v), 1)
+        except (ValueError, TypeError):
+            pass
+        try:
+            if ha_client and info.get("power_entity"):
+                v = ha_client.get_state(info["power_entity"])
+                if v not in (None, "unknown", "unavailable"):
+                    fv = float(v)
+                    # Auto-scale: if value > 100 assume W, convert to kW
+                    power_kw = round(fv / 1000.0 if abs(fv) > 100 else fv, 3)
+        except (ValueError, TypeError):
+            pass
+        result[m_id] = {
+            "label":        info.get("label", m_id),
+            "type":         info.get("type", "battery"),
+            "v2x":          info.get("v2x", False),
+            "soc_entity":   info.get("soc_entity"),
+            "power_entity": info.get("power_entity"),
+            "soc":          soc_val,
+            "power_kw":     power_kw,
+        }
+    return result
+
+
 @app.route("/api/power")
 def api_power():
     """Returns live power (kW) from configured power sensor or derived from reads."""
@@ -665,14 +706,38 @@ def api_power():
 
         # Find power sensor and sub-meter sensors from config
         power_sensor = bat_sensor = ev_sensor = None
+        soc_sensors = {}  # {meter_id: {soc, inverter_power}}
         for m_id, m_data in meters_cfg.items():
             meta = (m_data or {}).get("meta", {}) or {}
             if not meta.get("sub_meter"):
                 power_sensor = meta.get("power_sensor")
-            elif "battery" in m_id.lower() or "solax" in m_id.lower():
+            elif _is_meter_type(meta, m_id, "battery"):
                 bat_sensor = ((m_data.get("channels") or {}).get("import") or {}).get("read")
-            elif "ev" in m_id.lower() or "zappi" in m_id.lower():
+                if meta.get("soc_sensor") or meta.get("inverter_power_sensor"):
+                    soc_sensors[m_id] = {
+                        "soc_entity":   meta.get("soc_sensor"),
+                        "power_entity": meta.get("inverter_power_sensor"),
+                        "label":        meta.get("device") or m_id,
+                        "type":         "battery",
+                    }
+            elif _is_meter_type(meta, m_id, "ev"):
                 ev_sensor = ((m_data.get("channels") or {}).get("import") or {}).get("read")
+                if meta.get("device_power_sensor"):
+                    soc_sensors[m_id] = {
+                        "soc_entity":   None,
+                        "power_entity": meta.get("device_power_sensor"),
+                        "label":        meta.get("device") or m_id,
+                        "type":         "ev",
+                        "v2x":          bool(meta.get("v2x_capable")),
+                    }
+            elif _is_meter_type(meta, m_id, "heat_pump"):
+                if meta.get("device_power_sensor"):
+                    soc_sensors[m_id] = {
+                        "soc_entity":   None,
+                        "power_entity": meta.get("device_power_sensor"),
+                        "label":        meta.get("device") or m_id,
+                        "type":         "heat_pump",
+                    }
 
         def sensor_kw(entity_id):
             if not entity_id or not _ha_client:
@@ -712,13 +777,14 @@ def api_power():
         for m_id, m_data in meters_blk.items():
             if not m_data:
                 continue
-            meta   = m_data.get("meta", {}) or {}
-            ch     = m_data.get("channels", {}) or {}
-            if not meta.get("sub_meter", False):
+            # Use config meta for type detection — block meta may not have meter_type
+            cfg_meta = (meters_cfg.get(m_id) or {}).get("meta", {}) or {}
+            ch       = m_data.get("channels", {}) or {}
+            if not cfg_meta.get("sub_meter", False):
                 continue
-            if "battery" in m_id.lower() or "solax" in m_id.lower() or "inverter" in m_id.lower():
+            if _is_meter_type(cfg_meta, m_id, "battery"):
                 bat_kw = derive_kw(ch.get("import", {}).get("reads", []))
-            elif "ev" in m_id.lower() or "zappi" in m_id.lower() or "charger" in m_id.lower():
+            elif _is_meter_type(cfg_meta, m_id, "ev"):
                 ev_kw = derive_kw(ch.get("import", {}).get("reads", []))
 
         if power_sensor:
@@ -769,6 +835,7 @@ def api_power():
             "max_kw":           10,
             "has_power_sensor": bool(power_sensor),
             "rate":             current_rate,
+            "soc_sensors":      _build_soc_response(soc_sensors, _ha_client),
         })
     except Exception as e:
         logger.error("api_power: %s", e)
@@ -986,6 +1053,59 @@ def api_power_history():
         return jsonify({"rows": rows})
     except Exception as e:
         logger.error("api_power_history: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/meter/<meter_id>/delete-data", methods=["POST"])
+def api_meter_delete_data(meter_id: str):
+    """
+    Cascade delete all data associated with a meter ID.
+    Called when a meter is removed from config.
+    Returns: { deleted: {blocks, sub_meter_history, power_history_not_applicable} }
+    """
+    try:
+        store = _get_store()
+        deleted = {}
+        with store._conn:
+            # Delete blocks for this meter
+            cur = store._conn.execute(
+                "DELETE FROM blocks WHERE meter_id = ?", (meter_id,)
+            )
+            deleted["blocks"] = cur.rowcount
+            # Delete sub_meter_history for this meter
+            cur = store._conn.execute(
+                "DELETE FROM sub_meter_history WHERE meter_id = ?", (meter_id,)
+            )
+            deleted["sub_meter_history"] = cur.rowcount
+        logger.info("api_meter_delete_data: cascade deleted %s for meter %s", deleted, meter_id)
+        return jsonify({"deleted": deleted, "meter_id": meter_id})
+    except Exception as e:
+        logger.error("api_meter_delete_data: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/sub-meter/history")
+def api_sub_meter_history():
+    """
+    Return rolling 48-hour SoC and inverter power history for a battery sub-meter.
+    Used by the Live Power page to auto-scale the inverter gauge.
+    Returns: { rows: [{captured_at, soc_pct, inverter_kw}], max_kw: float }
+    """
+    try:
+        meter_id = request.args.get("meter_id", "")
+        hours    = min(int(request.args.get("hours", 48)), 48)
+        if not meter_id:
+            return jsonify({"error": "meter_id required"}), 400
+        store = _get_store()
+        rows  = store.get_sub_meter_history(meter_id, hours=hours)
+        # Compute max abs inverter kW for gauge scaling
+        max_kw = 5.0  # minimum scale
+        for r in rows:
+            if r.get("inverter_kw") is not None:
+                max_kw = max(max_kw, abs(r["inverter_kw"]))
+        return jsonify({"rows": rows, "max_kw": round(max_kw, 1)})
+    except Exception as e:
+        logger.error("api_sub_meter_history: %s", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -1233,15 +1353,19 @@ def api_blocks_summary():
             pe_utc = datetime(d.year, d.month, d.day, 23, 59, 59) + _td(hours=14)
             s        = _ec.calculate_billing_summary_for_period(day_blocks, ps_utc, pe_utc)
 
-            # Standing charge: take directly from any block — it is the same value
-            # on all blocks for a given local day. Do NOT use s["total_standing"]
-            # because calculate_billing_summary groups by block_start.date() (UTC)
-            # which double-counts on BST days (23:xx UTC block = next local day).
-            # standing_charge lives at block["meters"][meter_id]["standing_charge"]
+            # Standing charge: use MAX across all day blocks from main meter only.
+            # Do NOT use day_blocks[0] — the first BST block arrives at 23:00 UTC the
+            # previous night and may have sc=0.0 if the sensor was briefly unavailable.
+            # Sub-meters always have sc=0 — skip them to avoid corrupting totals with
+            # multiple batteries.
             standing = 0.0
-            if day_blocks:
-                _first_meter = next(iter((day_blocks[0].get("meters") or {}).values()), {})
-                standing = float(_first_meter.get("standing_charge") or 0.0)
+            for _blk in day_blocks:
+                for _m in (_blk.get("meters") or {}).values():
+                    if (_m or {}).get("meta", {}).get("sub_meter"):
+                        continue
+                    _sc = float((_m or {}).get("standing_charge") or 0.0)
+                    if _sc > standing:
+                        standing = _sc
 
             main_imp_kwh  = 0.0
             main_imp_cost = 0.0
@@ -1395,8 +1519,7 @@ def api_blocks_summary():
             "is_sub": mid != "electricity_main",
         } for mid in all_meter_ids]
 
-        export_color = meter_colors.get("electricity_main_export",
-                       meter_colors.get("electricity_main", "#ff7f0e"))
+        export_color = meter_colors.get("electricity_main_export", "#ff7f0e")
 
         _postcode = ""
         for _md in cfg.get("meters", {}).values():
@@ -1788,6 +1911,32 @@ def api_save_config():
         # change_reason is an optional UI field, not part of the config schema
         change_reason = payload.pop("change_reason", None) or None
         data = payload
+
+        # Validate device names — unique, max 40 chars, safe characters
+        import re as _re
+        _NAME_REGEX = _re.compile(r"^[a-zA-Z0-9 '\-&().]+$")
+        _NAME_MAX   = 40
+        seen_names  = {}
+        name_errors = []
+        for mid, mdata in (data.get("meters") or {}).items():
+            meta     = (mdata or {}).get("meta") or {}
+            is_sub   = meta.get("sub_meter")
+            raw_name = (meta.get("device") if is_sub else meta.get("site") or "").strip()
+            if not raw_name:
+                if is_sub:
+                    name_errors.append(f'Meter "{mid}": device name is required.')
+                continue
+            if len(raw_name) > _NAME_MAX:
+                name_errors.append(f'"{raw_name}": name must be {_NAME_MAX} characters or fewer.')
+            if not _NAME_REGEX.match(raw_name):
+                name_errors.append(f'"{raw_name}": name contains invalid characters.')
+            lower = raw_name.lower()
+            if lower in seen_names:
+                name_errors.append(f'"{raw_name}": name is already used by another meter.')
+            else:
+                seen_names[lower] = mid
+        if name_errors:
+            return jsonify({"error": " | ".join(name_errors)}), 400
 
         # Zip current data before committing config change
         _create_backup_zip(label="pre_config_save")
@@ -2917,14 +3066,25 @@ def api_blocks_delete_preview():
     try:
         data      = request.get_json(force=True) or {}
         from_date = data.get("from_date", "").strip()
+        from_time = data.get("from_time", "00:00").strip() or "00:00"
         to_date   = data.get("to_date", "").strip()
+        to_time   = data.get("to_time", "23:59").strip() or "23:59"
         meter_id  = data.get("meter_id") or None
         if not from_date or not to_date:
             return jsonify({"error": "from_date and to_date required"}), 400
         if from_date > to_date:
             return jsonify({"error": "from_date must not be after to_date"}), 400
+        # Convert local times to UTC using the configured timezone
+        _cfg = load_config()
+        _tz_name = "UTC"
+        for _md in (_cfg.get("meters") or {}).values():
+            if not (_md.get("meta") or {}).get("sub_meter"):
+                _tz_name = (_md.get("meta") or {}).get("timezone", "UTC")
+                break
+        from_time_utc = _corrections_time_to_utc(from_time, _tz_name, from_date)
+        to_time_utc   = _corrections_time_to_utc(to_time,   _tz_name, to_date)
         store = _get_store()
-        result = store.count_blocks_for_date_range(from_date, to_date, meter_id)
+        result = store.count_blocks_for_date_range(from_date, to_date, meter_id, from_time_utc, to_time_utc)
         return jsonify(result)
     except Exception as e:
         logger.error("api_blocks_delete_preview: %s", e)
@@ -2941,7 +3101,9 @@ def api_blocks_delete():
     try:
         data      = request.get_json(force=True) or {}
         from_date = data.get("from_date", "").strip()
+        from_time = data.get("from_time", "00:00").strip() or "00:00"
         to_date   = data.get("to_date", "").strip()
+        to_time   = data.get("to_time", "23:59").strip() or "23:59"
         meter_id  = data.get("meter_id") or None
         confirmed = data.get("confirmed", False)
         if not from_date or not to_date:
@@ -2950,8 +3112,17 @@ def api_blocks_delete():
             return jsonify({"error": "from_date must not be after to_date"}), 400
         if not confirmed:
             return jsonify({"error": "confirmed must be true"}), 400
+        # Convert local times to UTC using the configured timezone
+        _cfg = load_config()
+        _tz_name = "UTC"
+        for _md in (_cfg.get("meters") or {}).values():
+            if not (_md.get("meta") or {}).get("sub_meter"):
+                _tz_name = (_md.get("meta") or {}).get("timezone", "UTC")
+                break
+        from_time_utc = _corrections_time_to_utc(from_time, _tz_name, from_date)
+        to_time_utc   = _corrections_time_to_utc(to_time,   _tz_name, to_date)
         store = _get_store()
-        result = store.delete_blocks_for_date_range(from_date, to_date, meter_id)
+        result = store.delete_blocks_for_date_range(from_date, to_date, meter_id, from_time_utc, to_time_utc)
         logger.info(
             "api_blocks_delete: deleted %d blocks across %d dates (%s\u2192%s meter=%s)",
             result["deleted"], result["dates"], from_date, to_date, meter_id or "all"

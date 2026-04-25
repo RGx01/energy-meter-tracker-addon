@@ -1,5 +1,84 @@
 # Changelog
 
+## [2.7.0] — 2026-04-24
+
+### Added
+
+- **Live Power — Battery SoC card** — battery sub-meters with a SoC sensor configured now show a battery icon with fill level (green ≥60%, amber ≥20%, red <20%) and percentage on the Live Power page. The icon updates on every 5-second poll.
+
+- **Live Power — Inverter gauge** — battery sub-meters with an inverter power sensor show a bidirectional semicircular gauge below the SoC icon. Teal arc fills leftward for discharging, purple fills rightward for charging. Gauge scale is derived from 48-hour history via the `sub_meter_history` table.
+
+- **Live Power — EV Charger card** — EV sub-meters with a charger power sensor show a 🚗 card with a unidirectional charge gauge (0 on left, max on right). V2X-capable EVs show a bidirectional gauge. Gauge scale derived from 48-hour history.
+
+- **Live Power — Heat Pump card** — heat pump sub-meters with a power sensor show a ♨️ card with a unidirectional power gauge.
+
+- **Live Power — Status pill** — grid import/export rows on the main power card replaced with a single coloured status pill: 🔴 Importing / 🟢 Exporting / ⚡ Net Zero with current kW.
+
+- **Meter Type field** — sub-meter config cards now have a Meter Type dropdown (🔋 Battery / 🚗 EV Charger / ♨️ Heat Pump). Setting the type shows contextual sensor fields (SoC, inverter power, charger power, heat pump power) and drives the Live Power card display. The wizard automatically sets meter_type for devices configured through the guided setup.
+
+- **SoC sensor field** — battery sub-meters can configure a Home Assistant entity for battery state of charge (%). Informational only — not recorded in blocks.
+
+- **Inverter power sensor field** — battery sub-meters can configure a live inverter power sensor (W or kW). Auto-scales from W to kW if value exceeds 100. Informational only.
+
+- **Charger / Heat Pump power sensor field** — EV charger and heat pump sub-meters can configure a live power sensor. Informational only.
+
+- **`sub_meter_history` table** — new DB table recording SoC % and power kW for all sub-meters with sensors configured, every engine tick. Pruned at 48 hours. Used to derive gauge scale on Live Power page. Replaces the previous (unused) battery-specific history approach.
+
+- **`meter_type` column on `meters` table** — persists the explicit meter type, taking priority over keyword detection in all detection paths (server, config UI, live power).
+
+- **Cascade delete on meter removal** — removing a sub-meter from config now permanently deletes all associated blocks and `sub_meter_history` rows via `/api/meter/<id>/delete-data`. A confirmation prompt clearly states data will be deleted.
+
+- **Device name validation** — device names are validated for uniqueness (case-insensitive), maximum 40 characters, and allowed characters (`a-z A-Z 0-9 space ' - & ( ) .`) at both client and server level. Inline red border feedback on the field, pre-save error list, and server-side 400 rejection.
+
+- **Change reason modal skipped for non-billing changes** — the change reason prompt now only appears when billing-significant fields change (billing day, block period, timezone, currency). Routine changes (sensor entities, device names, meter type) save immediately without interruption.
+
+### Fixed
+
+- **Standing charge £0 on BST days** — `calculate_billing_summary_for_period` (billing chart hover/summaries) and `api_blocks_summary` (Usage Stats data table) both used the first block of each local day to record the standing charge. In BST (UTC+1), the first block of a local day arrives at 23:00 UTC the previous night and may have `sc=0.0` if the standing charge sensor was briefly unavailable. Any subsequent non-zero block for that day was ignored, zeroing the entire day's standing charge. Fixed in both code paths to use `MAX(standing_charge)` per day from the main meter only, matching the SQL billing query which was already correct.
+
+- **Sub-meter rate sawtooth on charts after restart** — gap-fill blocks for sub-meters were written with `rate=0.0` when the sub-meter had no post-restart reads yet (skip path in `build_gap_blocks`). This produced a brief spike to zero on the rate line in billing charts at every restart. Fixed by looking up `last_known_rates` for the sub-meter even when skipping, so gap blocks carry the correct last known rate.
+
+- **Sub-meter rate zero on first block after DB restore** — `_post_gap_rates` was initialised to `None` on every engine tick. `ensure_correct_block` received `last_known_rates=None`, so when the sub-meter's rates list was empty (first tick after restore, before any rate sensor reads had accumulated), `finalise_block` had no fallback and defaulted the rate to `0.0`. Fixed by pre-populating `_post_gap_rates` from the last finalised block in the DB on every tick, so a rate fallback is always available.
+
+- **Gap fill blocks missing CI data** — gap blocks built at startup via `build_gap_blocks` bypassed `finalise_block` entirely, so `carbon_g` was always `NULL` on gap blocks even when CI data was available in the `carbon_intensity` table. Fixed by looking up CI from the table for each gap block immediately after construction, before writing to the DB.
+
+- **Engine startup waiting 60s when prod DB used on dev** — the sensor readiness wait treated sensors with state `None` (not present in HA) the same as sensors with state `"unavailable"` (present but not ready). On a dev system using a prod DB, sensors that don't exist in dev HA caused a 60-second timeout on every startup. Fixed to skip the wait immediately for sensors that don't exist in HA (`get_state` returns `None`), only waiting for sensors that exist but are currently unavailable.
+
+- **Gap fill using live sensor reads rather than preloaded state** — gap fill was deferred until the first live sensor fire after restart. If the export sensor fired before sub-meter sensors had reported, gap fill ran with incomplete `post_reads`, producing gap blocks with `rate=0.0` for sub-meters. Fixed by moving gap fill to run immediately after the concurrent sensor + CI wait at startup, using preloaded HA state as `post_reads`. The deferred path is retained as a fallback when sensors are still unavailable after the 60-second timeout.
+
+- **Carbon intensity missing from first blocks after restart** — CI fetch previously ran on the first engine tick, after gap fill had already written blocks. Gap blocks and the catch-up block immediately after restart had `carbon_g=NULL`. Fixed by fetching CI concurrently with the sensor wait at startup (30s timeout), so CI data is available in the `carbon_intensity` table before gap fill runs.
+
+- **Meter type keyword detection showing sensor fields before type set** — `buildSubCard` in `meter_config.html` fell back to keyword matching on device name and meter ID when `meter_type` was not set, causing sensor fields (SoC, inverter power etc.) to appear on sub-meters whose names happened to contain words like "battery" or "ev". Config UI now only uses the explicit `meter_type` field — no keyword fallback. Keywords removed from `server.py` entirely since no user could have configured these sensors before 2.7.0.
+
+- **Config page showing stale config after DB restore** — after restoring a DB via Data Management, the meter_config page retained the old JS config object from before the restore. Now reloads automatically when the page becomes visible again after being hidden for more than 3 seconds (covers the case where restore is done in another tab).
+
+- **Site name change creating spurious billing period** — `site` and `site_name` were included in the billing-significant fields list, so renaming the site triggered a new config period and change reason modal. Site name is a display label with no billing impact. Removed from `SIGNIFICANT` in both `block_store.py` and `meter_config.html`.
+
+- **Delete Blocks time range returning wrong blocks** — the `count_blocks_for_date_range` and `delete_blocks_for_date_range` functions used `OR` logic between the from-time and to-time conditions on the same date, matching every block on that date (since every block is either `>= from_time` OR `<= to_time`). A 07:00–07:20 window returned 130 blocks instead of 4. Fixed to use `AND` when `from_date == to_date`, `OR`-based logic only for multi-date ranges.
+
+- **Delete Blocks time inputs not converting local time to UTC** — new time pickers on the Delete Blocks page sent local time (BST) directly to the server, which compared it against UTC `block_start` values. Fixed by converting local time inputs to UTC via `_corrections_time_to_utc` at the server endpoint before querying, consistent with how Historical Corrections handles time-of-day filtering.
+
+- **Live Power CI card failing on first load** — all API calls (power, billing, CI, history) fired simultaneously on page load, saturating the Waitress thread pool. The CI call — which makes an outbound HTTP request to National Grid ESO — timed out on the client side before the response arrived. Fixed by staggering initial loads: power at 0ms, billing at 300ms, CI at 600ms, history at 900ms.
+
+- **`INV_MAX_KW` global gauge scale not per-meter** — the inverter gauge scale was a single global value shared across all battery cards. With multiple batteries, the first card to update would set the scale for all others. Renamed to `_invMaxKw` per-meter map with `_getInvMax(meterId)` / `_setInvMax(meterId, kw)` helpers. Each battery card now maintains its own gauge scale independently.
+
+### Changed
+
+- **Meter IDs hidden** — meter IDs are no longer shown in the config UI or wizard. They are auto-generated timestamps and have no user-facing meaning. Device Name and Site Name are the user-facing identifiers throughout.
+
+- **`inverter_possible` auto-set** — Battery type meters automatically set `inverter_possible = true` in the database. The checkbox remains visible for all sub-meter types to allow manual override (e.g. an EV fed by a battery inverter).
+
+- **V2X checkbox** — shown for EV type meters and for any sub-meter where no meter_type has been set yet. Hidden for Battery and Heat Pump types.
+
+- **Sub-meter info box** — the sensor requirements help text in the sub-meter config card is now type-aware, showing guidance specific to Battery, EV Charger, or Heat Pump rather than generic CT clamp instructions.
+
+- **Live Power grid column** — summary grid changed from fixed `1fr 1fr` to `repeat(auto-fit, minmax(220px, 1fr))` with `align-items: stretch`. Battery, EV and heat pump cards slot in between the power gauge and CI card and all cards are equal height.
+
+- **Keyword detection** — meter type detection now checks the explicit `meter_type` DB field first. Keywords (battery, charger, ev, zappi, heat, pump, etc.) are only used as a fallback when no type is set — preserving backward compatibility for existing meters created before 2.7.0.
+
+- **Wizard meter IDs** — wizard no longer shows or collects a meter ID for the main meter. Main meter always uses `electricity_main`. Sub-meters auto-generate a timestamp ID. Existing sub-meters are matched by `meter_type` field rather than keyword matching on ID.
+
+
 ## [2.6.3] — 2026-04-23
 
 ### Added
@@ -55,7 +134,7 @@
 
 ### Fixed
 
-- **Sub-meter display rate used weighted average instead of last rate** — at tariff boundaries (e.g. Octopus off-peak → peak transition) a sub-meter block that recorded a tiny amount of kWh spanning both sides of the boundary would compute a weighted average rate (e.g. `£0.189`) rather than using the last rate in the block (e.g. `£0.323`). This caused the sub-meter rate line on charts to show an anomalous mid-point value while the main meter showed the correct end-of-block rate. All meters now consistently use the last captured rate in the block, which is the intent — capturing the rate as close to block end as possible to account for any API lag from remote rate providers.
+- **Sub-meter display rate used weighted average instead of last rate** — at tariff boundaries (e.g. off-peak → peak transition) a sub-meter block that recorded a tiny amount of kWh spanning both sides of the boundary would compute a weighted average rate (e.g. `£0.189`) rather than using the last rate in the block (e.g. `£0.323`). This caused the sub-meter rate line on charts to show an anomalous mid-point value while the main meter showed the correct end-of-block rate. All meters now consistently use the last captured rate in the block, which is the intent — capturing the rate as close to block end as possible to account for any API lag from remote rate providers.
 
 - **Net bar colour wrong when standing charge tips a day positive** — on the Net billing chart with "Inc. Standing Charge" enabled, days where the standing charge pushed a net-credit day into net-cost showed the bar above zero in the credit colour (grey) rather than the cost colour (blue). The bar height calculation correctly included the standing charge but the colour check did not. Fixed by including `barStandingVal(agg)` in the colour check to match the bar height calculation exactly.
 
