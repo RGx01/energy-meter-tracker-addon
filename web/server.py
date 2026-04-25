@@ -124,13 +124,13 @@ def start():
     """Start Flask in a background daemon thread."""
     t = threading.Thread(target=_run, daemon=True, name="flask")
     t.start()
-    _port = int(os.environ.get("EMT_PORT", "8099"))
+    _port = int(os.environ.get("EMT_PORT") or "8099")
     logger.info("server: Flask started on port %d", _port)
 
 
 def _run():
     from waitress import serve
-    _port = int(os.environ.get("EMT_PORT", "8099"))
+    _port = int(os.environ.get("EMT_PORT") or "8099")
     serve(app, host="0.0.0.0", port=_port, threads=4)
 
 

@@ -8,8 +8,9 @@ if [ -n "$SUPERVISOR_TOKEN" ]; then
   LOG_LEVEL=$(bashio::config 'log_level' 2>/dev/null || echo "info")
   export LOG_LEVEL="${LOG_LEVEL:-info}"
   export EMT_MODE="supervised"
-  EMT_PORT=$(bashio::config 'port' 2>/dev/null || echo "8099")
-  export EMT_PORT="${EMT_PORT:-8099}"
+  EMT_PORT=$(bashio::config 'port' 2>/dev/null)
+  if [ -z "$EMT_PORT" ] || [ "$EMT_PORT" = "null" ]; then EMT_PORT="8099"; fi
+  export EMT_PORT="${EMT_PORT}"
   PUBLISH_HA=$(bashio::config 'publish_ha_sensors' 2>/dev/null || echo "true")
   export PUBLISH_HA_SENSORS="${PUBLISH_HA:-true}"
   if [ "$PUBLISH_HA_SENSORS" = "false" ]; then
