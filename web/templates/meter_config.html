@@ -217,6 +217,8 @@
 
 <script>
 let config   = {{ config | tojson }};
+// Snapshot of server config for detecting billing-significant changes
+var _serverConfig = JSON.parse(JSON.stringify(config));
 let entities = [];
 var hasData  = {{ has_data | tojson }};
 // Timezone select HTML — rendered server-side to avoid JS string escaping issues
@@ -246,6 +248,20 @@ document.addEventListener('DOMContentLoaded', function() {
   document.getElementById('btn-add-main').addEventListener('click', addMainMeter);
   document.getElementById('btn-add-sub').addEventListener('click', addSubMeter);
   document.getElementById('btn-wizard').addEventListener('click', startWizard);
+
+  // Reload config if the page becomes visible after being hidden — catches the case
+  // where the user restores a DB on the Data Management page then switches back here.
+  // The in-memory config object would be stale without a reload.
+  var _hiddenAt = null;
+  document.addEventListener('visibilitychange', function() {
+    if (document.hidden) {
+      _hiddenAt = Date.now();
+    } else if (_hiddenAt && (Date.now() - _hiddenAt) > 3000) {
+      // Only reload if the page was hidden for more than 3 seconds
+      // (avoids reloading on brief tab switches)
+      window.location.reload();
+    }
+  });
   document.getElementById('btn-wizard-empty').addEventListener('click', startWizard);
   loadEntities().then(function() {
     renderAll();
@@ -258,10 +274,13 @@ document.addEventListener('DOMContentLoaded', function() {
 
 // Field type → acceptable units/device_class
 var FIELD_FILTERS = {
-  read:                  { units: ['kWh'], unitSuffixes: [], device_class: ['energy'] },
-  power_sensor:          { units: ['W', 'w', 'kW'], unitSuffixes: [], device_class: ['power'] },
-  rate:                  { units: [], unitSuffixes: ['/kwh'], device_class: ['monetary', 'currency'] },
-  standing_charge_sensor:{ units: [], unitSuffixes: ['/day'], device_class: ['monetary', 'currency'] },
+  read:                    { units: ['kWh'], unitSuffixes: [], device_class: ['energy'] },
+  power_sensor:            { units: ['W', 'w', 'kW'], unitSuffixes: [], device_class: ['power'] },
+  rate:                    { units: [], unitSuffixes: ['/kwh'], device_class: ['monetary', 'currency'] },
+  standing_charge_sensor:  { units: [], unitSuffixes: ['/day'], device_class: ['monetary', 'currency'] },
+  soc_sensor:              { units: ['%'], unitSuffixes: [], device_class: ['battery'] },
+  inverter_power_sensor:   { units: ['W', 'w', 'kW'], unitSuffixes: [], device_class: ['power'] },
+  device_power_sensor:     { units: ['W', 'w', 'kW'], unitSuffixes: [], device_class: ['power'] },
 };
 
 async function loadEntities() {
@@ -338,7 +357,6 @@ function buildMainCard(meterId, meter) {
     '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">' +
       '<div style="display:flex;align-items:center;gap:10px;">' +
         '<span class="badge badge-main">MAIN METER</span>' +
-        '<span style="font-family:var(--mono);font-size:13px;">' + meterId + '</span>' +
       '</div>' +
       '<button class="btn btn-danger btn-sm js-remove-meter" data-meter="' + meterId + '">✕ Remove</button>' +
     '</div>' +
@@ -353,11 +371,7 @@ function buildMainCard(meterId, meter) {
     '</div>' +
 
     '<div class="grid-2">' +
-      '<div class="form-group"><label>Meter ID</label>' +
-        (existingMeterIds.has(meterId)
-          ? '<input type="text" class="js-meter-id" data-meter="' + meterId + '" value="' + esc(meterId) + '" style="font-family:var(--mono);" readonly title="Meter ID cannot be changed after data has been collected"><small style="color:var(--warning-color,#b45309);">⚠ ID is locked — changing it would orphan historical data</small>'
-          : '<input type="text" class="js-meter-id" data-meter="' + meterId + '" value="' + esc(meterId) + '" style="font-family:var(--mono);">') +
-        '</div>' +
+      '<input type="hidden" class="js-meter-id" data-meter="' + meterId + '" value="' + esc(meterId) + '">' +
       '<div class="form-group"><label>Site Name</label>' +
         '<input type="text" class="js-meta" data-meter="' + meterId + '" data-key="site" value="' + esc(meta.site||'') + '"></div>' +
       '<div class="form-group"><div style="font-size:12px;color:var(--muted);padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:4px;">' +
@@ -423,9 +437,18 @@ function buildSubCard(meterId, meter) {
   }
   var rateVal = imp.rate || mainImportRate;
 
-  var parentOpts = mainMeters.map(function(m) {
-    return '<option value="' + m + '" ' + (meta.parent_meter===m?'selected':'') + '>' + m + '</option>';
-  }).join('');
+  // Detect sub-meter type — meter_type field takes priority, then device name/ID keywords
+  var meterType  = meta.meter_type || '';
+  // Type detection — explicit meter_type only, no keyword guessing in config UI
+  // Keywords are retained in server.py only for backward compat with existing sensors
+  var isBattery  = meterType === 'battery';
+  var isEV       = meterType === 'ev';
+  var isHeatPump = meterType === 'heat_pump';
+
+  // Auto-set parent_meter to first main meter (not shown in UI)
+  if (!meta.parent_meter && mainMeters.length > 0) {
+    config.meters[meterId].meta['parent_meter'] = mainMeters[0];
+  }
 
   var div = document.createElement('div');
   div.className = 'card';
@@ -435,7 +458,6 @@ function buildSubCard(meterId, meter) {
     '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">' +
       '<div style="display:flex;align-items:center;gap:10px;">' +
         '<span class="badge badge-sub">SUB-METER</span>' +
-        '<span style="font-family:var(--mono);font-size:13px;">' + meterId + '</span>' +
       '</div>' +
       '<button class="btn btn-danger btn-sm js-remove-meter" data-meter="' + meterId + '">✕ Remove</button>' +
     '</div>' +
@@ -443,37 +465,84 @@ function buildSubCard(meterId, meter) {
     '<div class="info-box">' +
       '<strong>Sub-meter sensor requirements</strong>' +
       '<ul>' +
-        '<li>Must be <strong>cumulative kWh consumed (import only)</strong> — not net usage, not export, not power in watts</li>' +
-        '<li><strong>CT clamp via PowerCalc</strong> — aggregated kWh, updates every 60s minimum</li>' +
-        '<li><strong>Device integration</strong> — if your device reports kWh directly (e.g. Zappi, Solax)</li>' +
+        '<li>The <strong>read sensor</strong> must be <strong>cumulative kWh (import only)</strong> — not net, not export, not watts</li>' +
+        (isBattery
+          ? '<li>Battery integrations (GivEnergy, Powerwall, Solax) report kWh directly — use the consumption sensor</li>' +
+            '<li>Add the SoC and inverter power sensors below to enable the Live Power battery card</li>'
+          : isEV
+          ? '<li>EV charger integrations (Zappi, Ohme, Wallbox) report session kWh — use the total energy sensor</li>' +
+            '<li>Add the charger power sensor below to show live charge rate on the Live Power page</li>'
+          : isHeatPump
+          ? '<li>Heat pump energy sensors report cumulative kWh — check your integration docs for the correct entity</li>' +
+            '<li>Add the heat pump power sensor below to show live draw on the Live Power page</li>'
+          : '<li><strong>CT clamp via PowerCalc</strong> — aggregated kWh, updates every 60s minimum</li>' +
+            '<li><strong>Device integration</strong> — if your device reports kWh directly</li>') +
       '</ul>' +
       'If no rate sensor is provided the main meter import rate is used automatically.' +
     '</div>' +
 
     '<div class="grid-2">' +
-      '<div class="form-group"><label>Meter ID</label>' +
-        (existingMeterIds.has(meterId)
-          ? '<input type="text" class="js-meter-id" data-meter="' + meterId + '" value="' + esc(meterId) + '" style="font-family:var(--mono);" readonly title="Meter ID cannot be changed after data has been collected"><small style="color:var(--warning-color,#b45309);">⚠ ID is locked — changing it would orphan historical data</small>'
-          : '<input type="text" class="js-meter-id" data-meter="' + meterId + '" value="' + esc(meterId) + '" style="font-family:var(--mono);">') +
-        '</div>' +
+      '<input type="hidden" class="js-meter-id" data-meter="' + meterId + '" value="' + esc(meterId) + '">' +
+      '<div class="form-group"><label>Meter Type</label>' +
+        (meta.meter_type && existingMeterIds.has(meterId)
+          // Locked — meter has data, type cannot change
+          ? '<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);font-size:13px;">' +
+              (meta.meter_type==='battery' ? '🔋 Battery' : meta.meter_type==='ev' ? '🚗 EV Charger' : '♨️ Heat Pump') +
+              '<span style="margin-left:auto;font-size:11px;color:var(--muted);">🔒 locked</span>' +
+            '</div>' +
+            '<small style="color:var(--muted);">🔒 Meter type is permanent once data has been recorded. To change it you must delete this meter — which will also permanently delete all its historical data.</small>'
+          // Not yet locked — show dropdown
+          : '<select class="js-meta" data-meter="' + meterId + '" data-key="meter_type">' +
+              '<option value=""'   + (!meta.meter_type ? ' selected' : '') + '>— Select type —</option>' +
+              '<option value="battery"'   + (meta.meter_type==='battery'   ? ' selected' : '') + '>🔋 Battery</option>' +
+              '<option value="ev"'        + (meta.meter_type==='ev'        ? ' selected' : '') + '>🚗 EV Charger</option>' +
+              '<option value="heat_pump"' + (meta.meter_type==='heat_pump' ? ' selected' : '') + '>♨️ Heat Pump</option>' +
+            '</select>' +
+            '<small style="color:var(--muted);">Sets the meter icon and enables additional sensor fields on the Live Power page. Cannot be changed after data is recorded.</small>') +
+      '</div>' +
       '<div class="form-group"><label>Device Name</label>' +
         '<input type="text" class="js-meta" data-meter="' + meterId + '" data-key="device" value="' + esc(meta.device||'') + '"></div>' +
-      '<div class="form-group"><label>Parent Meter</label>' +
-        '<select class="js-meta" data-meter="' + meterId + '" data-key="parent_meter">' +
-          '<option value="">— select —</option>' + parentOpts +
-        '</select></div>' +
     '</div>' +
 
-    '<div style="display:flex;gap:24px;margin-bottom:16px;">' +
-      '<div class="checkbox-row">' +
-        '<input type="checkbox" id="inv-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="inverter_possible" ' + (meta.inverter_possible?'checked':'') + '>' +
-        '<label for="inv-' + meterId + '">Inverter possible (battery/solar)</label>' +
-      '</div>' +
-      '<div class="checkbox-row">' +
-        '<input type="checkbox" id="v2x-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="v2x_capable" ' + (meta.v2x_capable?'checked':'') + '>' +
-        '<label for="v2x-' + meterId + '">V2X capable (vehicle-to-grid)</label>' +
-      '</div>' +
-    '</div>' +
+    // V2X checkbox — show for EV type, or when no meter_type set (unknown type)
+    (isEV || !meterType
+      ? '<div style="margin-bottom:16px;"><div class="checkbox-row">' +
+          '<input type="checkbox" id="v2x-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="v2x_capable" ' + (meta.v2x_capable?'checked':'') + '>' +
+          '<label for="v2x-' + meterId + '">V2X / Vehicle-to-Grid capable</label>' +
+        '</div></div>'
+      : '') +
+    // Inverter possible — hidden for battery (auto-set), shown for all other types
+    (!isBattery
+      ? '<div style="display:flex;gap:24px;margin-bottom:16px;">' +
+          '<div class="checkbox-row">' +
+            '<input type="checkbox" id="inv-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="inverter_possible" ' + (meta.inverter_possible?'checked':'') + '>' +
+            '<label for="inv-' + meterId + '">Inverter possible</label>' +
+          '</div>' +
+        '</div>'
+      : '') +
+
+    // SoC sensor and inverter power sensor — only shown for battery type meters
+    (isBattery
+      ? '<div class="form-group" style="grid-column:1/-1;margin-bottom:8px;">' +
+          '<label>State of Charge Sensor <span style="color:var(--muted);font-weight:400;">(optional — enables SoC dial on Live Power page)</span></label>' +
+          buildEntityInput(meterId + '__soc__soc_sensor', meta.soc_sensor||'', meterId, 'soc', 'soc_sensor', true) +
+          '<small style="color:var(--muted);">Battery SoC in % (0–100). From your battery integration (e.g. GivEnergy, Powerwall, Solax). ⓘ Informational only — not recorded in blocks or used in calculations.</small>' +
+        '</div>' +
+        '<div class="form-group" style="grid-column:1/-1;margin-bottom:16px;">' +
+          '<label>Inverter Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — shows live kW below SoC dial)</span></label>' +
+          buildEntityInput(meterId + '__inverter_power__inverter_power_sensor', meta.inverter_power_sensor||'', meterId, 'inverter_power', 'inverter_power_sensor', true) +
+          '<small style="color:var(--muted);">Live inverter power in W or kW. ⓘ Informational only — not recorded in blocks or used in calculations.</small>' +
+        '</div>'
+      : '') +
+
+    // Power sensor — shown for EV charger and heat pump meters
+    ((isEV || isHeatPump)
+      ? '<div class="form-group" style="grid-column:1/-1;margin-bottom:16px;">' +
+          '<label>' + (isEV ? 'Charger' : 'Heat Pump') + ' Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — shows live kW on Live Power page)</span></label>' +
+          buildEntityInput(meterId + '__device_power__device_power_sensor', meta.device_power_sensor||'', meterId, 'device_power', 'device_power_sensor', true) +
+          '<small style="color:var(--muted);">Live power in W or kW. ⓘ Informational only — not recorded in blocks or used in calculations.</small>' +
+        '</div>'
+      : '') +
 
     '<hr>' +
     '<div class="section-divider">Import Channel</div>' +
@@ -554,12 +623,53 @@ function onContainerChange(e) {
   else if (el.classList.contains('js-meta-int'))  { config.meters[m].meta[k] = parseInt(el.value)||1; }
   else if (el.classList.contains('js-meta-bool')) { config.meters[m].meta[k] = el.checked; }
   else if (el.classList.contains('js-meter-id'))  { renameMeter(m, el.value); }
+  else if (el.classList.contains('js-meta') && el.dataset.key === 'meter_type') {
+    // Only fires when dropdown is shown (not locked)
+    config.meters[m].meta['meter_type'] = el.value;
+    renderAll();
+    return;
+  }
+
+  // Inline validation for device/site name fields
+  if (el.classList.contains('js-meta') && (el.dataset.key === 'device' || el.dataset.key === 'site')) {
+    var nameVal = el.value.trim();
+    var nameErr = '';
+    if (nameVal && nameVal.length > _NAME_MAX) {
+      nameErr = 'Name must be ' + _NAME_MAX + ' characters or fewer.';
+    } else if (nameVal && !_NAME_REGEX.test(nameVal)) {
+      nameErr = 'Invalid characters. Use letters, numbers, spaces and \' - & ( ) . only.';
+    } else if (nameVal) {
+      // Check uniqueness against other meters
+      var lower = nameVal.toLowerCase();
+      var duplicate = Object.keys(config.meters).some(function(otherId) {
+        if (otherId === m) return false;
+        var otherMeta = (config.meters[otherId].meta || {});
+        var otherName = (otherMeta.device || otherMeta.site || '').trim().toLowerCase();
+        return otherName === lower;
+      });
+      if (duplicate) nameErr = 'This name is already used by another meter.';
+    }
+    el.style.borderColor = nameErr ? 'var(--danger)' : '';
+    el.title = nameErr || '';
+  }
   else if (el.classList.contains('js-ch-field')) {
     var ch = el.dataset.channel, f = el.dataset.field;
     if (ch === 'power') {
       // power_sensor stored in meter meta
       if (el.value) config.meters[m].meta['power_sensor'] = el.value;
       else delete config.meters[m].meta['power_sensor'];
+    } else if (ch === 'soc') {
+      // soc_sensor stored in meter meta
+      if (el.value) config.meters[m].meta['soc_sensor'] = el.value;
+      else delete config.meters[m].meta['soc_sensor'];
+    } else if (ch === 'inverter_power') {
+      // inverter_power_sensor stored in meter meta
+      if (el.value) config.meters[m].meta['inverter_power_sensor'] = el.value;
+      else delete config.meters[m].meta['inverter_power_sensor'];
+    } else if (ch === 'device_power') {
+      // device_power_sensor stored in meter meta (EV charger, heat pump)
+      if (el.value) config.meters[m].meta['device_power_sensor'] = el.value;
+      else delete config.meters[m].meta['device_power_sensor'];
     } else {
       if (!config.meters[m].channels[ch]) config.meters[m].channels[ch] = {};
       if (el.value) config.meters[m].channels[ch][f] = el.value;
@@ -577,9 +687,23 @@ function onContainerClick(e) {
   var el = e.target.closest('button');
   if (!el) return;
   if (el.classList.contains('js-remove-meter')) {
-    if (confirm('Remove meter "' + el.dataset.meter + '"?')) {
-      delete config.meters[el.dataset.meter];
+    var mid = el.dataset.meter;
+    var mData = config.meters[mid] || {};
+    var isSub = (mData.meta || {}).sub_meter;
+    var devName = (mData.meta || {}).device || mid;
+    var msg = isSub
+      ? 'Remove "' + devName + '"?\n\nThis will permanently delete all historical data for this meter from the database. This cannot be undone.'
+      : 'Remove this main meter?\n\nThis will permanently delete all historical data. This cannot be undone.';
+    if (confirm(msg)) {
+      delete config.meters[mid];
       renderAll();
+      // Cascade delete all data for this meter ID
+      fetch(apiUrl('/api/meter/' + encodeURIComponent(mid) + '/delete-data'), { method: 'POST' })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          if (d.deleted) console.log('Cascade delete:', d.deleted, 'rows for', mid);
+        })
+        .catch(function(e) { console.warn('Cascade delete failed:', e); });
     }
   } else if (el.classList.contains('js-clear-entity')) {
     var t = document.getElementById(el.dataset.target);
@@ -670,8 +794,51 @@ function hideDrop(inp) {
 }
 
 // ── Save ──────────────────────────────────────────────────────────────────────
+// ── Device name validation ─────────────────────────────────────────────────
+var _NAME_MAX   = 40;
+var _NAME_REGEX = /^[a-zA-Z0-9 '\-&().]+$/;  // allowed chars
+
+function validateDeviceNames() {
+  // Returns an array of error strings, empty if all valid
+  var errors = [];
+  var seen = {};  // lower-case name → first meter id
+
+  Object.keys(config.meters).forEach(function(mid) {
+    var meta     = (config.meters[mid].meta || {});
+    var isSub    = meta.sub_meter;
+    var rawName  = isSub ? (meta.device || '').trim() : (meta.site || '').trim();
+    var label    = isSub ? 'Device name' : 'Site name';
+
+    if (!rawName) {
+      if (isSub) errors.push('"' + mid + '": Device name is required.');
+      return;  // main meter site name is optional
+    }
+    if (rawName.length > _NAME_MAX) {
+      errors.push('"' + rawName + '": ' + label + ' must be ' + _NAME_MAX + ' characters or fewer.');
+    }
+    if (!_NAME_REGEX.test(rawName)) {
+      errors.push('"' + rawName + '": ' + label + ' contains invalid characters. Use letters, numbers, spaces and \' - & ( ) . only.');
+    }
+    var lower = rawName.toLowerCase();
+    if (seen[lower] !== undefined) {
+      errors.push('"' + rawName + '": Name is already used by another meter. All meter names must be unique.');
+    } else {
+      seen[lower] = mid;
+    }
+  });
+  return errors;
+}
+
 function _doSave(changeReason) {
   hideAlerts();
+
+  // Validate device names before saving
+  var nameErrors = validateDeviceNames();
+  if (nameErrors.length > 0) {
+    showError('Please fix the following before saving:\n• ' + nameErrors.join('\n• '));
+    return;
+  }
+
   var payload = Object.assign({}, config);
   if (changeReason) payload.change_reason = changeReason;
   fetch(apiUrl('/api/config'), {
@@ -679,18 +846,42 @@ function _doSave(changeReason) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   }).then(function(r) { return r.json(); }).then(function(data) {
-    if (data.ok) show('alert-success');
+    if (data.ok) {
+      // Brief flash then reload so new sensor fields appear for any updated meter_type
+      show('alert-success');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      setTimeout(function() { window.location.reload(); }, 1200);
+    }
     else showError(data.error || 'Save failed');
   }).catch(function(e) { showError(e.message); });
 }
 
+function isBillingSignificant() {
+  // Mirror config_meta_significant from block_store.py
+  // Only show change reason modal when billing fields actually changed
+  var SIGNIFICANT = ['billing_day', 'block_minutes', 'timezone', 'currency_symbol', 'currency_code'];
+  var oldMeta = _serverConfig && _serverConfig.meters
+    ? (Object.values(_serverConfig.meters).find(function(m) { return !(m.meta||{}).sub_meter; }) || {}).meta || {}
+    : {};
+  var newMeta = {};
+  Object.values(config.meters || {}).forEach(function(m) {
+    if (!(m.meta||{}).sub_meter) newMeta = m.meta || {};
+  });
+  return SIGNIFICANT.some(function(k) { return oldMeta[k] !== newMeta[k]; });
+}
+
 function saveConfig() {
-  // Show the change reason modal — user can skip or provide a reason
-  var modal = document.getElementById('change-reason-modal');
-  var input = document.getElementById('change-reason-input');
-  input.value = '';
-  modal.style.display = 'flex';
-  setTimeout(function() { input.focus(); }, 50);
+  if (isBillingSignificant()) {
+    // Show change reason modal — billing period may be created
+    var modal = document.getElementById('change-reason-modal');
+    var input = document.getElementById('change-reason-input');
+    input.value = '';
+    modal.style.display = 'flex';
+    setTimeout(function() { input.focus(); }, 50);
+  } else {
+    // Non-significant change — save immediately, no modal needed
+    _doSave(null);
+  }
 }
 
 document.getElementById('change-reason-save').addEventListener('click', function() {
@@ -817,9 +1008,6 @@ function renderWizStep() {
 function wizStepMain() {
   return '<h3 style="margin:0 0 6px;">Main Meter</h3>' +
     '<p style="color:var(--muted);font-size:13px;margin:0 0 20px;">Tell us about your electricity meter and billing.</p>' +
-    '<div class="form-group"><label>Meter ID</label>' +
-      '<input id="wiz-mainId" type="text" value="' + esc(wiz.data.mainId) + '" style="font-family:var(--mono);" placeholder="electricity_main">' +
-      '<small style="color:var(--muted);">Used internally — cannot be changed later</small></div>' +
     '<div class="grid-2">' +
       '<div class="form-group"><label>Site Name <span style="color:var(--muted);font-weight:400;">(optional)</span></label>' +
         '<input id="wiz-site" type="text" value="' + esc(wiz.data.site) + '" placeholder="My Home"></div>' +
@@ -919,6 +1107,14 @@ function wizStepSubSensors() {
         buildWizEntity('wiz-sub-' + devId + '-read', sd.read) + '</div>' +
       '<div class="form-group"><label>Rate Sensor ' + (impRate ? '(default: one-time copy from main meter at setup — update here if your sub-meter has a different rate or you retrospectively change rates)' : '') + '</label>' +
         buildWizEntity('wiz-sub-' + devId + '-rate', sd.rate || impRate) + '</div>' +
+      (devId === 'battery'
+        ? '<div class="form-group"><label>State of Charge Sensor <span style="color:var(--muted);font-weight:400;">(optional — enables SoC dial on Live Power page)</span></label>' +
+            buildWizEntity('wiz-sub-' + devId + '-soc', sd.soc||'') +
+            '<small style="color:var(--muted);">Battery SoC in % (0–100). From your battery integration. ⓘ Informational only — not recorded in blocks or used in calculations.</small></div>' +
+          '<div class="form-group"><label>Inverter Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — shows live kW below SoC dial)</span></label>' +
+            buildWizEntity('wiz-sub-' + devId + '-inverter-power', sd.inverter_power||'') +
+            '<small style="color:var(--muted);">Live inverter power in W or kW. ⓘ Informational only — not recorded in blocks or used in calculations.</small></div>'
+        : '') +
     '</div>';
   });
 
@@ -969,7 +1165,7 @@ function showDropById(id, inp) {
 function wizCollectStep() {
   var step = WIZ_STEPS[wiz.step];
   if (step === 'main') {
-    wiz.data.mainId     = (document.getElementById('wiz-mainId').value||'electricity_main').trim().replace(/\s+/g,'_');
+    wiz.data.mainId     = 'electricity_main';
     wiz.data.site       = document.getElementById('wiz-site').value;
     wiz.data.supplier   = document.getElementById('wiz-supplier').value;
     wiz.data.billing_day   = parseInt(document.getElementById('wiz-billing-day').value)||1;
@@ -989,15 +1185,47 @@ function wizCollectStep() {
       var nameEl = document.getElementById('wiz-sub-' + devId + '-name');
       var readEl = document.getElementById('wiz-sub-' + devId + '-read');
       var rateEl = document.getElementById('wiz-sub-' + devId + '-rate');
+      var socEl  = document.getElementById('wiz-sub-' + devId + '-soc');
+      var invEl  = document.getElementById('wiz-sub-' + devId + '-inverter-power');
       if (nameEl) wiz.data.subMeters[devId].name = nameEl.value;
       if (readEl) wiz.data.subMeters[devId].read = readEl.value;
       if (rateEl) wiz.data.subMeters[devId].rate = rateEl.value;
+      if (socEl && socEl.value) wiz.data.subMeters[devId].soc = socEl.value;
+      if (invEl && invEl.value) wiz.data.subMeters[devId].inverter_power = invEl.value;
     });
   }
 }
 
 function wizNext() {
   wizCollectStep();
+
+  // Validate device names on sub_sensors step
+  if (WIZ_STEPS[wiz.step] === 'sub_sensors') {
+    var nameErrs = [];
+    var seenWiz  = {};
+    wiz.devices.forEach(function(devId) {
+      var sd   = wiz.data.subMeters[devId] || {};
+      var name = (sd.name || '').trim();
+      if (!name) {
+        nameErrs.push('Please enter a device name for each meter.');
+        return;
+      }
+      if (name.length > _NAME_MAX) {
+        nameErrs.push('"' + name + '": must be ' + _NAME_MAX + ' chars or fewer.');
+      } else if (!_NAME_REGEX.test(name)) {
+        nameErrs.push('"' + name + '": invalid characters. Use letters, numbers, spaces and \' - & ( ) . only.');
+      }
+      var lower = name.toLowerCase();
+      if (seenWiz[lower]) {
+        nameErrs.push('"' + name + '": duplicate name — each meter must have a unique name.');
+      }
+      seenWiz[lower] = true;
+    });
+    if (nameErrs.length) {
+      alert(nameErrs.join('\n'));
+      return;
+    }
+  }
   // Skip sub_sensors if no devices selected
   WIZ_STEPS = wiz.devices.length > 0
     ? ['main', 'sensors', 'devices', 'sub_sensors', 'done']
@@ -1038,33 +1266,37 @@ async function wizApplyAndClose() {
 
   // Build sub-meters
   var devDefaults = {
-    ev:      { id: 'ev_charger',    inverter_possible: false, v2x_capable: false },
-    battery: { id: 'house_battery', inverter_possible: true,  v2x_capable: false },
-    heat:    { id: 'heat_pump',     inverter_possible: false, v2x_capable: false },
+    ev:      { inverter_possible: false, v2x_capable: false, meter_type: 'ev' },
+    battery: { inverter_possible: true,  v2x_capable: false, meter_type: 'battery' },
+    heat:    { inverter_possible: false, v2x_capable: false, meter_type: 'heat_pump' },
   };
 
-  // Find existing sub-meter IDs that match each device type
+  // Find existing sub-meter IDs that match each device type by meter_type field
   function findExistingSubId(devId) {
-    var keywords = { ev: ['ev','charger'], battery: ['battery','batt'], heat: ['heat','pump'] };
-    var kws = keywords[devId];
+    var typeMap = { ev: 'ev', battery: 'battery', heat: 'heat_pump' };
+    var targetType = typeMap[devId];
     return Object.keys(config.meters).find(function(id) {
-      if (!config.meters[id].meta.sub_meter) return false;
-      return kws.some(function(kw) { return id.toLowerCase().indexOf(kw) !== -1; });
+      var m = config.meters[id];
+      return m.meta.sub_meter && m.meta.meter_type === targetType;
     });
   }
 
   wiz.devices.forEach(function(devId) {
     var sd      = d.subMeters[devId] || {};
     var def     = devDefaults[devId];
-    var subId   = findExistingSubId(devId) || def.id;
+    // Reuse existing sub-meter ID if one exists for this type, otherwise auto-generate
+    var subId   = findExistingSubId(devId) || ('sub_meter_' + Date.now() + Math.floor(Math.random()*1000));
 
     config.meters[subId] = {
       meta: {
         sub_meter:         true,
-        device:            sd.name || def.id,
+        meter_type:        def.meter_type,
+        device:            sd.name || '',
         parent_meter:      mainId,
         inverter_possible: def.inverter_possible,
-        v2x_capable:       def.v2x_capable
+        v2x_capable:       def.v2x_capable,
+        ...(devId === 'battery' && sd.soc ? { soc_sensor: sd.soc } : {}),
+        ...(devId === 'battery' && sd.inverter_power ? { inverter_power_sensor: sd.inverter_power } : {})
       },
       channels: {
         import: { read: sd.read || '', rate: sd.rate || d.importRate || '' }

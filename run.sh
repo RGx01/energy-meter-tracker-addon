@@ -8,11 +8,18 @@ if [ -n "$SUPERVISOR_TOKEN" ]; then
   LOG_LEVEL=$(bashio::config 'log_level' 2>/dev/null || echo "info")
   export LOG_LEVEL="${LOG_LEVEL:-info}"
   export EMT_MODE="supervised"
+  PUBLISH_HA=$(bashio::config 'publish_ha_sensors' 2>/dev/null || echo "true")
+  export PUBLISH_HA_SENSORS="${PUBLISH_HA:-true}"
+  if [ "$PUBLISH_HA_SENSORS" = "false" ]; then
+    bashio::log.warning "publish_ha_sensors=false — HA sensor publishing disabled (dev mode)"
+  fi
   bashio::log.info "Energy Meter Tracker starting in Supervised mode (log_level=${LOG_LEVEL})"
 else
   # ── Standalone Docker mode ──
   export LOG_LEVEL="${LOG_LEVEL:-info}"
   export EMT_MODE="standalone"
+  # Allow disabling HA sensor publishing via -e PUBLISH_HA_SENSORS=false
+  export PUBLISH_HA_SENSORS="${PUBLISH_HA_SENSORS:-true}"
   echo "[INFO] Energy Meter Tracker starting in standalone Docker mode (log_level=${LOG_LEVEL})"
 
   if [ -z "$HA_URL" ]; then

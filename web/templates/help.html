@@ -11,87 +11,20 @@
 
 {% block content %}
 <style>
-.help-section {
-  margin-bottom: 28px;
-}
-.help-section h3 {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--accent);
-  margin-bottom: 12px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.help-section p {
-  font-size: 13px;
-  color: var(--text);
-  line-height: 1.7;
-  margin-bottom: 10px;
-}
-.help-section ul {
-  margin: 8px 0 10px 18px;
-  font-size: 13px;
-  line-height: 1.7;
-  color: var(--text);
-}
-.help-section li {
-  margin-bottom: 4px;
-}
+.help-section { margin-bottom: 28px; }
+.help-section h3 { font-size: 15px; font-weight: 600; color: var(--accent); margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+.help-section p { font-size: 13px; color: var(--text); line-height: 1.7; margin-bottom: 10px; }
+.help-section ul { margin: 8px 0 10px 18px; font-size: 13px; line-height: 1.7; color: var(--text); }
+.help-section li { margin-bottom: 4px; }
 .help-section strong { color: var(--accent); }
-.help-section code {
-  font-family: var(--mono);
-  font-size: 12px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 1px 5px;
-  color: var(--accent2);
-  word-break: break-all;
-}
-.note-box {
-  background: rgba(124,106,247,0.07);
-  border: 1px solid rgba(124,106,247,0.25);
-  border-radius: var(--radius);
-  padding: 12px 14px;
-  font-size: 13px;
-  line-height: 1.7;
-  color: var(--text);
-  margin: 12px 0;
-}
-.warn-box {
-  background: rgba(245,158,11,0.07);
-  border: 1px solid rgba(245,158,11,0.3);
-  border-radius: var(--radius);
-  padding: 12px 14px;
-  font-size: 13px;
-  line-height: 1.7;
-  color: var(--text);
-  margin: 12px 0;
-}
-.two-col {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
-  margin-top: 12px;
-}
-.help-pre {
-  background: var(--bg);
-  padding: 12px;
-  border-radius: 6px;
-  font-size: 12px;
-  overflow-x: auto;
-  white-space: pre;
-  word-break: normal;
-  -webkit-overflow-scrolling: touch;
-  border: 1px solid var(--border);
-}
+.help-section code { font-family: var(--mono); font-size: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; color: var(--accent2); word-break: break-all; }
+.note-box { background: rgba(124,106,247,0.07); border: 1px solid rgba(124,106,247,0.25); border-radius: var(--radius); padding: 12px 14px; font-size: 13px; line-height: 1.7; color: var(--text); margin: 12px 0; }
+.warn-box { background: rgba(245,158,11,0.07); border: 1px solid rgba(245,158,11,0.3); border-radius: var(--radius); padding: 12px 14px; font-size: 13px; line-height: 1.7; color: var(--text); margin: 12px 0; }
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 12px; }
+.help-pre { background: var(--bg); padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto; white-space: pre; word-break: normal; -webkit-overflow-scrolling: touch; border: 1px solid var(--border); }
 @media (max-width: 768px) {
   .two-col { grid-template-columns: 1fr; gap: 12px; }
-  .help-section p,
-  .help-section ul,
-  .note-box,
-  .warn-box { font-size: 13px; }
+  .help-section p, .help-section ul, .note-box, .warn-box { font-size: 13px; }
   .card { padding: 14px 16px; }
   .help-pre { font-size: 11px; }
   .help-section code { font-size: 11px; }
@@ -104,44 +37,29 @@
   <div class="warn-box" style="margin-bottom:16px;">
     ⚠️ <strong>Informational use only.</strong> Energy Meter Tracker provides a close approximation
     of your consumption based on local sensor readings. It cannot replicate your
-    supplier's authoritative meter reconciliation, which is derived from your smart
-    meter's secure data stream and subject to settlement adjustments. Do not use this data
-    for billing disputes or formal energy accounting.
+    supplier's authoritative meter reconciliation. Do not use this data for billing disputes
+    or formal energy accounting.
   </div>
   <p>
-    <strong>Required Hardware</strong> The addon is intended to be used with an IHD/CAD capable of providing meter readings at reliable 
+    <strong>Required Hardware</strong> — The addon is intended to be used with an IHD/CAD capable of providing meter readings at reliable
     regular intervals (0.1Hz).
   </p>
   <p>
-    <strong>Energy Meter Tracker</strong> is a Home Assistant add-on that records your electricity usage in 
-    configurable reconciliation periods — matching the intervals used by your energy supplier for billing. The add-on stores meter readings
-    at each boundary so you can see what happened in any given period, including
-    how much of your usage was from the grid versus your battery, EV or other device.
-  </p>
-  <p>
-    It works by subscribing to your smart meter sensors in Home Assistant and taking timestamped
-    readings continuously. At each reconciliation period boundary it interpolates precisely to the boundary
-    timestamp, finalises the block, and moves on — giving you accurate data
-    even when sensor updates don't land exactly on the boundary.
+    <strong>Energy Meter Tracker</strong> is a Home Assistant add-on that records your electricity usage in
+    configurable reconciliation periods — matching the intervals used by your energy supplier for billing.
+    It stores meter readings at each boundary so you can see exactly what happened in any given period,
+    including how much of your usage was from the grid versus your battery, EV or other device.
   </p>
 </div>
 
-<!-- ── The half-hour block ───────────────────────────────────────────────── -->
+<!-- ── The reconciliation period ─────────────────────────────────────────── -->
 <div class="card help-section">
   <div class="card-title">🕐 Meter Reconciliation Period</div>
   <p>
     Each block covers exactly one reconciliation period: for example <code>09:00 → 09:30</code> at 30 minutes,
     or <code>09:00 → 09:05</code> at 5 minutes. In the UK, energy suppliers use 30-minute half-hourly (HH)
-    settlement periods. Other countries may use different resolutions — some markets are moving to
-    15-minute or even 5-minute intervals. Configure the reconciliation period to match your supplier
+    settlement periods. Configure the reconciliation period to match your supplier
     before data collection begins. <strong>It cannot be changed without clearing all historical data.</strong>
-  </p>
-  <p>
-    Within each block the engine collects multiple readings from your sensors. When the block
-    closes at the boundary, it uses the readings either side of the boundary timestamp to
-    <strong>interpolate</strong> a precise opening and closing value — so even if your smart meter
-    only updates every 60 seconds, the block delta is accurate to the boundary, not to whenever
-    the last reading happened to arrive.
   </p>
   <div class="note-box">
     <strong>Why interpolation matters:</strong> If your meter reads 1000.0 kWh at 09:28 and
@@ -155,36 +73,80 @@
   <div class="card-title">⚖️ Main Meter &amp; Sub-meters</div>
   <p>
     The <strong>main meter</strong> reads directly from your smart meter via a Consumer Access
-    Device (CAD) connected to your local MQTT broker, typically updating every 10 seconds.
-    It is the <strong>authoritative source of truth</strong> for how much energy crossed the
-    grid boundary. Everything else is derived from it.
+    Device (CAD) and is the authoritative source of truth for how much energy crossed the grid boundary.
   </p>
   <p>
-    <strong>Sub-meters</strong> track individual devices — an EV charger, home battery, or
-    heat pump. They tell you how that grid energy was used, but they do not override the main
-    meter reading. Solar generation is not currently supported as a sub-meter type.
+    <strong>Sub-meters</strong> track individual devices — a home battery, EV charger, or heat pump.
+    Each sub-meter has a <strong>Meter Type</strong> which enables additional configuration and
+    drives the Live Power page display:
   </p>
+  <ul>
+    <li>🔋 <strong>Battery</strong> — enables SoC sensor and inverter power sensor fields. Shows a battery icon with charge level and an inverter gauge on Live Power.</li>
+    <li>🚗 <strong>EV Charger</strong> — enables a charger power sensor field. Shows a unidirectional charge gauge on Live Power. Mark as V2X capable if the vehicle supports vehicle-to-grid.</li>
+    <li>♨️ <strong>Heat Pump</strong> — enables a heat pump power sensor field. Shows a unidirectional power gauge on Live Power.</li>
+  </ul>
 
   <div class="two-col">
     <div class="note-box">
       <strong>Grid remainder</strong><br>
       In each block, sub-meter consumption is subtracted from the main meter's grid import.
       Whatever is left is the <em>remainder</em> — the portion of grid import not accounted for
-      by any sub-meter. This is what's used for billing calculations, not the raw main meter total.
+      by any sub-meter. This is what's used for billing calculations.
     </div>
     <div class="note-box">
-      <strong>Battery / inverter logic</strong><br>
+      <strong>Inverter possible</strong><br>
       Devices marked <em>inverter possible</em> may show consumption from battery discharge rather
-      than grid. The engine allocates grid energy to protected loads first (EV, heat pump), then
-      to inverter devices. Any excess sub-meter kWh is attributed to battery discharge.
+      than grid. The engine allocates grid energy to protected loads first, then to inverter devices.
+      This flag is set automatically for Battery type meters and can be enabled manually for any
+      sub-meter (e.g. an EV fed by a battery inverter).
     </div>
   </div>
 
   <div class="warn-box">
-    ⚠️ <strong>Export sub-metering and solar generation are not yet supported.</strong> The
-    export channel on the main meter records total grid export. Individual device export
-    (e.g. battery discharging to grid, or V2G from a V2X-capable EV) is not yet broken down
-    by sub-meter. Solar generation tracking is planned for a future release.
+    ⚠️ <strong>Export sub-metering and solar generation are not yet supported.</strong> Individual
+    device export (e.g. battery discharging to grid, V2G from a V2X-capable EV) is not yet broken
+    down by sub-meter. Solar generation tracking is planned for a future release.
+  </div>
+</div>
+
+<!-- ── Meter Config ───────────────────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">⚙️ Meter Configuration</div>
+  <p>
+    Meter IDs are assigned automatically and not shown in the UI — the <strong>Device Name</strong>
+    (for sub-meters) and <strong>Site Name</strong> (for the main meter) are the user-facing identifiers
+    used throughout charts and reports. Names must be unique, 40 characters or fewer, and contain only
+    letters, numbers, spaces and <code>' - &amp; ( ) .</code>
+  </p>
+  <p>
+    <strong>Deleting a sub-meter permanently removes all associated historical data</strong> from the
+    database. There is no recovery path — ensure you have a backup before deleting.
+  </p>
+  <p>
+    The <strong>change reason</strong> prompt only appears when billing-significant fields change
+    (billing day, block period, timezone, currency). Routine sensor or name updates save immediately.
+  </p>
+
+  <div class="two-col">
+    <div>
+      <p><strong>Battery sub-meter sensors</strong></p>
+      <ul>
+        <li><strong>Read sensor</strong> — cumulative kWh consumed (required)</li>
+        <li><strong>SoC sensor</strong> — battery state of charge in % (optional, Live Power only)</li>
+        <li><strong>Inverter power sensor</strong> — live inverter power in W or kW (optional, Live Power only)</li>
+      </ul>
+    </div>
+    <div>
+      <p><strong>EV / Heat Pump sub-meter sensors</strong></p>
+      <ul>
+        <li><strong>Read sensor</strong> — cumulative kWh consumed (required)</li>
+        <li><strong>Charger / Heat Pump power sensor</strong> — live power in W or kW (optional, Live Power only)</li>
+      </ul>
+    </div>
+  </div>
+  <div class="note-box">
+    ⓘ The SoC, inverter power, charger power and heat pump power sensors are <strong>informational only</strong> —
+    they are displayed on the Live Power page but are not recorded in blocks or used in any billing calculations.
   </div>
 </div>
 
@@ -205,28 +167,48 @@
       <p><strong>Rate sensors</strong></p>
       <ul>
         <li>Must be the <strong>current rate per kWh</strong> — the live tariff rate</li>
-        <li>Used to calculate cost per block</li>
-        <li>For Agile/flexible tariffs these change each reconciliation period — the engine captures the rate in effect during each block</li>
+        <li>For Agile/flexible tariffs these change each period</li>
         <li>Example: <code>sensor.octopus_energy_electricity_current_rate</code></li>
       </ul>
     </div>
     <div>
       <p><strong>Sub-meter — Read sensors</strong></p>
       <ul>
-        <li>Must be <strong>cumulative kWh consumed (import only)</strong> — not net usage, not export, not power in watts</li>
-        <li>Can update less frequently (60s+) — interpolation still works</li>
+        <li>Must be <strong>cumulative kWh consumed (import only)</strong> — not net, not export, not watts</li>
+        <li>Can update less frequently (60s+)</li>
         <li>CT clamp via PowerCalc, or native device integration (Zappi, Solax, etc.)</li>
-        <li>If no rate sensor is configured the main meter import rate is used automatically</li>
+        <li>If no rate sensor is configured the main meter import rate is used</li>
       </ul>
     </div>
     <div>
       <p><strong>Standing charge sensor</strong></p>
       <ul>
         <li>Must be a <strong>daily standing charge</strong> value</li>
-        <li>Can be a fixed <a href="https://www.home-assistant.io/integrations/input_number/" style="color:var(--accent);" target="_blank">input_number</a> helper if your supplier doesn't expose it</li>
+        <li>Can be a fixed <a href="https://www.home-assistant.io/integrations/input_number/" style="color:var(--accent);" target="_blank">input_number</a> helper</li>
         <li>Only needed on the main import channel</li>
       </ul>
     </div>
+  </div>
+</div>
+
+<!-- ── Live Power ─────────────────────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">⚡ Live Power Page</div>
+  <p>
+    The Live Power page shows your current grid power and billing totals. The summary row at the top
+    adapts to your configuration:
+  </p>
+  <ul>
+    <li><strong>Live Power gauge</strong> — net grid power (negative = exporting). Status pill shows Importing/Exporting/Net Zero with current kW.</li>
+    <li><strong>🔋 Battery card</strong> — appears when a battery sub-meter has SoC or inverter power sensors configured. Shows charge level (colour-coded green/amber/red) and a bidirectional inverter gauge (teal = discharging, purple = charging).</li>
+    <li><strong>🚗 EV Charger card</strong> — appears when an EV sub-meter has a charger power sensor configured. Shows a unidirectional charge gauge (0 on left, max on right). Gauge scale is derived from the 48-hour history.</li>
+    <li><strong>♨️ Heat Pump card</strong> — appears when a heat pump sub-meter has a power sensor configured. Same unidirectional gauge as the EV charger.</li>
+    <li><strong>🌿 Carbon Intensity card</strong> — appears when a postcode prefix is configured. Shows current gCO₂/kWh and 48-hour forecast.</li>
+  </ul>
+  <div class="note-box">
+    ⓘ Device name detection for Live Power cards uses the <strong>Meter Type</strong> field set in
+    Meter Config. If no type is set, keywords in the device name or meter ID are used as a fallback
+    (e.g. "battery", "charger", "zappi", "heat pump"). Setting the Meter Type explicitly is recommended.
   </div>
 </div>
 
@@ -236,50 +218,28 @@
   <p>
     If the add-on is stopped or Home Assistant restarts, the engine detects any missing blocks
     when it comes back online. It uses the last known reading before the outage and the first
-    reading after to <strong>interpolate the missing blocks</strong>, marking them as
-    <code>interpolated: true</code> in the data.
-  </p>
-  <p>
-    Interpolated blocks are less accurate than live-captured blocks but ensure your cumulative
-    totals remain consistent. Gaps longer than 12 hours are not interpolated — the blocks are
-    left as zero to avoid misleading data.
+    reading after to <strong>interpolate the missing blocks</strong>. Gaps longer than 12 hours
+    are not interpolated — the blocks are left as zero to avoid misleading data.
   </p>
 </div>
 
 <!-- ── Data storage ──────────────────────────────────────────────────────── -->
 <div class="card help-section">
   <div class="card-title">💾 Data Storage &amp; Backup</div>
-  <p>
-    All data is stored in a single SQLite database:
-  </p>
+  <p>All data is stored in a single SQLite database:</p>
   <ul>
     <li><code>blocks.db</code> — everything: all finalised blocks, config history, meter definitions, and current block state. This is the only file you need to back up.</li>
-    <li><code>meters_config.json</code> — human-readable config export, written automatically for reference. The database is authoritative — this file is not read back as live state.</li>
+    <li><code>meters_config.json</code> — human-readable config export only. The database is authoritative.</li>
   </ul>
   <p style="margin-top:12px;">
-    Data is stored in the add-on's private <code>/data/energy_meter_tracker/</code> directory. After
-    every block finalise, <code>blocks.db</code> is copied to
-    <code>/share/energy_meter_tracker_backup/</code> using SQLite's online backup API — no risk of
-    a corrupted mid-write copy. A zip snapshot is also created automatically before every config
-    save, and manually on demand from the
+    Data is stored in <code>/data/energy_meter_tracker/</code>. After every block finalise,
+    <code>blocks.db</code> is copied to <code>/share/energy_meter_tracker_backup/</code>.
+    A zip snapshot is created automatically before every config save and on demand from the
     <a href="{{ url_for('data_management_page') }}" style="color:var(--accent);">Data Management page</a>.
   </p>
   <div class="warn-box">
     ⚠️ <strong>Uninstalling the add-on will wipe <code>/data/</code>.</strong> Always ensure you
-    have a recent backup in <code>/share/</code> before uninstalling. Updating the add-on
-    (without uninstalling) preserves your data.
-  </div>
-  <div class="warn-box" style="margin-top:10px;">
-    ⚠️ <strong>Switching from a store add-on to a local add-on (or vice versa) will start with a fresh empty database.</strong>
-    Even if the slug is identical, HA's supervisor stores data in separate directories —
-    <code>local_</code> add-ons get a different path from store add-ons. Your existing data is
-    not lost but it will not be picked up automatically. The safe migration process is:
-    <ol style="margin-top:8px;margin-bottom:0;padding-left:20px;">
-      <li>Take a manual backup zip from the Data Management page <em>before</em> switching.</li>
-      <li>Install the new version and complete initial setup if prompted.</li>
-      <li>Go to Data Management and restore from the backup zip.</li>
-      <li>Uninstall the old version once you have confirmed data is intact.</li>
-    </ol>
+    have a recent backup in <code>/share/</code> before uninstalling.
   </div>
 </div>
 
@@ -288,12 +248,7 @@
   <div class="card-title">🐳 Standalone Docker</div>
   <p>
     When running in standalone Docker mode, the add-on connects to your HA instance using a
-    Long-Lived Access Token rather than the Supervisor. The UI is accessible directly at
-    <code>http://&lt;host&gt;:8099</code>.
-  </p>
-  <p style="margin-top:8px;">
-    <strong>Adding to the HA sidebar</strong> — add a <code>panel_iframe</code> entry to your
-    <code>configuration.yaml</code>:
+    Long-Lived Access Token. The UI is accessible directly at <code>http://&lt;host&gt;:8099</code>.
   </p>
   <pre class="help-pre">panel_iframe:
   energy_meter:
@@ -301,34 +256,20 @@
     icon: mdi:speedometer
     url: "http://192.168.1.x:8099"</pre>
   <p style="margin-top:8px;">
-    Replace <code>192.168.1.x</code> with your Docker host IP and restart HA. This adds a sidebar
-    entry that embeds the UI within HA — similar to the supervised experience.
-  </p>
-  <p style="margin-top:8px;">
-    <strong>Embedding charts in Lovelace</strong> — use the dedicated Lovelace endpoints
-    rather than the plain chart file URLs. These include a meta refresh and aggressive
-    no-cache headers so the Lovelace web card always shows current data:
+    <strong>Embedding charts in Lovelace</strong> — use the dedicated Lovelace endpoints:
   </p>
   <pre class="help-pre">http://192.168.1.x:8099/lovelace/billing   # Billing chart
 http://192.168.1.x:8099/lovelace/heatmap   # Net energy heatmap</pre>
-  <p style="margin-top:8px;">
-    Add these as <strong>Webpage</strong> cards in your Lovelace dashboard. The chart refreshes
-    every 130 seconds automatically — you do not need to set a refresh interval on the card itself.
-  </p>
   <div class="warn-box">
     ⚠️ <strong>The volume mount is essential.</strong> Always run with
-    <code>-v /path/to/data:/data/energy_meter_tracker</code> — without it all data is lost
-    when the container is recreated. The <code>/share</code> backup path is not available
-    in standalone mode so use the Backup Now button regularly.
+    <code>-v /path/to/data:/data/energy_meter_tracker</code>.
   </div>
 </div>
 
 <!-- ── HA sensors ────────────────────────────────────────────────────────── -->
 <div class="card help-section">
   <div class="card-title">🏠 Home Assistant Sensors</div>
-  <p>
-    After each block finalises, the engine updates four synthetic HA sensors with your cumulative totals:
-  </p>
+  <p>After each block finalises, the engine updates four synthetic HA sensors:</p>
   <ul>
     <li><code>sensor.energy_meter_import_kwh</code> — total grid import (kWh)</li>
     <li><code>sensor.energy_meter_export_kwh</code> — total grid export (kWh)</li>
@@ -338,17 +279,11 @@ http://192.168.1.x:8099/lovelace/heatmap   # Net energy heatmap</pre>
   <p style="margin-top:12px;">
     These sensors use <code>state_class: total_increasing</code> and <code>device_class: energy</code>
     so they are compatible with the HA Energy dashboard and Utility Meter integrations.
-    You can point Utility Meter helpers at these sensors to get daily, weekly, and monthly breakdowns.
   </p>
 </div>
 
 <div class="card help-section">
-  <div class="card-title">📖 Further Reading & Support</div>
-  <p>
-    The in-app help covers the essentials. For more detailed documentation including sensor
-    requirements, known limitations, integration guides, and hardware recommendations, see the
-    project wiki on GitHub.
-  </p>
+  <div class="card-title">📖 Further Reading &amp; Support</div>
   <ul>
     <li><a href="https://github.com/RGx01/energy-meter-tracker-addon/wiki" target="_blank" style="color:var(--accent);">GitHub Wiki</a> — sensor requirements, known limitations, integration guides</li>
     <li><a href="https://github.com/RGx01/energy-meter-tracker-addon/issues" target="_blank" style="color:var(--accent);">GitHub Issues</a> — bug reports and feature requests</li>
@@ -360,25 +295,20 @@ http://192.168.1.x:8099/lovelace/heatmap   # Net energy heatmap</pre>
 
 {% block scripts %}
 <script>
-// On mobile, make each help card collapsible by tapping the title
 (function() {
   if (window.innerWidth > 768) return;
   var cards = document.querySelectorAll('.help-section');
   cards.forEach(function(card, idx) {
     var title = card.querySelector('.card-title');
     if (!title) return;
-    // Collect all siblings after the title
     var siblings = [];
     var el = title.nextElementSibling;
     while (el) { siblings.push(el); el = el.nextElementSibling; }
-    // Wrap them
     var wrapper = document.createElement('div');
     siblings.forEach(function(s){ wrapper.appendChild(s); });
     card.appendChild(wrapper);
-    // First card open, rest collapsed
     var open = idx === 0;
     wrapper.style.display = open ? 'block' : 'none';
-    // Indicator
     var ind = document.createElement('span');
     ind.style.cssText = 'margin-left:auto;font-size:11px;color:var(--muted);';
     ind.textContent = open ? '▲' : '▼';

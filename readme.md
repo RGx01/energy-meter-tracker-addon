@@ -38,15 +38,31 @@ A Home Assistant add-on that records your electricity usage in precise configura
 - Records grid carbon intensity at every block (🇬🇧 UK, postcode required) for per-period carbon accounting
 - Carbon Insights: house consumption, solar offset, EV mileage and gCO₂/mile, battery charging behaviour, heat pump vs gas comparison
 
-## What's new in 2.6.0
+## What's new in 2.7.0
 
-- **🌿 Insights page** — dedicated carbon analysis by billing period. Cards adapt to your setup: Carbon Summary (all users), Solar Export Offset, House Consumption, Battery Charging Behaviour, Heat Pump, EV Charging. Navigate between billing periods with the prev/next selector or click the trend chart bars directly.
+- **⚡ Live Power — sub-meter cards** — battery, EV charger and heat pump sub-meters now show dedicated cards on the Live Power page. Battery cards show SoC with a colour-coded icon (green/amber/red) and a bidirectional inverter gauge (teal = discharging, purple = charging). EV charger cards show a unidirectional charge gauge with V2X support. Heat pump cards show a power gauge.
 
-- **⚙️ Settings page** — replaces the old Meter Config sidebar entry. Two tabs: **Meter Config** (all existing configuration) and **Carbon** (assumption overrides). Carbon tab covers petrol/diesel gCO₂/mile, EV efficiency and charging losses, battery round-trip efficiency, heat pump SCOP and gas comparison figures — all with citations, all overridable.
+- **Meter Type** — sub-meters now have an explicit type field (🔋 Battery / 🚗 EV Charger / ♨️ Heat Pump) in Settings → Meter Config. Setting the type unlocks the contextual sensor fields needed for Live Power cards. **Meter type is permanent once data has been recorded** — choose carefully.
 
-- **Honest carbon accounting** — all carbon figures and their accompanying kWh use only blocks with recorded carbon intensity data. Coverage percentage shown throughout. Partial-period carbon is never mixed with full-period kWh.
+- **More reliable restarts** — the engine now waits for all configured sensors to report before starting, and fetches carbon intensity data before gap filling. Gap fill blocks now carry correct rates, standing charges and carbon intensity rather than zeroes.
 
-- **`blocks.db` single source of truth** — `meters_config.json` is no longer read when `blocks.db` exists. Moving a database between environments now correctly picks up the DB's own site name, block size and timezone.
+- **Standing charge BST fix** — users in BST (UTC+1) may see corrected standing charge figures for some historical days in the billing chart and Usage Stats. This is correct data, not a regression.
+
+- **Sub-meter cascade delete** — removing a sub-meter from config now permanently deletes all its historical block data. A confirmation prompt makes this clear before proceeding.
+
+- **Delete Blocks time pickers** — the Delete Blocks page now accepts from/to times (local time) in addition to dates, allowing precise block removal within a single day.
+
+### Upgrading to 2.7.0 — action required
+
+**Existing sub-meter users** need to set the Meter Type for each sub-meter before the new Live Power cards will appear:
+
+1. Go to **Settings → Meter Config**
+2. Open each sub-meter card
+3. Select the correct type from the **Meter Type** dropdown
+4. Configure the sensor fields that appear (SoC sensor, inverter power sensor etc.)
+5. Save — the Live Power page will reload and show the new cards
+
+> ⚠️ Meter type cannot be changed after data has been recorded. If you set the wrong type you will need to delete the meter and all its data, then recreate it.
 
 ## Requirements
 
@@ -201,6 +217,7 @@ The Live Power page appears in the sidebar once a **power sensor** is configured
 It provides:
 
 - **Live power gauge** — shows net grid flow with asymmetric import/export scales derived from your usage history; colour reflects carbon intensity (UK) or import magnitude (global)
+- **Sub-meter cards** — battery, EV charger and heat pump sub-meters show dedicated cards with live gauges once a Meter Type and sensors are configured in Settings → Meter Config
 - **Billing cards** — Today, This Bill and This Year with full sub-meter breakdown; figures match the Billing chart exactly; This Bill uses your billing history to show the correct period even if your billing day has changed
 - **Carbon intensity** (🇬🇧 UK only) — add your outward postcode prefix (e.g. `DE1`) in Meter Config to enable a 48-hour forecast strip from the National Grid API
 
@@ -290,7 +307,5 @@ The volume mount is **essential** — without it all data is lost when the conta
 - 💬 [Community Forum](https://community.home-assistant.io/t/energy-meter-tracker/995674) — discussion and help
 
 ## Disclaimer
-
-Energy Meter Tracker is for informational use only. It cannot replicate your supplier's authoritative Half-Hourly reconciliation. Do not use this data for billing disputes or formal energy accounting.
 
 Energy Meter Tracker is for informational use only. It cannot replicate your supplier's authoritative Half-Hourly reconciliation. Do not use this data for billing disputes or formal energy accounting.

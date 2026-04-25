@@ -32,11 +32,17 @@
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;">
     <div>
       <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:6px;">From date <span style="font-weight:400;">(dd/mm/yyyy)</span></label>
-      <input type="date" id="del-from-date" style="width:100%;" lang="en-GB">
+      <div style="display:flex;gap:8px;">
+        <input type="date" id="del-from-date" style="flex:1;" lang="en-GB">
+        <input type="time" id="del-from-time" style="width:110px;" value="00:00" title="Start time (local)">
+      </div>
     </div>
     <div>
       <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:6px;">To date <span style="font-weight:400;">(dd/mm/yyyy)</span></label>
-      <input type="date" id="del-to-date" style="width:100%;" lang="en-GB">
+      <div style="display:flex;gap:8px;">
+        <input type="date" id="del-to-date" style="flex:1;" lang="en-GB">
+        <input type="time" id="del-to-time" style="width:110px;" value="23:59" title="End time (local)">
+      </div>
     </div>
   </div>
 
@@ -104,7 +110,9 @@ document.addEventListener('DOMContentLoaded', function() {
 
 function deleteBlocksPreview() {
   var fromDate = document.getElementById('del-from-date').value;
+  var fromTime = document.getElementById('del-from-time').value || '00:00';
   var toDate   = document.getElementById('del-to-date').value;
+  var toTime   = document.getElementById('del-to-time').value || '23:59';
   var meterId  = document.getElementById('del-meter-id').value || null;
   var errEl    = document.getElementById('del-error');
   var prevEl   = document.getElementById('del-preview');
@@ -129,7 +137,7 @@ function deleteBlocksPreview() {
   fetch(apiUrl('/api/blocks/delete/preview'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from_date: fromDate, to_date: toDate, meter_id: meterId })
+    body: JSON.stringify({ from_date: fromDate, from_time: fromTime, to_date: toDate, to_time: toTime, meter_id: meterId })
   })
   .then(function(r) { return r.json(); })
   .then(function(d) {
@@ -158,7 +166,9 @@ function deleteBlocksPreview() {
 
 function deleteBlocksApply() {
   var fromDate = document.getElementById('del-from-date').value;
+  var fromTime = document.getElementById('del-from-time').value || '00:00';
   var toDate   = document.getElementById('del-to-date').value;
+  var toTime   = document.getElementById('del-to-time').value || '23:59';
   var meterId  = document.getElementById('del-meter-id').value || null;
   var confBtn  = document.getElementById('del-confirm-btn');
   var errEl    = document.getElementById('del-error');
@@ -171,7 +181,7 @@ function deleteBlocksApply() {
   fetch(apiUrl('/api/blocks/delete'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from_date: fromDate, to_date: toDate, meter_id: meterId, confirmed: true })
+    body: JSON.stringify({ from_date: fromDate, from_time: fromTime, to_date: toDate, to_time: toTime, meter_id: meterId, confirmed: true })
   })
   .then(function(r) { return r.json(); })
   .then(function(d) {
