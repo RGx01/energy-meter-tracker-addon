@@ -1922,6 +1922,9 @@ async def engine_startup(ha: HAClient):
             # Always use now regardless of any date in the config JSON —
             # using a historical date would trigger gap fill for all missing blocks.
             _store.insert_config_period(config, effective_from=datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
+            # Clear any stale current_block from a previous session —
+            # if there's no config period, the current_block is invalid.
+            _store.save_current_block({})
             logger.info("engine_startup: new install — initial config period created")
 
     logger.info("engine_startup: %d existing blocks in store", _store.count_blocks())

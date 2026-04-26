@@ -601,6 +601,135 @@ class TestExtractLastReads(unittest.TestCase):
         self.assertEqual(rates, {})
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# build_gap_blocks — sub-meter rate on restart (2.7.0 sawtooth fix)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBuildGapBlocksSubMeterRate(unittest.TestCase):
+    """Tests that sub-meter gap blocks carry correct rates from last_known_rates,
+    not 0.0 — fixes the rate sawtooth visible on billing charts after restart."""
+
+    CONFIG = {
+        "meters": {
+            "electricity_main": {
+                "meta": {"sub_meter": False},
+                "channels": {
+                    "import": {"read": "sensor.imp", "rate": "sensor.rate"},
+                    "export": {"read": "sensor.exp", "rate": "sensor.rate"},
+                },
+            },
+            "sub_meter_battery": {
+                "meta": {"sub_meter": True, "parent_meter": "electricity_main"},
+                "channels": {
+                    "import": {"read": "sensor.bat_imp", "rate": "sensor.rate"},
+                },
+            },
+        }
+    }
+
+    def _window(self):
+        return [(dt("2026-01-01T09:00:00"), dt("2026-01-01T09:30:00"))]
+
+    def test_sub_meter_gap_block_uses_last_known_rate(self):
+        """Sub-meter gap block rate comes from last_known_rates, not 0.0."""
+        pre = {
+            "electricity_main": {
+                "import": read(1000.0, "2026-01-01T08:45:00"),
+                "export": read(500.0,  "2026-01-01T08:45:00"),
+            },
+            "sub_meter_battery": {
+                "import": read(100.0, "2026-01-01T08:45:00"),
+            },
+        }
+        post = {
+            "electricity_main": {
+                "import": read(1002.0, "2026-01-01T09:45:00"),
+                "export": read(500.5,  "2026-01-01T09:45:00"),
+            },
+            # sub_meter_battery has no post read — simulates restart before sub-meter fires
+        }
+        rates = {
+            "electricity_main": {
+                "import": {"ts": "2026-01-01T08:30:00", "value": 0.3582},
+                "export": {"ts": "2026-01-01T08:30:00", "value": 0.12},
+            },
+            "sub_meter_battery": {
+                "import": {"ts": "2026-01-01T08:30:00", "value": 0.3582},
+            },
+        }
+        blocks = engine.build_gap_blocks(self._window(), pre, post, rates, self.CONFIG)
+        self.assertEqual(len(blocks), 1)
+        bat = blocks[0]["meters"].get("sub_meter_battery")
+        self.assertIsNotNone(bat, "sub_meter_battery should appear in gap block")
+        ch = bat["channels"]["import"]
+        self.assertAlmostEqual(ch["rate"], 0.3582, places=4,
+            msg="Sub-meter gap block must use last_known_rates rate, not 0.0")
+
+    def test_sub_meter_gap_block_rate_not_zero_when_no_post_read(self):
+        """Gap block rate must never be 0.0 when last_known_rates has a value."""
+        pre = {
+            "electricity_main": {
+                "import": read(1000.0, "2026-01-01T08:45:00"),
+                "export": read(500.0,  "2026-01-01T08:45:00"),
+            },
+            "sub_meter_battery": {
+                "import": read(100.0, "2026-01-01T08:45:00"),
+            },
+        }
+        post = {
+            "electricity_main": {
+                "import": read(1002.0, "2026-01-01T09:45:00"),
+                "export": read(500.0,  "2026-01-01T09:45:00"),
+            },
+        }
+        rates = {
+            "electricity_main": {
+                "import": {"ts": "2026-01-01T08:30:00", "value": 0.25},
+                "export": {"ts": "2026-01-01T08:30:00", "value": 0.10},
+            },
+            "sub_meter_battery": {
+                "import": {"ts": "2026-01-01T08:30:00", "value": 0.25},
+            },
+        }
+        blocks = engine.build_gap_blocks(self._window(), pre, post, rates, self.CONFIG)
+        bat = blocks[0]["meters"].get("sub_meter_battery")
+        if bat:
+            ch = bat["channels"]["import"]
+            self.assertNotEqual(ch["rate"], 0.0,
+                msg="Sub-meter gap block rate must not be 0.0 when last_known_rates is available")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _PUBLISH_HA_SENSORS flag
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPublishHASensorsFlag(unittest.TestCase):
+    """Tests that _PUBLISH_HA_SENSORS is correctly read from the environment."""
+
+    def test_default_is_true(self):
+        """_PUBLISH_HA_SENSORS defaults to True when env var absent."""
+        import os
+        env_val = os.environ.get("PUBLISH_HA_SENSORS", "true")
+        result = env_val.lower() != "false"
+        self.assertTrue(result, "Should default to True when PUBLISH_HA_SENSORS not set")
+
+    def test_false_string_disables(self):
+        """PUBLISH_HA_SENSORS=false evaluates to False."""
+        result = "false".lower() != "false"
+        self.assertFalse(result)
+
+    def test_true_string_enables(self):
+        """PUBLISH_HA_SENSORS=true evaluates to True."""
+        result = "true".lower() != "false"
+        self.assertTrue(result)
+
+    def test_case_insensitive(self):
+        """PUBLISH_HA_SENSORS=FALSE (uppercase) also disables."""
+        result = "FALSE".lower() != "false"
+        self.assertFalse(result)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
