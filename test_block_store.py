@@ -2636,3 +2636,405 @@ class TestMeterTypePersistence(unittest.TestCase):
             "SELECT inverter_possible FROM meters WHERE meter_id = 'sub_meter_ev_001'"
         ).fetchone()
         self.assertEqual(row["inverter_possible"], 0)
+
+
+
+import tempfile
+from block_store import BlockStore
+
+class TestInverterPowerInvert(unittest.TestCase):
+    """Tests for inverter_power_invert field persistence through write/read roundtrip."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        self.tmp.close()
+        self.store = BlockStore(self.tmp.name)
+
+    def tearDown(self):
+        self.store._conn.close()
+        os.unlink(self.tmp.name)
+
+    BASE_CONFIG = {
+        "meters": {
+            "electricity_main": {
+                "meta": {
+                    "site": "Test Home", "timezone": "UTC",
+                    "billing_day": 1, "block_minutes": 30,
+                    "currency_symbol": "£", "currency_code": "GBP",
+                },
+                "channels": {
+                    "import": {"sensor": "sensor.import"},
+                    "export": {"sensor": "sensor.export"},
+                },
+            },
+            "sub_meter_battery_001": {
+                "meta": {
+                    "sub_meter": True, "meter_type": "battery",
+                    "device": "House Battery",
+                    "parent_meter": "electricity_main",
+                    "soc_sensor": "sensor.soc",
+                    "inverter_power_sensor": "sensor.inv_power",
+                    "inverter_power_invert": True,
+                },
+                "channels": { "import": {"sensor": "sensor.battery_import"} },
+            },
+        }
+    }
+
+    def test_inverter_power_invert_true_roundtrip(self):
+        """inverter_power_invert=True persists through insert and config_from_db."""
+        self.store.insert_config_period(self.BASE_CONFIG)
+        pid = self.store.get_current_config_period_id()
+        restored = self.store.config_from_db(pid)
+        sub = restored["meters"]["sub_meter_battery_001"]["meta"]
+        self.assertTrue(sub.get("inverter_power_invert"),
+                        "inverter_power_invert should be True after roundtrip")
+
+    def test_inverter_power_invert_false_not_in_meta(self):
+        """inverter_power_invert=False is not included in meta (falsy values omitted)."""
+        cfg = {
+            "meters": {
+                "electricity_main": self.BASE_CONFIG["meters"]["electricity_main"],
+                "sub_meter_battery_002": {
+                    "meta": {
+                        "sub_meter": True, "meter_type": "battery",
+                        "device": "Battery 2",
+                        "parent_meter": "electricity_main",
+                        "inverter_power_invert": False,
+                    },
+                    "channels": { "import": {"sensor": "sensor.bat2"} },
+                }
+            }
+        }
+        self.store.insert_config_period(cfg)
+        pid = self.store.get_current_config_period_id()
+        restored = self.store.config_from_db(pid)
+        sub = restored["meters"]["sub_meter_battery_002"]["meta"]
+        self.assertFalse(sub.get("inverter_power_invert"),
+                         "inverter_power_invert=False should not appear in meta")
+
+    def test_inverter_power_invert_db_column(self):
+        """inverter_power_invert is stored as INTEGER 1 in the meters table."""
+        self.store.insert_config_period(self.BASE_CONFIG)
+        row = self.store._conn.execute(
+            "SELECT inverter_power_invert FROM meters WHERE meter_id = 'sub_meter_battery_001'"
+        ).fetchone()
+        self.assertEqual(row["inverter_power_invert"], 1)
+
+    def test_inverter_power_invert_stored_as_integer_one(self):
+        """inverter_power_invert=True is stored as INTEGER 1 in meters table after insert."""
+        self.store.insert_config_period(self.BASE_CONFIG)
+        row = self.store._conn.execute(
+            "SELECT inverter_power_invert FROM meters WHERE meter_id = 'sub_meter_battery_001'"
+        ).fetchone()
+        self.assertIsNotNone(row, "meter row should exist")
+        self.assertEqual(row["inverter_power_invert"], 1,
+                         "inverter_power_invert=True should be stored as INTEGER 1")
+
+
+class TestConfigFromDbReconstruction(unittest.TestCase):
+    """Tests that config_from_db correctly reconstructs all meter meta fields."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        self.tmp.close()
+        self.store = BlockStore(self.tmp.name)
+        self.FULL_CONFIG = {
+            "meters": {
+                "electricity_main": {
+                    "meta": {
+                        "site": "My Home", "timezone": "Europe/London",
+                        "billing_day": 3, "block_minutes": 30,
+                        "currency_symbol": "£", "currency_code": "GBP",
+                        "power_sensor": "sensor.smart_meter_power",
+                        "postcode_prefix": "DE1",
+                        "supplier": "Octopus Energy",
+                    },
+                    "channels": {
+                        "import": {"read": "sensor.import", "rate": "sensor.rate"},
+                        "export": {"read": "sensor.export", "rate": "sensor.export_rate"},
+                    },
+                },
+                "sub_meter_battery": {
+                    "meta": {
+                        "sub_meter": True, "meter_type": "battery",
+                        "device": "Solax Battery",
+                        "parent_meter": "electricity_main",
+                        "soc_sensor": "sensor.solax_soc",
+                        "inverter_power_sensor": "sensor.solax_power",
+                        "inverter_power_invert": True,
+                        "inverter_possible": True,
+                    },
+                    "channels": { "import": {"read": "sensor.solax_kwh", "rate": "sensor.rate"} },
+                },
+                "sub_meter_ev": {
+                    "meta": {
+                        "sub_meter": True, "meter_type": "ev",
+                        "device": "Zappi Charger",
+                        "parent_meter": "electricity_main",
+                        "device_power_sensor": "sensor.zappi_power",
+                        "v2x_capable": True,
+                    },
+                    "channels": { "import": {"read": "sensor.zappi_kwh", "rate": "sensor.rate"} },
+                },
+                "sub_meter_hp": {
+                    "meta": {
+                        "sub_meter": True, "meter_type": "heat_pump",
+                        "device": "Heat Pump",
+                        "parent_meter": "electricity_main",
+                        "device_power_sensor": "sensor.hp_power",
+                    },
+                    "channels": { "import": {"read": "sensor.hp_kwh", "rate": "sensor.rate"} },
+                },
+            }
+        }
+        self.store.insert_config_period(self.FULL_CONFIG)
+        self.pid = self.store.get_current_config_period_id()
+        self.restored = self.store.config_from_db(self.pid)
+
+    def tearDown(self):
+        self.store._conn.close()
+        os.unlink(self.tmp.name)
+
+    def test_site_name_reconstructed(self):
+        main = self.restored["meters"]["electricity_main"]["meta"]
+        self.assertEqual(main.get("site"), "My Home")
+
+    def test_postcode_reconstructed(self):
+        main = self.restored["meters"]["electricity_main"]["meta"]
+        self.assertEqual(main.get("postcode_prefix"), "DE1")
+
+    def test_battery_soc_sensor_reconstructed(self):
+        sub = self.restored["meters"]["sub_meter_battery"]["meta"]
+        self.assertEqual(sub.get("soc_sensor"), "sensor.solax_soc")
+
+    def test_battery_inverter_power_sensor_reconstructed(self):
+        sub = self.restored["meters"]["sub_meter_battery"]["meta"]
+        self.assertEqual(sub.get("inverter_power_sensor"), "sensor.solax_power")
+
+    def test_battery_inverter_power_invert_reconstructed(self):
+        sub = self.restored["meters"]["sub_meter_battery"]["meta"]
+        self.assertTrue(sub.get("inverter_power_invert"))
+
+    def test_battery_meter_type_reconstructed(self):
+        sub = self.restored["meters"]["sub_meter_battery"]["meta"]
+        self.assertEqual(sub.get("meter_type"), "battery")
+
+    def test_ev_device_power_sensor_reconstructed(self):
+        sub = self.restored["meters"]["sub_meter_ev"]["meta"]
+        self.assertEqual(sub.get("device_power_sensor"), "sensor.zappi_power")
+
+    def test_ev_v2x_capable_reconstructed(self):
+        sub = self.restored["meters"]["sub_meter_ev"]["meta"]
+        self.assertTrue(sub.get("v2x_capable"))
+
+    def test_ev_meter_type_reconstructed(self):
+        sub = self.restored["meters"]["sub_meter_ev"]["meta"]
+        self.assertEqual(sub.get("meter_type"), "ev")
+
+    def test_hp_device_power_sensor_reconstructed(self):
+        sub = self.restored["meters"]["sub_meter_hp"]["meta"]
+        self.assertEqual(sub.get("device_power_sensor"), "sensor.hp_power")
+
+    def test_hp_meter_type_reconstructed(self):
+        sub = self.restored["meters"]["sub_meter_hp"]["meta"]
+        self.assertEqual(sub.get("meter_type"), "heat_pump")
+
+    def test_all_meters_present(self):
+        self.assertEqual(len(self.restored["meters"]), 4)
+
+
+class TestCascadeDeleteConfig(unittest.TestCase):
+    """Tests that cascade delete correctly removes meter from meters table."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        self.tmp.close()
+        self.store = BlockStore(self.tmp.name)
+        self.CONFIG = {
+            "meters": {
+                "electricity_main": {
+                    "meta": {
+                        "site": "Test", "timezone": "UTC",
+                        "billing_day": 1, "block_minutes": 30,
+                        "currency_symbol": "£", "currency_code": "GBP",
+                    },
+                    "channels": {
+                        "import": {"read": "sensor.imp", "rate": "sensor.rate"},
+                        "export": {"read": "sensor.exp", "rate": "sensor.rate"},
+                    },
+                },
+                "sub_meter_battery": {
+                    "meta": {
+                        "sub_meter": True, "meter_type": "battery",
+                        "device": "House Battery",
+                        "parent_meter": "electricity_main",
+                    },
+                    "channels": { "import": {"read": "sensor.bat", "rate": "sensor.rate"} },
+                },
+            }
+        }
+        self.store.insert_config_period(self.CONFIG)
+        self.pid = self.store.get_current_config_period_id()
+
+    def tearDown(self):
+        self.store._conn.close()
+        os.unlink(self.tmp.name)
+
+    def _write_meters_delete_then_rewrite(self, new_cfg):
+        """Mirrors the delete-then-rewrite pattern in api_meter_delete_data."""
+        with self.store._conn:
+            old_ids = [r["id"] for r in self.store._conn.execute(
+                "SELECT id FROM meters WHERE config_period_id=?", (self.pid,)
+            ).fetchall()]
+            for oid in old_ids:
+                self.store._conn.execute(
+                    "DELETE FROM meter_channels WHERE meter_id=?", (oid,)
+                )
+            self.store._conn.execute(
+                "DELETE FROM meters WHERE config_period_id=?", (self.pid,)
+            )
+            self.store._write_meters(new_cfg, self.pid)
+
+    def test_meter_present_before_delete(self):
+        """Both meters exist before delete."""
+        restored = self.store.config_from_db(self.pid)
+        self.assertIn("sub_meter_battery", restored["meters"])
+        self.assertIn("electricity_main", restored["meters"])
+
+    def test_meter_absent_after_delete_rewrite(self):
+        """Sub-meter is absent after delete-then-rewrite with config that excludes it."""
+        new_cfg = {
+            "meters": {
+                "electricity_main": self.CONFIG["meters"]["electricity_main"]
+            }
+        }
+        self._write_meters_delete_then_rewrite(new_cfg)
+        restored = self.store.config_from_db(self.pid)
+        self.assertNotIn("sub_meter_battery", restored["meters"],
+                         "Deleted sub-meter should not appear in config_from_db")
+
+    def test_main_meter_preserved_after_delete(self):
+        """Main meter is preserved after sub-meter delete."""
+        new_cfg = {
+            "meters": {
+                "electricity_main": self.CONFIG["meters"]["electricity_main"]
+            }
+        }
+        self._write_meters_delete_then_rewrite(new_cfg)
+        restored = self.store.config_from_db(self.pid)
+        self.assertIn("electricity_main", restored["meters"])
+
+    def test_both_meters_present_without_delete(self):
+        """Both meters present in config_from_db after initial insert — no delete performed."""
+        restored = self.store.config_from_db(self.pid)
+        self.assertIn("sub_meter_battery", restored["meters"])
+        self.assertIn("electricity_main", restored["meters"])
+        self.assertEqual(len(restored["meters"]), 2)
+
+
+class TestFreshInstallNoDuplicatePeriod(unittest.TestCase):
+    """Tests that a fresh install doesn't create a duplicate billing period."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        self.tmp.close()
+        self.store = BlockStore(self.tmp.name)
+
+    def tearDown(self):
+        self.store._conn.close()
+        os.unlink(self.tmp.name)
+
+    def test_no_blocks_period_updated_in_place(self):
+        """When current period has 0 blocks, _write_meters update replaces rather than creates."""
+        # Simulate engine creating initial empty period
+        empty_cfg = {
+            "meters": {
+                "electricity_main": {
+                    "meta": {
+                        "site": "", "timezone": "UTC",
+                        "billing_day": 1, "block_minutes": 30,
+                        "currency_symbol": "£", "currency_code": "GBP",
+                    },
+                    "channels": {
+                        "import": {"read": "", "rate": ""},
+                        "export": {"read": "", "rate": ""},
+                    },
+                }
+            }
+        }
+        self.store.insert_config_period(empty_cfg)
+        pid1 = self.store.get_current_config_period_id()
+
+        # Verify no blocks
+        block_count = self.store._conn.execute(
+            "SELECT COUNT(*) FROM blocks WHERE config_period_id=?", (pid1,)
+        ).fetchone()[0]
+        self.assertEqual(block_count, 0)
+
+        # Simulate wizard saving full config — should update period 1, not create period 2
+        full_cfg = {
+            "meters": {
+                "electricity_main": {
+                    "meta": {
+                        "site": "My Home", "timezone": "Europe/London",
+                        "billing_day": 1, "block_minutes": 30,
+                        "currency_symbol": "£", "currency_code": "GBP",
+                        "supplier": "Octopus Energy",
+                    },
+                    "channels": {
+                        "import": {"read": "sensor.import", "rate": "sensor.rate"},
+                        "export": {"read": "sensor.export", "rate": "sensor.rate"},
+                    },
+                }
+            }
+        }
+        # Rewrite meters for existing period (simulates api_save_config block_count==0 path)
+        with self.store._conn:
+            old_ids = [r["id"] for r in self.store._conn.execute(
+                "SELECT id FROM meters WHERE config_period_id=?", (pid1,)
+            ).fetchall()]
+            for oid in old_ids:
+                self.store._conn.execute("DELETE FROM meter_channels WHERE meter_id=?", (oid,))
+            self.store._conn.execute("DELETE FROM meters WHERE config_period_id=?", (pid1,))
+            self.store._write_meters(full_cfg, pid1)
+
+        # Should still be only one config period
+        periods = self.store._conn.execute(
+            "SELECT COUNT(*) FROM config_periods"
+        ).fetchone()[0]
+        self.assertEqual(periods, 1, "Should be exactly 1 config period after wizard save on fresh install")
+
+    def test_period_count_after_two_saves_with_no_blocks(self):
+        """Multiple saves with 0 blocks should not accumulate periods."""
+        cfg = {
+            "meters": {
+                "electricity_main": {
+                    "meta": {
+                        "site": "Home", "timezone": "UTC",
+                        "billing_day": 1, "block_minutes": 30,
+                        "currency_symbol": "£", "currency_code": "GBP",
+                    },
+                    "channels": {
+                        "import": {"read": "sensor.import", "rate": "sensor.rate"},
+                        "export": {"read": "", "rate": ""},
+                    },
+                }
+            }
+        }
+        self.store.insert_config_period(cfg)
+        pid = self.store.get_current_config_period_id()
+
+        # Two updates on same zero-block period
+        for _ in range(2):
+            with self.store._conn:
+                old_ids = [r["id"] for r in self.store._conn.execute(
+                    "SELECT id FROM meters WHERE config_period_id=?", (pid,)
+                ).fetchall()]
+                for oid in old_ids:
+                    self.store._conn.execute("DELETE FROM meter_channels WHERE meter_id=?", (oid,))
+                self.store._conn.execute("DELETE FROM meters WHERE config_period_id=?", (pid,))
+                self.store._write_meters(cfg, pid)
+
+        periods = self.store._conn.execute("SELECT COUNT(*) FROM config_periods").fetchone()[0]
+        self.assertEqual(periods, 1)

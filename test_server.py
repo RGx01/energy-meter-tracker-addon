@@ -1801,3 +1801,294 @@ class TestRenamedRoutes(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.7.0 — new routes registered
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNewRoutesRegistered270(unittest.TestCase):
+    """Verify all new 2.7.0 API routes are registered."""
+
+    def setUp(self):
+        self.client = make_client()
+
+    def _registered(self, endpoint):
+        return endpoint in [r.endpoint for r in server.app.url_map.iter_rules()]
+
+    def test_api_meter_delete_data_registered(self):
+        self.assertTrue(self._registered("api_meter_delete_data"))
+
+    def test_api_sub_meter_history_registered(self):
+        self.assertTrue(self._registered("api_sub_meter_history"))
+
+    def test_api_entities_registered(self):
+        self.assertTrue(self._registered("api_entities"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.7.0 — api_meter_delete_data
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApiMeterDeleteData(unittest.TestCase):
+    """Tests for the atomic cascade delete endpoint."""
+
+    CONFIG_WITH_SUB = {
+        "meters": {
+            "electricity_main": {
+                "meta": {
+                    "billing_day": 1, "block_minutes": 30,
+                    "timezone": "Europe/London",
+                    "currency_symbol": "£", "currency_code": "GBP",
+                    "site": "Test Home",
+                },
+                "channels": {
+                    "import": {"read": "sensor.imp", "rate": "sensor.rate"},
+                    "export": {"read": "sensor.exp", "rate": "sensor.rate"},
+                },
+            },
+            "sub_meter_battery": {
+                "meta": {
+                    "sub_meter": True, "meter_type": "battery",
+                    "device": "House Battery",
+                    "parent_meter": "electricity_main",
+                },
+                "channels": {
+                    "import": {"read": "sensor.bat", "rate": "sensor.rate"},
+                },
+            },
+        }
+    }
+
+    def setUp(self):
+        store = BlockStore(":memory:")
+        store.insert_config_period(self.CONFIG_WITH_SUB)
+        # Add a block for the sub-meter using the correct format
+        store.append_blocks([{
+            "start": "2026-01-15T08:00:00",
+            "end":   "2026-01-15T08:30:00",
+            "meters": {
+                "sub_meter_battery": {
+                    "meta": {"billing_day": 1, "block_minutes": 30, "timezone": "UTC"},
+                    "channels": {
+                        "import": {
+                            "kwh": 0.5, "kwh_total": 0.5, "kwh_remainder": 0.5,
+                            "cost": 0.18, "rate": 0.32,
+                            "read_start": 100.0, "read_end": 100.5,
+                        }
+                    },
+                    "standing_charge": 0.0,
+                    "interpolated": False,
+                }
+            },
+            "totals": {"import_kwh": 0.5, "import_cost": 0.18},
+            "interpolated": False,
+        }])
+        self.client = make_client(store=store)
+        # Config without sub-meter (for sending in delete request)
+        self.new_config = {
+            "meters": {
+                "electricity_main": self.CONFIG_WITH_SUB["meters"]["electricity_main"]
+            }
+        }
+
+    def test_delete_returns_200(self):
+        r = self.client.post(
+            "/api/meter/sub_meter_battery/delete-data",
+            data=json.dumps({"config": self.new_config}),
+            content_type="application/json"
+        )
+        self.assertEqual(r.status_code, 200)
+
+    def test_delete_returns_ok_true(self):
+        r = self.client.post(
+            "/api/meter/sub_meter_battery/delete-data",
+            data=json.dumps({"config": self.new_config}),
+            content_type="application/json"
+        )
+        data = json.loads(r.data)
+        self.assertTrue(data.get("ok"))
+
+    def test_delete_reports_blocks_deleted(self):
+        r = self.client.post(
+            "/api/meter/sub_meter_battery/delete-data",
+            data=json.dumps({"config": self.new_config}),
+            content_type="application/json"
+        )
+        data = json.loads(r.data)
+        self.assertIn("deleted", data)
+        self.assertGreaterEqual(data["deleted"].get("blocks", 0), 1,
+            "At least 1 block should be reported as deleted")
+
+    def test_delete_nonexistent_meter_still_ok(self):
+        """Deleting a meter with no blocks should still return ok."""
+        r = self.client.post(
+            "/api/meter/nonexistent_meter/delete-data",
+            data=json.dumps({"config": self.new_config}),
+            content_type="application/json"
+        )
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertTrue(data.get("ok"))
+        self.assertEqual(data["deleted"].get("blocks", 0), 0)
+
+    def test_delete_without_config_still_works(self):
+        """Delete with no config body should still delete blocks."""
+        r = self.client.post(
+            "/api/meter/sub_meter_battery/delete-data",
+            data=json.dumps({}),
+            content_type="application/json"
+        )
+        self.assertEqual(r.status_code, 200)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.7.0 — api_save_config: name validation and fresh install period handling
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApiSaveConfigValidation(unittest.TestCase):
+    """Tests for device name validation in api_save_config."""
+
+    def setUp(self):
+        self.client = make_client()
+
+    def _save(self, config):
+        return self.client.post(
+            "/api/config",
+            data=json.dumps(config),
+            content_type="application/json"
+        )
+
+    def test_valid_config_returns_ok(self):
+        with patch.object(server, "save_config", return_value=None), \
+             patch.object(server, "_create_backup_zip", return_value=None):
+            r = self._save(MINIMAL_CONFIG)
+        self.assertEqual(r.status_code, 200)
+
+    def test_duplicate_device_name_rejected(self):
+        cfg = {
+            "meters": {
+                "electricity_main": MINIMAL_CONFIG["meters"]["electricity_main"],
+                "sub_meter_001": {
+                    "meta": {"sub_meter": True, "device": "Battery"},
+                    "channels": {"import": {"read": "s.a", "rate": "s.b"}},
+                },
+                "sub_meter_002": {
+                    "meta": {"sub_meter": True, "device": "Battery"},
+                    "channels": {"import": {"read": "s.c", "rate": "s.d"}},
+                },
+            }
+        }
+        r = self._save(cfg)
+        self.assertEqual(r.status_code, 400)
+        data = json.loads(r.data)
+        self.assertIn("error", data)
+        self.assertIn("already used", data["error"])
+
+    def test_device_name_too_long_rejected(self):
+        cfg = {
+            "meters": {
+                "electricity_main": MINIMAL_CONFIG["meters"]["electricity_main"],
+                "sub_meter_001": {
+                    "meta": {"sub_meter": True, "device": "A" * 41},
+                    "channels": {"import": {"read": "s.a", "rate": "s.b"}},
+                },
+            }
+        }
+        r = self._save(cfg)
+        self.assertEqual(r.status_code, 400)
+        data = json.loads(r.data)
+        self.assertIn("40 characters", data["error"])
+
+    def test_device_name_invalid_chars_rejected(self):
+        cfg = {
+            "meters": {
+                "electricity_main": MINIMAL_CONFIG["meters"]["electricity_main"],
+                "sub_meter_001": {
+                    "meta": {"sub_meter": True, "device": "Battery<script>"},
+                    "channels": {"import": {"read": "s.a", "rate": "s.b"}},
+                },
+            }
+        }
+        r = self._save(cfg)
+        self.assertEqual(r.status_code, 400)
+        data = json.loads(r.data)
+        self.assertIn("invalid characters", data["error"])
+
+    def test_missing_meters_key_rejected(self):
+        r = self._save({"site": "Home"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_duplicate_check_case_insensitive(self):
+        """'battery' and 'Battery' should be treated as duplicates."""
+        cfg = {
+            "meters": {
+                "electricity_main": MINIMAL_CONFIG["meters"]["electricity_main"],
+                "sub_meter_001": {
+                    "meta": {"sub_meter": True, "device": "battery"},
+                    "channels": {"import": {"read": "s.a", "rate": "s.b"}},
+                },
+                "sub_meter_002": {
+                    "meta": {"sub_meter": True, "device": "Battery"},
+                    "channels": {"import": {"read": "s.c", "rate": "s.d"}},
+                },
+            }
+        }
+        r = self._save(cfg)
+        self.assertEqual(r.status_code, 400)
+
+
+class TestApiSaveConfigFreshInstall(unittest.TestCase):
+    """Tests that wizard save on fresh install doesn't create a duplicate period."""
+
+    def setUp(self):
+        # Fresh store with zero blocks
+        self.store = BlockStore(":memory:")
+        self.store.insert_config_period({
+            "meters": {
+                "electricity_main": {
+                    "meta": {
+                        "billing_day": 1, "block_minutes": 30,
+                        "timezone": "UTC",
+                        "currency_symbol": "£", "currency_code": "GBP",
+                        "site": "",
+                    },
+                    "channels": {
+                        "import": {"read": "", "rate": ""},
+                        "export": {"read": "", "rate": ""},
+                    },
+                }
+            }
+        })
+        self.client = make_client(store=self.store)
+
+    def test_zero_blocks_period_not_duplicated(self):
+        """Saving config with 0 blocks should not create a new config period."""
+        full_cfg = {
+            "meters": {
+                "electricity_main": {
+                    "meta": {
+                        "billing_day": 1, "block_minutes": 30,
+                        "timezone": "Europe/London",
+                        "currency_symbol": "£", "currency_code": "GBP",
+                        "site": "My Home",
+                        "supplier": "Octopus Energy",
+                    },
+                    "channels": {
+                        "import": {"read": "sensor.import", "rate": "sensor.rate"},
+                        "export": {"read": "sensor.export", "rate": "sensor.rate"},
+                    },
+                }
+            }
+        }
+        with patch.object(server, "_create_backup_zip", return_value=None):
+            r = self.client.post(
+                "/api/config",
+                data=json.dumps(full_cfg),
+                content_type="application/json"
+            )
+        self.assertEqual(r.status_code, 200)
+        period_count = self.store._conn.execute(
+            "SELECT COUNT(*) FROM config_periods"
+        ).fetchone()[0]
+        self.assertEqual(period_count, 1,
+            "Fresh install wizard save should update existing period, not create a new one")

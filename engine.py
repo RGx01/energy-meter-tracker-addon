@@ -447,6 +447,19 @@ def ensure_correct_block(ha: HAClient, current_block: dict, now: datetime,
             current_block = fresh
 
     if not current_block or not current_block.get("start"):
+        # Don't create the first block until sensors are configured.
+        # If no import sensor is set we're in the pre-wizard state —
+        # the block_minutes value is the default (30) which may not match
+        # what the wizard will set. Creating a block now would cause a
+        # block-size mismatch and racing after wizard saves.
+        cfg = load_config()
+        has_sensors = any(
+            (meter.get("channels") or {}).get("import", {}).get("read")
+            for meter in (cfg.get("meters") or {}).values()
+            if not (meter.get("meta") or {}).get("sub_meter")
+        )
+        if not has_sensors:
+            return current_block  # return None/empty — no block yet
         logger.info("Creating first block %s", iso(start))
         return create_block(start, end, block_minutes=int(get_block_minutes()))
 
@@ -1918,8 +1931,13 @@ async def engine_startup(ha: HAClient):
             migrated = migrate_json_to_sqlite(BLOCKS_PATH + ".migrated", _store, _migration_config)
             logger.info("engine_startup: re-migration complete — %d blocks migrated", migrated)
         else:
-            # Brand new install — create initial config period
-            _store.insert_config_period(config)
+            # Brand new install — create initial config period starting NOW
+            # Always use now regardless of any date in the config JSON —
+            # using a historical date would trigger gap fill for all missing blocks.
+            _store.insert_config_period(config, effective_from=datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
+            # Clear any stale current_block from a previous session —
+            # if there's no config period, the current_block is invalid.
+            _store.save_current_block({})
             logger.info("engine_startup: new install — initial config period created")
 
     logger.info("engine_startup: %d existing blocks in store", _store.count_blocks())
