@@ -152,8 +152,6 @@
 
 ### 2.7.1
 - **CI gap backfill** — scan blocks with `NULL carbon_g` and backfill from stored `carbon_intensity` table; fetch historical CI from National Grid ESO range endpoint for any gaps not already stored. Was planned for 2.6.4 but slipped.
-- **Test suite updates** — block_store tests for `inverter_power_invert` roundtrip, `config_from_db` reconstruction, cascade delete atomicity; server-level tests for `api_meter_delete_data` atomic operation, `block_count == 0` period update path, wizard fresh-install single-period behaviour
-- **Live Power card layout** — responsive grid with minimum card widths, zoom/focus toggle per card; CI card double-width or anchored to its own row when gauge count is high
 - **Toolbar unification** — billing chart, heatmap and Insights toolbars refactored to match the Usage Stats pattern (segmented tabs in topbar, period nav in floating sub-bar, consistent mobile collapse)
 
 ### 2.8.0 — Usage Insights Tab
