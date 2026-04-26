@@ -18,6 +18,19 @@
 {% block subbar %}
 <div class="settings-subbar">
   <button class="btn btn-secondary" id="btn-wizard">✦ Setup Wizard</button>
+  <div style="position:relative;display:inline-block;">
+    <button class="btn btn-secondary" id="btn-add-device" onclick="toggleAddDeviceMenu(event)">+ Add Device ▾</button>
+    <div id="add-device-menu" style="display:none;position:absolute;top:calc(100% + 4px);left:0;z-index:200;
+         background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+         box-shadow:0 4px 16px rgba(0,0,0,0.5);min-width:180px;overflow:hidden;">
+      <button class="btn" style="display:block;width:100%;text-align:left;padding:10px 16px;border:none;border-radius:0;background:transparent;color:var(--fg);cursor:pointer;"
+              onmousedown="event.stopPropagation();addDevice('battery')">🔋 House Battery</button>
+      <button class="btn" style="display:block;width:100%;text-align:left;padding:10px 16px;border:none;border-radius:0;background:transparent;color:var(--fg);cursor:pointer;"
+              onmousedown="event.stopPropagation();addDevice('ev')">🚗 EV Charger</button>
+      <button class="btn" style="display:block;width:100%;text-align:left;padding:10px 16px;border:none;border-radius:0;background:transparent;color:var(--fg);cursor:pointer;"
+              onmousedown="event.stopPropagation();addDevice('heat_pump')">♨️ Heat Pump</button>
+    </div>
+  </div>
   <button class="btn btn-secondary" id="btn-refresh">↺ Refresh Entities</button>
   <a href="{{ url_for('billing_history_page') }}" class="btn btn-secondary">🕓 Billing History</a>
 </div>
@@ -41,20 +54,142 @@
     <div style="color:var(--muted);font-size:13px;margin-bottom:20px;">Add your electricity meter to get started</div>
     <div style="display:flex;gap:10px;justify-content:center;">
       <button class="btn btn-primary" id="btn-wizard-empty">✦ Setup Wizard</button>
-      <button class="btn btn-secondary" id="btn-add-main">+ Add Manually</button>
     </div>
   </div>
 </div>
 
-<!-- ── Sub-meters ─────────────────────────────────────────────────────────── -->
-<div style="margin:28px 0 8px;display:flex;align-items:center;justify-content:space-between;">
-  <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);">Sub-meters</div>
-  <button class="btn btn-secondary btn-sm" id="btn-add-sub">+ Add Sub-meter</button>
+<!-- ── Devices ───────────────────────────────────────────────────────────── -->
+<div id="sub-meter-container" style="margin-top:16px;"></div>
+
+<!-- ── Add Device Modal ──────────────────────────────────────────────────── -->
+<div id="add-device-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;overflow-y:auto;">
+  <div style="max-width:560px;margin:60px auto;padding:0 16px 60px;">
+    <div class="card" style="padding:32px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;">
+        <div>
+          <div id="add-device-title" style="font-size:18px;font-weight:700;"></div>
+          <div id="add-device-subtitle" style="font-size:13px;color:var(--muted);margin-top:4px;"></div>
+        </div>
+        <button onclick="closeAddDevice()" style="background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;padding:0;">✕</button>
+      </div>
+
+      <!-- Device name -->
+      <div class="form-group" style="margin-bottom:20px;">
+        <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Device Name</label>
+        <input type="text" id="ad-device-name" style="margin-top:6px;" placeholder="e.g. House Battery">
+      </div>
+
+      <!-- Battery fields -->
+      <div id="ad-battery-fields">
+        <div class="form-group" style="margin-bottom:20px;">
+          <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">State of Charge Sensor <span style="font-weight:400;">(optional)</span></label>
+          <div style="margin-top:6px;">
+            <input type="text" id="ad-soc-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="entity-input ad-entity" data-field="soc">
+            <div id="ad-soc-sensor_drop" class="entity-drop"></div>
+          </div>
+          <small style="color:var(--muted);">Battery SoC in % (0–100). Enables the SoC dial on Live Power.</small>
+        </div>
+        <div class="form-group" style="margin-bottom:20px;">
+          <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Inverter Power Sensor <span style="font-weight:400;">(optional)</span></label>
+          <div style="margin-top:6px;">
+            <input type="text" id="ad-inverter-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="entity-input ad-entity" data-field="inverter">
+            <div id="ad-inverter-sensor_drop" class="entity-drop"></div>
+          </div>
+          <div class="checkbox-row" style="margin-top:8px;">
+            <input type="checkbox" id="ad-invert">
+            <label for="ad-invert">Invert sensor value — <span style="font-weight:400;color:var(--muted);">tick if positive = charging, negative = discharging</span></label>
+          </div>
+          <small style="color:var(--muted);">Live inverter power in W or kW. Enables the inverter gauge on Live Power.</small>
+        </div>
+      </div>
+
+      <!-- EV fields -->
+      <div id="ad-ev-fields">
+        <div class="form-group" style="margin-bottom:20px;">
+          <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Charger Power Sensor <span style="font-weight:400;">(optional)</span></label>
+          <div style="margin-top:6px;">
+            <input type="text" id="ad-ev-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="entity-input ad-entity" data-field="ev">
+            <div id="ad-ev-sensor_drop" class="entity-drop"></div>
+          </div>
+          <div class="checkbox-row" style="margin-top:8px;">
+            <input type="checkbox" id="ad-v2x">
+            <label for="ad-v2x">V2X / Vehicle-to-Grid capable — <span style="font-weight:400;color:var(--muted);">enables bidirectional gauge</span></label>
+          </div>
+          <div class="checkbox-row" style="margin-top:6px;">
+            <input type="checkbox" id="ad-ev-inverter-possible">
+            <label for="ad-ev-inverter-possible">Inverter possible — <span style="font-weight:400;color:var(--muted);">tick if this device uses battery and grid</span></label>
+          </div>
+        </div>
+      </div>
+
+      <!-- Heat pump fields -->
+      <div id="ad-hp-fields">
+        <div class="form-group" style="margin-bottom:20px;">
+          <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Heat Pump Power Sensor <span style="font-weight:400;">(optional)</span></label>
+          <div style="margin-top:6px;">
+            <input type="text" id="ad-hp-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="entity-input ad-entity" data-field="hp">
+            <div id="ad-hp-sensor_drop" class="entity-drop"></div>
+          </div>
+          <div class="checkbox-row" style="margin-top:8px;">
+            <input type="checkbox" id="ad-hp-inverter-possible">
+            <label for="ad-hp-inverter-possible">Inverter possible — <span style="font-weight:400;color:var(--muted);">tick if this device uses battery and grid</span></label>
+          </div>
+        </div>
+      </div>
+
+      <!-- Common fields -->
+      <div class="form-group" style="margin-bottom:20px;">
+        <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Read Sensor — Cumulative kWh</label>
+        <div style="margin-top:6px;">
+          <input type="text" id="ad-read-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="entity-input ad-entity" data-field="read">
+          <div id="ad-read-sensor_drop" class="entity-drop"></div>
+        </div>
+        <small style="color:var(--muted);">Cumulative import kWh from your device integration or CT clamp via PowerCalc.</small>
+      </div>
+
+      <div class="form-group" style="margin-bottom:28px;">
+        <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Rate Sensor <span style="font-weight:400;">(defaults to main meter rate — change only if this device has a different tariff)</span></label>
+        <div style="margin-top:6px;">
+          <input type="text" id="ad-rate-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="entity-input ad-entity" data-field="rate">
+          <div id="ad-rate-sensor_drop" class="entity-drop"></div>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:12px;justify-content:flex-end;">
+        <button class="btn btn-secondary" onclick="closeAddDevice()">Cancel</button>
+        <button class="btn btn-primary" id="ad-confirm-btn" onclick="confirmAddDevice()">Add Device</button>
+      </div>
+    </div>
+  </div>
 </div>
 
-<div id="sub-meter-container"></div>
-<div id="no-sub-meters" style="color:var(--muted);font-size:13px;padding:12px 0;display:none;">
-  No sub-meters configured. Add a sub-meter to track individual devices like EV chargers or batteries.
+<!-- ── Delete Confirmation Modal ─────────────────────────────────────────── -->
+<div id="delete-device-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;overflow-y:auto;">
+  <div style="max-width:480px;margin:120px auto;padding:0 16px;">
+    <div class="card" style="padding:32px;border:1px solid var(--danger);">
+      <div style="font-size:22px;margin-bottom:12px;">⚠️</div>
+      <div id="del-modal-title" style="font-size:17px;font-weight:700;margin-bottom:8px;"></div>
+      <div id="del-modal-body" style="font-size:13px;color:var(--muted);margin-bottom:20px;line-height:1.6;"></div>
+
+      <div style="background:rgba(240,82,82,0.08);border:1px solid var(--danger);border-radius:var(--radius);padding:14px;margin-bottom:24px;">
+        <div style="font-size:12px;font-weight:600;color:var(--danger);margin-bottom:8px;">TO CONFIRM, TYPE DELETE BELOW</div>
+        <input type="text" id="del-modal-confirm-input"
+               style="width:100%;font-family:var(--mono);letter-spacing:0.1em;text-transform:uppercase;"
+               placeholder="DELETE" autocomplete="off">
+      </div>
+
+      <div style="font-size:12px;color:var(--muted);margin-bottom:24px;">
+        💡 Take a backup first — <a href="data-management" style="color:var(--accent);">Data Management → Create Backup</a>
+      </div>
+
+      <div style="display:flex;gap:12px;justify-content:flex-end;">
+        <button class="btn btn-secondary" onclick="closeDeleteModal()">Cancel</button>
+        <button class="btn" id="del-modal-confirm-btn"
+                style="background:var(--danger);color:#fff;opacity:0.4;cursor:not-allowed;"
+                disabled onclick="executeDelete()">Permanently Delete</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- ── Wizard Modal ───────────────────────────────────────────────────────── -->
@@ -245,8 +380,6 @@ const existingMeterIds = new Set(Object.keys(config.meters || {}));
 document.addEventListener('DOMContentLoaded', function() {
   document.getElementById('btn-save').addEventListener('click', saveConfig);
   document.getElementById('btn-refresh').addEventListener('click', function() { loadEntities().then(renderAll); });
-  document.getElementById('btn-add-main').addEventListener('click', addMainMeter);
-  document.getElementById('btn-add-sub').addEventListener('click', addSubMeter);
   document.getElementById('btn-wizard').addEventListener('click', startWizard);
 
   // Reload config if the page becomes visible after being hidden — catches the case
@@ -296,6 +429,8 @@ async function loadEntities() {
   try {
     var r = await fetch(apiUrl('/api/entities'));
     entities = await r.json();  // [{id, unit, device_class}, ...]
+    // Also store on window for modal autocomplete
+    window._entities = entities.map(function(e) { return { entity_id: e.id, unit: e.unit }; });
   } catch(e) { console.warn('Could not load entities', e); }
 }
 
@@ -337,16 +472,10 @@ function renderAll() {
     mainIds.forEach(function(id) { mc.appendChild(buildMainCard(id, meters[id])); });
   }
 
-  // Sub-meters
+  // Devices (sub-meters)
   var sc  = document.getElementById('sub-meter-container');
-  var nsm = document.getElementById('no-sub-meters');
   sc.innerHTML = '';
-  if (subIds.length === 0) {
-    nsm.style.display = 'block';
-  } else {
-    nsm.style.display = 'none';
-    subIds.forEach(function(id) { sc.appendChild(buildSubCard(id, meters[id])); });
-  }
+  subIds.forEach(function(id) { sc.appendChild(buildSubCard(id, meters[id])); });
 
   attachListeners();
 }
@@ -365,7 +494,8 @@ function buildMainCard(meterId, meter) {
   div.innerHTML =
     '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">' +
       '<div style="display:flex;align-items:center;gap:10px;">' +
-        '<span class="badge badge-main">MAIN METER</span>' +
+        '<span style="font-size:13px;font-weight:600;color:var(--fg);">⚡ ' +
+        esc(((meta.site || meta.site_name || 'Main Meter')).toUpperCase()) + '</span>' +
       '</div>' +
       '<button class="btn btn-danger btn-sm js-remove-meter" data-meter="' + meterId + '">✕ Remove</button>' +
     '</div>' +
@@ -384,7 +514,7 @@ function buildMainCard(meterId, meter) {
       '<div class="form-group"><label>Site Name</label>' +
         '<input type="text" class="js-meta" data-meter="' + meterId + '" data-key="site" value="' + esc(meta.site||'') + '"></div>' +
       '<div class="form-group"><div style="font-size:12px;color:var(--muted);padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:4px;">' +
-        '⚡ Supplier is recorded per billing period — set it on the <a href="config-history" style="color:var(--accent);">Billing History</a> page.' +
+        '⚡ Supplier is recorded per billing period — set it on the <a href="billing-history" style="color:var(--accent);">Billing History</a> page.' +
         '</div></div>' +
       '<div class="form-group"><label>First day of your billing period</label>' +
         '<input type="number" min="1" max="28" class="js-meta js-meta-int" data-meter="' + meterId + '" data-key="billing_day" value="' + (meta.billing_day||1) + '"></div>' +
@@ -466,7 +596,9 @@ function buildSubCard(meterId, meter) {
   div.innerHTML =
     '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">' +
       '<div style="display:flex;align-items:center;gap:10px;">' +
-        '<span class="badge badge-sub">SUB-METER</span>' +
+        '<span style="font-size:13px;font-weight:600;color:var(--fg);">' +
+        (isBattery ? '🔋' : isEV ? '🚗' : isHeatPump ? '♨️' : '⚡') +
+        ' ' + esc((meta.device || 'Device').toUpperCase()) + '</span>' +
       '</div>' +
       '<button class="btn btn-danger btn-sm js-remove-meter" data-meter="' + meterId + '">✕ Remove</button>' +
     '</div>' +
@@ -487,7 +619,7 @@ function buildSubCard(meterId, meter) {
           : '<li><strong>CT clamp via PowerCalc</strong> — aggregated kWh, updates every 60s minimum</li>' +
             '<li><strong>Device integration</strong> — if your device reports kWh directly</li>') +
       '</ul>' +
-      'If no rate sensor is provided the main meter import rate is used automatically.' +
+      'Rate defaults to main meter rate — change only if this device has a different tariff.' +
     '</div>' +
 
     '<div class="grid-2">' +
@@ -525,7 +657,7 @@ function buildSubCard(meterId, meter) {
       ? '<div style="display:flex;gap:24px;margin-bottom:16px;">' +
           '<div class="checkbox-row">' +
             '<input type="checkbox" id="inv-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="inverter_possible" ' + (meta.inverter_possible?'checked':'') + '>' +
-            '<label for="inv-' + meterId + '">Inverter possible</label>' +
+            '<label for="inv-' + meterId + '">Inverter possible — <span style="font-weight:400;color:var(--muted);">tick if this device uses battery and grid</span></label>' +
           '</div>' +
         '</div>'
       : '') +
@@ -704,63 +836,246 @@ function onContainerClick(e) {
     var mData = config.meters[mid] || {};
     var isSub = (mData.meta || {}).sub_meter;
     var devName = (mData.meta || {}).device || mid;
-    var msg = isSub
-      ? 'Remove "' + devName + '"?\n\nThis will permanently delete all historical data for this meter from the database. This cannot be undone.'
-      : 'Remove this main meter?\n\nThis will permanently delete all historical data. This cannot be undone.';
-    if (confirm(msg)) {
-      delete config.meters[mid];
-      renderAll();
-      // Cascade delete all data for this meter ID
-      fetch(apiUrl('/api/meter/' + encodeURIComponent(mid) + '/delete-data'), { method: 'POST' })
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-          if (d.deleted) console.log('Cascade delete:', d.deleted, 'rows for', mid);
-        })
-        .catch(function(e) { console.warn('Cascade delete failed:', e); });
-    }
+    openDeleteModal(mid, devName, isSub);
   } else if (el.classList.contains('js-clear-entity')) {
     var t = document.getElementById(el.dataset.target);
     if (t) { t.value = ''; t.dispatchEvent(new Event('change')); }
   }
 }
 
-// ── Add meters ────────────────────────────────────────────────────────────────
-function addMainMeter() {
-  var id = 'electricity_main';
-  if (config.meters[id]) id = 'electricity_main_' + Date.now();
-  config.meters[id] = {
-    meta: { type: 'electricity', site: '', billing_day: 1 },
-    channels: {
-      import: { read: '', rate: '' },
-      export: { read: '', rate: '' }
-    }
+var _addDeviceType = null;
+
+var _deleteMid = null;
+var _deleteDevName = null;
+
+function openDeleteModal(mid, devName, isSub) {
+  _deleteMid     = mid;
+  _deleteDevName = devName;
+
+  document.getElementById('del-modal-title').textContent =
+    'Delete ' + (isSub ? '"' + devName + '"' : 'main meter') + '?';
+  document.getElementById('del-modal-body').innerHTML =
+    'This will permanently delete <strong>all historical data</strong> for this device from the database.' +
+    '<br><br>This action <strong>cannot be undone</strong>.';
+
+  var input = document.getElementById('del-modal-confirm-input');
+  var btn   = document.getElementById('del-modal-confirm-btn');
+  input.value = '';
+  btn.disabled = true;
+  btn.style.opacity = '0.4';
+  btn.style.cursor  = 'not-allowed';
+
+  // Enable confirm button only when user types DELETE
+  input.oninput = function() {
+    var ok = input.value.trim().toUpperCase() === 'DELETE';
+    btn.disabled      = !ok;
+    btn.style.opacity = ok ? '1' : '0.4';
+    btn.style.cursor  = ok ? 'pointer' : 'not-allowed';
   };
-  renderAll();
+
+  document.getElementById('delete-device-overlay').style.display = 'block';
+  setTimeout(function() { input.focus(); }, 100);
 }
 
-function addSubMeter() {
-  var id = 'sub_meter_' + Date.now();
-  var mainMeters = Object.keys(config.meters||{}).filter(function(k) { return !config.meters[k].meta.sub_meter; });
-  var mainImportRate = '';
-  if (mainMeters.length > 0) {
-    var mainCh = (config.meters[mainMeters[0]].channels||{}).import || {};
-    mainImportRate = mainCh.rate || '';
+function closeDeleteModal() {
+  document.getElementById('delete-device-overlay').style.display = 'none';
+  _deleteMid     = null;
+  _deleteDevName = null;
+}
+
+function executeDelete() {
+  var mid     = _deleteMid;
+  var devName = _deleteDevName;
+  if (!mid) return;
+
+  closeDeleteModal();
+
+  // Remove from in-memory config
+  delete config.meters[mid];
+  renderAll();
+
+  var errEl = document.getElementById('alert-error');
+  if (errEl) { errEl.textContent = '⏳ Deleting "' + devName + '"…'; errEl.classList.add('show'); }
+
+  // Single atomic operation — delete data AND save config together
+  fetch(apiUrl('/api/meter/' + encodeURIComponent(mid) + '/delete-data'), {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ config: config })
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (errEl) errEl.classList.remove('show');
+      if (d.ok) {
+        document.getElementById('alert-success').textContent =
+          '✓ "' + devName + '" deleted — ' + (d.deleted.blocks || 0) + ' blocks removed.';
+        show('alert-success');
+        setTimeout(function() { window.location.reload(); }, 1500);
+      } else {
+        if (errEl) { errEl.textContent = '✗ Delete failed: ' + (d.error || 'unknown error'); errEl.classList.add('show'); }
+      }
+    })
+    .catch(function(e) {
+      if (errEl) { errEl.textContent = '✗ Delete failed: ' + e; errEl.classList.add('show'); }
+    });
+}
+
+function toggleAddDeviceMenu(e) {
+  e.stopPropagation();
+  var menu = document.getElementById('add-device-menu');
+  menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
+  function closeMenu(evt) {
+    if (!document.getElementById('btn-add-device').contains(evt.target) &&
+        !document.getElementById('add-device-menu').contains(evt.target)) {
+      menu.style.display = 'none';
+      document.removeEventListener('mousedown', closeMenu);
+    }
   }
+  if (menu.style.display === 'block') document.addEventListener('mousedown', closeMenu);
+}
+
+function addDevice(type) {
+  document.getElementById('add-device-menu').style.display = 'none';
+  _addDeviceType = type;
+
+  var titles    = { battery: '🔋 Add House Battery', ev: '🚗 Add EV Charger', heat_pump: '♨️ Add Heat Pump' };
+  var subtitles = {
+    battery:   'Configure your battery meter and Live Power sensors',
+    ev:        'Configure your EV charger meter and Live Power sensors',
+    heat_pump: 'Configure your heat pump meter and Live Power sensors'
+  };
+  var defaults  = { battery: 'House Battery', ev: 'EV Charger', heat_pump: 'Heat Pump' };
+
+  document.getElementById('add-device-title').textContent    = titles[type];
+  document.getElementById('add-device-subtitle').textContent = subtitles[type];
+  document.getElementById('ad-device-name').value            = defaults[type];
+  document.getElementById('ad-confirm-btn').textContent      = 'Add ' + defaults[type];
+
+  // Clear all sensor fields
+  ['ad-soc-sensor','ad-inverter-sensor','ad-ev-sensor','ad-hp-sensor','ad-read-sensor','ad-rate-sensor'].forEach(function(id) {
+    document.getElementById(id).value = '';
+  });
+  document.getElementById('ad-invert').checked = false;
+  document.getElementById('ad-v2x').checked    = false;
+  document.getElementById('ad-ev-inverter-possible').checked = false;
+  document.getElementById('ad-hp-inverter-possible').checked = false;
+
+  // Pre-fill rate from main meter
+  var mainMeters = Object.keys(config.meters||{}).filter(function(k) { return !config.meters[k].meta.sub_meter; });
+  if (mainMeters.length > 0) {
+    var mainRate = ((config.meters[mainMeters[0]].channels||{}).import||{}).rate || '';
+    document.getElementById('ad-rate-sensor').value = mainRate;
+  }
+
+  // Show/hide type-specific fields
+  document.getElementById('ad-battery-fields').style.display = type === 'battery'   ? '' : 'none';
+  document.getElementById('ad-ev-fields').style.display      = type === 'ev'        ? '' : 'none';
+  document.getElementById('ad-hp-fields').style.display      = type === 'heat_pump' ? '' : 'none';
+
+  setupAdEntityDropdowns();
+  document.getElementById('add-device-overlay').style.display = 'block';
+  setTimeout(function() { document.getElementById('ad-device-name').focus(); }, 100);
+}
+
+function closeAddDevice() {
+  document.getElementById('add-device-overlay').style.display = 'none';
+  _addDeviceType = null;
+}
+
+function confirmAddDevice() {
+  var type    = _addDeviceType;
+  var devName = document.getElementById('ad-device-name').value.trim();
+  if (!devName) { alert('Please enter a device name.'); return; }
+
+  // Name uniqueness check
+  var usedNames = Object.values(config.meters||{}).map(function(m) {
+    return ((m.meta||{}).device||'').toLowerCase();
+  });
+  if (usedNames.indexOf(devName.toLowerCase()) !== -1) {
+    alert('"' + devName + '" is already used. Please choose a unique name.');
+    return;
+  }
+
+  var mainMeters = Object.keys(config.meters||{}).filter(function(k) { return !config.meters[k].meta.sub_meter; });
+  var id = 'sub_meter_' + Date.now();
+
+  var meta = {
+    sub_meter:         true,
+    meter_type:        type,
+    device:            devName,
+    parent_meter:      mainMeters[0] || '',
+    inverter_possible: type === 'battery',
+  };
+
+  if (type === 'battery') {
+    var soc = document.getElementById('ad-soc-sensor').value.trim();
+    var inv = document.getElementById('ad-inverter-sensor').value.trim();
+    if (soc) meta.soc_sensor = soc;
+    if (inv) meta.inverter_power_sensor = inv;
+    if (document.getElementById('ad-invert').checked) meta.inverter_power_invert = true;
+  } else if (type === 'ev') {
+    var evp = document.getElementById('ad-ev-sensor').value.trim();
+    if (evp) meta.device_power_sensor = evp;
+    if (document.getElementById('ad-v2x').checked) meta.v2x_capable = true;
+    if (document.getElementById('ad-ev-inverter-possible').checked) meta.inverter_possible = true;
+  } else if (type === 'heat_pump') {
+    var hpp = document.getElementById('ad-hp-sensor').value.trim();
+    if (hpp) meta.device_power_sensor = hpp;
+    if (document.getElementById('ad-hp-inverter-possible').checked) meta.inverter_possible = true;
+  }
+
   config.meters[id] = {
-    meta: {
-      sub_meter: true,
-      device: '',
-      parent_meter: mainMeters.length === 1 ? mainMeters[0] : '',
-      inverter_possible: false,
-      v2x_capable: false
-    },
+    meta:     meta,
     channels: {
-      import: { read: '', rate: mainImportRate }
+      import: {
+        read:  document.getElementById('ad-read-sensor').value.trim(),
+        rate:  document.getElementById('ad-rate-sensor').value.trim(),
+        rates: [], reads: []
+      }
     }
   };
+
+  closeAddDevice();
   renderAll();
-  var el = document.querySelector('[data-meter="' + id + '"]');
-  if (el) el.scrollIntoView({ behavior: 'smooth' });
+  saveConfig();
+
+  setTimeout(function() {
+    var cards = document.querySelectorAll('#sub-meter-container .card');
+    if (cards.length) cards[cards.length - 1].scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, 200);
+}
+
+function setupAdEntityDropdowns() {
+  document.querySelectorAll('.ad-entity').forEach(function(input) {
+    input.removeEventListener('input', input._adHandler);
+    input._adHandler = function() {
+      var dropId = input.id + '_drop';
+      var drop   = document.getElementById(dropId);
+      if (!drop) return;
+      var q = input.value.toLowerCase();
+      if (!q) { drop.innerHTML = ''; drop.style.display = 'none'; return; }
+      var matches = (window._entities||[]).filter(function(e) {
+        return e.entity_id.toLowerCase().indexOf(q) !== -1;
+      }).slice(0, 8);
+      if (!matches.length) { drop.innerHTML = ''; drop.style.display = 'none'; return; }
+      drop.innerHTML = matches.map(function(e) {
+        var eid = e.entity_id;
+        return '<div class="entity-option" onmousedown="event.preventDefault();' +
+          'document.getElementById(&quot;' + input.id + '&quot;).value=&quot;' + eid + '&quot;;' +
+          'document.getElementById(&quot;' + dropId + '&quot;).style.display=&quot;none&quot;">' +
+          eid + (e.unit ? ' <span style="color:var(--muted);font-size:11px;">(' + e.unit + ')</span>' : '') +
+          '</div>';
+      }).join('');
+      drop.style.display = 'block';
+    };
+    input.addEventListener('input', input._adHandler);
+    input.addEventListener('blur', function() {
+      setTimeout(function() {
+        var drop = document.getElementById(input.id + '_drop');
+        if (drop) drop.style.display = 'none';
+      }, 200);
+    });
+  });
 }
 
 function renameMeter(oldId, newId) {
@@ -1105,7 +1420,7 @@ function wizStepSubSensors() {
   var impRate = wiz.data.importRate || '';
 
   var html = '<h3 style="margin:0 0 6px;">Sub-meter Sensors</h3>' +
-    '<p style="color:var(--muted);font-size:13px;margin:0 0 20px;">Map sensors for each device. Rate is copied once from your main import meter at setup time. Update here if your sub-meter has a different rate, or if you retrospectively change the main meter rate sensor.</p>';
+    '<p style="color:var(--muted);font-size:13px;margin:0 0 20px;">Map sensors for each device. Rate defaults to your main meter rate — only change if this device is on a different tariff.</p>';
 
   wiz.devices.forEach(function(devId) {
     if (!wiz.data.subMeters[devId]) wiz.data.subMeters[devId] = { read: '', rate: impRate, name: '' };

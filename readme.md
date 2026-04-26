@@ -54,15 +54,15 @@ A Home Assistant add-on that records your electricity usage in precise configura
 
 ### Upgrading to 2.7.0 — action required
 
-**Existing sub-meter users** need to set the Meter Type for each sub-meter before the new Live Power cards will appear:
+**Existing users** need to set the Meter Type for each sub-meter before the new Live Power cards will appear. The type dropdown is available for existing meters that don't yet have a type set — once set and saved it locks permanently.
 
 1. Go to **Settings → Meter Config**
-2. Open each sub-meter card
-3. Select the correct type from the **Meter Type** dropdown
+2. Open each device card
+3. Select the correct type from the **Meter Type** dropdown (🔋 Battery / 🚗 EV Charger / ♨️ Heat Pump)
 4. Configure the sensor fields that appear (SoC sensor, inverter power sensor etc.)
 5. Save — the Live Power page will reload and show the new cards
 
-> ⚠️ Meter type cannot be changed after data has been recorded. If you set the wrong type you will need to delete the meter and all its data, then recreate it.
+> ⚠️ Meter type locks permanently once set and data has been recorded. If you set the wrong type you must use **Add Device** to add a replacement, then delete the incorrectly typed device and all its data.
 
 ## Requirements
 

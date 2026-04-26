@@ -34,7 +34,7 @@
 
 ### Fixed
 
-- **Standing charge £0 on BST days** — `calculate_billing_summary_for_period` (billing chart hover/summaries) and `api_blocks_summary` (Usage Stats data table) both used the first block of each local day to record the standing charge. In BST (UTC+1), the first block of a local day arrives at 23:00 UTC the previous night and may have `sc=0.0` if the standing charge sensor was briefly unavailable. Any subsequent non-zero block for that day was ignored, zeroing the entire day's standing charge. Fixed in both code paths to use `MAX(standing_charge)` per day from the main meter only, matching the SQL billing query which was already correct.
+- **Standing charge charge £0 on BST days** — `calculate_billing_summary_for_period` (billing chart hover/summaries) and `api_blocks_summary` (Usage Stats data table) both used the first block of each local day to record the standing charge. In BST (UTC+1), the first block of a local day arrives at 23:00 UTC the previous night and may have `sc=0.0` if the standing charge sensor was briefly unavailable. Any subsequent non-zero block for that day was ignored, zeroing the entire day's standing charge. Fixed in both code paths to use `MAX(standing_charge)` per day from the main meter only, matching the SQL billing query which was already correct.
 
 - **Sub-meter rate sawtooth on charts after restart** — gap-fill blocks for sub-meters were written with `rate=0.0` when the sub-meter had no post-restart reads yet (skip path in `build_gap_blocks`). This produced a brief spike to zero on the rate line in billing charts at every restart. Fixed by looking up `last_known_rates` for the sub-meter even when skipping, so gap blocks carry the correct last known rate.
 
