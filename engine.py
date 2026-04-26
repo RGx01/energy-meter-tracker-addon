@@ -1918,8 +1918,10 @@ async def engine_startup(ha: HAClient):
             migrated = migrate_json_to_sqlite(BLOCKS_PATH + ".migrated", _store, _migration_config)
             logger.info("engine_startup: re-migration complete — %d blocks migrated", migrated)
         else:
-            # Brand new install — create initial config period
-            _store.insert_config_period(config)
+            # Brand new install — create initial config period starting NOW
+            # Always use now regardless of any date in the config JSON —
+            # using a historical date would trigger gap fill for all missing blocks.
+            _store.insert_config_period(config, effective_from=datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
             logger.info("engine_startup: new install — initial config period created")
 
     logger.info("engine_startup: %d existing blocks in store", _store.count_blocks())

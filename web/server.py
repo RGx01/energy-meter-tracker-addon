@@ -1087,6 +1087,13 @@ def api_meter_delete_data(meter_id: str):
         new_cfg  = payload.get("config")
         deleted  = {}
 
+        # Pause engine before modifying DB — prevents mid-tick inconsistency
+        try:
+            import engine as _eng_d
+            _eng_d.pause_engine()
+        except Exception:
+            pass
+
         with store._conn:
             # 1. Delete all data for this meter
             cur = store._conn.execute(
@@ -1123,8 +1130,20 @@ def api_meter_delete_data(meter_id: str):
                 pass
 
             # 2. Save updated config (meter removed) in same transaction
+            # Must delete existing meter rows first — _write_meters only upserts,
+            # it won't remove meters that are no longer in the config.
             if new_cfg:
                 period_id = store.get_current_config_period_id()
+                old_meter_ids = [r["id"] for r in store._conn.execute(
+                    "SELECT id FROM meters WHERE config_period_id=?", (period_id,)
+                ).fetchall()]
+                for old_mid in old_meter_ids:
+                    store._conn.execute(
+                        "DELETE FROM meter_channels WHERE meter_id=?", (old_mid,)
+                    )
+                store._conn.execute(
+                    "DELETE FROM meters WHERE config_period_id=?", (period_id,)
+                )
                 store._write_meters(new_cfg, period_id)
 
         logger.info("api_meter_delete_data: deleted %s for meter %s", deleted, meter_id)
@@ -2011,7 +2030,14 @@ def api_save_config():
             should_create = True
             if cur_id is not None:
                 old_cfg = store.config_from_db(cur_id)
-                if old_cfg.get("meters"):
+                # If current period has no blocks yet, update in place regardless
+                # of how significant the change is — no data to protect
+                block_count = store._conn.execute(
+                    "SELECT COUNT(*) FROM blocks WHERE config_period_id = ?", (cur_id,)
+                ).fetchone()[0]
+                if block_count == 0:
+                    should_create = False
+                elif old_cfg.get("meters"):
                     if not config_meta_significant(old_cfg, data):
                         should_create = False
             if should_create:

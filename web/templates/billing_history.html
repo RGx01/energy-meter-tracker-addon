@@ -438,7 +438,7 @@ function showError(msg) {
 // ── Delete ────────────────────────────────────────────────────────────────────
 function newPeriod() {
   // Open edit modal pre-populated with today's date and current active config values
-  var active = periods.find(function(p) { return !p.effective_to; });
+  var active = _periods.find(function(p) { return !p.effective_to; });
   if (!active) { alert('No active config period found.'); return; }
   _editId = null;  // null = create mode
   document.getElementById('edit-from').value          = new Date().toISOString().slice(0,10);

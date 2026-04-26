@@ -17,7 +17,6 @@
 
 {% block subbar %}
 <div class="settings-subbar">
-  <button class="btn btn-secondary" id="btn-wizard">✦ Setup Wizard</button>
   <div style="position:relative;display:inline-block;">
     <button class="btn btn-secondary" id="btn-add-device" onclick="toggleAddDeviceMenu(event)">+ Add Device ▾</button>
     <div id="add-device-menu" style="display:none;position:absolute;top:calc(100% + 4px);left:0;z-index:200;
@@ -83,16 +82,16 @@
       <div id="ad-battery-fields">
         <div class="form-group" style="margin-bottom:20px;">
           <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">State of Charge Sensor <span style="font-weight:400;">(optional)</span></label>
-          <div style="margin-top:6px;">
-            <input type="text" id="ad-soc-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="entity-input ad-entity" data-field="soc">
+          <div style="margin-top:6px;position:relative;">
+            <input type="text" id="ad-soc-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="ad-entity" data-field="soc">
             <div id="ad-soc-sensor_drop" class="entity-drop"></div>
           </div>
           <small style="color:var(--muted);">Battery SoC in % (0–100). Enables the SoC dial on Live Power.</small>
         </div>
         <div class="form-group" style="margin-bottom:20px;">
           <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Inverter Power Sensor <span style="font-weight:400;">(optional)</span></label>
-          <div style="margin-top:6px;">
-            <input type="text" id="ad-inverter-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="entity-input ad-entity" data-field="inverter">
+          <div style="margin-top:6px;position:relative;">
+            <input type="text" id="ad-inverter-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="ad-entity" data-field="inverter">
             <div id="ad-inverter-sensor_drop" class="entity-drop"></div>
           </div>
           <div class="checkbox-row" style="margin-top:8px;">
@@ -107,8 +106,8 @@
       <div id="ad-ev-fields">
         <div class="form-group" style="margin-bottom:20px;">
           <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Charger Power Sensor <span style="font-weight:400;">(optional)</span></label>
-          <div style="margin-top:6px;">
-            <input type="text" id="ad-ev-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="entity-input ad-entity" data-field="ev">
+          <div style="margin-top:6px;position:relative;">
+            <input type="text" id="ad-ev-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="ad-entity" data-field="ev">
             <div id="ad-ev-sensor_drop" class="entity-drop"></div>
           </div>
           <div class="checkbox-row" style="margin-top:8px;">
@@ -126,8 +125,8 @@
       <div id="ad-hp-fields">
         <div class="form-group" style="margin-bottom:20px;">
           <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Heat Pump Power Sensor <span style="font-weight:400;">(optional)</span></label>
-          <div style="margin-top:6px;">
-            <input type="text" id="ad-hp-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="entity-input ad-entity" data-field="hp">
+          <div style="margin-top:6px;position:relative;">
+            <input type="text" id="ad-hp-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="ad-entity" data-field="hp">
             <div id="ad-hp-sensor_drop" class="entity-drop"></div>
           </div>
           <div class="checkbox-row" style="margin-top:8px;">
@@ -140,8 +139,8 @@
       <!-- Common fields -->
       <div class="form-group" style="margin-bottom:20px;">
         <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Read Sensor — Cumulative kWh</label>
-        <div style="margin-top:6px;">
-          <input type="text" id="ad-read-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="entity-input ad-entity" data-field="read">
+        <div style="margin-top:6px;position:relative;">
+          <input type="text" id="ad-read-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="ad-entity" data-field="read">
           <div id="ad-read-sensor_drop" class="entity-drop"></div>
         </div>
         <small style="color:var(--muted);">Cumulative import kWh from your device integration or CT clamp via PowerCalc.</small>
@@ -149,8 +148,8 @@
 
       <div class="form-group" style="margin-bottom:28px;">
         <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Rate Sensor <span style="font-weight:400;">(defaults to main meter rate — change only if this device has a different tariff)</span></label>
-        <div style="margin-top:6px;">
-          <input type="text" id="ad-rate-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="entity-input ad-entity" data-field="rate">
+        <div style="margin-top:6px;position:relative;">
+          <input type="text" id="ad-rate-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="ad-entity" data-field="rate">
           <div id="ad-rate-sensor_drop" class="entity-drop"></div>
         </div>
       </div>
@@ -380,7 +379,6 @@ const existingMeterIds = new Set(Object.keys(config.meters || {}));
 document.addEventListener('DOMContentLoaded', function() {
   document.getElementById('btn-save').addEventListener('click', saveConfig);
   document.getElementById('btn-refresh').addEventListener('click', function() { loadEntities().then(renderAll); });
-  document.getElementById('btn-wizard').addEventListener('click', startWizard);
 
   // Reload config if the page becomes visible after being hidden — catches the case
   // where the user restores a DB on the Data Management page then switches back here.
@@ -1047,33 +1045,68 @@ function confirmAddDevice() {
 
 function setupAdEntityDropdowns() {
   document.querySelectorAll('.ad-entity').forEach(function(input) {
-    input.removeEventListener('input', input._adHandler);
+    if (input._adHandler) input.removeEventListener('input', input._adHandler);
     input._adHandler = function() {
-      var dropId = input.id + '_drop';
-      var drop   = document.getElementById(dropId);
+      var drop = document.getElementById(input.id + '_drop');
       if (!drop) return;
       var q = input.value.toLowerCase();
-      if (!q) { drop.innerHTML = ''; drop.style.display = 'none'; return; }
-      var matches = (window._entities||[]).filter(function(e) {
-        return e.entity_id.toLowerCase().indexOf(q) !== -1;
-      }).slice(0, 8);
+      if (q.length < 1) { drop.innerHTML = ''; drop.style.display = 'none'; return; }
+
+      // Map data-field to FIELD_FILTERS key
+      var fieldMap = {
+        soc:      'soc_sensor',
+        inverter: 'inverter_power_sensor',
+        ev:       'device_power_sensor',
+        hp:       'device_power_sensor',
+        read:     'read',
+        rate:     'rate'
+      };
+      var filterKey = fieldMap[input.dataset.field] || input.dataset.field;
+      // Use filterEntities but bypass its min-length check by passing 2+ chars
+      // For single char, do manual filter+search
+      var matches;
+      if (q.length >= 2) {
+        matches = filterEntities(filterKey, q).slice(0, 8);
+      } else {
+        var filter = FIELD_FILTERS[filterKey];
+        var candidates = entities;
+        if (filter) {
+          var filtered = candidates.filter(function(e) {
+            var unit = (e.unit||'').toLowerCase();
+            var unitOk   = filter.units.some(function(u) { return unit === u.toLowerCase(); });
+            var suffixOk = (filter.unitSuffixes||[]).some(function(s) { return unit.endsWith(s); });
+            var classOk  = filter.device_class.some(function(dc) { return (e.device_class||'').toLowerCase() === dc.toLowerCase(); });
+            return unitOk || suffixOk || classOk;
+          });
+          if (filtered.length > 0) candidates = filtered;
+        }
+        matches = candidates.filter(function(e) { return e.id.toLowerCase().indexOf(q) !== -1; }).slice(0, 8);
+      }
       if (!matches.length) { drop.innerHTML = ''; drop.style.display = 'none'; return; }
       drop.innerHTML = matches.map(function(e) {
-        var eid = e.entity_id;
-        return '<div class="entity-option" onmousedown="event.preventDefault();' +
-          'document.getElementById(&quot;' + input.id + '&quot;).value=&quot;' + eid + '&quot;;' +
-          'document.getElementById(&quot;' + dropId + '&quot;).style.display=&quot;none&quot;">' +
-          eid + (e.unit ? ' <span style="color:var(--muted);font-size:11px;">(' + e.unit + ')</span>' : '') +
+        return '<div class="entity-option" data-val="' + e.id + '">' +
+          e.id +
+          (e.unit ? ' <span style="color:var(--muted);font-size:11px;">(' + e.unit + ')</span>' : '') +
           '</div>';
       }).join('');
+      // Wire selection via mousedown on each option
+      drop.querySelectorAll('.entity-option').forEach(function(opt) {
+        opt.addEventListener('mousedown', function(ev) {
+          ev.preventDefault();
+          input.value = opt.dataset.val;
+          drop.innerHTML = '';
+          drop.style.display = 'none';
+        });
+      });
       drop.style.display = 'block';
     };
     input.addEventListener('input', input._adHandler);
+    if (input.value.length >= 2) input._adHandler();
     input.addEventListener('blur', function() {
       setTimeout(function() {
         var drop = document.getElementById(input.id + '_drop');
-        if (drop) drop.style.display = 'none';
-      }, 200);
+        if (drop) { drop.innerHTML = ''; drop.style.display = 'none'; }
+      }, 300);
     });
   });
 }
@@ -1293,6 +1326,8 @@ function startWizard() {
     standingCharge: imp.standing_charge_sensor   || '',
     exportRead:    exp.read                      || '',
     exportRate:    exp.rate                      || '',
+    powerSensor:   mainMeta.power_sensor         || '',
+    postcode:      mainMeta.postcode_prefix       || '',
     subMeters:     subMeters
   };
 
@@ -1351,8 +1386,13 @@ function wizStepMain() {
           : '<select id="wiz-block-minutes"><option value="5"' + (wiz.data.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (wiz.data.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((wiz.data.block_minutes||30)===30?' selected':'') + '>30 min</option></select><small style="color:var(--muted);">Set once — cannot be changed after data collection begins</small>') +
       '</div>' +
       '<div class="form-group"><label>Timezone</label>' +
-        buildTzSelect('wiz-tz-select', wiz.data.timezone||'UTC') + '</div>' +
-      '<div style="font-size:11px;color:var(--muted);margin-top:-8px;margin-bottom:8px;">UK users: Europe/London (handles BST automatically)</div>' +
+        buildTzSelect('wiz-tz-select', wiz.data.timezone||'UTC') +
+        '<div style="font-size:11px;color:var(--muted);margin-top:4px;">UK users: Europe/London (handles BST automatically)</div></div>' +
+      '<div class="form-group" id="wiz-postcode-wrap" style="' + (((wiz.data.timezone||'UTC') === 'Europe/London') ? '' : 'display:none;') + '">' +
+        '<label>Postcode Prefix <span style="color:var(--muted);font-weight:400;">(optional — enables carbon intensity forecast)</span></label>' +
+        '<input id="wiz-postcode" type="text" value="' + esc(wiz.data.postcode||'') + '" placeholder="e.g. DE1, SW1, M" style="max-width:200px;">' +
+        '<small style="color:var(--muted);">🇬🇧 UK only — first part of your postcode. Enables the 48-hour carbon forecast on the Live Power page via the National Grid API.</small>' +
+      '</div>' +
 
     '</div>';
 }
@@ -1373,7 +1413,12 @@ function wizStepSensors() {
     '<div class="form-group"><label>Export Read Sensor — cumulative kWh to grid</label>' +
       buildWizEntity('wiz-exp-read', wiz.data.exportRead) + '</div>' +
     '<div class="form-group"><label>Export Rate Sensor <span style="color:var(--muted);font-weight:400;">(optional)</span></label>' +
-      buildWizEntity('wiz-exp-rate', wiz.data.exportRate) + '</div>';
+      buildWizEntity('wiz-exp-rate', wiz.data.exportRate) + '</div>' +
+
+    '<div class="section-divider" style="margin-top:20px;">Live Power</div>' +
+    '<div class="form-group"><label>Smart Meter Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — shows live net W on Live Power page)</span></label>' +
+      buildWizEntity('wiz-power', wiz.data.powerSensor) +
+      '<small style="color:var(--muted);">Net grid power in W or kW. Positive = importing, negative = exporting. ⓘ Informational only.</small></div>';
 }
 
 function wizStepDevices() {
@@ -1438,10 +1483,26 @@ function wizStepSubSensors() {
       (devId === 'battery'
         ? '<div class="form-group"><label>State of Charge Sensor <span style="color:var(--muted);font-weight:400;">(optional — enables SoC dial on Live Power page)</span></label>' +
             buildWizEntity('wiz-sub-' + devId + '-soc', sd.soc||'') +
-            '<small style="color:var(--muted);">Battery SoC in % (0–100). From your battery integration. ⓘ Informational only — not recorded in blocks or used in calculations.</small></div>' +
+            '<small style="color:var(--muted);">Battery SoC in % (0–100). From your battery integration. ⓘ Informational only.</small></div>' +
           '<div class="form-group"><label>Inverter Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — shows live kW below SoC dial)</span></label>' +
             buildWizEntity('wiz-sub-' + devId + '-inverter-power', sd.inverter_power||'') +
-            '<small style="color:var(--muted);">Live inverter power in W or kW. ⓘ Informational only — not recorded in blocks or used in calculations.</small></div>'
+            '<small style="color:var(--muted);">Live inverter power in W or kW. ⓘ Informational only.</small></div>' +
+          '<div class="checkbox-row" style="margin-bottom:16px;">' +
+            '<input type="checkbox" id="wiz-sub-' + devId + '-invert" ' + (sd.inverter_power_invert ? 'checked' : '') + '>' +
+            '<label for="wiz-sub-' + devId + '-invert">Invert sensor value — <span style="font-weight:400;color:var(--muted);">tick if positive = charging, negative = discharging</span></label>' +
+          '</div>'
+        : devId === 'ev'
+        ? '<div class="form-group"><label>Charger Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — shows live kW on Live Power page)</span></label>' +
+            buildWizEntity('wiz-sub-' + devId + '-device-power', sd.device_power||'') +
+            '<small style="color:var(--muted);">Live charger power in W or kW. ⓘ Informational only.</small></div>' +
+          '<div class="checkbox-row" style="margin-bottom:16px;">' +
+            '<input type="checkbox" id="wiz-sub-' + devId + '-v2x" ' + (sd.v2x_capable ? 'checked' : '') + '>' +
+            '<label for="wiz-sub-' + devId + '-v2x">V2X / Vehicle-to-Grid capable — <span style="font-weight:400;color:var(--muted);">enables bidirectional gauge</span></label>' +
+          '</div>'
+        : devId === 'heat'
+        ? '<div class="form-group"><label>Heat Pump Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — shows live kW on Live Power page)</span></label>' +
+            buildWizEntity('wiz-sub-' + devId + '-device-power', sd.device_power||'') +
+            '<small style="color:var(--muted);">Live heat pump power in W or kW. ⓘ Informational only.</small></div>'
         : '') +
     '</div>';
   });
@@ -1464,6 +1525,14 @@ function setupWizEntityDropdowns() {
     inp.addEventListener('focus', function() { if (inp.value.length >= 2) showDropById(inp.id, inp); });
     inp.addEventListener('blur',  function() { setTimeout(function() { hideDrop(inp); }, 200); });
   });
+  // Show/hide postcode field based on timezone
+  var tzSel = document.getElementById('wiz-tz-select');
+  if (tzSel) {
+    tzSel.addEventListener('change', function() {
+      var w = document.getElementById('wiz-postcode-wrap');
+      if (w) w.style.display = tzSel.value === 'Europe/London' ? '' : 'none';
+    });
+  }
 }
 
 function showDropById(id, inp) {
@@ -1471,9 +1540,12 @@ function showDropById(id, inp) {
   if (!drop) return;
   // Infer field type from element ID
   var field = '';
-  if (id.indexOf('-read') !== -1)  field = 'read';
-  else if (id.indexOf('-rate') !== -1) field = 'rate';
-  else if (id.indexOf('-sc') !== -1)   field = 'standing_charge_sensor';
+  if (id.indexOf('-read') !== -1)         field = 'read';
+  else if (id.indexOf('-rate') !== -1)    field = 'rate';
+  else if (id.indexOf('-sc') !== -1)      field = 'standing_charge_sensor';
+  else if (id.indexOf('-soc') !== -1)     field = 'soc_sensor';
+  else if (id === 'wiz-power')            field = 'power_sensor';
+  else if (id.indexOf('-inverter-power') !== -1 || id.indexOf('-device-power') !== -1) field = 'inverter_power_sensor';
   var matches = filterEntities(field, inp.value);
   if (matches.length === 0) { drop.style.display = 'none'; return; }
   drop.innerHTML = matches.map(function(e) {
@@ -1493,20 +1565,24 @@ function showDropById(id, inp) {
 function wizCollectStep() {
   var step = WIZ_STEPS[wiz.step];
   if (step === 'main') {
-    wiz.data.mainId     = 'electricity_main';
-    wiz.data.site       = document.getElementById('wiz-site').value;
-    wiz.data.supplier   = document.getElementById('wiz-supplier').value;
+    wiz.data.mainId        = 'electricity_main';
+    wiz.data.site          = document.getElementById('wiz-site').value;
+    wiz.data.supplier      = document.getElementById('wiz-supplier').value;
     wiz.data.billing_day   = parseInt(document.getElementById('wiz-billing-day').value)||1;
-  var bmEl = document.getElementById('wiz-block-minutes');
-  wiz.data.block_minutes = bmEl ? parseInt(bmEl.value)||30 : (wiz.data.block_minutes||30);
-  var tzEl = document.getElementById('wiz-tz-select');
-  wiz.data.timezone = tzEl ? tzEl.value : (wiz.data.timezone || 'UTC');
+    var bmEl = document.getElementById('wiz-block-minutes');
+    wiz.data.block_minutes = bmEl ? parseInt(bmEl.value)||30 : (wiz.data.block_minutes||30);
+    var tzEl = document.getElementById('wiz-tz-select');
+    wiz.data.timezone = tzEl ? tzEl.value : (wiz.data.timezone || 'UTC');
+    var pcEl = document.getElementById('wiz-postcode');
+    if (pcEl) wiz.data.postcode = pcEl.value.trim();
   } else if (step === 'sensors') {
     wiz.data.importRead     = document.getElementById('wiz-imp-read').value;
     wiz.data.importRate     = document.getElementById('wiz-imp-rate').value;
     wiz.data.standingCharge = document.getElementById('wiz-imp-sc').value;
     wiz.data.exportRead     = document.getElementById('wiz-exp-read').value;
     wiz.data.exportRate     = document.getElementById('wiz-exp-rate').value;
+    var pwrEl = document.getElementById('wiz-power');
+    if (pwrEl) wiz.data.powerSensor = pwrEl.value;
   } else if (step === 'sub_sensors') {
     wiz.devices.forEach(function(devId) {
       if (!wiz.data.subMeters[devId]) wiz.data.subMeters[devId] = {};
@@ -1515,11 +1591,17 @@ function wizCollectStep() {
       var rateEl = document.getElementById('wiz-sub-' + devId + '-rate');
       var socEl  = document.getElementById('wiz-sub-' + devId + '-soc');
       var invEl  = document.getElementById('wiz-sub-' + devId + '-inverter-power');
-      if (nameEl) wiz.data.subMeters[devId].name = nameEl.value;
-      if (readEl) wiz.data.subMeters[devId].read = readEl.value;
-      if (rateEl) wiz.data.subMeters[devId].rate = rateEl.value;
+      var invertEl   = document.getElementById('wiz-sub-' + devId + '-invert');
+      var devPwrEl   = document.getElementById('wiz-sub-' + devId + '-device-power');
+      var v2xEl      = document.getElementById('wiz-sub-' + devId + '-v2x');
+      if (nameEl)   wiz.data.subMeters[devId].name = nameEl.value;
+      if (readEl)   wiz.data.subMeters[devId].read = readEl.value;
+      if (rateEl)   wiz.data.subMeters[devId].rate = rateEl.value;
       if (socEl && socEl.value) wiz.data.subMeters[devId].soc = socEl.value;
       if (invEl && invEl.value) wiz.data.subMeters[devId].inverter_power = invEl.value;
+      if (invertEl) wiz.data.subMeters[devId].inverter_power_invert = invertEl.checked;
+      if (devPwrEl && devPwrEl.value) wiz.data.subMeters[devId].device_power = devPwrEl.value;
+      if (v2xEl)    wiz.data.subMeters[devId].v2x_capable = v2xEl.checked;
     });
   }
 }
@@ -1580,7 +1662,9 @@ async function wizApplyAndClose() {
       supplier:      d.supplier || undefined,
       billing_day:    d.billing_day,
       block_minutes: d.block_minutes || 30,
-      timezone:      d.timezone || 'UTC' 
+      timezone:      d.timezone || 'UTC',
+      ...(d.powerSensor ? { power_sensor: d.powerSensor } : {}),
+      ...(d.postcode ? { postcode_prefix: d.postcode } : {})
     },
     channels: {
       import: { read: d.importRead, rate: d.importRate },
@@ -1624,7 +1708,10 @@ async function wizApplyAndClose() {
         inverter_possible: def.inverter_possible,
         v2x_capable:       def.v2x_capable,
         ...(devId === 'battery' && sd.soc ? { soc_sensor: sd.soc } : {}),
-        ...(devId === 'battery' && sd.inverter_power ? { inverter_power_sensor: sd.inverter_power } : {})
+        ...(devId === 'battery' && sd.inverter_power ? { inverter_power_sensor: sd.inverter_power } : {}),
+        ...(devId === 'battery' && sd.inverter_power_invert ? { inverter_power_invert: true } : {}),
+        ...((devId === 'ev' || devId === 'heat') && sd.device_power ? { device_power_sensor: sd.device_power } : {}),
+        ...(devId === 'ev' && sd.v2x_capable ? { v2x_capable: true } : {})
       },
       channels: {
         import: { read: sd.read || '', rate: sd.rate || d.importRate || '' }
