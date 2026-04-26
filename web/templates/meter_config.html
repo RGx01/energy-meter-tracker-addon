@@ -837,7 +837,7 @@ function onContainerClick(e) {
     openDeleteModal(mid, devName, isSub);
   } else if (el.classList.contains('js-clear-entity')) {
     var t = document.getElementById(el.dataset.target);
-    if (t) { t.value = ''; t.dispatchEvent(new Event('change')); }
+    if (t) { t.value = ''; t.dispatchEvent(new Event('change', { bubbles: true })); }
   }
 }
 
