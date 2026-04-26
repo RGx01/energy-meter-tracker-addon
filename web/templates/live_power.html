@@ -1119,8 +1119,24 @@ function _expandCard(which) {
     if (clonedContent)  clonedContent.style.display = '';
     if (clonedLoading)  clonedLoading.style.display = 'none';
     if (clonedError)    clonedError.style.display = 'none';
-    // Give cloned elements unique IDs to avoid conflicts
-    if (clonedContent) clonedContent.id = 'carbon-content-modal';
+    if (clonedContent)  clonedContent.id = 'carbon-content-modal';
+
+    // Redraw bars at modal size after layout settles
+    setTimeout(function() {
+      var modalForecast = _expandModal.querySelector('.carbon-forecast');
+      if (!modalForecast || !_lastCarbonData) return;
+      var containerH = modalForecast.getBoundingClientRect().height || 200;
+      var slots = _lastCarbonData.slots || [];
+      var intensities = slots.map(function(s) { return s.intensity || 0; });
+      var maxI = Math.max.apply(null, intensities) || 1;
+      var bars = modalForecast.querySelectorAll('.carbon-slot');
+      bars.forEach(function(bar, i) {
+        if (slots[i]) {
+          var h = Math.max(4, Math.round((slots[i].intensity / maxI) * containerH));
+          bar.style.height = h + 'px';
+        }
+      });
+    }, 100);
   }
 
   // For power history: replace cloned canvas with the ACTUAL canvas element
@@ -1359,10 +1375,13 @@ function carbonIndexClass(index) {
   return (index || '').toLowerCase().replace(' ', '-');
 }
 
+var _lastCarbonData = null;
+
 function processCarbonData(d) {
   var loadingEl  = document.getElementById('carbon-loading');
   var contentEl  = document.getElementById('carbon-content');
   var errorEl    = document.getElementById('carbon-error');
+  _lastCarbonData = d;
 
   if (!d.slots || !d.slots.length) {
     if (loadingEl) loadingEl.style.display = 'none';

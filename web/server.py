@@ -2073,14 +2073,6 @@ def api_save_config():
                 pass
 
         logger.info("server: config saved (%d meters)", len(data["meters"]))
-        for _mid, _md in data.get("meters", {}).items():
-            _meta = _md.get("meta") or {}
-            if _meta.get("sub_meter"):
-                logger.info("server: save payload — %s soc=%s inv_pwr=%s dev_pwr=%s",
-                            _mid,
-                            _meta.get("soc_sensor"),
-                            _meta.get("inverter_power_sensor"),
-                            _meta.get("device_power_sensor"))
 
         # Re-run engine_startup to pick up new sensor subscriptions
         import asyncio
