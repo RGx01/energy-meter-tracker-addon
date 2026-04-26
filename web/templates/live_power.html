@@ -5,11 +5,137 @@
 /* ── Summary page ── */
 .summary-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
   gap: 20px;
   margin-bottom: 20px;
   align-items: stretch;
   min-width: 0;
+  max-width: 1400px;
+}
+
+/* ── Wide row: CI + Power History side by side ── */
+.wide-row {
+  display: flex;
+  gap: 20px;
+  margin-bottom: 20px;
+  align-items: stretch;
+  max-width: 1400px;
+}
+.wide-row .carbon-card {
+  flex: 0 0 auto;
+  min-width: 420px;
+  width: 420px;
+  align-self: stretch;
+  margin-bottom: 0;
+}
+.wide-row .power-history-card {
+  flex: 1 1 0;
+  min-width: 0;
+  margin-bottom: 0;
+}
+@media (max-width: 960px) {
+  .wide-row { flex-direction: column; }
+  .wide-row .carbon-card { width: 100%; min-width: 0; }
+}
+
+/* ── Expand overlay ── */
+.expand-btn {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--muted);
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  transition: color 0.15s, background 0.15s;
+  z-index: 1;
+}
+.expand-btn:hover { color: var(--text); background: rgba(255,255,255,0.06); }
+.expand-btn svg { width: 14px; height: 14px; }
+
+.expand-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  z-index: 500;
+  backdrop-filter: blur(2px);
+  align-items: center;
+  justify-content: center;
+  overflow-y: auto;
+  padding: 16px;
+  box-sizing: border-box;
+}
+.expand-backdrop.active {
+  display: flex;
+}
+
+/* The modal container inside the backdrop */
+.expand-modal {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 24px;
+  width: min(1200px, 96vw);
+  height: min(900px, 96vh);
+  overflow: visible;
+  box-shadow: 0 24px 64px rgba(0,0,0,0.7);
+  position: relative;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+}
+.expand-modal .power-history-wrap {
+  flex: 1;
+  height: unset;
+}
+.expand-modal .power-history-legend {
+  flex-shrink: 0;
+}
+.expand-modal .carbon-forecast {
+  flex: 1;
+  height: unset;
+}
+.expand-modal .carbon-time-labels {
+  flex-shrink: 0;
+}
+.expand-modal .card-title {
+  flex-shrink: 0;
+}
+.expand-modal #carbon-content,
+.expand-modal #carbon-content-modal {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+.expand-modal-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: rgba(255,255,255,0.08);
+  cursor: pointer;
+  color: var(--text);
+  border-radius: 6px;
+  font-size: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1;
+}
+.expand-modal-close:hover { background: rgba(255,255,255,0.15); }
+
+.expandable-card {
+  position: relative;
 }
 
 .power-card {
@@ -37,6 +163,7 @@
   gap: 12px;
   min-width: 0;
   overflow: hidden;
+  align-self: stretch;
 }
 
 /* ── Battery icon ── */
@@ -305,11 +432,12 @@
 /* ── Rolling power chart ── */
 .power-history-card {
   margin-bottom: 20px;
+  position: relative;
 }
 .power-history-wrap {
   position: relative;
   width: 100%;
-  height: 180px;
+  height: 140px;
 }
 .power-history-wrap canvas {
   width: 100%;
@@ -386,9 +514,10 @@
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 20px 24px;
-  height: 100%;
   min-width: 0;
-  overflow: hidden;
+  position: relative;
+  display: flex;
+  flex-direction: column;
 }
 
 .carbon-current {
@@ -417,6 +546,7 @@
   border-radius: 4px;
   margin-bottom: 16px;
   display: inline-block;
+  align-self: flex-start;
 }
 
 .carbon-index.very-low  { background: rgba(34,197,94,0.15);  color: #22c55e; }
@@ -429,8 +559,25 @@
   display: flex;
   gap: 2px;
   margin-top: 12px;
-  height: 40px;
+  min-height: 60px;
+  flex-grow: 1;
   align-items: flex-end;
+  position: relative;
+}
+
+.carbon-slot {
+  flex: 1;
+  border-radius: 2px 2px 0 0;
+  min-height: 4px;
+  cursor: default;
+  transition: opacity 0.15s;
+  align-self: flex-end;
+}
+
+#carbon-content {
+  display: flex;
+  flex-direction: column;
+  flex-grow: 1;
 }
 
 .carbon-slot {
@@ -454,6 +601,7 @@
   font-size: 9px;
   color: var(--muted);
   margin-top: 4px;
+  overflow: hidden;
 }
 
 .no-data {
@@ -463,12 +611,7 @@
   padding: 20px 0;
 }
 
-@media (max-width: 1100px) {
-  .summary-grid { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
-}
-@media (max-width: 600px) {
-  .summary-grid { grid-template-columns: 1fr; }
-}
+
 
 </style>
 {% endblock %}
@@ -540,9 +683,20 @@
   <!-- Battery SoC cards — rendered dynamically by updatePower() -->
   <div id="soc-cards-container" style="display:contents;"></div>
 
+</div>
+
+{% if has_postcode or has_power_sensor %}
+<!-- ── Wide row: CI + Power History ── -->
+<div class="wide-row">
+
   {% if has_postcode %}
   <!-- Carbon intensity card -->
-  <div class="carbon-card">
+  <div class="carbon-card card expandable-card" id="carbon-card-wrap">
+    <button class="expand-btn" id="carbon-expand-btn" title="Expand" onclick="_expandCard('carbon')">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M3 3h4M3 3v4M13 3h-4M13 3v4M3 13h4M3 13v-4M13 13h-4M13 13v-4"/>
+      </svg>
+    </button>
     <div class="card-title">🌿 Carbon Intensity</div>
     <div id="carbon-loading" style="color:var(--muted);font-size:13px;">Loading forecast...</div>
     <div id="carbon-content" style="display:none;">
@@ -561,36 +715,41 @@
   </div>
   {% endif %}
 
-</div>
-
-{% endif %}
-
-{% if has_power_sensor %}
-<!-- ── Rolling Power Chart ── -->
-<div class="card power-history-card">
-  <div class="card-title" style="display:flex;align-items:center;gap:12px;">
-    <span id="ph-title">📈 48-Hour Power History</span>
-    {% if has_postcode %}
-    <div class="ph-toggle" id="ph-toggle">
-      <button id="ph-btn-kw"  class="active" onclick="_phSetMode('kw')">kW</button>
-      <button id="ph-btn-co2" onclick="_phSetMode('co2')">CO₂</button>
+  {% if has_power_sensor %}
+  <!-- Rolling Power Chart -->
+  <div class="card power-history-card expandable-card" id="power-history-card-wrap">
+    <button class="expand-btn" id="ph-expand-btn" title="Expand" onclick="_expandCard('ph')">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M3 3h4M3 3v4M13 3h-4M13 3v4M3 13h4M3 13v-4M13 13h-4M13 13v-4"/>
+      </svg>
+    </button>
+    <div class="card-title" style="display:flex;align-items:center;gap:12px;">
+      <span id="ph-title">📈 48-Hour Power History</span>
+      {% if has_postcode %}
+      <div class="ph-toggle" id="ph-toggle">
+        <button id="ph-btn-kw"  class="active" onclick="_phSetMode('kw')">kW</button>
+        <button id="ph-btn-co2" onclick="_phSetMode('co2')">CO₂</button>
+      </div>
+      {% endif %}
     </div>
-    {% endif %}
+    <div class="power-history-wrap">
+      <canvas id="power-history-canvas"></canvas>
+      <div class="ph-tooltip" id="ph-tooltip"></div>
+    </div>
+    <div class="power-history-legend" id="power-history-legend">
+      <span id="ph-legend-import"><i style="background:#ff6b6b;"></i>Importing</span>
+      <span id="ph-legend-export"><i style="background:#00d4aa;"></i>Exporting</span>
+      <span id="ph-legend-co2" style="display:none;">
+        <i style="background:linear-gradient(to right,#ff6b6b,#00d4aa);"></i>
+        Net carbon rate (gCO₂/min) — red = emitting, green = offsetting
+      </span>
+      <span id="power-history-status" style="margin-left:auto;font-size:11px;color:var(--muted);"></span>
+    </div>
   </div>
-  <div class="power-history-wrap">
-    <canvas id="power-history-canvas"></canvas>
-    <div class="ph-tooltip" id="ph-tooltip"></div>
-  </div>
-  <div class="power-history-legend" id="power-history-legend">
-    <span id="ph-legend-import"><i style="background:#ff6b6b;"></i>Importing</span>
-    <span id="ph-legend-export"><i style="background:#00d4aa;"></i>Exporting</span>
-    <span id="ph-legend-co2" style="display:none;">
-      <i style="background:linear-gradient(to right,#ff6b6b,#00d4aa);"></i>
-      Net carbon rate (gCO₂/min) — red = emitting, green = offsetting
-    </span>
-    <span id="power-history-status" style="margin-left:auto;font-size:11px;color:var(--muted);"></span>
-  </div>
+  {% endif %}
+
 </div>
+{% endif %}
 {% endif %}
 
 <!-- ── Billing Summary ── -->
@@ -908,6 +1067,116 @@ function buildSocCard(meterId, info) {
   '</div>';
 }
 
+// ── Expand / collapse overlay ──────────────────────────────────────────────
+// Cards stay in the DOM. On expand, we clone the card's innerHTML into a
+// modal div inside the backdrop. Collapse destroys the modal content.
+// This avoids all DOM-move fragility.
+
+var _backdrop = document.createElement('div');
+_backdrop.className = 'expand-backdrop';
+_backdrop.addEventListener('click', function(e) {
+  if (e.target === _backdrop) _collapseAll();
+});
+document.body.appendChild(_backdrop);
+
+var _expandModal = document.createElement('div');
+_expandModal.className = 'expand-modal';
+_backdrop.appendChild(_expandModal);
+
+var _expandWhich = null;
+var _phOrigWrap = null; // original .power-history-wrap
+
+function _expandCard(which) {
+  if (event) event.stopPropagation();
+  _expandWhich = which;
+
+  var cardId = which === 'carbon' ? 'carbon-card-wrap' : 'power-history-card-wrap';
+  var card = document.getElementById(cardId);
+  if (!card) return;
+
+  // Clone card content (not the expand button) into modal
+  _expandModal.innerHTML = '';
+
+  // Close button
+  var closeBtn = document.createElement('button');
+  closeBtn.className = 'expand-modal-close';
+  closeBtn.innerHTML = '✕';
+  closeBtn.addEventListener('click', _collapseAll);
+  _expandModal.appendChild(closeBtn);
+
+  // Clone card children (skip the expand-btn)
+  Array.from(card.children).forEach(function(child) {
+    if (!child.classList.contains('expand-btn')) {
+      _expandModal.appendChild(child.cloneNode(true));
+    }
+  });
+
+  // Fix cloned carbon content — remove inline display:none so CSS flex takes over
+  if (which === 'carbon') {
+    var clonedContent = _expandModal.querySelector('#carbon-content');
+    var clonedLoading = _expandModal.querySelector('#carbon-loading');
+    var clonedError   = _expandModal.querySelector('#carbon-error');
+    if (clonedContent)  clonedContent.style.display = '';
+    if (clonedLoading)  clonedLoading.style.display = 'none';
+    if (clonedError)    clonedError.style.display = 'none';
+    // Give cloned elements unique IDs to avoid conflicts
+    if (clonedContent) clonedContent.id = 'carbon-content-modal';
+  }
+
+  // For power history: replace cloned canvas with the ACTUAL canvas element
+  // so all existing event listeners (hover, drag zoom etc.) keep working
+  if (which === 'ph' && _phCanvas) {
+    var modalWrap = _expandModal.querySelector('.power-history-wrap');
+    if (modalWrap) {
+      // Move actual canvas + tooltip into modal wrap
+      _phOrigWrap = _phCanvas.parentElement;
+      var tip = _phOrigWrap.querySelector('.ph-tooltip');
+      modalWrap.innerHTML = '';
+      modalWrap.appendChild(_phCanvas);
+      if (tip) modalWrap.appendChild(tip);
+      // Set explicit canvas CSS height so _phDraw can read correct dimensions
+      _phCanvas.style.height = '100%';
+      setTimeout(function() {
+        // Force canvas to fill the wrap using its actual pixel height
+        var wrapH = modalWrap.getBoundingClientRect().height || 500;
+        _phCanvas.style.height = wrapH + 'px';
+        if (typeof _phDraw === 'function') _phDraw();
+      }, 150);
+    }
+  }
+
+  _backdrop.classList.add('active');
+}
+
+function _collapseAll() {
+  // Restore canvas to original wrap before clearing modal
+  if (_expandWhich === 'ph' && _phOrigWrap && _phCanvas) {
+    var tip = _expandModal.querySelector('.ph-tooltip');
+    _phCanvas.style.height = '';  // restore CSS-controlled height
+    _phOrigWrap.appendChild(_phCanvas);
+    if (tip) _phOrigWrap.appendChild(tip);
+    _phOrigWrap = null;
+    setTimeout(function() { if (typeof _phDraw === 'function') _phDraw(); }, 50);
+  }
+
+  _backdrop.classList.remove('active');
+  _expandModal.innerHTML = '';
+  _expandWhich = null;
+}
+
+// ESC key to collapse
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') _collapseAll();
+});
+
+// ── Grid layout adjustment ─────────────────────────────────────────────────
+// Adjust CI card column span so it never sits as a thin orphan.
+// CI card is now in the wide-row, not the summary-grid — this function
+// is retained for future use but currently a no-op.
+function _adjustGridLayout() {
+  // no-op — CI card is in wide-row, not summary-grid
+}
+
 function updateSocCards(socSensors) {
   var container = document.getElementById('soc-cards-container');
   if (!container) return;
@@ -964,6 +1233,8 @@ function updateSocCards(socSensors) {
     var mid = card.id.replace('soc-card-', '');
     if (!socSensors[mid]) card.remove();
   });
+
+  _adjustGridLayout();
 }
 
 
@@ -981,6 +1252,8 @@ function updateSocCards(socSensors) {
 // Billing, carbon and power history are deferred slightly.
 updatePower();
 pollTimer = setInterval(updatePower, 5000);
+// Initial layout adjustment — runs after first card render settles
+setTimeout(_adjustGridLayout, 500);
 
 window.addEventListener('beforeunload', function() {
   if (pollTimer) clearInterval(pollTimer);
@@ -1129,10 +1402,12 @@ function processCarbonData(d) {
     forecastEl.innerHTML = '';
     var intensities = d.slots.map(function(s) { return s.intensity || 0; });
     var maxI = Math.max.apply(null, intensities) || 1;
+    // Use actual rendered height of container, fallback to 60px
+    var containerH = forecastEl.getBoundingClientRect().height || 60;
     d.slots.forEach(function(slot) {
       var fromDt = new Date(slot.from);
       var isNow  = (now >= fromDt && now < new Date(slot.to));
-      var h      = Math.max(6, Math.round((slot.intensity / maxI) * 40));
+      var h      = Math.max(4, Math.round((slot.intensity / maxI) * containerH));
       var colour = CARBON_COLOURS[(slot.index || '').toLowerCase()] || '#6b7080';
       var bar    = document.createElement('div');
       bar.className = 'carbon-slot' + (isNow ? ' current-slot' : '');
@@ -1671,6 +1946,7 @@ window.addEventListener('message', function(e) {
 window.addEventListener('resize', function() {
   clearTimeout(_phTimer);
   _phTimer = setTimeout(_phDraw, 200);
+  _adjustGridLayout();
 }, { passive: true });
 
 // Load immediately then refresh every 30s (synced with power poll cadence)
