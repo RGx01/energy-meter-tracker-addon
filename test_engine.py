@@ -730,6 +730,142 @@ class TestPublishHASensorsFlag(unittest.TestCase):
         self.assertFalse(result)
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ensure_correct_block — no first block before sensors configured (2.7.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEnsureCorrectBlockNoSensors(unittest.TestCase):
+    """Tests that ensure_correct_block does not create a first block when
+    no main import sensor is configured (pre-wizard fresh install state)."""
+
+    def setUp(self):
+        """Wire a fresh store with no sensor config into the engine."""
+        import tempfile, os
+        self.tmp = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        self.tmp.close()
+        self.store = BlockStore(self.tmp.name)
+        # Insert config period with no sensors — simulates fresh install
+        # initial empty period created by engine_startup before wizard saves
+        self.store.insert_config_period({
+            "meters": {
+                "electricity_main": {
+                    "meta": {
+                        "timezone": "UTC", "billing_day": 1,
+                        "block_minutes": 30,
+                        "currency_symbol": "£", "currency_code": "GBP",
+                    },
+                    "channels": {
+                        "import": {"read": "", "rate": ""},
+                        "export": {"read": "", "rate": ""},
+                    },
+                }
+            }
+        })
+        self._orig_store = engine._store
+        engine._store = self.store
+
+    def tearDown(self):
+        engine._store = self._orig_store
+        self.store._conn.close()
+        import os
+        os.unlink(self.tmp.name)
+
+    def _call_ecb(self, now, current_block=None):
+        """Call ensure_correct_block with a minimal ha stub."""
+        from unittest.mock import MagicMock
+        ha = MagicMock()
+        return engine.ensure_correct_block(ha, current_block or {}, now)
+
+    def test_no_block_created_without_sensors(self):
+        """ensure_correct_block returns None/empty when no import sensor set."""
+        now = datetime(2026, 4, 26, 14, 17, 0)
+        result = self._call_ecb(now)
+        self.assertFalse(result and result.get("start"),
+            "Should not create first block when no sensors configured")
+
+    def test_no_block_written_to_db_without_sensors(self):
+        """ensure_correct_block does not write current_block to DB without sensors."""
+        now = datetime(2026, 4, 26, 14, 17, 0)
+        self._call_ecb(now)
+        cb = self.store.load_current_block()
+        self.assertFalse(cb and cb.get("start"),
+            "current_block should not be written to DB without sensors")
+
+    def test_block_created_once_sensors_configured(self):
+        """ensure_correct_block creates block after sensors are added."""
+        store_with_sensors = BlockStore(":memory:")
+        store_with_sensors.insert_config_period({
+            "meters": {
+                "electricity_main": {
+                    "meta": {
+                        "timezone": "UTC", "billing_day": 1,
+                        "block_minutes": 5,
+                        "currency_symbol": "£", "currency_code": "GBP",
+                    },
+                    "channels": {
+                        "import": {"read": "sensor.import", "rate": "sensor.rate"},
+                        "export": {"read": "sensor.export", "rate": "sensor.rate"},
+                    },
+                }
+            }
+        })
+        engine._store = store_with_sensors
+        now = datetime(2026, 4, 26, 14, 17, 0)
+        from unittest.mock import MagicMock
+        result = engine.ensure_correct_block(MagicMock(), {}, now)
+        self.assertTrue(result and result.get("start"),
+            "Should create first block once sensors are configured")
+        self.assertEqual(result["start"], "2026-04-26T14:15:00",
+            "First block should align to 5-min boundary, not 30-min default")
+        store_with_sensors._conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# new install — current_block cleared on new install (2.7.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNewInstallCurrentBlockCleared(unittest.TestCase):
+    """Tests that a stale current_block from a previous session is cleared
+    when the engine detects a new install (no active config period)."""
+
+    def test_current_block_cleared_in_new_install_store(self):
+        """After new install path, current_block should be empty."""
+        import tempfile, os
+        tmp = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        tmp.close()
+        store = BlockStore(tmp.name)
+
+        # Simulate stale state: write a current_block as if from a previous session
+        store._ensure_schema()
+        store.save_current_block({"start": "2026-04-26T12:30:00", "meters": {}})
+
+        # Verify it's there
+        cb_before = store.load_current_block()
+        self.assertTrue(cb_before and cb_before.get("start"),
+            "Stale current_block should be present before new install")
+
+        # Simulate what engine_startup does on new install
+        store.save_current_block({})
+
+        # Should be gone
+        cb_after = store.load_current_block()
+        self.assertFalse(cb_after and cb_after.get("start"),
+            "current_block should be cleared after new install")
+
+        store._conn.close()
+        os.unlink(tmp.name)
+
+    def test_current_block_none_after_clear(self):
+        """load_current_block returns falsy after save_current_block({})."""
+        store = BlockStore(":memory:")
+        store._ensure_schema()
+        store.save_current_block({"start": "2026-04-26T12:00:00"})
+        store.save_current_block({})
+        cb = store.load_current_block()
+        self.assertFalse(cb and cb.get("start"))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

@@ -447,6 +447,19 @@ def ensure_correct_block(ha: HAClient, current_block: dict, now: datetime,
             current_block = fresh
 
     if not current_block or not current_block.get("start"):
+        # Don't create the first block until sensors are configured.
+        # If no import sensor is set we're in the pre-wizard state —
+        # the block_minutes value is the default (30) which may not match
+        # what the wizard will set. Creating a block now would cause a
+        # block-size mismatch and racing after wizard saves.
+        cfg = load_config()
+        has_sensors = any(
+            (meter.get("channels") or {}).get("import", {}).get("read")
+            for meter in (cfg.get("meters") or {}).values()
+            if not (meter.get("meta") or {}).get("sub_meter")
+        )
+        if not has_sensors:
+            return current_block  # return None/empty — no block yet
         logger.info("Creating first block %s", iso(start))
         return create_block(start, end, block_minutes=int(get_block_minutes()))
 
