@@ -679,8 +679,18 @@ def _build_soc_response(soc_sensors, ha_client):
                 v = ha_client.get_state(info["power_entity"])
                 if v not in (None, "unknown", "unavailable"):
                     fv = float(v)
-                    # Auto-scale: if value > 100 assume W, convert to kW
-                    fv = fv / 1000.0 if abs(fv) > 100 else fv
+                    # Use unit_of_measurement to determine W vs kW — don't guess from magnitude
+                    unit = ""
+                    try:
+                        attrs = ha_client.get_attributes(info["power_entity"])
+                        unit = (attrs or {}).get("unit_of_measurement", "")
+                    except Exception:
+                        pass
+                    if unit.upper() == "W":
+                        fv = fv / 1000.0
+                    elif unit.upper() not in ("KW", "kW"):
+                        # Unknown unit — fall back to magnitude heuristic
+                        fv = fv / 1000.0 if abs(fv) > 100 else fv
                     # Invert if sensor convention is positive=charging, negative=discharging
                     if info.get("power_invert"):
                         fv = -fv
@@ -1066,26 +1076,69 @@ def api_power_history():
 @app.route("/api/meter/<meter_id>/delete-data", methods=["POST"])
 def api_meter_delete_data(meter_id: str):
     """
-    Cascade delete all data associated with a meter ID.
-    Called when a meter is removed from config.
-    Returns: { deleted: {blocks, sub_meter_history, power_history_not_applicable} }
+    Atomically remove a meter from config AND delete all its data.
+    Body: { config: <full config object> }
+    Both operations run in a single DB transaction — all-or-nothing.
+    Returns: { deleted: {blocks, sub_meter_history, current_reads}, ok: true }
     """
     try:
-        store = _get_store()
-        deleted = {}
+        store    = _get_store()
+        payload  = request.get_json(force=True) or {}
+        new_cfg  = payload.get("config")
+        deleted  = {}
+
         with store._conn:
-            # Delete blocks for this meter
+            # 1. Delete all data for this meter
             cur = store._conn.execute(
                 "DELETE FROM blocks WHERE meter_id = ?", (meter_id,)
             )
             deleted["blocks"] = cur.rowcount
-            # Delete sub_meter_history for this meter
+
             cur = store._conn.execute(
                 "DELETE FROM sub_meter_history WHERE meter_id = ?", (meter_id,)
             )
             deleted["sub_meter_history"] = cur.rowcount
-        logger.info("api_meter_delete_data: cascade deleted %s for meter %s", deleted, meter_id)
-        return jsonify({"deleted": deleted, "meter_id": meter_id})
+
+            cur = store._conn.execute(
+                "DELETE FROM current_reads WHERE meter_id = ?", (meter_id,)
+            )
+            deleted["current_reads"] = cur.rowcount
+
+            # Remove from current_block JSON if present
+            try:
+                cb_row = store._conn.execute(
+                    "SELECT id, last_checkpoint FROM current_block WHERE id = 1"
+                ).fetchone()
+                if cb_row and cb_row["last_checkpoint"]:
+                    import json as _json
+                    cb = _json.loads(cb_row["last_checkpoint"])
+                    if meter_id in (cb.get("meters") or {}):
+                        del cb["meters"][meter_id]
+                        store._conn.execute(
+                            "UPDATE current_block SET last_checkpoint = ? WHERE id = 1",
+                            (_json.dumps(cb),)
+                        )
+                        deleted["current_block"] = 1
+            except Exception:
+                pass
+
+            # 2. Save updated config (meter removed) in same transaction
+            if new_cfg:
+                period_id = store.get_current_config_period_id()
+                store._write_meters(new_cfg, period_id)
+
+        logger.info("api_meter_delete_data: deleted %s for meter %s", deleted, meter_id)
+
+        # Restart engine to pick up config change
+        try:
+            import asyncio as _asyncio
+            from engine import engine_startup as _engine_startup_d
+            if _event_loop and _event_loop.is_running() and _ha_client:
+                _asyncio.run_coroutine_threadsafe(_engine_startup_d(_ha_client), _event_loop)
+        except Exception:
+            pass
+
+        return jsonify({"ok": True, "deleted": deleted, "meter_id": meter_id})
     except Exception as e:
         logger.error("api_meter_delete_data: %s", e)
         return jsonify({"error": str(e)}), 500

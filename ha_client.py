@@ -73,6 +73,7 @@ class HAClient:
         self._ws:              aiohttp.ClientWebSocketResponse | None = None
         self._msg_id:          int = 1
         self._state_cache:     dict = {}          # entity_id → state string
+        self._attr_cache:      dict = {}          # entity_id → attributes dict
         self._subscriptions:   dict = {}          # entity_id → [callbacks]
         self._connected:       asyncio.Event = asyncio.Event()
         self._pending:         dict = {}          # msg_id → Future
@@ -201,6 +202,7 @@ class HAClient:
 
                 # Update cache
                 self._state_cache[entity_id] = state_val
+                self._attr_cache[entity_id]  = new_state.get("attributes", {})
 
                 # Fire any registered callbacks
                 for cb in self._subscriptions.get(entity_id, []):
@@ -226,6 +228,10 @@ class HAClient:
         """
         return self._state_cache.get(entity_id)
 
+    def get_attributes(self, entity_id: str) -> dict:
+        """Return cached attributes dict for entity_id, or {}."""
+        return self._attr_cache.get(entity_id) or {}
+
     async def preload_states(self, entity_ids: list[str]):
         """
         Fetch current states for a list of entities via REST API.
@@ -244,6 +250,7 @@ class HAClient:
             eid = s.get("entity_id", "")
             if not wanted or eid in wanted:
                 self._state_cache[eid] = s.get("state")
+                self._attr_cache[eid]  = s.get("attributes", {})
                 loaded += 1
 
         logger.info("ha_client: preloaded %d states", loaded)
