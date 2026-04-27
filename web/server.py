@@ -881,16 +881,60 @@ def api_billing():
         now_local = datetime.now(_tz)
         now_naive = now_local.replace(tzinfo=None)
 
-        def _fmt_total(totals, label_imp, label_exp):
+        def _fmt_total(totals, label_imp, label_exp, start_date=None, end_date=None):
             """Format SQL totals into billing card total + rows."""
             imp_cost = totals["imp_cost"]
             exp_cost = totals["exp_cost"]
             standing = totals["standing"]
             total    = round(imp_cost + standing - exp_cost, 2)
             rows = []
+
+            # Sub-meter breakdown rows
+            sub_rows = []
+            sub_kwh_total = 0.0
+            sub_cost_total = 0.0
+            if start_date and end_date:
+                active_period_sq = (
+                    "SELECT id FROM config_periods "
+                    "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+                )
+                sub_cur = store._conn.execute(
+                    f"""SELECT m.meter_id,
+                               COALESCE(SUM(COALESCE(b.imp_kwh_grid, b.imp_kwh)), 0.0) as kwh,
+                               COALESCE(SUM(b.imp_cost), 0.0) as cost
+                        FROM blocks b
+                        JOIN meters m ON m.meter_id = b.meter_id
+                          AND m.config_period_id = ({active_period_sq})
+                        WHERE m.is_sub_meter = 1
+                          AND b.local_date >= ? AND b.local_date <= ?
+                        GROUP BY m.meter_id
+                        HAVING kwh > 0.001 OR cost > 0.001""",
+                    (start_date, end_date)
+                )
+                for sr in sub_cur.fetchall():
+                    mid   = sr["meter_id"]
+                    kwh   = float(sr["kwh"])
+                    cost  = float(sr["cost"])
+                    meta  = (cfg.get("meters", {}).get(mid, {}).get("meta") or {})
+                    device = meta.get("device") or mid
+                    sub_rows.append({"label": f"↳ {device} ({kwh:.3f} kWh)",
+                                     "cost": cost, "bold": False})
+                    sub_kwh_total  += kwh
+                    sub_cost_total += cost
+
+            # Total Import = grid remainder + sub-meters
+            total_imp_kwh  = totals["imp_kwh"] + sub_kwh_total
+            total_imp_cost = imp_cost + sub_cost_total
+            if total_imp_kwh > 0.001 or total_imp_cost > 0.001:
+                rows.append({"label": f"{label_imp} ({total_imp_kwh:.3f} kWh)",
+                             "cost": total_imp_cost, "bold": True})
+            # Grid import (remainder after sub-meters)
             if totals["imp_kwh"] > 0.001 or imp_cost > 0.001:
-                rows.append({"label": f"{label_imp} ({totals['imp_kwh']:.3f} kWh)",
-                             "cost": imp_cost, "bold": True})
+                rows.append({"label": f"Grid Import ({totals['imp_kwh']:.3f} kWh)",
+                             "cost": imp_cost, "bold": False})
+            # Sub-meter rows
+            rows.extend(sub_rows)
+            # Export and standing charge
             if totals["exp_kwh"] > 0.001:
                 rows.append({"label": f"Grid Export ({totals['exp_kwh']:.3f} kWh)",
                              "cost": -exp_cost, "bold": False})
@@ -906,7 +950,8 @@ def api_billing():
         today_t = store.get_billing_totals_for_local_date_range(
             today_local_date, today_local_date
         )
-        today_total, today_rows = _fmt_total(today_t, "Total Import", "Total Import")
+        today_total, today_rows = _fmt_total(today_t, "Total Import", "Total Import",
+                                              today_local_date, today_local_date)
 
         # Billing period — find current period from config history
         _bp_periods = _ec.get_billing_periods_from_config_periods(
@@ -950,14 +995,16 @@ def api_billing():
             period_start_date.isoformat(), today_local_date
         )
 
-        month_total, month_rows = _fmt_total(month_t, "Total Import", "Total Import")
+        month_total, month_rows = _fmt_total(month_t, "Total Import", "Total Import",
+                                              period_start_date.isoformat(), today_local_date)
 
         # Calendar year — from Jan 1 local to today local
         year_start_date = now_local.date().replace(month=1, day=1).isoformat()
         year_t = store.get_billing_totals_for_local_date_range(
             year_start_date, today_local_date
         )
-        year_total, year_rows = _fmt_total(year_t, "Total Import", "Total Import")
+        year_total, year_rows = _fmt_total(year_t, "Total Import", "Total Import",
+                                            year_start_date, today_local_date)
 
         def fmt_rows(rows):
             return [{"label": r["label"], "cost": r["cost"], "bold": r.get("bold", False)}
@@ -1178,10 +1225,14 @@ def api_sub_meter_history():
         store = _get_store()
         rows  = store.get_sub_meter_history(meter_id, hours=hours)
         # Compute max abs inverter kW for gauge scaling
+        # Use 95th percentile to filter spurious outlier readings
+        kw_vals = [abs(r["inverter_kw"]) for r in rows
+                   if r.get("inverter_kw") is not None]
         max_kw = 5.0  # minimum scale
-        for r in rows:
-            if r.get("inverter_kw") is not None:
-                max_kw = max(max_kw, abs(r["inverter_kw"]))
+        if kw_vals:
+            kw_vals.sort()
+            p95_idx = int(len(kw_vals) * 0.95)
+            max_kw = max(max_kw, kw_vals[p95_idx])
         return jsonify({"rows": rows, "max_kw": round(max_kw, 1)})
     except Exception as e:
         logger.error("api_sub_meter_history: %s", e)

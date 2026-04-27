@@ -3,28 +3,82 @@
 {% block head %}
 <style>
 /* ── Summary page ── */
-.summary-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 20px;
-  margin-bottom: 20px;
-  align-items: stretch;
-  min-width: 0;
+/* Outer row — in layout-a contains both gauges and CI side by side */
+.gauge-ci-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 12px;
   max-width: 1400px;
+  align-items: stretch;
+}
+
+/* Gauge grid sits inside gauge-ci-row */
+.summary-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: stretch;
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+/* In layout-b gauges get own full row */
+.layout-b .gauge-ci-row {
+  display: block;
+  margin-bottom: 12px;
+}
+.layout-b .summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 300px));
+  gap: 12px;
+  justify-content: start;
+  max-width: 1400px;
+}
+
+/* CI card in layout-a — flex child of gauge-ci-row, expands to fill remaining space */
+.layout-a #carbon-card-wrap {
+  flex: 1 1 340px;
+  min-width: 340px;
+  margin-bottom: 0;
+}
+.layout-a #carbon-card-wrap .carbon-card {
+  height: 100%;
+  margin-bottom: 0;
+}
+
+/* CI card in layout-b — fixed width beside history */
+.layout-b #carbon-card-wrap {
+  flex: 0 0 auto;
 }
 
 /* ── Wide row: CI + Power History side by side ── */
 .wide-row {
   display: flex;
-  gap: 20px;
-  margin-bottom: 20px;
+  gap: 12px;
+  margin-bottom: 12px;
   align-items: stretch;
   max-width: 1400px;
 }
+
+/* In layout-a the wide-row only contains history — goes full width */
+.layout-a .wide-row {
+  display: block;
+  margin-bottom: 12px;
+  max-width: 1400px;
+}
+.layout-a #power-history-card-wrap {
+  margin-bottom: 0;
+}
+.layout-a #power-history-card-wrap .power-history-card {
+  margin-bottom: 0;
+}
+
+/* In layout-b CI is in wide-row beside history */
 .wide-row .carbon-card {
   flex: 0 0 auto;
-  min-width: 420px;
-  width: 420px;
+  min-width: 340px;
+  width: 340px;
   align-self: stretch;
   margin-bottom: 0;
 }
@@ -32,10 +86,6 @@
   flex: 1 1 0;
   min-width: 0;
   margin-bottom: 0;
-}
-@media (max-width: 960px) {
-  .wide-row { flex-direction: column; }
-  .wide-row .carbon-card { width: 100%; min-width: 0; }
 }
 
 /* ── Expand overlay ── */
@@ -142,12 +192,14 @@
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 24px;
+  padding: 14px 12px;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 16px;
-  min-width: 0;
+  gap: 10px;
+  min-width: 220px;
+  max-width: 300px;
+  flex: 0 0 auto;
   overflow: hidden;
 }
 
@@ -156,12 +208,14 @@
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 20px 16px;
+  padding: 14px 12px;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 12px;
-  min-width: 0;
+  gap: 10px;
+  min-width: 220px;
+  max-width: 300px;
+  flex: 0 0 auto;
   overflow: hidden;
   align-self: stretch;
 }
@@ -277,8 +331,8 @@
 .gauge-wrap {
   position: relative;
   width: 100%;
-  max-width: 220px;
-  height: 120px;
+  max-width: 180px;
+  height: 100px;
 }
 
 .gauge-wrap svg {
@@ -296,7 +350,7 @@
 }
 
 .gauge-kw {
-  font-size: 28px;
+  font-size: 22px;
   font-weight: 700;
   font-family: var(--mono);
   color: var(--text);
@@ -304,13 +358,13 @@
 }
 
 .gauge-unit {
-  font-size: 12px;
+  font-size: 11px;
   color: var(--muted);
   margin-top: 2px;
 }
 
 .gauge-label {
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -322,14 +376,14 @@
   width: 100%;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 6px;
 }
 
 .power-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 14px;
+  padding: 6px 10px;
   background: var(--bg);
   border-radius: var(--radius);
   border: 1px solid var(--border);
@@ -338,20 +392,20 @@
 .power-row-label {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 13px;
+  gap: 6px;
+  font-size: 11px;
   color: var(--muted);
 }
 
 .power-row-dot {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   flex-shrink: 0;
 }
 
 .power-row-value {
-  font-size: 15px;
+  font-size: 13px;
   font-weight: 600;
   font-family: var(--mono);
   color: var(--text);
@@ -381,49 +435,50 @@
 /* ── Billing summary ── */
 .billing-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 20px;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  max-width: 1400px;
 }
 
 .billing-card {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 20px 24px;
+  padding: 14px 16px;
   min-width: 0;
   overflow: hidden;
 }
 
 .billing-total {
-  font-size: clamp(20px, 5vw, 32px);
+  font-size: clamp(18px, 4vw, 28px);
   font-weight: 700;
   font-family: var(--mono);
   color: var(--accent);
   line-height: 1;
-  margin-bottom: 4px;
+  margin-bottom: 3px;
   word-break: break-all;
 }
 
 .billing-period {
-  font-size: 11px;
+  font-size: 10px;
   color: var(--muted);
-  margin-bottom: 16px;
+  margin-bottom: 10px;
 }
 
 .billing-rows {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
 }
 
 .billing-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  font-size: 12px;
-  padding: 6px 10px;
+  font-size: 11px;
+  padding: 4px 8px;
   background: var(--bg);
-  border-radius: 6px;
+  border-radius: 4px;
 }
 
 .billing-row-label { color: var(--muted); }
@@ -437,7 +492,7 @@
 .power-history-wrap {
   position: relative;
   width: 100%;
-  height: 140px;
+  height: 120px;
 }
 .power-history-wrap canvas {
   width: 100%;
@@ -609,8 +664,40 @@
   font-size: 13px;
   text-align: center;
   padding: 20px 0;
+}/* ── Responsive breakpoints ── */
+
+/* Tablet / HA app portrait ~600-900px — billing 1 col, gauges flex */
+@media (max-width: 900px) {
+  .billing-grid {
+    grid-template-columns: 1fr;
+  }
+  .wide-row { flex-direction: column; }
+  .wide-row .carbon-card { width: 100%; min-width: 0; }
+  .gauge-ci-row { flex-wrap: wrap; }
+  .layout-a #carbon-card-wrap { min-width: 0; max-width: 100%; flex: 1 1 100%; }
 }
 
+/* Mobile portrait ≤600px — everything single column */
+@media (max-width: 600px) {
+  .gauge-ci-row { flex-direction: column; }
+  .layout-a #carbon-card-wrap { min-width: 0; width: 100%; max-width: 100%; }
+
+  .power-card,
+  .soc-card {
+    min-width: 0;
+    max-width: 100%;
+    width: 100%;
+    flex: 1 1 100%;
+  }
+
+  .summary-grid {
+    display: flex;
+    flex-direction: column;
+  }
+  .layout-b .summary-grid {
+    grid-template-columns: 1fr;
+  }
+}
 
 
 </style>
@@ -633,12 +720,14 @@
 
 <!-- ── Live Power ── -->
 {% if not has_power_sensor %}
-<div class="card" style="text-align:center;padding:32px;margin-bottom:20px;">
+<div class="card" style="text-align:center;padding:32px;margin-bottom:12px;">
   <div style="font-size:32px;margin-bottom:12px;">⚡</div>
   <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No power sensor configured</div>
   <div style="color:var(--muted);font-size:13px;">Add a power sensor in <a href="{{ url_for('settings_page') }}" style="color:var(--accent);">Meter Config</a> to enable the live power gauge.</div>
 </div>
 {% else %}
+<div class="live-power-page">
+<div class="gauge-ci-row">
 <div class="summary-grid">
 
   <!-- Main gauge -->
@@ -683,9 +772,13 @@
   <!-- Battery SoC cards — rendered dynamically by updatePower() -->
   <div id="soc-cards-container" style="display:contents;"></div>
 
-</div>
+</div><!-- /.summary-grid -->
 
 {% if has_postcode or has_power_sensor %}
+<!-- ── CI card slot (moves here in layout-a, stays in wide-row in layout-b) ── -->
+<!-- In layout-a JS moves #carbon-card-wrap here; in layout-b it stays in wide-row -->
+</div><!-- /.gauge-ci-row -->
+
 <!-- ── Wide row: CI + Power History ── -->
 <div class="wide-row">
 
@@ -748,7 +841,8 @@
   </div>
   {% endif %}
 
-</div>
+</div><!-- /.wide-row -->
+</div><!-- /.live-power-page -->
 {% endif %}
 {% endif %}
 
@@ -1190,7 +1284,7 @@ document.addEventListener('keydown', function(e) {
 // CI card is now in the wide-row, not the summary-grid — this function
 // is retained for future use but currently a no-op.
 function _adjustGridLayout() {
-  // no-op — CI card is in wide-row, not summary-grid
+  _applyLayout();
 }
 
 function updateSocCards(socSensors) {
@@ -1490,6 +1584,39 @@ setTimeout(function() { loadCarbonAndSchedule(); }, 600);
 
 {% if has_power_sensor %}
 // ── Rolling power history chart ──────────────────────────────────────────────
+// ── Layout switcher ──────────────────────────────────────────────────────
+function _applyLayout() {
+  var container = document.getElementById('soc-cards-container');
+  var gaugeCount = (container ? container.children.length : 0) + 1; // +1 for live power
+  var page = document.querySelector('.live-power-page');
+  if (!page) return;
+
+  var gaugeCiRow = document.querySelector('.gauge-ci-row');
+  var wideRow    = document.querySelector('.wide-row');
+  var carbonWrap = document.getElementById('carbon-card-wrap');
+
+  if (gaugeCount <= 3) {
+    page.classList.add('layout-a');
+    page.classList.remove('layout-b');
+    // Move CI card into gauge-ci-row so it sits beside gauges, expanding to fill
+    if (gaugeCiRow && carbonWrap && !gaugeCiRow.contains(carbonWrap)) {
+      gaugeCiRow.appendChild(carbonWrap);
+    }
+  } else {
+    page.classList.add('layout-b');
+    page.classList.remove('layout-a');
+    // Move CI card back into wide-row beside history
+    if (wideRow && carbonWrap && !wideRow.contains(carbonWrap)) {
+      wideRow.insertBefore(carbonWrap, wideRow.firstChild);
+    }
+  }
+}
+
+// Run on load and whenever soc cards update
+document.addEventListener('DOMContentLoaded', function() {
+  setTimeout(_applyLayout, 100);
+});
+
 var _phCanvas   = document.getElementById('power-history-canvas');
 var _phHasCI    = {{ 'true' if has_postcode else 'false' }};
 var _phData     = [];   // [{captured_at, net_kw, intensity, carbon_gco2_min}]
@@ -1537,19 +1664,28 @@ function _phUpdateTitle() {
 
 function _phApplyMode() {
   _phUpdateTitle();
-  // Toggle button active state
-  var btnKw  = document.getElementById('ph-btn-kw');
-  var btnCo2 = document.getElementById('ph-btn-co2');
-  if (btnKw)  btnKw.classList.toggle('active',  _phMode === 'kw');
-  if (btnCo2) btnCo2.classList.toggle('active', _phMode === 'co2');
-  // Legend items
-  var legImp = document.getElementById('ph-legend-import');
-  var legExp = document.getElementById('ph-legend-export');
-  var legCo2 = document.getElementById('ph-legend-co2');
-  var isCo2  = _phMode === 'co2';
-  if (legImp) legImp.style.display = isCo2 ? 'none' : '';
-  if (legExp) legExp.style.display = isCo2 ? 'none' : '';
-  if (legCo2) legCo2.style.display = isCo2 ? ''     : 'none';
+  // Update all instances — original card and modal clone if open
+  // Modal canvas was moved so the card content is split: canvas in modal,
+  // buttons/legend cloned. Update both document and modal.
+  var isCo2 = _phMode === 'co2';
+
+  function applyToContext(ctx) {
+    var btnKw  = ctx.querySelector('#ph-btn-kw');
+    var btnCo2 = ctx.querySelector('#ph-btn-co2');
+    var legImp = ctx.querySelector('#ph-legend-import');
+    var legExp = ctx.querySelector('#ph-legend-export');
+    var legCo2 = ctx.querySelector('#ph-legend-co2');
+    if (btnKw)  btnKw.classList.toggle('active',  _phMode === 'kw');
+    if (btnCo2) btnCo2.classList.toggle('active', _phMode === 'co2');
+    if (legImp) legImp.style.display = isCo2 ? 'none' : '';
+    if (legExp) legExp.style.display = isCo2 ? 'none' : '';
+    if (legCo2) legCo2.style.display = isCo2 ? ''     : 'none';
+  }
+
+  applyToContext(document);
+  if (_expandWhich === 'ph' && _backdrop && _backdrop.classList.contains('active')) {
+    applyToContext(_expandModal);
+  }
 }
 
 function _phGetTheme() {
