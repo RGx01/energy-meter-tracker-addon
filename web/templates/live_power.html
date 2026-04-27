@@ -1659,11 +1659,14 @@ function _phSetMode(mode) {
 }
 
 function _phUpdateTitle() {
-  var el = document.getElementById('ph-title');
-  if (!el) return;
-  el.textContent = (_phMode === 'co2' && _phHasCI)
+  var title = (_phMode === 'co2' && _phHasCI)
     ? '☁️ 48-Hour Carbon Rate'
     : '📈 48-Hour Power History';
+  // Update all instances — original and modal clone
+  [document, _expandModal].forEach(function(ctx) {
+    var el = ctx.querySelector('#ph-title');
+    if (el) el.textContent = title;
+  });
 }
 
 function _phApplyMode() {
