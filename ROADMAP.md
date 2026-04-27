@@ -154,7 +154,16 @@
 - **CI gap backfill** — scan blocks with `NULL carbon_g` and backfill from stored `carbon_intensity` table; fetch historical CI from National Grid ESO range endpoint for any gaps not already stored. Was planned for 2.6.4 but slipped.
 - **Toolbar unification** — billing chart, heatmap and Insights toolbars refactored to match the Usage Stats pattern (segmented tabs in topbar, period nav in floating sub-bar, consistent mobile collapse)
 
-### 2.8.0 — Usage Insights Tab
+### 2.8.0 — Usage Insights Tab + Timezone Refactor
+
+**Timezone refactor** *(breaking schema change — migrate at startup)*
+- Drop `local_date` column from `blocks` table — currently written by engine at block time using configured timezone
+- Engine becomes fully timezone-agnostic — all processing in UTC
+- Timezone responsibility moves entirely to server.py query layer
+- Billing date range queries use UTC boundary equivalents of local dates via `local_date_to_utc_bounds(date_str, tz_name)` helper
+- Retroactively corrects all historical accounting for users who had wrong timezone configured (e.g. UTC instead of Europe/London during BST)
+- Migration: on startup, drop `local_date` column if present (SQLite requires table rebuild — use `ALTER TABLE` + copy approach)
+- Timezone config remains in meter config for display purposes but engine no longer reads it
 
 The hidden Usage tab on the Insights page becomes active. Placeholder tab already present in `insights.html`.
 
