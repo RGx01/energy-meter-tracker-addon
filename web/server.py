@@ -124,12 +124,14 @@ def start():
     """Start Flask in a background daemon thread."""
     t = threading.Thread(target=_run, daemon=True, name="flask")
     t.start()
-    logger.info("server: Flask started on port 8099")
+    _port = int(os.environ.get("EMT_PORT") or "8099")
+    logger.info("server: Flask started on port %d", _port)
 
 
 def _run():
     from waitress import serve
-    serve(app, host="0.0.0.0", port=8099, threads=4)
+    _port = int(os.environ.get("EMT_PORT") or "8099")
+    serve(app, host="0.0.0.0", port=_port, threads=4)
 
 
 # ── Settings defaults ─────────────────────────────────────────────────────────
@@ -652,6 +654,61 @@ def live_power_page():
     )
 
 
+def _is_meter_type(meta: dict, meter_id: str, expected_type: str) -> bool:
+    """Check if a meter is of the given type using only the explicit meter_type field.
+    No keyword fallback — meter_type must be explicitly set via the config UI (2.7.0+).
+    """
+    return (meta.get('meter_type') or '').lower() == expected_type
+
+
+def _build_soc_response(soc_sensors, ha_client):
+    """Safely build SoC sensor readings dict for the live power API response."""
+    result = {}
+    for m_id, info in soc_sensors.items():
+        soc_val = None
+        power_kw = None
+        try:
+            if ha_client and info.get("soc_entity"):
+                v = ha_client.get_state(info["soc_entity"])
+                if v not in (None, "unknown", "unavailable"):
+                    soc_val = round(float(v), 1)
+        except (ValueError, TypeError):
+            pass
+        try:
+            if ha_client and info.get("power_entity"):
+                v = ha_client.get_state(info["power_entity"])
+                if v not in (None, "unknown", "unavailable"):
+                    fv = float(v)
+                    # Use unit_of_measurement to determine W vs kW — don't guess from magnitude
+                    unit = ""
+                    try:
+                        attrs = ha_client.get_attributes(info["power_entity"])
+                        unit = (attrs or {}).get("unit_of_measurement", "")
+                    except Exception:
+                        pass
+                    if unit.upper() == "W":
+                        fv = fv / 1000.0
+                    elif unit.upper() not in ("KW", "kW"):
+                        # Unknown unit — fall back to magnitude heuristic
+                        fv = fv / 1000.0 if abs(fv) > 100 else fv
+                    # Invert if sensor convention is positive=charging, negative=discharging
+                    if info.get("power_invert"):
+                        fv = -fv
+                    power_kw = round(fv, 3)
+        except (ValueError, TypeError):
+            pass
+        result[m_id] = {
+            "label":        info.get("label", m_id),
+            "type":         info.get("type", "battery"),
+            "v2x":          info.get("v2x", False),
+            "soc_entity":   info.get("soc_entity"),
+            "power_entity": info.get("power_entity"),
+            "soc":          soc_val,
+            "power_kw":     power_kw,
+        }
+    return result
+
+
 @app.route("/api/power")
 def api_power():
     """Returns live power (kW) from configured power sensor or derived from reads."""
@@ -665,14 +722,39 @@ def api_power():
 
         # Find power sensor and sub-meter sensors from config
         power_sensor = bat_sensor = ev_sensor = None
+        soc_sensors = {}  # {meter_id: {soc, inverter_power}}
         for m_id, m_data in meters_cfg.items():
             meta = (m_data or {}).get("meta", {}) or {}
             if not meta.get("sub_meter"):
                 power_sensor = meta.get("power_sensor")
-            elif "battery" in m_id.lower() or "solax" in m_id.lower():
+            elif _is_meter_type(meta, m_id, "battery"):
                 bat_sensor = ((m_data.get("channels") or {}).get("import") or {}).get("read")
-            elif "ev" in m_id.lower() or "zappi" in m_id.lower():
+                if meta.get("soc_sensor") or meta.get("inverter_power_sensor"):
+                    soc_sensors[m_id] = {
+                        "soc_entity":    meta.get("soc_sensor"),
+                        "power_entity":  meta.get("inverter_power_sensor"),
+                        "power_invert":  bool(meta.get("inverter_power_invert", False)),
+                        "label":         meta.get("device") or m_id,
+                        "type":          "battery",
+                    }
+            elif _is_meter_type(meta, m_id, "ev"):
                 ev_sensor = ((m_data.get("channels") or {}).get("import") or {}).get("read")
+                if meta.get("device_power_sensor"):
+                    soc_sensors[m_id] = {
+                        "soc_entity":   None,
+                        "power_entity": meta.get("device_power_sensor"),
+                        "label":        meta.get("device") or m_id,
+                        "type":         "ev",
+                        "v2x":          bool(meta.get("v2x_capable")),
+                    }
+            elif _is_meter_type(meta, m_id, "heat_pump"):
+                if meta.get("device_power_sensor"):
+                    soc_sensors[m_id] = {
+                        "soc_entity":   None,
+                        "power_entity": meta.get("device_power_sensor"),
+                        "label":        meta.get("device") or m_id,
+                        "type":         "heat_pump",
+                    }
 
         def sensor_kw(entity_id):
             if not entity_id or not _ha_client:
@@ -712,13 +794,14 @@ def api_power():
         for m_id, m_data in meters_blk.items():
             if not m_data:
                 continue
-            meta   = m_data.get("meta", {}) or {}
-            ch     = m_data.get("channels", {}) or {}
-            if not meta.get("sub_meter", False):
+            # Use config meta for type detection — block meta may not have meter_type
+            cfg_meta = (meters_cfg.get(m_id) or {}).get("meta", {}) or {}
+            ch       = m_data.get("channels", {}) or {}
+            if not cfg_meta.get("sub_meter", False):
                 continue
-            if "battery" in m_id.lower() or "solax" in m_id.lower() or "inverter" in m_id.lower():
+            if _is_meter_type(cfg_meta, m_id, "battery"):
                 bat_kw = derive_kw(ch.get("import", {}).get("reads", []))
-            elif "ev" in m_id.lower() or "zappi" in m_id.lower() or "charger" in m_id.lower():
+            elif _is_meter_type(cfg_meta, m_id, "ev"):
                 ev_kw = derive_kw(ch.get("import", {}).get("reads", []))
 
         if power_sensor:
@@ -769,6 +852,7 @@ def api_power():
             "max_kw":           10,
             "has_power_sensor": bool(power_sensor),
             "rate":             current_rate,
+            "soc_sensors":      _build_soc_response(soc_sensors, _ha_client),
         })
     except Exception as e:
         logger.error("api_power: %s", e)
@@ -797,16 +881,60 @@ def api_billing():
         now_local = datetime.now(_tz)
         now_naive = now_local.replace(tzinfo=None)
 
-        def _fmt_total(totals, label_imp, label_exp):
+        def _fmt_total(totals, label_imp, label_exp, start_date=None, end_date=None):
             """Format SQL totals into billing card total + rows."""
             imp_cost = totals["imp_cost"]
             exp_cost = totals["exp_cost"]
             standing = totals["standing"]
             total    = round(imp_cost + standing - exp_cost, 2)
             rows = []
+
+            # Sub-meter breakdown rows
+            sub_rows = []
+            sub_kwh_total = 0.0
+            sub_cost_total = 0.0
+            if start_date and end_date:
+                active_period_sq = (
+                    "SELECT id FROM config_periods "
+                    "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+                )
+                sub_cur = store._conn.execute(
+                    f"""SELECT m.meter_id,
+                               COALESCE(SUM(COALESCE(b.imp_kwh_grid, b.imp_kwh)), 0.0) as kwh,
+                               COALESCE(SUM(b.imp_cost), 0.0) as cost
+                        FROM blocks b
+                        JOIN meters m ON m.meter_id = b.meter_id
+                          AND m.config_period_id = ({active_period_sq})
+                        WHERE m.is_sub_meter = 1
+                          AND b.local_date >= ? AND b.local_date <= ?
+                        GROUP BY m.meter_id
+                        HAVING kwh > 0.001 OR cost > 0.001""",
+                    (start_date, end_date)
+                )
+                for sr in sub_cur.fetchall():
+                    mid   = sr["meter_id"]
+                    kwh   = float(sr["kwh"])
+                    cost  = float(sr["cost"])
+                    meta  = (cfg.get("meters", {}).get(mid, {}).get("meta") or {})
+                    device = meta.get("device") or mid
+                    sub_rows.append({"label": f"↳ {device} ({kwh:.3f} kWh)",
+                                     "cost": cost, "bold": False})
+                    sub_kwh_total  += kwh
+                    sub_cost_total += cost
+
+            # Total Import = grid remainder + sub-meters
+            total_imp_kwh  = totals["imp_kwh"] + sub_kwh_total
+            total_imp_cost = imp_cost + sub_cost_total
+            if total_imp_kwh > 0.001 or total_imp_cost > 0.001:
+                rows.append({"label": f"{label_imp} ({total_imp_kwh:.3f} kWh)",
+                             "cost": total_imp_cost, "bold": True})
+            # Grid import (remainder after sub-meters)
             if totals["imp_kwh"] > 0.001 or imp_cost > 0.001:
-                rows.append({"label": f"{label_imp} ({totals['imp_kwh']:.3f} kWh)",
-                             "cost": imp_cost, "bold": True})
+                rows.append({"label": f"Grid Import ({totals['imp_kwh']:.3f} kWh)",
+                             "cost": imp_cost, "bold": False})
+            # Sub-meter rows
+            rows.extend(sub_rows)
+            # Export and standing charge
             if totals["exp_kwh"] > 0.001:
                 rows.append({"label": f"Grid Export ({totals['exp_kwh']:.3f} kWh)",
                              "cost": -exp_cost, "bold": False})
@@ -822,7 +950,8 @@ def api_billing():
         today_t = store.get_billing_totals_for_local_date_range(
             today_local_date, today_local_date
         )
-        today_total, today_rows = _fmt_total(today_t, "Total Import", "Total Import")
+        today_total, today_rows = _fmt_total(today_t, "Total Import", "Total Import",
+                                              today_local_date, today_local_date)
 
         # Billing period — find current period from config history
         _bp_periods = _ec.get_billing_periods_from_config_periods(
@@ -866,14 +995,16 @@ def api_billing():
             period_start_date.isoformat(), today_local_date
         )
 
-        month_total, month_rows = _fmt_total(month_t, "Total Import", "Total Import")
+        month_total, month_rows = _fmt_total(month_t, "Total Import", "Total Import",
+                                              period_start_date.isoformat(), today_local_date)
 
         # Calendar year — from Jan 1 local to today local
         year_start_date = now_local.date().replace(month=1, day=1).isoformat()
         year_t = store.get_billing_totals_for_local_date_range(
             year_start_date, today_local_date
         )
-        year_total, year_rows = _fmt_total(year_t, "Total Import", "Total Import")
+        year_total, year_rows = _fmt_total(year_t, "Total Import", "Total Import",
+                                            year_start_date, today_local_date)
 
         def fmt_rows(rows):
             return [{"label": r["label"], "cost": r["cost"], "bold": r.get("bold", False)}
@@ -986,6 +1117,125 @@ def api_power_history():
         return jsonify({"rows": rows})
     except Exception as e:
         logger.error("api_power_history: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/meter/<meter_id>/delete-data", methods=["POST"])
+def api_meter_delete_data(meter_id: str):
+    """
+    Atomically remove a meter from config AND delete all its data.
+    Body: { config: <full config object> }
+    Both operations run in a single DB transaction — all-or-nothing.
+    Returns: { deleted: {blocks, sub_meter_history, current_reads}, ok: true }
+    """
+    try:
+        store    = _get_store()
+        payload  = request.get_json(force=True) or {}
+        new_cfg  = payload.get("config")
+        deleted  = {}
+
+        # Pause engine before modifying DB — prevents mid-tick inconsistency
+        try:
+            import engine as _eng_d
+            _eng_d.pause_engine()
+        except Exception:
+            pass
+
+        with store._conn:
+            # 1. Delete all data for this meter
+            cur = store._conn.execute(
+                "DELETE FROM blocks WHERE meter_id = ?", (meter_id,)
+            )
+            deleted["blocks"] = cur.rowcount
+
+            cur = store._conn.execute(
+                "DELETE FROM sub_meter_history WHERE meter_id = ?", (meter_id,)
+            )
+            deleted["sub_meter_history"] = cur.rowcount
+
+            cur = store._conn.execute(
+                "DELETE FROM current_reads WHERE meter_id = ?", (meter_id,)
+            )
+            deleted["current_reads"] = cur.rowcount
+
+            # Remove from current_block JSON if present
+            try:
+                cb_row = store._conn.execute(
+                    "SELECT id, last_checkpoint FROM current_block WHERE id = 1"
+                ).fetchone()
+                if cb_row and cb_row["last_checkpoint"]:
+                    import json as _json
+                    cb = _json.loads(cb_row["last_checkpoint"])
+                    if meter_id in (cb.get("meters") or {}):
+                        del cb["meters"][meter_id]
+                        store._conn.execute(
+                            "UPDATE current_block SET last_checkpoint = ? WHERE id = 1",
+                            (_json.dumps(cb),)
+                        )
+                        deleted["current_block"] = 1
+            except Exception:
+                pass
+
+            # 2. Save updated config (meter removed) in same transaction
+            # Must delete existing meter rows first — _write_meters only upserts,
+            # it won't remove meters that are no longer in the config.
+            if new_cfg:
+                period_id = store.get_current_config_period_id()
+                old_meter_ids = [r["id"] for r in store._conn.execute(
+                    "SELECT id FROM meters WHERE config_period_id=?", (period_id,)
+                ).fetchall()]
+                for old_mid in old_meter_ids:
+                    store._conn.execute(
+                        "DELETE FROM meter_channels WHERE meter_id=?", (old_mid,)
+                    )
+                store._conn.execute(
+                    "DELETE FROM meters WHERE config_period_id=?", (period_id,)
+                )
+                store._write_meters(new_cfg, period_id)
+
+        logger.info("api_meter_delete_data: deleted %s for meter %s", deleted, meter_id)
+
+        # Restart engine to pick up config change
+        try:
+            import asyncio as _asyncio
+            from engine import engine_startup as _engine_startup_d
+            if _event_loop and _event_loop.is_running() and _ha_client:
+                _asyncio.run_coroutine_threadsafe(_engine_startup_d(_ha_client), _event_loop)
+        except Exception:
+            pass
+
+        return jsonify({"ok": True, "deleted": deleted, "meter_id": meter_id})
+    except Exception as e:
+        logger.error("api_meter_delete_data: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/sub-meter/history")
+def api_sub_meter_history():
+    """
+    Return rolling 48-hour SoC and inverter power history for a battery sub-meter.
+    Used by the Live Power page to auto-scale the inverter gauge.
+    Returns: { rows: [{captured_at, soc_pct, inverter_kw}], max_kw: float }
+    """
+    try:
+        meter_id = request.args.get("meter_id", "")
+        hours    = min(int(request.args.get("hours", 48)), 48)
+        if not meter_id:
+            return jsonify({"error": "meter_id required"}), 400
+        store = _get_store()
+        rows  = store.get_sub_meter_history(meter_id, hours=hours)
+        # Compute max abs inverter kW for gauge scaling
+        # Use 95th percentile to filter spurious outlier readings
+        kw_vals = [abs(r["inverter_kw"]) for r in rows
+                   if r.get("inverter_kw") is not None]
+        max_kw = 5.0  # minimum scale
+        if kw_vals:
+            kw_vals.sort()
+            p95_idx = int(len(kw_vals) * 0.95)
+            max_kw = max(max_kw, kw_vals[p95_idx])
+        return jsonify({"rows": rows, "max_kw": round(max_kw, 1)})
+    except Exception as e:
+        logger.error("api_sub_meter_history: %s", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -1233,15 +1483,19 @@ def api_blocks_summary():
             pe_utc = datetime(d.year, d.month, d.day, 23, 59, 59) + _td(hours=14)
             s        = _ec.calculate_billing_summary_for_period(day_blocks, ps_utc, pe_utc)
 
-            # Standing charge: take directly from any block — it is the same value
-            # on all blocks for a given local day. Do NOT use s["total_standing"]
-            # because calculate_billing_summary groups by block_start.date() (UTC)
-            # which double-counts on BST days (23:xx UTC block = next local day).
-            # standing_charge lives at block["meters"][meter_id]["standing_charge"]
+            # Standing charge: use MAX across all day blocks from main meter only.
+            # Do NOT use day_blocks[0] — the first BST block arrives at 23:00 UTC the
+            # previous night and may have sc=0.0 if the sensor was briefly unavailable.
+            # Sub-meters always have sc=0 — skip them to avoid corrupting totals with
+            # multiple batteries.
             standing = 0.0
-            if day_blocks:
-                _first_meter = next(iter((day_blocks[0].get("meters") or {}).values()), {})
-                standing = float(_first_meter.get("standing_charge") or 0.0)
+            for _blk in day_blocks:
+                for _m in (_blk.get("meters") or {}).values():
+                    if (_m or {}).get("meta", {}).get("sub_meter"):
+                        continue
+                    _sc = float((_m or {}).get("standing_charge") or 0.0)
+                    if _sc > standing:
+                        standing = _sc
 
             main_imp_kwh  = 0.0
             main_imp_cost = 0.0
@@ -1395,8 +1649,7 @@ def api_blocks_summary():
             "is_sub": mid != "electricity_main",
         } for mid in all_meter_ids]
 
-        export_color = meter_colors.get("electricity_main_export",
-                       meter_colors.get("electricity_main", "#ff7f0e"))
+        export_color = meter_colors.get("electricity_main_export", "#ff7f0e")
 
         _postcode = ""
         for _md in cfg.get("meters", {}).values():
@@ -1789,6 +2042,32 @@ def api_save_config():
         change_reason = payload.pop("change_reason", None) or None
         data = payload
 
+        # Validate device names — unique, max 40 chars, safe characters
+        import re as _re
+        _NAME_REGEX = _re.compile(r"^[a-zA-Z0-9 '\-&().]+$")
+        _NAME_MAX   = 40
+        seen_names  = {}
+        name_errors = []
+        for mid, mdata in (data.get("meters") or {}).items():
+            meta     = (mdata or {}).get("meta") or {}
+            is_sub   = meta.get("sub_meter")
+            raw_name = (meta.get("device") if is_sub else meta.get("site") or "").strip()
+            if not raw_name:
+                if is_sub:
+                    name_errors.append(f'Meter "{mid}": device name is required.')
+                continue
+            if len(raw_name) > _NAME_MAX:
+                name_errors.append(f'"{raw_name}": name must be {_NAME_MAX} characters or fewer.')
+            if not _NAME_REGEX.match(raw_name):
+                name_errors.append(f'"{raw_name}": name contains invalid characters.')
+            lower = raw_name.lower()
+            if lower in seen_names:
+                name_errors.append(f'"{raw_name}": name is already used by another meter.')
+            else:
+                seen_names[lower] = mid
+        if name_errors:
+            return jsonify({"error": " | ".join(name_errors)}), 400
+
         # Zip current data before committing config change
         _create_backup_zip(label="pre_config_save")
 
@@ -1802,7 +2081,14 @@ def api_save_config():
             should_create = True
             if cur_id is not None:
                 old_cfg = store.config_from_db(cur_id)
-                if old_cfg.get("meters"):
+                # If current period has no blocks yet, update in place regardless
+                # of how significant the change is — no data to protect
+                block_count = store._conn.execute(
+                    "SELECT COUNT(*) FROM blocks WHERE config_period_id = ?", (cur_id,)
+                ).fetchone()[0]
+                if block_count == 0:
+                    should_create = False
+                elif old_cfg.get("meters"):
                     if not config_meta_significant(old_cfg, data):
                         should_create = False
             if should_create:
@@ -2917,14 +3203,25 @@ def api_blocks_delete_preview():
     try:
         data      = request.get_json(force=True) or {}
         from_date = data.get("from_date", "").strip()
+        from_time = data.get("from_time", "00:00").strip() or "00:00"
         to_date   = data.get("to_date", "").strip()
+        to_time   = data.get("to_time", "23:59").strip() or "23:59"
         meter_id  = data.get("meter_id") or None
         if not from_date or not to_date:
             return jsonify({"error": "from_date and to_date required"}), 400
         if from_date > to_date:
             return jsonify({"error": "from_date must not be after to_date"}), 400
+        # Convert local times to UTC using the configured timezone
+        _cfg = load_config()
+        _tz_name = "UTC"
+        for _md in (_cfg.get("meters") or {}).values():
+            if not (_md.get("meta") or {}).get("sub_meter"):
+                _tz_name = (_md.get("meta") or {}).get("timezone", "UTC")
+                break
+        from_time_utc = _corrections_time_to_utc(from_time, _tz_name, from_date)
+        to_time_utc   = _corrections_time_to_utc(to_time,   _tz_name, to_date)
         store = _get_store()
-        result = store.count_blocks_for_date_range(from_date, to_date, meter_id)
+        result = store.count_blocks_for_date_range(from_date, to_date, meter_id, from_time_utc, to_time_utc)
         return jsonify(result)
     except Exception as e:
         logger.error("api_blocks_delete_preview: %s", e)
@@ -2941,7 +3238,9 @@ def api_blocks_delete():
     try:
         data      = request.get_json(force=True) or {}
         from_date = data.get("from_date", "").strip()
+        from_time = data.get("from_time", "00:00").strip() or "00:00"
         to_date   = data.get("to_date", "").strip()
+        to_time   = data.get("to_time", "23:59").strip() or "23:59"
         meter_id  = data.get("meter_id") or None
         confirmed = data.get("confirmed", False)
         if not from_date or not to_date:
@@ -2950,8 +3249,17 @@ def api_blocks_delete():
             return jsonify({"error": "from_date must not be after to_date"}), 400
         if not confirmed:
             return jsonify({"error": "confirmed must be true"}), 400
+        # Convert local times to UTC using the configured timezone
+        _cfg = load_config()
+        _tz_name = "UTC"
+        for _md in (_cfg.get("meters") or {}).values():
+            if not (_md.get("meta") or {}).get("sub_meter"):
+                _tz_name = (_md.get("meta") or {}).get("timezone", "UTC")
+                break
+        from_time_utc = _corrections_time_to_utc(from_time, _tz_name, from_date)
+        to_time_utc   = _corrections_time_to_utc(to_time,   _tz_name, to_date)
         store = _get_store()
-        result = store.delete_blocks_for_date_range(from_date, to_date, meter_id)
+        result = store.delete_blocks_for_date_range(from_date, to_date, meter_id, from_time_utc, to_time_utc)
         logger.info(
             "api_blocks_delete: deleted %d blocks across %d dates (%s\u2192%s meter=%s)",
             result["deleted"], result["dates"], from_date, to_date, meter_id or "all"

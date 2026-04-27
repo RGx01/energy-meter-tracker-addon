@@ -69,6 +69,7 @@ BLOCK_MINUTES      = 30  # default — overridden at runtime from config
 
 _read_queue:               list         = []
 _last_known_sensor_values: dict         = {}
+_PUBLISH_HA_SENSORS: bool = os.environ.get("PUBLISH_HA_SENSORS", "true").lower() != "false"
 _engine_loop_lock:         asyncio.Lock = None   # initialised in setup()
 _engine_paused:            bool         = False
 _last_ci_fetch:            datetime | None = None   # UTC — last carbon intensity fetch
@@ -446,6 +447,19 @@ def ensure_correct_block(ha: HAClient, current_block: dict, now: datetime,
             current_block = fresh
 
     if not current_block or not current_block.get("start"):
+        # Don't create the first block until sensors are configured.
+        # If no import sensor is set we're in the pre-wizard state —
+        # the block_minutes value is the default (30) which may not match
+        # what the wizard will set. Creating a block now would cause a
+        # block-size mismatch and racing after wizard saves.
+        cfg = load_config()
+        has_sensors = any(
+            (meter.get("channels") or {}).get("import", {}).get("read")
+            for meter in (cfg.get("meters") or {}).values()
+            if not (meter.get("meta") or {}).get("sub_meter")
+        )
+        if not has_sensors:
+            return current_block  # return None/empty — no block yet
         logger.info("Creating first block %s", iso(start))
         return create_block(start, end, block_minutes=int(get_block_minutes()))
 
@@ -656,6 +670,7 @@ def build_gap_blocks(
     post_reads_by_channel: dict,
     last_known_rates:      dict,
     config:                dict,
+    last_standing_charge:  float = 0.0,
 ) -> list:
     gap_blocks = []
 
@@ -678,7 +693,7 @@ def build_gap_blocks(
             is_sub      = meter_meta.get("sub_meter", False)
             meter_block = {
                 "channels": {}, "meta": meter_meta,
-                "interpolated": True, "standing_charge": 0.0,
+                "interpolated": True, "standing_charge": last_standing_charge,
             }
 
             for channel_name in meter_cfg.get("channels", {}).keys():
@@ -716,6 +731,13 @@ def build_gap_blocks(
 
                     if skip_reason:
                         logger.warning("build_gap_blocks: %s/%s zero — %s", meter_name, channel_name, skip_reason)
+                        # Still look up the last known rate so the chart rate line
+                        # doesn't spike to zero on restarts
+                        _sr = last_known_rates.get(meter_name, {}).get(channel_name)
+                        if _sr is None:
+                            parent_name = meter_meta.get("parent_meter")
+                            _sr = last_known_rates.get(parent_name, {}).get(channel_name)
+                        sub_rate = _rate_value(_sr)
 
                     meter_block["channels"][channel_name] = {
                         "kwh": sub_kwh, "rate": sub_rate, "cost": sub_cost,
@@ -912,6 +934,20 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
         import_channel_cfg     = meter_cfg.get("channels", {}).get("import", {})
         standing_charge_sensor = import_channel_cfg.get("standing_charge_sensor")
         raw_sc                 = read_sensor(ha, standing_charge_sensor) if standing_charge_sensor else 0.0
+        if (raw_sc is None or raw_sc == 0.0) and standing_charge_sensor:
+            # Sensor unavailable — fall back to last known value from DB
+            try:
+                _sc_row = _store._conn.execute(
+                    """SELECT standing_charge FROM blocks
+                       WHERE meter_id = ? AND standing_charge > 0
+                       ORDER BY block_start DESC LIMIT 1""",
+                    (meter_name,)
+                ).fetchone()
+                if _sc_row:
+                    raw_sc = float(_sc_row["standing_charge"])
+                    logger.debug("finalise_block: standing charge sensor unavailable, using last known value %.4f", raw_sc)
+            except Exception:
+                pass
         meter_block["standing_charge"] = raw_sc if raw_sc is not None else 0.0
 
         parent_name  = meter_meta.get("parent_meter")
@@ -1188,7 +1224,8 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
 async def _deferred_sensor_update(ha: HAClient, engine_totals: dict):
     """Awaitable wrapper so finalise_block (sync) can schedule an async sensor push."""
     try:
-        await update_ha_sensors(ha, engine_totals)
+        if _PUBLISH_HA_SENSORS:
+            await update_ha_sensors(ha, engine_totals)
     except Exception as e:
         logger.error("_deferred_sensor_update: %s", e)
 
@@ -1373,7 +1410,15 @@ async def _engine_tick(ha: HAClient):
         capture_samples(ha, current_block, now)
 
     # Deferred gap filling
-    _post_gap_rates = None  # set if gap fill runs, used as rate fallback for orphan block
+    # Pre-populate with rates from the last finalised block so finalise_block
+    # always has a rate fallback even when no gap fill has run this tick.
+    _post_gap_rates = None
+    try:
+        _last_blk = _store.get_last_block()
+        if _last_blk:
+            _, _post_gap_rates = extract_last_reads(_last_blk)
+    except Exception:
+        pass
     if has_gap_marker(current_block):
         has_real_read = False
         post_reads    = {}
@@ -1423,14 +1468,29 @@ async def _engine_tick(ha: HAClient):
 
             if missing_windows:
                 config     = load_config()
+                # Get last known standing charge from most recent finalised main-meter block
+                last_sc = 0.0
+                try:
+                    row = _store._conn.execute(
+                        """SELECT standing_charge FROM blocks
+                           WHERE meter_id = 'electricity_main'
+                             AND standing_charge > 0
+                           ORDER BY block_start DESC LIMIT 1"""
+                    ).fetchone()
+                    if row:
+                        last_sc = float(row["standing_charge"])
+                except Exception:
+                    pass
                 gap_blocks = build_gap_blocks(
-                    missing_windows, pre_reads, post_reads, last_rates, config
+                    missing_windows, pre_reads, post_reads, last_rates, config,
+                    last_standing_charge=last_sc
                 )
                 for gb in gap_blocks:
                     append_block_replace(gb)
 
                 engine_totals = _store.get_cumulative_totals()
-                await update_ha_sensors(ha, engine_totals)
+                if _PUBLISH_HA_SENSORS:
+                    await update_ha_sensors(ha, engine_totals)
                 logger.info("gap fill: %d interpolated blocks inserted", len(gap_blocks))
             else:
                 logger.warning("gap fill: no missing windows found, clearing marker")
@@ -1493,6 +1553,46 @@ async def _engine_tick(ha: HAClient):
     except Exception as e:
         logger.warning("_engine_tick: power_history write skipped: %s", e)
 
+    # Write sub_meter_history rows every tick for battery/EV sub-meters
+    try:
+        cfg = load_config()
+        _batt_kws = ['battery', 'batt', 'inverter', 'solax', 'givenergy', 'powerwall', 'solar']
+        _pruned_sub = False
+        for mid, m_data in cfg.get("meters", {}).items():
+            meta = (m_data or {}).get("meta", {}) or {}
+            if not meta.get("sub_meter"):
+                continue
+            soc_s = meta.get("soc_sensor")
+            inv_s = meta.get("inverter_power_sensor")
+            dev_s = meta.get("device_power_sensor")
+            if not soc_s and not inv_s and not dev_s:
+                continue  # no sensors configured for this sub-meter
+            soc_val = inv_val = None
+            if soc_s and ha:
+                v = ha.get_state(soc_s)
+                if v not in (None, "unknown", "unavailable"):
+                    try:
+                        soc_val = round(float(v), 1)
+                    except (ValueError, TypeError):
+                        pass
+            # Use inverter_power_sensor for batteries, device_power_sensor for EV/heat pump
+            power_s = inv_s or dev_s
+            if power_s and ha:
+                v = ha.get_state(power_s)
+                if v not in (None, "unknown", "unavailable"):
+                    try:
+                        fv = float(v)
+                        inv_val = round(fv / 1000.0 if abs(fv) > 100 else fv, 3)
+                    except (ValueError, TypeError):
+                        pass
+            if soc_val is not None or inv_val is not None:
+                _store.append_sub_meter_history(now.isoformat(), mid, soc_val, inv_val)
+                if not _pruned_sub:
+                    _store.prune_sub_meter_history(hours=48)
+                    _pruned_sub = True
+    except Exception as e:
+        logger.warning("_engine_tick: sub_meter_history write skipped: %s", e)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Startup  (replaces @time_trigger("startup"))
@@ -1520,6 +1620,9 @@ async def engine_startup(ha: HAClient):
         logger.info("engine_startup: WAL checkpoint complete")
     except Exception as _wce:
         logger.warning("engine_startup: WAL checkpoint failed: %s", _wce)
+
+    if not _PUBLISH_HA_SENSORS:
+        logger.warning("engine_startup: HA sensor publishing DISABLED (publish_ha_sensors=false)")
 
     config = load_config()  # now reads from the open store ✓
 
@@ -1581,20 +1684,131 @@ async def engine_startup(ha: HAClient):
                 logger.info("engine_startup: power sensor subscribed for cache: %s", ps)
             break
 
+    # Subscribe to SoC sensors for all battery sub-meters
+    for mid, mcfg in config.get("meters", {}).items():
+        if mcfg.get("meta", {}).get("sub_meter", False):
+            soc_s = mcfg.get("meta", {}).get("soc_sensor")
+            if soc_s:
+                ha.subscribe_state(soc_s, lambda entity_id, new_val, full_state: None)
+                logger.info("engine_startup: SoC sensor subscribed for cache: %s (%s)", soc_s, mid)
+            inv_s = mcfg.get("meta", {}).get("inverter_power_sensor")
+            if inv_s:
+                ha.subscribe_state(inv_s, lambda entity_id, new_val, full_state: None)
+                logger.info("engine_startup: inverter power sensor subscribed for cache: %s (%s)", inv_s, mid)
+            dev_s = mcfg.get("meta", {}).get("device_power_sensor")
+            if dev_s:
+                ha.subscribe_state(dev_s, lambda entity_id, new_val, full_state: None)
+                logger.info("engine_startup: device power sensor subscribed for cache: %s (%s)", dev_s, mid)
+
     # Pre-load sensor states into ha_client cache
     sensors_to_preload = []
     for mcfg in config.get("meters", {}).values():
-        # Include power_sensor from meta (not in channels)
+        # Include power_sensor, soc_sensor and inverter_power_sensor from meta (not in channels)
         ps = mcfg.get("meta", {}).get("power_sensor")
         if ps:
             sensors_to_preload.append(ps)
+        soc_s = mcfg.get("meta", {}).get("soc_sensor")
+        if soc_s:
+            sensors_to_preload.append(soc_s)
+        inv_s = mcfg.get("meta", {}).get("inverter_power_sensor")
+        if inv_s:
+            sensors_to_preload.append(inv_s)
+        dev_s = mcfg.get("meta", {}).get("device_power_sensor")
+        if dev_s:
+            sensors_to_preload.append(dev_s)
         for ccfg in mcfg.get("channels", {}).values():
             for key in ("read", "rate", "standing_charge_sensor"):
                 eid = ccfg.get(key)
                 if eid:
                     sensors_to_preload.append(eid)
+    # ── Wait for sensors + CI (concurrent, with timeouts) ──────────────
+    # Preload immediately — this gets the current REST-cached state for all sensors.
     if sensors_to_preload:
         await ha.preload_states(sensors_to_preload)
+
+    # Identify read sensors that are still unavailable after preload.
+    # These are the sensors we need to wait for — rate/SC sensors are less
+    # critical since we fall back to last_known_rates from DB.
+    _read_sensors = set()
+    for mcfg in config.get("meters", {}).values():
+        for ccfg in mcfg.get("channels", {}).values():
+            eid = ccfg.get("read")
+            if eid:
+                _read_sensors.add(eid)
+
+    _SENSOR_TIMEOUT = 60   # seconds to wait for read sensors
+    _CI_TIMEOUT     = 30   # seconds to wait for CI API
+
+    # Run sensor wait and CI fetch concurrently
+    async def _wait_for_sensors():
+        """Wait until all read sensors have a valid state or timeout.
+        Only waits for sensors that exist in HA but are currently unavailable.
+        Sensors that don't exist in HA at all (None) are skipped immediately —
+        waiting won't help and would cause unnecessary 60s delays on dev systems
+        using a prod DB with sensors not present in the dev HA instance.
+        """
+        import asyncio as _aio
+        deadline = _aio.get_event_loop().time() + _SENSOR_TIMEOUT
+        pending = {e for e in _read_sensors
+                   if ha.get_state(e) in ("unknown", "unavailable")}
+        missing = {e for e in _read_sensors if ha.get_state(e) is None}
+        if missing:
+            logger.warning("engine_startup: %d sensor(s) not found in HA — skipping wait: %s",
+                           len(missing), missing)
+        if not pending:
+            logger.info("engine_startup: all read sensors available after preload")
+            return
+        logger.info("engine_startup: waiting for %d sensor(s): %s", len(pending), pending)
+        while pending:
+            remaining = deadline - _aio.get_event_loop().time()
+            if remaining <= 0:
+                logger.warning("engine_startup: sensor wait timeout — %d sensor(s) still unavailable: %s",
+                               len(pending), pending)
+                return
+            await _aio.sleep(min(1.0, remaining))
+            pending = {e for e in pending
+                       if ha.get_state(e) in ("unknown", "unavailable")}
+        logger.info("engine_startup: all read sensors now available")
+
+    async def _startup_ci_fetch():
+        """Fetch CI data at startup with timeout — runs in executor to avoid blocking event loop."""
+        import asyncio as _aio
+        import urllib.error
+        postcode = _get_postcode()
+        if not postcode:
+            return
+        loop = _aio.get_event_loop()
+        def _do_fetch():
+            try:
+                slots = _fetch_carbon_intensity(postcode)
+                for slot in slots:
+                    _store.upsert_carbon_intensity(
+                        slot["captured_at"], postcode,
+                        slot["intensity"], slot["ci_index"]
+                    )
+                _store.prune_carbon_intensity(days=4)
+                return len(slots)
+            except urllib.error.URLError as e:
+                logger.warning("engine_startup: CI fetch failed: %s — will retry on first tick", e)
+                return 0
+            except Exception as e:
+                logger.warning("engine_startup: CI fetch error: %s", e)
+                return 0
+        try:
+            n = await _aio.wait_for(loop.run_in_executor(None, _do_fetch), timeout=_CI_TIMEOUT)
+            if n:
+                global _last_ci_fetch
+                _last_ci_fetch = datetime.now(timezone.utc).replace(tzinfo=None)
+                logger.info("engine_startup: CI fetch complete — %d slots for %s", n, postcode)
+        except _aio.TimeoutError:
+            logger.warning("engine_startup: CI fetch timed out after %ds — will retry on first tick", _CI_TIMEOUT)
+
+    import asyncio as _asyncio
+    await _asyncio.gather(
+        _wait_for_sensors(),
+        _startup_ci_fetch(),
+        return_exceptions=True
+    )
 
     # ── Detect and store currency symbol ────────────────────────────────
     for mid, mcfg in config.get("meters", {}).items():
@@ -1717,8 +1931,13 @@ async def engine_startup(ha: HAClient):
             migrated = migrate_json_to_sqlite(BLOCKS_PATH + ".migrated", _store, _migration_config)
             logger.info("engine_startup: re-migration complete — %d blocks migrated", migrated)
         else:
-            # Brand new install — create initial config period
-            _store.insert_config_period(config)
+            # Brand new install — create initial config period starting NOW
+            # Always use now regardless of any date in the config JSON —
+            # using a historical date would trigger gap fill for all missing blocks.
+            _store.insert_config_period(config, effective_from=datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
+            # Clear any stale current_block from a previous session —
+            # if there's no config period, the current_block is invalid.
+            _store.save_current_block({})
             logger.info("engine_startup: new install — initial config period created")
 
     logger.info("engine_startup: %d existing blocks in store", _store.count_blocks())
@@ -1799,10 +2018,84 @@ async def engine_startup(ha: HAClient):
                     for channel in (meter_data.get("channels") or {}).values():
                         channel["reads"] = []
                         channel["rates"] = []
-                set_gap_marker(current_block, pre_reads, last_rates,
-                               last_block_start=last_block_start)
-                _store.save_current_block(current_block)
-                logger.info("engine_startup: gap marker set, stale reads cleared, will fill on first capture")
+                # ── Attempt immediate gap fill using preloaded sensor states ──
+                # Build post_reads from the preloaded HA state cache.
+                # This avoids the race condition where gap fill was previously
+                # deferred until the first live sensor fire, which could happen
+                # before sub-meter sensors had reported — producing rate=0 gap blocks.
+                _preload_post_reads = {}
+                _has_preload_read = False
+                for _m_name, _m_cfg in config.get("meters", {}).items():
+                    _preload_post_reads[_m_name] = {}
+                    for _ch_name, _ch_cfg in _m_cfg.get("channels", {}).items():
+                        _eid = _ch_cfg.get("read")
+                        if not _eid:
+                            continue
+                        _val = ha.get_state(_eid)
+                        if _val not in (None, "unknown", "unavailable"):
+                            try:
+                                _preload_post_reads[_m_name][_ch_name] = {
+                                    "ts":    datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+                                    "value": float(_val),
+                                }
+                                _has_preload_read = True
+                            except (ValueError, TypeError):
+                                pass
+
+                if _has_preload_read:
+                    # We have sensor data — fill gap immediately using preloaded states
+                    logger.info("engine_startup: filling gap immediately using preloaded sensor states")
+                    _startup_sc = 0.0
+                    try:
+                        _sc_row = _store._conn.execute(
+                            """SELECT standing_charge FROM blocks
+                               WHERE meter_id = 'electricity_main'
+                                 AND standing_charge > 0
+                               ORDER BY block_start DESC LIMIT 1"""
+                        ).fetchone()
+                        if _sc_row:
+                            _startup_sc = float(_sc_row["standing_charge"])
+                    except Exception:
+                        pass
+                    _startup_gap_blocks = build_gap_blocks(
+                        missing_windows, pre_reads, _preload_post_reads,
+                        last_rates, config,
+                        last_standing_charge=_startup_sc
+                    )
+                    # Add CI to gap blocks from the carbon_intensity table
+                    _postcode = _get_postcode()
+                    for _gb in _startup_gap_blocks:
+                        try:
+                            if _postcode:
+                                _ci = _store.get_nearest_carbon_intensity(
+                                    _gb["start"], _postcode
+                                )
+                                if _ci:
+                                    _intensity = _ci["intensity"]
+                                    for _mn, _mb in (_gb.get("meters") or {}).items():
+                                        _imp_ch = (_mb.get("channels") or {}).get("import")
+                                        _exp_ch = (_mb.get("channels") or {}).get("export")
+                                        _is_sub = (_mb.get("meta") or {}).get("sub_meter", False)
+                                        if _is_sub:
+                                            _imp_kwh = float((_imp_ch or {}).get("kwh", 0.0) or 0.0)
+                                            _mb["carbon_g"] = round(_imp_kwh * _intensity, 4)
+                                        else:
+                                            _imp_kwh = float((_imp_ch or {}).get("kwh_total",
+                                                       (_imp_ch or {}).get("kwh", 0.0)) or 0.0)
+                                            _exp_kwh = float((_exp_ch or {}).get("kwh", 0.0) or 0.0)
+                                            _mb["carbon_g"] = round((_imp_kwh - _exp_kwh) * _intensity, 4)
+                        except Exception:
+                            pass
+                        append_block_replace(_gb)
+                    logger.info("engine_startup: %d gap blocks filled at startup", len(_startup_gap_blocks))
+                    # No gap marker needed — gap already filled
+                else:
+                    # Sensors still unavailable after wait — fall back to deferred fill
+                    logger.warning("engine_startup: no preloaded reads available — deferring gap fill")
+                    set_gap_marker(current_block, pre_reads, last_rates,
+                                   last_block_start=last_block_start)
+                    _store.save_current_block(current_block)
+                    logger.info("engine_startup: gap marker set, will fill on first sensor capture")
             else:
                 logger.info("engine_startup: no session gap detected")
 

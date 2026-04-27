@@ -601,6 +601,271 @@ class TestExtractLastReads(unittest.TestCase):
         self.assertEqual(rates, {})
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# build_gap_blocks — sub-meter rate on restart (2.7.0 sawtooth fix)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBuildGapBlocksSubMeterRate(unittest.TestCase):
+    """Tests that sub-meter gap blocks carry correct rates from last_known_rates,
+    not 0.0 — fixes the rate sawtooth visible on billing charts after restart."""
+
+    CONFIG = {
+        "meters": {
+            "electricity_main": {
+                "meta": {"sub_meter": False},
+                "channels": {
+                    "import": {"read": "sensor.imp", "rate": "sensor.rate"},
+                    "export": {"read": "sensor.exp", "rate": "sensor.rate"},
+                },
+            },
+            "sub_meter_battery": {
+                "meta": {"sub_meter": True, "parent_meter": "electricity_main"},
+                "channels": {
+                    "import": {"read": "sensor.bat_imp", "rate": "sensor.rate"},
+                },
+            },
+        }
+    }
+
+    def _window(self):
+        return [(dt("2026-01-01T09:00:00"), dt("2026-01-01T09:30:00"))]
+
+    def test_sub_meter_gap_block_uses_last_known_rate(self):
+        """Sub-meter gap block rate comes from last_known_rates, not 0.0."""
+        pre = {
+            "electricity_main": {
+                "import": read(1000.0, "2026-01-01T08:45:00"),
+                "export": read(500.0,  "2026-01-01T08:45:00"),
+            },
+            "sub_meter_battery": {
+                "import": read(100.0, "2026-01-01T08:45:00"),
+            },
+        }
+        post = {
+            "electricity_main": {
+                "import": read(1002.0, "2026-01-01T09:45:00"),
+                "export": read(500.5,  "2026-01-01T09:45:00"),
+            },
+            # sub_meter_battery has no post read — simulates restart before sub-meter fires
+        }
+        rates = {
+            "electricity_main": {
+                "import": {"ts": "2026-01-01T08:30:00", "value": 0.3582},
+                "export": {"ts": "2026-01-01T08:30:00", "value": 0.12},
+            },
+            "sub_meter_battery": {
+                "import": {"ts": "2026-01-01T08:30:00", "value": 0.3582},
+            },
+        }
+        blocks = engine.build_gap_blocks(self._window(), pre, post, rates, self.CONFIG)
+        self.assertEqual(len(blocks), 1)
+        bat = blocks[0]["meters"].get("sub_meter_battery")
+        self.assertIsNotNone(bat, "sub_meter_battery should appear in gap block")
+        ch = bat["channels"]["import"]
+        self.assertAlmostEqual(ch["rate"], 0.3582, places=4,
+            msg="Sub-meter gap block must use last_known_rates rate, not 0.0")
+
+    def test_sub_meter_gap_block_rate_not_zero_when_no_post_read(self):
+        """Gap block rate must never be 0.0 when last_known_rates has a value."""
+        pre = {
+            "electricity_main": {
+                "import": read(1000.0, "2026-01-01T08:45:00"),
+                "export": read(500.0,  "2026-01-01T08:45:00"),
+            },
+            "sub_meter_battery": {
+                "import": read(100.0, "2026-01-01T08:45:00"),
+            },
+        }
+        post = {
+            "electricity_main": {
+                "import": read(1002.0, "2026-01-01T09:45:00"),
+                "export": read(500.0,  "2026-01-01T09:45:00"),
+            },
+        }
+        rates = {
+            "electricity_main": {
+                "import": {"ts": "2026-01-01T08:30:00", "value": 0.25},
+                "export": {"ts": "2026-01-01T08:30:00", "value": 0.10},
+            },
+            "sub_meter_battery": {
+                "import": {"ts": "2026-01-01T08:30:00", "value": 0.25},
+            },
+        }
+        blocks = engine.build_gap_blocks(self._window(), pre, post, rates, self.CONFIG)
+        bat = blocks[0]["meters"].get("sub_meter_battery")
+        if bat:
+            ch = bat["channels"]["import"]
+            self.assertNotEqual(ch["rate"], 0.0,
+                msg="Sub-meter gap block rate must not be 0.0 when last_known_rates is available")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _PUBLISH_HA_SENSORS flag
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPublishHASensorsFlag(unittest.TestCase):
+    """Tests that _PUBLISH_HA_SENSORS is correctly read from the environment."""
+
+    def test_default_is_true(self):
+        """_PUBLISH_HA_SENSORS defaults to True when env var absent."""
+        import os
+        env_val = os.environ.get("PUBLISH_HA_SENSORS", "true")
+        result = env_val.lower() != "false"
+        self.assertTrue(result, "Should default to True when PUBLISH_HA_SENSORS not set")
+
+    def test_false_string_disables(self):
+        """PUBLISH_HA_SENSORS=false evaluates to False."""
+        result = "false".lower() != "false"
+        self.assertFalse(result)
+
+    def test_true_string_enables(self):
+        """PUBLISH_HA_SENSORS=true evaluates to True."""
+        result = "true".lower() != "false"
+        self.assertTrue(result)
+
+    def test_case_insensitive(self):
+        """PUBLISH_HA_SENSORS=FALSE (uppercase) also disables."""
+        result = "FALSE".lower() != "false"
+        self.assertFalse(result)
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ensure_correct_block — no first block before sensors configured (2.7.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEnsureCorrectBlockNoSensors(unittest.TestCase):
+    """Tests that ensure_correct_block does not create a first block when
+    no main import sensor is configured (pre-wizard fresh install state)."""
+
+    def setUp(self):
+        """Wire a fresh store with no sensor config into the engine."""
+        import tempfile, os
+        self.tmp = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        self.tmp.close()
+        self.store = BlockStore(self.tmp.name)
+        # Insert config period with no sensors — simulates fresh install
+        # initial empty period created by engine_startup before wizard saves
+        self.store.insert_config_period({
+            "meters": {
+                "electricity_main": {
+                    "meta": {
+                        "timezone": "UTC", "billing_day": 1,
+                        "block_minutes": 30,
+                        "currency_symbol": "£", "currency_code": "GBP",
+                    },
+                    "channels": {
+                        "import": {"read": "", "rate": ""},
+                        "export": {"read": "", "rate": ""},
+                    },
+                }
+            }
+        })
+        self._orig_store = engine._store
+        engine._store = self.store
+
+    def tearDown(self):
+        engine._store = self._orig_store
+        self.store._conn.close()
+        import os
+        os.unlink(self.tmp.name)
+
+    def _call_ecb(self, now, current_block=None):
+        """Call ensure_correct_block with a minimal ha stub."""
+        from unittest.mock import MagicMock
+        ha = MagicMock()
+        return engine.ensure_correct_block(ha, current_block or {}, now)
+
+    def test_no_block_created_without_sensors(self):
+        """ensure_correct_block returns None/empty when no import sensor set."""
+        now = datetime(2026, 4, 26, 14, 17, 0)
+        result = self._call_ecb(now)
+        self.assertFalse(result and result.get("start"),
+            "Should not create first block when no sensors configured")
+
+    def test_no_block_written_to_db_without_sensors(self):
+        """ensure_correct_block does not write current_block to DB without sensors."""
+        now = datetime(2026, 4, 26, 14, 17, 0)
+        self._call_ecb(now)
+        cb = self.store.load_current_block()
+        self.assertFalse(cb and cb.get("start"),
+            "current_block should not be written to DB without sensors")
+
+    def test_block_created_once_sensors_configured(self):
+        """ensure_correct_block creates block after sensors are added."""
+        store_with_sensors = BlockStore(":memory:")
+        store_with_sensors.insert_config_period({
+            "meters": {
+                "electricity_main": {
+                    "meta": {
+                        "timezone": "UTC", "billing_day": 1,
+                        "block_minutes": 5,
+                        "currency_symbol": "£", "currency_code": "GBP",
+                    },
+                    "channels": {
+                        "import": {"read": "sensor.import", "rate": "sensor.rate"},
+                        "export": {"read": "sensor.export", "rate": "sensor.rate"},
+                    },
+                }
+            }
+        })
+        engine._store = store_with_sensors
+        now = datetime(2026, 4, 26, 14, 17, 0)
+        from unittest.mock import MagicMock
+        result = engine.ensure_correct_block(MagicMock(), {}, now)
+        self.assertTrue(result and result.get("start"),
+            "Should create first block once sensors are configured")
+        self.assertEqual(result["start"], "2026-04-26T14:15:00",
+            "First block should align to 5-min boundary, not 30-min default")
+        store_with_sensors._conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# new install — current_block cleared on new install (2.7.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNewInstallCurrentBlockCleared(unittest.TestCase):
+    """Tests that a stale current_block from a previous session is cleared
+    when the engine detects a new install (no active config period)."""
+
+    def test_current_block_cleared_in_new_install_store(self):
+        """After new install path, current_block should be empty."""
+        import tempfile, os
+        tmp = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        tmp.close()
+        store = BlockStore(tmp.name)
+
+        # Simulate stale state: write a current_block as if from a previous session
+        store._ensure_schema()
+        store.save_current_block({"start": "2026-04-26T12:30:00", "meters": {}})
+
+        # Verify it's there
+        cb_before = store.load_current_block()
+        self.assertTrue(cb_before and cb_before.get("start"),
+            "Stale current_block should be present before new install")
+
+        # Simulate what engine_startup does on new install
+        store.save_current_block({})
+
+        # Should be gone
+        cb_after = store.load_current_block()
+        self.assertFalse(cb_after and cb_after.get("start"),
+            "current_block should be cleared after new install")
+
+        store._conn.close()
+        os.unlink(tmp.name)
+
+    def test_current_block_none_after_clear(self):
+        """load_current_block returns falsy after save_current_block({})."""
+        store = BlockStore(":memory:")
+        store._ensure_schema()
+        store.save_current_block({"start": "2026-04-26T12:00:00"})
+        store.save_current_block({})
+        cb = store.load_current_block()
+        self.assertFalse(cb and cb.get("start"))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

@@ -1,225 +1,209 @@
 # Roadmap
 
-This document outlines the planned release trajectory for Energy Meter Tracker. Scope and timing are subject to change.
-
----
-
 ## Released
 
-### 1.0.0 — Initial Release
-Core half-hour metering engine, sub-meter support, gap filling, billing charts, HA sensor publishing.
+### 2.7.0
 
-### 1.1.0 — Web UI
-Flask-based web UI with Meter Config, Charts, Import & Backup, Logs and Help pages.
+**Live Power**
+- Battery SoC card — battery icon with fill level (green/amber/red) and percentage
+- Inverter gauge — bidirectional semicircle (teal = discharging, purple = charging) with per-meter independent scale
+- EV charger card — unidirectional charge gauge, V2X / bidirectional capable
+- Heat pump card — unidirectional power gauge
+- Status pill — Importing / Exporting (Net Zero state removed)
+- Inverter power sensor W→kW conversion uses `unit_of_measurement` from HA attribute cache rather than magnitude heuristic
 
-### 1.2.0 — Setup Wizard
-Guided setup wizard for first-time configuration of main meter and sub-meters.
+**Meter Config**
+- "Add Device" dropdown replaces "Add Sub-meter" button — pre-configured modal for Battery / EV Charger / Heat Pump with entity pickers and correct sensor fields per type
+- Device type icon and name replaces SUB-METER / MAIN METER badges in card headers
+- Setup Wizard removed from toolbar — auto-launches on first run only, inaccessible with existing config
+- Delete device — styled confirmation modal requiring user to type DELETE, progress indicator, atomic server-side operation (data + config in single DB transaction, engine paused during delete)
+- Save alert fixed to float at top of viewport regardless of scroll position
+- Config page reload on tab switch only triggers when a DB restore actually occurred (sessionStorage flag), not on normal tab switches; wizard state protected from reload
+- Billing History link fixed (was pointing to non-existent route)
 
-### 1.3.x — Stability & Timezone
-Timezone-aware chart rendering, UTC timestamp fixes, silent sensor timeout fix, standing charge billing fix.
+**Meter Type**
+- Meter type field — Battery / EV Charger / Heat Pump — locked permanently once data recorded
+- Existing users upgrading: type dropdown available for meters with no type set, locks after first save with data recorded
+- SoC sensor, inverter power sensor + invert checkbox, charger power sensor, heat pump power sensor fields
+- V2X capable checkbox for EV chargers
+- Inverter possible checkbox with clearer description
+- `inverter_power_invert` persisted correctly through `config_from_db`
+- `meter_type` column in `meters` table; keyword detection removed from server and config UI
 
-### 1.4.0 — Global Readiness
-Configurable reconciliation period (5/15/30 min), automatic currency detection, international sensor compatibility.
+**Wizard**
+- Smart meter power sensor field added to sensors step
+- Postcode prefix field added to main step (shown only when timezone is Europe/London)
+- Battery sub-sensor step: SoC sensor, inverter power sensor, invert checkbox
+- EV charger sub-sensor step: charger power sensor, V2X checkbox
+- Heat pump sub-sensor step: heat pump power sensor
+- Fresh install no longer creates a duplicate billing period when wizard saves over the initial empty period
+- Fresh install always uses "now" as config period start — prevents gap fill disaster when `meters_config.json` present
 
-### 1.5.0 — Live Power Gauge
-Live power gauge, carbon intensity forecast, billing cards (Today / This Bill / This Year), billing auto-refresh.
+**Engine / Startup**
+- Startup sensor wait + concurrent CI fetch before gap fill
+- Immediate gap fill using preloaded HA sensor states after startup wait
+- Gap fill blocks now carry correct rates, standing charges and carbon intensity
+- Standing charge BST fix — uses MAX per day from main meter only
+- Sub-meter rate sawtooth fix on restart
+- Sub-meter rate zero fix after DB restore
+- HA sensor publishing disabled via `publish_ha_sensors` config option (for parallel dev/prod testing)
+- Port configurable via `port` config option (for parallel dev/prod testing)
 
-### 1.6.0 — Usage Stats & Theme
-Usage Stats chart (daily/monthly/yearly with sub-meter breakdown), global light/dark theme toggle, remember last page, mobile improvements.
+**Billing / Data**
+- Standing charge BST fix in billing chart hover and Usage Stats data table
+- Delete Blocks page — from/to time pickers (local time, converted to UTC)
+- Cascade delete atomic — engine paused, data deleted, config rewritten in single transaction
+- Config page reload after DB restore uses sessionStorage flag from Data Management page
+- Site name change no longer creates spurious billing period
+- New billing period not created when current period has zero blocks (fresh install / wizard)
 
-### 1.6.x — Polish & Fixes
-Billing/Calendar period toggle, data table totals column, heatmap mobile fixes, light/dark mode fixes throughout.
+**Bug fixes**
+- `billing_history.html` newPeriod() referenced undefined `periods` instead of `_periods`
+- Sub-meter rate zero after gap fill on skip path
+- CI missing from gap fill blocks
+- Engine waiting 60s on dev with sensors not in HA
+- Gap fill race condition — deferred until first sensor fire before this fix
+- Delete Blocks AND/OR logic fix for same-date ranges
+- Delete Blocks local→UTC time conversion
+- `inverter_power_invert` missing from `config_from_db` meta reconstruction
+- `no-sub-meters` null reference crashing renderAll silently
+- Add device dropdown transparent in dark theme
+- Add device dropdown items not selectable (click intercepted by outside-close handler)
 
-### 2.0.0 — SQLite Foundation
-SQLite storage replacing `blocks.json`, Billing History page, config period chain, billing period transition logic, fast SQL aggregation, gauge scale cache.
+### 2.6.3
+- Usage Stats data table scrollable on desktop, sticky headers, sortable date column, zebra shading, colour dots
+- Billing chart day order toggle
+- Heatmap fills available viewport, larger mobile metric buttons
+- CI fetch moved before ensure_correct_block
 
-### 2.1.0 — Full SQLite: Single Source of Truth
-All state in `blocks.db`. Fully normalised schema — no JSON blobs. `cumulative_totals.json`, `current_block.json` and `meters_config.json` eliminated as authoritative state. Historical Corrections enhanced with time-of-day window and per-meter targeting.
+### 2.6.2
+- Theme toggle consolidated to logo, logo size increase
+- Insights mobile topbar and metric label improvements
+- GitHub wiki link in Help
 
-### 2.1.x — Sub-meter & Billing Fixes
-Sub-meter flags in reconstructed block dicts, double-counting fixes in cumulative totals and billing, standing charge corrections restricted to main meter, colour sync between Billing chart and Usage Stats.
+### 2.6.1
+- Logo theme toggle
+- Sub-meter weighted average rate bug, session gap detection block_minutes fix
+- Upgrade wizard and startup crash fixes
 
-### 2.2.0 — Data Management
-Bill summary redesigned. Delete Blocks page. Historical Corrections promoted to own page. Compact Database. Lovelace chart endpoints.
+### 2.6.0
+- Insights page with carbon analysis and Carbon assumptions tab
+- Settings page restructure
 
-### 2.2.x — Chart & Billing Fixes
-Auto-refresh improvements, cache headers, chart regeneration optimisation, gap-fill rate and spike fixes.
+### 2.5.x
+- Power history drag zoom and touch zoom
+- Storage monitoring card on Data Management
+- Mobile topbar collapse
 
-### 2.3.0 — Carbon Tracking
-Carbon intensity recording from National Grid ESO API (UK, postcode required). `carbon_g` per block. 48-hour power history chart with kW/CO₂ toggle. Hover tooltip.
+### 2.4.x
+- Carbon footprint in Usage Stats
+- DB restore hardening (WAL checkpoint, engine pause, no-restart restore)
+- Upgrade safety backup on version change
 
-### 2.4.0 — Carbon in Usage Stats
-CO₂ metric in Usage Stats (net + totals views). `carbon_g_imp`/`carbon_g_exp` split. Reliable backup and restore (WAL flush, engine pause/reset). Server-side zip restore. Upgrade safety backup on first start per version.
+### 2.3.0
+- Carbon intensity recording (National Grid API, UK only)
+- 48-hour power history chart with kW / CO₂ toggle and hover tooltip
+- `carbon_g` on blocks
 
-### 2.4.1 — Carbon Accounting Fixes
-Blue bar shows house remainder not full main meter net carbon. `carbon_g_total` double-count removed. Mixed CO₂ units within a chart render fixed. Per-block `carbon_g_imp`/`carbon_g_exp` to handle days with mixed NULL/non-NULL carbon data.
+### 2.2.x
+- Delete Blocks sub-page
+- Historical Corrections promoted to own page
+- Compact Database
+- Lovelace-friendly chart endpoints
 
-### 2.5.0 — Carbon Heatmaps & UI Polish
-Heatmap metric toggle (kWh / gCO₂ / gCO₂/kWh). Effective intensity column in Usage Stats CO₂ mode. Power history drag zoom. Usage Stats auto-refresh TTL. Tab buttons in topbar. Floating toolbars. Fixed topbar across all pages.
+### 2.1.x
+- Fully relational SQLite schema — `meters`, `meter_channels`, `current_block`, `current_reads` tables
+- `meters_config.json` demoted to convenience export only
+- Config history (Billing History page)
+- Gap fill hardening — multiple fixes across 2.1.5–2.1.9
 
-### 2.5.x — Stability & Mobile
-Touch zoom, mobile topbar collapse, orientation fixes, billing landscape fix, chart height fix, Y axis duplicate labels, stale test timestamp, storage monitoring card.
+### 2.0.0
+- SQLite database replacing blocks.json
+- Config history / Billing History
+- Billing period transition logic
+- Fast SQL billing aggregation
+
+### 1.6.x
+- Usage Stats chart — daily, monthly, yearly with sub-meter breakdown
+- Data table with copy-to-clipboard export
+- Light/dark theme toggle
+- Summary page renamed to Live Power
+
+### 1.5.1
+- Live Power page — gauge, billing cards, carbon intensity forecast
+- Power sensor and postcode prefix fields in Meter Config
+
+### 1.4.0
+- Configurable meter reconciliation period (5, 15 or 30 minutes)
+- Automatic currency detection
+
+### 1.2.0
+- Guided Setup Wizard
+
+### 1.1.0
+- Flask-based web UI
+
+### 1.0.0
+- Initial release — core metering engine, sub-meter support, gap filling, billing charts, HA sensor publishing
 
 ---
 
 ## Planned
 
-### 2.6.0 — Carbon Insights & Navigation Refactor *(in development)*
-**Theme: Make per-block carbon data meaningful and surface it in a dedicated Insights page**
+### 2.7.1
+- **CI gap backfill** — scan blocks with `NULL carbon_g` and backfill from stored `carbon_intensity` table; fetch historical CI from National Grid ESO range endpoint for any gaps not already stored. Was planned for 2.6.4 but slipped.
+- **Toolbar unification** — billing chart, heatmap and Insights toolbars refactored to match the Usage Stats pattern (segmented tabs in topbar, period nav in floating sub-bar, consistent mobile collapse)
+- **Main meter cascade delete** — deleting a main meter should also delete all child sub-meters and their data. Currently only the main meter's blocks are deleted, leaving sub-meters orphaned in config with a broken `parent_meter` reference. Fix requires: UI `executeDelete` to identify and remove child meters from `config.meters`; server `api_meter_delete_data` to cascade block/history/current_reads deletion to all meters where `parent_meter_id = meter_id`; delete confirmation modal to warn user that child meters will also be deleted.
 
-EMT records actual grid carbon intensity at the time of every block. 2.6.0 surfaces this as a dedicated **Insights** page backed by a **Settings** page for assumption management, and refactors the navigation to reflect the evolved UI.
+### 2.8.0 — Usage Insights Tab + Timezone Refactor
 
-#### Navigation refactor
-- Sidebar renamed and restructured: ⚙️ Settings | 📊 Charts | 🌿 Insights | ⚡ Live Power | 🗄️ Data Management | 📋 Logs | 📖 Help
-- **Settings** absorbs Meter Config as its default tab, with a 🌿 Carbon tab for assumptions
-- Meter Config sub-bar: Wizard | Refresh | Billing History actions
-- All routes renamed for clarity: `/config` → `/settings`, `/import` → `/data-management`, `/summary` → `/live-power`, `/config-history` → `/billing-history`
-- Templates renamed to match: `meter_config.html`, `live_power.html`, `data_management.html`, `billing_history.html`
-- `blocks.db` confirmed as sole source of truth — `load_config()` in both `server.py` and `engine.py` never falls back to `meters_config.json` when `blocks.db` exists
+**Timezone refactor** *(breaking schema change — migrate at startup)*
+- Drop `local_date` column from `blocks` table — currently written by engine at block time using configured timezone
+- Engine becomes fully timezone-agnostic — all processing in UTC
+- Timezone responsibility moves entirely to server.py query layer
+- Billing date range queries use UTC boundary equivalents of local dates via `local_date_to_utc_bounds(date_str, tz_name)` helper
+- Retroactively corrects all historical accounting for users who had wrong timezone configured (e.g. UTC instead of Europe/London during BST)
+- Migration: on startup, drop `local_date` column if present (SQLite requires table rebuild — use `ALTER TABLE` + copy approach)
+- Timezone config remains in meter config for display purposes but engine no longer reads it
 
-#### Settings page
-- ⚙️ Meter Config tab — existing Meter Config content, unchanged
-- 🌿 Carbon tab — carbon equivalence assumptions with citations, export displacement methodology, EV/battery/heat pump assumptions, distance unit (miles/km)
-- Postcode prompt inline if not configured
-- Assumptions stored in `settings` key in `store_meta` table (no schema change)
+The hidden Usage tab on the Insights page becomes active. Placeholder tab already present in `insights.html`.
 
-#### Settings — assumptions
-| Assumption | Default | Source |
-|---|---|---|
-| Petrol car gCO₂/mile | 180 g | BEIS/DESNZ 2023 |
-| Diesel car gCO₂/mile | 168 g | BEIS/DESNZ 2023 |
-| Tree CO₂/year | 21 kg | Woodland Trust |
-| Flight LHR→NYC | 670 kgCO₂ | BEIS 2023 (economy, RF) |
-| Distance unit | miles | — |
-| EV efficiency | 3.2 miles/kWh | UK average |
-| EV charge efficiency | 88% | IEA 2022, Type 2 AC |
-| Battery round-trip | 90% | Li-ion home battery |
-| Heat pump SCOP | 3.0 | Typical air-source |
-| Gas boiler efficiency | 90% | Modern condensing |
-| Gas gCO₂/kWh | 203 g | BEIS/DESNZ 2023 |
-| Export displacement | Grid average | National Grid ESO |
+**Cost breakdown**
+- Total spend for the billing period split by meter (house remainder, EV, battery, heat pump)
+- Standing charge as £ and % of total bill
+- Effective rate (total spend ÷ total import kWh)
+- Comparison to previous period
 
-#### Insights page — Period view
-Cards adapt based on configured meters. Irrelevant cards are silently omitted.
+**Usage patterns**
+- Peak consumption window (which 3-hour block has the highest average import)
+- Highest consumption day in the period
+- Average daily import kWh
+- Self-sufficiency ratio (export ÷ (import + export)) where export data exists
+- Comparison to previous period for all metrics
 
-**Carbon Summary** — net kgCO₂, effective intensity vs grid average, import/export split, equivalences (car miles, tree days, flight %), billing period trend chart (inline SVG, click-to-navigate).
+**Tariff efficiency** *(if rate sensor history is reliable)*
+- % of EV charging kWh recorded during cheap-rate blocks
+- % of battery charging kWh recorded during cheap-rate blocks
+- Estimated saving vs charging entirely at peak rate
 
-**House Consumption** — grid import minus EV and battery charging. Baseline load — lighting and appliances. % of total import.
+**Open questions to resolve before build**
+- Does cost breakdown duplicate the Charts billing view enough to be redundant, or does the period-over-period comparison add sufficient value?
+- Tariff efficiency requires identifying which rate is "cheap" — is this derivable from the rate sensor history alone (e.g. lowest N% of recorded rates), or does it need explicit tariff band configuration?
+- Should the Usage tab require carbon data, or is it fully independent of the CI pipeline?
 
-**Solar Export Offset** — export displaced X kgCO₂. Equivalences. Note that export may include battery discharge.
-
-**EV Charging** — total carbon, average charge intensity vs grid average, estimated distance (using efficiency + charge efficiency assumptions), gCO₂/mile vs petrol/diesel comparison.
-
-**Battery Charging Behaviour** — average charge intensity vs grid average, estimated carbon saving if charged cleaner than average. Honest note: cannot split export between solar and battery without additional metering.
-
-**Heat Pump** — electricity used, heat delivered (kWh × COP), carbon vs equivalent gas boiler, % cleaner, grid crossover intensity.
-
-#### Insights navigation architecture
-- 🌿 Carbon tab (active) | Usage tab (hidden, placeholder for 2.7.0)
-- Period selector: prev/next arrows in topbar, label shows billing period dates
-- Trend chart: inline SVG bar chart, click any bar to navigate to that period
-- Three states: no postcode → collecting data → full insights
-
-#### Data layer
-- `GET /api/insights/periods` — list all billing periods with carbon summary
-- `GET /api/insights/billing-period?period_start=YYYY-MM-DD` — full carbon breakdown including sub-meter avg charge intensity and house remainder
-- `GET/POST /api/settings` — reads/writes `settings` table
-- Meter type detection: `meta.meter_type` key first, falls back to meter ID keywords (ev, charger, battery, heat, pump)
-
-#### Help page additions
-- Cost sensor setup guide — standard variable, Economy 7, Octopus Go, IOG template, Agile (API), no-cost-data scenario
+### 3.0.0
+- Remove `migrate_json_to_sqlite()` — blocks.json migration path deprecated since 2.2.3
+- Remove all 1.x.x / 2.0.x upgrade shims
+- API versioning
 
 ---
 
-### 2.7.0 — Carbon Insights: Comparisons
-**Theme: Longitudinal carbon analysis — understand trends over time**
+## Open Questions
 
-With 12+ months of per-block carbon data, meaningful comparisons become possible. This release adds comparison views to the Insights page.
+- **CI backfill staleness threshold** — how old does a block's CI data need to be before backfilling is worthwhile? Needs defining before 2.7.1 build.
+- **Usage Insights scope** — does cost breakdown duplicate Charts billing view? Does tariff efficiency require explicit tariff configuration or is it derivable from rate sensor history? To be resolved before 2.8.0 build begins.
 
-#### Insights navigation expansion
-The Insights topbar Carbon tab gains sub-navigation:
+## Decisions Made
 
-| View | Description |
-|---|---|
-| **Period** | Existing detail view for one billing period (2.6.0) |
-| **Month** | Current billing period vs previous period + same period last year |
-| **Year** | Annual summary — all billing periods aggregated |
-
-#### Month comparison view
-- Side-by-side: selected period vs previous period vs same period last year (where available)
-- Delta cards: carbon ↑↓, intensity ↑↓, EV carbon ↑↓, house consumption ↑↓
-- "Your carbon was X% lower than this time last year"
-- Grid intensity delta: "The grid was X gCO₂/kWh cleaner than last year" — separates your behaviour from grid improvement
-
-#### Year summary view
-- Total carbon for the year, breakdown by category (house, EV, battery, solar offset)
-- Best and worst billing period for carbon intensity
-- Trend chart showing all periods in the year
-- Year-on-year comparison card (requires 2 years of data)
-- "Annual carbon report" exportable summary
-
-#### Year-on-year
-- Year selector: [2025] [2026▼]
-- Same metrics as month comparison but at annual scale
-- Highlights grid decarbonisation contribution vs behaviour change contribution
-
-#### Data layer additions
-- `GET /api/insights/year-summary?year=YYYY` — aggregate all periods in a year
-- `GET /api/insights/compare?period_a=YYYY-MM-DD&period_b=YYYY-MM-DD` — delta between two periods
-
----
-
-### 2.8.0 — Meter Replacement
-**Theme: Handle real-world meter changes gracefully**
-
-When a physical meter is replaced, cumulative reads reset to zero. The engine clips negative deltas to zero but affected blocks are wrong. Explicit user-triggered correction flow via Billing History with preview and confirmation.
-
----
-
-### 2.9.0 — Gas Meters
-**Theme: Whole-home energy tracking**
-
-Extend the engine to support gas meter recording alongside electricity. Requires a design spike — gas uses m³/ft³ with calorific value conversion, different billing periods, and slower sensor updates.
-
----
-
-### 2.10.0 — Cost Sensor Guidance & Tariff Templates
-**Theme: Lower the barrier for users without API cost sensors**
-
-- Help page: step-by-step cost sensor setup guide for standard variable, Economy 7, Octopus Go, IOG, Agile
-- IOG template: normalised HA template handling 6-hour rolling cheap window resetting at noon
-- Tariff template library in UI: select your tariff type, get a copy-pasteable HA template
-
----
-
-### 3.0.0 — Charting Insights
-**Theme: Understand your energy patterns**
-
-- Peak demand analysis — highest consumption periods and times of day
-- Solar self-consumption ratio (requires solar generation sub-meter)
-- Tariff optimisation hints (Agile, Go charging windows)
-- Day-of-week and seasonal consumption patterns
-- Cost forecasting — projected bill based on current period rate
-
----
-
-## Longer Term / Unscheduled
-
-- **Solar generation tracking** — export sub-metering and self-consumption breakdown
-- **V2G / V2X export** — breakdown of EV-to-grid export by device
-- **Multiple batteries / inverters** — better support for complex hybrid systems
-- **Multi-dwelling / multi-site** — support for properties with more than one grid connection
-- **Usage Insights** — non-carbon insights: peak times, highest consumption days, standing charge as % of bill
-- **HACS / community distribution** — evaluate distribution channels beyond the add-on store
-
----
-
-## Release Principles
-
-- Each release has a clear theme and a testable scope
-- Billing accuracy is never compromised by new features
-- Breaking changes (data format, config schema) require a migration path and deprecation notice
-- The reconciliation block is the authoritative unit — higher-resolution features are additive, not replacements
-- `blocks.db` is the single source of truth — no other file takes precedence when the DB exists
-- User data is never deleted without explicit confirmation
-- Migration tools are maintained for at least one full minor release after the migration they support
+- **Meter type locking** — `meter_type` is locked for life once set. Users who set the wrong type must delete and recreate the meter (cascade delete handles data cleanup cleanly).
+- **Multiple battery gauge scaling** — each battery has its own inverter, so each card fetches its own 48hr history independently. Scale is self-sorting per card. `INV_MAX_KW` variable to be renamed per-meter for clarity in a future cleanup.

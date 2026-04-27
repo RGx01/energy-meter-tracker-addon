@@ -274,7 +274,7 @@ async function doZipRestore() {
 
     if (data.ok) {
       statusEl.textContent = '✓ Restored successfully. Reloading…';
-      setTimeout(function() { window.location.reload(); }, 2500);
+      setTimeout(function() { sessionStorage.setItem('emt_db_restored', Date.now()); window.location.reload(); }, 2500);
     } else {
       statusEl.classList.remove('show');
       showError(data.error || 'Restore failed');
@@ -372,7 +372,7 @@ async function doImport() {
     if (data.ok) {
       const el = document.getElementById('alert-success');
       el.textContent = '✓ Imported: ' + data.imported.join(', ') + '. Reloading…';
-      setTimeout(function() { window.location.reload(); }, 2500);
+      setTimeout(function() { sessionStorage.setItem('emt_db_restored', Date.now()); window.location.reload(); }, 2500);
       el.classList.add('show');
       selectedFiles = {};
       renderFileList();
@@ -522,7 +522,7 @@ async function confirmRestore() {
     if (data.ok) {
       const el = document.getElementById('alert-success');
       el.textContent = '✓ Restored: ' + checked.join(', ') + '. Reloading…';
-      setTimeout(function() { window.location.reload(); }, 2500);
+      setTimeout(function() { sessionStorage.setItem('emt_db_restored', Date.now()); window.location.reload(); }, 2500);
       el.classList.add('show');
     } else {
       showError(data.error || 'Restore failed');

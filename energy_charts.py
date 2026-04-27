@@ -633,10 +633,14 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
 
         # ── Pass 2: accumulate all meters, subtracting sub-meter totals from main import ──
         for meter_name, meter in meters.items():
-            display_name = meter_name.replace("_", " ").title()
-            if meter.get("meta", {}).get("sub_meter"):
-                display_name += " (sub-meter)"
             meter_m = (meter or {}).get("meta", {}) or {}
+            is_sub  = meter_m.get("sub_meter", False)
+            if is_sub:
+                display_name = meter_m.get("device") or meter_name.replace("_", " ").title()
+            else:
+                display_name = meter_m.get("site") or meter_m.get("site_name") or meter_name.replace("_", " ").title()
+            if not display_name:
+                display_name = meter_name.replace("_", " ").title()
             is_main_import = (meter_name == "electricity_main")
 
             for channel_name, channel in (meter.get("channels", {}) or {}).items():
@@ -693,10 +697,18 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
                     pass
 
         day_key = block_start.date()
-        if day_key not in charged_days:
-            for meter in (meters or {}).values():
-                standing_by_day[day_key] += float((meter or {}).get("standing_charge") or 0.0)
-            charged_days.add(day_key)
+        # Use MAX standing_charge per day from main meter only — same as SQL billing query.
+        # The first BST block arrives at 23:00 UTC the previous night and may have sc=0.
+        # Sub-meters always have sc=0 — skip them to avoid corrupting totals.
+        for meter in (meters or {}).values():
+            if (meter or {}).get("meta", {}).get("sub_meter"):
+                continue
+            sc = float((meter or {}).get("standing_charge") or 0.0)
+            if sc > 0:
+                standing_by_day[day_key] = max(standing_by_day[day_key], sc)
+            elif day_key not in charged_days:
+                standing_by_day.setdefault(day_key, 0.0)
+        charged_days.add(day_key)
 
     total_standing = sum(standing_by_day.values())
     total_cost = sum(t["cost"] for t in meter_totals.values()) + total_standing
@@ -1087,7 +1099,13 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
         _ys = meter_kwh[meter]
         customdata = [[x_ranges[i], total_hh_kwh[i], abs(_ys[i])] for i in range(slots)]
 
-        nice_name = meter.replace("_", " ").replace("electricity main", "House").replace("export", "Grid Export").title()
+        nice_name = meter_display_name.get(
+                        meter,
+                        meter.replace("_", " ")
+                             .replace("electricity main", "House")
+                             .replace("export", "Grid Export")
+                             .title()
+                    )
         raw_rates = meter_rate[meter]
         last_nonzero = max((i for i, v in enumerate(raw_rates) if v != 0.0), default=None)
         if last_nonzero is not None:
@@ -1339,14 +1357,21 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
             reverse=True
         )
 
+        # Detect config-change boundary — period starts on a non-billing-day
+        # meaning it was created by a config change mid-cycle, not a natural boundary
+        _is_config_change = (
+            i > 0 and
+            p_start.day != billing_day
+        )
         period_sections.append({
-            "index":      i,
-            "start":      p_start,
-            "end":        p_end,
-            "summary":    summary,
-            "is_current": is_current,
-            "is_prev":    is_prev,
-            "days":       period_days,
+            "index":          i,
+            "start":          p_start,
+            "end":            p_end,
+            "summary":        summary,
+            "is_current":     is_current,
+            "is_prev":        is_prev,
+            "is_config_change": _is_config_change,
+            "days":           period_days,
         })
 
     # Filter out periods that have no blocks at all (e.g. tiny config-change slivers
@@ -1424,7 +1449,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     dropdown_options = []
     for ps in period_sections_display:
         s_str = ps["start"].strftime("%d %b %Y")
-        e_str = (ps["end"] - timedelta(days=1)).strftime("%d %b %Y")
+        e_str = (ps["end"] - timedelta(seconds=1)).strftime("%d %b %Y")
         cost  = ps["summary"]["total_cost"]
         label = f"{s_str} → {e_str}  |  {currency}{cost:.2f}"
         if ps["is_current"]:
@@ -1533,7 +1558,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         charts_open = is_current or is_prev
 
         s_str      = ps["start"].strftime("%d %b %Y")
-        e_str      = (ps["end"] - timedelta(days=1)).strftime("%d %b %Y")
+        e_str      = (ps["end"] - timedelta(seconds=1)).strftime("%d %b %Y")
         bill_total = ps["summary"]["total_cost"]
         ph         = f"{s_str} &rarr; {e_str}"   # period heading shorthand
 
@@ -1579,8 +1604,18 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         open_attr    = "open" if charts_open else ""
         toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}"
 
+        config_change_banner = ""
+        if ps.get("is_config_change"):
+            config_change_banner = f"""
+<div style="display:flex;align-items:center;gap:10px;padding:8px 14px;margin-bottom:12px;
+            background:rgba(124,106,247,0.08);border:1px solid rgba(124,106,247,0.3);
+            border-radius:6px;font-size:12px;color:#7c6af7;">
+  ⚙️ <strong>Configuration changed</strong> &mdash; new billing period started {ps['start'].strftime('%-d %b %Y')}
+</div>"""
+
         sections_html_parts.append(f"""
 <div class="period-section month-section" id="{pid}" style="visibility:hidden;position:absolute;">
+  {config_change_banner}
   <details class="bill-toggle" open>
     <summary class="bill-toggle-summary">Bill Summary &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}</summary>
     <div class="bill-toggle-body">

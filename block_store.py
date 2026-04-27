@@ -70,11 +70,16 @@ CREATE TABLE IF NOT EXISTS meters (
     is_sub_meter       INTEGER NOT NULL DEFAULT 0,
     parent_meter_id    TEXT,               -- meter_id of parent (sub-meters only)
     device_label       TEXT,               -- display name e.g. "EV Charger"
+    meter_type         TEXT,               -- battery, ev, heat_pump, or NULL
     protected          INTEGER DEFAULT 0,  -- protected load (EV, heat pump)
     inverter_possible  INTEGER DEFAULT 0,  -- battery / inverter capable
     power_sensor       TEXT,               -- HA entity_id (main meter only)
     postcode_prefix    TEXT,               -- UK carbon intensity (main meter only)
-    v2x_capable        INTEGER DEFAULT 0,  -- V2G / bidirectional charging capable
+    v2x_capable             INTEGER DEFAULT 0,  -- V2G / bidirectional charging capable
+    inverter_power_invert   INTEGER DEFAULT 0,  -- negate inverter power sensor value
+    soc_sensor         TEXT,               -- HA entity_id for battery SoC % (informational)
+    inverter_power_sensor TEXT,            -- HA entity_id for inverter power W/kW (informational)
+    device_power_sensor TEXT,              -- HA entity_id for EV/heat pump power W/kW (informational)
     FOREIGN KEY (config_period_id) REFERENCES config_periods(id),
     UNIQUE (config_period_id, meter_id)
 );
@@ -208,6 +213,17 @@ CREATE TABLE IF NOT EXISTS power_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_power_history_time ON power_history (captured_at);
+
+CREATE TABLE IF NOT EXISTS sub_meter_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at TEXT    NOT NULL,  -- UTC ISO
+    meter_id    TEXT    NOT NULL,  -- battery sub-meter ID
+    soc_pct     REAL,              -- state of charge 0-100, NULL if no SoC sensor
+    inverter_kw REAL               -- inverter power kW, positive=charging, negative=discharging, NULL if no sensor
+);
+
+CREATE INDEX IF NOT EXISTS idx_sub_meter_history_time ON sub_meter_history (captured_at);
+CREATE INDEX IF NOT EXISTS idx_sub_meter_history_meter ON sub_meter_history (meter_id, captured_at);
 """
 
 
@@ -344,6 +360,19 @@ def _row_to_block(rows: list[sqlite3.Row]) -> dict:
                 meta["postcode_prefix"] = row["postcode_prefix"]
             if row["v2x_capable"]:
                 meta["v2x_capable"] = True
+            try:
+                if row["soc_sensor"]:
+                    meta["soc_sensor"] = row["soc_sensor"]
+                if row["meter_type"]:
+                    meta["meter_type"] = row["meter_type"]
+                if row["inverter_power_sensor"]:
+                    meta["inverter_power_sensor"] = row["inverter_power_sensor"]
+                if row["inverter_power_invert"]:
+                    meta["inverter_power_invert"] = True
+                if row["device_power_sensor"]:
+                    meta["device_power_sensor"] = row["device_power_sensor"]
+            except IndexError:
+                pass  # older DB without these columns
         except IndexError:
             pass  # meters columns not present (e.g. get_last_block pre-join)
 
@@ -420,7 +449,7 @@ def config_meta_significant(old_config: dict, new_config: dict) -> bool:
     NOT significant — only fields that affect billing calculations are.
     """
     SIGNIFICANT = ("billing_day", "block_minutes", "timezone",
-                   "currency_symbol", "currency_code", "site", "site_name")
+                   "currency_symbol", "currency_code")
 
     def _main_meta(cfg):
         for m in cfg.get("meters", {}).values():
@@ -479,8 +508,17 @@ class BlockStore:
         _ph_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(power_history)").fetchall()} if self._conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='power_history'").fetchone() else set()
 
         for _col, _tbl, _defn, _col_set in [
-            ("v2x_capable",      "meters",         "INTEGER DEFAULT 0", _m_cols),
-            ("supplier",         "config_periods",  "TEXT",              _cp_cols),
+            ("protected",            "meters",         "INTEGER DEFAULT 0",  _m_cols),
+            ("inverter_possible",    "meters",         "INTEGER DEFAULT 0",  _m_cols),
+            ("power_sensor",         "meters",         "TEXT",               _m_cols),
+            ("postcode_prefix",      "meters",         "TEXT",               _m_cols),
+            ("v2x_capable",          "meters",         "INTEGER DEFAULT 0",  _m_cols),
+            ("inverter_power_invert","meters",         "INTEGER DEFAULT 0",  _m_cols),
+            ("meter_type",           "meters",         "TEXT",               _m_cols),
+            ("soc_sensor",           "meters",         "TEXT",               _m_cols),
+            ("inverter_power_sensor","meters",         "TEXT",               _m_cols),
+            ("device_power_sensor",  "meters",         "TEXT",               _m_cols),
+            ("supplier",              "config_periods",  "TEXT",              _cp_cols),
             ("mpan",             "meter_channels",  "TEXT",              _mc_cols),
             ("tariff",           "meter_channels",  "TEXT",              _mc_cols),
             ("carbon_g",         "blocks",          "REAL",              _b_cols),
@@ -619,6 +657,40 @@ class BlockStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def append_sub_meter_history(self, captured_at: str, meter_id: str,
+                                soc_pct: float | None,
+                                inverter_kw: float | None) -> None:
+        """Append a battery history row for one battery meter."""
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO sub_meter_history (captured_at, meter_id, soc_pct, inverter_kw)
+                   VALUES (?, ?, ?, ?)""",
+                (captured_at, meter_id, soc_pct, inverter_kw)
+            )
+
+    def prune_sub_meter_history(self, hours: int = 48) -> int:
+        """Delete sub_meter_history rows older than `hours` hours. Returns rows deleted."""
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                  - timedelta(hours=hours)).isoformat()
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM sub_meter_history WHERE captured_at < ?", (cutoff,)
+            )
+        return cur.rowcount
+
+    def get_sub_meter_history(self, meter_id: str, hours: int = 48) -> list:
+        """Return sub_meter_history rows for one meter for the last `hours` hours, oldest first."""
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                  - timedelta(hours=hours)).isoformat()
+        rows = self._conn.execute(
+            """SELECT captured_at, soc_pct, inverter_kw
+               FROM sub_meter_history
+               WHERE meter_id = ? AND captured_at >= ?
+               ORDER BY captured_at ASC""",
+            (meter_id, cutoff)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def close(self) -> None:
         try:
             self._conn.close()
@@ -722,29 +794,38 @@ class BlockStore:
 
 
     def delete_blocks_for_date_range(
-        self, from_date: str, to_date: str, meter_id: str | None = None
+        self, from_date: str, to_date: str, meter_id: str | None = None,
+        from_time: str = "00:00", to_time: str = "23:59"
     ) -> dict:
         """
-        Delete all blocks whose local_date falls within [from_date, to_date] inclusive.
-
-        Optionally restricted to a single meter_id (deletes that meter's rows only).
-        When meter_id is None, ALL meters are deleted for the date range.
-
-        Returns {"deleted": N, "dates": N_distinct_dates}.
-        Raises ValueError on invalid inputs.
+        Delete all blocks whose local_date falls within [from_date, to_date] inclusive,
+        optionally restricted by time-of-day (UTC HH:MM) within those dates.
         """
         if not from_date or not to_date:
             raise ValueError("from_date and to_date are required")
         if from_date > to_date:
             raise ValueError("from_date must not be after to_date")
 
-        where  = "local_date >= ? AND local_date <= ?"
-        params = [from_date, to_date]
+        from_time = from_time or "00:00"
+        to_time   = to_time   or "23:59"
+
+        if from_date == to_date:
+            # Same date — simple AND range on block_start time
+            where  = "local_date = ? AND TIME(block_start) >= ? AND TIME(block_start) <= ?"
+            params = [from_date, from_time, to_time]
+        else:
+            # Multi-date — first date from from_time, last date up to to_time, middle dates all
+            where  = """(
+                (local_date = ? AND TIME(block_start) >= ?) OR
+                (local_date = ? AND TIME(block_start) <= ?) OR
+                (local_date > ? AND local_date < ?)
+            )"""
+            params = [from_date, from_time, to_date, to_time, from_date, to_date]
+
         if meter_id:
             where  += " AND meter_id = ?"
             params.append(meter_id)
 
-        # Count first so the caller can preview
         cur = self._conn.execute(
             f"SELECT COUNT(*) as n, COUNT(DISTINCT local_date) as d FROM blocks WHERE {where}",
             params
@@ -759,17 +840,31 @@ class BlockStore:
         return {"deleted": n_blocks, "dates": n_dates}
 
     def count_blocks_for_date_range(
-        self, from_date: str, to_date: str, meter_id: str | None = None
+        self, from_date: str, to_date: str, meter_id: str | None = None,
+        from_time: str = "00:00", to_time: str = "23:59"
     ) -> dict:
         """
-        Preview how many blocks would be deleted for a given date range.
+        Preview how many blocks would be deleted for a given date/time range.
         Returns {"blocks": N, "dates": N_distinct_dates}.
         """
-        where  = "local_date >= ? AND local_date <= ?"
-        params = [from_date, to_date]
+        from_time = from_time or "00:00"
+        to_time   = to_time   or "23:59"
+
+        if from_date == to_date:
+            where  = "local_date = ? AND TIME(block_start) >= ? AND TIME(block_start) <= ?"
+            params = [from_date, from_time, to_time]
+        else:
+            where  = """(
+                (local_date = ? AND TIME(block_start) >= ?) OR
+                (local_date = ? AND TIME(block_start) <= ?) OR
+                (local_date > ? AND local_date < ?)
+            )"""
+            params = [from_date, from_time, to_date, to_time, from_date, to_date]
+
         if meter_id:
             where  += " AND meter_id = ?"
             params.append(meter_id)
+
         cur = self._conn.execute(
             f"SELECT COUNT(*) as n, COUNT(DISTINCT local_date) as d FROM blocks WHERE {where}",
             params
@@ -1174,28 +1269,41 @@ class BlockStore:
             parent      = meta.get("parent_meter")
             device      = meta.get("device")
             protected   = 1 if meta.get("protected") else 0
-            inv_poss    = 1 if meta.get("inverter_possible") else 0
+            inv_poss    = 1 if (meta.get("meter_type") == "battery" or meta.get("inverter_possible")) else 0
             power_s     = meta.get("power_sensor")
             postcode    = meta.get("postcode_prefix")
             v2x         = 1 if meta.get("v2x_capable") else 0
+            meter_type  = meta.get("meter_type")
+            soc_s       = meta.get("soc_sensor")
+            inv_pwr_s    = meta.get("inverter_power_sensor")
+            inv_invert   = 1 if meta.get("inverter_power_invert") else 0
+            dev_pwr_s   = meta.get("device_power_sensor")
 
             cur = self._conn.execute(
                 """INSERT INTO meters
                        (config_period_id, meter_id, is_sub_meter, parent_meter_id,
                         device_label, protected, inverter_possible,
-                        power_sensor, postcode_prefix, v2x_capable)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        power_sensor, postcode_prefix, v2x_capable,
+                        meter_type, soc_sensor, inverter_power_sensor, inverter_power_invert,
+                        device_power_sensor)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(config_period_id, meter_id) DO UPDATE SET
-                       is_sub_meter      = excluded.is_sub_meter,
-                       parent_meter_id   = excluded.parent_meter_id,
-                       device_label      = excluded.device_label,
-                       protected         = excluded.protected,
-                       inverter_possible = excluded.inverter_possible,
-                       power_sensor      = excluded.power_sensor,
-                       postcode_prefix   = excluded.postcode_prefix,
-                       v2x_capable       = excluded.v2x_capable""",
+                       is_sub_meter            = excluded.is_sub_meter,
+                       parent_meter_id         = excluded.parent_meter_id,
+                       device_label            = excluded.device_label,
+                       protected               = excluded.protected,
+                       inverter_possible       = excluded.inverter_possible,
+                       power_sensor            = excluded.power_sensor,
+                       postcode_prefix         = excluded.postcode_prefix,
+                       v2x_capable             = excluded.v2x_capable,
+                       meter_type              = excluded.meter_type,
+                       soc_sensor              = excluded.soc_sensor,
+                       inverter_power_sensor   = excluded.inverter_power_sensor,
+                       inverter_power_invert   = excluded.inverter_power_invert,
+                       device_power_sensor     = excluded.device_power_sensor""",
                 (period_id, meter_id, is_sub, parent, device,
-                 protected, inv_poss, power_s, postcode, v2x)
+                 protected, inv_poss, power_s, postcode, v2x,
+                 meter_type, soc_s, inv_pwr_s, inv_invert, dev_pwr_s)
             )
             meter_row_id = cur.lastrowid or self._conn.execute(
                 "SELECT id FROM meters WHERE config_period_id=? AND meter_id=?",
@@ -1268,6 +1376,19 @@ class BlockStore:
                 meta["postcode_prefix"] = m["postcode_prefix"]
             if m["v2x_capable"]:
                 meta["v2x_capable"] = True
+            try:
+                if m["meter_type"]:
+                    meta["meter_type"] = m["meter_type"]
+                if m["soc_sensor"]:
+                    meta["soc_sensor"] = m["soc_sensor"]
+                if m["inverter_power_sensor"]:
+                    meta["inverter_power_sensor"] = m["inverter_power_sensor"]
+                if m["inverter_power_invert"]:
+                    meta["inverter_power_invert"] = True
+                if m["device_power_sensor"]:
+                    meta["device_power_sensor"] = m["device_power_sensor"]
+            except IndexError:
+                pass
 
             channels = {}
             ch_rows = self._conn.execute(
@@ -1380,6 +1501,10 @@ class BlockStore:
                             postcode_prefix    TEXT,
                             supplier           TEXT,
                             v2x_capable        INTEGER DEFAULT 0,
+                            meter_type         TEXT,
+                            soc_sensor         TEXT,
+                            inverter_power_sensor TEXT,
+                            device_power_sensor TEXT,
                             FOREIGN KEY (config_period_id) REFERENCES config_periods(id),
                             UNIQUE (config_period_id, meter_id)
                         )
@@ -1752,7 +1877,7 @@ class BlockStore:
                    cp.currency_symbol, cp.currency_code, cp.effective_from,
                    m.is_sub_meter, m.parent_meter_id, m.device_label,
                    m.inverter_possible, m.power_sensor, m.postcode_prefix,
-                   m.v2x_capable
+                   m.v2x_capable, m.meter_type, m.soc_sensor, m.inverter_power_sensor, m.inverter_power_invert, m.device_power_sensor
             FROM blocks b
             JOIN config_periods cp ON b.config_period_id = cp.id
             LEFT JOIN meters m ON m.meter_id = b.meter_id
@@ -1777,7 +1902,7 @@ class BlockStore:
                    cp.currency_symbol, cp.currency_code, cp.effective_from,
                    m.is_sub_meter, m.parent_meter_id, m.device_label,
                    m.inverter_possible, m.power_sensor, m.postcode_prefix,
-                   m.v2x_capable
+                   m.v2x_capable, m.meter_type, m.soc_sensor, m.inverter_power_sensor, m.inverter_power_invert, m.device_power_sensor
             FROM blocks b
             JOIN config_periods cp ON b.config_period_id = cp.id
             LEFT JOIN meters m ON m.meter_id = b.meter_id
@@ -1802,7 +1927,7 @@ class BlockStore:
                    cp.currency_symbol, cp.currency_code, cp.effective_from,
                    m.is_sub_meter, m.parent_meter_id, m.device_label,
                    m.inverter_possible, m.power_sensor, m.postcode_prefix,
-                   m.v2x_capable
+                   m.v2x_capable, m.meter_type, m.soc_sensor, m.inverter_power_sensor, m.inverter_power_invert, m.device_power_sensor
             FROM blocks b
             JOIN config_periods cp ON b.config_period_id = cp.id
             LEFT JOIN meters m ON m.meter_id = b.meter_id
