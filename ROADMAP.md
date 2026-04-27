@@ -153,6 +153,7 @@
 ### 2.7.1
 - **CI gap backfill** — scan blocks with `NULL carbon_g` and backfill from stored `carbon_intensity` table; fetch historical CI from National Grid ESO range endpoint for any gaps not already stored. Was planned for 2.6.4 but slipped.
 - **Toolbar unification** — billing chart, heatmap and Insights toolbars refactored to match the Usage Stats pattern (segmented tabs in topbar, period nav in floating sub-bar, consistent mobile collapse)
+- **Main meter cascade delete** — deleting a main meter should also delete all child sub-meters and their data. Currently only the main meter's blocks are deleted, leaving sub-meters orphaned in config with a broken `parent_meter` reference. Fix requires: UI `executeDelete` to identify and remove child meters from `config.meters`; server `api_meter_delete_data` to cascade block/history/current_reads deletion to all meters where `parent_meter_id = meter_id`; delete confirmation modal to warn user that child meters will also be deleted.
 
 ### 2.8.0 — Usage Insights Tab + Timezone Refactor
 
