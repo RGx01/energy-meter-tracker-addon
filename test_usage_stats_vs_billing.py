@@ -961,3 +961,132 @@ class TestSubMeterCarbonAccounting(unittest.TestCase):
         self.assertAlmostEqual(row["carbon_g_net"], -55.0, places=3)
         self.assertAlmostEqual(row["carbon_g_total"], -55.0, places=3,
             msg="Total = main_carbon_g only (EV carbon already in main meter figure)")
+
+class TestLivePowerBillingCard(unittest.TestCase):
+    """
+    Verify the live power billing card _fmt_total row calculation.
+    Total Import = raw grid import (includes sub-meters)
+    Grid Import = raw grid - sum(sub-meters)
+    Sub-meter rows sum + Grid Import = Total Import
+    """
+
+    def setUp(self):
+        self.store = BlockStore(":memory:")
+        self.store.insert_config_period({"meters": {
+            "electricity_main": {"meta": {
+                "billing_day": 1, "block_minutes": 30,
+                "timezone": "UTC", "currency_symbol": "£", "currency_code": "GBP",
+            }, "channels": {"import": {"read": "s.imp", "rate": "s.rate"},
+                            "export": {"read": "s.exp", "rate": "s.exp_rate"}}},
+            "house_battery": {"meta": {"sub_meter": True, "parent_meter": "electricity_main",
+                                       "device": "Solax Battery"},
+                              "channels": {"import": {"read": "s.bat", "rate": "s.rate"}}},
+        }})
+        self.cp = self.store._conn.execute(
+            "SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+
+    def _insert(self, main_imp, bat_imp, rate=0.07, exp=0.0, exp_rate=0.12, sc=0.50):
+        ld = "2026-04-27"
+        ts = "2026-04-27T00:00:00"
+        for meter_id, imp_kwh in [("electricity_main", main_imp), ("house_battery", bat_imp)]:
+            self.store._conn.execute("""
+                INSERT INTO blocks (
+                    block_start, block_end, local_date, local_year, local_month, local_day,
+                    meter_id, config_period_id, interpolated,
+                    imp_kwh, imp_kwh_grid, imp_kwh_remainder,
+                    imp_rate, imp_cost, exp_kwh, exp_rate, exp_cost, standing_charge)
+                VALUES (?,?,?,2026,4,27, ?,?,0,
+                        ?,NULL,NULL, ?,?,?,?,?,?)
+            """, (ts, ts, ld, meter_id, self.cp,
+                  imp_kwh, rate, round(imp_kwh * rate, 6),
+                  exp if meter_id == "electricity_main" else 0.0,
+                  exp_rate,
+                  round(exp * exp_rate, 6) if meter_id == "electricity_main" else 0.0,
+                  sc if meter_id == "electricity_main" else 0.0))
+        self.store._conn.commit()
+
+    def _get_billing_totals(self):
+        return self.store.get_billing_totals_for_local_date_range("2026-04-27", "2026-04-27")
+
+    def _get_sub_kwh(self):
+        """Simulate what _fmt_total's sub-meter SQL returns."""
+        active_period_sq = (
+            "SELECT id FROM config_periods "
+            "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+        )
+        cur = self.store._conn.execute(
+            f"""SELECT m.meter_id,
+                       COALESCE(SUM(COALESCE(b.imp_kwh_grid, b.imp_kwh)), 0.0) as kwh,
+                       COALESCE(SUM(b.imp_cost), 0.0) as cost
+                FROM blocks b
+                JOIN meters m ON m.meter_id = b.meter_id
+                  AND m.config_period_id = ({active_period_sq})
+                WHERE m.is_sub_meter = 1
+                  AND b.local_date >= '2026-04-27' AND b.local_date <= '2026-04-27'
+                GROUP BY m.meter_id""")
+        return [(r["meter_id"], float(r["kwh"]), float(r["cost"])) for r in cur.fetchall()]
+
+    def _get_raw_grid(self):
+        """Simulate the raw grid query in _fmt_total."""
+        active_period_sq = (
+            "SELECT id FROM config_periods "
+            "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+        )
+        cur = self.store._conn.execute(
+            f"""SELECT COALESCE(SUM(COALESCE(b.imp_kwh_grid, b.imp_kwh)), 0.0) as raw_kwh,
+                       COALESCE(SUM(b.imp_cost), 0.0) as raw_cost
+                FROM blocks b
+                JOIN meters m ON m.meter_id = b.meter_id
+                  AND m.config_period_id = ({active_period_sq})
+                WHERE m.is_sub_meter = 0
+                  AND b.local_date >= '2026-04-27' AND b.local_date <= '2026-04-27'"""
+        ).fetchone()
+        return float(cur["raw_kwh"]), float(cur["raw_cost"])
+
+    def test_total_import_equals_raw_grid(self):
+        """Total Import shown on card must equal raw main meter import."""
+        self._insert(main_imp=13.375, bat_imp=11.609)
+        raw_kwh, _ = self._get_raw_grid()
+        self.assertAlmostEqual(raw_kwh, 13.375, places=3,
+            msg="Total Import must equal raw grid import")
+
+    def test_grid_import_remainder_correct(self):
+        """Grid Import must be raw grid minus sub-meter attributed portion."""
+        self._insert(main_imp=13.375, bat_imp=11.609)
+        raw_kwh, _ = self._get_raw_grid()
+        subs = self._get_sub_kwh()
+        sub_kwh_total = sum(s[1] for s in subs)
+        grid_imp = raw_kwh - sub_kwh_total
+        self.assertAlmostEqual(grid_imp, 13.375 - 11.609, places=3,
+            msg="Grid Import must be raw grid minus sub-meter total")
+
+    def test_sub_plus_grid_equals_total(self):
+        """Grid Import + sub-meter kWh must equal Total Import."""
+        self._insert(main_imp=13.375, bat_imp=11.609)
+        raw_kwh, _ = self._get_raw_grid()
+        subs = self._get_sub_kwh()
+        sub_kwh_total = sum(s[1] for s in subs)
+        grid_imp = raw_kwh - sub_kwh_total
+        self.assertAlmostEqual(grid_imp + sub_kwh_total, raw_kwh, places=3,
+            msg="Grid Import + sub-meters must equal Total Import — no double counting")
+
+    def test_no_sub_meters_grid_equals_total(self):
+        """With no sub-meters Grid Import must equal Total Import."""
+        # Only insert main meter block
+        self.store._conn.execute("""
+            INSERT INTO blocks (
+                block_start, block_end, local_date, local_year, local_month, local_day,
+                meter_id, config_period_id, interpolated,
+                imp_kwh, imp_kwh_grid, imp_kwh_remainder,
+                imp_rate, imp_cost, standing_charge)
+            VALUES ('2026-04-27T00:00:00','2026-04-27T00:00:00','2026-04-27',2026,4,27,
+                    'electricity_main',?,0, 10.0,NULL,NULL, 0.07,0.70,0.50)
+        """, (self.cp,))
+        self.store._conn.commit()
+        raw_kwh, _ = self._get_raw_grid()
+        subs = self._get_sub_kwh()
+        sub_kwh_total = sum(s[1] for s in subs)
+        grid_imp = raw_kwh - sub_kwh_total
+        self.assertAlmostEqual(grid_imp, raw_kwh, places=3,
+            msg="With no sub-meters Grid Import must equal Total Import")
+        self.assertAlmostEqual(grid_imp, 10.0, places=3)

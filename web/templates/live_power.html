@@ -30,9 +30,8 @@
 }
 .layout-b .summary-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 300px));
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
   gap: 12px;
-  justify-content: start;
   max-width: 1400px;
 }
 
@@ -270,6 +269,7 @@
   width: 100%;
   max-width: 180px;
   height: 100px;
+  margin-top: auto;
 }
 
 .inv-gauge-wrap svg {
@@ -333,6 +333,7 @@
   width: 100%;
   max-width: 180px;
   height: 100px;
+  margin-top: auto;
 }
 
 .gauge-wrap svg {
@@ -733,6 +734,7 @@
   <!-- Main gauge -->
   <div class="power-card">
     <div class="card-title">⚡ Live Power</div>
+    <div id="power-status" style="font-size:13px;font-weight:600;padding:6px 16px;border-radius:20px;background:var(--bg);border:1px solid var(--border);color:var(--muted);">—</div>
     <div class="gauge-wrap">
       <svg viewBox="0 0 220 120" xmlns="http://www.w3.org/2000/svg">
         <!-- Background arc -->
@@ -761,8 +763,6 @@
         <div class="gauge-unit" id="gauge-unit-label">kW net</div>
       </div>
     </div>
-
-    <div id="power-status" style="font-size:13px;font-weight:600;padding:6px 16px;border-radius:20px;background:var(--bg);border:1px solid var(--border);color:var(--muted);">—</div>
 
     <!-- Hidden elements retained for JS compatibility -->
     <span id="import-kw" style="display:none;"></span>
@@ -1067,12 +1067,12 @@ function setInvGauge(meterId, pkw) {
   } else {
     // Unidirectional — 0 at left edge, fills rightward, needle sweeps -90° to +90°
     var frac = Math.max(0, Math.min(1, Math.abs(pkw) / _getInvMax(meterId)));
-    angle  = -90 + frac * 180;  // -90° (left) to +90° (right)
+    angle  = -90 + frac * 180;
     arcLen = frac * INV_ARC_LEN;
-    col   = '#7c6af7';
+    col   = isHeatPump ? '#f97316' : '#7c6af7';
     label = isHeatPump ? 'Consumption' : 'Charging';
     arc.style.strokeDasharray  = arcLen + ' ' + (INV_ARC_LEN - arcLen);
-    arc.style.strokeDashoffset = INV_ARC_LEN - arcLen;  // start from left
+    arc.style.strokeDashoffset = 0;
   }
 
   arc.style.stroke = col;

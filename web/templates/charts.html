@@ -360,7 +360,7 @@
       </label>
     </div>
     <div class="bar-toolbar-right">
-      
+      <button class="bar-seg-btn" id="bar-sort-btn" onclick="barToggleSort()" style="font-size:11px;">↑ Oldest first</button>
     </div>
   </div>
 
@@ -617,6 +617,9 @@ function showChart(name, btn) {
   document.getElementById('chart-heatmap').style.display = name === 'heatmap' ? 'block' : 'none';
   document.getElementById('chart-bar').style.display     = name === 'bar'     ? 'flex' : 'none';
   _activeChart = name;
+  // Hide regenerate button on Usage Stats — it auto-refreshes live data
+  var regenBtn = document.querySelector('[onclick="regenerate()"][title="Regenerate Charts"]');
+  if (regenBtn) regenBtn.style.visibility = name === 'bar' ? 'hidden' : '';
   if (name === 'bar') {
     barInit();
   } else {
@@ -781,6 +784,9 @@ function barSyncUI() {
   document.querySelectorAll('#bar-view-seg .bar-seg-btn').forEach(function(b){
     b.classList.toggle('active', b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'"+barView+"'") !== -1);
   });
+  // Sync sort button label
+  var sortBtn = document.getElementById('bar-sort-btn');
+  if (sortBtn) sortBtn.textContent = barSortDesc ? '↓ Latest first' : '↑ Oldest first';
 }
 
 function barGetYears() {
@@ -1441,7 +1447,7 @@ function barBuildTable() {
   }
 
   // Build HTML — add Total column header
-  var html = '<thead><tr><th style="cursor:pointer;user-select:none;" onclick="barToggleSort()">Period ' + (barSortDesc ? '↓' : '↑') + '</th>';
+  var html = '<thead><tr><th style="cursor:pointer;user-select:none;" onclick="barToggleSort()" title="Click to change sort order">Period</th>';
   cols.forEach(function(c){
     var dotHtml = c.color ? '<span class="bar-legend-dot" style="background:' + c.color + ';margin-right:5px;"></span>' : '';
     html += '<th>' + dotHtml + c.label + '</th>';
@@ -1523,6 +1529,8 @@ function barBuildTable() {
 function barToggleSort() {
   barSortDesc = !barSortDesc;
   localStorage.setItem('emt_bar_sort_desc', barSortDesc ? 'true' : 'false');
+  var btn = document.getElementById('bar-sort-btn');
+  if (btn) btn.textContent = barSortDesc ? '↓ Latest first' : '↑ Oldest first';
   barBuildTable();
 }
 
