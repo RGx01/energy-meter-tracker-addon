@@ -857,12 +857,17 @@ var _deleteDevName = null;
 function openDeleteModal(mid, devName, isSub) {
   _deleteMid     = mid;
   _deleteDevName = devName;
+  var isMain = !isSub;
 
   document.getElementById('del-modal-title').textContent =
-    'Delete ' + (isSub ? '"' + devName + '"' : 'main meter') + '?';
-  document.getElementById('del-modal-body').innerHTML =
-    'This will permanently delete <strong>all historical data</strong> for this device from the database.' +
-    '<br><br>This action <strong>cannot be undone</strong>.';
+    isMain ? 'Delete main meter and all data?' : 'Delete "' + devName + '"?';
+  document.getElementById('del-modal-body').innerHTML = isMain
+    ? '<strong>⚠️ This will delete your entire database and start fresh.</strong>' +
+      '<br><br>All historical blocks, carbon data, and sub-meters will be permanently removed.' +
+      '<br><br>A backup will be created in <code>/share/energy_meter_tracker_backup</code> before deletion.' +
+      '<br><br>This action <strong>cannot be undone</strong>.'
+    : 'This will permanently delete <strong>all historical data</strong> for this device from the database.' +
+      '<br><br>This action <strong>cannot be undone</strong>.';
 
   var input = document.getElementById('del-modal-confirm-input');
   var btn   = document.getElementById('del-modal-confirm-btn');
@@ -894,16 +899,46 @@ function executeDelete() {
   var devName = _deleteDevName;
   if (!mid) return;
 
+  var isMain = !Object.values(config.meters).some(function(m) {
+    return m.meta && m.meta.sub_meter && mid !== 'electricity_main';
+  }) && mid === 'electricity_main';
+
   closeDeleteModal();
 
-  // Remove from in-memory config
+  var errEl = document.getElementById('alert-error');
+
+  if (isMain) {
+    // Main meter — backup DB and wipe everything
+    if (errEl) { errEl.textContent = '⏳ Creating backup and deleting all data…'; errEl.classList.add('show'); }
+    fetch(apiUrl('/api/meter/main/reset'), {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({})
+    })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (errEl) errEl.classList.remove('show');
+        if (d.ok) {
+          document.getElementById('alert-success').textContent =
+            '✓ All data deleted — backup saved. Restarting…';
+          show('alert-success');
+          setTimeout(function() { window.location.reload(); }, 2500);
+        } else {
+          if (errEl) { errEl.textContent = '✗ Reset failed: ' + (d.error || 'unknown error'); errEl.classList.add('show'); }
+        }
+      })
+      .catch(function(e) {
+        if (errEl) { errEl.textContent = '✗ Reset failed: ' + e; errEl.classList.add('show'); }
+      });
+    return;
+  }
+
+  // Sub-meter — existing flow
   delete config.meters[mid];
   renderAll();
 
-  var errEl = document.getElementById('alert-error');
   if (errEl) { errEl.textContent = '⏳ Deleting "' + devName + '"…'; errEl.classList.add('show'); }
 
-  // Single atomic operation — delete data AND save config together
   fetch(apiUrl('/api/meter/' + encodeURIComponent(mid) + '/delete-data'), {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },

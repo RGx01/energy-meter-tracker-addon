@@ -1137,6 +1137,70 @@ def api_power_history():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/meter/main/reset", methods=["POST"])
+def api_meter_main_reset():
+    """
+    Nuclear option — backup the DB then wipe it entirely.
+    Used when user deletes the main meter (electricity_main).
+    Triggers engine restart via engine_startup on next connection.
+    """
+    try:
+        import shutil, time
+        store = _get_store()
+
+        # Create backup first
+        try:
+            _backup_to_share(store)
+            logger.info("api_meter_main_reset: backup created")
+        except Exception as be:
+            logger.warning("api_meter_main_reset: backup failed: %s", be)
+
+        # Close store connection
+        db_path = store._path
+        store._conn.close()
+
+        # Delete the DB files
+        for suffix in ["", "-wal", "-shm"]:
+            p = db_path + suffix
+            if os.path.exists(p):
+                os.remove(p)
+                logger.info("api_meter_main_reset: removed %s", p)
+
+        # Also clear meters_config.json
+        cfg_p = config_path()
+        if os.path.exists(cfg_p):
+            import json as _j
+            with open(cfg_p, "w") as f:
+                _j.dump({"meters": {}}, f, indent=2)
+
+        logger.info("api_meter_main_reset: database wiped — restarting addon")
+
+        # Trigger addon restart via supervisor API — runs in background thread
+        # so the HTTP response is returned before the process exits
+        import threading, urllib.request as _ur, json as _j2
+        def _restart():
+            import time; time.sleep(1)
+            try:
+                token = os.environ.get("SUPERVISOR_TOKEN", "")
+                req = _ur.Request(
+                    "http://supervisor/addons/self/restart",
+                    data=b"{}",
+                    headers={"Authorization": "Bearer " + token,
+                             "Content-Type": "application/json"},
+                    method="POST"
+                )
+                _ur.urlopen(req, timeout=10)
+            except Exception as re:
+                logger.warning("api_meter_main_reset: supervisor restart failed: %s — using sys.exit", re)
+                import sys; sys.exit(0)
+        threading.Thread(target=_restart, daemon=True).start()
+
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.error("api_meter_main_reset: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/meter/<meter_id>/delete-data", methods=["POST"])
 def api_meter_delete_data(meter_id: str):
     """
@@ -2510,9 +2574,11 @@ def api_insights_periods():
 def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
     """
     Core aggregation for Insights — works for any UTC time range.
-    Returns the full insights dict (without period_start/end/label/is_current).
+    Uses a direct lightweight SQL query rather than get_blocks_for_range
+    to avoid fetching unnecessary columns and joining reads.
     """
     from datetime import datetime as _dt
+
     meters_cfg = cfg.get("meters") or {}
     sub_meter_ids = {
         mid for mid, md in meters_cfg.items()
@@ -2530,9 +2596,17 @@ def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
         if any(k in mid_l for k in ("solar", "pv", "inv")): return "inverter"
         return "unknown"
 
-    _ps_dt = _dt.fromisoformat(utc_start)
-    _pe_dt = _dt.fromisoformat(utc_end)
-    period_blocks = store.get_blocks_for_range(_ps_dt, _pe_dt)
+    # Lightweight direct query — only columns needed for carbon insights
+    rows = store._conn.execute(
+        """SELECT b.meter_id, b.imp_kwh, b.exp_kwh, b.carbon_g,
+                  COALESCE(m.is_sub_meter, 0) as is_sub_meter
+           FROM blocks b
+           LEFT JOIN meters m ON m.meter_id = b.meter_id
+                              AND m.config_period_id = b.config_period_id
+           WHERE b.block_start >= ? AND b.block_start < ?
+           ORDER BY b.block_start""",
+        (utc_start, utc_end)
+    ).fetchall()
 
     block_minutes = 30
     if meters_cfg:
@@ -2545,50 +2619,20 @@ def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
     ci_kwh_weighted = ci_duration = 0.0
     eff_carbon = eff_kwh = 0.0
     has_carbon = False
-
-    for block in period_blocks:
-        for mid, md in (block.get("meters") or {}).items():
-            if mid in sub_meter_ids:
-                continue
-            ch_imp = ((md.get("channels") or {}).get("import") or {})
-            ch_exp = ((md.get("channels") or {}).get("export") or {})
-            b_imp  = float(ch_imp.get("kwh") or 0)
-            b_exp  = float(ch_exp.get("kwh") or 0)
-            b_net  = b_imp - b_exp
-            main_imp_kwh += b_imp
-            main_exp_kwh += b_exp
-            cg = md.get("carbon_g")
-            if cg is None:
-                continue
-            cg = float(cg)
-            has_carbon = True
-            cg_net += cg
-            main_ci_imp_kwh += b_imp
-            main_ci_exp_kwh += b_exp
-            if b_net != 0:
-                b_intensity = abs(cg / b_net)
-                cg_imp += b_imp * b_intensity
-                cg_exp += b_exp * b_intensity
-                ci_kwh_weighted += b_intensity * block_minutes
-                ci_duration     += block_minutes
-                eff_carbon += abs(cg)
-                eff_kwh    += abs(b_net)
-            elif b_imp > 0:
-                cg_imp += abs(cg)
-            else:
-                cg_exp += abs(cg)
-
-    effective_intensity  = round(eff_carbon / eff_kwh, 1) if eff_kwh > 0 else None
-    grid_avg_intensity   = round(ci_kwh_weighted / ci_duration, 1) if ci_duration > 0 else None
-    avg_export_intensity = round(cg_exp / main_ci_exp_kwh, 1) if main_ci_exp_kwh > 0 else None
+    total_blocks = 0
+    ci_blocks = 0
 
     sub_totals = {}
-    total_sub_imp_kwh  = 0.0
-    total_sub_carbon_g = 0.0
-    for block in period_blocks:
-        for mid, md in (block.get("meters") or {}).items():
-            if mid not in sub_meter_ids:
-                continue
+
+    for row in rows:
+        mid        = row["meter_id"]
+        b_imp      = float(row["imp_kwh"] or 0)
+        b_exp      = float(row["exp_kwh"] or 0)
+        b_net      = b_imp - b_exp
+        cg         = row["carbon_g"]
+        is_sub     = bool(row["is_sub_meter"]) or mid in sub_meter_ids
+
+        if is_sub:
             if mid not in sub_totals:
                 _m_meta = (meters_cfg.get(mid, {}).get("meta") or {})
                 sub_totals[mid] = {
@@ -2598,22 +2642,50 @@ def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
                     "inverter_possible": bool(_m_meta.get("inverter_possible")),
                     "ci_kwh_weighted": 0.0, "ci_kwh_duration": 0.0,
                 }
-            ch_imp = ((md.get("channels") or {}).get("import") or {})
-            b_imp  = float(ch_imp.get("kwh") or 0)
             sub_totals[mid]["imp_kwh"]      += b_imp
             sub_totals[mid]["total_blocks"] += 1
-            total_sub_imp_kwh += b_imp
-            cg = md.get("carbon_g")
             if cg is not None:
                 cg_f = float(cg)
                 sub_totals[mid]["carbon_g"]   += cg_f
                 sub_totals[mid]["ci_blocks"]  += 1
                 sub_totals[mid]["ci_imp_kwh"] += b_imp
-                total_sub_carbon_g += cg_f
                 if b_imp > 0.001:
                     b_intensity = abs(cg_f / b_imp)
                     sub_totals[mid]["ci_kwh_weighted"] += b_intensity * b_imp
                     sub_totals[mid]["ci_kwh_duration"] += b_imp
+            continue
+
+        # Main meter
+        total_blocks += 1
+        main_imp_kwh += b_imp
+        main_exp_kwh += b_exp
+
+        if cg is None:
+            continue
+
+        cg_f = float(cg)
+        has_carbon = True
+        ci_blocks += 1
+        cg_net += cg_f
+        main_ci_imp_kwh += b_imp
+        main_ci_exp_kwh += b_exp
+
+        if b_net != 0:
+            b_intensity = abs(cg_f / b_net)
+            cg_imp += b_imp * b_intensity
+            cg_exp += b_exp * b_intensity
+            ci_kwh_weighted += b_intensity * block_minutes
+            ci_duration     += block_minutes
+            eff_carbon += abs(cg_f)
+            eff_kwh    += abs(b_net)
+        elif b_imp > 0:
+            cg_imp += abs(cg_f)
+        else:
+            cg_exp += abs(cg_f)
+
+    effective_intensity  = round(eff_carbon / eff_kwh, 1) if eff_kwh > 0 else None
+    grid_avg_intensity   = round(ci_kwh_weighted / ci_duration, 1) if ci_duration > 0 else None
+    avg_export_intensity = round(cg_exp / main_ci_exp_kwh, 1) if main_ci_exp_kwh > 0 else None
 
     for mid, st in sub_totals.items():
         if st["ci_kwh_duration"] > 0:
@@ -2623,6 +2695,8 @@ def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
         del st["ci_kwh_weighted"]
         del st["ci_kwh_duration"]
 
+    total_sub_imp_kwh  = sum(st["imp_kwh"]   for st in sub_totals.values())
+    total_sub_carbon_g = sum(st["carbon_g"]  for st in sub_totals.values())
     house_imp_kwh    = max(0.0, main_imp_kwh - total_sub_imp_kwh)
     house_ci_imp_kwh = max(0.0, main_ci_imp_kwh - sum(
         st.get("ci_imp_kwh", 0.0) for st in sub_totals.values()
@@ -2635,16 +2709,6 @@ def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
     merged   = dict(SETTINGS_DEFAULTS)
     merged.update(settings)
 
-    total_blocks = sum(
-        1 for b in period_blocks
-        for mid in (b.get("meters") or {})
-        if mid not in sub_meter_ids
-    )
-    ci_blocks = sum(
-        1 for b in period_blocks
-        for mid, md in (b.get("meters") or {}).items()
-        if mid not in sub_meter_ids and md.get("carbon_g") is not None
-    )
     coverage_pct = round(ci_blocks / total_blocks * 100, 1) if total_blocks else 0
 
     return {

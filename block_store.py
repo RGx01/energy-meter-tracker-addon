@@ -480,6 +480,15 @@ class BlockStore:
         self._conn.row_factory = sqlite3.Row
         self._apply_pragmas()
         self._ensure_schema()
+        # Covering index for insights aggregation — created after migrations
+        # so carbon_g and other late-added columns are guaranteed to exist
+        try:
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_blocks_insights "
+                "ON blocks (block_start, meter_id, imp_kwh, exp_kwh, carbon_g, config_period_id)"
+            )
+        except Exception:
+            pass
         logger.debug("BlockStore opened: %s", db_path)
 
     # ── Connection management ─────────────────────────────────────────────
