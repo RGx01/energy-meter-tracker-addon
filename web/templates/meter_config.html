@@ -920,9 +920,20 @@ function executeDelete() {
         if (errEl) errEl.classList.remove('show');
         if (d.ok) {
           document.getElementById('alert-success').textContent =
-            '✓ All data deleted — backup saved. Restarting…';
+            '✓ All data deleted — backup saved. Add-on restarting, please wait…';
           show('alert-success');
-          setTimeout(function() { window.location.reload(); }, 2500);
+          // Poll until the server comes back then redirect to meter config
+          var polls = 0;
+          function pollReady() {
+            polls++;
+            if (polls > 30) { window.location.reload(); return; }
+            fetch(apiUrl('/api/status')).then(function() {
+              window.location.href = apiUrl('/settings');
+            }).catch(function() {
+              setTimeout(pollReady, 1500);
+            });
+          }
+          setTimeout(pollReady, 3000);
         } else {
           if (errEl) { errEl.textContent = '✗ Reset failed: ' + (d.error || 'unknown error'); errEl.classList.add('show'); }
         }

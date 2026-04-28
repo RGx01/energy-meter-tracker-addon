@@ -684,8 +684,8 @@ class TestBillSummaryMainImportRaw(unittest.TestCase):
             msg="Rendered HTML must show EV charger device label")
         self.assertIn("Solax Battery", html,
             msg="Rendered HTML must show battery device label")
-        self.assertIn("House (remainder)", html,
-            msg="Rendered HTML must show house remainder label")
+        self.assertIn("Direct import", html,
+            msg="Rendered HTML must show direct import label")
         self.assertIn("Import — total grid", html,
             msg="Rendered HTML must show total grid header")
 

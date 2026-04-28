@@ -376,17 +376,17 @@
     
 <!-- House card -->
     <div class="insight-card" id="card-house" style="display:none;">
-      <div class="insight-card-title">🏠 House Consumption (direct from grid)</div>
+      <div class="insight-card-title">🏠 Direct Import</div>
       <div class="insight-headline" id="house-headline"></div>
       <div class="insight-sub"     id="house-sub"></div>
       <div class="insight-grid">
         <div class="insight-metric">
-          <div class="insight-metric-label">House import</div>
+          <div class="insight-metric-label">Direct import</div>
           <div class="insight-metric-value" id="house-kwh"></div>
           <div class="insight-metric-unit">kWh</div>
         </div>
         <div class="insight-metric" id="house-carbon-wrap">
-          <div class="insight-metric-label">House carbon</div>
+          <div class="insight-metric-label">Direct import carbon</div>
           <div class="insight-metric-value" id="house-carbon"></div>
           <div class="insight-metric-unit">kgCO₂</div>
         </div>
@@ -401,7 +401,7 @@
           <div class="insight-metric-unit">gCO₂/kWh</div>
         </div>
         <div class="insight-metric" id="house-pct-wrap">
-          <div class="insight-metric-label">% of grid import</div>
+          <div class="insight-metric-label">% direct import</div>
           <div class="insight-metric-value" id="house-pct"></div>
           <div class="insight-metric-unit">% of total</div>
         </div>
@@ -458,7 +458,7 @@
       <div class="insight-equiv" id="bat-equiv"></div>
       <div class="insight-footnote">
         Carbon shown is the cost of grid energy used to charge the battery. The battery
-        sub-meter records grid import only — solar contribution to charging is not captured
+        sub-meter records direct grid consumption only — solar contribution to charging is not captured
         here (it appears as reduced main meter import instead). The key question is whether
         grid charging was timed to cleaner periods.<br>
         <strong>Effective intensity</strong> adjusts the charge intensity for round-trip losses
@@ -733,7 +733,7 @@ function renderInsights(d, _cmp) {
     document.getElementById('sol-equiv').innerHTML    = equivLines(d.carbon_g_exp, a);
   }
 
-  // House remainder
+  // Direct import
   if (d.house_ci_imp_kwh > 0.1 || d.house_imp_kwh > 0.1) {
     var house_kg   = d.house_carbon_g != null ? d.house_carbon_g / 1000 : null;
     // Use CI kWh alongside carbon for consistent pairing
@@ -1240,13 +1240,13 @@ function renderComparison(d, c) {
     }
   }
 
-  // House consumption
+  // Direct import
   if (d.house_imp_kwh != null && c.house_imp_kwh != null) {
     var hPct = pct(d.house_imp_kwh, c.house_imp_kwh);
     if (hPct !== null) {
       lines.push(line(
         hPct < 0 ? '✓' : '↑',
-        'House consumption <strong>' + sign(hPct) + hPct + '%</strong>'
+        'Direct import <strong>' + sign(hPct) + hPct + '%</strong>'
         + ' (' + d.house_imp_kwh.toFixed(0) + ' vs ' + c.house_imp_kwh.toFixed(0) + ' kWh)',
         hPct < 0
       ));
