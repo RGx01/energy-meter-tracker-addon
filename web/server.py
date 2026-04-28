@@ -524,9 +524,9 @@ def _format_billing(summary, cfg, currency):
     total_imp_cost = main_imp_cost + sum(float(r["cost"]) for r in sub_rows)
     if total_imp_kwh > 0.0001 or total_imp_cost > 0.0001:
         rows.append({"label": f"Total Import ({total_imp_kwh:.3f} kWh)", "cost": total_imp_cost, "bold": True})
-    # Grid remainder
+    # Direct import (remainder not attributed to sub-meters)
     if main_imp_kwh > 0.0001 or main_imp_cost > 0.0001:
-        rows.append({"label": f"Grid Import ({main_imp_kwh:.3f} kWh)", "cost": main_imp_cost})
+        rows.append({"label": f"Direct import ({main_imp_kwh:.3f} kWh)", "cost": main_imp_cost})
     # Sub-meters
     for r in sub_rows:
         rows.append(r)
@@ -947,7 +947,7 @@ def api_billing():
                 rows.append({"label": f"{label_imp} ({total_imp_kwh:.3f} kWh)",
                              "cost": total_imp_cost, "bold": True})
             if grid_imp_kwh > 0.001 or grid_imp_cost > 0.001:
-                rows.append({"label": f"Grid Import ({grid_imp_kwh:.3f} kWh)",
+                rows.append({"label": f"Direct import ({grid_imp_kwh:.3f} kWh)",
                              "cost": grid_imp_cost, "bold": False})
             # Sub-meter rows
             rows.extend(sub_rows)
@@ -1068,11 +1068,8 @@ def api_carbon():
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read())
 
-        # Log raw structure for debugging
-        logger.info("api_carbon raw keys: %s", list(data.keys()) if isinstance(data, dict) else type(data).__name__)
         slots = []
         raw = data.get("data", [])
-        logger.info("api_carbon data type: %s", type(raw).__name__)
         # Handle dict shape: {data: {regionid, postcode, data: [{from, to, intensity}]}}
         if isinstance(raw, dict):
             for slot in raw.get("data", []):
@@ -1499,7 +1496,7 @@ def api_blocks_summary():
             if is_sub:
                 label = meta.get("device") or meta.get("site") or meter_id
             else:
-                label = "Grid"
+                label = "Direct"
             meter_labels[meter_id] = label
 
         all_dates = [datetime.strptime(d, "%Y-%m-%d").date() for d in all_date_strs]
@@ -2626,11 +2623,12 @@ def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
 
     for row in rows:
         mid        = row["meter_id"]
-        b_imp      = float(row["imp_kwh"] or 0)
+        b_imp_raw  = float(row["imp_kwh"] or 0)
+        is_sub     = bool(row["is_sub_meter"]) or mid in sub_meter_ids
+        b_imp      = b_imp_raw
         b_exp      = float(row["exp_kwh"] or 0)
         b_net      = b_imp - b_exp
         cg         = row["carbon_g"]
-        is_sub     = bool(row["is_sub_meter"]) or mid in sub_meter_ids
 
         if is_sub:
             if mid not in sub_totals:

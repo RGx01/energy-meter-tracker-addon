@@ -738,6 +738,24 @@ def build_gap_blocks(
                             parent_name = meter_meta.get("parent_meter")
                             _sr = last_known_rates.get(parent_name, {}).get(channel_name)
                         sub_rate = _rate_value(_sr)
+                    else:
+                        # Spike detection — sub-meter kwh cannot exceed parent grid import
+                        # for this window. Get parent import kwh for sanity check.
+                        parent_name   = meter_meta.get("parent_meter", "electricity_main")
+                        parent_pre    = pre_reads_by_channel.get(parent_name, {}).get(channel_name)
+                        parent_post   = post_reads_by_channel.get(parent_name, {}).get(channel_name)
+                        if parent_pre and parent_post and parent_post["value"] > parent_pre["value"]:
+                            p_opener    = interpolate_value(parent_pre, parent_post, window_start)
+                            p_closer    = interpolate_value(parent_pre, parent_post, window_end)
+                            parent_kwh  = max(round(p_closer["value"] - p_opener["value"], 6), 0.0)
+                            if sub_kwh > parent_kwh * 1.05:  # 5% tolerance for rounding
+                                logger.error(
+                                    "build_gap_blocks: %s/%s %.4f kWh EXCEEDS parent grid %.4f kWh "
+                                    "— sensor spike detected. Clipping to parent.",
+                                    meter_name, channel_name, sub_kwh, parent_kwh,
+                                )
+                                sub_kwh  = min(sub_kwh, parent_kwh)
+                                sub_cost = round(sub_kwh * sub_rate, 6)
 
                     meter_block["channels"][channel_name] = {
                         "kwh": sub_kwh, "rate": sub_rate, "cost": sub_cost,
@@ -778,6 +796,9 @@ def build_gap_blocks(
                     block["totals"]["export_cost"] += cost
 
             block["meters"][meter_name] = meter_block
+
+        # Apply grid-authoritative clipping to gap blocks (same as finalise_block PASS 2)
+        _apply_pass2(block)
 
         gap_blocks.append(block)
         logger.info(
@@ -891,6 +912,115 @@ def generate_charts(store: "BlockStore"):
 # ─────────────────────────────────────────────────────────────────────────────
 # Block finalise
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _apply_pass2(block: dict) -> None:
+    """
+    PASS 2 — grid-authoritative sub-meter distribution.
+    Clips each sub-meter's import to what the parent grid import can supply,
+    sets kwh_grid and kwh_battery on each sub-meter channel.
+    Called from both finalise_block and build_gap_blocks.
+    """
+    # Build parent → sub_kwh_total map
+    parent_sub_kwh: dict = {}
+    for meter_name, meter_block in block["meters"].items():
+        meta = meter_block.get("meta", {})
+        if not meta.get("sub_meter"):
+            continue
+        parent_name = meta.get("parent_meter")
+        if not parent_name:
+            continue
+        sub_import = meter_block["channels"].get("import")
+        if sub_import:
+            parent_sub_kwh[parent_name] = parent_sub_kwh.get(parent_name, 0.0) + sub_import.get("kwh", 0.0)
+
+    for parent_meter_name in parent_sub_kwh:
+        parent_block  = block["meters"].get(parent_meter_name)
+        if not parent_block:
+            continue
+        parent_import = parent_block["channels"].get("import")
+        if not parent_import:
+            continue
+
+        grid_kwh       = parent_import.get("kwh", 0.0)
+        parent_rate    = parent_import.get("rate", 0.0)
+        grid_remaining = grid_kwh
+
+        protected   = []
+        unprotected = []
+
+        for meter_name, meter_block in block["meters"].items():
+            meta = meter_block.get("meta", {})
+            if not meta.get("sub_meter") or meta.get("parent_meter") != parent_meter_name:
+                continue
+            sub_import = meter_block["channels"].get("import")
+            if not sub_import:
+                continue
+            delta = sub_import.get("kwh", 0.0)
+            if meta.get("v2x_capable") and delta < 0:
+                logger.info("PASS 2: %s discharging %.4f kWh (V2X), excluded", meter_name, abs(delta))
+                continue
+            if delta == 0.0:
+                continue
+            entry = {
+                "meter_name": meter_name, "meter_block": meter_block,
+                "sub_import": sub_import, "kwh": delta,
+            }
+            (protected if not meta.get("inverter_possible", False) else unprotected).append(entry)
+
+        protected.sort(key=lambda x: x["kwh"], reverse=True)
+        unprotected.sort(key=lambda x: x["kwh"], reverse=True)
+
+        for entry in protected:
+            claimed = min(entry["kwh"], grid_remaining)
+            if entry["kwh"] > grid_kwh:
+                logger.error(
+                    "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
+                    "sensor may be misconfigured or reporting incorrect values. Clipping.",
+                    entry["meter_name"], entry["kwh"], grid_kwh,
+                )
+            elif claimed < entry["kwh"]:
+                logger.warning(
+                    "PASS 2: %s protected load %.4f kWh clipped to %.4f kWh",
+                    entry["meter_name"], entry["kwh"], claimed,
+                )
+            grid_remaining = max(grid_remaining - claimed, 0.0)
+            entry["sub_import"]["kwh_grid"]    = claimed
+            entry["sub_import"]["kwh_battery"] = entry["kwh"] - claimed
+            entry["sub_import"]["cost"]        = round(claimed * parent_rate, 6)
+            logger.info(
+                "PASS 2: %s protected  grid=%.4f  battery=%.4f",
+                entry["meter_name"], claimed, entry["sub_import"]["kwh_battery"],
+            )
+
+        for entry in unprotected:
+            claimed    = min(entry["kwh"], grid_remaining)
+            battery    = entry["kwh"] - claimed
+            if entry["kwh"] > grid_kwh:
+                logger.error(
+                    "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
+                    "sensor may be misconfigured or reporting incorrect values. Clipping.",
+                    entry["meter_name"], entry["kwh"], grid_kwh,
+                )
+            grid_remaining = max(grid_remaining - claimed, 0.0)
+            entry["sub_import"]["kwh_grid"]    = claimed
+            entry["sub_import"]["kwh_battery"] = battery
+            entry["sub_import"]["cost"]        = round(claimed * parent_rate, 6)
+            logger.info(
+                "PASS 2: %s unprotected  grid=%.4f  battery=%.4f",
+                entry["meter_name"], claimed, battery,
+            )
+
+        remainder_kwh  = max(grid_remaining, 0.0)
+        remainder_cost = round(remainder_kwh * parent_rate, 6)
+        parent_import["kwh_total"]      = grid_kwh
+        parent_import["kwh_remainder"]  = remainder_kwh
+        parent_import["cost_remainder"] = remainder_cost
+        parent_import["rate_used"]      = parent_rate
+        logger.info(
+            "PASS 2: %s  grid=%.4f kWh  remainder=%.4f kWh",
+            parent_meter_name, grid_kwh, remainder_kwh,
+        )
+
 
 def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: bool = False,
                    last_known_rates: dict | None = None):
@@ -1021,82 +1151,7 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
                 parent_sub_cost[parent_name] = parent_sub_cost.get(parent_name, 0.0) + sub_import["cost"]
 
     # ── PASS 2 — grid-authoritative sub-meter distribution ────────────────
-    for parent_meter_name, sub_kwh_total in parent_sub_kwh.items():
-        parent_block  = block["meters"].get(parent_meter_name)
-        if not parent_block:
-            continue
-        parent_import = parent_block["channels"].get("import")
-        if not parent_import:
-            continue
-
-        grid_kwh      = parent_import.get("kwh", 0.0)
-        parent_rate   = parent_import.get("rate", 0.0)
-        grid_remaining = grid_kwh
-
-        protected   = []
-        unprotected = []
-
-        for meter_name, meter_block in block["meters"].items():
-            meta = meter_block.get("meta", {})
-            if not meta.get("sub_meter") or meta.get("parent_meter") != parent_meter_name:
-                continue
-            sub_import = meter_block["channels"].get("import")
-            if not sub_import:
-                continue
-            delta = sub_import.get("kwh", 0.0)
-            if meta.get("v2x_capable") and delta < 0:
-                logger.info("PASS 2: %s discharging %.4f kWh (V2X), excluded", meter_name, abs(delta))
-                continue
-            if delta == 0.0:
-                continue
-            entry = {
-                "meter_name": meter_name, "meter_block": meter_block,
-                "sub_import": sub_import, "kwh": delta,
-            }
-            (protected if not meta.get("inverter_possible", False) else unprotected).append(entry)
-
-        protected.sort(key=lambda x: x["kwh"], reverse=True)
-        unprotected.sort(key=lambda x: x["kwh"], reverse=True)
-
-        for entry in protected:
-            claimed = min(entry["kwh"], grid_remaining)
-            if claimed < entry["kwh"]:
-                logger.warning(
-                    "PASS 2: %s protected load %.4f kWh clipped to %.4f kWh",
-                    entry["meter_name"], entry["kwh"], claimed,
-                )
-            grid_remaining = max(grid_remaining - claimed, 0.0)
-            entry["sub_import"]["kwh_grid"]    = claimed
-            entry["sub_import"]["kwh_battery"] = entry["kwh"] - claimed
-            entry["sub_import"]["cost"]        = round(claimed * parent_rate, 6)
-            logger.info(
-                "PASS 2: %s protected  grid=%.4f  battery=%.4f",
-                entry["meter_name"], claimed, entry["sub_import"]["kwh_battery"],
-            )
-
-        for entry in unprotected:
-            claimed        = min(entry["kwh"], grid_remaining)
-            battery        = entry["kwh"] - claimed
-            grid_remaining = max(grid_remaining - claimed, 0.0)
-            entry["sub_import"]["kwh_grid"]    = claimed
-            entry["sub_import"]["kwh_battery"] = battery
-            entry["sub_import"]["cost"]        = round(claimed * parent_rate, 6)
-            logger.info(
-                "PASS 2: %s unprotected  grid=%.4f  battery=%.4f",
-                entry["meter_name"], claimed, battery,
-            )
-
-        remainder_kwh  = max(grid_remaining, 0.0)
-        remainder_cost = round(remainder_kwh * parent_rate, 6)
-        parent_import["kwh_total"]     = grid_kwh
-        parent_import["kwh_remainder"] = remainder_kwh
-        parent_import["cost_remainder"] = remainder_cost
-        parent_import["rate_used"]     = parent_rate
-        logger.info(
-            "PASS 2: %s  grid=%.4f kWh  remainder=%.4f kWh",
-            parent_meter_name, grid_kwh, remainder_kwh,
-        )
-
+    _apply_pass2(block)
     # ── PASS 3 — compute block totals ─────────────────────────────────────
     for meter_name, meter_block in block["meters"].items():
         meta = meter_block["meta"]

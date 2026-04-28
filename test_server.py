@@ -2090,3 +2090,192 @@ class TestApiSaveConfigFreshInstall(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(period_count, 1,
             "Fresh install wizard save should update existing period, not create a new one")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /api/insights/data-bounds
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApiInsightsDataBounds(unittest.TestCase):
+
+    def setUp(self):
+        self.client = make_client()
+
+    def test_returns_200(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/insights/data-bounds")
+        self.assertEqual(r.status_code, 200)
+
+    def test_response_has_earliest_and_latest(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/insights/data-bounds")
+        d = json.loads(r.data)
+        self.assertIn("earliest", d)
+        self.assertIn("latest", d)
+
+    def test_empty_store_returns_none(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/insights/data-bounds")
+        d = json.loads(r.data)
+        self.assertIsNone(d["earliest"])
+        self.assertIsNone(d["latest"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /api/insights/calendar-month and /api/insights/calendar-year
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApiInsightsCalendar(unittest.TestCase):
+
+    def setUp(self):
+        self.client = make_client()
+
+    def test_calendar_month_returns_200(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/insights/calendar-month?year=2026&month=4")
+        self.assertEqual(r.status_code, 200)
+
+    def test_calendar_month_has_required_fields(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/insights/calendar-month?year=2026&month=4")
+        d = json.loads(r.data)
+        for field in ["has_carbon", "imp_kwh", "exp_kwh", "carbon_g_net",
+                      "period_start", "period_end", "period_label",
+                      "sub_meters", "assumptions"]:
+            self.assertIn(field, d)
+
+    def test_calendar_month_period_label(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/insights/calendar-month?year=2026&month=4")
+        d = json.loads(r.data)
+        self.assertIn("2026", d["period_label"])
+
+    def test_calendar_year_returns_200(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/insights/calendar-year?year=2026")
+        self.assertEqual(r.status_code, 200)
+
+    def test_calendar_year_has_required_fields(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/insights/calendar-year?year=2026")
+        d = json.loads(r.data)
+        for field in ["has_carbon", "imp_kwh", "exp_kwh", "carbon_g_net",
+                      "period_start", "period_end", "period_label",
+                      "sub_meters", "assumptions"]:
+            self.assertIn(field, d)
+
+    def test_calendar_year_period_label_is_year_string(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/insights/calendar-year?year=2026")
+        d = json.loads(r.data)
+        self.assertEqual(d["period_label"], "2026")
+
+    def test_calendar_month_defaults_to_current(self):
+        """Omitting year/month should still return a valid response."""
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/insights/calendar-month")
+        self.assertEqual(r.status_code, 200)
+
+    def test_calendar_year_response_has_carbon_field(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/insights/calendar-year?year=2026")
+        d = json.loads(r.data)
+        self.assertIn("has_carbon", d)
+        self.assertIsInstance(d["has_carbon"], bool)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _aggregate_insights direct tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAggregateInsights(unittest.TestCase):
+    """Test _aggregate_insights directly with known block data."""
+
+    def setUp(self):
+        import tempfile, os
+        self.tmp = tempfile.mktemp(suffix=".db")
+        from block_store import BlockStore
+        self.store = BlockStore(self.tmp)
+        # Insert a known block
+        with self.store._conn:
+            self.store._conn.execute(
+                "INSERT INTO config_periods (billing_day, block_minutes, timezone, "
+                "currency_symbol, currency_code, effective_from) "
+                "VALUES (1, 30, 'Europe/London', '£', 'GBP', '2026-01-01')"
+            )
+            cp_id = self.store._conn.execute(
+                "SELECT id FROM config_periods LIMIT 1"
+            ).fetchone()[0]
+            # Main meter block
+            self.store._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, local_date, local_year, "
+                "local_month, local_day, meter_id, config_period_id, imp_kwh, exp_kwh, carbon_g) "
+                "VALUES ('2026-04-01T00:00:00', '2026-04-01T00:30:00', '2026-04-01', "
+                "2026, 4, 1, 'electricity_main', ?, 10.0, 2.0, 500.0)",
+                (cp_id,)
+            )
+            # Sub-meter block
+            self.store._conn.execute(
+                "INSERT INTO meters (meter_id, config_period_id, is_sub_meter) "
+                "VALUES ('ev_charger', ?, 1)",
+                (cp_id,)
+            )
+            self.store._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, local_date, local_year, "
+                "local_month, local_day, meter_id, config_period_id, imp_kwh, "
+                "exp_kwh, carbon_g) "
+                "VALUES ('2026-04-01T00:00:00', '2026-04-01T00:30:00', '2026-04-01', "
+                "2026, 4, 1, 'ev_charger', ?, 4.0, 0.0, 200.0)",
+                (cp_id,)
+            )
+        self.cfg = {
+            "meters": {
+                "electricity_main": {"meta": {"timezone": "Europe/London", "block_minutes": 30}},
+                "ev_charger": {"meta": {"sub_meter": True, "timezone": "Europe/London"}},
+            }
+        }
+
+    def tearDown(self):
+        import os
+        self.store._conn.close()
+        if os.path.exists(self.tmp):
+            os.remove(self.tmp)
+
+    def test_has_carbon_true(self):
+        d = server._aggregate_insights(
+            self.store, self.cfg,
+            "2026-04-01T00:00:00", "2026-04-02T00:00:00"
+        )
+        self.assertTrue(d["has_carbon"])
+
+    def test_main_meter_imp_kwh(self):
+        d = server._aggregate_insights(
+            self.store, self.cfg,
+            "2026-04-01T00:00:00", "2026-04-02T00:00:00"
+        )
+        self.assertAlmostEqual(d["imp_kwh"], 10.0, places=3)
+
+    def test_sub_meter_imp_kwh(self):
+        """Sub-meter imp_kwh is correctly accumulated."""
+        d = server._aggregate_insights(
+            self.store, self.cfg,
+            "2026-04-01T00:00:00", "2026-04-02T00:00:00"
+        )
+        self.assertIn("ev_charger", d["sub_meters"])
+        self.assertAlmostEqual(d["sub_meters"]["ev_charger"]["imp_kwh"], 4.0, places=3)
+
+    def test_house_imp_kwh_is_remainder(self):
+        """House import = main import minus sub-meter import."""
+        d = server._aggregate_insights(
+            self.store, self.cfg,
+            "2026-04-01T00:00:00", "2026-04-02T00:00:00"
+        )
+        self.assertAlmostEqual(d["house_imp_kwh"], 6.0, places=3)
+
+    def test_empty_range_returns_no_carbon(self):
+        d = server._aggregate_insights(
+            self.store, self.cfg,
+            "2025-01-01T00:00:00", "2025-01-02T00:00:00"
+        )
+        self.assertFalse(d["has_carbon"])
+        self.assertEqual(d["imp_kwh"], 0.0)
