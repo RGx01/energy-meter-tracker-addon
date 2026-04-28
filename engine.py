@@ -1265,11 +1265,16 @@ def _get_postcode() -> str | None:
         for m_data in cfg.get("meters", {}).values():
             meta = (m_data or {}).get("meta", {}) or {}
             if not meta.get("sub_meter"):
-                pc = meta.get("postcode_prefix", "").strip().upper()
+                pc = _normalise_postcode(meta.get("postcode_prefix", ""))
                 return pc if pc else None
     except Exception:
         pass
     return None
+
+
+def _normalise_postcode(raw: str) -> str:
+    """Strip full postcode to outward code only. 'DE1 3AT' → 'DE1', 'SW1A 2AA' → 'SW1A'."""
+    return raw.strip().upper().split()[0] if raw and raw.strip() else ""
 
 
 def _fetch_carbon_intensity(postcode: str) -> list:
@@ -1598,6 +1603,173 @@ async def _engine_tick(ha: HAClient):
 # Startup  (replaces @time_trigger("startup"))
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def _backfill_carbon_gaps(store, cfg: dict) -> None:
+    """
+    Backfill NULL carbon_g blocks from the National Grid ESO historical API.
+    - First time a postcode is configured: backfills up to 60 days
+    - Subsequent restarts: only checks last 48 hours (matches CI prune window)
+    Only runs if a postcode is configured.
+    """
+    import urllib.request
+    import json as _json
+
+    postcode = _normalise_postcode(
+        cfg.get("meters", {})
+           .get("electricity_main", {})
+           .get("meta", {})
+           .get("postcode_prefix", "")
+    )
+    if not postcode:
+        return
+
+    # Determine if this is first run for this postcode
+    first_run = True
+    try:
+        meta_row = store._conn.execute(
+            "SELECT value FROM store_meta WHERE key = 'carbon_backfill_done'"
+        ).fetchone()
+        if meta_row and meta_row["value"] == postcode:
+            first_run = False
+    except Exception:
+        pass
+
+    # Window: full 60 days on first run, 48 hours on subsequent restarts
+    lookback_hours = 60 * 24 if first_run else 48
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+              ).strftime("%Y-%m-%dT%H:%M:%S")
+
+    null_rows = store._conn.execute(
+        """SELECT DISTINCT strftime('%Y-%m-%dT%H:00:00', block_start) as hour
+           FROM blocks
+           WHERE carbon_g IS NULL
+             AND meter_id = 'electricity_main'
+             AND block_start >= ?
+           ORDER BY hour""",
+        (cutoff,)
+    ).fetchall()
+
+    if not null_rows:
+        if first_run:
+            # Mark complete so future restarts use 48hr window
+            try:
+                with store._conn:
+                    store._conn.execute(
+                        "INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)",
+                        ("carbon_backfill_done", postcode)
+                    )
+            except Exception:
+                pass
+        logger.info("_backfill_carbon_gaps: no NULL carbon_g blocks found")
+        return
+
+    logger.info("_backfill_carbon_gaps: %d hour windows to backfill for %s (%s)",
+                len(null_rows), postcode, "first run" if first_run else "48hr check")
+
+    fetched_windows = set()
+    total_slots = 0
+
+    for row in null_rows:
+        hour_str = row["hour"]
+        hour_dt  = datetime.fromisoformat(hour_str)
+        win_key  = hour_str[:13]
+        if win_key in fetched_windows:
+            continue
+        fetched_windows.add(win_key)
+
+        existing = store._conn.execute(
+            """SELECT 1 FROM carbon_intensity
+               WHERE postcode = ?
+                 AND captured_at BETWEEN ? AND ?
+               LIMIT 1""",
+            (postcode,
+             (hour_dt - timedelta(minutes=30)).isoformat(),
+             (hour_dt + timedelta(minutes=30)).isoformat())
+        ).fetchone()
+        if existing:
+            continue
+
+        from_iso = hour_dt.strftime("%Y-%m-%dT%H:%MZ")
+        to_iso   = (hour_dt + timedelta(hours=48)).strftime("%Y-%m-%dT%H:%MZ")
+        # Mark all hours in this 48h window as fetched to avoid duplicate calls
+        for h in range(48):
+            fetched_windows.add((hour_dt + timedelta(hours=h)).strftime("%Y-%m-%dT%H"))
+
+        url = (f"https://api.carbonintensity.org.uk/regional/intensity"
+               f"/{from_iso}/{to_iso}/postcode/{postcode}")
+
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = _json.loads(resp.read())
+
+            raw = data.get("data", [])
+            if isinstance(raw, dict):
+                entries = raw.get("data", [])
+            elif isinstance(raw, list) and raw:
+                entries = raw[0].get("data", []) if "data" in raw[0] else raw
+            else:
+                entries = []
+
+            slots_stored = 0
+            for slot in entries:
+                intensity_obj = slot.get("intensity", {})
+                intensity_val = intensity_obj.get("forecast") or intensity_obj.get("actual")
+                ci_index      = intensity_obj.get("index")
+                slot_from     = slot.get("from")
+                if slot_from and intensity_val is not None:
+                    captured_at = slot_from.replace("Z", "").replace("+00:00", "")
+                    store.upsert_carbon_intensity(captured_at, postcode,
+                                                  float(intensity_val), ci_index)
+                    slots_stored += 1
+            total_slots += slots_stored
+            logger.info("_backfill_carbon_gaps: fetched %d slots from %s",
+                        slots_stored, from_iso)
+
+        except Exception as e:
+            logger.warning("_backfill_carbon_gaps: API fetch failed for %s: %s", from_iso, e)
+
+        await asyncio.sleep(0.5)
+
+    # Recompute carbon_g for NULL blocks in window
+    if total_slots > 0:
+        updated = 0
+        null_blocks = store._conn.execute(
+            """SELECT id, block_start, imp_kwh, exp_kwh
+               FROM blocks
+               WHERE carbon_g IS NULL
+                 AND meter_id = 'electricity_main'
+                 AND block_start >= ?""",
+            (cutoff,)
+        ).fetchall()
+
+        with store._conn:
+            for block in null_blocks:
+                ci_row = store.get_nearest_carbon_intensity(block["block_start"], postcode)
+                if not ci_row or ci_row.get("intensity") is None:
+                    continue
+                imp_kwh  = block["imp_kwh"] or 0.0
+                exp_kwh  = block["exp_kwh"] or 0.0
+                carbon_g = round((imp_kwh - exp_kwh) * float(ci_row["intensity"]), 4)
+                store._conn.execute(
+                    "UPDATE blocks SET carbon_g = ? WHERE id = ?",
+                    (carbon_g, block["id"])
+                )
+                updated += 1
+        logger.info("_backfill_carbon_gaps: updated carbon_g on %d blocks", updated)
+    else:
+        logger.info("_backfill_carbon_gaps: no new CI data fetched")
+
+    # Mark complete — future restarts use 48hr window only
+    try:
+        with store._conn:
+            store._conn.execute(
+                "INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)",
+                ("carbon_backfill_done", postcode)
+            )
+    except Exception:
+        pass
+
+
 async def engine_startup(ha: HAClient):
     """
     Run once when the add-on starts.
@@ -1884,6 +2056,14 @@ async def engine_startup(ha: HAClient):
             # Record this version so we don't backup again until next upgrade
             with open(_ver_file, "w") as _vfw:
                 _vfw.write(_cur_ver)
+            # Clear CI backfill flag so historical backfill runs once for new version
+            try:
+                with _store._conn:
+                    _store._conn.execute(
+                        "DELETE FROM store_meta WHERE key = 'carbon_backfill_done'"
+                    )
+            except Exception:
+                pass
             logger.info(
                 "engine_startup: upgrade backup created for v%s: %s",
                 _cur_ver, os.path.basename(_bk_path)
@@ -2098,6 +2278,12 @@ async def engine_startup(ha: HAClient):
                     logger.info("engine_startup: gap marker set, will fill on first sensor capture")
             else:
                 logger.info("engine_startup: no session gap detected")
+
+    # ── CI gap backfill ──────────────────────────────────────────────────
+    try:
+        await _backfill_carbon_gaps(_store, config)
+    except Exception as _e:
+        logger.warning("engine_startup: CI backfill failed: %s", _e)
 
     # ── Startup charts ───────────────────────────────────────────────────
     generate_charts(_store)

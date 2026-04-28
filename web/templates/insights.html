@@ -4,29 +4,85 @@
 <div class="topbar">
   <div>
     <h2>Insights</h2>
-    <div class="sub">Energy and carbon analysis by billing period</div>
+    <div class="sub">Energy and carbon analysis</div>
   </div>
   <div class="insights-tabs">
     <button class="insights-tab active" data-tab="carbon" onclick="showInsightTab('carbon', this)">🌿 <span class="insights-tab-label">Carbon</span></button>
-  </div>
-  <div id="period-nav" style="display:none; align-items:center; gap:8px;">
-    <button class="btn btn-secondary" id="btn-prev" onclick="navPeriod(-1)">←</button>
-    <span id="period-label" style="font-size:13px; font-weight:600; min-width:160px; text-align:center;"></span>
-    <button class="btn btn-secondary" id="btn-next" onclick="navPeriod(1)">→</button>
   </div>
 </div>
 {% endblock %}
 
 {% block head %}
 <style>
-  @media (max-width: 768px), (max-height: 500px) and (orientation: landscape) {
+  /* Floating insights toolbar — matches Usage Stats pattern */
+  .ins-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--surface);
+    padding: 8px 16px;
+    border-radius: 0 0 8px 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+    position: sticky;
+    top: 0;
+    z-index: 9;
+  }
+  .ins-toolbar .bar-seg {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+  .ins-toolbar .bar-seg-btn {
+    background: transparent;
+    border: none;
+    border-right: 1px solid var(--border);
+    padding: 5px 13px;
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+    font-family: var(--sans);
+  }
+  .ins-toolbar .bar-seg-btn:last-child { border-right: none; }
+  .ins-toolbar .bar-seg-btn.active { background: rgba(0,212,170,0.1); color: var(--accent); }
+  .ins-toolbar .bar-seg-btn:hover:not(.active) { background: rgba(255,255,255,0.05); color: var(--text); }
+  .ins-sep {
+    width: 1px;
+    height: 20px;
+    background: var(--border);
+    flex-shrink: 0;
+  }
+  .ins-nav-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 5px 12px;
+    font-size: 13px;
+    color: var(--muted);
+    cursor: pointer;
+    font-family: var(--sans);
+    transition: all 0.15s;
+  }
+  .ins-nav-btn:hover { color: var(--text); background: rgba(255,255,255,0.05); }
+  .ins-nav-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+  #ins-period-label {
+    font-size: 13px;
+    font-weight: 600;
+    min-width: 120px;
+    text-align: center;
+    color: var(--text);
+  }
+  @media (max-width: 768px) {
     .topbar .sub { display: none; }
     .topbar { padding: 8px 12px; gap: 6px; flex-wrap: nowrap; align-items: center; }
     .insights-tab { padding: 6px 10px; font-size: 18px; }
     .insights-tab-label { display: none; }
-    #period-nav { gap: 4px !important; }
-    #period-label { font-size: 11px !important; min-width: 0 !important; }
-    .btn-secondary { padding: 6px 8px; min-width: 32px; }
+    .ins-toolbar { gap: 4px; }
+    #ins-period-label { min-width: 80px; font-size: 11px; }
+    .ins-nav-btn { padding: 4px 8px; }
   }
 </style>
 {% endblock %}
@@ -151,6 +207,26 @@
   .postcode-field:focus { outline:none; border-color:var(--accent); }
 </style>
 
+<!-- Floating insights toolbar -->
+<div id="period-nav" class="ins-toolbar" style="display:none;">
+  <div class="bar-seg" id="ins-mode-seg">
+    <button class="bar-seg-btn active" onclick="insSetMode('month', this)">Month</button>
+    <button class="bar-seg-btn"        onclick="insSetMode('year',  this)">Year</button>
+  </div>
+  <div class="ins-sep"></div>
+  <button class="ins-nav-btn" id="btn-prev" onclick="navPeriod(-1)">←</button>
+  <span id="ins-period-label"></span>
+  <button class="ins-nav-btn" id="btn-next" onclick="navPeriod(1)">→</button>
+  <div class="ins-sep" id="ins-cmp-sep" style="display:none;"></div>
+  <div class="bar-seg" id="ins-compare-seg" style="display:none;">
+    <button class="bar-seg-btn" onclick="insSetCompare('prev',     this)">vs Last Month</button>
+    <button class="bar-seg-btn" onclick="insSetCompare('year',     this)">vs Same Month Last Year</button>
+  </div>
+  <div class="bar-seg" id="ins-compare-year-seg" style="display:none;">
+    <button class="bar-seg-btn" onclick="insSetCompare('lastyear', this)">vs Last Year</button>
+  </div>
+</div>
+
 <div id="insights-loading" style="text-align:center; padding:60px; color:var(--muted); font-size:13px;">
   Loading…
 </div>
@@ -200,6 +276,12 @@
   <div id="insights-body" style="display:none;">
 
     <!-- Summary card -->
+    <!-- Comparison narrative panel — shown when compare mode active -->
+    <div id="cmp-panel" style="display:none; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; margin-bottom:12px;">
+      <div id="cmp-panel-title" style="font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; color:var(--muted); margin-bottom:10px;"></div>
+      <div id="cmp-panel-lines" style="display:flex; flex-direction:column; gap:6px; font-size:13px; color:var(--text);"></div>
+    </div>
+
     <div class="insight-card" id="card-summary">
       <div class="insight-card-title">🌍 Carbon Summary</div>
       <div class="insight-headline" id="sum-net-headline"></div>
@@ -482,8 +564,13 @@
 </div><!-- /tab-carbon -->
 
 <script>
-var _periods   = [];
-var _periodIdx = 0;
+var _periods    = [];
+var _periodIdx  = 0;
+var _insMode    = 'month';   // 'month' | 'year'
+var _insCompare = null;      // null | 'prev' | 'year' | 'lastyear'
+var _calYear    = new Date().getFullYear();
+var _calMonth   = new Date().getMonth() + 1;  // 1-12
+var _dataBounds = { earliest: null, latest: null };  // from /api/insights/data-bounds
 var _trendChart = null;
 
 function showInsightTab(name, btn) {
@@ -530,7 +617,7 @@ function equivLines(carbon_g, a) {
 }
 
 // ── Render ──────────────────────────────────────────────────────────────────
-function renderInsights(d) {
+function renderInsights(d, _cmp) {
   document.getElementById('insights-loading').style.display = 'none';
   document.getElementById('insights-body').style.display    = 'none';
   document.getElementById('no-carbon').style.display        = 'none';
@@ -551,7 +638,7 @@ function renderInsights(d) {
   document.getElementById('sum-net-headline').textContent =
     (net_kg < 0 ? '−' : '') + Math.abs(net_kg).toFixed(2) + ' kgCO₂';
   document.getElementById('sum-net-sub').textContent =
-    'Net carbon ' + (net_kg < 0 ? 'offset' : 'emitted') + ' this billing period.';
+    'Net carbon ' + (net_kg < 0 ? 'offset' : 'emitted') + (d.period_label ? ' — ' + d.period_label : ' this period') + '.';
 
   var verdict = document.getElementById('sum-verdict');
   var hasFlexible = d.exp_kwh > 0.1 || Object.values(d.sub_meters || {}).some(function(m) {
@@ -910,10 +997,19 @@ function renderInsights(d) {
     evEquiv.innerHTML = evLines.join('<br>');
   }
 
+  // Render comparison deltas if _cmp provided — must happen before renderTrend
+  try {
+    if (_cmp && _cmp.has_carbon) {
+      renderComparison(d, _cmp);
+    } else {
+      document.querySelectorAll('.ins-delta').forEach(function(el) { el.remove(); });
+      document.getElementById('cmp-panel').style.display = 'none';
+    }
+  } catch(e) {
+  }
+
   renderTrend();
 }
-
-// ── Trend chart (inline SVG — no external dependency) ───────────────────────
 function _trendNavTo(idx) {
   if (idx < 0 || idx >= _periods.length || idx === _periodIdx) return;
   _periodIdx = idx;
@@ -1022,34 +1118,299 @@ function renderTrend() {
   wrap.innerHTML = svgParts.join('');
 }
 
+function renderComparison(d, c) {
+  // Remove previous delta badges
+  document.querySelectorAll('.ins-delta').forEach(function(el) { el.remove(); });
+
+  if (!c || !c.has_carbon) {
+    document.getElementById('cmp-panel').style.display = 'none';
+    return;
+  }
+
+  // ── Determine comparison label ────────────────────────────────────────────
+  var cmpLabel = c.period_label || 'previous period';
+
+  // ── Narrative lines ───────────────────────────────────────────────────────
+  var lines = [];
+  var a = d.assumptions || {};
+
+  function pct(val, cmp) {
+    if (!val || !cmp || cmp === 0) return null;
+    return Math.round((val - cmp) / Math.abs(cmp) * 100);
+  }
+  function sign(n) { return n > 0 ? '+' : ''; }
+  function col(n, lowerBetter) {
+    if (Math.abs(n) < 3) return 'var(--muted)';
+    return (lowerBetter ? n < 0 : n > 0) ? '#00d4aa' : '#ff6b6b';
+  }
+  function line(icon, text, positive) {
+    var c = positive === null ? 'var(--muted)' : (positive ? '#00d4aa' : '#ff6b6b');
+    return '<span style="color:' + c + ';">' + icon + '</span> ' + text;
+  }
+
+  // Net carbon — always show this one
+  if (d.carbon_g_net != null && c.carbon_g_net != null) {
+    var netPct = pct(d.carbon_g_net, c.carbon_g_net);
+    var netBetter = d.carbon_g_net < c.carbon_g_net;
+    lines.push(line(
+      netBetter ? '✓' : '↑',
+      'Net carbon <strong>' + (netBetter ? 'down' : 'up') + ' ' + Math.abs(netPct) + '%</strong> vs ' + cmpLabel
+      + ' (' + (d.carbon_g_net/1000).toFixed(1) + ' vs ' + (c.carbon_g_net/1000).toFixed(1) + ' kgCO₂)',
+      netBetter
+    ));
+  }
+
+  // Grid intensity — always show
+  if (d.effective_intensity != null && c.effective_intensity != null) {
+    var intPct = pct(d.effective_intensity, c.effective_intensity);
+    var intBetter = d.effective_intensity < c.effective_intensity;
+    lines.push(line(
+      intBetter ? '✓' : '↑',
+      'Grid was <strong>' + Math.abs(intPct) + '% ' + (intBetter ? 'greener' : 'dirtier') + '</strong> '
+      + '(' + Math.round(d.effective_intensity) + ' vs ' + Math.round(c.effective_intensity) + ' gCO₂/kWh)',
+      intBetter
+    ));
+  }
+
+  // Export / solar — show if either period has export
+  if (d.exp_kwh > 0.1 || c.exp_kwh > 0.1) {
+    var expPct = pct(d.exp_kwh, c.exp_kwh);
+    if (expPct !== null) {
+      lines.push(line(
+        expPct > 0 ? '✓' : '↓',
+        'Solar export <strong>' + sign(expPct) + expPct + '%</strong>'
+        + ' (' + d.exp_kwh.toFixed(0) + ' vs ' + c.exp_kwh.toFixed(0) + ' kWh)',
+        expPct > 0
+      ));
+    }
+  }
+
+  // Sub-meters
+  var evKwh = 0, evCmpKwh = 0, batKwh = 0, batCmpKwh = 0, hpKwh = 0, hpCmpKwh = 0;
+  Object.keys(d.sub_meters || {}).forEach(function(mid) {
+    var sm = d.sub_meters[mid]; var cSm = (c.sub_meters || {})[mid];
+    if (!cSm) return;
+    if (sm.meter_type === 'ev_charger' || sm.meter_type === 'ev') {
+      evKwh += sm.imp_kwh; evCmpKwh += cSm.imp_kwh;
+    } else if (sm.meter_type === 'battery') {
+      batKwh += sm.imp_kwh; batCmpKwh += cSm.imp_kwh;
+    } else if (sm.meter_type === 'heat_pump') {
+      hpKwh += sm.imp_kwh; hpCmpKwh += cSm.imp_kwh;
+    }
+  });
+
+  if (evKwh > 0 || evCmpKwh > 0) {
+    var evPct = pct(evKwh, evCmpKwh);
+    if (evPct !== null) {
+      var eff  = parseFloat(a.ev_efficiency  || 3.2);
+      var chEff = parseFloat(a.ev_charge_eff || 0.88);
+      var miles    = Math.round((evKwh    * chEff) * eff);
+      var cmpMiles = Math.round((evCmpKwh * chEff) * eff);
+      var diff = miles - cmpMiles;
+      lines.push(line(
+        '⚡',
+        'EV charged <strong>' + sign(evPct) + evPct + '%</strong>'
+        + ' — est. ' + miles + ' miles (' + (diff >= 0 ? '+' : '') + diff + ' vs ' + cmpLabel + ')',
+        null
+      ));
+    }
+  }
+
+  if (batKwh > 0 || batCmpKwh > 0) {
+    var batPct = pct(batKwh, batCmpKwh);
+    if (batPct !== null) {
+      lines.push(line(
+        '🔋',
+        'Battery charged <strong>' + sign(batPct) + batPct + '%</strong>'
+        + ' (' + batKwh.toFixed(0) + ' vs ' + batCmpKwh.toFixed(0) + ' kWh)',
+        null
+      ));
+    }
+  }
+
+  if (hpKwh > 0 || hpCmpKwh > 0) {
+    var hpPct = pct(hpKwh, hpCmpKwh);
+    if (hpPct !== null) {
+      lines.push(line(
+        '♨️',
+        'Heat pump <strong>' + sign(hpPct) + hpPct + '%</strong>'
+        + ' (' + hpKwh.toFixed(0) + ' vs ' + hpCmpKwh.toFixed(0) + ' kWh)',
+        null
+      ));
+    }
+  }
+
+  // House consumption
+  if (d.house_imp_kwh != null && c.house_imp_kwh != null) {
+    var hPct = pct(d.house_imp_kwh, c.house_imp_kwh);
+    if (hPct !== null) {
+      lines.push(line(
+        hPct < 0 ? '✓' : '↑',
+        'House consumption <strong>' + sign(hPct) + hPct + '%</strong>'
+        + ' (' + d.house_imp_kwh.toFixed(0) + ' vs ' + c.house_imp_kwh.toFixed(0) + ' kWh)',
+        hPct < 0
+      ));
+    }
+  }
+
+  // ── Render panel ─────────────────────────────────────────────────────────
+  var panel = document.getElementById('cmp-panel');
+  if (lines.length === 0) {
+    panel.style.display = 'none';
+    return;
+  }
+  document.getElementById('cmp-panel-title').textContent = 'Compared to ' + cmpLabel;
+  document.getElementById('cmp-panel-lines').innerHTML = lines.map(function(l) {
+    return '<div>' + l + '</div>';
+  }).join('');
+  panel.style.display = '';
+
+  // ── Delta badges (subtle, secondary to narrative) ─────────────────────────
+  function addBadge(elId, val, cmpVal, lowerBetter) {
+    var el = document.getElementById(elId);
+    if (!el || val == null || !cmpVal) return;
+    var p = pct(val, cmpVal);
+    if (p === null) return;
+    var c2 = col(p, lowerBetter);
+    el.insertAdjacentHTML('afterend',
+      '<span class="ins-delta" style="font-size:11px;margin-left:6px;color:' + c2 + ';">'
+      + sign(p) + p + '%</span>');
+  }
+  addBadge('sum-net-headline',  d.carbon_g_net,         c.carbon_g_net,         true);
+  addBadge('sum-eff-int',       d.effective_intensity,  c.effective_intensity,  true);
+  addBadge('sum-ci-imp-kwh',    d.ci_imp_kwh,           c.ci_imp_kwh,           true);
+  if (evKwh)  addBadge('ev-kwh',  evKwh,  evCmpKwh,  false);
+  if (batKwh) addBadge('bat-kwh', batKwh, batCmpKwh, false);
+  if (hpKwh)  addBadge('hp-kwh',  hpKwh,  hpCmpKwh,  true);
+  addBadge('house-kwh', d.house_imp_kwh, c.house_imp_kwh, true);
+}
+
 // ── Period nav ───────────────────────────────────────────────────────────────
+function insSetMode(mode, el) {
+  _insMode    = mode;
+  _insCompare = null;
+  document.querySelectorAll('#ins-mode-seg .bar-seg-btn').forEach(function(b) {
+    b.classList.toggle('active', b === el);
+  });
+  document.querySelectorAll('#ins-compare-seg .bar-seg-btn, #ins-compare-year-seg .bar-seg-btn').forEach(function(b) {
+    b.classList.remove('active');
+  });
+  document.getElementById('ins-compare-seg').style.display      = mode === 'month' ? '' : 'none';
+  document.getElementById('ins-compare-year-seg').style.display = mode === 'year'  ? '' : 'none';
+  document.getElementById('ins-cmp-sep').style.display          = '';
+  updatePeriodNav();
+  loadPeriod();
+}
+
+function insSetCompare(cmp, el) {
+  _insCompare = (_insCompare === cmp) ? null : cmp;  // toggle
+  document.querySelectorAll('#ins-compare-seg .bar-seg-btn, #ins-compare-year-seg .bar-seg-btn').forEach(function(b) {
+    b.classList.remove('active');
+  });
+  if (_insCompare) el.classList.add('active');
+  loadPeriod();
+}
+
 function navPeriod(dir) {
-  var next = _periodIdx + dir;
-  if (next < 0 || next >= _periods.length) return;
-  _periodIdx = next;
+  if (_insMode === 'month') {
+    _calMonth += dir;
+    if (_calMonth > 12) { _calMonth = 1;  _calYear++; }
+    if (_calMonth < 1)  { _calMonth = 12; _calYear--; }
+  } else {
+    _calYear += dir;
+  }
+  updatePeriodNav();
   loadPeriod();
 }
 
 function updatePeriodNav() {
-  var p = _periods[_periodIdx];
-  document.getElementById('period-label').textContent =
-    periodLabel(p) + (p.is_current ? ' (current)' : '');
-  document.getElementById('btn-prev').disabled = (_periodIdx === 0);
-  document.getElementById('btn-next').disabled = (_periodIdx === _periods.length - 1);
+  var now      = new Date();
+  var earliest = _dataBounds.earliest ? new Date(_dataBounds.earliest) : null;
+  var label, atFuture, atPast;
+
+  if (_insMode === 'month') {
+    var d = new Date(_calYear, _calMonth - 1, 1);
+    label    = d.toLocaleString('default', {month: 'long', year: 'numeric'});
+    atFuture = (_calYear > now.getFullYear() || (_calYear === now.getFullYear() && _calMonth >= now.getMonth() + 1));
+    atPast   = earliest ? (d <= new Date(earliest.getFullYear(), earliest.getMonth(), 1)) : false;
+
+    // Gate compare buttons
+    var earliestYear  = earliest ? earliest.getFullYear() : 9999;
+    var earliestMonth = earliest ? earliest.getMonth() : 11;  // 0-based
+    // Compare at month granularity — if we have ANY data in the target month, allow it
+    var prevMonthYear  = _calMonth === 1 ? _calYear - 1 : _calYear;
+    var prevMonthMonth = _calMonth === 1 ? 11 : _calMonth - 2;  // 0-based
+    var lastYearMonth  = _calMonth - 1;  // 0-based, same month
+    var hasPrevMonth = (prevMonthYear > earliestYear) || (prevMonthYear === earliestYear && prevMonthMonth >= earliestMonth);
+    var hasLastYear  = (_calYear - 1 > earliestYear) || (_calYear - 1 === earliestYear && lastYearMonth >= earliestMonth);
+    document.querySelector('#ins-compare-seg .bar-seg-btn:nth-child(1)').disabled = !hasPrevMonth;
+    document.querySelector('#ins-compare-seg .bar-seg-btn:nth-child(2)').disabled = !hasLastYear;
+    if (_insCompare === 'prev' && !hasPrevMonth) { _insCompare = null; }
+    if (_insCompare === 'year' && !hasLastYear)  { _insCompare = null; }
+    // Re-sync active state
+    document.querySelectorAll('#ins-compare-seg .bar-seg-btn').forEach(function(b) {
+      b.classList.remove('active');
+    });
+    if (_insCompare === 'prev') document.querySelector('#ins-compare-seg .bar-seg-btn:nth-child(1)').classList.add('active');
+    if (_insCompare === 'year') document.querySelector('#ins-compare-seg .bar-seg-btn:nth-child(2)').classList.add('active');
+
+  } else {
+    label    = String(_calYear);
+    atFuture = _calYear >= now.getFullYear();
+    atPast   = earliest ? _calYear <= earliest.getFullYear() : false;
+
+    var hasLastYear = earliest ? (_calYear - 1) >= earliest.getFullYear() : false;
+    document.querySelector('#ins-compare-year-seg .bar-seg-btn').disabled = !hasLastYear;
+    if (_insCompare === 'lastyear' && !hasLastYear) { _insCompare = null; }
+    document.querySelector('#ins-compare-year-seg .bar-seg-btn').classList.toggle('active', _insCompare === 'lastyear');
+  }
+
+  document.getElementById('ins-period-label').textContent = label;
+  document.getElementById('btn-next').disabled = atFuture;
+  document.getElementById('btn-prev').disabled = atPast;
 }
 
 async function loadPeriod() {
   document.getElementById('insights-body').style.display = 'none';
   document.getElementById('no-carbon').style.display     = 'none';
   document.getElementById('insights-loading').style.display = 'block';
+  document.getElementById('insights-loading').textContent = 'Loading…';
+
+  // Capture compare mode BEFORE updatePeriodNav runs (which may reset _insCompare)
+  var compareMode = _insCompare;
   updatePeriodNav();
-  var p = _periods[_periodIdx];
+
   try {
-    var r = await fetch(apiUrl('/api/insights/billing-period?period_start=' + p.period_start));
+    var url, cmpUrl;
+    if (_insMode === 'month') {
+      url = apiUrl('/api/insights/calendar-month?year=' + _calYear + '&month=' + _calMonth);
+      if (compareMode === 'prev') {
+        var pm = _calMonth - 1, py = _calYear;
+        if (pm < 1) { pm = 12; py--; }
+        cmpUrl = apiUrl('/api/insights/calendar-month?year=' + py + '&month=' + pm);
+      } else if (compareMode === 'year') {
+        cmpUrl = apiUrl('/api/insights/calendar-month?year=' + (_calYear - 1) + '&month=' + _calMonth);
+      }
+    } else {
+      url    = apiUrl('/api/insights/calendar-year?year=' + _calYear);
+      if (compareMode === 'lastyear') {
+        cmpUrl = apiUrl('/api/insights/calendar-year?year=' + (_calYear - 1));
+      }
+    }
+
+    var r = await fetch(url);
     var d = await r.json();
     if (d.error) throw new Error(d.error);
+
+    var cmpData = null;
+    if (cmpUrl) {
+      var cr = await fetch(cmpUrl);
+      cmpData = await cr.json();
+      if (cmpData.error) cmpData = null;
+    }
+
     document.getElementById('insights-loading').style.display = 'none';
-    renderInsights(d);
+    renderInsights(d, cmpData);
   } catch(e) {
     document.getElementById('insights-loading').textContent = 'Failed to load insights: ' + e.message;
   }
@@ -1108,19 +1469,23 @@ async function initInsights() {
       return;
     }
 
-    // Load periods
-    var pr = await fetch(apiUrl('/api/insights/periods'));
-    var d  = await pr.json();
-    if (d.error) throw new Error(d.error);
-    _periods = (d.periods || []).filter(function(p) { return p.has_carbon; });
+    document.getElementById('period-nav').style.display      = 'flex';
+    document.getElementById('ins-compare-seg').style.display = '';
+    document.getElementById('ins-cmp-sep').style.display     = '';
 
-    if (_periods.length === 0) {
-      document.getElementById('no-carbon').style.display = 'block';
-      return;
+    // Fetch data bounds to gate navigation and compare buttons
+    var br = await fetch(apiUrl('/api/insights/data-bounds'));
+    var bd = await br.json();
+    if (!bd.error && bd.earliest) _dataBounds = bd;
+
+    // Fetch billing periods for trend chart
+    var pr = await fetch(apiUrl('/api/insights/periods'));
+    var pd = await pr.json();
+    if (!pd.error) {
+      _periods = (pd.periods || []).filter(function(p) { return p.has_carbon; });
     }
 
-    _periodIdx = _periods.length - 1;
-    document.getElementById('period-nav').style.display = 'flex';
+    updatePeriodNav();
     loadPeriod();
 
   } catch(e) {

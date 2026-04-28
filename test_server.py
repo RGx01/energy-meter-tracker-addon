@@ -1239,15 +1239,14 @@ class TestApiImportBlocksDb(unittest.TestCase):
             msg=f"blocks.db not in imported: {result.get('imported')}"
         )
 
-    def test_meters_config_alone_still_works(self):
-        """Importing meters_config.json without blocks.db still succeeds."""
-        import io
+    def test_meters_config_alone_returns_error(self):
+        """Importing meters_config.json without blocks.db is rejected — DB is sole source of truth since 2.1.0."""
+        import io, json
         cfg = {"meters": {"electricity_main": {"meta": {
             "billing_day": 1, "block_minutes": 30,
             "timezone": "Europe/London",
             "currency_symbol": "£", "currency_code": "GBP",
         }, "channels": {"import": {}, "export": {}}}}}
-        import json
         cfg_bytes = json.dumps(cfg).encode()
         data = {"meters_config": (io.BytesIO(cfg_bytes), "meters_config.json")}
         r = self.client.post(
@@ -1256,8 +1255,7 @@ class TestApiImportBlocksDb(unittest.TestCase):
             content_type="multipart/form-data"
         )
         result = r.get_json()
-        self.assertTrue(result.get("ok"), msg=f"Import failed: {result}")
-        self.assertIn("meters_config.json", result.get("imported", []))
+        self.assertIn("error", result, msg="Expected error when importing meters_config.json alone")
 
     def test_empty_import_returns_error(self):
         """Importing nothing returns an error."""
