@@ -2,14 +2,15 @@
 
 {% block topbar %}
 <div class="topbar">
-  <div>
+  <div style="flex:1;">
     <h2>Insights</h2>
     <div class="sub">Energy, carbon and cost analysis</div>
   </div>
-  <div class="insights-tabs">
+  <div class="insights-tabs" style="flex:0 0 auto;">
     <button class="insights-tab active" data-tab="carbon" onclick="showInsightTab('carbon', this)">🌿 <span class="insights-tab-label">Carbon</span></button>
     <button class="insights-tab" data-tab="usage" onclick="showInsightTab('usage', this)">💷 <span class="insights-tab-label">Usage</span></button>
   </div>
+  <div style="flex:1;"></div>
 </div>
 {% endblock %}
 
@@ -548,6 +549,13 @@
 <!-- ── Usage tab ──────────────────────────────────────────────────────────── -->
 <div id="tab-usage" style="display:none;">
 
+  <!-- Narrative comparison card — only shown when a comparison period is active -->
+  <div class="insight-card" id="ucard-narrative" style="display:none;">
+    <div class="insight-card-title" id="u-narrative-title">What changed?</div>
+    <div id="u-narrative-headline" class="insight-headline" style="font-size:1.1rem;margin-bottom:8px;"></div>
+    <div id="u-narrative-bullets" style="margin-top:4px;"></div>
+  </div>
+
   <!-- Cost & Earnings card -->
   <div class="insight-card" id="ucard-cost">
     <div class="insight-card-title">Cost &amp; Earnings</div>
@@ -620,7 +628,7 @@
     <div class="insight-card-title">Peak Demand Window</div>
     <div class="insight-headline" id="u-peak-headline">—</div>
     <div class="insight-sub" id="u-peak-sub">The 2-hour window with the highest house grid import.</div>
-    <div class="insight-footnote">House import only — EV and battery charging excluded. Based on half-hour block totals converted to local time.</div>
+    <div class="insight-footnote" id="u-peak-footnote">Based on half-hour block totals converted to local time.</div>
   </div>
 
   <!-- Battery card — shown only if battery sub-meter configured -->
@@ -695,12 +703,25 @@ var _trendChart = null;
 
 var _activeInsightTab = 'carbon';
 
+function _insSaveState() {
+  try {
+    localStorage.setItem('emt_insights_state', JSON.stringify({
+      tab:     _activeInsightTab,
+      mode:    _insMode,
+      year:    _calYear,
+      month:   _calMonth,
+      compare: _insCompare
+    }));
+  } catch(e) {}
+}
+
 function showInsightTab(name, btn) {
   _activeInsightTab = name;
   document.querySelectorAll('.insights-tab').forEach(function(b) { b.classList.remove('active'); });
   btn.classList.add('active');
   document.getElementById('tab-carbon').style.display = name === 'carbon' ? 'block' : 'none';
   document.getElementById('tab-usage').style.display  = name === 'usage'  ? 'block' : 'none';
+  _insSaveState();
   loadPeriod();
 }
 
@@ -1531,18 +1552,16 @@ async function loadPeriod() {
 
     if (_insMode === 'month') {
       url = apiUrl(apiBase + '/calendar-month?year=' + _calYear + '&month=' + _calMonth);
-      if (!isUsage) {
-        if (compareMode === 'prev') {
-          var pm = _calMonth - 1, py = _calYear;
-          if (pm < 1) { pm = 12; py--; }
-          cmpUrl = apiUrl(apiBase + '/calendar-month?year=' + py + '&month=' + pm);
-        } else if (compareMode === 'year') {
-          cmpUrl = apiUrl(apiBase + '/calendar-month?year=' + (_calYear - 1) + '&month=' + _calMonth);
-        }
+      if (compareMode === 'prev') {
+        var pm = _calMonth - 1, py = _calYear;
+        if (pm < 1) { pm = 12; py--; }
+        cmpUrl = apiUrl(apiBase + '/calendar-month?year=' + py + '&month=' + pm);
+      } else if (compareMode === 'year') {
+        cmpUrl = apiUrl(apiBase + '/calendar-month?year=' + (_calYear - 1) + '&month=' + _calMonth);
       }
     } else {
       url = apiUrl(apiBase + '/calendar-year?year=' + _calYear);
-      if (!isUsage && compareMode === 'lastyear') {
+      if (compareMode === 'lastyear') {
         cmpUrl = apiUrl(apiBase + '/calendar-year?year=' + (_calYear - 1));
       }
     }
@@ -1552,7 +1571,7 @@ async function loadPeriod() {
     if (d.error) throw new Error(d.error);
 
     var cmpData = null;
-    if (cmpUrl && !isUsage) {
+    if (cmpUrl) {
       var cr = await fetch(cmpUrl);
       cmpData = await cr.json();
       if (cmpData.error) cmpData = null;
@@ -1560,7 +1579,7 @@ async function loadPeriod() {
 
     document.getElementById('insights-loading').style.display = 'none';
     if (isUsage) {
-      renderUsage(d);
+      renderUsage(d, cmpData);
     } else {
       renderInsights(d, cmpData);
     }
@@ -1638,6 +1657,33 @@ async function initInsights() {
       _periods = (pd.periods || []).filter(function(p) { return p.has_carbon; });
     }
 
+    // Restore last position
+    try {
+      var _saved = JSON.parse(localStorage.getItem('emt_insights_state') || '{}');
+      if (_saved.mode   && ['bill','month','year'].indexOf(_saved.mode) !== -1) _insMode = _saved.mode;
+      if (_saved.year   && _saved.year > 2000)  _calYear  = _saved.year;
+      if (_saved.month  && _saved.month >= 1 && _saved.month <= 12) _calMonth = _saved.month;
+      if (_saved.compare) _insCompare = _saved.compare;
+      if (_saved.tab    && ['carbon','usage'].indexOf(_saved.tab) !== -1) {
+        _activeInsightTab = _saved.tab;
+        var tabBtn = document.querySelector('.insights-tab[data-tab="' + _saved.tab + '"]');
+        if (tabBtn) {
+          document.querySelectorAll('.insights-tab').forEach(function(b) { b.classList.remove('active'); });
+          tabBtn.classList.add('active');
+        }
+        document.getElementById('tab-carbon').style.display = _saved.tab === 'carbon' ? 'block' : 'none';
+        document.getElementById('tab-usage').style.display  = _saved.tab === 'usage'  ? 'block' : 'none';
+      }
+      // Restore compare button state
+      if (_saved.compare) {
+        document.querySelectorAll('.bar-seg-btn').forEach(function(b) {
+          if (b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'" + _saved.compare + "'") !== -1) {
+            b.classList.add('active');
+          }
+        });
+      }
+    } catch(e) {}
+
     updatePeriodNav();
     loadPeriod();
 
@@ -1664,20 +1710,32 @@ function fmtHour(h) {
 function renderUsageTierBars(tiers, totalKwh, containerId, currency) {
   var el = document.getElementById(containerId);
   if (!el || !tiers || !tiers.length) return;
+  // Sort cheapest first
+  var sorted = tiers.slice().sort(function(a,b) { return a.rate - b.rate; });
   var html = '';
-  tiers.forEach(function(t) {
-    var pct = totalKwh > 0 ? Math.round(t.kwh / totalKwh * 100) : 0;
-    var rateP = (t.rate * 100).toFixed(2);
-    html += '<div style="margin-bottom:10px;">' +
-      '<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;">' +
-        '<span style="color:var(--text);font-family:var(--mono);">' + rateP + 'p/kWh</span>' +
-        '<span style="color:var(--muted);">' + t.kwh.toFixed(1) + ' kWh &nbsp;·&nbsp; ' +
-          (currency || '£') + t.cost.toFixed(2) + ' &nbsp;·&nbsp; ' + pct + '%</span>' +
-      '</div>' +
-      '<div style="height:6px;background:var(--bg);border-radius:3px;overflow:hidden;">' +
-        '<div style="height:100%;width:' + pct + '%;background:var(--accent);border-radius:3px;transition:width 0.4s;"></div>' +
-      '</div>' +
-    '</div>';
+  sorted.forEach(function(t, i) {
+    var pct     = totalKwh > 0 ? (t.kwh / totalKwh * 100) : 0;
+    var pctDisp = pct < 1 ? pct.toFixed(1) : Math.round(pct);
+    var rateP   = (t.rate * 100).toFixed(2);
+    // Bar width: minimum 2px so even 0% tiers show a sliver
+    var barW    = Math.max(pct, 0.3);
+    // Colour: cheapest = accent, others step through muted palette
+    var colours = ['var(--accent)', 'var(--warning, #f59e0b)', 'var(--danger, #ef4444)', 'var(--muted)'];
+    var col     = colours[Math.min(i, colours.length - 1)];
+    html +=
+      '<div style="margin-bottom:14px;">' +
+        '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;">' +
+          '<span style="font-family:var(--mono);font-size:13px;color:var(--text);">' + rateP + 'p/kWh</span>' +
+          '<span style="font-size:12px;color:var(--muted);">' +
+            t.kwh.toFixed(1) + ' kWh &nbsp;·&nbsp; ' +
+            (currency || '£') + t.cost.toFixed(2) + ' &nbsp;·&nbsp; ' +
+            '<strong style="color:var(--text);">' + pctDisp + '%</strong>' +
+          '</span>' +
+        '</div>' +
+        '<div style="height:5px;background:var(--bg);border-radius:3px;overflow:visible;">' +
+          '<div style="height:100%;width:' + barW + '%;min-width:3px;background:' + col + ';border-radius:3px;transition:width 0.4s;"></div>' +
+        '</div>' +
+      '</div>';
   });
   el.innerHTML = html;
 }
@@ -1693,10 +1751,123 @@ function renderSubDeviceRates(tiers, totalKwh, containerId, currency) {
   el.style.display = '';
 }
 
-function renderUsage(d) {
+function generateUsageNarrative(cur, prev, cmpLabel) {
+  // Returns {headline, bullets[]} explaining what drove the cost difference
+  var deltas = [];
+  var currency = '£';
+
+  var costDelta = cur.net_cost - prev.net_cost;  // positive = worse (more expensive)
+
+  // ── Per-component deltas ─────────────────────────────────────────────────
+  // Import cost
+  var impDelta = cur.imp_cost - prev.imp_cost;
+  if (Math.abs(impDelta) > 0.50) {
+    // Check if rate changed meaningfully
+    var rateChanged = cur.weighted_rate && prev.weighted_rate &&
+                      Math.abs(cur.weighted_rate - prev.weighted_rate) > 0.001;
+    var kwhDelta = cur.imp_kwh - prev.imp_kwh;
+    var msg;
+    if (rateChanged && Math.abs(kwhDelta) < 20) {
+      msg = 'Your average import rate shifted from ' +
+            fmtRate(prev.weighted_rate) + 'p to ' + fmtRate(cur.weighted_rate) + 'p/kWh' +
+            (impDelta > 0 ? ', increasing' : ', reducing') + ' import cost by ' +
+            currency + Math.abs(impDelta).toFixed(2) + '.';
+    } else {
+      msg = 'Grid import ' + (kwhDelta > 0 ? 'increased' : 'decreased') + ' by ' +
+            Math.abs(kwhDelta).toFixed(0) + ' kWh' +
+            (impDelta > 0 ? ', adding ' : ', saving ') +
+            currency + Math.abs(impDelta).toFixed(2) + ' in import cost.';
+    }
+    deltas.push({ magnitude: Math.abs(impDelta), text: msg });
+  }
+
+  // Export earnings
+  var expDelta = cur.exp_cost - prev.exp_cost;  // positive = earned more
+  if (Math.abs(expDelta) > 0.50) {
+    var expKwhDelta = cur.exp_kwh - prev.exp_kwh;
+    deltas.push({
+      magnitude: Math.abs(expDelta),
+      text: 'Export earnings ' + (expDelta > 0 ? 'increased' : 'decreased') + ' by ' +
+            currency + Math.abs(expDelta).toFixed(2) +
+            ' (' + (expKwhDelta > 0 ? '+' : '') + expKwhDelta.toFixed(0) + ' kWh exported)' +
+            (expDelta < 0 ? ' — likely less solar generation.' : '.')
+    });
+  }
+
+  // Sub-meter deltas
+  var curSubs  = cur.sub_meters  || {};
+  var prevSubs = prev.sub_meters || {};
+  var allMids  = new Set(Object.keys(curSubs).concat(Object.keys(prevSubs)));
+  allMids.forEach(function(mid) {
+    var cs = curSubs[mid]  || { imp_kwh: 0, imp_cost: 0, label: mid, meter_type: '' };
+    var ps = prevSubs[mid] || { imp_kwh: 0, imp_cost: 0, label: mid, meter_type: '' };
+    var subCostDelta = (cs.imp_cost || 0) - (ps.imp_cost || 0);
+    var subKwhDelta  = (cs.imp_kwh  || 0) - (ps.imp_kwh  || 0);
+    if (Math.abs(subCostDelta) < 0.50 && Math.abs(subKwhDelta) < 10) return;
+    var label = cs.label || ps.label || mid;
+    var type  = (cs.meter_type || ps.meter_type || '').toLowerCase();
+    var typeHint = type === 'ev' ? ' — EV charging' :
+                   type === 'battery' ? ' — battery charging' :
+                   type === 'heat_pump' ? ' — heat pump' : '';
+    // Describe what drove the cost change: volume, rate, or both
+    var subMsg;
+    var kwhSign = subKwhDelta > 0 ? '+' : '';
+    if (Math.abs(subCostDelta) < 0.50) {
+      subMsg = label + typeHint + ' usage was similar (' + kwhSign + subKwhDelta.toFixed(0) + ' kWh).';
+    } else if (Math.sign(subKwhDelta) === Math.sign(subCostDelta) || subKwhDelta === 0) {
+      // Volume drove cost — straightforward
+      subMsg = label + typeHint + (subKwhDelta > 0 ? ' used more' : ' used less') +
+               ' energy (' + kwhSign + subKwhDelta.toFixed(0) + ' kWh), ' +
+               (subCostDelta > 0 ? 'adding ' : 'saving ') +
+               currency + Math.abs(subCostDelta).toFixed(2) + '.';
+    } else {
+      // Volume and cost moved in opposite directions — rate changed
+      subMsg = label + typeHint + ' used ' + kwhSign + subKwhDelta.toFixed(0) + ' kWh ' +
+               'but cost ' + (subCostDelta > 0 ? currency + subCostDelta.toFixed(2) + ' more' :
+                              currency + Math.abs(subCostDelta).toFixed(2) + ' less') +
+               ' — rate changed between periods.';
+    }
+    deltas.push({ magnitude: Math.abs(subCostDelta), text: subMsg });
+  });
+
+  // Standing charge
+  var scDelta = cur.standing_charge - prev.standing_charge;
+  if (Math.abs(scDelta) > 0.20) {
+    deltas.push({
+      magnitude: Math.abs(scDelta),
+      text: 'Standing charge ' + (scDelta > 0 ? 'increased' : 'decreased') + ' by ' +
+            currency + Math.abs(scDelta).toFixed(2) +
+            (Math.abs(cur.total_days - prev.total_days) > 1
+              ? ' (' + cur.total_days + ' days vs ' + prev.total_days + ' days).'
+              : '.')
+    });
+  }
+
+  // ── Headline ─────────────────────────────────────────────────────────────
+  var headline;
+  if (Math.abs(costDelta) < 0.50) {
+    headline = 'Cost was similar to ' + cmpLabel + '.';
+  } else if (costDelta > 0) {
+    headline = currency + costDelta.toFixed(2) + ' more than ' + cmpLabel + '.';
+  } else {
+    headline = currency + Math.abs(costDelta).toFixed(2) + ' less than ' + cmpLabel + '.';
+  }
+
+  // Sort by magnitude, take top 3
+  deltas.sort(function(a, b) { return b.magnitude - a.magnitude; });
+  var bullets = deltas.slice(0, 3).map(function(d) { return d.text; });
+
+  if (!bullets.length) {
+    bullets.push('No significant differences found between the two periods.');
+  }
+
+  return { headline: headline, bullets: bullets };
+}
+
+function renderUsage(d, cmpData) {
   document.getElementById('tab-usage').style.display = 'block';
   // Hide all device cards first
-  ['ucard-battery','ucard-ev','ucard-hp'].forEach(function(id) {
+  ['ucard-battery','ucard-ev','ucard-hp','ucard-narrative'].forEach(function(id) {
     document.getElementById(id).style.display = 'none';
   });
 
@@ -1762,6 +1933,18 @@ function renderUsage(d) {
     document.getElementById('u-peak-sub').textContent =
       'Highest house grid draw: ' + (d.peak_window_kwh || 0).toFixed(1) +
       ' kWh in the ' + fmtHour(d.peak_window_start) + ' window.';
+    // Dynamic footnote — only mention device types that are configured
+    var subTypes = Object.values(d.sub_meters || {}).map(function(s) { return (s.meter_type||'').toLowerCase(); });
+    var excl = [];
+    if (subTypes.some(function(t){ return t==='ev'||t==='ev_charger'; }))    excl.push('EV charging');
+    if (subTypes.some(function(t){ return t==='battery'||t==='inverter'; })) excl.push('battery charging');
+    if (subTypes.some(function(t){ return t==='heat_pump'; }))               excl.push('heat pump');
+    var fnEl = document.getElementById('u-peak-footnote');
+    if (fnEl) {
+      fnEl.textContent = (excl.length
+        ? excl.join(' and ') + ' excluded — '
+        : '') + 'based on half-hour block totals converted to local time.';
+    }
   }
 
   // ── Sub-meter device cards ────────────────────────────────────────────────
@@ -1794,6 +1977,24 @@ function renderUsage(d) {
       renderSubDeviceRates(sm.rate_tiers, sm.imp_kwh, 'u-hp-rates', currency);
     }
   });
+
+  // ── Narrative comparison ──────────────────────────────────────────────────
+  if (cmpData && !cmpData.error) {
+    var cmpLabel = _insCompare === 'prev' ? 'last month' :
+                   _insCompare === 'year' ? 'same month last year' :
+                   _insCompare === 'lastyear' ? 'last year' : 'previous period';
+    var narrative = generateUsageNarrative(d, cmpData, cmpLabel);
+    document.getElementById('u-narrative-title').textContent = 'What changed vs ' + cmpLabel + '?';
+    document.getElementById('u-narrative-headline').textContent = narrative.headline;
+    var bulletsHtml = narrative.bullets.map(function(b) {
+      return '<div style="display:flex;gap:8px;margin-bottom:6px;">' +
+             '<span style="color:var(--accent);flex-shrink:0;">→</span>' +
+             '<span style="color:var(--muted);font-size:13px;">' + b + '</span>' +
+             '</div>';
+    }).join('');
+    document.getElementById('u-narrative-bullets').innerHTML = bulletsHtml;
+    document.getElementById('ucard-narrative').style.display = 'block';
+  }
 }
 
 initInsights();

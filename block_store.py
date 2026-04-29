@@ -546,11 +546,27 @@ class BlockStore:
         self._ensure_schema()
         # Covering index for insights aggregation — created after migrations
         # so carbon_g and other late-added columns are guaranteed to exist
+        # Covering index for all insights/summary queries — avoids row fetches.
+        # Includes all columns used by _aggregate_insights, _aggregate_usage,
+        # and api_blocks_summary. Rebuilt if schema changes (DROP + CREATE).
+        _insights_idx_sql = (
+            "CREATE INDEX IF NOT EXISTS idx_blocks_insights "
+            "ON blocks (block_start, meter_id, config_period_id, "
+            "imp_kwh, imp_kwh_grid, imp_kwh_remainder, "
+            "imp_rate, imp_cost, imp_cost_remainder, "
+            "exp_kwh, exp_cost, "
+            "standing_charge, carbon_g)"
+        )
         try:
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_blocks_insights "
-                "ON blocks (block_start, meter_id, imp_kwh, exp_kwh, carbon_g, config_period_id)"
-            )
+            existing = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_blocks_insights'"
+            ).fetchone()
+            if existing and existing[0] and "standing_charge" not in existing[0]:
+                # Old narrow index — drop and recreate with full covering set
+                with self._conn:
+                    self._conn.execute("DROP INDEX IF EXISTS idx_blocks_insights")
+            with self._conn:
+                self._conn.execute(_insights_idx_sql)
         except Exception:
             pass
         # 2.8.0 — drop timezone-baked local date columns (now computed at query time)

@@ -1501,7 +1501,7 @@ def api_blocks_summary():
         _raw_rows = store._conn.execute(f"""
             SELECT b.block_start, b.meter_id, m.is_sub_meter, m.parent_meter_id,
                    b.imp_kwh, b.imp_kwh_grid, b.imp_kwh_remainder,
-                   b.imp_cost, b.imp_cost_remainder, b.exp_kwh, b.exp_cost,
+                   b.imp_cost, b.exp_kwh, b.exp_cost,
                    b.standing_charge, b.carbon_g,
                    b.interpolated, cp.billing_day
             FROM blocks b
@@ -1542,19 +1542,17 @@ def api_blocks_summary():
             if not _is_sub:
                 # Main meter
                 _m = _dd["main"]
-                # Use remainder → grid → raw for imp_kwh and imp_cost (matches billing logic)
+                # imp_kwh: use remainder → grid → raw (house-only kWh for the chart label)
+                # imp_cost: use FULL main meter cost — sub-meter costs appear as
+                # separate additive rows in the chart, so Direct import = total main cost
                 if _r["imp_kwh_remainder"] is not None:
                     _m_imp = float(_r["imp_kwh_remainder"])
                 elif _r["imp_kwh_grid"] is not None:
                     _m_imp = float(_r["imp_kwh_grid"])
                 else:
                     _m_imp = _imp
-                if _r["imp_cost_remainder"] is not None:
-                    _m_cost = float(_r["imp_cost_remainder"])
-                else:
-                    _m_cost = _cost_imp
                 _m["imp_kwh"]  += _m_imp
-                _m["imp_cost"] += _m_cost
+                _m["imp_cost"] += _cost_imp
                 _m["exp_kwh"]  += _exp
                 _m["exp_cost"] += _cost_exp
                 if _sc > _dd["standing"]:

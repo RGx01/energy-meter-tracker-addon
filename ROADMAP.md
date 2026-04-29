@@ -197,3 +197,22 @@ Extend the engine to support gas meter recording alongside electricity. Requires
 - API versioning
 
 ---
+---
+
+## Backlog — Unscheduled Items
+
+### Device Decommissioning
+When a physical device (battery, EV charger, heat pump) is replaced or retired, the current
+workflow requires deleting the sub-meter entirely — which destroys all historical data.
+
+**Required:** A "decommission" option on sub-meter devices that:
+- Stops the engine polling for that meter's entities
+- Retains all historical block data for reporting
+- Marks the meter as inactive in config so it is excluded from live charts but visible in
+  historical billing/usage/carbon views with a clear "decommissioned" label
+- Allows the meter to be reactivated if the same device returns
+
+Workaround in the interim: remove the HA entity sensors from the meter config fields
+(leave the meter in place) — the engine will stop recording new data but history is preserved.
+
+---
