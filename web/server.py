@@ -1275,15 +1275,19 @@ def api_sub_meter_history():
             return jsonify({"error": "meter_id required"}), 400
         store = _get_store()
         rows  = store.get_sub_meter_history(meter_id, hours=hours)
-        # Compute max abs inverter kW for gauge scaling
-        # Use 95th percentile to filter spurious outlier readings
+        # Compute max abs inverter kW for gauge scaling.
+        # Use 90th percentile — spurious sensor spikes (e.g. Solax reporting
+        # impossible values) can make up > 5% of readings, causing p95 to land
+        # on a spike. p90 is robust against up to 10% bad readings.
+        # Also clamp to 20 kW — no residential inverter exceeds this; values
+        # above it are always sensor errors and should not inflate the scale.
         kw_vals = [abs(r["inverter_kw"]) for r in rows
-                   if r.get("inverter_kw") is not None]
+                   if r.get("inverter_kw") is not None and abs(r["inverter_kw"]) <= 20.0]
         max_kw = 5.0  # minimum scale
         if kw_vals:
             kw_vals.sort()
-            p95_idx = int(len(kw_vals) * 0.95)
-            max_kw = max(max_kw, kw_vals[p95_idx])
+            p90_idx = min(int(len(kw_vals) * 0.90), len(kw_vals) - 1)
+            max_kw = max(max_kw, kw_vals[p90_idx])
         return jsonify({"rows": rows, "max_kw": round(max_kw, 1)})
     except Exception as e:
         logger.error("api_sub_meter_history: %s", e)
@@ -2832,6 +2836,365 @@ def api_insights_calendar_year():
         return jsonify(d)
     except Exception as e:
         logger.exception("api_insights_calendar_year failed")
+        return jsonify({"error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage Insights — aggregation + endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
+                     tz_name: str = "UTC") -> dict:
+    """
+    Core aggregation for Usage Insights — works for any UTC time range.
+    Returns cost, earnings, rate-tier distribution, self-sufficiency,
+    peak demand window, and per-device breakdowns.
+    All monetary values in the configured currency.
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _ZI
+    from collections import defaultdict
+
+    try:
+        tz = _ZI(tz_name)
+    except Exception:
+        tz = _ZI("UTC")
+
+    meters_cfg  = cfg.get("meters") or {}
+    sub_meter_ids = {
+        mid for mid, md in meters_cfg.items()
+        if (md.get("meta") or {}).get("sub_meter")
+    }
+
+    # Fetch all columns needed for usage insights in one query
+    rows = store._conn.execute(
+        """SELECT b.meter_id, b.block_start,
+                  b.imp_kwh, b.imp_kwh_grid, b.imp_kwh_remainder,
+                  b.imp_rate, b.imp_cost,
+                  b.exp_kwh, b.exp_rate, b.exp_cost,
+                  b.standing_charge,
+                  COALESCE(m.is_sub_meter, 0) as is_sub_meter,
+                  m.meter_type
+           FROM blocks b
+           LEFT JOIN meters m ON m.meter_id = b.meter_id
+                              AND m.config_period_id = b.config_period_id
+           WHERE b.block_start >= ? AND b.block_start < ?
+           ORDER BY b.block_start""",
+        (utc_start, utc_end)
+    ).fetchall()
+
+    # ── Accumulators ──────────────────────────────────────────────────────────
+    main_imp_kwh   = 0.0   # total grid import
+    main_exp_kwh   = 0.0   # total export
+    main_imp_cost  = 0.0   # total import cost
+    main_exp_cost  = 0.0   # total export earnings
+    house_imp_kwh  = 0.0   # import remainder (house only, excl sub-meters)
+    house_imp_cost = 0.0   # cost of house-only import
+
+    # Standing charge — sum once per local day
+    daily_sc: dict = {}    # date_str → max sc value
+
+    # Rate tier distribution {rate → {kwh, cost, blocks}}
+    rate_tiers: dict = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "blocks": 0})
+
+    # Peak demand window — 2hr buckets (0–23) by hour, accumulate house imp_kwh
+    hour_kwh: dict = defaultdict(float)   # hour (0-23) → house import kWh
+
+    total_blocks = 0
+
+    # Sub-meter accumulators
+    sub_totals: dict = {}
+
+    for row in rows:
+        mid     = row["meter_id"]
+        bs      = row["block_start"]
+        is_sub  = bool(row["is_sub_meter"]) or mid in sub_meter_ids
+        imp     = float(row["imp_kwh"] or 0)
+        exp     = float(row["exp_kwh"] or 0)
+        imp_cost = float(row["imp_cost"] or 0)
+        exp_cost = float(row["exp_cost"] or 0)
+        rate     = float(row["imp_rate"] or 0)
+        sc       = float(row["standing_charge"] or 0)
+
+        if is_sub:
+            if mid not in sub_totals:
+                _meta = (meters_cfg.get(mid, {}).get("meta") or {})
+                sub_totals[mid] = {
+                    "imp_kwh":   0.0,
+                    "imp_cost":  0.0,
+                    "exp_kwh":   0.0,
+                    "label":     _meta.get("device") or mid,
+                    "meter_type": (row["meter_type"] or "").lower(),
+                    # rate tier breakdown per sub-meter
+                    "rate_tiers": defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "blocks": 0}),
+                }
+            # Use imp_kwh_grid for sub-meters (grid portion only)
+            sub_grid_kwh = float(row["imp_kwh_grid"] or imp)
+            sub_totals[mid]["imp_kwh"]  += sub_grid_kwh
+            sub_totals[mid]["imp_cost"] += imp_cost
+            sub_totals[mid]["exp_kwh"]  += exp
+            if rate > 0:
+                sub_totals[mid]["rate_tiers"][round(rate, 6)]["kwh"]    += sub_grid_kwh
+                sub_totals[mid]["rate_tiers"][round(rate, 6)]["cost"]   += imp_cost
+                sub_totals[mid]["rate_tiers"][round(rate, 6)]["blocks"] += 1
+            continue
+
+        # ── Main meter ────────────────────────────────────────────────────────
+        total_blocks += 1
+        main_imp_kwh  += imp
+        main_exp_kwh  += exp
+        main_imp_cost += imp_cost
+        main_exp_cost += exp_cost
+
+        # House-only import (main minus sub-meters, already computed by engine)
+        rem = row["imp_kwh_remainder"]
+        h_imp = float(rem) if rem is not None else imp
+        h_cost = imp_cost * (h_imp / imp) if imp > 0 else 0.0
+        house_imp_kwh  += h_imp
+        house_imp_cost += h_cost
+
+        # Standing charge — once per local day
+        try:
+            local_d = (_dt.fromisoformat(bs)
+                       .replace(tzinfo=_ZI("UTC"))
+                       .astimezone(tz)
+                       .strftime("%Y-%m-%d"))
+        except Exception:
+            local_d = bs[:10]
+        if sc > 0:
+            if local_d not in daily_sc or sc > daily_sc[local_d]:
+                daily_sc[local_d] = sc
+        elif local_d not in daily_sc:
+            daily_sc[local_d] = 0.0
+
+        # Rate tier accumulation (main meter total) — only when actually importing
+        if rate > 0 and imp > 0:
+            rate_key = round(rate, 6)
+            rate_tiers[rate_key]["kwh"]    += imp
+            rate_tiers[rate_key]["cost"]   += imp_cost
+            rate_tiers[rate_key]["blocks"] += 1
+
+        # Peak demand window — local hour bucket
+        try:
+            local_hour = (_dt.fromisoformat(bs)
+                          .replace(tzinfo=_ZI("UTC"))
+                          .astimezone(tz)
+                          .hour)
+            hour_kwh[local_hour] += h_imp
+        except Exception:
+            pass
+
+    # ── Derived totals ────────────────────────────────────────────────────────
+    total_sc = round(sum(daily_sc.values()), 4)
+    total_days = len(daily_sc)
+    net_cost = round(main_imp_cost + total_sc - main_exp_cost, 4)
+
+    # Weighted average import rate
+    weighted_rate = round(main_imp_cost / main_imp_kwh, 6) if main_imp_kwh > 0 else None
+
+    # Net grid position — import minus export (positive = net consumer, negative = net exporter)
+    # Self-sufficiency cannot be computed without a generation meter (we don't know
+    # how much solar was self-consumed vs exported). We report net position instead.
+    net_grid_kwh = round(main_imp_kwh - main_exp_kwh, 3)
+
+    # Net exporter days — days where exp_kwh > imp_kwh
+    # Requires a per-day query (lightweight)
+    net_exporter_days = 0
+    try:
+        day_rows = store._conn.execute(
+            """SELECT SUM(imp_kwh) as di, SUM(exp_kwh) as de
+               FROM blocks
+               WHERE meter_id='electricity_main'
+                 AND block_start >= ? AND block_start < ?
+               GROUP BY date(block_start)""",
+            (utc_start, utc_end)
+        ).fetchall()
+        net_exporter_days = sum(1 for r in day_rows
+                                if (r["de"] or 0) > (r["di"] or 0))
+    except Exception:
+        pass
+
+    # Peak demand window — find the 2-hour window with highest average house import
+    peak_window_start = peak_window_kwh = None
+    if hour_kwh:
+        hours = sorted(hour_kwh.keys())
+        best = -1.0
+        best_h = hours[0]
+        for h in hours:
+            h2 = (h + 1) % 24
+            combined = hour_kwh.get(h, 0) + hour_kwh.get(h2, 0)
+            if combined > best:
+                best = combined
+                best_h = h
+        peak_window_start = best_h
+        peak_window_kwh   = round(best, 3)
+
+    # Serialise rate_tiers (keys are floats, not JSON-safe as dict keys)
+    rate_tiers_list = sorted(
+        [{"rate": k, "kwh": round(v["kwh"], 3),
+          "cost": round(v["cost"], 4), "blocks": v["blocks"]}
+         for k, v in rate_tiers.items()],
+        key=lambda x: x["rate"]
+    )
+
+    # Serialise sub_totals rate_tiers similarly
+    for mid, st in sub_totals.items():
+        st["rate_tiers"] = sorted(
+            [{"rate": k, "kwh": round(v["kwh"], 3),
+              "cost": round(v["cost"], 4), "blocks": v["blocks"]}
+             for k, v in st["rate_tiers"].items()],
+            key=lambda x: x["rate"]
+        )
+
+    return {
+        # Cost & earnings
+        "imp_kwh":          round(main_imp_kwh,  3),
+        "exp_kwh":          round(main_exp_kwh,  3),
+        "imp_cost":         round(main_imp_cost, 4),
+        "exp_cost":         round(main_exp_cost, 4),
+        "standing_charge":  total_sc,
+        "net_cost":         net_cost,
+        "weighted_rate":    weighted_rate,
+        "total_days":       total_days,
+        # Rate tier distribution (main meter)
+        "rate_tiers":       rate_tiers_list,
+        # Net grid position
+        "net_grid_kwh":      net_grid_kwh,    # positive = net importer, negative = net exporter
+        "net_exporter_days": net_exporter_days,
+        # House consumption (excl sub-meters)
+        "house_imp_kwh":    round(house_imp_kwh,  3),
+        "house_imp_cost":   round(house_imp_cost, 4),
+        # Peak demand
+        "peak_window_start": peak_window_start,   # local hour 0-23
+        "peak_window_kwh":   peak_window_kwh,
+        # Sub-meters
+        "sub_meters":        sub_totals,
+    }
+
+
+@app.route("/api/usage/billing-period")
+def api_usage_billing_period():
+    """
+    Usage insights for a billing period.
+    Query params: period_start=YYYY-MM-DD (local date). Omit for current period.
+    """
+    try:
+        import energy_charts as _ec
+        from zoneinfo import ZoneInfo as _ZI
+        from datetime import datetime, timezone
+        store   = _get_store()
+        cfg     = load_config()
+        tz_name = "UTC"
+        for md in (cfg.get("meters") or {}).values():
+            tz_name = (md.get("meta") or {}).get("timezone", "UTC")
+            break
+        tz = _ZI(tz_name)
+
+        periods = _ec.get_billing_periods_from_config_periods(
+            store.get_config_periods(), tz=tz
+        )
+        if not periods:
+            return jsonify({"error": "No billing periods found"}), 404
+
+        requested = request.args.get("period_start")
+        now_local = datetime.now(tz).replace(tzinfo=None)
+        target_ps = target_pe = None
+        for (ps, pe) in periods:
+            if requested:
+                if ps.date().isoformat() == requested:
+                    target_ps, target_pe = ps, pe
+                    break
+            else:
+                target_ps, target_pe = ps, pe
+
+        if not target_ps:
+            return jsonify({"error": "Billing period not found"}), 404
+
+        is_current = target_ps <= now_local < target_pe
+        ps_iso = target_ps.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+        pe_iso = target_pe.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+
+        d = _aggregate_usage(store, cfg, ps_iso, pe_iso, tz_name)
+        d["period_start"] = target_ps.date().isoformat()
+        d["period_end"]   = target_pe.date().isoformat()
+        d["is_current"]   = is_current
+        return jsonify(d)
+    except Exception as e:
+        logger.exception("api_usage_billing_period failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/usage/calendar-month")
+def api_usage_calendar_month():
+    """
+    Usage insights for a calendar month.
+    Query params: year=YYYY, month=MM (1-12)
+    """
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        from datetime import datetime, timezone, timedelta
+        store   = _get_store()
+        cfg     = load_config()
+        tz_name = "UTC"
+        for md in (cfg.get("meters") or {}).values():
+            tz_name = (md.get("meta") or {}).get("timezone", "UTC")
+            break
+        tz = _ZI(tz_name)
+
+        year  = int(request.args.get("year",  datetime.now(tz).year))
+        month = int(request.args.get("month", datetime.now(tz).month))
+
+        local_start = datetime(year, month, 1, tzinfo=tz)
+        if month == 12:
+            local_end = datetime(year + 1, 1, 1, tzinfo=tz)
+        else:
+            local_end = datetime(year, month + 1, 1, tzinfo=tz)
+
+        utc_start = local_start.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+        utc_end   = local_end.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+
+        d = _aggregate_usage(store, cfg, utc_start, utc_end, tz_name)
+        d["period_start"] = local_start.date().isoformat()
+        d["period_end"]   = (local_end - timedelta(days=1)).date().isoformat()
+        d["period_label"] = local_start.strftime("%B %Y")
+        return jsonify(d)
+    except Exception as e:
+        logger.exception("api_usage_calendar_month failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/usage/calendar-year")
+def api_usage_calendar_year():
+    """
+    Usage insights for a calendar year.
+    Query params: year=YYYY
+    """
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        from datetime import datetime, timezone, timedelta
+        store   = _get_store()
+        cfg     = load_config()
+        tz_name = "UTC"
+        for md in (cfg.get("meters") or {}).values():
+            tz_name = (md.get("meta") or {}).get("timezone", "UTC")
+            break
+        tz = _ZI(tz_name)
+
+        year = int(request.args.get("year", datetime.now(tz).year))
+
+        local_start = datetime(year, 1, 1, tzinfo=tz)
+        local_end   = datetime(year + 1, 1, 1, tzinfo=tz)
+
+        utc_start = local_start.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+        utc_end   = local_end.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+
+        d = _aggregate_usage(store, cfg, utc_start, utc_end, tz_name)
+        d["period_start"] = local_start.date().isoformat()
+        d["period_end"]   = (local_end - timedelta(days=1)).date().isoformat()
+        d["period_label"] = str(year)
+        return jsonify(d)
+    except Exception as e:
+        logger.exception("api_usage_calendar_year failed")
         return jsonify({"error": str(e)}), 500
 
 

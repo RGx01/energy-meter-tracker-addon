@@ -4,10 +4,11 @@
 <div class="topbar">
   <div>
     <h2>Insights</h2>
-    <div class="sub">Energy and carbon analysis</div>
+    <div class="sub">Energy, carbon and cost analysis</div>
   </div>
   <div class="insights-tabs">
     <button class="insights-tab active" data-tab="carbon" onclick="showInsightTab('carbon', this)">🌿 <span class="insights-tab-label">Carbon</span></button>
+    <button class="insights-tab" data-tab="usage" onclick="showInsightTab('usage', this)">💷 <span class="insights-tab-label">Usage</span></button>
   </div>
 </div>
 {% endblock %}
@@ -544,6 +545,143 @@
     
     </div><!-- /insights-body -->
 </div><!-- /tab-carbon -->
+<!-- ── Usage tab ──────────────────────────────────────────────────────────── -->
+<div id="tab-usage" style="display:none;">
+
+  <!-- Cost & Earnings card -->
+  <div class="insight-card" id="ucard-cost">
+    <div class="insight-card-title">Cost &amp; Earnings</div>
+    <div class="insight-headline" id="u-net-headline">—</div>
+    <div class="insight-sub" id="u-net-sub">Net cost this period.</div>
+    <div class="insight-grid">
+      <div class="insight-metric">
+        <div class="insight-metric-label">Grid Import</div>
+        <span class="insight-metric-value" id="u-imp-cost">—</span>
+        <span class="insight-metric-unit" id="u-currency-imp"></span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Export Earnings</div>
+        <span class="insight-metric-value" id="u-exp-cost">—</span>
+        <span class="insight-metric-unit" id="u-currency-exp"></span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Standing Charge</div>
+        <span class="insight-metric-value" id="u-standing">—</span>
+        <span class="insight-metric-unit" id="u-currency-sc"></span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Avg Import Rate</div>
+        <span class="insight-metric-value" id="u-avg-rate">—</span>
+        <span class="insight-metric-unit">p/kWh</span>
+      </div>
+    </div>
+    <div id="u-sc-note" class="insight-footnote" style="display:none;"></div>
+  </div>
+
+  <!-- Rate Period Usage card — only shown when >1 rate tier -->
+  <div class="insight-card" id="ucard-rates" style="display:none;">
+    <div class="insight-card-title">Rate Period Usage</div>
+    <div class="insight-sub" id="u-rates-sub">How your import is distributed across tariff rate periods.</div>
+    <div id="u-rate-bars"></div>
+    <div class="insight-footnote">Rate periods are determined by the import rate recorded on each half-hour block. Percentages show share of total grid import kWh.</div>
+  </div>
+
+  <!-- Net Grid Position card -->
+  <div class="insight-card" id="ucard-grid">
+    <div class="insight-card-title">Grid Position</div>
+    <div class="insight-headline" id="u-net-grid-headline">—</div>
+    <div class="insight-sub" id="u-net-grid-sub"></div>
+    <div class="insight-grid">
+      <div class="insight-metric">
+        <div class="insight-metric-label">Grid Import</div>
+        <span class="insight-metric-value" id="u-imp-kwh">—</span>
+        <span class="insight-metric-unit">kWh</span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Export</div>
+        <span class="insight-metric-value" id="u-exp-kwh">—</span>
+        <span class="insight-metric-unit">kWh</span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Direct to House</div>
+        <span class="insight-metric-value" id="u-house-kwh">—</span>
+        <span class="insight-metric-unit">kWh</span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Net Exporter Days</div>
+        <span class="insight-metric-value" id="u-exporter-days">—</span>
+        <span class="insight-metric-unit" id="u-exporter-days-unit"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Peak Demand card -->
+  <div class="insight-card" id="ucard-peak">
+    <div class="insight-card-title">Peak Demand Window</div>
+    <div class="insight-headline" id="u-peak-headline">—</div>
+    <div class="insight-sub" id="u-peak-sub">The 2-hour window with the highest house grid import.</div>
+    <div class="insight-footnote">House import only — EV and battery charging excluded. Based on half-hour block totals converted to local time.</div>
+  </div>
+
+  <!-- Battery card — shown only if battery sub-meter configured -->
+  <div class="insight-card" id="ucard-battery" style="display:none;">
+    <div class="insight-card-title">Battery — <span id="u-bat-label"></span></div>
+    <div class="insight-sub">Grid energy used to charge the battery this period.</div>
+    <div class="insight-grid">
+      <div class="insight-metric">
+        <div class="insight-metric-label">Charged from Grid</div>
+        <span class="insight-metric-value" id="u-bat-kwh">—</span>
+        <span class="insight-metric-unit">kWh</span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Charging Cost</div>
+        <span class="insight-metric-value" id="u-bat-cost">—</span>
+        <span class="insight-metric-unit" id="u-currency-bat"></span>
+      </div>
+    </div>
+    <div id="u-bat-rates" class="insight-equiv" style="display:none;"></div>
+  </div>
+
+  <!-- EV card — shown only if EV sub-meter configured -->
+  <div class="insight-card" id="ucard-ev" style="display:none;">
+    <div class="insight-card-title">EV Charger — <span id="u-ev-label"></span></div>
+    <div class="insight-sub">Grid energy delivered to your vehicle this period.</div>
+    <div class="insight-grid">
+      <div class="insight-metric">
+        <div class="insight-metric-label">Charged from Grid</div>
+        <span class="insight-metric-value" id="u-ev-kwh">—</span>
+        <span class="insight-metric-unit">kWh</span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Charging Cost</div>
+        <span class="insight-metric-value" id="u-ev-cost">—</span>
+        <span class="insight-metric-unit" id="u-currency-ev"></span>
+      </div>
+    </div>
+    <div id="u-ev-rates" class="insight-equiv" style="display:none;"></div>
+  </div>
+
+  <!-- Heat Pump card — shown only if heat pump sub-meter configured -->
+  <div class="insight-card" id="ucard-hp" style="display:none;">
+    <div class="insight-card-title">Heat Pump — <span id="u-hp-label"></span></div>
+    <div class="insight-sub">Grid energy consumed by your heat pump this period.</div>
+    <div class="insight-grid">
+      <div class="insight-metric">
+        <div class="insight-metric-label">Electricity Used</div>
+        <span class="insight-metric-value" id="u-hp-kwh">—</span>
+        <span class="insight-metric-unit">kWh</span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Running Cost</div>
+        <span class="insight-metric-value" id="u-hp-cost">—</span>
+        <span class="insight-metric-unit" id="u-currency-hp"></span>
+      </div>
+    </div>
+    <div id="u-hp-rates" class="insight-equiv" style="display:none;"></div>
+  </div>
+
+</div><!-- /tab-usage -->
+
 
 <script>
 var _periods    = [];
@@ -555,10 +693,15 @@ var _calMonth   = new Date().getMonth() + 1;  // 1-12
 var _dataBounds = { earliest: null, latest: null };  // from /api/insights/data-bounds
 var _trendChart = null;
 
+var _activeInsightTab = 'carbon';
+
 function showInsightTab(name, btn) {
+  _activeInsightTab = name;
   document.querySelectorAll('.insights-tab').forEach(function(b) { b.classList.remove('active'); });
   btn.classList.add('active');
   document.getElementById('tab-carbon').style.display = name === 'carbon' ? 'block' : 'none';
+  document.getElementById('tab-usage').style.display  = name === 'usage'  ? 'block' : 'none';
+  loadPeriod();
 }
 
 // ── Formatting ──────────────────────────────────────────────────────────────
@@ -1373,6 +1516,7 @@ function updatePeriodNav() {
 async function loadPeriod() {
   document.getElementById('insights-body').style.display = 'none';
   document.getElementById('no-carbon').style.display     = 'none';
+  document.getElementById('tab-usage').style.display     = 'none';
   document.getElementById('insights-loading').style.display = 'block';
   document.getElementById('insights-loading').textContent = 'Loading…';
 
@@ -1382,19 +1526,24 @@ async function loadPeriod() {
 
   try {
     var url, cmpUrl;
+    var isUsage = (_activeInsightTab === 'usage');
+    var apiBase = isUsage ? '/api/usage' : '/api/insights';
+
     if (_insMode === 'month') {
-      url = apiUrl('/api/insights/calendar-month?year=' + _calYear + '&month=' + _calMonth);
-      if (compareMode === 'prev') {
-        var pm = _calMonth - 1, py = _calYear;
-        if (pm < 1) { pm = 12; py--; }
-        cmpUrl = apiUrl('/api/insights/calendar-month?year=' + py + '&month=' + pm);
-      } else if (compareMode === 'year') {
-        cmpUrl = apiUrl('/api/insights/calendar-month?year=' + (_calYear - 1) + '&month=' + _calMonth);
+      url = apiUrl(apiBase + '/calendar-month?year=' + _calYear + '&month=' + _calMonth);
+      if (!isUsage) {
+        if (compareMode === 'prev') {
+          var pm = _calMonth - 1, py = _calYear;
+          if (pm < 1) { pm = 12; py--; }
+          cmpUrl = apiUrl(apiBase + '/calendar-month?year=' + py + '&month=' + pm);
+        } else if (compareMode === 'year') {
+          cmpUrl = apiUrl(apiBase + '/calendar-month?year=' + (_calYear - 1) + '&month=' + _calMonth);
+        }
       }
     } else {
-      url    = apiUrl('/api/insights/calendar-year?year=' + _calYear);
-      if (compareMode === 'lastyear') {
-        cmpUrl = apiUrl('/api/insights/calendar-year?year=' + (_calYear - 1));
+      url = apiUrl(apiBase + '/calendar-year?year=' + _calYear);
+      if (!isUsage && compareMode === 'lastyear') {
+        cmpUrl = apiUrl(apiBase + '/calendar-year?year=' + (_calYear - 1));
       }
     }
 
@@ -1403,14 +1552,18 @@ async function loadPeriod() {
     if (d.error) throw new Error(d.error);
 
     var cmpData = null;
-    if (cmpUrl) {
+    if (cmpUrl && !isUsage) {
       var cr = await fetch(cmpUrl);
       cmpData = await cr.json();
       if (cmpData.error) cmpData = null;
     }
 
     document.getElementById('insights-loading').style.display = 'none';
-    renderInsights(d, cmpData);
+    if (isUsage) {
+      renderUsage(d);
+    } else {
+      renderInsights(d, cmpData);
+    }
   } catch(e) {
     document.getElementById('insights-loading').textContent = 'Failed to load insights: ' + e.message;
   }
@@ -1491,6 +1644,156 @@ async function initInsights() {
   } catch(e) {
     document.getElementById('insights-loading').textContent = 'Failed to load: ' + e.message;
   }
+}
+
+
+// ── Usage Insights Renderer ──────────────────────────────────────────────────
+function fmtCost(v, decimals) {
+  if (v == null) return '—';
+  return Math.abs(v).toFixed(decimals != null ? decimals : 2);
+}
+function fmtRate(v) {
+  if (v == null) return '—';
+  return (v * 100).toFixed(2);  // convert £/kWh to p/kWh
+}
+function fmtHour(h) {
+  var pad = function(n) { return n < 10 ? '0' + n : '' + n; };
+  return pad(h) + ':00–' + pad((h + 2) % 24) + ':00';
+}
+
+function renderUsageTierBars(tiers, totalKwh, containerId, currency) {
+  var el = document.getElementById(containerId);
+  if (!el || !tiers || !tiers.length) return;
+  var html = '';
+  tiers.forEach(function(t) {
+    var pct = totalKwh > 0 ? Math.round(t.kwh / totalKwh * 100) : 0;
+    var rateP = (t.rate * 100).toFixed(2);
+    html += '<div style="margin-bottom:10px;">' +
+      '<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;">' +
+        '<span style="color:var(--text);font-family:var(--mono);">' + rateP + 'p/kWh</span>' +
+        '<span style="color:var(--muted);">' + t.kwh.toFixed(1) + ' kWh &nbsp;·&nbsp; ' +
+          (currency || '£') + t.cost.toFixed(2) + ' &nbsp;·&nbsp; ' + pct + '%</span>' +
+      '</div>' +
+      '<div style="height:6px;background:var(--bg);border-radius:3px;overflow:hidden;">' +
+        '<div style="height:100%;width:' + pct + '%;background:var(--accent);border-radius:3px;transition:width 0.4s;"></div>' +
+      '</div>' +
+    '</div>';
+  });
+  el.innerHTML = html;
+}
+
+function renderSubDeviceRates(tiers, totalKwh, containerId, currency) {
+  var el = document.getElementById(containerId);
+  if (!el || !tiers || !tiers.length) { if(el) el.style.display='none'; return; }
+  var lines = tiers.map(function(t) {
+    var pct = totalKwh > 0 ? Math.round(t.kwh / totalKwh * 100) : 0;
+    return (t.rate * 100).toFixed(2) + 'p/kWh: ' + t.kwh.toFixed(1) + ' kWh (' + pct + '%)';
+  });
+  el.textContent = 'Rate breakdown: ' + lines.join(' · ');
+  el.style.display = '';
+}
+
+function renderUsage(d) {
+  document.getElementById('tab-usage').style.display = 'block';
+  // Hide all device cards first
+  ['ucard-battery','ucard-ev','ucard-hp'].forEach(function(id) {
+    document.getElementById(id).style.display = 'none';
+  });
+
+  var currency = '£';  // default — could be passed from config if needed
+
+  // ── Cost & Earnings ───────────────────────────────────────────────────────
+  var netPositive = d.net_cost >= 0;
+  var netAbs = Math.abs(d.net_cost);
+  document.getElementById('u-net-headline').textContent =
+    (netPositive ? '' : '−') + currency + netAbs.toFixed(2);
+  document.getElementById('u-net-headline').style.color =
+    netPositive ? 'var(--text)' : 'var(--success)';
+  document.getElementById('u-net-sub').textContent =
+    (netPositive
+      ? 'Net cost this period — import + standing charge minus export earnings.'
+      : 'Net earnings this period — you exported more than you spent on import.');
+
+  ['u-currency-imp','u-currency-exp','u-currency-sc'].forEach(function(id) {
+    document.getElementById(id).textContent = currency;
+  });
+  document.getElementById('u-imp-cost').textContent = fmtCost(d.imp_cost);
+  document.getElementById('u-exp-cost').textContent = fmtCost(d.exp_cost);
+  document.getElementById('u-standing').textContent = fmtCost(d.standing_charge);
+  document.getElementById('u-avg-rate').textContent = fmtRate(d.weighted_rate);
+
+  if (d.total_days > 0 && d.standing_charge > 0) {
+    var scNote = document.getElementById('u-sc-note');
+    scNote.textContent = 'Standing charge: ' + currency +
+      (d.standing_charge / d.total_days).toFixed(4) + '/day × ' + d.total_days + ' days.';
+    scNote.style.display = '';
+  }
+
+  // ── Rate Period Usage ────────────────────────────────────────────────────
+  var rateTiers = d.rate_tiers || [];
+  if (rateTiers.length > 1) {
+    document.getElementById('ucard-rates').style.display = 'block';
+    renderUsageTierBars(rateTiers, d.imp_kwh, 'u-rate-bars', currency);
+  } else {
+    document.getElementById('ucard-rates').style.display = 'none';
+  }
+
+  // ── Grid Position ─────────────────────────────────────────────────────────
+  var netKwh = d.net_grid_kwh;
+  var netExp = netKwh < 0;
+  document.getElementById('u-net-grid-headline').textContent =
+    (netExp ? '−' : '+') + Math.abs(netKwh).toFixed(1) + ' kWh';
+  document.getElementById('u-net-grid-headline').style.color =
+    netExp ? 'var(--success)' : 'var(--text)';
+  document.getElementById('u-net-grid-sub').textContent =
+    netExp
+      ? 'Net exporter this period — you exported more than you imported from the grid.'
+      : 'Net importer this period — grid import exceeded export.';
+  document.getElementById('u-imp-kwh').textContent   = (d.imp_kwh || 0).toFixed(1);
+  document.getElementById('u-exp-kwh').textContent   = (d.exp_kwh || 0).toFixed(1);
+  document.getElementById('u-house-kwh').textContent = (d.house_imp_kwh || 0).toFixed(1);
+  var expDays = d.net_exporter_days || 0;
+  document.getElementById('u-exporter-days').textContent      = expDays;
+  document.getElementById('u-exporter-days-unit').textContent = expDays === 1 ? 'day' : 'days';
+
+  // ── Peak Demand Window ────────────────────────────────────────────────────
+  if (d.peak_window_start != null) {
+    document.getElementById('u-peak-headline').textContent = fmtHour(d.peak_window_start);
+    document.getElementById('u-peak-sub').textContent =
+      'Highest house grid draw: ' + (d.peak_window_kwh || 0).toFixed(1) +
+      ' kWh in the ' + fmtHour(d.peak_window_start) + ' window.';
+  }
+
+  // ── Sub-meter device cards ────────────────────────────────────────────────
+  var subs = d.sub_meters || {};
+  Object.keys(subs).forEach(function(mid) {
+    var sm = subs[mid];
+    var type = (sm.meter_type || '').toLowerCase();
+    var label = sm.label || mid;
+
+    if (type === 'battery' || type === 'inverter') {
+      document.getElementById('ucard-battery').style.display = 'block';
+      document.getElementById('u-bat-label').textContent     = label;
+      document.getElementById('u-bat-kwh').textContent       = (sm.imp_kwh || 0).toFixed(1);
+      document.getElementById('u-bat-cost').textContent      = fmtCost(sm.imp_cost);
+      document.getElementById('u-currency-bat').textContent  = currency;
+      renderSubDeviceRates(sm.rate_tiers, sm.imp_kwh, 'u-bat-rates', currency);
+    } else if (type === 'ev' || type === 'ev_charger') {
+      document.getElementById('ucard-ev').style.display      = 'block';
+      document.getElementById('u-ev-label').textContent      = label;
+      document.getElementById('u-ev-kwh').textContent        = (sm.imp_kwh || 0).toFixed(1);
+      document.getElementById('u-ev-cost').textContent       = fmtCost(sm.imp_cost);
+      document.getElementById('u-currency-ev').textContent   = currency;
+      renderSubDeviceRates(sm.rate_tiers, sm.imp_kwh, 'u-ev-rates', currency);
+    } else if (type === 'heat_pump') {
+      document.getElementById('ucard-hp').style.display      = 'block';
+      document.getElementById('u-hp-label').textContent      = label;
+      document.getElementById('u-hp-kwh').textContent        = (sm.imp_kwh || 0).toFixed(1);
+      document.getElementById('u-hp-cost').textContent       = fmtCost(sm.imp_cost);
+      document.getElementById('u-currency-hp').textContent   = currency;
+      renderSubDeviceRates(sm.rate_tiers, sm.imp_kwh, 'u-hp-rates', currency);
+    }
+  });
 }
 
 initInsights();
