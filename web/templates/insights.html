@@ -430,12 +430,17 @@
           <div class="insight-metric-unit">kgCO₂</div>
         </div>
         <div class="insight-metric">
-          <div class="insight-metric-label">Energy charged</div>
+          <div class="insight-metric-label">AC from grid</div>
           <div class="insight-metric-value" id="bat-kwh"></div>
           <div class="insight-metric-unit">kWh</div>
         </div>
         <div class="insight-metric">
-          <div class="insight-metric-label">Avg charge intensity</div>
+          <div class="insight-metric-label">Usable DC stored</div>
+          <div class="insight-metric-value" id="bat-dc-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Avg intensity</div>
           <div class="insight-metric-value" id="bat-intensity"></div>
           <div class="insight-metric-unit">gCO₂/kWh</div>
         </div>
@@ -444,16 +449,6 @@
           <div class="insight-metric-value" id="bat-vs-grid"></div>
           <div class="insight-metric-unit">gCO₂/kWh</div>
         </div>
-        <div class="insight-metric">
-          <div class="insight-metric-label">Effective intensity</div>
-          <div class="insight-metric-value" id="bat-effective-int"></div>
-          <div class="insight-metric-unit">gCO₂/kWh usable</div>
-        </div>
-        <div class="insight-metric">
-          <div class="insight-metric-label">Lost to inefficiency</div>
-          <div class="insight-metric-value" id="bat-carbon-lost"></div>
-          <div class="insight-metric-unit">kgCO₂</div>
-        </div>
       </div>
       <div class="insight-equiv" id="bat-equiv"></div>
       <div class="insight-footnote">
@@ -461,10 +456,6 @@
         sub-meter records direct grid consumption only — solar contribution to charging is not captured
         here (it appears as reduced main meter import instead). The key question is whether
         grid charging was timed to cleaner periods.<br>
-        <strong>Effective intensity</strong> adjusts the charge intensity for round-trip losses
-        (charge intensity ÷ round-trip efficiency) — this is the true carbon cost per usable kWh
-        delivered by the battery. <strong>Lost to inefficiency</strong> is the carbon attributable
-        to heat losses during the charge/discharge cycle (total carbon × loss fraction).<br>
         Battery discharge carbon (to house or export) cannot be separated without
         generation-side metering.
         <a href="{{ url_for('settings_page') }}?tab=carbon">Edit assumptions →</a>
@@ -535,14 +526,9 @@
           <div class="insight-metric-unit">gCO₂/kWh</div>
         </div>
         <div class="insight-metric">
-          <div class="insight-metric-label">Effective intensity</div>
-          <div class="insight-metric-value" id="ev-effective-int"></div>
-          <div class="insight-metric-unit">gCO₂/kWh usable DC</div>
-        </div>
-        <div class="insight-metric">
-          <div class="insight-metric-label">Lost to charging loss</div>
-          <div class="insight-metric-value" id="ev-carbon-lost"></div>
-          <div class="insight-metric-unit">kgCO₂</div>
+          <div class="insight-metric-label">vs grid average</div>
+          <div class="insight-metric-value" id="ev-vs-grid"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
         </div>
       </div>
       <div class="insight-equiv" id="ev-equiv"></div>
@@ -550,11 +536,7 @@
         EV carbon based on sub-meter AC import × grid intensity at time of charging.
         Mileage: AC import × charge efficiency (AC→DC loss) × EV efficiency (miles/kWh battery).
         Efficiency figure should be from your trip computer or manufacturer spec — not derived
-        from wall/smart meter energy, which would double-count the charging loss.<br>
-        <strong>Effective intensity</strong> adjusts the charge intensity for AC→DC charging losses
-        (charge intensity ÷ charge efficiency) — the true carbon cost per usable kWh stored in the battery.
-        <strong>Lost to charging loss</strong> is the carbon attributable to heat losses during charging
-        (total carbon × loss fraction).
+        from wall/smart meter energy, which would double-count the charging loss.
         <a href="{{ url_for('settings_page') }}?tab=carbon">Edit assumptions →</a>
       </div>
     </div>
@@ -597,7 +579,7 @@ function periodLabel(p) {
 }
 
 // ── Equivalences ────────────────────────────────────────────────────────────
-function equivLines(carbon_g, a) {
+function equivLines(carbon_g, a, period_start, period_end, data_start) {
   if (!carbon_g || carbon_g <= 0) return '';
   var kg  = carbon_g / 1000;
   var isKm = (a.distance_unit === 'km');
@@ -607,11 +589,53 @@ function equivLines(carbon_g, a) {
     ? (a.co2_car_petrol_g_per_mile || 180) / 1.60934
     : (a.co2_car_petrol_g_per_mile || 180);
   var car_dist   = Math.round(kg * 1000 / petrol_g_per_dist);
-  var tree_days  = Math.round(kg / ((a.co2_tree_kg_per_year || 21) / 365));
+  var tree_kg_yr = a.co2_tree_kg_per_year || 21;
+  var tree_days  = Math.round(kg / (tree_kg_yr / 365));
   var flight_pct = (kg / (a.co2_flight_lhr_nyc_kg || 670) * 100).toFixed(1);
+
+  // Multi-tree calculation based on actual data span
+  var treeStr = '';
+  if (tree_days > 0 && period_start && period_end) {
+    // Use actual data start if available (avoids counting empty period before first block)
+    var effective_start = data_start
+      ? new Date(data_start + 'T12:00:00Z')
+      : new Date(period_start + 'T12:00:00Z');
+    var pe = new Date(period_end + 'T12:00:00Z');
+    // Cap period end at today for partial periods
+    var today = new Date();
+    today.setUTCHours(12, 0, 0, 0);
+    var effective_end = pe < today ? pe : today;
+    var days_in_period = Math.max(1, Math.round((effective_end - effective_start) / 86400000));
+    var period_years   = days_in_period / 365;
+    var trees_needed   = Math.ceil(kg / (tree_kg_yr * period_years));
+    var months_in_period = days_in_period / 30.44;
+    var timeframe;
+    if (_insMode === 'month') {
+      // In month mode, use actual days if less than ~3 weeks
+      if (days_in_period < 21) {
+        timeframe = days_in_period + ' days';
+      } else {
+        timeframe = '1 month';
+      }
+    } else if (Math.round(months_in_period) <= 1) {
+      timeframe = days_in_period + ' days';
+    } else if (Math.round(months_in_period) >= 11) {
+      timeframe = '1 year';
+    } else {
+      timeframe = Math.round(months_in_period) + ' months';
+    }
+    if (trees_needed === 1) {
+      treeStr = '🌳 1 tree clears this in ' + timeframe + ' · would take <strong>' + tree_days + ' days</strong> alone';
+    } else {
+      treeStr = '🌳 <strong>' + trees_needed + ' trees</strong> clear this in ' + timeframe + ' · a single tree takes <strong>' + tree_days + ' days</strong>';
+    }
+  } else if (tree_days > 0) {
+    treeStr = '🌳 A tree would absorb this in <strong>' + tree_days + ' days</strong>';
+  }
+
   var lines = [];
   if (car_dist > 0)   lines.push('🚗 Equivalent to <strong>' + car_dist.toLocaleString() + ' ' + distLabel + '</strong> in a petrol car');
-  if (tree_days > 0)  lines.push('🌳 A tree would absorb this in <strong>' + tree_days + ' days</strong>');
+  if (treeStr)        lines.push(treeStr);
   if (flight_pct > 0) lines.push('✈️ <strong>' + flight_pct + '%</strong> of a return flight LHR→NYC per passenger');
   return lines.join(' &nbsp;·&nbsp; ');
 }
@@ -676,7 +700,7 @@ function renderInsights(d, _cmp) {
   } else {
     document.getElementById('sum-ci-exp-wrap').style.display = 'none';
   }
-  document.getElementById('sum-equiv').innerHTML = equivLines(Math.max(0, d.carbon_g_net), a);
+  document.getElementById('sum-equiv').innerHTML = equivLines(Math.max(0, d.carbon_g_net), a, d.period_start, d.period_end, d.data_start);
 
   if (d.carbon_coverage_pct < 95) {
     document.getElementById('sum-coverage').textContent =
@@ -689,10 +713,7 @@ function renderInsights(d, _cmp) {
   if (d.exp_kwh > 0.1 && d.carbon_g_exp > 0) {
     document.getElementById('card-solar').style.display = 'block';
     var off_kg = d.carbon_g_exp / 1000;
-    document.getElementById('sol-headline').textContent =
-      d.avg_export_intensity != null
-        ? Math.round(d.avg_export_intensity) + ' gCO₂/kWh avg export intensity'
-        : off_kg.toFixed(2) + ' kgCO₂ offset';
+    document.getElementById('sol-headline').textContent = off_kg.toFixed(2) + ' kgCO₂ offset';
     document.getElementById('sol-sub').textContent = 'Your solar export displaced this much carbon from the grid.';
     document.getElementById('sol-offset').textContent = off_kg.toFixed(2);
     document.getElementById('sol-kwh').textContent    = fmtKwh(d.ci_exp_kwh > 0 ? d.ci_exp_kwh : d.exp_kwh);
@@ -730,7 +751,7 @@ function renderInsights(d, _cmp) {
         }
       }
     }
-    document.getElementById('sol-equiv').innerHTML    = equivLines(d.carbon_g_exp, a);
+    document.getElementById('sol-equiv').innerHTML    = equivLines(d.carbon_g_exp, a, d.period_start, d.period_end, d.data_start);
   }
 
   // Direct import
@@ -743,9 +764,7 @@ function renderInsights(d, _cmp) {
       : (d.imp_kwh > 0 ? Math.round(d.house_imp_kwh / d.imp_kwh * 100) : null);
     document.getElementById('card-house').style.display = 'block';
     document.getElementById('house-headline').textContent =
-      d.house_avg_intensity != null
-        ? Math.round(d.house_avg_intensity) + ' gCO₂/kWh avg intensity'
-        : fmtKwh(house_kwh_display) + ' kWh';
+      house_kg != null ? house_kg.toFixed(2) + ' kgCO₂' : fmtKwh(house_kwh_display) + ' kWh';
     document.getElementById('house-sub').textContent =
       'Grid import attributable to house loads (excluding EV and battery charging)' +
       (d.house_ci_imp_kwh > 0 && d.house_ci_imp_kwh < d.house_imp_kwh
@@ -777,7 +796,7 @@ function renderInsights(d, _cmp) {
       document.getElementById('house-carbon-wrap').style.display = 'none';
     }
     document.getElementById('house-equiv').innerHTML =
-      house_kg != null ? equivLines(d.house_carbon_g, a) : '';
+      house_kg != null ? equivLines(d.house_carbon_g, a, d.period_start, d.period_end, d.data_start) : '';
   }
 
   // Battery
@@ -791,26 +810,19 @@ function renderInsights(d, _cmp) {
     var grid_avg = d.grid_avg_intensity;
 
     document.getElementById('card-battery').style.display = 'block';
-    document.getElementById('bat-headline').textContent   =
-      bat_int != null
-        ? Math.round(bat_int) + ' gCO₂/kWh avg charge intensity'
-        : fmtKwh(bat.imp_kwh) + ' kWh charged';
+    document.getElementById('bat-headline').textContent = bat_kg.toFixed(2) + ' kgCO₂';
     document.getElementById('bat-sub').textContent =
       'How cleanly your battery charged from the grid this period.';
     var ci_kwh_bat = bat.ci_imp_kwh || 0;
+    var bat_ac_kwh = ci_kwh_bat > 0 ? ci_kwh_bat : bat.imp_kwh;
+    var bat_dc_kwh = bat_ac_kwh * (a.battery_roundtrip_efficiency || 0.85);
     document.getElementById('bat-carbon').textContent   = bat_kg.toFixed(2);
-    document.getElementById('bat-kwh').textContent      = ci_kwh_bat > 0 ? fmtKwh(ci_kwh_bat) : fmtKwh(bat.imp_kwh);
+    document.getElementById('bat-kwh').textContent      = fmtKwh(bat_ac_kwh);
+    document.getElementById('bat-dc-kwh').textContent   = fmtKwh(bat_dc_kwh);
     document.getElementById('bat-intensity').textContent = bat_int != null ? Math.round(bat_int) : '—';
     document.getElementById('bat-vs-grid').textContent  = grid_avg != null ? Math.round(grid_avg) : '—';
 
     var rte = a.battery_roundtrip_efficiency || 0.85;
-    if (bat_int != null) {
-      document.getElementById('bat-effective-int').textContent = Math.round(bat_int / rte);
-    } else {
-      document.getElementById('bat-effective-int').textContent = '—';
-    }
-    var carbon_lost = bat_kg > 0 ? (bat_kg * (1 - rte)) : 0;
-    document.getElementById('bat-carbon-lost').textContent = carbon_lost > 0 ? carbon_lost.toFixed(2) : '—';
 
     var batLines = [];
     if (bat_int != null && grid_avg != null) {
@@ -840,7 +852,7 @@ function renderInsights(d, _cmp) {
     batLines.push('<em>Note: export may include battery discharge — we cannot split solar vs battery ' +
       'export without additional metering.</em>');
     if (bat.carbon_g > 0) {
-      var batEquivStr = equivLines(bat.carbon_g, a);
+      var batEquivStr = equivLines(bat.carbon_g, a, d.period_start, d.period_end, bat.data_start || d.data_start);
       if (batEquivStr) batLines.push(batEquivStr);
     }
     document.getElementById('bat-equiv').innerHTML = batLines.join('<br>');
@@ -871,10 +883,7 @@ function renderInsights(d, _cmp) {
     var cleaner_pct = gas_kg > 0 ? Math.round(saving_kg / gas_kg * 100) : null;
 
     document.getElementById('card-hp').style.display   = 'block';
-    document.getElementById('hp-headline').textContent  =
-      hp.avg_charge_intensity != null
-        ? Math.round(hp.avg_charge_intensity) + ' gCO₂/kWh avg intensity'
-        : hp_kg.toFixed(2) + ' kgCO₂';
+    document.getElementById('hp-headline').textContent = hp_kg.toFixed(2) + ' kgCO₂';
     document.getElementById('hp-sub').textContent       = 'Carbon from heat pump electricity use this period.';
     var ci_kwh_hp = hp.ci_imp_kwh || 0;
     document.getElementById('hp-carbon').textContent    = hp_kg.toFixed(2);
@@ -899,7 +908,7 @@ function renderInsights(d, _cmp) {
         'full grid draw — actual carbon may be lower if solar or battery contributed.</em>');
     }
     if (hp.carbon_g > 0) {
-      var hpEquivStr = equivLines(hp.carbon_g, a);
+      var hpEquivStr = equivLines(hp.carbon_g, a, d.period_start, d.period_end, hp.data_start || d.data_start);
       if (hpEquivStr) hpLines.push(hpEquivStr);
     }
     document.getElementById('hp-equiv').innerHTML = hpLines.join('<br>');
@@ -915,10 +924,7 @@ function renderInsights(d, _cmp) {
     var ev_ci_kwh = ev.ci_imp_kwh || 0;
     var ev_int = ev_ci_kwh > 0 ? Math.round(ev.carbon_g / ev_ci_kwh) : null;
     document.getElementById('card-ev').style.display = 'block';
-    document.getElementById('ev-headline').textContent =
-      ev.avg_charge_intensity != null
-        ? Math.round(ev.avg_charge_intensity) + ' gCO₂/kWh avg charge intensity'
-        : ev_kg.toFixed(2) + ' kgCO₂';
+    document.getElementById('ev-headline').textContent = ev_kg.toFixed(2) + ' kgCO₂';
     document.getElementById('ev-sub').textContent = 'Carbon attributable to EV charging this period.';
     var ci_kwh_ev  = ev.ci_imp_kwh || 0;
     var charge_eff_display = a.ev_charge_efficiency || 0.88;
@@ -929,15 +935,9 @@ function renderInsights(d, _cmp) {
     document.getElementById('ev-kwh').textContent       = ci_kwh_ev > 0 ? fmtKwh(ci_kwh_ev) : fmtKwh(ev.imp_kwh);
     document.getElementById('ev-dc-kwh').textContent    = fmtKwh(dc_kwh);
     document.getElementById('ev-intensity').textContent = ev_int != null ? Math.round(ev_int) : '—';
+    document.getElementById('ev-vs-grid').textContent   = d.grid_avg_intensity != null ? Math.round(d.grid_avg_intensity) : '—';
 
     var charge_eff = a.ev_charge_efficiency || 0.88;
-    if (ev_int != null) {
-      document.getElementById('ev-effective-int').textContent = Math.round(ev_int / charge_eff);
-    } else {
-      document.getElementById('ev-effective-int').textContent = '—';
-    }
-    var ev_carbon_lost = ev_kg > 0 ? (ev_kg * (1 - charge_eff)) : 0;
-    document.getElementById('ev-carbon-lost').textContent = ev_carbon_lost > 0 ? ev_carbon_lost.toFixed(2) : '—';
     var evEquiv = document.getElementById('ev-equiv');
     var evLines = [];
     // EV vs grid average intensity
@@ -991,7 +991,7 @@ function renderInsights(d, _cmp) {
         'full grid draw — actual carbon may be lower if solar or battery contributed.</em>');
     }
     if (ev.carbon_g > 0) {
-      var evEquivStr = equivLines(ev.carbon_g, a);
+      var evEquivStr = equivLines(ev.carbon_g, a, d.period_start, d.period_end, ev.data_start || d.data_start);
       if (evEquivStr) evLines.push(evEquivStr);
     }
     evEquiv.innerHTML = evLines.join('<br>');

@@ -1447,7 +1447,7 @@ function barBuildTable() {
   }
 
   // Build HTML — add Total column header
-  var html = '<thead><tr><th style="cursor:pointer;user-select:none;" onclick="barToggleSort()" title="Click to change sort order">Period</th>';
+  var html = '<thead><tr><th style="cursor:pointer;user-select:none;" onclick="barToggleSort()" title="Click to change sort order">Period <span id="bar-sort-arrow">' + (barSortDesc ? '↓' : '↑') + '</span></th>';
   cols.forEach(function(c){
     var dotHtml = c.color ? '<span class="bar-legend-dot" style="background:' + c.color + ';margin-right:5px;"></span>' : '';
     html += '<th>' + dotHtml + c.label + '</th>';
@@ -1531,6 +1531,8 @@ function barToggleSort() {
   localStorage.setItem('emt_bar_sort_desc', barSortDesc ? 'true' : 'false');
   var btn = document.getElementById('bar-sort-btn');
   if (btn) btn.textContent = barSortDesc ? '↓ Latest first' : '↑ Oldest first';
+  var arrow = document.getElementById('bar-sort-arrow');
+  if (arrow) arrow.textContent = barSortDesc ? '↓' : '↑';
   barBuildTable();
 }
 

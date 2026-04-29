@@ -58,7 +58,8 @@ def inject_globals():
                 break
     except Exception:
         pass
-    return {"app_version": APP_VERSION, "has_power_sensor": has_power_sensor, "has_postcode": has_postcode}
+    return {"app_version": APP_VERSION, "has_power_sensor": has_power_sensor, "has_postcode": has_postcode,
+            "server_port": int(os.environ.get("EMT_PORT") or "8099")}
 
 
 class IngressMiddleware:
@@ -2709,9 +2710,26 @@ def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
 
     coverage_pct = round(ci_blocks / total_blocks * 100, 1) if total_blocks else 0
 
+    # Actual first block date within range — main meter and per sub-meter
+    first_block_row = store._conn.execute(
+        "SELECT MIN(block_start) as first_block FROM blocks "
+        "WHERE meter_id = 'electricity_main' AND block_start >= ? AND block_start < ?",
+        (utc_start, utc_end)
+    ).fetchone()
+    data_start = first_block_row["first_block"][:10] if first_block_row and first_block_row["first_block"] else None
+
+    for mid in sub_totals:
+        row = store._conn.execute(
+            "SELECT MIN(block_start) as first_block FROM blocks "
+            "WHERE meter_id = ? AND block_start >= ? AND block_start < ?",
+            (mid, utc_start, utc_end)
+        ).fetchone()
+        sub_totals[mid]["data_start"] = row["first_block"][:10] if row and row["first_block"] else data_start
+
     return {
         "has_carbon":           has_carbon,
         "carbon_coverage_pct":  coverage_pct,
+        "data_start":           data_start,
         "imp_kwh":              round(main_imp_kwh, 3),
         "exp_kwh":              round(main_exp_kwh, 3),
         "ci_imp_kwh":           round(main_ci_imp_kwh, 3),
