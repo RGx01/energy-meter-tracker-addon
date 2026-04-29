@@ -888,12 +888,9 @@ def generate_charts(store: "BlockStore"):
     block_minutes   = int(main_meta.get("block_minutes") or 30)
     currency_symbol = main_meta.get("currency_symbol", "£")
 
-    # Both charts need all blocks for now — phase 2 of optimisation will
-    # push date-range queries into the charting functions themselves.
-    # This is still a significant win: the store is queried once and both
-    # charts share the same list, vs the old approach of loading the full
-    # JSON file twice (once per chart call site).
-    blocks = store.get_all_blocks()
+    # Use lightweight block fetch — significantly faster than get_all_blocks()
+    # for large datasets as it skips full _rows_to_blocks reconstruction.
+    blocks = store.get_blocks_lightweight()
 
     try:
         html = energy_charts.generate_net_heatmap(blocks, timezone_name=timezone_name, block_minutes=block_minutes, currency=currency_symbol)

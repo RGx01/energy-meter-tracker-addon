@@ -62,8 +62,22 @@ sys.modules["ha_client"] = hc
 
 # Stub block_store — use real in-memory BlockStore pre-loaded with MINIMAL_BLOCKS
 # (defined after MINIMAL_BLOCKS below, wired in via make_client)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from block_store import BlockStore, open_block_store
+# Remove any cached stub from previous test runs before importing the real module
+if "block_store" in sys.modules:
+    del sys.modules["block_store"]
+import importlib.util as _ilu
+_bs_spec = _ilu.spec_from_file_location(
+    "block_store_real",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "block_store.py")
+)
+_bs_real = _ilu.module_from_spec(_bs_spec)
+_bs_spec.loader.exec_module(_bs_real)
+BlockStore       = _bs_real.BlockStore
+open_block_store = _bs_real.open_block_store
+_ldtub  = _bs_real.local_date_to_utc_bounds
+_ldrtub = _bs_real.local_date_range_to_utc_bounds
 
 def _make_test_store(blocks=None):
     """Create an in-memory BlockStore pre-loaded with given blocks."""
@@ -82,6 +96,8 @@ def _make_test_store(blocks=None):
 bs_mod = types.ModuleType("block_store")
 bs_mod.BlockStore       = BlockStore
 bs_mod.open_block_store = lambda path: _make_test_store()
+bs_mod.local_date_to_utc_bounds        = _ldtub
+bs_mod.local_date_range_to_utc_bounds  = _ldrtub
 sys.modules["block_store"] = bs_mod
 
 # Stub engine (pause/resume only)
@@ -456,22 +472,18 @@ class TestApiBlocksSummaryCarbonG(unittest.TestCase):
         from zoneinfo import ZoneInfo
         bs = "2026-04-14T10:00:00"
         be = "2026-04-14T10:30:00"
-        ld = (datetime.fromisoformat(bs)
-              .replace(tzinfo=ZoneInfo("UTC"))
-              .astimezone(ZoneInfo("Europe/London"))
-              .date().isoformat())
         store._conn.execute("""
             INSERT INTO blocks (
-                block_start, block_end, local_date, local_year, local_month, local_day,
+                block_start, block_end,
                 meter_id, config_period_id, interpolated,
                 imp_kwh, imp_kwh_grid, imp_kwh_remainder,
                 imp_rate, imp_cost, imp_cost_remainder,
                 imp_read_start, imp_read_end,
                 exp_kwh, exp_rate, exp_cost,
                 exp_read_start, exp_read_end, standing_charge, carbon_g)
-            VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,NULL,NULL,NULL,?,NULL,?,NULL,NULL,?,?)
-        """, (bs, be, ld, int(ld[:4]), int(ld[5:7]), int(ld[8:10]),
-              "electricity_main", cp_id, 0,
+            VALUES (?,?,?,?,0,?,NULL,NULL,?,NULL,NULL,NULL,NULL,?,NULL,?,NULL,NULL,?,?)
+        """, (bs, be,
+              "electricity_main", cp_id,
               imp_kwh, 0.49, exp_kwh, 0.0, 0.5, carbon_g))
         store._conn.commit()
         return store, cfg
@@ -1282,25 +1294,24 @@ class TestApiCorrectionsEnhanced(unittest.TestCase):
         blocks = [
             # 20/3 — three blocks for main meter (UTC = local in March)
             ("2026-03-20T14:00:00", "2026-03-20T14:30:00", "electricity_main",
-             "2026-03-20", 0.5, 0.245, 0.1225, 0.1, 0.04, 0.004, 0.6),
+             0.5, 0.245, 0.1225, 0.1, 0.04, 0.004, 0.6),
             ("2026-03-20T15:00:00", "2026-03-20T15:30:00", "electricity_main",
-             "2026-03-20", 0.6, 0.285, 0.1710, 0.0, 0.04, 0.0000, 0.6),
+             0.6, 0.285, 0.1710, 0.0, 0.04, 0.0000, 0.6),
             ("2026-03-20T15:30:00", "2026-03-20T16:00:00", "electricity_main",
-             "2026-03-20", 0.4, 0.285, 0.1140, 0.0, 0.04, 0.0000, 0.6),
+             0.4, 0.285, 0.1140, 0.0, 0.04, 0.0000, 0.6),
             # 20/3 — ev_charger sub-meter
             ("2026-03-20T15:00:00", "2026-03-20T15:30:00", "ev_charger",
-             "2026-03-20", 0.3, 0.285, 0.0855, 0.0, 0.04, 0.0000, 0.0),
+             0.3, 0.285, 0.0855, 0.0, 0.04, 0.0000, 0.0),
             # 21/3
             ("2026-03-21T10:00:00", "2026-03-21T10:30:00", "electricity_main",
-             "2026-03-21", 0.7, 0.245, 0.1715, 0.0, 0.04, 0.0000, 0.6),
+             0.7, 0.245, 0.1715, 0.0, 0.04, 0.0000, 0.6),
         ]
-        for (bs, be, mid, ld, ikwh, irate, icost, ekwh, erate, ecost, sc) in blocks:
+        for (bs, be, mid, ikwh, irate, icost, ekwh, erate, ecost, sc) in blocks:
             store._conn.execute("""
-                INSERT INTO blocks (block_start, block_end, meter_id, config_period_id,
-                  local_date, local_year, local_month, local_day, interpolated,
+                INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, interpolated,
                   imp_kwh, imp_rate, imp_cost, exp_kwh, exp_rate, exp_cost, standing_charge)
-                VALUES (?,?,?,?,?,2026,3,20,0, ?,?,?,?,?,?,?)
-            """, (bs, be, mid, cp_id, ld, ikwh, irate, icost, ekwh, erate, ecost, sc))
+                VALUES (?,?,?,?,0, ?,?,?,?,?,?,?)
+            """, (bs, be, mid, cp_id, ikwh, irate, icost, ekwh, erate, ecost, sc))
         store._conn.commit()
         # insert_config_period already inserts electricity_main via _write_meters.
         # Add ev_charger as a sub-meter so the standing charge correction subquery
@@ -1436,7 +1447,8 @@ class TestApiCorrectionsEnhanced(unittest.TestCase):
         # Only main meter rows are updated — sub-meter standing_charge stays 0
         rows = store._conn.execute(
             """SELECT standing_charge FROM blocks
-               WHERE local_date='2026-03-20' AND meter_id='electricity_main'"""
+               WHERE block_start >= '2026-03-20T00:00:00' AND block_start < '2026-03-21T00:00:00'
+               AND meter_id='electricity_main'"""
         ).fetchall()
         self.assertGreater(len(rows), 0)
         for row in rows:
@@ -1459,20 +1471,19 @@ class TestApiCorrectionsEnhanced(unittest.TestCase):
         # block_start UTC '2026-07-14T23:30:00', local_date '2026-07-15'
         blocks = [
             # Night rate blocks (local 00:30–06:30 BST = 23:30–05:30 UTC)
-            ("2026-07-14T23:30:00", "2026-07-14T23:30:00", "2026-07-15", 0.5, 0.08),
-            ("2026-07-15T00:00:00", "2026-07-15T00:00:00", "2026-07-15", 0.5, 0.08),
-            ("2026-07-15T05:30:00", "2026-07-15T05:30:00", "2026-07-15", 0.5, 0.08),
+            ("2026-07-14T23:30:00", "2026-07-14T23:30:00", 0.5, 0.08),
+            ("2026-07-15T00:00:00", "2026-07-15T00:00:00", 0.5, 0.08),
+            ("2026-07-15T05:30:00", "2026-07-15T05:30:00", 0.5, 0.08),
             # Day rate blocks (local 07:30+ BST = 06:30+ UTC)
-            ("2026-07-15T06:30:00", "2026-07-15T06:30:00", "2026-07-15", 0.5, 0.245),
-            ("2026-07-15T12:00:00", "2026-07-15T12:00:00", "2026-07-15", 0.5, 0.245),
+            ("2026-07-15T06:30:00", "2026-07-15T06:30:00", 0.5, 0.245),
+            ("2026-07-15T12:00:00", "2026-07-15T12:00:00", 0.5, 0.245),
         ]
-        for (bs, be, ld, kwh, rate) in blocks:
+        for (bs, be, kwh, rate) in blocks:
             store._conn.execute("""
-                INSERT INTO blocks (block_start, block_end, meter_id, config_period_id,
-                  local_date, local_year, local_month, local_day, interpolated,
+                INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, interpolated,
                   imp_kwh, imp_rate, imp_cost, exp_kwh, exp_rate, exp_cost, standing_charge)
-                VALUES (?,?,'electricity_main',?,?,2026,7,15,0, ?,?,ROUND(?*?,6),0,0,0,0.5)
-            """, (bs, be, cp_id, ld, kwh, rate, kwh, rate))
+                VALUES (?,?,'electricity_main',?,0, ?,?,ROUND(?*?,6),0,0,0,0.5)
+            """, (bs, be, cp_id, kwh, rate, kwh, rate))
         store._conn.commit()
 
         client = make_client(store=store)
@@ -2208,10 +2219,9 @@ class TestAggregateInsights(unittest.TestCase):
             ).fetchone()[0]
             # Main meter block
             self.store._conn.execute(
-                "INSERT INTO blocks (block_start, block_end, local_date, local_year, "
-                "local_month, local_day, meter_id, config_period_id, imp_kwh, exp_kwh, carbon_g) "
-                "VALUES ('2026-04-01T00:00:00', '2026-04-01T00:30:00', '2026-04-01', "
-                "2026, 4, 1, 'electricity_main', ?, 10.0, 2.0, 500.0)",
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, imp_kwh, exp_kwh, carbon_g) "
+                "VALUES ('2026-04-01T00:00:00', '2026-04-01T00:30:00', "
+                "'electricity_main', ?, 10.0, 2.0, 500.0)",
                 (cp_id,)
             )
             # Sub-meter block
@@ -2221,11 +2231,10 @@ class TestAggregateInsights(unittest.TestCase):
                 (cp_id,)
             )
             self.store._conn.execute(
-                "INSERT INTO blocks (block_start, block_end, local_date, local_year, "
-                "local_month, local_day, meter_id, config_period_id, imp_kwh, "
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, imp_kwh, "
                 "exp_kwh, carbon_g) "
-                "VALUES ('2026-04-01T00:00:00', '2026-04-01T00:30:00', '2026-04-01', "
-                "2026, 4, 1, 'ev_charger', ?, 4.0, 0.0, 200.0)",
+                "VALUES ('2026-04-01T00:00:00', '2026-04-01T00:30:00', "
+                "'ev_charger', ?, 4.0, 0.0, 200.0)",
                 (cp_id,)
             )
         self.cfg = {
