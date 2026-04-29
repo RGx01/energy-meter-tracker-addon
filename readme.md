@@ -76,6 +76,8 @@ A Home Assistant add-on that records your electricity usage in precise configura
 
 ### HA OS / Supervised (recommended)
 
+[![Open your Home Assistant instance and show the add app repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2FRGx01%2Fenergy-meter-tracker-addon)
+
 1. Add this repository to your Home Assistant add-on store
 2. Install **Energy Meter Tracker**
 3. Start the add-on and open the Web UI
