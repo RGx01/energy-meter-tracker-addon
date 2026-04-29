@@ -58,7 +58,8 @@ def inject_globals():
                 break
     except Exception:
         pass
-    return {"app_version": APP_VERSION, "has_power_sensor": has_power_sensor, "has_postcode": has_postcode}
+    return {"app_version": APP_VERSION, "has_power_sensor": has_power_sensor, "has_postcode": has_postcode,
+            "server_port": int(os.environ.get("EMT_PORT") or "8099")}
 
 
 class IngressMiddleware:
@@ -524,9 +525,9 @@ def _format_billing(summary, cfg, currency):
     total_imp_cost = main_imp_cost + sum(float(r["cost"]) for r in sub_rows)
     if total_imp_kwh > 0.0001 or total_imp_cost > 0.0001:
         rows.append({"label": f"Total Import ({total_imp_kwh:.3f} kWh)", "cost": total_imp_cost, "bold": True})
-    # Grid remainder
+    # Direct import (remainder not attributed to sub-meters)
     if main_imp_kwh > 0.0001 or main_imp_cost > 0.0001:
-        rows.append({"label": f"Grid Import ({main_imp_kwh:.3f} kWh)", "cost": main_imp_cost})
+        rows.append({"label": f"Direct import ({main_imp_kwh:.3f} kWh)", "cost": main_imp_cost})
     # Sub-meters
     for r in sub_rows:
         rows.append(r)
@@ -922,16 +923,33 @@ def api_billing():
                     sub_kwh_total  += kwh
                     sub_cost_total += cost
 
-            # Total Import = grid remainder + sub-meters
-            total_imp_kwh  = totals["imp_kwh"] + sub_kwh_total
-            total_imp_cost = imp_cost + sub_cost_total
+            # Get raw grid import (before sub-meter deduction) for correct total
+            raw_cur = store._conn.execute(
+                f"""SELECT COALESCE(SUM(COALESCE(b.imp_kwh_grid, b.imp_kwh)), 0.0) as raw_kwh,
+                           COALESCE(SUM(b.imp_cost), 0.0) as raw_cost
+                    FROM blocks b
+                    JOIN meters m ON m.meter_id = b.meter_id
+                      AND m.config_period_id = ({active_period_sq})
+                    WHERE m.is_sub_meter = 0
+                      AND b.local_date >= ? AND b.local_date <= ?""",
+                (start_date, end_date)
+            ).fetchone()
+            raw_grid_kwh  = float(raw_cur["raw_kwh"])  if raw_cur else totals["imp_kwh"]
+            raw_grid_cost = float(raw_cur["raw_cost"]) if raw_cur else imp_cost
+
+            # Total Import = raw grid import (already includes all consumption)
+            total_imp_kwh  = raw_grid_kwh
+            total_imp_cost = raw_grid_cost
+            # Grid Import = raw grid minus sub-meter attributed portion
+            grid_imp_kwh   = max(0.0, raw_grid_kwh  - sub_kwh_total)
+            grid_imp_cost  = max(0.0, raw_grid_cost - sub_cost_total)
+
             if total_imp_kwh > 0.001 or total_imp_cost > 0.001:
                 rows.append({"label": f"{label_imp} ({total_imp_kwh:.3f} kWh)",
                              "cost": total_imp_cost, "bold": True})
-            # Grid import (remainder after sub-meters)
-            if totals["imp_kwh"] > 0.001 or imp_cost > 0.001:
-                rows.append({"label": f"Grid Import ({totals['imp_kwh']:.3f} kWh)",
-                             "cost": imp_cost, "bold": False})
+            if grid_imp_kwh > 0.001 or grid_imp_cost > 0.001:
+                rows.append({"label": f"Direct import ({grid_imp_kwh:.3f} kWh)",
+                             "cost": grid_imp_cost, "bold": False})
             # Sub-meter rows
             rows.extend(sub_rows)
             # Export and standing charge
@@ -1039,7 +1057,7 @@ def api_carbon():
         for m_data in cfg.get("meters", {}).values():
             meta = (m_data or {}).get("meta", {}) or {}
             if not meta.get("sub_meter"):
-                postcode = meta.get("postcode_prefix", "").strip().upper()
+                postcode = meta.get("postcode_prefix", "").strip().upper().split()[0] if meta.get("postcode_prefix", "").strip() else ""
                 break
         if not postcode:
             return jsonify({"error": "no_postcode"}), 404
@@ -1051,11 +1069,8 @@ def api_carbon():
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read())
 
-        # Log raw structure for debugging
-        logger.info("api_carbon raw keys: %s", list(data.keys()) if isinstance(data, dict) else type(data).__name__)
         slots = []
         raw = data.get("data", [])
-        logger.info("api_carbon data type: %s", type(raw).__name__)
         # Handle dict shape: {data: {regionid, postcode, data: [{from, to, intensity}]}}
         if isinstance(raw, dict):
             for slot in raw.get("data", []):
@@ -1117,6 +1132,70 @@ def api_power_history():
         return jsonify({"rows": rows})
     except Exception as e:
         logger.error("api_power_history: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/meter/main/reset", methods=["POST"])
+def api_meter_main_reset():
+    """
+    Nuclear option — backup the DB then wipe it entirely.
+    Used when user deletes the main meter (electricity_main).
+    Triggers engine restart via engine_startup on next connection.
+    """
+    try:
+        import shutil, time
+        store = _get_store()
+
+        # Create backup first
+        try:
+            _backup_to_share(store)
+            logger.info("api_meter_main_reset: backup created")
+        except Exception as be:
+            logger.warning("api_meter_main_reset: backup failed: %s", be)
+
+        # Close store connection
+        db_path = store._path
+        store._conn.close()
+
+        # Delete the DB files
+        for suffix in ["", "-wal", "-shm"]:
+            p = db_path + suffix
+            if os.path.exists(p):
+                os.remove(p)
+                logger.info("api_meter_main_reset: removed %s", p)
+
+        # Also clear meters_config.json
+        cfg_p = config_path()
+        if os.path.exists(cfg_p):
+            import json as _j
+            with open(cfg_p, "w") as f:
+                _j.dump({"meters": {}}, f, indent=2)
+
+        logger.info("api_meter_main_reset: database wiped — restarting addon")
+
+        # Trigger addon restart via supervisor API — runs in background thread
+        # so the HTTP response is returned before the process exits
+        import threading, urllib.request as _ur, json as _j2
+        def _restart():
+            import time; time.sleep(1)
+            try:
+                token = os.environ.get("SUPERVISOR_TOKEN", "")
+                req = _ur.Request(
+                    "http://supervisor/addons/self/restart",
+                    data=b"{}",
+                    headers={"Authorization": "Bearer " + token,
+                             "Content-Type": "application/json"},
+                    method="POST"
+                )
+                _ur.urlopen(req, timeout=10)
+            except Exception as re:
+                logger.warning("api_meter_main_reset: supervisor restart failed: %s — using sys.exit", re)
+                import sys; sys.exit(0)
+        threading.Thread(target=_restart, daemon=True).start()
+
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.error("api_meter_main_reset: %s", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -1253,7 +1332,7 @@ def api_carbon_current():
         for m_data in cfg.get("meters", {}).values():
             meta = (m_data or {}).get("meta", {}) or {}
             if not meta.get("sub_meter"):
-                postcode = meta.get("postcode_prefix", "").strip().upper()
+                postcode = meta.get("postcode_prefix", "").strip().upper().split()[0] if meta.get("postcode_prefix", "").strip() else ""
                 break
 
         if not postcode:
@@ -1418,7 +1497,7 @@ def api_blocks_summary():
             if is_sub:
                 label = meta.get("device") or meta.get("site") or meter_id
             else:
-                label = "Grid"
+                label = "Direct"
             meter_labels[meter_id] = label
 
         all_dates = [datetime.strptime(d, "%Y-%m-%d").date() for d in all_date_strs]
@@ -2490,6 +2569,186 @@ def api_insights_periods():
         return jsonify({"error": str(e)}), 500
 
 
+def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
+    """
+    Core aggregation for Insights — works for any UTC time range.
+    Uses a direct lightweight SQL query rather than get_blocks_for_range
+    to avoid fetching unnecessary columns and joining reads.
+    """
+    from datetime import datetime as _dt
+
+    meters_cfg = cfg.get("meters") or {}
+    sub_meter_ids = {
+        mid for mid, md in meters_cfg.items()
+        if (md.get("meta") or {}).get("sub_meter")
+    }
+
+    def _meter_type(mid, md):
+        explicit = (md.get("meta") or {}).get("meter_type", "")
+        if explicit:
+            return explicit
+        mid_l = mid.lower()
+        if any(k in mid_l for k in ("ev", "charger")):      return "ev_charger"
+        if any(k in mid_l for k in ("battery", "batt")):    return "battery"
+        if any(k in mid_l for k in ("heat", "pump")):       return "heat_pump"
+        if any(k in mid_l for k in ("solar", "pv", "inv")): return "inverter"
+        return "unknown"
+
+    # Lightweight direct query — only columns needed for carbon insights
+    rows = store._conn.execute(
+        """SELECT b.meter_id, b.imp_kwh, b.exp_kwh, b.carbon_g,
+                  COALESCE(m.is_sub_meter, 0) as is_sub_meter
+           FROM blocks b
+           LEFT JOIN meters m ON m.meter_id = b.meter_id
+                              AND m.config_period_id = b.config_period_id
+           WHERE b.block_start >= ? AND b.block_start < ?
+           ORDER BY b.block_start""",
+        (utc_start, utc_end)
+    ).fetchall()
+
+    block_minutes = 30
+    if meters_cfg:
+        first_mid = next(iter(meters_cfg))
+        block_minutes = int((meters_cfg[first_mid].get("meta") or {}).get("block_minutes", 30) or 30)
+
+    main_imp_kwh = main_exp_kwh = 0.0
+    main_ci_imp_kwh = main_ci_exp_kwh = 0.0
+    cg_imp = cg_exp = cg_net = 0.0
+    ci_kwh_weighted = ci_duration = 0.0
+    eff_carbon = eff_kwh = 0.0
+    has_carbon = False
+    total_blocks = 0
+    ci_blocks = 0
+
+    sub_totals = {}
+
+    for row in rows:
+        mid        = row["meter_id"]
+        b_imp_raw  = float(row["imp_kwh"] or 0)
+        is_sub     = bool(row["is_sub_meter"]) or mid in sub_meter_ids
+        b_imp      = b_imp_raw
+        b_exp      = float(row["exp_kwh"] or 0)
+        b_net      = b_imp - b_exp
+        cg         = row["carbon_g"]
+
+        if is_sub:
+            if mid not in sub_totals:
+                _m_meta = (meters_cfg.get(mid, {}).get("meta") or {})
+                sub_totals[mid] = {
+                    "imp_kwh": 0.0, "carbon_g": 0.0, "ci_blocks": 0,
+                    "ci_imp_kwh": 0.0, "total_blocks": 0,
+                    "meter_type": _meter_type(mid, meters_cfg.get(mid, {})),
+                    "inverter_possible": bool(_m_meta.get("inverter_possible")),
+                    "ci_kwh_weighted": 0.0, "ci_kwh_duration": 0.0,
+                }
+            sub_totals[mid]["imp_kwh"]      += b_imp
+            sub_totals[mid]["total_blocks"] += 1
+            if cg is not None:
+                cg_f = float(cg)
+                sub_totals[mid]["carbon_g"]   += cg_f
+                sub_totals[mid]["ci_blocks"]  += 1
+                sub_totals[mid]["ci_imp_kwh"] += b_imp
+                if b_imp > 0.001:
+                    b_intensity = abs(cg_f / b_imp)
+                    sub_totals[mid]["ci_kwh_weighted"] += b_intensity * b_imp
+                    sub_totals[mid]["ci_kwh_duration"] += b_imp
+            continue
+
+        # Main meter
+        total_blocks += 1
+        main_imp_kwh += b_imp
+        main_exp_kwh += b_exp
+
+        if cg is None:
+            continue
+
+        cg_f = float(cg)
+        has_carbon = True
+        ci_blocks += 1
+        cg_net += cg_f
+        main_ci_imp_kwh += b_imp
+        main_ci_exp_kwh += b_exp
+
+        if b_net != 0:
+            b_intensity = abs(cg_f / b_net)
+            cg_imp += b_imp * b_intensity
+            cg_exp += b_exp * b_intensity
+            ci_kwh_weighted += b_intensity * block_minutes
+            ci_duration     += block_minutes
+            eff_carbon += abs(cg_f)
+            eff_kwh    += abs(b_net)
+        elif b_imp > 0:
+            cg_imp += abs(cg_f)
+        else:
+            cg_exp += abs(cg_f)
+
+    effective_intensity  = round(eff_carbon / eff_kwh, 1) if eff_kwh > 0 else None
+    grid_avg_intensity   = round(ci_kwh_weighted / ci_duration, 1) if ci_duration > 0 else None
+    avg_export_intensity = round(cg_exp / main_ci_exp_kwh, 1) if main_ci_exp_kwh > 0 else None
+
+    for mid, st in sub_totals.items():
+        if st["ci_kwh_duration"] > 0:
+            st["avg_charge_intensity"] = round(st["ci_kwh_weighted"] / st["ci_kwh_duration"], 1)
+        else:
+            st["avg_charge_intensity"] = None
+        del st["ci_kwh_weighted"]
+        del st["ci_kwh_duration"]
+
+    total_sub_imp_kwh  = sum(st["imp_kwh"]   for st in sub_totals.values())
+    total_sub_carbon_g = sum(st["carbon_g"]  for st in sub_totals.values())
+    house_imp_kwh    = max(0.0, main_imp_kwh - total_sub_imp_kwh)
+    house_ci_imp_kwh = max(0.0, main_ci_imp_kwh - sum(
+        st.get("ci_imp_kwh", 0.0) for st in sub_totals.values()
+    ))
+    house_carbon_g   = max(0.0, cg_imp - total_sub_carbon_g) if has_carbon else None
+    house_avg_intensity = round(house_carbon_g / house_ci_imp_kwh, 1) \
+        if house_carbon_g and house_ci_imp_kwh > 0 else None
+
+    settings = store.get_settings()
+    merged   = dict(SETTINGS_DEFAULTS)
+    merged.update(settings)
+
+    coverage_pct = round(ci_blocks / total_blocks * 100, 1) if total_blocks else 0
+
+    # Actual first block date within range — main meter and per sub-meter
+    first_block_row = store._conn.execute(
+        "SELECT MIN(block_start) as first_block FROM blocks "
+        "WHERE meter_id = 'electricity_main' AND block_start >= ? AND block_start < ?",
+        (utc_start, utc_end)
+    ).fetchone()
+    data_start = first_block_row["first_block"][:10] if first_block_row and first_block_row["first_block"] else None
+
+    for mid in sub_totals:
+        row = store._conn.execute(
+            "SELECT MIN(block_start) as first_block FROM blocks "
+            "WHERE meter_id = ? AND block_start >= ? AND block_start < ?",
+            (mid, utc_start, utc_end)
+        ).fetchone()
+        sub_totals[mid]["data_start"] = row["first_block"][:10] if row and row["first_block"] else data_start
+
+    return {
+        "has_carbon":           has_carbon,
+        "carbon_coverage_pct":  coverage_pct,
+        "data_start":           data_start,
+        "imp_kwh":              round(main_imp_kwh, 3),
+        "exp_kwh":              round(main_exp_kwh, 3),
+        "ci_imp_kwh":           round(main_ci_imp_kwh, 3),
+        "ci_exp_kwh":           round(main_ci_exp_kwh, 3),
+        "carbon_g_imp":         round(cg_imp, 1) if has_carbon else None,
+        "carbon_g_exp":         round(cg_exp, 1) if has_carbon else None,
+        "carbon_g_net":         round(cg_net, 1) if has_carbon else None,
+        "effective_intensity":  effective_intensity,
+        "avg_export_intensity": avg_export_intensity,
+        "grid_avg_intensity":   grid_avg_intensity,
+        "sub_meters":           sub_totals,
+        "house_imp_kwh":        round(house_imp_kwh, 3),
+        "house_ci_imp_kwh":     round(house_ci_imp_kwh, 3),
+        "house_carbon_g":       round(house_carbon_g, 1) if house_carbon_g is not None else None,
+        "house_avg_intensity":  house_avg_intensity,
+        "assumptions":          merged,
+    }
+
+
 @app.route("/api/insights/billing-period")
 def api_insights_billing_period():
     """
@@ -2515,9 +2774,8 @@ def api_insights_billing_period():
         if not periods:
             return jsonify({"error": "No billing periods found"}), 404
 
-        # Find requested period
-        requested  = request.args.get("period_start")
-        now_local  = datetime.now(tz).replace(tzinfo=None)  # periods are naive local datetimes
+        requested = request.args.get("period_start")
+        now_local = datetime.now(tz).replace(tzinfo=None)
         target_ps = target_pe = None
         for (ps, pe) in periods:
             if requested:
@@ -2525,7 +2783,7 @@ def api_insights_billing_period():
                     target_ps, target_pe = ps, pe
                     break
             else:
-                target_ps, target_pe = ps, pe  # last one wins = most recent
+                target_ps, target_pe = ps, pe
 
         if not target_ps:
             return jsonify({"error": "Billing period not found"}), 404
@@ -2534,189 +2792,109 @@ def api_insights_billing_period():
         ps_iso = target_ps.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
         pe_iso = target_pe.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
 
-        # Get meter config for sub-meter classification
-        meters_cfg = cfg.get("meters") or {}
-        sub_meter_ids = {
-            mid for mid, md in meters_cfg.items()
-            if (md.get("meta") or {}).get("sub_meter")
-        }
-
-        def _meter_type(mid, md):
-            """Resolve meter type from meta key or fall back to meter ID keywords."""
-            explicit = (md.get("meta") or {}).get("meter_type", "")
-            if explicit:
-                return explicit
-            mid_l = mid.lower()
-            if any(k in mid_l for k in ("ev", "charger")):      return "ev_charger"
-            if any(k in mid_l for k in ("battery", "batt")):    return "battery"
-            if any(k in mid_l for k in ("heat", "pump")):       return "heat_pump"
-            if any(k in mid_l for k in ("solar", "pv", "inv")): return "inverter"
-            return "unknown"
-
-        # Fetch blocks for this period using range query (efficient)
-        from datetime import datetime as _dt
-        _ps_dt = _dt.fromisoformat(ps_iso)
-        _pe_dt = _dt.fromisoformat(pe_iso)
-        period_blocks = store.get_blocks_for_range(_ps_dt, _pe_dt)
-
-        # ── Main meter aggregation ─────────────────────────────────────────────
-        main_imp_kwh = main_exp_kwh = 0.0
-        main_ci_imp_kwh = main_ci_exp_kwh = 0.0  # kWh only from CI blocks
-        cg_imp = cg_exp = cg_net = 0.0
-        ci_kwh_weighted = ci_duration = 0.0
-        eff_carbon = eff_kwh = 0.0
-        has_carbon = False
-        block_minutes = 30
-        if meters_cfg:
-            first_mid = next(iter(meters_cfg))
-            block_minutes = int((meters_cfg[first_mid].get("meta") or {}).get("block_minutes", 30) or 30)
-
-        for block in period_blocks:
-            for mid, md in (block.get("meters") or {}).items():
-                if mid in sub_meter_ids:
-                    continue
-                ch_imp = ((md.get("channels") or {}).get("import") or {})
-                ch_exp = ((md.get("channels") or {}).get("export") or {})
-                b_imp  = float(ch_imp.get("kwh") or 0)
-                b_exp  = float(ch_exp.get("kwh") or 0)
-                b_net  = b_imp - b_exp
-                main_imp_kwh += b_imp
-                main_exp_kwh += b_exp
-
-                cg = md.get("carbon_g")
-                if cg is None:
-                    continue
-                cg = float(cg)
-                has_carbon = True
-                cg_net += cg
-                main_ci_imp_kwh += b_imp
-                main_ci_exp_kwh += b_exp
-
-                if b_net != 0:
-                    b_intensity = abs(cg / b_net)
-                    cg_imp += b_imp * b_intensity
-                    cg_exp += b_exp * b_intensity
-                elif b_imp > 0:
-                    cg_imp += abs(cg)
-                else:
-                    cg_exp += abs(cg)
-
-                if b_net != 0:
-                    b_intensity = abs(cg / b_net)
-                    ci_kwh_weighted += b_intensity * block_minutes
-                    ci_duration     += block_minutes
-                    eff_carbon += abs(cg)
-                    eff_kwh    += abs(b_net)
-
-        effective_intensity = round(eff_carbon / eff_kwh, 1) if eff_kwh > 0 else None
-        grid_avg_intensity  = round(ci_kwh_weighted / ci_duration, 1) if ci_duration > 0 else None
-        avg_export_intensity = round(cg_exp / main_ci_exp_kwh, 1) if main_ci_exp_kwh > 0 else None
-
-        # ── Sub-meter aggregation ──────────────────────────────────────────────
-        sub_totals = {}
-        # Track total sub-meter import for house remainder calculation
-        total_sub_imp_kwh   = 0.0
-        total_sub_carbon_g  = 0.0
-        for block in period_blocks:
-            for mid, md in (block.get("meters") or {}).items():
-                if mid not in sub_meter_ids:
-                    continue
-                if mid not in sub_totals:
-                    _m_meta = (meters_cfg.get(mid, {}).get("meta") or {})
-                    sub_totals[mid] = {
-                        "imp_kwh":            0.0,
-                        "carbon_g":           0.0,
-                        "ci_blocks":          0,
-                        "ci_imp_kwh":         0.0,  # kWh only from blocks with CI data
-                        "total_blocks":       0,
-                        "meter_type":         _meter_type(mid, meters_cfg.get(mid, {})),
-                        "inverter_possible":  bool(_m_meta.get("inverter_possible")),
-                        # For charging intensity: weighted sum of intensity × kwh
-                        "ci_kwh_weighted":    0.0,
-                        "ci_kwh_duration":    0.0,
-                    }
-                ch_imp = ((md.get("channels") or {}).get("import") or {})
-                b_imp  = float(ch_imp.get("kwh") or 0)
-                sub_totals[mid]["imp_kwh"]      += b_imp
-                sub_totals[mid]["total_blocks"]  += 1
-                total_sub_imp_kwh += b_imp
-                cg = md.get("carbon_g")
-                if cg is not None:
-                    cg_f = float(cg)
-                    sub_totals[mid]["carbon_g"]   += cg_f
-                    sub_totals[mid]["ci_blocks"]  += 1
-                    sub_totals[mid]["ci_imp_kwh"] += b_imp  # kWh only from CI blocks
-                    total_sub_carbon_g += cg_f
-                    # Derive charging intensity for this block
-                    if b_imp > 0.001:
-                        b_intensity = abs(cg_f / b_imp)
-                        sub_totals[mid]["ci_kwh_weighted"] += b_intensity * b_imp
-                        sub_totals[mid]["ci_kwh_duration"] += b_imp
-
-        # Compute weighted average charging intensity per sub-meter
-        for mid, st in sub_totals.items():
-            if st["ci_kwh_duration"] > 0:
-                st["avg_charge_intensity"] = round(
-                    st["ci_kwh_weighted"] / st["ci_kwh_duration"], 1
-                )
-            else:
-                st["avg_charge_intensity"] = None
-            # Clean up internal accumulators before sending to client
-            del st["ci_kwh_weighted"]
-            del st["ci_kwh_duration"]
-
-        # ── House remainder ────────────────────────────────────────────────────
-        house_imp_kwh    = max(0.0, main_imp_kwh - total_sub_imp_kwh)
-        house_ci_imp_kwh = max(0.0, main_ci_imp_kwh - sum(
-            st.get("ci_imp_kwh", 0.0) for st in sub_totals.values()
-        ))
-        house_carbon_g   = max(0.0, cg_imp - total_sub_carbon_g) if has_carbon else None
-        house_avg_intensity = round(house_carbon_g / house_ci_imp_kwh, 1) \
-            if house_carbon_g and house_ci_imp_kwh > 0 else None
-
-        # ── Settings ──────────────────────────────────────────────────────────
-        settings = store.get_settings()
-        merged   = dict(SETTINGS_DEFAULTS)
-        merged.update(settings)
-
-        # ── Carbon coverage ────────────────────────────────────────────────────
-        total_blocks = sum(
-            1 for b in period_blocks
-            for mid in (b.get("meters") or {})
-            if mid not in sub_meter_ids
-        )
-        ci_blocks = sum(
-            1 for b in period_blocks
-            for mid, md in (b.get("meters") or {}).items()
-            if mid not in sub_meter_ids and md.get("carbon_g") is not None
-        )
-        coverage_pct = round(ci_blocks / total_blocks * 100, 1) if total_blocks else 0
-
-        return jsonify({
-            "period_start":         target_ps.date().isoformat(),
-            "period_end":           target_pe.date().isoformat(),
-            "is_current":           is_current,
-            "has_carbon":           has_carbon,
-            "carbon_coverage_pct":  coverage_pct,
-            "imp_kwh":              round(main_imp_kwh, 3),
-            "exp_kwh":              round(main_exp_kwh, 3),
-            "ci_imp_kwh":           round(main_ci_imp_kwh, 3),
-            "ci_exp_kwh":           round(main_ci_exp_kwh, 3),
-            "carbon_g_imp":         round(cg_imp, 1) if has_carbon else None,
-            "carbon_g_exp":         round(cg_exp, 1) if has_carbon else None,
-            "carbon_g_net":         round(cg_net, 1) if has_carbon else None,
-            "effective_intensity":  effective_intensity,
-            "avg_export_intensity": avg_export_intensity,
-            "grid_avg_intensity":   grid_avg_intensity,
-            "sub_meters":           sub_totals,
-            "house_imp_kwh":        round(house_imp_kwh, 3),
-            "house_ci_imp_kwh":     round(house_ci_imp_kwh, 3),
-            "house_carbon_g":       round(house_carbon_g, 1) if house_carbon_g is not None else None,
-            "house_avg_intensity":  house_avg_intensity,
-            "assumptions":          merged,
-        })
+        d = _aggregate_insights(store, cfg, ps_iso, pe_iso)
+        d["period_start"] = target_ps.date().isoformat()
+        d["period_end"]   = target_pe.date().isoformat()
+        d["is_current"]   = is_current
+        return jsonify(d)
     except Exception as e:
         logger.exception("api_insights_billing_period failed")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/insights/data-bounds")
+def api_insights_data_bounds():
+    """Return earliest and latest block dates with carbon data."""
+    try:
+        store = _get_store()
+        row = store._conn.execute(
+            """SELECT MIN(block_start) as earliest, MAX(block_start) as latest
+               FROM blocks
+               WHERE meter_id = 'electricity_main'
+                 AND carbon_g IS NOT NULL"""
+        ).fetchone()
+        return jsonify({
+            "earliest": row["earliest"][:10] if row and row["earliest"] else None,
+            "latest":   row["latest"][:10]   if row and row["latest"]   else None,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/insights/calendar-month")
+def api_insights_calendar_month():
+    """
+    Carbon insights for a calendar month.
+    Query params: year=YYYY, month=MM (1-12)
+    Returns same shape as /api/insights/billing-period.
+    """
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        from datetime import datetime, timezone, timedelta
+        store   = _get_store()
+        cfg     = load_config()
+        tz_name = "Europe/London"
+        for mid, md in (cfg.get("meters") or {}).items():
+            tz_name = (md.get("meta") or {}).get("timezone", "Europe/London")
+            break
+        tz = _ZI(tz_name)
+
+        year  = int(request.args.get("year",  datetime.now(tz).year))
+        month = int(request.args.get("month", datetime.now(tz).month))
+
+        # Calendar month boundaries in local time → UTC
+        local_start = datetime(year, month, 1, tzinfo=tz)
+        if month == 12:
+            local_end = datetime(year + 1, 1, 1, tzinfo=tz)
+        else:
+            local_end = datetime(year, month + 1, 1, tzinfo=tz)
+
+        utc_start = local_start.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+        utc_end   = local_end.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+
+        # Reuse same data aggregation as billing-period endpoint
+        d = _aggregate_insights(store, cfg, utc_start, utc_end)
+        d["period_start"] = local_start.date().isoformat()
+        d["period_end"]   = (local_end - timedelta(days=1)).date().isoformat()
+        d["period_label"] = local_start.strftime("%B %Y")
+        return jsonify(d)
+    except Exception as e:
+        logger.exception("api_insights_calendar_month failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/insights/calendar-year")
+def api_insights_calendar_year():
+    """
+    Carbon insights for a calendar year.
+    Query params: year=YYYY
+    Returns same shape as /api/insights/billing-period.
+    """
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        from datetime import datetime, timezone, timedelta
+        store   = _get_store()
+        cfg     = load_config()
+        tz_name = "Europe/London"
+        for mid, md in (cfg.get("meters") or {}).items():
+            tz_name = (md.get("meta") or {}).get("timezone", "Europe/London")
+            break
+        tz = _ZI(tz_name)
+
+        year = int(request.args.get("year", datetime.now(tz).year))
+
+        local_start = datetime(year, 1, 1, tzinfo=tz)
+        local_end   = datetime(year + 1, 1, 1, tzinfo=tz)
+
+        utc_start = local_start.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+        utc_end   = local_end.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+
+        d = _aggregate_insights(store, cfg, utc_start, utc_end)
+        d["period_start"] = local_start.date().isoformat()
+        d["period_end"]   = (local_end - timedelta(days=1)).date().isoformat()
+        d["period_label"] = str(year)
+        return jsonify(d)
+    except Exception as e:
+        logger.exception("api_insights_calendar_year failed")
         return jsonify({"error": str(e)}), 500
 
 

@@ -867,6 +867,71 @@ class TestNewInstallCurrentBlockCleared(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PASS 2 — sub-meter exceeds parent: warn not clip
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPass2SubMeterExceedsParent(unittest.TestCase):
+    """
+    When a sub-meter's kWh exceeds the parent grid import, PASS 2 should
+    log a WARNING but NOT clip — the raw energy must be preserved in kwh_grid.
+    This covers the gap-block attribution scenario where a restart causes
+    a sub-meter delta to span more than one block window.
+    """
+
+    def _make_block(self, main_kwh, sub_kwh):
+        """Build a minimal block dict with one sub-meter."""
+        return {
+            "start": "2026-04-29T00:00:00",
+            "end":   "2026-04-29T00:30:00",
+            "meters": {
+                "electricity_main": {
+                    "meta": {"sub_meter": False},
+                    "channels": {
+                        "import": {"kwh": main_kwh, "kwh_total": main_kwh,
+                                   "rate": 0.30, "cost": round(main_kwh * 0.30, 6)},
+                        "export": {"kwh": 0.0, "rate": 0.12, "cost": 0.0},
+                    },
+                    "standing_charge": 0.0,
+                },
+                "ev_charger": {
+                    "meta": {"sub_meter": True, "inverter_possible": False,
+                             "parent_meter": "electricity_main"},
+                    "channels": {
+                        "import": {"kwh": sub_kwh, "rate": 0.30,
+                                   "cost": round(sub_kwh * 0.30, 6)},
+                    },
+                    "standing_charge": 0.0,
+                },
+            },
+        }
+
+    def test_warns_when_sub_exceeds_parent(self):
+        """WARNING logged when sub-meter kWh > parent grid import * 1.05."""
+        block = self._make_block(main_kwh=3.659, sub_kwh=5.01)
+        with self.assertLogs("engine", level="WARNING") as cm:
+            engine._apply_pass2(block)
+        self.assertTrue(any("EXCEEDS" in line for line in cm.output))
+
+    def test_energy_not_clipped(self):
+        """kwh_grid must equal the raw sub_kwh — no energy lost."""
+        block = self._make_block(main_kwh=3.659, sub_kwh=5.01)
+        import logging
+        with self.assertLogs("engine", level="WARNING"):
+            engine._apply_pass2(block)
+        ev_import = block["meters"]["ev_charger"]["channels"]["import"]
+        self.assertAlmostEqual(ev_import["kwh_grid"], 5.01, places=4)
+
+    def test_no_warning_within_tolerance(self):
+        """No warning when sub-meter is within 5% of parent."""
+        block = self._make_block(main_kwh=3.659, sub_kwh=3.5)
+        # Should not raise — no WARNING logged
+        import logging
+        with self.assertLogs("engine", level="INFO") as cm:
+            engine._apply_pass2(block)
+        self.assertFalse(any("EXCEEDS" in line for line in cm.output))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

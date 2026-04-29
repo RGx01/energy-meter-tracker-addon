@@ -193,14 +193,27 @@ CREATE INDEX IF NOT EXISTS idx_current_reads_time  ON current_reads (captured_at
 -- Carbon intensity samples from National Grid API (15-min cadence, ~4-day retention).
 -- postcode stored per row so config changes don't invalidate historical data.
 CREATE TABLE IF NOT EXISTS carbon_intensity (
-    captured_at   TEXT NOT NULL,      -- UTC ISO, 30-min API slot boundary
-    postcode      TEXT NOT NULL,
-    intensity     REAL,               -- gCO2/kWh forecast
-    ci_index      TEXT,               -- very-low/low/moderate/high/very-high
+    captured_at          TEXT NOT NULL,      -- UTC ISO, 30-min API slot boundary
+    postcode             TEXT NOT NULL,
+    intensity_forecast   REAL,               -- gCO₂/kWh forecast (always populated)
+    intensity_actual     REAL,               -- gCO₂/kWh actual (populated ~24hr later)
+    ci_index             TEXT,               -- very-low/low/moderate/high/very-high
     PRIMARY KEY (captured_at, postcode)
 );
+-- Computed alias: intensity = COALESCE(actual, forecast) for backward compat
+-- All consumers should use get_nearest_carbon_intensity which applies this.
 
 CREATE INDEX IF NOT EXISTS idx_carbon_intensity_time ON carbon_intensity (captured_at);
+
+-- Generation mix per block — fuel type percentages at time of each block.
+-- Populated at block finalise time and backfilled alongside carbon_g.
+-- One row per fuel per block. Lives as long as the block.
+CREATE TABLE IF NOT EXISTS generation_mix (
+    block_id    INTEGER NOT NULL REFERENCES blocks(id) ON DELETE CASCADE,
+    fuel        TEXT    NOT NULL,   -- 'wind','solar','gas','nuclear','biomass','hydro','imports','other'
+    perc        REAL    NOT NULL,   -- percentage of generation mix (0.0–100.0)
+    PRIMARY KEY (block_id, fuel)
+);
 
 -- High-resolution net power history (engine-tick cadence ~10s, 48hr retention).
 -- Only written when a power sensor is configured. intensity is denormalised from
@@ -480,6 +493,43 @@ class BlockStore:
         self._conn.row_factory = sqlite3.Row
         self._apply_pragmas()
         self._ensure_schema()
+        # Covering index for insights aggregation — created after migrations
+        # so carbon_g and other late-added columns are guaranteed to exist
+        try:
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_blocks_insights "
+                "ON blocks (block_start, meter_id, imp_kwh, exp_kwh, carbon_g, config_period_id)"
+            )
+        except Exception:
+            pass
+        # Migrate carbon_intensity: rename intensity → intensity_forecast, add intensity_actual
+        try:
+            cols = [r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(carbon_intensity)"
+            ).fetchall()]
+            if "intensity" in cols and "intensity_forecast" not in cols:
+                with self._conn:
+                    self._conn.execute(
+                        "ALTER TABLE carbon_intensity RENAME COLUMN intensity TO intensity_forecast"
+                    )
+            if "intensity_actual" not in cols and "intensity_forecast" in cols + ["intensity_forecast"]:
+                with self._conn:
+                    self._conn.execute(
+                        "ALTER TABLE carbon_intensity ADD COLUMN intensity_actual REAL"
+                    )
+        except Exception:
+            pass
+        try:
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS generation_mix (
+                    block_id INTEGER NOT NULL REFERENCES blocks(id) ON DELETE CASCADE,
+                    fuel     TEXT    NOT NULL,
+                    perc     REAL    NOT NULL,
+                    PRIMARY KEY (block_id, fuel)
+                )
+            """)
+        except Exception:
+            pass
         logger.debug("BlockStore opened: %s", db_path)
 
     # ── Connection management ─────────────────────────────────────────────
@@ -554,22 +604,47 @@ class BlockStore:
     # ── Carbon intensity ─────────────────────────────────────────────────────
 
     def upsert_carbon_intensity(self, captured_at: str, postcode: str,
-                                 intensity: float | None, ci_index: str | None) -> None:
-        """Store a carbon intensity sample. captured_at should be the 30-min slot boundary."""
+                                 intensity_forecast: float | None,
+                                 ci_index: str | None,
+                                 intensity_actual: float | None = None) -> None:
+        """
+        Store a carbon intensity sample. captured_at is the 30-min slot boundary.
+        intensity_forecast is always provided. intensity_actual is populated ~24hr
+        later when NESO publishes actuals — only updates if provided (not None).
+        """
         with self._conn:
-            self._conn.execute(
-                """INSERT INTO carbon_intensity (captured_at, postcode, intensity, ci_index)
-                   VALUES (?, ?, ?, ?)
-                   ON CONFLICT(captured_at, postcode) DO UPDATE SET
-                       intensity = excluded.intensity,
-                       ci_index  = excluded.ci_index""",
-                (captured_at, postcode, intensity, ci_index)
-            )
+            if intensity_actual is not None:
+                self._conn.execute(
+                    """INSERT INTO carbon_intensity
+                           (captured_at, postcode, intensity_forecast, intensity_actual, ci_index)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(captured_at, postcode) DO UPDATE SET
+                           intensity_forecast = COALESCE(excluded.intensity_forecast, intensity_forecast),
+                           intensity_actual   = excluded.intensity_actual,
+                           ci_index           = excluded.ci_index""",
+                    (captured_at, postcode, intensity_forecast, intensity_actual, ci_index)
+                )
+            else:
+                self._conn.execute(
+                    """INSERT INTO carbon_intensity
+                           (captured_at, postcode, intensity_forecast, ci_index)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(captured_at, postcode) DO UPDATE SET
+                           intensity_forecast = excluded.intensity_forecast,
+                           ci_index           = excluded.ci_index""",
+                    (captured_at, postcode, intensity_forecast, ci_index)
+                )
 
     def get_nearest_carbon_intensity(self, block_start: str, postcode: str) -> dict | None:
-        """Return the nearest carbon_intensity row to block_start for the given postcode."""
+        """
+        Return the nearest carbon_intensity row to block_start for the given postcode.
+        intensity = COALESCE(actual, forecast) — actual preferred when available.
+        """
         row = self._conn.execute(
-            """SELECT captured_at, intensity, ci_index
+            """SELECT captured_at, ci_index,
+                      COALESCE(intensity_actual, intensity_forecast) as intensity,
+                      intensity_forecast,
+                      intensity_actual
                FROM carbon_intensity
                WHERE postcode = ?
                ORDER BY ABS(strftime('%s', captured_at) - strftime('%s', ?))
@@ -587,6 +662,55 @@ class BlockStore:
                 "DELETE FROM carbon_intensity WHERE captured_at < ?", (cutoff,)
             )
         return cur.rowcount
+
+    # ── Generation mix ────────────────────────────────────────────────────────
+
+    def upsert_generation_mix(self, block_id: int, mix: list[dict]) -> None:
+        """
+        Store generation mix for a block. mix is a list of {fuel, perc} dicts
+        from the National Grid ESO API generationmix array.
+        Replaces any existing mix for this block.
+        """
+        if not mix or block_id is None:
+            return
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM generation_mix WHERE block_id = ?", (block_id,)
+            )
+            self._conn.executemany(
+                "INSERT INTO generation_mix (block_id, fuel, perc) VALUES (?, ?, ?)",
+                [(block_id, str(row.get("fuel", "")).lower(), float(row.get("perc", 0)))
+                 for row in mix if row.get("fuel") is not None]
+            )
+
+    def get_generation_mix(self, block_id: int) -> list[dict]:
+        """Return generation mix for a block as [{fuel, perc}, ...] sorted by perc desc."""
+        rows = self._conn.execute(
+            "SELECT fuel, perc FROM generation_mix WHERE block_id = ? ORDER BY perc DESC",
+            (block_id,)
+        ).fetchall()
+        return [{"fuel": r["fuel"], "perc": r["perc"]} for r in rows]
+
+    def get_generation_mix_for_range(self, utc_start: str, utc_end: str,
+                                      meter_id: str = "electricity_main") -> list[dict]:
+        """
+        Return imp_kwh-weighted average generation mix across all blocks in the
+        given UTC range for the specified meter. Returns [{fuel, perc}, ...].
+        Useful for period-level Insights aggregations.
+        """
+        rows = self._conn.execute(
+            """SELECT gm.fuel,
+                      SUM(gm.perc * b.imp_kwh) / NULLIF(SUM(b.imp_kwh), 0) as weighted_perc
+               FROM generation_mix gm
+               JOIN blocks b ON b.id = gm.block_id
+               WHERE b.block_start >= ? AND b.block_start < ?
+                 AND b.meter_id = ?
+                 AND b.imp_kwh > 0
+               GROUP BY gm.fuel
+               ORDER BY weighted_perc DESC""",
+            (utc_start, utc_end, meter_id)
+        ).fetchall()
+        return [{"fuel": r["fuel"], "perc": round(r["weighted_perc"], 2)} for r in rows]
 
     # ── Power history ─────────────────────────────────────────────────────────
 

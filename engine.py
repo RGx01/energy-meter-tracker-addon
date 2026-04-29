@@ -73,6 +73,7 @@ _PUBLISH_HA_SENSORS: bool = os.environ.get("PUBLISH_HA_SENSORS", "true").lower()
 _engine_loop_lock:         asyncio.Lock = None   # initialised in setup()
 _engine_paused:            bool         = False
 _last_ci_fetch:            datetime | None = None   # UTC — last carbon intensity fetch
+_current_slot_mix:         dict            = {}      # captured_at → generationmix list
 
 
 def setup():
@@ -738,6 +739,23 @@ def build_gap_blocks(
                             parent_name = meter_meta.get("parent_meter")
                             _sr = last_known_rates.get(parent_name, {}).get(channel_name)
                         sub_rate = _rate_value(_sr)
+                    else:
+                        # Spike detection — sub-meter kwh cannot exceed parent grid import
+                        # for this window. Get parent import kwh for sanity check.
+                        parent_name   = meter_meta.get("parent_meter", "electricity_main")
+                        parent_pre    = pre_reads_by_channel.get(parent_name, {}).get(channel_name)
+                        parent_post   = post_reads_by_channel.get(parent_name, {}).get(channel_name)
+                        if parent_pre and parent_post and parent_post["value"] > parent_pre["value"]:
+                            p_opener    = interpolate_value(parent_pre, parent_post, window_start)
+                            p_closer    = interpolate_value(parent_pre, parent_post, window_end)
+                            parent_kwh  = max(round(p_closer["value"] - p_opener["value"], 6), 0.0)
+                            if sub_kwh > parent_kwh * 1.05:  # 5% tolerance for rounding
+                                logger.warning(
+                                    "build_gap_blocks: %s/%s %.4f kWh EXCEEDS parent grid %.4f kWh "
+                                    "— may be gap attribution issue or misconfigured sensor. "
+                                    "Recording as-is.",
+                                    meter_name, channel_name, sub_kwh, parent_kwh,
+                                )
 
                     meter_block["channels"][channel_name] = {
                         "kwh": sub_kwh, "rate": sub_rate, "cost": sub_cost,
@@ -778,6 +796,9 @@ def build_gap_blocks(
                     block["totals"]["export_cost"] += cost
 
             block["meters"][meter_name] = meter_block
+
+        # Apply grid-authoritative clipping to gap blocks (same as finalise_block PASS 2)
+        _apply_pass2(block)
 
         gap_blocks.append(block)
         logger.info(
@@ -891,6 +912,120 @@ def generate_charts(store: "BlockStore"):
 # ─────────────────────────────────────────────────────────────────────────────
 # Block finalise
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _apply_pass2(block: dict) -> None:
+    """
+    PASS 2 — grid-authoritative sub-meter distribution.
+    Clips each sub-meter's import to what the parent grid import can supply,
+    sets kwh_grid and kwh_battery on each sub-meter channel.
+    Called from both finalise_block and build_gap_blocks.
+    """
+    # Build parent → sub_kwh_total map
+    parent_sub_kwh: dict = {}
+    for meter_name, meter_block in block["meters"].items():
+        meta = meter_block.get("meta", {})
+        if not meta.get("sub_meter"):
+            continue
+        parent_name = meta.get("parent_meter")
+        if not parent_name:
+            continue
+        sub_import = meter_block["channels"].get("import")
+        if sub_import:
+            parent_sub_kwh[parent_name] = parent_sub_kwh.get(parent_name, 0.0) + sub_import.get("kwh", 0.0)
+
+    for parent_meter_name in parent_sub_kwh:
+        parent_block  = block["meters"].get(parent_meter_name)
+        if not parent_block:
+            continue
+        parent_import = parent_block["channels"].get("import")
+        if not parent_import:
+            continue
+
+        grid_kwh       = parent_import.get("kwh", 0.0)
+        parent_rate    = parent_import.get("rate", 0.0)
+        grid_remaining = grid_kwh
+
+        protected   = []
+        unprotected = []
+
+        for meter_name, meter_block in block["meters"].items():
+            meta = meter_block.get("meta", {})
+            if not meta.get("sub_meter") or meta.get("parent_meter") != parent_meter_name:
+                continue
+            sub_import = meter_block["channels"].get("import")
+            if not sub_import:
+                continue
+            delta = sub_import.get("kwh", 0.0)
+            if meta.get("v2x_capable") and delta < 0:
+                logger.info("PASS 2: %s discharging %.4f kWh (V2X), excluded", meter_name, abs(delta))
+                continue
+            if delta == 0.0:
+                continue
+            entry = {
+                "meter_name": meter_name, "meter_block": meter_block,
+                "sub_import": sub_import, "kwh": delta,
+            }
+            (protected if not meta.get("inverter_possible", False) else unprotected).append(entry)
+
+        protected.sort(key=lambda x: x["kwh"], reverse=True)
+        unprotected.sort(key=lambda x: x["kwh"], reverse=True)
+
+        for entry in protected:
+            claimed = min(entry["kwh"], grid_remaining)
+            if entry["kwh"] > grid_kwh:
+                logger.warning(
+                    "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
+                    "may be a gap block attribution issue or misconfigured sensor. "
+                    "Recording as-is.",
+                    entry["meter_name"], entry["kwh"], grid_kwh,
+                )
+                claimed = entry["kwh"]  # do not clip — preserve energy
+            elif claimed < entry["kwh"]:
+                logger.warning(
+                    "PASS 2: %s protected load %.4f kWh clipped to %.4f kWh",
+                    entry["meter_name"], entry["kwh"], claimed,
+                )
+            grid_remaining = max(grid_remaining - claimed, 0.0)
+            entry["sub_import"]["kwh_grid"]    = claimed
+            entry["sub_import"]["kwh_battery"] = entry["kwh"] - claimed
+            entry["sub_import"]["cost"]        = round(claimed * parent_rate, 6)
+            logger.info(
+                "PASS 2: %s protected  grid=%.4f  battery=%.4f",
+                entry["meter_name"], claimed, entry["sub_import"]["kwh_battery"],
+            )
+
+        for entry in unprotected:
+            claimed    = min(entry["kwh"], grid_remaining)
+            battery    = entry["kwh"] - claimed
+            if entry["kwh"] > grid_kwh:
+                logger.warning(
+                    "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
+                    "may be a gap block attribution issue or misconfigured sensor. "
+                    "Recording as-is.",
+                    entry["meter_name"], entry["kwh"], grid_kwh,
+                )
+                claimed = entry["kwh"]  # do not clip — preserve energy
+                battery = 0.0
+            grid_remaining = max(grid_remaining - claimed, 0.0)
+            entry["sub_import"]["kwh_grid"]    = claimed
+            entry["sub_import"]["kwh_battery"] = battery
+            entry["sub_import"]["cost"]        = round(claimed * parent_rate, 6)
+            logger.info(
+                "PASS 2: %s unprotected  grid=%.4f  battery=%.4f",
+                entry["meter_name"], claimed, battery,
+            )
+
+        remainder_kwh  = max(grid_remaining, 0.0)
+        remainder_cost = round(remainder_kwh * parent_rate, 6)
+        parent_import["kwh_total"]      = grid_kwh
+        parent_import["kwh_remainder"]  = remainder_kwh
+        parent_import["cost_remainder"] = remainder_cost
+        parent_import["rate_used"]      = parent_rate
+        logger.info(
+            "PASS 2: %s  grid=%.4f kWh  remainder=%.4f kWh",
+            parent_meter_name, grid_kwh, remainder_kwh,
+        )
+
 
 def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: bool = False,
                    last_known_rates: dict | None = None):
@@ -1021,82 +1156,7 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
                 parent_sub_cost[parent_name] = parent_sub_cost.get(parent_name, 0.0) + sub_import["cost"]
 
     # ── PASS 2 — grid-authoritative sub-meter distribution ────────────────
-    for parent_meter_name, sub_kwh_total in parent_sub_kwh.items():
-        parent_block  = block["meters"].get(parent_meter_name)
-        if not parent_block:
-            continue
-        parent_import = parent_block["channels"].get("import")
-        if not parent_import:
-            continue
-
-        grid_kwh      = parent_import.get("kwh", 0.0)
-        parent_rate   = parent_import.get("rate", 0.0)
-        grid_remaining = grid_kwh
-
-        protected   = []
-        unprotected = []
-
-        for meter_name, meter_block in block["meters"].items():
-            meta = meter_block.get("meta", {})
-            if not meta.get("sub_meter") or meta.get("parent_meter") != parent_meter_name:
-                continue
-            sub_import = meter_block["channels"].get("import")
-            if not sub_import:
-                continue
-            delta = sub_import.get("kwh", 0.0)
-            if meta.get("v2x_capable") and delta < 0:
-                logger.info("PASS 2: %s discharging %.4f kWh (V2X), excluded", meter_name, abs(delta))
-                continue
-            if delta == 0.0:
-                continue
-            entry = {
-                "meter_name": meter_name, "meter_block": meter_block,
-                "sub_import": sub_import, "kwh": delta,
-            }
-            (protected if not meta.get("inverter_possible", False) else unprotected).append(entry)
-
-        protected.sort(key=lambda x: x["kwh"], reverse=True)
-        unprotected.sort(key=lambda x: x["kwh"], reverse=True)
-
-        for entry in protected:
-            claimed = min(entry["kwh"], grid_remaining)
-            if claimed < entry["kwh"]:
-                logger.warning(
-                    "PASS 2: %s protected load %.4f kWh clipped to %.4f kWh",
-                    entry["meter_name"], entry["kwh"], claimed,
-                )
-            grid_remaining = max(grid_remaining - claimed, 0.0)
-            entry["sub_import"]["kwh_grid"]    = claimed
-            entry["sub_import"]["kwh_battery"] = entry["kwh"] - claimed
-            entry["sub_import"]["cost"]        = round(claimed * parent_rate, 6)
-            logger.info(
-                "PASS 2: %s protected  grid=%.4f  battery=%.4f",
-                entry["meter_name"], claimed, entry["sub_import"]["kwh_battery"],
-            )
-
-        for entry in unprotected:
-            claimed        = min(entry["kwh"], grid_remaining)
-            battery        = entry["kwh"] - claimed
-            grid_remaining = max(grid_remaining - claimed, 0.0)
-            entry["sub_import"]["kwh_grid"]    = claimed
-            entry["sub_import"]["kwh_battery"] = battery
-            entry["sub_import"]["cost"]        = round(claimed * parent_rate, 6)
-            logger.info(
-                "PASS 2: %s unprotected  grid=%.4f  battery=%.4f",
-                entry["meter_name"], claimed, battery,
-            )
-
-        remainder_kwh  = max(grid_remaining, 0.0)
-        remainder_cost = round(remainder_kwh * parent_rate, 6)
-        parent_import["kwh_total"]     = grid_kwh
-        parent_import["kwh_remainder"] = remainder_kwh
-        parent_import["cost_remainder"] = remainder_cost
-        parent_import["rate_used"]     = parent_rate
-        logger.info(
-            "PASS 2: %s  grid=%.4f kWh  remainder=%.4f kWh",
-            parent_meter_name, grid_kwh, remainder_kwh,
-        )
-
+    _apply_pass2(block)
     # ── PASS 3 — compute block totals ─────────────────────────────────────
     for meter_name, meter_block in block["meters"].items():
         meta = meter_block["meta"]
@@ -1147,6 +1207,28 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
         logger.warning("finalise_block: carbon_g computation failed: %s", e)
 
     append_block(block)
+
+    # ── PASS 3c — store generation mix for each meter block ─────────────
+    try:
+        if postcode and _current_slot_mix:
+            start_iso = block.get("start", "")
+            # Find nearest slot mix by timestamp
+            nearest_key = min(_current_slot_mix.keys(),
+                               key=lambda k: abs(
+                                   datetime.fromisoformat(k).timestamp() -
+                                   datetime.fromisoformat(start_iso).timestamp()
+                               )) if start_iso else None
+            if nearest_key:
+                mix = _current_slot_mix[nearest_key]
+                for meter_name in block.get("meters", {}):
+                    row = _store._conn.execute(
+                        "SELECT id FROM blocks WHERE block_start = ? AND meter_id = ? LIMIT 1",
+                        (start_iso, meter_name)
+                    ).fetchone()
+                    if row:
+                        _store.upsert_generation_mix(row["id"], mix)
+    except Exception as _gme:
+        logger.debug("finalise_block: generation mix storage failed: %s", _gme)
 
     # ── PASS 4 — update cumulative totals (derived from DB, no JSON file) ───
     engine_totals = _store.get_cumulative_totals()
@@ -1265,11 +1347,16 @@ def _get_postcode() -> str | None:
         for m_data in cfg.get("meters", {}).values():
             meta = (m_data or {}).get("meta", {}) or {}
             if not meta.get("sub_meter"):
-                pc = meta.get("postcode_prefix", "").strip().upper()
+                pc = _normalise_postcode(meta.get("postcode_prefix", ""))
                 return pc if pc else None
     except Exception:
         pass
     return None
+
+
+def _normalise_postcode(raw: str) -> str:
+    """Strip full postcode to outward code only. 'DE1 3AT' → 'DE1', 'SW1A 2AA' → 'SW1A'."""
+    return raw.strip().upper().split()[0] if raw and raw.strip() else ""
 
 
 def _fetch_carbon_intensity(postcode: str) -> list:
@@ -1302,16 +1389,19 @@ def _fetch_carbon_intensity(postcode: str) -> list:
 
     for slot in entries:
         intensity_obj = slot.get("intensity", {})
-        intensity_val = intensity_obj.get("forecast")
+        forecast      = intensity_obj.get("forecast")
+        actual        = intensity_obj.get("actual")    # None until ~24hr after slot
         ci_index      = intensity_obj.get("index")
         slot_from     = slot.get("from")
-        if slot_from and intensity_val is not None:
-            # Normalise to plain ISO (strip trailing Z)
+        if slot_from and (forecast is not None or actual is not None):
             captured_at = slot_from.replace("Z", "").replace("+00:00", "")
             slots.append({
-                "captured_at": captured_at,
-                "intensity":   float(intensity_val),
-                "ci_index":    ci_index,
+                "captured_at":       captured_at,
+                "intensity":         float(actual if actual is not None else forecast),
+                "intensity_forecast": float(forecast) if forecast is not None else None,
+                "intensity_actual":   float(actual)   if actual   is not None else None,
+                "ci_index":          ci_index,
+                "generationmix":     slot.get("generationmix", []),
             })
 
     return slots
@@ -1341,8 +1431,11 @@ async def _tick_carbon_intensity() -> float | None:
         for slot in slots:
             _store.upsert_carbon_intensity(
                 slot["captured_at"], postcode,
-                slot["intensity"], slot["ci_index"]
+                slot["intensity_forecast"], slot["ci_index"],
+                slot["intensity_actual"]
             )
+            if slot.get("generationmix"):
+                _current_slot_mix[slot["captured_at"]] = slot["generationmix"]
         _store.prune_carbon_intensity(days=4)
         _last_ci_fetch = now
         logger.info("_tick_carbon_intensity: stored %d slots for %s", len(slots), postcode)
@@ -1598,6 +1691,203 @@ async def _engine_tick(ha: HAClient):
 # Startup  (replaces @time_trigger("startup"))
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def _backfill_carbon_gaps(store, cfg: dict) -> None:
+    """
+    Backfill NULL carbon_g blocks from the National Grid ESO historical API.
+    - First time a postcode is configured: backfills up to 60 days
+    - Subsequent restarts: only checks last 48 hours (matches CI prune window)
+    Only runs if a postcode is configured.
+    """
+    import urllib.request
+    import json as _json
+
+    postcode = _normalise_postcode(
+        cfg.get("meters", {})
+           .get("electricity_main", {})
+           .get("meta", {})
+           .get("postcode_prefix", "")
+    )
+    if not postcode:
+        return
+
+    # Determine if this is first run for this postcode
+    first_run = True
+    try:
+        meta_row = store._conn.execute(
+            "SELECT value FROM store_meta WHERE key = 'carbon_backfill_done'"
+        ).fetchone()
+        if meta_row and meta_row["value"] == postcode:
+            first_run = False
+    except Exception:
+        pass
+
+    # Window: full 60 days on first run, 48 hours on subsequent restarts
+    lookback_hours = 60 * 24 if first_run else 48
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+              ).strftime("%Y-%m-%dT%H:%M:%S")
+
+    null_rows = store._conn.execute(
+        """SELECT DISTINCT strftime('%Y-%m-%dT%H:00:00', block_start) as hour
+           FROM blocks
+           WHERE carbon_g IS NULL
+             AND meter_id = 'electricity_main'
+             AND block_start >= ?
+           ORDER BY hour""",
+        (cutoff,)
+    ).fetchall()
+
+    if not null_rows:
+        if first_run:
+            # Mark complete so future restarts use 48hr window
+            try:
+                with store._conn:
+                    store._conn.execute(
+                        "INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)",
+                        ("carbon_backfill_done", postcode)
+                    )
+            except Exception:
+                pass
+        logger.info("_backfill_carbon_gaps: no NULL carbon_g blocks found")
+        return
+
+    logger.info("_backfill_carbon_gaps: %d hour windows to backfill for %s (%s)",
+                len(null_rows), postcode, "first run" if first_run else "48hr check")
+
+    fetched_windows = set()
+    total_slots = 0
+    _slot_mix   = {}  # captured_at → generationmix list
+
+    for row in null_rows:
+        hour_str = row["hour"]
+        hour_dt  = datetime.fromisoformat(hour_str)
+        win_key  = hour_str[:13]
+        if win_key in fetched_windows:
+            continue
+        fetched_windows.add(win_key)
+
+        existing = store._conn.execute(
+            """SELECT intensity_actual FROM carbon_intensity
+               WHERE postcode = ?
+                 AND captured_at BETWEEN ? AND ?
+               LIMIT 1""",
+            (postcode,
+             (hour_dt - timedelta(minutes=30)).isoformat(),
+             (hour_dt + timedelta(minutes=30)).isoformat())
+        ).fetchone()
+        # Skip if we already have actual data for this window
+        # (forecast-only rows should still be fetched when slot is old enough for actuals)
+        hours_ago = (datetime.now(timezone.utc).replace(tzinfo=None) - hour_dt).total_seconds() / 3600
+        if existing and existing["intensity_actual"] is not None:
+            continue
+        if existing and hours_ago < 12:
+            # Too recent for actuals — skip, we have forecast already
+            continue
+
+        from_iso = hour_dt.strftime("%Y-%m-%dT%H:%MZ")
+        to_iso   = (hour_dt + timedelta(hours=48)).strftime("%Y-%m-%dT%H:%MZ")
+        # Mark all hours in this 48h window as fetched to avoid duplicate calls
+        for h in range(48):
+            fetched_windows.add((hour_dt + timedelta(hours=h)).strftime("%Y-%m-%dT%H"))
+
+        url = (f"https://api.carbonintensity.org.uk/regional/intensity"
+               f"/{from_iso}/{to_iso}/postcode/{postcode}")
+
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = _json.loads(resp.read())
+
+            raw = data.get("data", [])
+            if isinstance(raw, dict):
+                entries = raw.get("data", [])
+            elif isinstance(raw, list) and raw:
+                entries = raw[0].get("data", []) if "data" in raw[0] else raw
+            else:
+                entries = []
+
+            slots_stored = 0
+            for slot in entries:
+                intensity_obj    = slot.get("intensity", {})
+                forecast         = intensity_obj.get("forecast")
+                actual           = intensity_obj.get("actual")
+                ci_index         = intensity_obj.get("index")
+                slot_from        = slot.get("from")
+                if slot_from and (forecast is not None or actual is not None):
+                    captured_at = slot_from.replace("Z", "").replace("+00:00", "")
+                    store.upsert_carbon_intensity(
+                        captured_at, postcode,
+                        float(forecast) if forecast is not None else None,
+                        ci_index,
+                        float(actual) if actual is not None else None
+                    )
+                    gen_mix = slot.get("generationmix", [])
+                    if gen_mix:
+                        _slot_mix[captured_at] = gen_mix
+                    slots_stored += 1
+            total_slots += slots_stored
+            logger.info("_backfill_carbon_gaps: fetched %d slots from %s",
+                        slots_stored, from_iso)
+
+        except Exception as e:
+            logger.warning("_backfill_carbon_gaps: API fetch failed for %s: %s", from_iso, e)
+
+        await asyncio.sleep(0.5)
+
+    # Recompute carbon_g for NULL blocks in window — main meter and sub-meters
+    if total_slots > 0:
+        updated = 0
+        null_blocks = store._conn.execute(
+            """SELECT id, meter_id, block_start, imp_kwh, exp_kwh
+               FROM blocks
+               WHERE carbon_g IS NULL
+                 AND block_start >= ?""",
+            (cutoff,)
+        ).fetchall()
+
+        with store._conn:
+            for block in null_blocks:
+                ci_row = store.get_nearest_carbon_intensity(block["block_start"], postcode)
+                if not ci_row or ci_row.get("intensity") is None:
+                    continue
+                imp_kwh   = block["imp_kwh"] or 0.0
+                exp_kwh   = block["exp_kwh"] or 0.0
+                intensity = float(ci_row["intensity"])
+                if block["meter_id"] == "electricity_main":
+                    carbon_g = round((imp_kwh - exp_kwh) * intensity, 4)
+                else:
+                    carbon_g = round(imp_kwh * intensity, 4)
+                store._conn.execute(
+                    "UPDATE blocks SET carbon_g = ? WHERE id = ?",
+                    (carbon_g, block["id"])
+                )
+                # Store generation mix for this block using nearest slot mix
+                captured_at = ci_row.get("captured_at")
+                if captured_at and captured_at in _slot_mix:
+                    store.upsert_generation_mix(block["id"], _slot_mix[captured_at])
+                elif _slot_mix:
+                    # Find nearest slot mix by timestamp
+                    nearest_key = min(_slot_mix.keys(),
+                                      key=lambda k: abs(
+                                          datetime.fromisoformat(k).timestamp() -
+                                          datetime.fromisoformat(block["block_start"]).timestamp()
+                                      ))
+                    store.upsert_generation_mix(block["id"], _slot_mix[nearest_key])
+                updated += 1
+        logger.info("_backfill_carbon_gaps: updated carbon_g on %d blocks", updated)
+    else:
+        logger.info("_backfill_carbon_gaps: no new CI data fetched")
+
+    # Mark complete — future restarts use 48hr window only
+    try:
+        with store._conn:
+            store._conn.execute(
+                "INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)",
+                ("carbon_backfill_done", postcode)
+            )
+    except Exception:
+        pass
+
+
 async def engine_startup(ha: HAClient):
     """
     Run once when the add-on starts.
@@ -1784,7 +2074,8 @@ async def engine_startup(ha: HAClient):
                 for slot in slots:
                     _store.upsert_carbon_intensity(
                         slot["captured_at"], postcode,
-                        slot["intensity"], slot["ci_index"]
+                        slot["intensity_forecast"], slot["ci_index"],
+                        slot["intensity_actual"]
                     )
                 _store.prune_carbon_intensity(days=4)
                 return len(slots)
@@ -1884,6 +2175,14 @@ async def engine_startup(ha: HAClient):
             # Record this version so we don't backup again until next upgrade
             with open(_ver_file, "w") as _vfw:
                 _vfw.write(_cur_ver)
+            # Clear CI backfill flag so historical backfill runs once for new version
+            try:
+                with _store._conn:
+                    _store._conn.execute(
+                        "DELETE FROM store_meta WHERE key = 'carbon_backfill_done'"
+                    )
+            except Exception:
+                pass
             logger.info(
                 "engine_startup: upgrade backup created for v%s: %s",
                 _cur_ver, os.path.basename(_bk_path)
@@ -2098,6 +2397,12 @@ async def engine_startup(ha: HAClient):
                     logger.info("engine_startup: gap marker set, will fill on first sensor capture")
             else:
                 logger.info("engine_startup: no session gap detected")
+
+    # ── CI gap backfill ──────────────────────────────────────────────────
+    try:
+        await _backfill_carbon_gaps(_store, config)
+    except Exception as _e:
+        logger.warning("engine_startup: CI backfill failed: %s", _e)
 
     # ── Startup charts ───────────────────────────────────────────────────
     generate_charts(_store)
