@@ -18,7 +18,8 @@ import unittest
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(__file__))
-from block_store import BlockStore, open_block_store, migrate_json_to_sqlite
+from block_store import (BlockStore, open_block_store, migrate_json_to_sqlite,
+                          local_date_to_utc_bounds, local_date_range_to_utc_bounds)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -235,10 +236,10 @@ class TestSchema(unittest.TestCase):
         )
         indexes = {r["name"] for r in cur.fetchall()}
         self.assertIn("idx_blocks_start", indexes)
-        self.assertIn("idx_blocks_date", indexes)
-        self.assertIn("idx_blocks_ym", indexes)
         self.assertIn("idx_blocks_meter", indexes)
         self.assertIn("idx_reads_captured", indexes)
+        self.assertNotIn("idx_blocks_date", indexes)
+        self.assertNotIn("idx_blocks_ym", indexes)
         store.close()
 
 
@@ -561,30 +562,38 @@ class TestQueryMethods(unittest.TestCase):
         self.assertEqual(len(blocks), 0)
 
     def test_get_blocks_for_date(self):
-        blocks = self.store.get_blocks_for_date("2026-03-02")
+        s, e = local_date_to_utc_bounds('2026-03-02', 'UTC')
+        blocks = self.store.get_blocks_for_utc_range(s, e)
         self.assertEqual(len(blocks), 48)
 
     def test_get_blocks_for_date_no_match(self):
-        blocks = self.store.get_blocks_for_date("2026-04-01")
+        s, e = local_date_to_utc_bounds('2026-04-01', 'UTC')
+        blocks = self.store.get_blocks_for_utc_range(s, e)
         self.assertEqual(len(blocks), 0)
 
     def test_get_blocks_for_month(self):
-        blocks = self.store.get_blocks_for_month(2026, 3)
+        s, e = local_date_range_to_utc_bounds('2026-03-01', '2026-03-31', 'UTC')
+        blocks = self.store.get_blocks_for_utc_range(s, e)
         self.assertEqual(len(blocks), 48 * 3)
 
     def test_get_blocks_for_month_no_match(self):
-        blocks = self.store.get_blocks_for_month(2025, 1)
+        s, e = local_date_range_to_utc_bounds('2025-01-01', '2025-01-31', 'UTC')
+        blocks = self.store.get_blocks_for_utc_range(s, e)
         self.assertEqual(len(blocks), 0)
 
-    def test_get_local_dates(self):
-        dates = self.store.get_local_dates()
+    def test_get_dates_in_utc_range(self):
+        dates = self.store.get_dates_in_utc_range(
+            "2026-03-01T00:00:00", "2026-03-04T00:00:00", "Europe/London"
+        )
         self.assertEqual(len(dates), 3)
         self.assertIn("2026-03-01", dates)
         self.assertIn("2026-03-02", dates)
         self.assertIn("2026-03-03", dates)
 
-    def test_get_local_dates_ordered(self):
-        dates = self.store.get_local_dates()
+    def test_get_dates_in_utc_range_ordered(self):
+        dates = self.store.get_dates_in_utc_range(
+            "2026-03-01T00:00:00", "2026-03-04T00:00:00", "Europe/London"
+        )
         self.assertEqual(dates, sorted(dates))
 
 
@@ -744,23 +753,26 @@ class TestLocalDate(unittest.TestCase):
         # 2026-03-15 00:00:00 UTC = 2026-03-15 00:00:00 GMT (no DST yet)
         block = make_block("2026-03-15T00:00:00")
         self.store.append_block(block)
-        dates = self.store.get_local_dates()
+        dates = self.store.get_dates_in_utc_range("2026-03-15T00:00:00", "2026-03-16T00:00:00", "Europe/London")
         self.assertIn("2026-03-15", dates)
 
     def test_late_utc_before_dst_is_same_date(self):
         # 2026-03-14 23:30:00 UTC = 2026-03-14 23:30:00 GMT
         block = make_block("2026-03-14T23:30:00")
         self.store.append_block(block)
-        dates = self.store.get_local_dates()
+        dates = self.store.get_dates_in_utc_range("2026-03-14T00:00:00", "2026-03-15T00:00:00", "Europe/London")
         self.assertIn("2026-03-14", dates)
 
     def test_blocks_for_date_uses_local_not_utc(self):
         # 2026-03-29 00:30 UTC = 01:30 BST (BST starts at 01:00 UTC on 29th)
-        # So local London date is 2026-03-29, not 2026-03-28
+        # So local London date is 2026-03-29
+        # UTC bounds for Mar 29 BST: 2026-03-29T00:00:00 → 2026-03-29T23:00:00
         block = make_block("2026-03-29T00:30:00")
         self.store.append_block(block)
-        blocks_29 = self.store.get_blocks_for_date("2026-03-29")
-        blocks_28 = self.store.get_blocks_for_date("2026-03-28")
+        s29, e29 = local_date_to_utc_bounds("2026-03-29", "Europe/London")
+        s28, e28 = local_date_to_utc_bounds("2026-03-28", "Europe/London")
+        blocks_29 = self.store.get_blocks_for_utc_range(s29, e29)
+        blocks_28 = self.store.get_blocks_for_utc_range(s28, e28)
         self.assertEqual(len(blocks_29), 1)
         self.assertEqual(len(blocks_28), 0)
 
@@ -1035,25 +1047,17 @@ class TestBillingTotalsVsBlockMethod(unittest.TestCase):
         ).fetchone()["id"]
 
     def _insert_block(self, block_start_iso, imp_kwh, imp_cost, exp_kwh, exp_cost, standing):
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        tz = ZoneInfo("Europe/London")
-        bs = datetime.fromisoformat(block_start_iso)
-        local_date = bs.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz).date().isoformat()
         self.store._conn.execute("""
             INSERT INTO blocks
-            (block_start, block_end, local_date, local_year, local_month, local_day,
+            (block_start, block_end,
              meter_id, config_period_id, interpolated,
-             imp_kwh, imp_kwh_grid, imp_kwh_remainder,
-             imp_rate, imp_cost, imp_cost_remainder,
-             imp_read_start, imp_read_end,
+             imp_kwh, imp_rate, imp_cost,
              exp_kwh, exp_rate, exp_cost,
-             exp_read_start, exp_read_end, standing_charge)
-            VALUES (?,?,?,?,?,?,?,?,?, ?,NULL,NULL, NULL,?,NULL, NULL,NULL, ?,NULL,?, NULL,NULL,?)
+             standing_charge)
+            VALUES (?,?,?,?,0, ?,NULL,?, ?,NULL,?, ?)
         """, (
-            block_start_iso, block_start_iso, local_date,
-            int(local_date[:4]), int(local_date[5:7]), int(local_date[8:10]),
-            "electricity_main", self.cp_id, 0,
+            block_start_iso, block_start_iso,
+            "electricity_main", self.cp_id,
             imp_kwh, imp_cost, exp_kwh, exp_cost, standing
         ))
         self.store._conn.commit()
@@ -1075,11 +1079,9 @@ class TestBillingTotalsVsBlockMethod(unittest.TestCase):
         for bd in blocks_data:
             self._insert_block(*bd)
 
-        start = datetime(2026, 3, 1, 0, 0, 0)
-        end   = datetime(2026, 3, 4, 0, 0, 0)
-
-        # SQL method
-        sql_t = self.store.get_billing_totals_for_range(start, end)
+        # SQL method — UTC range covering Mar 1-3 GMT
+        utc_s, utc_e = local_date_range_to_utc_bounds("2026-03-01", "2026-03-03", "Europe/London")
+        sql_t = self.store.get_billing_totals_for_utc_range(utc_s, utc_e, "Europe/London")
 
         # Expected from manual calculation
         self.assertAlmostEqual(sql_t["imp_kwh"],  1.0+1.2+0.8+0.9+1.1+0.7, places=3)
@@ -1100,22 +1102,24 @@ class TestBillingTotalsVsBlockMethod(unittest.TestCase):
         self._insert_block("2026-04-01T23:00:00", 1.0, 0.245, 0.0, 0.0, 0.60)
         self._insert_block("2026-04-02T00:00:00", 0.5, 0.122, 0.0, 0.0, 0.60)
 
-        # Test get_billing_totals_for_local_date_range (local_date-based, correct)
-        sql_t = self.store.get_billing_totals_for_local_date_range("2026-04-02", "2026-04-02")
+        # Use UTC bounds for BST Apr 2 — correctly includes 23:00 UTC Apr 1 block
+        utc_s, utc_e = local_date_range_to_utc_bounds("2026-04-02", "2026-04-02", "Europe/London")
+        sql_t = self.store.get_billing_totals_for_utc_range(utc_s, utc_e, "Europe/London")
         self.assertAlmostEqual(sql_t["standing"], 0.60, places=3,
                                msg="Blocks crossing UTC midnight but same BST day should count once")
         self.assertAlmostEqual(sql_t["imp_kwh"], 1.5, places=3,
-                               msg="Both BST blocks should be included in local_date range")
+                               msg="Both BST blocks should be included in UTC range for Apr 2 BST")
 
-    def test_bst_block_included_in_local_date_range(self):
-        """get_blocks_for_local_date_range includes 23:xx UTC blocks for the next local day."""
-        self._insert_block("2026-04-01T23:00:00", 2.0, 0.490, 0.0, 0.0, 0.50)  # local_date Apr 2
-        self._insert_block("2026-04-02T00:00:00", 1.0, 0.245, 0.0, 0.0, 0.50)  # local_date Apr 2
+    def test_bst_block_included_in_utc_range(self):
+        """get_blocks_for_utc_range includes 23:xx UTC blocks for the next local day when using UTC bounds."""
+        self._insert_block("2026-04-01T23:00:00", 2.0, 0.490, 0.0, 0.0, 0.50)  # BST Apr 2
+        self._insert_block("2026-04-02T00:00:00", 1.0, 0.245, 0.0, 0.0, 0.50)  # BST Apr 2
 
-        # local_date range Apr 2 only → should get BOTH blocks (1st is 23:00 UTC Apr 1)
-        blocks = self.store.get_blocks_for_local_date_range("2026-04-02", "2026-04-02")
+        # UTC bounds for BST Apr 2 = 2026-04-01T23:00:00 → 2026-04-02T23:00:00
+        utc_s, utc_e = local_date_range_to_utc_bounds("2026-04-02", "2026-04-02", "Europe/London")
+        blocks = self.store.get_blocks_for_utc_range(utc_s, utc_e)
         self.assertEqual(len(blocks), 2,
-                         "get_blocks_for_local_date_range should include 23:00 UTC block via local_date")
+                         "get_blocks_for_utc_range should include 23:00 UTC block for BST Apr 2")
 
         # block_start range Apr 2 00:00 → would miss the 23:00 UTC block
         from datetime import datetime
@@ -1343,18 +1347,14 @@ class TestCurrentBlock(unittest.TestCase):
             "SELECT id FROM config_periods LIMIT 1"
         ).fetchone()["id"]
         self.store._conn.execute("""
-            INSERT INTO blocks (block_start, block_end, local_date, local_year,
-            local_month, local_day, meter_id, config_period_id, interpolated,
+            INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, interpolated,
             imp_kwh, imp_cost, exp_kwh, exp_cost, standing_charge)
-            VALUES ('2026-01-01T00:00:00','2026-01-01T00:30:00','2026-01-01',
-            2026,1,1,'electricity_main',?,0, 1.5,0.368, 0.3,0.024, 0.5)
+            VALUES ('2026-01-01T00:00:00','2026-01-01T00:30:00','electricity_main',?,0, 1.5,0.368, 0.3,0.024, 0.5)
         """, (cp_id,))
         self.store._conn.execute("""
-            INSERT INTO blocks (block_start, block_end, local_date, local_year,
-            local_month, local_day, meter_id, config_period_id, interpolated,
+            INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, interpolated,
             imp_kwh, imp_cost, exp_kwh, exp_cost, standing_charge)
-            VALUES ('2026-01-01T00:30:00','2026-01-01T01:00:00','2026-01-01',
-            2026,1,1,'electricity_main',?,0, 2.0,0.490, 0.0,0.0, 0.5)
+            VALUES ('2026-01-01T00:30:00','2026-01-01T01:00:00','electricity_main',?,0, 2.0,0.490, 0.0,0.0, 0.5)
         """, (cp_id,))
         self.store._conn.commit()
 
@@ -1366,7 +1366,7 @@ class TestCurrentBlock(unittest.TestCase):
 
     def test_billing_totals_no_double_counting(self):
         """
-        get_billing_totals_for_local_date_range must not double-count sub-meters.
+        get_billing_totals_for_utc_range must not double-count sub-meters.
         electricity_main.imp_kwh already includes sub-meter consumption.
         """
         cfg = {"meters": {
@@ -1391,22 +1391,18 @@ class TestCurrentBlock(unittest.TestCase):
         # main: 3.0 kWh total, remainder=1.0 (house), cost=0.735
         # ev:   2.0 kWh, all from grid, no independent cost
         self.store._conn.execute("""
-            INSERT INTO blocks (block_start, block_end, local_date, local_year,
-            local_month, local_day, meter_id, config_period_id, interpolated,
+            INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, interpolated,
             imp_kwh, imp_kwh_remainder, imp_cost, exp_kwh, exp_cost, standing_charge)
-            VALUES ('2026-01-01T00:00:00','2026-01-01T00:30:00','2026-01-01',
-            2026,1,1,'electricity_main',?,0, 3.0,1.0,0.735, 0.2,0.024, 0.5)
+            VALUES ('2026-01-01T00:00:00','2026-01-01T00:30:00','electricity_main',?,0, 3.0,1.0,0.735, 0.2,0.024, 0.5)
         """, (cp_id,))
         self.store._conn.execute("""
-            INSERT INTO blocks (block_start, block_end, local_date, local_year,
-            local_month, local_day, meter_id, config_period_id, interpolated,
+            INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, interpolated,
             imp_kwh, imp_kwh_grid, imp_cost, exp_kwh, exp_cost, standing_charge)
-            VALUES ('2026-01-01T00:00:00','2026-01-01T00:30:00','2026-01-01',
-            2026,1,1,'ev_charger',?,0, 2.0,2.0,0.0, 0.0,0.0, 0.0)
+            VALUES ('2026-01-01T00:00:00','2026-01-01T00:30:00','ev_charger',?,0, 2.0,2.0,0.0, 0.0,0.0, 0.0)
         """, (cp_id,))
         self.store._conn.commit()
 
-        t = self.store.get_billing_totals_for_local_date_range('2026-01-01', '2026-01-01')
+        t = self.store.get_billing_totals_for_utc_range(*local_date_range_to_utc_bounds('2026-01-01', '2026-01-01', 'UTC'))
 
         # imp_kwh: remainder(1.0) + ev_grid(2.0) = 3.0, NOT 3.0+2.0=5.0
         self.assertAlmostEqual(t["imp_kwh"], 3.0, places=3,
@@ -1453,18 +1449,14 @@ class TestCurrentBlock(unittest.TestCase):
         # main: imp_kwh=3.0, imp_kwh_remainder=1.0 (house only), imp_cost=0.735
         # ev:   imp_kwh=2.0, imp_kwh_grid=2.0 (all from grid), no independent cost
         self.store._conn.execute("""
-            INSERT INTO blocks (block_start, block_end, local_date, local_year,
-            local_month, local_day, meter_id, config_period_id, interpolated,
+            INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, interpolated,
             imp_kwh, imp_kwh_remainder, imp_cost, exp_kwh, exp_cost, standing_charge)
-            VALUES ('2026-01-01T00:00:00','2026-01-01T00:30:00','2026-01-01',
-            2026,1,1,'electricity_main',?,0, 3.0,1.0,0.735, 0.0,0.0, 0.5)
+            VALUES ('2026-01-01T00:00:00','2026-01-01T00:30:00','electricity_main',?,0, 3.0,1.0,0.735, 0.0,0.0, 0.5)
         """, (cp_id,))
         self.store._conn.execute("""
-            INSERT INTO blocks (block_start, block_end, local_date, local_year,
-            local_month, local_day, meter_id, config_period_id, interpolated,
+            INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, interpolated,
             imp_kwh, imp_kwh_grid, imp_cost, exp_kwh, exp_cost, standing_charge)
-            VALUES ('2026-01-01T00:00:00','2026-01-01T00:30:00','2026-01-01',
-            2026,1,1,'ev_charger',?,0, 2.0,2.0,0.0, 0.0,0.0, 0.0)
+            VALUES ('2026-01-01T00:00:00','2026-01-01T00:30:00','ev_charger',?,0, 2.0,2.0,0.0, 0.0,0.0, 0.0)
         """, (cp_id,))
         self.store._conn.commit()
 
@@ -1512,9 +1504,7 @@ class TestUpgradePaths(unittest.TestCase):
                 currency_symbol TEXT, currency_code TEXT, site_name TEXT,
                 change_reason TEXT, full_config_json TEXT NOT NULL)""")
             conn.execute("""CREATE TABLE blocks (
-                id INTEGER PRIMARY KEY, block_start TEXT, block_end TEXT,
-                local_date TEXT NOT NULL, local_year INTEGER, local_month INTEGER,
-                local_day INTEGER, meter_id TEXT, config_period_id INTEGER,
+                id INTEGER PRIMARY KEY, block_start TEXT, block_end TEXT, meter_id TEXT, config_period_id INTEGER,
                 interpolated INTEGER, imp_kwh REAL, imp_cost REAL,
                 exp_kwh REAL, exp_cost REAL, standing_charge REAL NOT NULL DEFAULT 0)""")
             conn.commit()
@@ -1824,9 +1814,7 @@ class TestMigration(unittest.TestCase):
             site_name TEXT, change_reason TEXT,
             full_config_json TEXT NOT NULL)""")
         conn.execute("""CREATE TABLE blocks (
-            id INTEGER PRIMARY KEY, block_start TEXT, block_end TEXT,
-            local_date TEXT NOT NULL, local_year INTEGER, local_month INTEGER,
-            local_day INTEGER, meter_id TEXT, config_period_id INTEGER,
+            id INTEGER PRIMARY KEY, block_start TEXT, block_end TEXT, meter_id TEXT, config_period_id INTEGER,
             interpolated INTEGER, imp_kwh REAL, imp_cost REAL,
             exp_kwh REAL, exp_cost REAL, standing_charge REAL NOT NULL DEFAULT 0)""")
         conn.execute("""CREATE TABLE meters (
@@ -2068,23 +2056,19 @@ class TestBillingTotalsSubMeterNullGrid(unittest.TestCase):
         """
         # main: 13.0 kWh raw, 2.5 remainder
         self.store._conn.execute("""
-            INSERT INTO blocks (block_start, block_end, local_date, local_year,
-            local_month, local_day, meter_id, config_period_id, interpolated,
+            INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, interpolated,
             imp_kwh, imp_kwh_remainder, imp_cost, standing_charge)
-            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','2026-03-01',
-            2026,3,1,'electricity_main',?,0, 13.0,2.5,1.17,0.5)
+            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','electricity_main',?,0, 13.0,2.5,1.17,0.5)
         """, (self.cp,))
         # battery: 10.5 kWh raw but imp_kwh_grid=NULL (older block)
         self.store._conn.execute("""
-            INSERT INTO blocks (block_start, block_end, local_date, local_year,
-            local_month, local_day, meter_id, config_period_id, interpolated,
+            INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, interpolated,
             imp_kwh, imp_kwh_grid, imp_cost, standing_charge)
-            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','2026-03-01',
-            2026,3,1,'house_battery',?,0, 10.5,NULL,0.0,0.0)
+            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','house_battery',?,0, 10.5,NULL,0.0,0.0)
         """, (self.cp,))
         self.store._conn.commit()
 
-        t = self.store.get_billing_totals_for_local_date_range('2026-03-01', '2026-03-01')
+        t = self.store.get_billing_totals_for_utc_range(*local_date_range_to_utc_bounds('2026-03-01', '2026-03-01', 'UTC'))
 
         # 2.5 (main remainder) + 0 (battery NULL grid → 0) = 2.5, not 2.5+10.5=13.0
         self.assertAlmostEqual(t["imp_kwh"], 2.5, places=3,
@@ -2095,22 +2079,18 @@ class TestBillingTotalsSubMeterNullGrid(unittest.TestCase):
     def test_set_grid_is_included(self):
         """Sub-meter with imp_kwh_grid set should be included in total."""
         self.store._conn.execute("""
-            INSERT INTO blocks (block_start, block_end, local_date, local_year,
-            local_month, local_day, meter_id, config_period_id, interpolated,
+            INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, interpolated,
             imp_kwh, imp_kwh_remainder, imp_cost, standing_charge)
-            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','2026-03-01',
-            2026,3,1,'electricity_main',?,0, 13.0,2.5,1.17,0.5)
+            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','electricity_main',?,0, 13.0,2.5,1.17,0.5)
         """, (self.cp,))
         self.store._conn.execute("""
-            INSERT INTO blocks (block_start, block_end, local_date, local_year,
-            local_month, local_day, meter_id, config_period_id, interpolated,
+            INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, interpolated,
             imp_kwh, imp_kwh_grid, imp_cost, standing_charge)
-            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','2026-03-01',
-            2026,3,1,'house_battery',?,0, 10.5,10.5,0.0,0.0)
+            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','house_battery',?,0, 10.5,10.5,0.0,0.0)
         """, (self.cp,))
         self.store._conn.commit()
 
-        t = self.store.get_billing_totals_for_local_date_range('2026-03-01', '2026-03-01')
+        t = self.store.get_billing_totals_for_utc_range(*local_date_range_to_utc_bounds('2026-03-01', '2026-03-01', 'UTC'))
 
         # 2.5 remainder + 10.5 grid = 13.0 total grid draw
         self.assertAlmostEqual(t["imp_kwh"], 13.0, places=3,
@@ -2119,23 +2099,19 @@ class TestBillingTotalsSubMeterNullGrid(unittest.TestCase):
     def test_cost_from_main_meter_only(self):
         """imp_cost comes from main meter only — it already includes sub-meter costs."""
         self.store._conn.execute("""
-            INSERT INTO blocks (block_start, block_end, local_date, local_year,
-            local_month, local_day, meter_id, config_period_id, interpolated,
+            INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, interpolated,
             imp_kwh, imp_kwh_remainder, imp_cost, standing_charge)
-            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','2026-03-01',
-            2026,3,1,'electricity_main',?,0, 13.0,2.5,1.90,0.5)
+            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','electricity_main',?,0, 13.0,2.5,1.90,0.5)
         """, (self.cp,))
         # Battery: has its own imp_cost but main meter already includes it
         self.store._conn.execute("""
-            INSERT INTO blocks (block_start, block_end, local_date, local_year,
-            local_month, local_day, meter_id, config_period_id, interpolated,
+            INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, interpolated,
             imp_kwh, imp_kwh_grid, imp_cost, standing_charge)
-            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','2026-03-01',
-            2026,3,1,'house_battery',?,0, 10.5,10.5,0.73,0.0)
+            VALUES ('2026-03-01T00:00:00','2026-03-01T00:30:00','house_battery',?,0, 10.5,10.5,0.73,0.0)
         """, (self.cp,))
         self.store._conn.commit()
 
-        t = self.store.get_billing_totals_for_local_date_range('2026-03-01', '2026-03-01')
+        t = self.store.get_billing_totals_for_utc_range(*local_date_range_to_utc_bounds('2026-03-01', '2026-03-01', 'UTC'))
 
         # Total cost = main only (1.90) — sub-meter costs already included in main
         self.assertAlmostEqual(t["imp_cost"], 1.90, places=3,
@@ -2158,20 +2134,19 @@ class TestBlockDeletion(unittest.TestCase):
         }})
         cp_id = store.get_current_config_period_id()
         rows = [
-            ("2026-03-01T00:00:00", "electricity_main", "2026-03-01", 1.0),
-            ("2026-03-01T00:30:00", "electricity_main", "2026-03-01", 1.0),
-            ("2026-03-01T00:00:00", "ev_charger",       "2026-03-01", 0.5),
-            ("2026-03-02T00:00:00", "electricity_main", "2026-03-02", 2.0),
-            ("2026-03-02T00:30:00", "electricity_main", "2026-03-02", 2.0),
-            ("2026-03-03T00:00:00", "electricity_main", "2026-03-03", 3.0),
+            ("2026-03-01T00:00:00", "electricity_main", 1.0),
+            ("2026-03-01T00:30:00", "electricity_main", 1.0),
+            ("2026-03-01T00:00:00", "ev_charger",       0.5),
+            ("2026-03-02T00:00:00", "electricity_main", 2.0),
+            ("2026-03-02T00:30:00", "electricity_main", 2.0),
+            ("2026-03-03T00:00:00", "electricity_main", 3.0),
         ]
-        for (bs, mid, ld, kwh) in rows:
+        for (bs, mid, kwh) in rows:
             store._conn.execute("""
-                INSERT INTO blocks (block_start, block_end, meter_id, config_period_id,
-                  local_date, local_year, local_month, local_day, interpolated,
+                INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, interpolated,
                   imp_kwh, imp_rate, imp_cost, standing_charge)
-                VALUES (?,?,?,?,?,2026,3,1,0,?,0.07,?,0.5)
-            """, (bs, bs, mid, cp_id, ld, kwh, kwh * 0.07))
+                VALUES (?,?,?,?,0,?,0.07,?,0.5)
+            """, (bs, bs, mid, cp_id, kwh, kwh * 0.07))
         store._conn.commit()
         return store
 
@@ -3038,3 +3013,238 @@ class TestFreshInstallNoDuplicatePeriod(unittest.TestCase):
 
         periods = self.store._conn.execute("SELECT COUNT(*) FROM config_periods").fetchone()[0]
         self.assertEqual(periods, 1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# local_date_to_utc_bounds and local_date_range_to_utc_bounds
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestLocalDateToUtcBounds(unittest.TestCase):
+    """
+    Comprehensive tests for local_date_to_utc_bounds() covering:
+    - GMT (winter) days
+    - BST (summer) days
+    - BST start day (23-hour day, clocks forward)
+    - BST end day (25-hour day, clocks back)
+    - UTC timezone (no offset)
+    - Invalid timezone (falls back to UTC)
+    - Multi-day ranges via local_date_range_to_utc_bounds()
+    - Ranges straddling DST transitions
+    - Billing period summation correctness
+    """
+
+    def test_gmt_day(self):
+        """Winter GMT day: midnight-to-midnight UTC."""
+        start, end = local_date_to_utc_bounds('2026-01-15', 'Europe/London')
+        self.assertEqual(start, '2026-01-15T00:00:00')
+        self.assertEqual(end,   '2026-01-16T00:00:00')
+
+    def test_bst_day(self):
+        """Summer BST day: offset -1hr — day starts at 23:00 UTC previous day."""
+        start, end = local_date_to_utc_bounds('2026-07-15', 'Europe/London')
+        self.assertEqual(start, '2026-07-14T23:00:00')
+        self.assertEqual(end,   '2026-07-15T23:00:00')
+
+    def test_bst_start_day(self):
+        """BST starts 29 Mar 2026 — 23-hour day (clocks go forward at 01:00).
+        Mar 29 starts at midnight GMT (00:00 UTC) and ends at 23:00 UTC (Mar 30 midnight BST)."""
+        start, end = local_date_to_utc_bounds('2026-03-29', 'Europe/London')
+        self.assertEqual(start, '2026-03-29T00:00:00')
+        self.assertEqual(end,   '2026-03-29T23:00:00')
+        # Verify it's exactly 23 hours
+        from datetime import datetime
+        s = datetime.fromisoformat(start)
+        e = datetime.fromisoformat(end)
+        self.assertEqual((e - s).total_seconds(), 23 * 3600)
+
+    def test_bst_end_day(self):
+        """BST ends 25 Oct 2026 — 25-hour day (clocks go back at 02:00).
+        Oct 25 starts at 23:00 UTC Oct 24 (midnight BST) and ends at 00:00 UTC Oct 26 (midnight GMT)."""
+        start, end = local_date_to_utc_bounds('2026-10-25', 'Europe/London')
+        self.assertEqual(start, '2026-10-24T23:00:00')
+        self.assertEqual(end,   '2026-10-26T00:00:00')
+        # Verify it's exactly 25 hours
+        from datetime import datetime
+        s = datetime.fromisoformat(start)
+        e = datetime.fromisoformat(end)
+        self.assertEqual((e - s).total_seconds(), 25 * 3600)
+
+    def test_day_before_bst_start(self):
+        """28 Mar 2026 is still GMT — full 24 hours."""
+        start, end = local_date_to_utc_bounds('2026-03-28', 'Europe/London')
+        self.assertEqual(start, '2026-03-28T00:00:00')
+        self.assertEqual(end,   '2026-03-29T00:00:00')
+        from datetime import datetime
+        self.assertEqual(
+            (datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds(),
+            24 * 3600
+        )
+
+    def test_day_after_bst_start(self):
+        """30 Mar 2026 is BST — 24 hours in BST."""
+        start, end = local_date_to_utc_bounds('2026-03-30', 'Europe/London')
+        self.assertEqual(start, '2026-03-29T23:00:00')
+        self.assertEqual(end,   '2026-03-30T23:00:00')
+        from datetime import datetime
+        self.assertEqual(
+            (datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds(),
+            24 * 3600
+        )
+
+    def test_utc_timezone(self):
+        """UTC timezone: always midnight-to-midnight."""
+        start, end = local_date_to_utc_bounds('2026-04-15', 'UTC')
+        self.assertEqual(start, '2026-04-15T00:00:00')
+        self.assertEqual(end,   '2026-04-16T00:00:00')
+
+    def test_invalid_timezone_falls_back_to_utc(self):
+        """Invalid timezone falls back to UTC gracefully."""
+        start, end = local_date_to_utc_bounds('2026-04-15', 'Invalid/Zone')
+        self.assertEqual(start, '2026-04-15T00:00:00')
+        self.assertEqual(end,   '2026-04-16T00:00:00')
+
+    def test_year_boundary(self):
+        """New Year's Eve GMT."""
+        start, end = local_date_to_utc_bounds('2025-12-31', 'Europe/London')
+        self.assertEqual(start, '2025-12-31T00:00:00')
+        self.assertEqual(end,   '2026-01-01T00:00:00')
+
+    def test_leap_day(self):
+        """Feb 29 leap day handled correctly."""
+        start, end = local_date_to_utc_bounds('2028-02-29', 'Europe/London')
+        self.assertEqual(start, '2028-02-29T00:00:00')
+        self.assertEqual(end,   '2028-03-01T00:00:00')
+
+    def test_no_tzinfo_in_output(self):
+        """Output strings must be naive ISO — no Z, no +00:00."""
+        start, end = local_date_to_utc_bounds('2026-06-15', 'Europe/London')
+        self.assertNotIn('Z', start)
+        self.assertNotIn('+', start)
+        self.assertNotIn('Z', end)
+        self.assertNotIn('+', end)
+
+    def test_consecutive_days_are_contiguous(self):
+        """End of day N must equal start of day N+1 — no gaps or overlaps."""
+        _, end_14   = local_date_to_utc_bounds('2026-04-14', 'Europe/London')
+        start_15, _ = local_date_to_utc_bounds('2026-04-15', 'Europe/London')
+        self.assertEqual(end_14, start_15)
+
+    def test_consecutive_days_across_bst_start(self):
+        """No gap between 28 Mar (GMT) and 29 Mar (BST start).
+        Mar 28 ends 2026-03-29T00:00:00, Mar 29 starts 2026-03-29T00:00:00."""
+        _, end_28   = local_date_to_utc_bounds('2026-03-28', 'Europe/London')
+        start_29, _ = local_date_to_utc_bounds('2026-03-29', 'Europe/London')
+        self.assertEqual(end_28, start_29)
+
+    def test_consecutive_days_across_bst_end(self):
+        """No gap between 25 Oct (BST end) and 26 Oct (GMT)."""
+        _, end_25   = local_date_to_utc_bounds('2026-10-25', 'Europe/London')
+        start_26, _ = local_date_to_utc_bounds('2026-10-26', 'Europe/London')
+        self.assertEqual(end_25, start_26)
+
+
+class TestLocalDateRangeToUtcBounds(unittest.TestCase):
+    """Tests for local_date_range_to_utc_bounds() — multi-day ranges."""
+
+    def test_single_day_gmt(self):
+        """Single day range in GMT."""
+        start, end = local_date_range_to_utc_bounds(
+            '2026-01-15', '2026-01-15', 'Europe/London'
+        )
+        self.assertEqual(start, '2026-01-15T00:00:00')
+        self.assertEqual(end,   '2026-01-16T00:00:00')
+
+    def test_single_day_bst(self):
+        """Single day range in BST."""
+        start, end = local_date_range_to_utc_bounds(
+            '2026-06-15', '2026-06-15', 'Europe/London'
+        )
+        self.assertEqual(start, '2026-06-14T23:00:00')
+        self.assertEqual(end,   '2026-06-15T23:00:00')
+
+    def test_multi_day_gmt(self):
+        """Three GMT days: covers exactly 72 hours."""
+        start, end = local_date_range_to_utc_bounds(
+            '2026-01-15', '2026-01-17', 'Europe/London'
+        )
+        self.assertEqual(start, '2026-01-15T00:00:00')
+        self.assertEqual(end,   '2026-01-18T00:00:00')
+        from datetime import datetime
+        self.assertEqual(
+            (datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds(),
+            3 * 24 * 3600
+        )
+
+    def test_range_straddling_bst_start(self):
+        """
+        Billing period Mar 3 → Apr 2 straddles BST start (Mar 29).
+        Start (Mar 3) is GMT, end (Apr 2) is BST.
+        UTC start should be midnight GMT, UTC end should be 23:00 UTC (Apr 2 BST midnight).
+        """
+        start, end = local_date_range_to_utc_bounds(
+            '2026-03-03', '2026-04-02', 'Europe/London'
+        )
+        self.assertEqual(start, '2026-03-03T00:00:00')  # GMT — no offset
+        self.assertEqual(end,   '2026-04-02T23:00:00')  # BST — 1hr offset
+
+    def test_range_straddling_bst_end(self):
+        """
+        Period straddling BST end (Oct 25).
+        Start (Oct 3) is BST, end (Nov 2) is GMT.
+        """
+        start, end = local_date_range_to_utc_bounds(
+            '2026-10-03', '2026-11-02', 'Europe/London'
+        )
+        self.assertEqual(start, '2026-10-02T23:00:00')  # BST start
+        self.assertEqual(end,   '2026-11-03T00:00:00')  # GMT end
+
+    def test_bst_start_day_included_in_range(self):
+        """
+        Range Mar 28 → Mar 30 includes the 23-hour BST start day.
+        Total = 24 + 23 + 24 = 71 hours.
+        """
+        start, end = local_date_range_to_utc_bounds(
+            '2026-03-28', '2026-03-30', 'Europe/London'
+        )
+        self.assertEqual(start, '2026-03-28T00:00:00')
+        self.assertEqual(end,   '2026-03-30T23:00:00')
+        from datetime import datetime
+        hours = (datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds() / 3600
+        self.assertAlmostEqual(hours, 71, places=1)
+
+    def test_bst_end_day_included_in_range(self):
+        """
+        Range Oct 24 → Oct 26 includes the 25-hour BST end day.
+        Oct 24 (BST, 24h) + Oct 25 (transition, 25h) + Oct 26 (GMT, 24h) = 73 hours.
+        """
+        start, end = local_date_range_to_utc_bounds(
+            '2026-10-24', '2026-10-26', 'Europe/London'
+        )
+        self.assertEqual(start, '2026-10-23T23:00:00')
+        self.assertEqual(end,   '2026-10-27T00:00:00')
+        from datetime import datetime
+        hours = (datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds() / 3600
+        self.assertEqual(hours, 73)
+
+    def test_blocks_in_bst_transition_hour_not_double_counted(self):
+        """
+        On BST end day, the 01:00 BST hour occurs twice (01:00 BST = 00:00 UTC,
+        01:00 GMT = 01:00 UTC). Both UTC blocks should be within the UTC bounds
+        for Oct 25 and not duplicated.
+        """
+        start, end = local_date_to_utc_bounds('2026-10-25', 'Europe/London')
+        # 00:00 UTC (= 01:00 BST, first occurrence) should be >= start
+        self.assertGreaterEqual('2026-10-25T00:00:00', start)
+        self.assertLess('2026-10-25T00:00:00', end)
+        # 01:00 UTC (= 01:00 GMT, second occurrence) should also be in range
+        self.assertGreaterEqual('2026-10-25T01:00:00', start)
+        self.assertLess('2026-10-25T01:00:00', end)
+
+    def test_utc_range_same_as_single_day(self):
+        """UTC timezone: range bounds identical to single day bounds."""
+        start_r, end_r = local_date_range_to_utc_bounds(
+            '2026-04-15', '2026-04-15', 'UTC'
+        )
+        start_s, end_s = local_date_to_utc_bounds('2026-04-15', 'UTC')
+        self.assertEqual(start_r, start_s)
+        self.assertEqual(end_r,   end_s)

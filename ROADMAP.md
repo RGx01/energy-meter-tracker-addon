@@ -145,14 +145,33 @@ The main meter avoids this by using boundary interpolation — it finds the near
 
 ---
 
-### 2.8.0 — Timezone Refactor & Performance
-**Theme: Correctness and speed**
+### 2.8.0 — Timezone Refactor, Performance & Usage Insights
+**Theme: Correctness, speed and deeper usage analysis**
 
-#### Timezone refactor
+#### Timezone refactor (coupled with performance)
 Drop `local_date`, `local_year`, `local_month`, `local_day` from `blocks` table. Engine fully UTC. `local_date_to_utc_bounds()` helper computes correct UTC window at query time using the configured timezone. Retroactively corrects wrong-timezone users without data migration.
 
-#### Billing/Usage Stats performance
-Rewrite `calculate_billing_summary_for_period` and `build_day_chart_html` to work on lightweight SQL rows rather than full block dicts reconstructed via `_rows_to_blocks`. Currently ~470ms per chart regeneration, ~276ms of which is Python dict construction. Direct SQL should reduce this to ~40ms. Coupled with the timezone refactor since both require changes to the data access layer.
+#### Billing/Usage Stats performance (coupled with timezone)
+Rewrite `calculate_billing_summary_for_period` and `build_day_chart_html` to work on lightweight SQL rows rather than full block dicts reconstructed via `_rows_to_blocks`. Currently ~470ms per chart regeneration. Direct SQL target ~40ms. Both require changes to the data access layer.
+
+#### Carbon accuracy — forecast vs actual
+- Weekly pass fetching previous 7 days from NESO, populating `intensity_actual` where still NULL
+- Recompute `carbon_g` on affected blocks using actual over forecast
+- Add `carbon_source` column to blocks — `'forecast'` or `'actual'`
+- Insights coverage warning upgraded to show forecast vs actual split
+
+#### Sub-meter boundary interpolation
+Apply same pre/post boundary read logic to sub-meters as main meter at block finalise time. Fixes gap block attribution issue (documented in Known Engine Limitation). Requires careful interaction with seed/carry-forward mechanism.
+
+#### Generation mix UI
+- Live Power — stacked bar or donut showing current grid fuel split, updates on CI tick
+- Insights Carbon Summary — period-weighted average generation mix breakdown using `get_generation_mix_for_range()`
+
+#### Usage Insights tab
+New "Usage" tab on the Insights page alongside "Carbon":
+- **Cost breakdown** — total spend split by meter, standing charge as £ and %, effective rate (£/kWh)
+- **Usage patterns** — peak consumption window, highest consumption day, average daily import, self-sufficiency ratio (% of consumption from battery/solar vs grid)
+- **Tariff efficiency** — % of EV/battery charging during cheap rate periods, estimated saving vs peak rate (requires rate sensor history)
 
 ---
 
