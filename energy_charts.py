@@ -1159,105 +1159,65 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
     chart_id      = f"{chart_prefix}chart_{day.replace('-', '_')}"
     chart_id_safe = chart_id.replace('-', '_')
 
+    # ── Serialise chart data as JSON — browser won't parse until needed ──
+    meters_data = {}
+    for meter in sorted(meter_kwh.keys()):
+        bar_color  = meter_colors.get(meter, "#333333")
+        line_color = adjust_color(bar_color, 0.8)
+        nice_name  = meter_display_name.get(
+            meter,
+            meter.replace("_", " ")
+                 .replace("electricity main", "Direct import")
+                 .replace("export", "Grid Export")
+                 .title()
+        )
+        raw_rates = meter_rate[meter]
+        last_nonzero = max((i for i, v in enumerate(raw_rates) if v != 0.0), default=None)
+        if last_nonzero is not None:
+            truncated_rates = raw_rates[:last_nonzero + 1] + [raw_rates[last_nonzero]]
+            trunc_x_line    = [i - 0.5 for i in range(last_nonzero + 2)]
+        else:
+            truncated_rates = raw_rates + [raw_rates[-1]]
+            trunc_x_line    = [i - 0.5 for i in range(slots + 1)]
+        meters_data[meter] = {
+            "y":            meter_kwh[meter],
+            "rate":         truncated_rates,
+            "rate_x":       trunc_x_line,
+            "has_rate":     any(v != 0.0 for v in raw_rates),
+            "bar_color":    bar_color,
+            "line_color":   line_color,
+            "nice_name":    nice_name,
+            "is_export":    meter.endswith("_export"),
+        }
+
+    chart_data = {
+        "x_labels":    x_labels,
+        "x_ranges":    x_ranges,
+        "slots":       slots,
+        "block_minutes": block_minutes,
+        "currency":    currency,
+        "meters":      meters_data,
+    }
+    chart_data_json = json.dumps(chart_data, separators=(',', ':'))
+
+    chart_id      = f"{chart_prefix}chart_{day.replace('-', '_')}"
+    chart_id_safe = chart_id.replace('-', '_')
+
     return f"""
 <div class="day-chart-wrap">
   {summary_html}
   <div id="{chart_id}" class="chart-container"></div>
+  <script type="application/json" id="data_{chart_id}">{chart_data_json}</script>
+  <script>
+  (function() {{
+    if (!window._pendingCharts) window._pendingCharts = {{}};
+    window._pendingCharts['{chart_id}'] = '{chart_id}';
+  }})();
+  </script>
 </div>
-<script>
-(function() {{
-  var xLabels = {json.dumps(x_labels)};
-  var xRanges = {json.dumps(x_ranges)};
-  var xBar    = Array.from({{length:{slots}}}, (_, i) => i);
-  var xLine   = Array.from({{length:{slots+1}}}, (_, i) => i - 0.5);
-  var data    = [{",".join(traces)}];
-  var tickStep = Math.max(1, Math.round(30 / {block_minutes}));
-  var tickVals = xBar.filter(function(_, i) {{ return i % tickStep === 0; }});
-  var tickTexts = xLabels.filter(function(_, i) {{ return i % tickStep === 0; }});
-  var layout  = {{
-    autosize: true,
-    barmode: 'relative',
-    margin: {{l:46, r:52, t:16, b:80}},
-    plot_bgcolor:  _getThemeColours().plotBg,
-    paper_bgcolor: _getThemeColours().paperBg,
-    xaxis: {{
-      tickmode: 'array', tickvals: tickVals, ticktext: tickTexts, tickangle: -45,
-      showgrid: false
-    }},
-    yaxis:  {{title:'kWh',   showgrid:true,  gridcolor:_getThemeColours().gridC, titlefont:{{size:11, color:_getThemeColours().axisC}}, tickfont:{{color:_getThemeColours().axisC}}}},
-    yaxis2: {{title:'{currency}/kWh', overlaying:'y', side:'right', showgrid:false, titlefont:{{size:11, color:_getThemeColours().axisC}}, tickfont:{{color:_getThemeColours().axisC}}}},
-    legend: {{
-      orientation: 'h',
-      x: 0.5, xanchor: 'center',
-      y: -0.28, yanchor: 'top',
-      font: {{size: 11, color: _getThemeColours().axisC}},
-    }}
-  }};
-  function _doRender_{chart_id_safe}() {{
-      var el = document.getElementById('{chart_id}');
-      if (!el) return;
-      var wrap = el.closest('.day-chart-wrap');
-      var wrapH = wrap ? wrap.offsetHeight : 0;
-      layout.height = Math.max(wrapH > 0 ? wrapH : 0, 320);
-    function _alignY2() {{
-      var y1range = el._fullLayout.yaxis.range;
-      var y2range = el._fullLayout.yaxis2.range;
-      var y2max = el._fullLayout.yaxis2._range
-                  ? el._fullLayout.yaxis2._range[1]
-                  : y2range[1];
-      if (y2max <= 0) return;
-      var hasImport = data.some(function(t) {{ return t.yaxis !== 'y2' && t.y && t.y.some(function(v) {{ return v > 0.001; }}); }});
-      var hasExport = data.some(function(t) {{ return t.yaxis !== 'y2' && t.y && t.y.some(function(v) {{ return v < -0.001; }}); }});
-      var y1min = y1range[0];
-      var y1top, y2min;
-      var rawStep = y2max / 4;
-      var mag  = Math.pow(10, Math.floor(Math.log10(rawStep)));
-      var step = [1, 2, 2.5, 5, 10].map(function(f) {{ return f * mag; }})
-                   .find(function(s) {{ return s >= rawStep; }}) || mag;
-      var ticks = [];
-      for (var t = 0; t <= y2max + step * 0.01; t += step) ticks.push(parseFloat(t.toFixed(10)));
-      if (hasExport && !hasImport) {{
-        // Export only — add headroom above 0 on y1, align y2 accordingly
-        var exportDepth = -y1min;
-        y1top  = exportDepth * 0.5;
-        var frac  = exportDepth / (exportDepth + y1top);
-        var y2span = y2max / (1 - frac);
-        y2min  = -frac * y2span;
-      }} else if (hasImport && hasExport) {{
-        // Mixed — keep y1 as-is, offset y2 down
-        y1top  = y1range[1];
-        var negFrac = -y1min / (y1range[1] - y1min);
-        var y2span  = y2max / (1 - negFrac);
-        y2min  = -negFrac * y2span;
-      }} else {{
-        // Import only
-        y1top = y1range[1];
-        y2min = 0;
-      }}
-      Plotly.relayout(el, {{
-        'yaxis.range':     [y1min, y1top],
-        'yaxis2.range':    [y2min, y2max],
-        'yaxis2.tickmode': 'array',
-        'yaxis2.tickvals': ticks,
-        'yaxis2.ticktext': ticks.map(function(v) {{ return v.toFixed(2); }})
-      }});
-    }}
-    Plotly.newPlot(el, data, layout, {{responsive:true, displayModeBar:false}}).then(function() {{
-      _alignY2();
-      el.on('plotly_restyle', function() {{
-        setTimeout(_alignY2, 50);
-      }});
-    }});
-    if (!window._energyCharts) window._energyCharts = {{}};
-    window._energyCharts['{chart_id}'] = el;
-    _scaleChartEl(el);
-  }}
-  if (!window._pendingCharts) window._pendingCharts = {{}};
-  window._pendingCharts['{chart_id}'] = _doRender_{chart_id_safe};
-}})();
-
-</script>
 """
+
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2384,13 +2344,124 @@ function _scaleDayCharts() {{
 window.addEventListener('resize', _scaleDayCharts, {{passive: true}});
 
 // ── Deferred chart renderer ──────────────────────────────────
+// Charts store data in <script type="application/json"> blocks.
+// _renderSection reads the JSON and builds Plotly traces only when
+// the section becomes visible — no JS parsing at page load time.
+function _buildDayChart(chartId) {{
+  var el = document.getElementById(chartId);
+  if (!el) return;
+  var dataEl = document.getElementById('data_' + chartId);
+  if (!dataEl) return;
+  var d;
+  try {{ d = JSON.parse(dataEl.textContent); }} catch(e) {{ return; }}
+
+  var slots = d.slots;
+  var bm    = d.block_minutes;
+  var cur   = d.currency;
+  var xBar  = Array.from({{length: slots}}, function(_, i) {{ return i; }});
+  var xRanges = d.x_ranges;
+  var xLabels = d.x_labels;
+
+  var totalHhKwh = Array(slots).fill(0);
+  Object.values(d.meters).forEach(function(m) {{
+    if (!m.is_export) m.y.forEach(function(v, i) {{ totalHhKwh[i] += v; }});
+  }});
+
+  var traces = [];
+  Object.entries(d.meters).forEach(function(entry) {{
+    var mid = entry[0]; var m = entry[1];
+    var useArea = bm < 15;
+    var customdata = m.y.map(function(v, i) {{
+      return [xRanges[i], totalHhKwh[i], Math.abs(v)];
+    }});
+    var hoverTotal = m.is_export ? '' : ' (%{{customdata[1]:.3f}} total)';
+    var trace = {{
+      x: xBar, y: m.y,
+      type: useArea ? 'scatter' : 'bar',
+      name: m.nice_name,
+      customdata: customdata,
+      hovertemplate: m.nice_name + '<br>%{{customdata[0]}}<br>%{{customdata[2]:.3f}} kWh' + hoverTotal + '<extra></extra>'
+    }};
+    if (useArea) {{
+      trace.mode = 'lines'; trace.fill = 'tozeroy';
+      trace.line = {{shape: 'hv', color: m.bar_color}};
+    }} else {{
+      trace.width = 0.7; trace.marker = {{color: m.bar_color}};
+    }}
+    traces.push(trace);
+    if (m.has_rate) {{
+      traces.push({{
+        x: m.rate_x, y: m.rate,
+        type: 'scatter', mode: 'lines',
+        line: {{shape: 'hv', width: 2, color: m.line_color, dash: m.is_export ? 'dash' : 'solid'}},
+        name: m.nice_name + ' rate', yaxis: 'y2',
+        customdata: xRanges.concat([xRanges[xRanges.length - 1]]),
+        hovertemplate: m.nice_name + ' rate<br>%{{customdata}}<br>' + cur + '%{{y:.4f}}<extra></extra>'
+      }});
+    }}
+  }});
+
+  var tickStep = Math.max(1, Math.round(30 / bm));
+  var tickVals  = xBar.filter(function(_, i) {{ return i % tickStep === 0; }});
+  var tickTexts = xLabels.filter(function(_, i) {{ return i % tickStep === 0; }});
+  var tc = _getThemeColours();
+  var layout = {{
+    autosize: true, barmode: 'relative',
+    margin: {{l: 46, r: 52, t: 16, b: 80}},
+    plot_bgcolor: tc.plotBg, paper_bgcolor: tc.paperBg,
+    xaxis: {{tickmode:'array', tickvals:tickVals, ticktext:tickTexts, tickangle:-45, showgrid:false}},
+    yaxis:  {{title:'kWh', showgrid:true, gridcolor:tc.gridC, titlefont:{{size:11,color:tc.axisC}}, tickfont:{{color:tc.axisC}}}},
+    yaxis2: {{title:cur+'/kWh', overlaying:'y', side:'right', showgrid:false, titlefont:{{size:11,color:tc.axisC}}, tickfont:{{color:tc.axisC}}}},
+    legend: {{orientation:'h', x:0.5, xanchor:'center', y:-0.28, yanchor:'top', font:{{size:11,color:tc.axisC}}}}
+  }};
+  var wrap = el.closest('.day-chart-wrap');
+  var wrapH = wrap ? wrap.offsetHeight : 0;
+  layout.height = Math.max(wrapH > 0 ? wrapH : 0, 320);
+
+  function _alignY2() {{
+    var y1range = el._fullLayout.yaxis.range;
+    var y2max = el._fullLayout.yaxis2._range ? el._fullLayout.yaxis2._range[1] : el._fullLayout.yaxis2.range[1];
+    if (y2max <= 0) return;
+    var hasImport = traces.some(function(t) {{ return t.yaxis !== 'y2' && t.y && t.y.some(function(v) {{ return v > 0.001; }}); }});
+    var hasExport = traces.some(function(t) {{ return t.yaxis !== 'y2' && t.y && t.y.some(function(v) {{ return v < -0.001; }}); }});
+    var y1min = y1range[0]; var y1top, y2min;
+    var rawStep = y2max / 4;
+    var mag  = Math.pow(10, Math.floor(Math.log10(rawStep)));
+    var step = [1, 2, 2.5, 5, 10].map(function(f) {{ return f * mag; }}).find(function(s) {{ return s >= rawStep; }}) || mag;
+    var ticks = [];
+    for (var t = 0; t <= y2max + step * 0.01; t += step) ticks.push(parseFloat(t.toFixed(10)));
+    if (hasExport && !hasImport) {{
+      var exportDepth = -y1min; y1top = exportDepth * 0.5;
+      var frac = exportDepth / (exportDepth + y1top);
+      y2min = -frac * (y2max / (1 - frac));
+    }} else if (hasImport && hasExport) {{
+      y1top = y1range[1];
+      var negFrac = -y1min / (y1range[1] - y1min);
+      y2min = -negFrac * (y2max / (1 - negFrac));
+    }} else {{ y1top = y1range[1]; y2min = 0; }}
+    Plotly.relayout(el, {{
+      'yaxis.range': [y1min, y1top], 'yaxis2.range': [y2min, y2max],
+      'yaxis2.tickmode': 'array', 'yaxis2.tickvals': ticks,
+      'yaxis2.ticktext': ticks.map(function(v) {{ return v.toFixed(2); }})
+    }});
+  }}
+
+  Plotly.newPlot(el, traces, layout, {{responsive:true, displayModeBar:false}}).then(function() {{
+    _alignY2();
+    el.on('plotly_restyle', function() {{ setTimeout(_alignY2, 50); }});
+  }});
+  if (!window._energyCharts) window._energyCharts = {{}};
+  window._energyCharts[chartId] = el;
+  _scaleChartEl(el);
+}}
+
 function _renderSection(section) {{
   if (!section || !window._pendingCharts) return;
   section.querySelectorAll('.chart-container').forEach(function(el) {{
-    var fn = window._pendingCharts[el.id];
-    if (fn) {{
+    var chartId = window._pendingCharts[el.id];
+    if (chartId) {{
       delete window._pendingCharts[el.id];
-      fn();
+      _buildDayChart(chartId);
     }}
   }});
 }}
