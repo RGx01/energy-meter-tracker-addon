@@ -193,12 +193,15 @@ CREATE INDEX IF NOT EXISTS idx_current_reads_time  ON current_reads (captured_at
 -- Carbon intensity samples from National Grid API (15-min cadence, ~4-day retention).
 -- postcode stored per row so config changes don't invalidate historical data.
 CREATE TABLE IF NOT EXISTS carbon_intensity (
-    captured_at   TEXT NOT NULL,      -- UTC ISO, 30-min API slot boundary
-    postcode      TEXT NOT NULL,
-    intensity     REAL,               -- gCO2/kWh forecast
-    ci_index      TEXT,               -- very-low/low/moderate/high/very-high
+    captured_at          TEXT NOT NULL,      -- UTC ISO, 30-min API slot boundary
+    postcode             TEXT NOT NULL,
+    intensity_forecast   REAL,               -- gCO₂/kWh forecast (always populated)
+    intensity_actual     REAL,               -- gCO₂/kWh actual (populated ~24hr later)
+    ci_index             TEXT,               -- very-low/low/moderate/high/very-high
     PRIMARY KEY (captured_at, postcode)
 );
+-- Computed alias: intensity = COALESCE(actual, forecast) for backward compat
+-- All consumers should use get_nearest_carbon_intensity which applies this.
 
 CREATE INDEX IF NOT EXISTS idx_carbon_intensity_time ON carbon_intensity (captured_at);
 
@@ -499,6 +502,23 @@ class BlockStore:
             )
         except Exception:
             pass
+        # Migrate carbon_intensity: rename intensity → intensity_forecast, add intensity_actual
+        try:
+            cols = [r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(carbon_intensity)"
+            ).fetchall()]
+            if "intensity" in cols and "intensity_forecast" not in cols:
+                with self._conn:
+                    self._conn.execute(
+                        "ALTER TABLE carbon_intensity RENAME COLUMN intensity TO intensity_forecast"
+                    )
+            if "intensity_actual" not in cols and "intensity_forecast" in cols + ["intensity_forecast"]:
+                with self._conn:
+                    self._conn.execute(
+                        "ALTER TABLE carbon_intensity ADD COLUMN intensity_actual REAL"
+                    )
+        except Exception:
+            pass
         try:
             self._conn.execute("""
                 CREATE TABLE IF NOT EXISTS generation_mix (
@@ -584,22 +604,47 @@ class BlockStore:
     # ── Carbon intensity ─────────────────────────────────────────────────────
 
     def upsert_carbon_intensity(self, captured_at: str, postcode: str,
-                                 intensity: float | None, ci_index: str | None) -> None:
-        """Store a carbon intensity sample. captured_at should be the 30-min slot boundary."""
+                                 intensity_forecast: float | None,
+                                 ci_index: str | None,
+                                 intensity_actual: float | None = None) -> None:
+        """
+        Store a carbon intensity sample. captured_at is the 30-min slot boundary.
+        intensity_forecast is always provided. intensity_actual is populated ~24hr
+        later when NESO publishes actuals — only updates if provided (not None).
+        """
         with self._conn:
-            self._conn.execute(
-                """INSERT INTO carbon_intensity (captured_at, postcode, intensity, ci_index)
-                   VALUES (?, ?, ?, ?)
-                   ON CONFLICT(captured_at, postcode) DO UPDATE SET
-                       intensity = excluded.intensity,
-                       ci_index  = excluded.ci_index""",
-                (captured_at, postcode, intensity, ci_index)
-            )
+            if intensity_actual is not None:
+                self._conn.execute(
+                    """INSERT INTO carbon_intensity
+                           (captured_at, postcode, intensity_forecast, intensity_actual, ci_index)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(captured_at, postcode) DO UPDATE SET
+                           intensity_forecast = COALESCE(excluded.intensity_forecast, intensity_forecast),
+                           intensity_actual   = excluded.intensity_actual,
+                           ci_index           = excluded.ci_index""",
+                    (captured_at, postcode, intensity_forecast, intensity_actual, ci_index)
+                )
+            else:
+                self._conn.execute(
+                    """INSERT INTO carbon_intensity
+                           (captured_at, postcode, intensity_forecast, ci_index)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(captured_at, postcode) DO UPDATE SET
+                           intensity_forecast = excluded.intensity_forecast,
+                           ci_index           = excluded.ci_index""",
+                    (captured_at, postcode, intensity_forecast, ci_index)
+                )
 
     def get_nearest_carbon_intensity(self, block_start: str, postcode: str) -> dict | None:
-        """Return the nearest carbon_intensity row to block_start for the given postcode."""
+        """
+        Return the nearest carbon_intensity row to block_start for the given postcode.
+        intensity = COALESCE(actual, forecast) — actual preferred when available.
+        """
         row = self._conn.execute(
-            """SELECT captured_at, intensity, ci_index
+            """SELECT captured_at, ci_index,
+                      COALESCE(intensity_actual, intensity_forecast) as intensity,
+                      intensity_forecast,
+                      intensity_actual
                FROM carbon_intensity
                WHERE postcode = ?
                ORDER BY ABS(strftime('%s', captured_at) - strftime('%s', ?))

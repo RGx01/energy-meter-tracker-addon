@@ -1389,17 +1389,19 @@ def _fetch_carbon_intensity(postcode: str) -> list:
 
     for slot in entries:
         intensity_obj = slot.get("intensity", {})
-        intensity_val = intensity_obj.get("forecast")
+        forecast      = intensity_obj.get("forecast")
+        actual        = intensity_obj.get("actual")    # None until ~24hr after slot
         ci_index      = intensity_obj.get("index")
         slot_from     = slot.get("from")
-        if slot_from and intensity_val is not None:
-            # Normalise to plain ISO (strip trailing Z)
+        if slot_from and (forecast is not None or actual is not None):
             captured_at = slot_from.replace("Z", "").replace("+00:00", "")
             slots.append({
-                "captured_at":    captured_at,
-                "intensity":      float(intensity_val),
-                "ci_index":       ci_index,
-                "generationmix":  slot.get("generationmix", []),
+                "captured_at":       captured_at,
+                "intensity":         float(actual if actual is not None else forecast),
+                "intensity_forecast": float(forecast) if forecast is not None else None,
+                "intensity_actual":   float(actual)   if actual   is not None else None,
+                "ci_index":          ci_index,
+                "generationmix":     slot.get("generationmix", []),
             })
 
     return slots
@@ -1429,7 +1431,8 @@ async def _tick_carbon_intensity() -> float | None:
         for slot in slots:
             _store.upsert_carbon_intensity(
                 slot["captured_at"], postcode,
-                slot["intensity"], slot["ci_index"]
+                slot["intensity_forecast"], slot["ci_index"],
+                slot["intensity_actual"]
             )
             if slot.get("generationmix"):
                 _current_slot_mix[slot["captured_at"]] = slot["generationmix"]
@@ -1763,7 +1766,7 @@ async def _backfill_carbon_gaps(store, cfg: dict) -> None:
         fetched_windows.add(win_key)
 
         existing = store._conn.execute(
-            """SELECT 1 FROM carbon_intensity
+            """SELECT intensity_actual FROM carbon_intensity
                WHERE postcode = ?
                  AND captured_at BETWEEN ? AND ?
                LIMIT 1""",
@@ -1771,7 +1774,13 @@ async def _backfill_carbon_gaps(store, cfg: dict) -> None:
              (hour_dt - timedelta(minutes=30)).isoformat(),
              (hour_dt + timedelta(minutes=30)).isoformat())
         ).fetchone()
-        if existing:
+        # Skip if we already have actual data for this window
+        # (forecast-only rows should still be fetched when slot is old enough for actuals)
+        hours_ago = (datetime.now(timezone.utc).replace(tzinfo=None) - hour_dt).total_seconds() / 3600
+        if existing and existing["intensity_actual"] is not None:
+            continue
+        if existing and hours_ago < 12:
+            # Too recent for actuals — skip, we have forecast already
             continue
 
         from_iso = hour_dt.strftime("%Y-%m-%dT%H:%MZ")
@@ -1798,15 +1807,19 @@ async def _backfill_carbon_gaps(store, cfg: dict) -> None:
 
             slots_stored = 0
             for slot in entries:
-                intensity_obj = slot.get("intensity", {})
-                intensity_val = intensity_obj.get("forecast") or intensity_obj.get("actual")
-                ci_index      = intensity_obj.get("index")
-                slot_from     = slot.get("from")
-                if slot_from and intensity_val is not None:
+                intensity_obj    = slot.get("intensity", {})
+                forecast         = intensity_obj.get("forecast")
+                actual           = intensity_obj.get("actual")
+                ci_index         = intensity_obj.get("index")
+                slot_from        = slot.get("from")
+                if slot_from and (forecast is not None or actual is not None):
                     captured_at = slot_from.replace("Z", "").replace("+00:00", "")
-                    store.upsert_carbon_intensity(captured_at, postcode,
-                                                  float(intensity_val), ci_index)
-                    # Store generation mix keyed by captured_at for block association
+                    store.upsert_carbon_intensity(
+                        captured_at, postcode,
+                        float(forecast) if forecast is not None else None,
+                        ci_index,
+                        float(actual) if actual is not None else None
+                    )
                     gen_mix = slot.get("generationmix", [])
                     if gen_mix:
                         _slot_mix[captured_at] = gen_mix
@@ -2061,7 +2074,8 @@ async def engine_startup(ha: HAClient):
                 for slot in slots:
                     _store.upsert_carbon_intensity(
                         slot["captured_at"], postcode,
-                        slot["intensity"], slot["ci_index"]
+                        slot["intensity_forecast"], slot["ci_index"],
+                        slot["intensity_actual"]
                     )
                 _store.prune_carbon_intensity(days=4)
                 return len(slots)
