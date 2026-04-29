@@ -750,13 +750,12 @@ def build_gap_blocks(
                             p_closer    = interpolate_value(parent_pre, parent_post, window_end)
                             parent_kwh  = max(round(p_closer["value"] - p_opener["value"], 6), 0.0)
                             if sub_kwh > parent_kwh * 1.05:  # 5% tolerance for rounding
-                                logger.error(
+                                logger.warning(
                                     "build_gap_blocks: %s/%s %.4f kWh EXCEEDS parent grid %.4f kWh "
-                                    "— sensor spike detected. Clipping to parent.",
+                                    "— may be gap attribution issue or misconfigured sensor. "
+                                    "Recording as-is.",
                                     meter_name, channel_name, sub_kwh, parent_kwh,
                                 )
-                                sub_kwh  = min(sub_kwh, parent_kwh)
-                                sub_cost = round(sub_kwh * sub_rate, 6)
 
                     meter_block["channels"][channel_name] = {
                         "kwh": sub_kwh, "rate": sub_rate, "cost": sub_cost,
@@ -974,11 +973,13 @@ def _apply_pass2(block: dict) -> None:
         for entry in protected:
             claimed = min(entry["kwh"], grid_remaining)
             if entry["kwh"] > grid_kwh:
-                logger.error(
+                logger.warning(
                     "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
-                    "sensor may be misconfigured or reporting incorrect values. Clipping.",
+                    "may be a gap block attribution issue or misconfigured sensor. "
+                    "Recording as-is.",
                     entry["meter_name"], entry["kwh"], grid_kwh,
                 )
+                claimed = entry["kwh"]  # do not clip — preserve energy
             elif claimed < entry["kwh"]:
                 logger.warning(
                     "PASS 2: %s protected load %.4f kWh clipped to %.4f kWh",
@@ -997,11 +998,14 @@ def _apply_pass2(block: dict) -> None:
             claimed    = min(entry["kwh"], grid_remaining)
             battery    = entry["kwh"] - claimed
             if entry["kwh"] > grid_kwh:
-                logger.error(
+                logger.warning(
                     "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
-                    "sensor may be misconfigured or reporting incorrect values. Clipping.",
+                    "may be a gap block attribution issue or misconfigured sensor. "
+                    "Recording as-is.",
                     entry["meter_name"], entry["kwh"], grid_kwh,
                 )
+                claimed = entry["kwh"]  # do not clip — preserve energy
+                battery = 0.0
             grid_remaining = max(grid_remaining - claimed, 0.0)
             entry["sub_import"]["kwh_grid"]    = claimed
             entry["sub_import"]["kwh_battery"] = battery
