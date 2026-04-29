@@ -644,6 +644,10 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
             is_main_import = (meter_name == "electricity_main")
 
             for channel_name, channel in (meter.get("channels", {}) or {}).items():
+                # Sub-meter export channels are already captured in the main meter's
+                # export total — skip them to prevent phantom export sections in the bill.
+                if is_sub and channel_name.lower().endswith("export"):
+                    continue
                 try:
                     channel = channel or {}
                     channel_m = (channel.get("meta", {}) or {})
