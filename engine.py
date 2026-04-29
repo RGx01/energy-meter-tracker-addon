@@ -1672,7 +1672,16 @@ async def _engine_tick(ha: HAClient):
                 if v not in (None, "unknown", "unavailable"):
                     try:
                         fv = float(v)
-                        inv_val = round(fv / 1000.0 if abs(fv) > 100 else fv, 3)
+                        # Convert to kW using unit_of_measurement from HA attributes.
+                        # The meter config sensor picker only allows power sensors (W or kW),
+                        # so the unit is always known — no magnitude guessing needed.
+                        try:
+                            unit = (ha.get_attributes(power_s) or {}).get("unit_of_measurement", "")
+                        except Exception:
+                            unit = ""
+                        if unit.upper() == "W":
+                            fv = fv / 1000.0
+                        inv_val = round(fv, 3)
                     except (ValueError, TypeError):
                         pass
             if soc_val is not None or inv_val is not None:

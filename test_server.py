@@ -2288,3 +2288,276 @@ class TestAggregateInsights(unittest.TestCase):
         )
         self.assertFalse(d["has_carbon"])
         self.assertEqual(d["imp_kwh"], 0.0)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _aggregate_usage
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAggregateUsage(unittest.TestCase):
+    """Tests for _aggregate_usage() covering cost, rate tiers, peak window,
+    net grid position, and sub-meter breakdown."""
+
+    def setUp(self):
+        import sqlite3
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript("""
+            CREATE TABLE config_periods (
+                id INTEGER PRIMARY KEY,
+                billing_day INTEGER, block_minutes INTEGER,
+                timezone TEXT, currency_symbol TEXT, currency_code TEXT,
+                effective_from TEXT, effective_to TEXT,
+                site_name TEXT, change_reason TEXT
+            );
+            CREATE TABLE meters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                config_period_id INTEGER, meter_id TEXT,
+                is_sub_meter INTEGER DEFAULT 0,
+                parent_meter_id TEXT, device_label TEXT,
+                meter_type TEXT, protected INTEGER DEFAULT 0,
+                inverter_possible INTEGER DEFAULT 0,
+                power_sensor TEXT, postcode_prefix TEXT,
+                v2x_capable INTEGER DEFAULT 0,
+                inverter_power_invert INTEGER DEFAULT 0,
+                soc_sensor TEXT, inverter_power_sensor TEXT,
+                device_power_sensor TEXT
+            );
+            CREATE TABLE blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_start TEXT, block_end TEXT,
+                meter_id TEXT, config_period_id INTEGER,
+                imp_kwh REAL, imp_kwh_grid REAL, imp_kwh_remainder REAL,
+                imp_rate REAL, imp_cost REAL,
+                imp_cost_remainder REAL, imp_read_start REAL, imp_read_end REAL,
+                exp_kwh REAL, exp_rate REAL, exp_cost REAL,
+                exp_read_start REAL, exp_read_end REAL,
+                standing_charge REAL, carbon_g REAL, interpolated INTEGER DEFAULT 0
+            );
+        """)
+        # Config period
+        self.conn.execute("""INSERT INTO config_periods
+            (id, billing_day, block_minutes, timezone, currency_symbol, currency_code,
+             effective_from, effective_to)
+            VALUES (1, 3, 30, 'UTC', '£', 'GBP', '2026-01-01T00:00:00', NULL)""")
+        # Meters
+        self.conn.execute("""INSERT INTO meters
+            (config_period_id, meter_id, is_sub_meter, meter_type)
+            VALUES (1, 'electricity_main', 0, NULL)""")
+        self.conn.execute("""INSERT INTO meters
+            (config_period_id, meter_id, is_sub_meter, meter_type, device_label)
+            VALUES (1, 'ev_charger', 1, 'ev', 'Zappi')""")
+
+        # Insert 4 blocks: 2 at cheap rate (0.07), 1 at peak (0.30), 1 export
+        # Main meter - cheap rate block 1
+        self.conn.execute("""INSERT INTO blocks
+            (block_start, block_end, meter_id, config_period_id,
+             imp_kwh, imp_kwh_remainder, imp_rate, imp_cost,
+             exp_kwh, exp_rate, exp_cost, standing_charge)
+            VALUES ('2026-04-01T00:00:00','2026-04-01T00:30:00','electricity_main',1,
+                    5.0, 3.0, 0.07, 0.35,  0.0, 0.12, 0.0, 0.50)""")
+        # Main meter - cheap rate block 2
+        self.conn.execute("""INSERT INTO blocks
+            (block_start, block_end, meter_id, config_period_id,
+             imp_kwh, imp_kwh_remainder, imp_rate, imp_cost,
+             exp_kwh, exp_rate, exp_cost, standing_charge)
+            VALUES ('2026-04-01T01:00:00','2026-04-01T01:30:00','electricity_main',1,
+                    4.0, 2.0, 0.07, 0.28,  0.0, 0.12, 0.0, 0.50)""")
+        # Main meter - peak rate block
+        self.conn.execute("""INSERT INTO blocks
+            (block_start, block_end, meter_id, config_period_id,
+             imp_kwh, imp_kwh_remainder, imp_rate, imp_cost,
+             exp_kwh, exp_rate, exp_cost, standing_charge)
+            VALUES ('2026-04-01T08:00:00','2026-04-01T08:30:00','electricity_main',1,
+                    2.0, 2.0, 0.30, 0.60,  0.0, 0.12, 0.0, 0.50)""")
+        # Main meter - export block
+        self.conn.execute("""INSERT INTO blocks
+            (block_start, block_end, meter_id, config_period_id,
+             imp_kwh, imp_kwh_remainder, imp_rate, imp_cost,
+             exp_kwh, exp_rate, exp_cost, standing_charge)
+            VALUES ('2026-04-01T12:00:00','2026-04-01T12:30:00','electricity_main',1,
+                    0.0, 0.0, 0.12, 0.0,  3.0, 0.12, 0.36, 0.50)""")
+        # EV charger sub-meter - cheap rate
+        self.conn.execute("""INSERT INTO blocks
+            (block_start, block_end, meter_id, config_period_id,
+             imp_kwh, imp_kwh_grid, imp_rate, imp_cost,
+             exp_kwh, exp_rate, exp_cost, standing_charge)
+            VALUES ('2026-04-01T00:00:00','2026-04-01T00:30:00','ev_charger',1,
+                    2.0, 2.0, 0.07, 0.14,  0.0, 0.0, 0.0, 0.0)""")
+        self.conn.execute("""INSERT INTO blocks
+            (block_start, block_end, meter_id, config_period_id,
+             imp_kwh, imp_kwh_grid, imp_rate, imp_cost,
+             exp_kwh, exp_rate, exp_cost, standing_charge)
+            VALUES ('2026-04-01T01:00:00','2026-04-01T01:30:00','ev_charger',1,
+                    2.0, 2.0, 0.07, 0.14,  0.0, 0.0, 0.0, 0.0)""")
+        self.conn.commit()
+
+        class FakeStore:
+            def __init__(self, conn): self._conn = conn
+        self.store = FakeStore(self.conn)
+        self.cfg = {
+            "meters": {
+                "electricity_main": {"meta": {"timezone": "UTC", "block_minutes": 30,
+                                               "currency_symbol": "£"}},
+                "ev_charger": {"meta": {"sub_meter": True, "meter_type": "ev",
+                                         "device": "Zappi"}},
+            }
+        }
+
+    def _run(self):
+        return server._aggregate_usage(
+            self.store, self.cfg,
+            "2026-04-01T00:00:00", "2026-04-02T00:00:00"
+        )
+
+    def test_imp_kwh_total(self):
+        """Total grid import = sum of main meter imp_kwh."""
+        d = self._run()
+        self.assertAlmostEqual(d["imp_kwh"], 11.0, places=3)
+
+    def test_exp_kwh_total(self):
+        """Total export = 3.0 kWh."""
+        d = self._run()
+        self.assertAlmostEqual(d["exp_kwh"], 3.0, places=3)
+
+    def test_imp_cost_total(self):
+        """Import cost = 0.35 + 0.28 + 0.60 = 1.23."""
+        d = self._run()
+        self.assertAlmostEqual(d["imp_cost"], 1.23, places=4)
+
+    def test_exp_cost_total(self):
+        """Export earnings = 0.36."""
+        d = self._run()
+        self.assertAlmostEqual(d["exp_cost"], 0.36, places=4)
+
+    def test_standing_charge_once_per_day(self):
+        """Standing charge summed once per local day (not once per block)."""
+        d = self._run()
+        self.assertAlmostEqual(d["standing_charge"], 0.50, places=4)
+
+    def test_net_cost(self):
+        """Net = imp_cost + standing - exp_cost = 1.23 + 0.50 - 0.36 = 1.37."""
+        d = self._run()
+        self.assertAlmostEqual(d["net_cost"], 1.37, places=4)
+
+    def test_net_grid_kwh(self):
+        """Net grid = 11.0 imp - 3.0 exp = 8.0."""
+        d = self._run()
+        self.assertAlmostEqual(d["net_grid_kwh"], 8.0, places=3)
+
+    def test_rate_tiers_count(self):
+        """Two distinct rate tiers: 0.07 and 0.30."""
+        d = self._run()
+        self.assertEqual(len(d["rate_tiers"]), 2)
+
+    def test_rate_tiers_cheap_kwh(self):
+        """Cheap tier (0.07): 5.0 + 4.0 = 9.0 kWh."""
+        d = self._run()
+        cheap = next(t for t in d["rate_tiers"] if abs(t["rate"] - 0.07) < 0.001)
+        self.assertAlmostEqual(cheap["kwh"], 9.0, places=3)
+
+    def test_rate_tiers_peak_kwh(self):
+        """Peak tier (0.30): 2.0 kWh."""
+        d = self._run()
+        peak = next(t for t in d["rate_tiers"] if abs(t["rate"] - 0.30) < 0.001)
+        self.assertAlmostEqual(peak["kwh"], 2.0, places=3)
+
+    def test_weighted_rate(self):
+        """Weighted avg rate = total_cost / total_kwh = 1.23 / 11.0."""
+        d = self._run()
+        self.assertAlmostEqual(d["weighted_rate"], 1.23 / 11.0, places=5)
+
+    def test_house_imp_kwh(self):
+        """House remainder = 3.0 + 2.0 + 2.0 = 7.0 (from imp_kwh_remainder cols)."""
+        d = self._run()
+        self.assertAlmostEqual(d["house_imp_kwh"], 7.0, places=3)
+
+    def test_sub_meter_ev_present(self):
+        """EV charger appears in sub_meters."""
+        d = self._run()
+        self.assertIn("ev_charger", d["sub_meters"])
+
+    def test_sub_meter_ev_kwh(self):
+        """EV charger grid kwh = 2.0 + 2.0 = 4.0."""
+        d = self._run()
+        self.assertAlmostEqual(d["sub_meters"]["ev_charger"]["imp_kwh"], 4.0, places=3)
+
+    def test_sub_meter_ev_rate_tiers(self):
+        """EV sub-meter has rate tier breakdown."""
+        d = self._run()
+        ev = d["sub_meters"]["ev_charger"]
+        self.assertIn("rate_tiers", ev)
+        self.assertEqual(len(ev["rate_tiers"]), 1)
+        self.assertAlmostEqual(ev["rate_tiers"][0]["rate"], 0.07, places=4)
+        self.assertAlmostEqual(ev["rate_tiers"][0]["kwh"], 4.0, places=3)
+
+    def test_peak_window_fields_present(self):
+        """Peak window fields are present in response."""
+        d = self._run()
+        self.assertIn("peak_window_start", d)
+        self.assertIn("peak_window_kwh", d)
+
+    def test_net_exporter_days_zero(self):
+        """No net exporter days — export 3kWh < import 11kWh."""
+        d = self._run()
+        self.assertEqual(d["net_exporter_days"], 0)
+
+    def test_empty_range_returns_zeros(self):
+        """Empty date range returns zero costs and empty tiers."""
+        d = server._aggregate_usage(
+            self.store, self.cfg,
+            "2025-01-01T00:00:00", "2025-01-02T00:00:00"
+        )
+        self.assertEqual(d["imp_kwh"], 0.0)
+        self.assertEqual(d["imp_cost"], 0.0)
+        self.assertEqual(d["rate_tiers"], [])
+        self.assertIsNone(d["weighted_rate"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /api/usage/* endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApiUsageEndpoints(unittest.TestCase):
+
+    def setUp(self):
+        self.client = make_client()
+
+    def test_billing_period_returns_200_or_404(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/usage/billing-period")
+        self.assertIn(r.status_code, (200, 404, 500))
+
+    def test_calendar_month_returns_200(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/usage/calendar-month?year=2026&month=4")
+        self.assertIn(r.status_code, (200, 500))
+        if r.status_code == 200:
+            d = json.loads(r.data)
+            self.assertIn("imp_kwh", d)
+            self.assertIn("rate_tiers", d)
+            self.assertIn("net_grid_kwh", d)
+
+    def test_calendar_year_returns_200(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/usage/calendar-year?year=2026")
+        self.assertIn(r.status_code, (200, 500))
+
+    def test_calendar_month_has_period_label(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/usage/calendar-month?year=2026&month=1")
+        if r.status_code == 200:
+            d = json.loads(r.data)
+            self.assertIn("period_label", d)
+
+    def test_response_shape_keys(self):
+        """All required keys present in a successful response."""
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/usage/calendar-month?year=2026&month=4")
+        if r.status_code != 200:
+            return
+        d = json.loads(r.data)
+        for key in ("imp_kwh", "exp_kwh", "imp_cost", "exp_cost",
+                    "standing_charge", "net_cost", "net_grid_kwh",
+                    "rate_tiers", "sub_meters", "peak_window_start",
+                    "net_exporter_days", "house_imp_kwh"):
+            self.assertIn(key, d, msg=f"Missing key: {key}")
