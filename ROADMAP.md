@@ -131,6 +131,20 @@ Touch zoom, mobile topbar collapse, orientation fixes, billing landscape fix, ch
 
 ## Planned
 
+### Known Engine Limitation — Sub-meter Late Finalise
+
+When the addon restarts during active charging, blocks that finalise late (after a restart) use the raw cumulative delta for sub-meters. If no intermediate reads arrived during the gap, this delta can span multiple block windows — e.g. a Zappi charging at 7kW for 72 minutes with no reads may attribute all 8.4 kWh to a single 30-minute block rather than distributing it across the two or three affected blocks.
+
+The main meter avoids this by using boundary interpolation — it finds the nearest reads on either side of each block boundary and computes an exact energy value for each window. Sub-meters currently don't have this applied at late finalise time.
+
+**Symptom:** `PASS 2: ev_charger sub-meter X.XX kWh EXCEEDS parent grid import Y.YY kWh` WARNING in logs. The energy is preserved (not clipped) but is attributed to the wrong block.
+
+**Correct fix:** Apply boundary interpolation to sub-meters at block finalise time using the same pre/post read pair logic as the main meter. The seed value from the previous block's `read_end` serves as the pre-boundary read; the first post-restart read serves as the post-boundary read. This would correctly distribute the energy across each block window proportionally.
+
+**Why not fixed yet:** Requires careful handling of the seed/carry-forward mechanism for sub-meters and interaction with the gap fill path. Likely coupled with the timezone refactor in 2.8.0 since both require changes to how block boundaries are computed.
+
+---
+
 ### 2.8.0 — Timezone Refactor & Performance
 **Theme: Correctness and speed**
 
