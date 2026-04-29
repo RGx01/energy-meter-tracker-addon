@@ -963,8 +963,7 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
             summary_cost["electricity_main"]  += main_cost
             summary_rates["electricity_main"][round(main_rate, 4)] += main_kwh
             if "electricity_main" not in meter_display_name:
-                meta = main.get("meta", {}) or {}
-                meter_display_name["electricity_main"] = site_name or meta.get("site") or "Direct import"
+                meter_display_name["electricity_main"] = "Direct import"
 
             for meter_name, meter in meters.items():
                 if (meter or {}).get("meta", {}).get("sub_meter"):
@@ -1057,10 +1056,8 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
     if sub_meter_names:
         if house_kwh > 0.0001:
             label = meter_display_name.get("electricity_main", "Direct import")
-            # Only censor if it's an actual site name (not the generic fallback)
-            label_html = f'<span class="censored">{label}</span>' if site_name else label
             col   = '<div class="scol">'
-            col  += cs(f'↳ {label_html}', main_color, size="1em", bold=True)
+            col  += cs(f'↳ {label}', main_color, size="1em", bold=True)
             col  += cs(f'{house_kwh:.3f} kWh', main_color, size="1em")
             col  += cs(f'{currency}{house_cost:.2f}', main_color, size="1em")
             col  += rate_rows_colored("electricity_main", adjust_color(main_color, 0.75))
@@ -1529,7 +1526,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     <button class="view-btn" data-view="vs-prev"        onclick="showView('vs-prev')">vs Prev</button>
     <button class="view-btn vs-year-btn" data-view="vs-year" onclick="showView('vs-year')">vs Last Year</button>
     <button class="view-btn censor-btn" id="censor-toggle" onclick="toggleCensor()" title="Blur sensitive info">&#128065; Censor</button>
-    <button class="view-btn" id="sort-toggle" onclick="toggleSortOrder()" title="Toggle period order">↓ Newest first</button>
+    <button class="view-btn" id="sort-toggle" onclick="toggleSortOrder()" title="Toggle period order">↓ Latest first</button>
   </div>
 </div>"""
 
@@ -2600,7 +2597,7 @@ function toggleSortOrder() {{
   var btn = document.getElementById('sort-toggle');
   if (btn) {{
     btn.classList.toggle('active', nowAsc);
-    btn.textContent = nowAsc ? '↑ Oldest first' : '↓ Newest first';
+    btn.textContent = nowAsc ? '↑ Oldest first' : '↓ Latest first';
   }}
 }}
 

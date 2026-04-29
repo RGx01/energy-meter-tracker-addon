@@ -202,6 +202,16 @@ CREATE TABLE IF NOT EXISTS carbon_intensity (
 
 CREATE INDEX IF NOT EXISTS idx_carbon_intensity_time ON carbon_intensity (captured_at);
 
+-- Generation mix per block — fuel type percentages at time of each block.
+-- Populated at block finalise time and backfilled alongside carbon_g.
+-- One row per fuel per block. Lives as long as the block.
+CREATE TABLE IF NOT EXISTS generation_mix (
+    block_id    INTEGER NOT NULL REFERENCES blocks(id) ON DELETE CASCADE,
+    fuel        TEXT    NOT NULL,   -- 'wind','solar','gas','nuclear','biomass','hydro','imports','other'
+    perc        REAL    NOT NULL,   -- percentage of generation mix (0.0–100.0)
+    PRIMARY KEY (block_id, fuel)
+);
+
 -- High-resolution net power history (engine-tick cadence ~10s, 48hr retention).
 -- Only written when a power sensor is configured. intensity is denormalised from
 -- the nearest carbon_intensity row at capture time.
@@ -489,6 +499,17 @@ class BlockStore:
             )
         except Exception:
             pass
+        try:
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS generation_mix (
+                    block_id INTEGER NOT NULL REFERENCES blocks(id) ON DELETE CASCADE,
+                    fuel     TEXT    NOT NULL,
+                    perc     REAL    NOT NULL,
+                    PRIMARY KEY (block_id, fuel)
+                )
+            """)
+        except Exception:
+            pass
         logger.debug("BlockStore opened: %s", db_path)
 
     # ── Connection management ─────────────────────────────────────────────
@@ -596,6 +617,55 @@ class BlockStore:
                 "DELETE FROM carbon_intensity WHERE captured_at < ?", (cutoff,)
             )
         return cur.rowcount
+
+    # ── Generation mix ────────────────────────────────────────────────────────
+
+    def upsert_generation_mix(self, block_id: int, mix: list[dict]) -> None:
+        """
+        Store generation mix for a block. mix is a list of {fuel, perc} dicts
+        from the National Grid ESO API generationmix array.
+        Replaces any existing mix for this block.
+        """
+        if not mix or block_id is None:
+            return
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM generation_mix WHERE block_id = ?", (block_id,)
+            )
+            self._conn.executemany(
+                "INSERT INTO generation_mix (block_id, fuel, perc) VALUES (?, ?, ?)",
+                [(block_id, str(row.get("fuel", "")).lower(), float(row.get("perc", 0)))
+                 for row in mix if row.get("fuel") is not None]
+            )
+
+    def get_generation_mix(self, block_id: int) -> list[dict]:
+        """Return generation mix for a block as [{fuel, perc}, ...] sorted by perc desc."""
+        rows = self._conn.execute(
+            "SELECT fuel, perc FROM generation_mix WHERE block_id = ? ORDER BY perc DESC",
+            (block_id,)
+        ).fetchall()
+        return [{"fuel": r["fuel"], "perc": r["perc"]} for r in rows]
+
+    def get_generation_mix_for_range(self, utc_start: str, utc_end: str,
+                                      meter_id: str = "electricity_main") -> list[dict]:
+        """
+        Return imp_kwh-weighted average generation mix across all blocks in the
+        given UTC range for the specified meter. Returns [{fuel, perc}, ...].
+        Useful for period-level Insights aggregations.
+        """
+        rows = self._conn.execute(
+            """SELECT gm.fuel,
+                      SUM(gm.perc * b.imp_kwh) / NULLIF(SUM(b.imp_kwh), 0) as weighted_perc
+               FROM generation_mix gm
+               JOIN blocks b ON b.id = gm.block_id
+               WHERE b.block_start >= ? AND b.block_start < ?
+                 AND b.meter_id = ?
+                 AND b.imp_kwh > 0
+               GROUP BY gm.fuel
+               ORDER BY weighted_perc DESC""",
+            (utc_start, utc_end, meter_id)
+        ).fetchall()
+        return [{"fuel": r["fuel"], "perc": round(r["weighted_perc"], 2)} for r in rows]
 
     # ── Power history ─────────────────────────────────────────────────────────
 

@@ -73,6 +73,7 @@ _PUBLISH_HA_SENSORS: bool = os.environ.get("PUBLISH_HA_SENSORS", "true").lower()
 _engine_loop_lock:         asyncio.Lock = None   # initialised in setup()
 _engine_paused:            bool         = False
 _last_ci_fetch:            datetime | None = None   # UTC — last carbon intensity fetch
+_current_slot_mix:         dict            = {}      # captured_at → generationmix list
 
 
 def setup():
@@ -1203,6 +1204,28 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
 
     append_block(block)
 
+    # ── PASS 3c — store generation mix for each meter block ─────────────
+    try:
+        if postcode and _current_slot_mix:
+            start_iso = block.get("start", "")
+            # Find nearest slot mix by timestamp
+            nearest_key = min(_current_slot_mix.keys(),
+                               key=lambda k: abs(
+                                   datetime.fromisoformat(k).timestamp() -
+                                   datetime.fromisoformat(start_iso).timestamp()
+                               )) if start_iso else None
+            if nearest_key:
+                mix = _current_slot_mix[nearest_key]
+                for meter_name in block.get("meters", {}):
+                    row = _store._conn.execute(
+                        "SELECT id FROM blocks WHERE block_start = ? AND meter_id = ? LIMIT 1",
+                        (start_iso, meter_name)
+                    ).fetchone()
+                    if row:
+                        _store.upsert_generation_mix(row["id"], mix)
+    except Exception as _gme:
+        logger.debug("finalise_block: generation mix storage failed: %s", _gme)
+
     # ── PASS 4 — update cumulative totals (derived from DB, no JSON file) ───
     engine_totals = _store.get_cumulative_totals()
 
@@ -1369,9 +1392,10 @@ def _fetch_carbon_intensity(postcode: str) -> list:
             # Normalise to plain ISO (strip trailing Z)
             captured_at = slot_from.replace("Z", "").replace("+00:00", "")
             slots.append({
-                "captured_at": captured_at,
-                "intensity":   float(intensity_val),
-                "ci_index":    ci_index,
+                "captured_at":    captured_at,
+                "intensity":      float(intensity_val),
+                "ci_index":       ci_index,
+                "generationmix":  slot.get("generationmix", []),
             })
 
     return slots
@@ -1403,6 +1427,8 @@ async def _tick_carbon_intensity() -> float | None:
                 slot["captured_at"], postcode,
                 slot["intensity"], slot["ci_index"]
             )
+            if slot.get("generationmix"):
+                _current_slot_mix[slot["captured_at"]] = slot["generationmix"]
         _store.prune_carbon_intensity(days=4)
         _last_ci_fetch = now
         logger.info("_tick_carbon_intensity: stored %d slots for %s", len(slots), postcode)
@@ -1722,6 +1748,7 @@ async def _backfill_carbon_gaps(store, cfg: dict) -> None:
 
     fetched_windows = set()
     total_slots = 0
+    _slot_mix   = {}  # captured_at → generationmix list
 
     for row in null_rows:
         hour_str = row["hour"]
@@ -1775,6 +1802,10 @@ async def _backfill_carbon_gaps(store, cfg: dict) -> None:
                     captured_at = slot_from.replace("Z", "").replace("+00:00", "")
                     store.upsert_carbon_intensity(captured_at, postcode,
                                                   float(intensity_val), ci_index)
+                    # Store generation mix keyed by captured_at for block association
+                    gen_mix = slot.get("generationmix", [])
+                    if gen_mix:
+                        _slot_mix[captured_at] = gen_mix
                     slots_stored += 1
             total_slots += slots_stored
             logger.info("_backfill_carbon_gaps: fetched %d slots from %s",
@@ -1785,14 +1816,13 @@ async def _backfill_carbon_gaps(store, cfg: dict) -> None:
 
         await asyncio.sleep(0.5)
 
-    # Recompute carbon_g for NULL blocks in window
+    # Recompute carbon_g for NULL blocks in window — main meter and sub-meters
     if total_slots > 0:
         updated = 0
         null_blocks = store._conn.execute(
-            """SELECT id, block_start, imp_kwh, exp_kwh
+            """SELECT id, meter_id, block_start, imp_kwh, exp_kwh
                FROM blocks
                WHERE carbon_g IS NULL
-                 AND meter_id = 'electricity_main'
                  AND block_start >= ?""",
             (cutoff,)
         ).fetchall()
@@ -1802,13 +1832,29 @@ async def _backfill_carbon_gaps(store, cfg: dict) -> None:
                 ci_row = store.get_nearest_carbon_intensity(block["block_start"], postcode)
                 if not ci_row or ci_row.get("intensity") is None:
                     continue
-                imp_kwh  = block["imp_kwh"] or 0.0
-                exp_kwh  = block["exp_kwh"] or 0.0
-                carbon_g = round((imp_kwh - exp_kwh) * float(ci_row["intensity"]), 4)
+                imp_kwh   = block["imp_kwh"] or 0.0
+                exp_kwh   = block["exp_kwh"] or 0.0
+                intensity = float(ci_row["intensity"])
+                if block["meter_id"] == "electricity_main":
+                    carbon_g = round((imp_kwh - exp_kwh) * intensity, 4)
+                else:
+                    carbon_g = round(imp_kwh * intensity, 4)
                 store._conn.execute(
                     "UPDATE blocks SET carbon_g = ? WHERE id = ?",
                     (carbon_g, block["id"])
                 )
+                # Store generation mix for this block using nearest slot mix
+                captured_at = ci_row.get("captured_at")
+                if captured_at and captured_at in _slot_mix:
+                    store.upsert_generation_mix(block["id"], _slot_mix[captured_at])
+                elif _slot_mix:
+                    # Find nearest slot mix by timestamp
+                    nearest_key = min(_slot_mix.keys(),
+                                      key=lambda k: abs(
+                                          datetime.fromisoformat(k).timestamp() -
+                                          datetime.fromisoformat(block["block_start"]).timestamp()
+                                      ))
+                    store.upsert_generation_mix(block["id"], _slot_mix[nearest_key])
                 updated += 1
         logger.info("_backfill_carbon_gaps: updated carbon_g on %d blocks", updated)
     else:
