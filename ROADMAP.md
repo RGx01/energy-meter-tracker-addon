@@ -154,11 +154,12 @@ Drop `local_date`, `local_year`, `local_month`, `local_day` from `blocks` table.
 #### Billing/Usage Stats performance (coupled with timezone)
 Rewrite `calculate_billing_summary_for_period` and `build_day_chart_html` to work on lightweight SQL rows rather than full block dicts reconstructed via `_rows_to_blocks`. Currently ~470ms per chart regeneration. Direct SQL target ~40ms. Both require changes to the data access layer.
 
-#### Carbon accuracy — forecast vs actual
-- Weekly pass fetching previous 7 days from NESO, populating `intensity_actual` where still NULL
-- Recompute `carbon_g` on affected blocks using actual over forecast
-- Add `carbon_source` column to blocks — `'forecast'` or `'actual'`
-- Insights coverage warning upgraded to show forecast vs actual split
+#### Carbon accuracy — dropped
+Regional carbon intensity actuals are not available from the NESO API — the `actual`
+field only exists on the national endpoint. The regional endpoint (used by the engine)
+only ever returns `forecast`. Backfilling regional actuals is therefore not possible.
+The forecast values are directionally correct and sufficient for the Insights Carbon tab.
+The `intensity_actual` column remains in the schema but will not be populated.
 
 #### Sub-meter boundary interpolation
 Apply same pre/post boundary read logic to sub-meters as main meter at block finalise time. Fixes gap block attribution issue (documented in Known Engine Limitation). Requires careful interaction with seed/carry-forward mechanism.
