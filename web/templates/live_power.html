@@ -2404,18 +2404,24 @@ async function _phLoad() {
   }
 }
 
-// Redraw on theme change — also force-redraw donut with new --surface colour
-window.addEventListener('message', function(e) {
-  if (e.data && e.data.type === 'emt-theme') {
+// Redraw on theme change — observe data-theme attribute on <html>
+// live_power.html is the main page (not an iframe) so postMessage('emt-theme')
+// never arrives here. MutationObserver fires immediately when applyTheme()
+// sets data-theme, guaranteeing the canvas picks up the new --surface colour.
+(function() {
+  function onThemeChange() {
     _phDraw();
-    // Force donut redraw regardless of mix data signature
     _lastMixSlot = null;
-    var canvas = document.getElementById('mix-donut-canvas');
-    if (canvas && _mixSegments.length) {
+    if (_mixSegments.length) {
       _drawMixDonut(_mixSegments.map(function(s){ return {fuel:s.fuel, perc:s.perc}; }));
     }
   }
-});
+  new MutationObserver(function(mutations) {
+    mutations.forEach(function(m) {
+      if (m.attributeName === 'data-theme') onThemeChange();
+    });
+  }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+})();
 
 // Redraw on resize
 window.addEventListener('resize', function() {
