@@ -551,14 +551,14 @@
 
   <!-- Narrative comparison card — only shown when a comparison period is active -->
   <div class="insight-card" id="ucard-narrative" style="display:none;">
-    <div class="insight-card-title" id="u-narrative-title">What changed?</div>
+    <div class="insight-card-title" id="u-narrative-title">Compared to…</div>
     <div id="u-narrative-headline" class="insight-headline" style="font-size:1.1rem;margin-bottom:8px;"></div>
     <div id="u-narrative-bullets" style="margin-top:4px;"></div>
   </div>
 
   <!-- Cost & Earnings card -->
   <div class="insight-card" id="ucard-cost">
-    <div class="insight-card-title">Cost &amp; Earnings</div>
+    <div class="insight-card-title">💷 Cost &amp; Earnings</div>
     <div class="insight-headline" id="u-net-headline">—</div>
     <div class="insight-sub" id="u-net-sub">Net cost this period.</div>
     <div class="insight-grid">
@@ -588,7 +588,7 @@
 
   <!-- Rate Period Usage card — only shown when >1 rate tier -->
   <div class="insight-card" id="ucard-rates" style="display:none;">
-    <div class="insight-card-title">Rate Period Usage</div>
+    <div class="insight-card-title">📊 Rate Period Usage</div>
     <div class="insight-sub" id="u-rates-sub">How your import is distributed across tariff rate periods.</div>
     <div id="u-rate-bars"></div>
     <div class="insight-footnote">Rate periods are determined by the import rate recorded on each half-hour block. Percentages show share of total grid import kWh.</div>
@@ -596,7 +596,7 @@
 
   <!-- Net Grid Position card -->
   <div class="insight-card" id="ucard-grid">
-    <div class="insight-card-title">Grid Position</div>
+    <div class="insight-card-title">🔌 Grid Position</div>
     <div class="insight-headline" id="u-net-grid-headline">—</div>
     <div class="insight-sub" id="u-net-grid-sub"></div>
     <div class="insight-grid">
@@ -625,7 +625,7 @@
 
   <!-- Peak Demand card -->
   <div class="insight-card" id="ucard-peak">
-    <div class="insight-card-title">Peak Demand Window</div>
+    <div class="insight-card-title">⚡ Peak Demand Window</div>
     <div class="insight-headline" id="u-peak-headline">—</div>
     <div class="insight-sub" id="u-peak-sub">The 2-hour window with the highest house grid import.</div>
     <div class="insight-footnote" id="u-peak-footnote">Based on half-hour block totals converted to local time.</div>
@@ -633,7 +633,7 @@
 
   <!-- Battery card — shown only if battery sub-meter configured -->
   <div class="insight-card" id="ucard-battery" style="display:none;">
-    <div class="insight-card-title">Battery — <span id="u-bat-label"></span></div>
+    <div class="insight-card-title">🔋 Battery — <span id="u-bat-label"></span></div>
     <div class="insight-sub">Grid energy used to charge the battery this period.</div>
     <div class="insight-grid">
       <div class="insight-metric">
@@ -652,7 +652,7 @@
 
   <!-- EV card — shown only if EV sub-meter configured -->
   <div class="insight-card" id="ucard-ev" style="display:none;">
-    <div class="insight-card-title">EV Charger — <span id="u-ev-label"></span></div>
+    <div class="insight-card-title">🚗 EV Charger — <span id="u-ev-label"></span></div>
     <div class="insight-sub">Grid energy delivered to your vehicle this period.</div>
     <div class="insight-grid">
       <div class="insight-metric">
@@ -671,7 +671,7 @@
 
   <!-- Heat Pump card — shown only if heat pump sub-meter configured -->
   <div class="insight-card" id="ucard-hp" style="display:none;">
-    <div class="insight-card-title">Heat Pump — <span id="u-hp-label"></span></div>
+    <div class="insight-card-title">♨️ Heat Pump — <span id="u-hp-label"></span></div>
     <div class="insight-sub">Grid energy consumed by your heat pump this period.</div>
     <div class="insight-grid">
       <div class="insight-metric">
@@ -710,7 +710,8 @@ function _insSaveState() {
       mode:    _insMode,
       year:    _calYear,
       month:   _calMonth,
-      compare: _insCompare
+      compare: _insCompare,
+      compareManuallyClearedAt: _insCompareManuallyCleared ? Date.now() : null
     }));
   } catch(e) {}
 }
@@ -1466,8 +1467,11 @@ function insSetMode(mode, el) {
   loadPeriod();
 }
 
+var _insCompareManuallyCleared = false;
+
 function insSetCompare(cmp, el) {
   _insCompare = (_insCompare === cmp) ? null : cmp;  // toggle
+  _insCompareManuallyCleared = (_insCompare === null);  // track manual clear
   document.querySelectorAll('#ins-compare-seg .bar-seg-btn, #ins-compare-year-seg .bar-seg-btn').forEach(function(b) {
     b.classList.remove('active');
   });
@@ -1476,6 +1480,7 @@ function insSetCompare(cmp, el) {
 }
 
 function navPeriod(dir) {
+  _insSaveState();
   if (_insMode === 'month') {
     _calMonth += dir;
     if (_calMonth > 12) { _calMonth = 1;  _calYear++; }
@@ -1511,6 +1516,10 @@ function updatePeriodNav() {
     document.querySelector('#ins-compare-seg .bar-seg-btn:nth-child(2)').disabled = !hasLastYear;
     if (_insCompare === 'prev' && !hasPrevMonth) { _insCompare = null; }
     if (_insCompare === 'year' && !hasLastYear)  { _insCompare = null; }
+    // Auto-default to prev month comparison when nothing is active and it's available
+    if (_insCompare === null && hasPrevMonth && !_insCompareManuallyCleared) {
+      _insCompare = 'prev';
+    }
     // Re-sync active state
     document.querySelectorAll('#ins-compare-seg .bar-seg-btn').forEach(function(b) {
       b.classList.remove('active');
@@ -1526,6 +1535,10 @@ function updatePeriodNav() {
     var hasLastYear = earliest ? (_calYear - 1) >= earliest.getFullYear() : false;
     document.querySelector('#ins-compare-year-seg .bar-seg-btn').disabled = !hasLastYear;
     if (_insCompare === 'lastyear' && !hasLastYear) { _insCompare = null; }
+    // Auto-default to last year comparison when nothing is active and it's available
+    if (_insCompare === null && hasLastYear && !_insCompareManuallyCleared) {
+      _insCompare = 'lastyear';
+    }
     document.querySelector('#ins-compare-year-seg .bar-seg-btn').classList.toggle('active', _insCompare === 'lastyear');
   }
 
@@ -1663,7 +1676,12 @@ async function initInsights() {
       if (_saved.mode   && ['bill','month','year'].indexOf(_saved.mode) !== -1) _insMode = _saved.mode;
       if (_saved.year   && _saved.year > 2000)  _calYear  = _saved.year;
       if (_saved.month  && _saved.month >= 1 && _saved.month <= 12) _calMonth = _saved.month;
-      if (_saved.compare) _insCompare = _saved.compare;
+      if (_saved.compare) {
+        _insCompare = _saved.compare;
+      } else if (_saved.hasOwnProperty('compareManuallyClearedAt')) {
+        // User explicitly cleared compare — respect it
+        _insCompareManuallyCleared = true;
+      }
       if (_saved.tab    && ['carbon','usage'].indexOf(_saved.tab) !== -1) {
         _activeInsightTab = _saved.tab;
         var tabBtn = document.querySelector('.insights-tab[data-tab="' + _saved.tab + '"]');
@@ -1980,11 +1998,13 @@ function renderUsage(d, cmpData) {
 
   // ── Narrative comparison ──────────────────────────────────────────────────
   if (cmpData && !cmpData.error) {
-    var cmpLabel = _insCompare === 'prev' ? 'last month' :
-                   _insCompare === 'year' ? 'same month last year' :
-                   _insCompare === 'lastyear' ? 'last year' : 'previous period';
+    // Use actual period name (e.g. "March 2026") for consistency with Carbon tab
+    var cmpLabel = cmpData.period_label ||
+                   (_insCompare === 'prev' ? 'last month' :
+                    _insCompare === 'year' ? 'same month last year' :
+                    _insCompare === 'lastyear' ? 'last year' : 'previous period');
     var narrative = generateUsageNarrative(d, cmpData, cmpLabel);
-    document.getElementById('u-narrative-title').textContent = 'What changed vs ' + cmpLabel + '?';
+    document.getElementById('u-narrative-title').textContent = 'Compared to ' + cmpLabel;
     document.getElementById('u-narrative-headline').textContent = narrative.headline;
     var bulletsHtml = narrative.bullets.map(function(b) {
       return '<div style="display:flex;gap:8px;margin-bottom:6px;">' +
