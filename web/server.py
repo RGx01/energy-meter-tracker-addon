@@ -1501,7 +1501,7 @@ def api_blocks_summary():
         _raw_rows = store._conn.execute(f"""
             SELECT b.block_start, b.meter_id, m.is_sub_meter, m.parent_meter_id,
                    b.imp_kwh, b.imp_kwh_grid, b.imp_kwh_remainder,
-                   b.imp_cost, b.imp_cost_remainder, b.exp_kwh, b.exp_cost,
+                   b.imp_rate, b.imp_cost, b.imp_cost_remainder, b.exp_kwh, b.exp_cost,
                    b.standing_charge, b.carbon_g,
                    b.interpolated, cp.billing_day
             FROM blocks b
@@ -1525,7 +1525,10 @@ def api_blocks_summary():
                 _day_data[_local_d] = {
                     "main":        {"imp_kwh": 0.0, "imp_cost": 0.0, "exp_kwh": 0.0, "exp_cost": 0.0,
                                     "carbon_g": None, "cg_imp": None, "cg_exp": None,
-                                    "ci_abs_carbon": 0.0, "ci_abs_net_kwh": 0.0},
+                                    "ci_abs_carbon": 0.0, "ci_abs_net_kwh": 0.0,
+                                    # Rate-keyed accumulators for billing-accurate subtraction
+                                    "_main_by_rate": {},   # rate → {kwh, cost}
+                                    "_sub_by_rate":  {}},  # rate → {kwh, cost}
                     "subs":        {},
                     "standing":    0.0,
                     "billing_day": int(_r["billing_day"] or billing_day),
@@ -1540,22 +1543,23 @@ def api_blocks_summary():
             _cg  = float(_r["carbon_g"]) if _r["carbon_g"] is not None else None
 
             if not _is_sub:
-                # Main meter
+                # Main meter — accumulate raw cost by rate for billing-accurate subtraction.
+                # Direct import cost = main_cost[rate] - sub_cost[rate] per rate tier,
+                # matching calculate_billing_summary_for_period (2.7.1 behaviour).
                 _m = _dd["main"]
-                # Use remainder for both kwh and cost — Direct import = house-only,
-                # matching 2.7.1 behaviour. Sub-meter costs are separate additive rows.
+                _rate = round(float(_r["imp_rate"] or 0), 6)
                 if _r["imp_kwh_remainder"] is not None:
                     _m_imp = float(_r["imp_kwh_remainder"])
                 elif _r["imp_kwh_grid"] is not None:
                     _m_imp = float(_r["imp_kwh_grid"])
                 else:
                     _m_imp = _imp
-                if _r["imp_cost_remainder"] is not None:
-                    _m_cost = float(_r["imp_cost_remainder"])
-                else:
-                    _m_cost = _cost_imp
-                _m["imp_kwh"]  += _m_imp
-                _m["imp_cost"] += _m_cost
+                # Accumulate raw main cost by rate (sub subtraction happens after loop)
+                if _rate not in _dd["main"]["_main_by_rate"]:
+                    _dd["main"]["_main_by_rate"][_rate] = {"kwh": 0.0, "cost": 0.0}
+                _dd["main"]["_main_by_rate"][_rate]["kwh"]  += _m_imp
+                _dd["main"]["_main_by_rate"][_rate]["cost"] += _cost_imp
+                _m["imp_kwh"] += _m_imp  # kwh accumulates normally
                 _m["exp_kwh"]  += _exp
                 _m["exp_cost"] += _cost_exp
                 if _sc > _dd["standing"]:
@@ -1578,7 +1582,7 @@ def api_blocks_summary():
                         _m["ci_abs_carbon"]  += abs(_cg)
                         _m["ci_abs_net_kwh"] += _exp
             else:
-                # Sub-meter
+                # Sub-meter — accumulate by rate for main meter cost subtraction
                 _mid = _r["meter_id"]
                 if _mid not in _dd["subs"]:
                     _dd["subs"][_mid] = {"imp_kwh":0.0,"imp_cost":0.0,"exp_kwh":0.0,"exp_cost":0.0,"carbon_g":None}
@@ -1590,6 +1594,22 @@ def api_blocks_summary():
                 _s["exp_cost"] += _cost_exp
                 if _cg is not None:
                     _s["carbon_g"] = (_s["carbon_g"] or 0.0) + _cg
+                # Also accumulate sub cost by rate for main meter subtraction
+                _rate = round(float(_r["imp_rate"] or 0), 6)
+                if _rate not in _dd["main"]["_sub_by_rate"]:
+                    _dd["main"]["_sub_by_rate"][_rate] = {"kwh": 0.0, "cost": 0.0}
+                _dd["main"]["_sub_by_rate"][_rate]["kwh"]  += _sub_imp
+                _dd["main"]["_sub_by_rate"][_rate]["cost"] += _cost_imp
+
+        # ── Compute main meter imp_cost via rate-based subtraction ─────────────
+        # This matches calculate_billing_summary_for_period exactly (2.7.1 behaviour).
+        for _ld, _dd in _day_data.items():
+            _m = _dd["main"]
+            _direct_cost = 0.0
+            for _rate, _mv in (_m.get("_main_by_rate") or {}).items():
+                _sv = (_m.get("_sub_by_rate") or {}).get(_rate, {"kwh": 0.0, "cost": 0.0})
+                _direct_cost += max(0.0, _mv["cost"] - _sv["cost"])
+            _m["imp_cost"] = _direct_cost
 
         # Pre-compute billing periods
         _bp_start_by_date = {}

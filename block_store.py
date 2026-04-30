@@ -604,6 +604,20 @@ class BlockStore:
                     )
         except Exception:
             pass
+
+        # 2.8.0 — remove redundant generation_mix rows stored against sub-meter blocks.
+        # Mix is a grid property; only the main meter block needs it.
+        try:
+            with self._conn:
+                self._conn.execute("""
+                    DELETE FROM generation_mix
+                    WHERE block_id IN (
+                        SELECT id FROM blocks WHERE meter_id != 'electricity_main'
+                    )
+                """)
+        except Exception:
+            pass
+
         try:
             self._conn.execute("""
                 CREATE TABLE IF NOT EXISTS generation_mix (
