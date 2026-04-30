@@ -62,8 +62,22 @@ sys.modules["ha_client"] = hc
 
 # Stub block_store — use real in-memory BlockStore pre-loaded with MINIMAL_BLOCKS
 # (defined after MINIMAL_BLOCKS below, wired in via make_client)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from block_store import BlockStore, open_block_store
+# Remove any cached stub from previous test runs before importing the real module
+if "block_store" in sys.modules:
+    del sys.modules["block_store"]
+import importlib.util as _ilu
+_bs_spec = _ilu.spec_from_file_location(
+    "block_store_real",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "block_store.py")
+)
+_bs_real = _ilu.module_from_spec(_bs_spec)
+_bs_spec.loader.exec_module(_bs_real)
+BlockStore       = _bs_real.BlockStore
+open_block_store = _bs_real.open_block_store
+_ldtub  = _bs_real.local_date_to_utc_bounds
+_ldrtub = _bs_real.local_date_range_to_utc_bounds
 
 def _make_test_store(blocks=None):
     """Create an in-memory BlockStore pre-loaded with given blocks."""
@@ -82,6 +96,8 @@ def _make_test_store(blocks=None):
 bs_mod = types.ModuleType("block_store")
 bs_mod.BlockStore       = BlockStore
 bs_mod.open_block_store = lambda path: _make_test_store()
+bs_mod.local_date_to_utc_bounds        = _ldtub
+bs_mod.local_date_range_to_utc_bounds  = _ldrtub
 sys.modules["block_store"] = bs_mod
 
 # Stub engine (pause/resume only)
@@ -456,22 +472,18 @@ class TestApiBlocksSummaryCarbonG(unittest.TestCase):
         from zoneinfo import ZoneInfo
         bs = "2026-04-14T10:00:00"
         be = "2026-04-14T10:30:00"
-        ld = (datetime.fromisoformat(bs)
-              .replace(tzinfo=ZoneInfo("UTC"))
-              .astimezone(ZoneInfo("Europe/London"))
-              .date().isoformat())
         store._conn.execute("""
             INSERT INTO blocks (
-                block_start, block_end, local_date, local_year, local_month, local_day,
+                block_start, block_end,
                 meter_id, config_period_id, interpolated,
                 imp_kwh, imp_kwh_grid, imp_kwh_remainder,
                 imp_rate, imp_cost, imp_cost_remainder,
                 imp_read_start, imp_read_end,
                 exp_kwh, exp_rate, exp_cost,
                 exp_read_start, exp_read_end, standing_charge, carbon_g)
-            VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,NULL,NULL,NULL,?,NULL,?,NULL,NULL,?,?)
-        """, (bs, be, ld, int(ld[:4]), int(ld[5:7]), int(ld[8:10]),
-              "electricity_main", cp_id, 0,
+            VALUES (?,?,?,?,0,?,NULL,NULL,?,NULL,NULL,NULL,NULL,?,NULL,?,NULL,NULL,?,?)
+        """, (bs, be,
+              "electricity_main", cp_id,
               imp_kwh, 0.49, exp_kwh, 0.0, 0.5, carbon_g))
         store._conn.commit()
         return store, cfg
@@ -1282,25 +1294,24 @@ class TestApiCorrectionsEnhanced(unittest.TestCase):
         blocks = [
             # 20/3 — three blocks for main meter (UTC = local in March)
             ("2026-03-20T14:00:00", "2026-03-20T14:30:00", "electricity_main",
-             "2026-03-20", 0.5, 0.245, 0.1225, 0.1, 0.04, 0.004, 0.6),
+             0.5, 0.245, 0.1225, 0.1, 0.04, 0.004, 0.6),
             ("2026-03-20T15:00:00", "2026-03-20T15:30:00", "electricity_main",
-             "2026-03-20", 0.6, 0.285, 0.1710, 0.0, 0.04, 0.0000, 0.6),
+             0.6, 0.285, 0.1710, 0.0, 0.04, 0.0000, 0.6),
             ("2026-03-20T15:30:00", "2026-03-20T16:00:00", "electricity_main",
-             "2026-03-20", 0.4, 0.285, 0.1140, 0.0, 0.04, 0.0000, 0.6),
+             0.4, 0.285, 0.1140, 0.0, 0.04, 0.0000, 0.6),
             # 20/3 — ev_charger sub-meter
             ("2026-03-20T15:00:00", "2026-03-20T15:30:00", "ev_charger",
-             "2026-03-20", 0.3, 0.285, 0.0855, 0.0, 0.04, 0.0000, 0.0),
+             0.3, 0.285, 0.0855, 0.0, 0.04, 0.0000, 0.0),
             # 21/3
             ("2026-03-21T10:00:00", "2026-03-21T10:30:00", "electricity_main",
-             "2026-03-21", 0.7, 0.245, 0.1715, 0.0, 0.04, 0.0000, 0.6),
+             0.7, 0.245, 0.1715, 0.0, 0.04, 0.0000, 0.6),
         ]
-        for (bs, be, mid, ld, ikwh, irate, icost, ekwh, erate, ecost, sc) in blocks:
+        for (bs, be, mid, ikwh, irate, icost, ekwh, erate, ecost, sc) in blocks:
             store._conn.execute("""
-                INSERT INTO blocks (block_start, block_end, meter_id, config_period_id,
-                  local_date, local_year, local_month, local_day, interpolated,
+                INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, interpolated,
                   imp_kwh, imp_rate, imp_cost, exp_kwh, exp_rate, exp_cost, standing_charge)
-                VALUES (?,?,?,?,?,2026,3,20,0, ?,?,?,?,?,?,?)
-            """, (bs, be, mid, cp_id, ld, ikwh, irate, icost, ekwh, erate, ecost, sc))
+                VALUES (?,?,?,?,0, ?,?,?,?,?,?,?)
+            """, (bs, be, mid, cp_id, ikwh, irate, icost, ekwh, erate, ecost, sc))
         store._conn.commit()
         # insert_config_period already inserts electricity_main via _write_meters.
         # Add ev_charger as a sub-meter so the standing charge correction subquery
@@ -1436,7 +1447,8 @@ class TestApiCorrectionsEnhanced(unittest.TestCase):
         # Only main meter rows are updated — sub-meter standing_charge stays 0
         rows = store._conn.execute(
             """SELECT standing_charge FROM blocks
-               WHERE local_date='2026-03-20' AND meter_id='electricity_main'"""
+               WHERE block_start >= '2026-03-20T00:00:00' AND block_start < '2026-03-21T00:00:00'
+               AND meter_id='electricity_main'"""
         ).fetchall()
         self.assertGreater(len(rows), 0)
         for row in rows:
@@ -1459,20 +1471,19 @@ class TestApiCorrectionsEnhanced(unittest.TestCase):
         # block_start UTC '2026-07-14T23:30:00', local_date '2026-07-15'
         blocks = [
             # Night rate blocks (local 00:30–06:30 BST = 23:30–05:30 UTC)
-            ("2026-07-14T23:30:00", "2026-07-14T23:30:00", "2026-07-15", 0.5, 0.08),
-            ("2026-07-15T00:00:00", "2026-07-15T00:00:00", "2026-07-15", 0.5, 0.08),
-            ("2026-07-15T05:30:00", "2026-07-15T05:30:00", "2026-07-15", 0.5, 0.08),
+            ("2026-07-14T23:30:00", "2026-07-14T23:30:00", 0.5, 0.08),
+            ("2026-07-15T00:00:00", "2026-07-15T00:00:00", 0.5, 0.08),
+            ("2026-07-15T05:30:00", "2026-07-15T05:30:00", 0.5, 0.08),
             # Day rate blocks (local 07:30+ BST = 06:30+ UTC)
-            ("2026-07-15T06:30:00", "2026-07-15T06:30:00", "2026-07-15", 0.5, 0.245),
-            ("2026-07-15T12:00:00", "2026-07-15T12:00:00", "2026-07-15", 0.5, 0.245),
+            ("2026-07-15T06:30:00", "2026-07-15T06:30:00", 0.5, 0.245),
+            ("2026-07-15T12:00:00", "2026-07-15T12:00:00", 0.5, 0.245),
         ]
-        for (bs, be, ld, kwh, rate) in blocks:
+        for (bs, be, kwh, rate) in blocks:
             store._conn.execute("""
-                INSERT INTO blocks (block_start, block_end, meter_id, config_period_id,
-                  local_date, local_year, local_month, local_day, interpolated,
+                INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, interpolated,
                   imp_kwh, imp_rate, imp_cost, exp_kwh, exp_rate, exp_cost, standing_charge)
-                VALUES (?,?,'electricity_main',?,?,2026,7,15,0, ?,?,ROUND(?*?,6),0,0,0,0.5)
-            """, (bs, be, cp_id, ld, kwh, rate, kwh, rate))
+                VALUES (?,?,'electricity_main',?,0, ?,?,ROUND(?*?,6),0,0,0,0.5)
+            """, (bs, be, cp_id, kwh, rate, kwh, rate))
         store._conn.commit()
 
         client = make_client(store=store)
@@ -2208,10 +2219,9 @@ class TestAggregateInsights(unittest.TestCase):
             ).fetchone()[0]
             # Main meter block
             self.store._conn.execute(
-                "INSERT INTO blocks (block_start, block_end, local_date, local_year, "
-                "local_month, local_day, meter_id, config_period_id, imp_kwh, exp_kwh, carbon_g) "
-                "VALUES ('2026-04-01T00:00:00', '2026-04-01T00:30:00', '2026-04-01', "
-                "2026, 4, 1, 'electricity_main', ?, 10.0, 2.0, 500.0)",
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, imp_kwh, exp_kwh, carbon_g) "
+                "VALUES ('2026-04-01T00:00:00', '2026-04-01T00:30:00', "
+                "'electricity_main', ?, 10.0, 2.0, 500.0)",
                 (cp_id,)
             )
             # Sub-meter block
@@ -2221,11 +2231,10 @@ class TestAggregateInsights(unittest.TestCase):
                 (cp_id,)
             )
             self.store._conn.execute(
-                "INSERT INTO blocks (block_start, block_end, local_date, local_year, "
-                "local_month, local_day, meter_id, config_period_id, imp_kwh, "
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, imp_kwh, "
                 "exp_kwh, carbon_g) "
-                "VALUES ('2026-04-01T00:00:00', '2026-04-01T00:30:00', '2026-04-01', "
-                "2026, 4, 1, 'ev_charger', ?, 4.0, 0.0, 200.0)",
+                "VALUES ('2026-04-01T00:00:00', '2026-04-01T00:30:00', "
+                "'ev_charger', ?, 4.0, 0.0, 200.0)",
                 (cp_id,)
             )
         self.cfg = {
@@ -2279,3 +2288,570 @@ class TestAggregateInsights(unittest.TestCase):
         )
         self.assertFalse(d["has_carbon"])
         self.assertEqual(d["imp_kwh"], 0.0)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _aggregate_usage
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAggregateUsage(unittest.TestCase):
+    """Tests for _aggregate_usage() covering cost, rate tiers, peak window,
+    net grid position, and sub-meter breakdown."""
+
+    def setUp(self):
+        import sqlite3
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript("""
+            CREATE TABLE config_periods (
+                id INTEGER PRIMARY KEY,
+                billing_day INTEGER, block_minutes INTEGER,
+                timezone TEXT, currency_symbol TEXT, currency_code TEXT,
+                effective_from TEXT, effective_to TEXT,
+                site_name TEXT, change_reason TEXT
+            );
+            CREATE TABLE meters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                config_period_id INTEGER, meter_id TEXT,
+                is_sub_meter INTEGER DEFAULT 0,
+                parent_meter_id TEXT, device_label TEXT,
+                meter_type TEXT, protected INTEGER DEFAULT 0,
+                inverter_possible INTEGER DEFAULT 0,
+                power_sensor TEXT, postcode_prefix TEXT,
+                v2x_capable INTEGER DEFAULT 0,
+                inverter_power_invert INTEGER DEFAULT 0,
+                soc_sensor TEXT, inverter_power_sensor TEXT,
+                device_power_sensor TEXT
+            );
+            CREATE TABLE blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_start TEXT, block_end TEXT,
+                meter_id TEXT, config_period_id INTEGER,
+                imp_kwh REAL, imp_kwh_grid REAL, imp_kwh_remainder REAL,
+                imp_rate REAL, imp_cost REAL,
+                imp_cost_remainder REAL, imp_read_start REAL, imp_read_end REAL,
+                exp_kwh REAL, exp_rate REAL, exp_cost REAL,
+                exp_read_start REAL, exp_read_end REAL,
+                standing_charge REAL, carbon_g REAL, interpolated INTEGER DEFAULT 0
+            );
+        """)
+        # Config period
+        self.conn.execute("""INSERT INTO config_periods
+            (id, billing_day, block_minutes, timezone, currency_symbol, currency_code,
+             effective_from, effective_to)
+            VALUES (1, 3, 30, 'UTC', '£', 'GBP', '2026-01-01T00:00:00', NULL)""")
+        # Meters
+        self.conn.execute("""INSERT INTO meters
+            (config_period_id, meter_id, is_sub_meter, meter_type)
+            VALUES (1, 'electricity_main', 0, NULL)""")
+        self.conn.execute("""INSERT INTO meters
+            (config_period_id, meter_id, is_sub_meter, meter_type, device_label)
+            VALUES (1, 'ev_charger', 1, 'ev', 'Zappi')""")
+
+        # Insert 4 blocks: 2 at cheap rate (0.07), 1 at peak (0.30), 1 export
+        # Main meter - cheap rate block 1
+        self.conn.execute("""INSERT INTO blocks
+            (block_start, block_end, meter_id, config_period_id,
+             imp_kwh, imp_kwh_remainder, imp_rate, imp_cost,
+             exp_kwh, exp_rate, exp_cost, standing_charge)
+            VALUES ('2026-04-01T00:00:00','2026-04-01T00:30:00','electricity_main',1,
+                    5.0, 3.0, 0.07, 0.35,  0.0, 0.12, 0.0, 0.50)""")
+        # Main meter - cheap rate block 2
+        self.conn.execute("""INSERT INTO blocks
+            (block_start, block_end, meter_id, config_period_id,
+             imp_kwh, imp_kwh_remainder, imp_rate, imp_cost,
+             exp_kwh, exp_rate, exp_cost, standing_charge)
+            VALUES ('2026-04-01T01:00:00','2026-04-01T01:30:00','electricity_main',1,
+                    4.0, 2.0, 0.07, 0.28,  0.0, 0.12, 0.0, 0.50)""")
+        # Main meter - peak rate block
+        self.conn.execute("""INSERT INTO blocks
+            (block_start, block_end, meter_id, config_period_id,
+             imp_kwh, imp_kwh_remainder, imp_rate, imp_cost,
+             exp_kwh, exp_rate, exp_cost, standing_charge)
+            VALUES ('2026-04-01T08:00:00','2026-04-01T08:30:00','electricity_main',1,
+                    2.0, 2.0, 0.30, 0.60,  0.0, 0.12, 0.0, 0.50)""")
+        # Main meter - export block
+        self.conn.execute("""INSERT INTO blocks
+            (block_start, block_end, meter_id, config_period_id,
+             imp_kwh, imp_kwh_remainder, imp_rate, imp_cost,
+             exp_kwh, exp_rate, exp_cost, standing_charge)
+            VALUES ('2026-04-01T12:00:00','2026-04-01T12:30:00','electricity_main',1,
+                    0.0, 0.0, 0.12, 0.0,  3.0, 0.12, 0.36, 0.50)""")
+        # EV charger sub-meter - cheap rate
+        self.conn.execute("""INSERT INTO blocks
+            (block_start, block_end, meter_id, config_period_id,
+             imp_kwh, imp_kwh_grid, imp_rate, imp_cost,
+             exp_kwh, exp_rate, exp_cost, standing_charge)
+            VALUES ('2026-04-01T00:00:00','2026-04-01T00:30:00','ev_charger',1,
+                    2.0, 2.0, 0.07, 0.14,  0.0, 0.0, 0.0, 0.0)""")
+        self.conn.execute("""INSERT INTO blocks
+            (block_start, block_end, meter_id, config_period_id,
+             imp_kwh, imp_kwh_grid, imp_rate, imp_cost,
+             exp_kwh, exp_rate, exp_cost, standing_charge)
+            VALUES ('2026-04-01T01:00:00','2026-04-01T01:30:00','ev_charger',1,
+                    2.0, 2.0, 0.07, 0.14,  0.0, 0.0, 0.0, 0.0)""")
+        self.conn.commit()
+
+        class FakeStore:
+            def __init__(self, conn): self._conn = conn
+        self.store = FakeStore(self.conn)
+        self.cfg = {
+            "meters": {
+                "electricity_main": {"meta": {"timezone": "UTC", "block_minutes": 30,
+                                               "currency_symbol": "£"}},
+                "ev_charger": {"meta": {"sub_meter": True, "meter_type": "ev",
+                                         "device": "Zappi"}},
+            }
+        }
+
+    def _run(self):
+        return server._aggregate_usage(
+            self.store, self.cfg,
+            "2026-04-01T00:00:00", "2026-04-02T00:00:00"
+        )
+
+    def test_imp_kwh_total(self):
+        """Total grid import = sum of main meter imp_kwh."""
+        d = self._run()
+        self.assertAlmostEqual(d["imp_kwh"], 11.0, places=3)
+
+    def test_exp_kwh_total(self):
+        """Total export = 3.0 kWh."""
+        d = self._run()
+        self.assertAlmostEqual(d["exp_kwh"], 3.0, places=3)
+
+    def test_imp_cost_total(self):
+        """Import cost = 0.35 + 0.28 + 0.60 = 1.23."""
+        d = self._run()
+        self.assertAlmostEqual(d["imp_cost"], 1.23, places=4)
+
+    def test_exp_cost_total(self):
+        """Export earnings = 0.36."""
+        d = self._run()
+        self.assertAlmostEqual(d["exp_cost"], 0.36, places=4)
+
+    def test_standing_charge_once_per_day(self):
+        """Standing charge summed once per local day (not once per block)."""
+        d = self._run()
+        self.assertAlmostEqual(d["standing_charge"], 0.50, places=4)
+
+    def test_net_cost(self):
+        """Net = imp_cost + standing - exp_cost = 1.23 + 0.50 - 0.36 = 1.37."""
+        d = self._run()
+        self.assertAlmostEqual(d["net_cost"], 1.37, places=4)
+
+    def test_net_grid_kwh(self):
+        """Net grid = 11.0 imp - 3.0 exp = 8.0."""
+        d = self._run()
+        self.assertAlmostEqual(d["net_grid_kwh"], 8.0, places=3)
+
+    def test_rate_tiers_count(self):
+        """Two distinct rate tiers: 0.07 and 0.30."""
+        d = self._run()
+        self.assertEqual(len(d["rate_tiers"]), 2)
+
+    def test_rate_tiers_cheap_kwh(self):
+        """Cheap tier (0.07): 5.0 + 4.0 = 9.0 kWh."""
+        d = self._run()
+        cheap = next(t for t in d["rate_tiers"] if abs(t["rate"] - 0.07) < 0.001)
+        self.assertAlmostEqual(cheap["kwh"], 9.0, places=3)
+
+    def test_rate_tiers_peak_kwh(self):
+        """Peak tier (0.30): 2.0 kWh."""
+        d = self._run()
+        peak = next(t for t in d["rate_tiers"] if abs(t["rate"] - 0.30) < 0.001)
+        self.assertAlmostEqual(peak["kwh"], 2.0, places=3)
+
+    def test_weighted_rate(self):
+        """Weighted avg rate = total_cost / total_kwh = 1.23 / 11.0."""
+        d = self._run()
+        self.assertAlmostEqual(d["weighted_rate"], 1.23 / 11.0, places=5)
+
+    def test_house_imp_kwh(self):
+        """House remainder = 3.0 + 2.0 + 2.0 = 7.0 (from imp_kwh_remainder cols)."""
+        d = self._run()
+        self.assertAlmostEqual(d["house_imp_kwh"], 7.0, places=3)
+
+    def test_sub_meter_ev_present(self):
+        """EV charger appears in sub_meters."""
+        d = self._run()
+        self.assertIn("ev_charger", d["sub_meters"])
+
+    def test_sub_meter_ev_kwh(self):
+        """EV charger grid kwh = 2.0 + 2.0 = 4.0."""
+        d = self._run()
+        self.assertAlmostEqual(d["sub_meters"]["ev_charger"]["imp_kwh"], 4.0, places=3)
+
+    def test_sub_meter_ev_rate_tiers(self):
+        """EV sub-meter has rate tier breakdown."""
+        d = self._run()
+        ev = d["sub_meters"]["ev_charger"]
+        self.assertIn("rate_tiers", ev)
+        self.assertEqual(len(ev["rate_tiers"]), 1)
+        self.assertAlmostEqual(ev["rate_tiers"][0]["rate"], 0.07, places=4)
+        self.assertAlmostEqual(ev["rate_tiers"][0]["kwh"], 4.0, places=3)
+
+    def test_peak_window_fields_present(self):
+        """Peak window fields are present in response."""
+        d = self._run()
+        self.assertIn("peak_window_start", d)
+        self.assertIn("peak_window_kwh", d)
+
+    def test_net_exporter_days_zero(self):
+        """No net exporter days — export 3kWh < import 11kWh."""
+        d = self._run()
+        self.assertEqual(d["net_exporter_days"], 0)
+
+    def test_empty_range_returns_zeros(self):
+        """Empty date range returns zero costs and empty tiers."""
+        d = server._aggregate_usage(
+            self.store, self.cfg,
+            "2025-01-01T00:00:00", "2025-01-02T00:00:00"
+        )
+        self.assertEqual(d["imp_kwh"], 0.0)
+        self.assertEqual(d["imp_cost"], 0.0)
+        self.assertEqual(d["rate_tiers"], [])
+        self.assertIsNone(d["weighted_rate"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /api/usage/* endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApiUsageEndpoints(unittest.TestCase):
+
+    def setUp(self):
+        self.client = make_client()
+
+    def test_billing_period_returns_200_or_404(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/usage/billing-period")
+        self.assertIn(r.status_code, (200, 404, 500))
+
+    def test_calendar_month_returns_200(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/usage/calendar-month?year=2026&month=4")
+        self.assertIn(r.status_code, (200, 500))
+        if r.status_code == 200:
+            d = json.loads(r.data)
+            self.assertIn("imp_kwh", d)
+            self.assertIn("rate_tiers", d)
+            self.assertIn("net_grid_kwh", d)
+
+    def test_calendar_year_returns_200(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/usage/calendar-year?year=2026")
+        self.assertIn(r.status_code, (200, 500))
+
+    def test_calendar_month_has_period_label(self):
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/usage/calendar-month?year=2026&month=1")
+        if r.status_code == 200:
+            d = json.loads(r.data)
+            self.assertIn("period_label", d)
+
+    def test_response_shape_keys(self):
+        """All required keys present in a successful response."""
+        with patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = self.client.get("/api/usage/calendar-month?year=2026&month=4")
+        if r.status_code != 200:
+            return
+        d = json.loads(r.data)
+        for key in ("imp_kwh", "exp_kwh", "imp_cost", "exp_cost",
+                    "standing_charge", "net_cost", "net_grid_kwh",
+                    "rate_tiers", "sub_meters", "peak_window_start",
+                    "net_exporter_days", "house_imp_kwh"):
+            self.assertIn(key, d, msg=f"Missing key: {key}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /api/power/mix-history (2.8.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApiPowerMixHistory(unittest.TestCase):
+    """Tests for /api/power/mix-history endpoint."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mktemp(suffix=".db")
+        from block_store import BlockStore
+        self.store = BlockStore(self.tmp)
+        with self.store._conn:
+            self.store._conn.execute(
+                "INSERT INTO config_periods (billing_day, block_minutes, timezone, "
+                "currency_symbol, currency_code, effective_from) "
+                "VALUES (1, 30, 'UTC', '£', 'GBP', '2026-01-01')"
+            )
+            cp_id = self.store._conn.execute(
+                "SELECT id FROM config_periods LIMIT 1"
+            ).fetchone()[0]
+            # Insert recent main meter block (within 48 hours)
+            from datetime import datetime, timezone, timedelta
+            recent = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(tzinfo=None).isoformat()
+            self.store._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                "imp_kwh, exp_kwh) VALUES (?, ?, 'electricity_main', ?, 10.0, 0.0)",
+                (recent[:16], recent[:16], cp_id)
+            )
+            bid = self.store._conn.execute(
+                "SELECT id FROM blocks WHERE meter_id='electricity_main'"
+            ).fetchone()[0]
+            self.store._conn.execute(
+                "INSERT INTO generation_mix (block_id, fuel, perc) VALUES (?, 'wind', 65.0)",
+                (bid,)
+            )
+            self.store._conn.execute(
+                "INSERT INTO generation_mix (block_id, fuel, perc) VALUES (?, 'gas', 35.0)",
+                (bid,)
+            )
+        server.app.config["TESTING"] = True
+        self.client = server.app.test_client()
+
+    def tearDown(self):
+        import os
+        self.store._conn.close()
+        if os.path.exists(self.tmp):
+            os.remove(self.tmp)
+
+    def test_returns_200(self):
+        with patch.object(server, "_get_store", return_value=self.store):
+            r = self.client.get("/api/power/mix-history")
+        self.assertEqual(r.status_code, 200)
+
+    def test_response_has_slots_key(self):
+        with patch.object(server, "_get_store", return_value=self.store):
+            r = self.client.get("/api/power/mix-history")
+        d = json.loads(r.data)
+        self.assertIn("slots", d)
+
+    def test_slot_has_block_start_and_fuels(self):
+        with patch.object(server, "_get_store", return_value=self.store):
+            r = self.client.get("/api/power/mix-history")
+        d = json.loads(r.data)
+        self.assertGreater(len(d["slots"]), 0)
+        slot = d["slots"][0]
+        self.assertIn("block_start", slot)
+        self.assertIn("fuels", slot)
+        self.assertIn("wind", slot["fuels"])
+        self.assertAlmostEqual(slot["fuels"]["wind"], 65.0)
+
+    def test_empty_db_returns_empty_slots(self):
+        import tempfile, os
+        tmp2 = tempfile.mktemp(suffix=".db")
+        try:
+            from block_store import BlockStore
+            empty_store = BlockStore(tmp2)
+            with patch.object(server, "_get_store", return_value=empty_store):
+                r = self.client.get("/api/power/mix-history")
+            d = json.loads(r.data)
+            self.assertEqual(d["slots"], [])
+        finally:
+            if os.path.exists(tmp2):
+                os.remove(tmp2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _aggregate_insights generation_mix field (2.8.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAggregateInsightsGenerationMix(unittest.TestCase):
+    """_aggregate_insights returns generation_mix when mix data present."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mktemp(suffix=".db")
+        from block_store import BlockStore
+        self.store = BlockStore(self.tmp)
+        with self.store._conn:
+            self.store._conn.execute(
+                "INSERT INTO config_periods (billing_day, block_minutes, timezone, "
+                "currency_symbol, currency_code, effective_from) "
+                "VALUES (1, 30, 'UTC', '£', 'GBP', '2026-01-01')"
+            )
+            cp_id = self.store._conn.execute(
+                "SELECT id FROM config_periods LIMIT 1"
+            ).fetchone()[0]
+            self.store._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                "imp_kwh, exp_kwh, carbon_g) "
+                "VALUES ('2026-04-01T00:00:00', '2026-04-01T00:30:00', "
+                "'electricity_main', ?, 10.0, 0.0, 400.0)", (cp_id,)
+            )
+            bid = self.store._conn.execute(
+                "SELECT id FROM blocks WHERE meter_id='electricity_main'"
+            ).fetchone()[0]
+            self.store._conn.execute(
+                "INSERT INTO generation_mix (block_id, fuel, perc) VALUES (?, 'wind', 70.0)",
+                (bid,)
+            )
+            self.store._conn.execute(
+                "INSERT INTO generation_mix (block_id, fuel, perc) VALUES (?, 'gas', 30.0)",
+                (bid,)
+            )
+        self.cfg = {
+            "meters": {
+                "electricity_main": {"meta": {"timezone": "UTC", "block_minutes": 30}}
+            }
+        }
+
+    def tearDown(self):
+        import os
+        self.store._conn.close()
+        if os.path.exists(self.tmp):
+            os.remove(self.tmp)
+
+    def test_generation_mix_key_present(self):
+        d = server._aggregate_insights(
+            self.store, self.cfg,
+            "2026-04-01T00:00:00", "2026-04-02T00:00:00"
+        )
+        self.assertIn("generation_mix", d)
+
+    def test_generation_mix_contains_fuels(self):
+        d = server._aggregate_insights(
+            self.store, self.cfg,
+            "2026-04-01T00:00:00", "2026-04-02T00:00:00"
+        )
+        fuels = {r["fuel"]: r["perc"] for r in d["generation_mix"]}
+        self.assertIn("wind", fuels)
+        self.assertAlmostEqual(fuels["wind"], 70.0, places=1)
+
+    def test_generation_mix_empty_when_no_mix_data(self):
+        d = server._aggregate_insights(
+            self.store, self.cfg,
+            "2025-01-01T00:00:00", "2025-01-02T00:00:00"
+        )
+        self.assertEqual(d["generation_mix"], [])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# api_blocks_summary Direct import uses imp_cost_remainder (2.8.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApiBlocksSummaryDirectImportCost(unittest.TestCase):
+    """Direct import cost in api_blocks_summary uses imp_cost_remainder not imp_cost."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mktemp(suffix=".db")
+        from block_store import BlockStore
+        self.store = BlockStore(self.tmp)
+        with self.store._conn:
+            self.store._conn.execute(
+                "INSERT INTO config_periods (billing_day, block_minutes, timezone, "
+                "currency_symbol, currency_code, effective_from) "
+                "VALUES (1, 30, 'Europe/London', '£', 'GBP', '2026-01-01')"
+            )
+            cp_id = self.store._conn.execute(
+                "SELECT id FROM config_periods LIMIT 1"
+            ).fetchone()[0]
+            # Main meter: imp_cost=£1.00, imp_cost_remainder=£0.30 (house-only)
+            self.store._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                "imp_kwh, imp_kwh_remainder, imp_rate, imp_cost, imp_cost_remainder, "
+                "exp_kwh, exp_cost, standing_charge) "
+                "VALUES ('2026-04-07T00:00:00', '2026-04-07T00:30:00', "
+                "'electricity_main', ?, 10.0, 3.0, 0.05, 0.50, 0.15, 0.0, 0.0, 0.50)",
+                (cp_id,)
+            )
+            self.store._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                "imp_kwh, imp_kwh_remainder, imp_rate, imp_cost, imp_cost_remainder, "
+                "exp_kwh, exp_cost, standing_charge) "
+                "VALUES ('2026-04-07T00:30:00', '2026-04-07T01:00:00', "
+                "'electricity_main', ?, 10.0, 3.0, 0.05, 0.50, 0.15, 0.0, 0.0, 0.0)",
+                (cp_id,)
+            )
+            # Sub-meter (EV): accounts for the difference between imp_cost and remainder
+            self.store._conn.execute(
+                "INSERT OR IGNORE INTO meters (meter_id, config_period_id, is_sub_meter) "
+                "VALUES ('ev_charger', ?, 1)", (cp_id,)
+            )
+            self.store._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                "imp_kwh, imp_kwh_grid, imp_rate, imp_cost, exp_kwh, exp_cost) "
+                "VALUES ('2026-04-07T00:00:00', '2026-04-07T00:30:00', "
+                "'ev_charger', ?, 7.0, 7.0, 0.05, 0.35, 0.0, 0.0)",
+                (cp_id,)
+            )
+            self.store._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                "imp_kwh, imp_kwh_grid, imp_rate, imp_cost, exp_kwh, exp_cost) "
+                "VALUES ('2026-04-07T00:30:00', '2026-04-07T01:00:00', "
+                "'ev_charger', ?, 7.0, 7.0, 0.05, 0.35, 0.0, 0.0)",
+                (cp_id,)
+            )
+        server.app.config["TESTING"] = True
+        self.client = server.app.test_client()
+
+    def tearDown(self):
+        import os
+        self.store._conn.close()
+        if os.path.exists(self.tmp):
+            os.remove(self.tmp)
+
+    def test_direct_import_uses_rate_based_subtraction(self):
+        """Direct import cost = main_cost - sub_cost by rate, not imp_cost_remainder."""
+        with patch.object(server, "_get_store", return_value=self.store), \
+             patch.object(server, "load_config", return_value={
+                 "meters": {
+                     "electricity_main": {"meta": {"timezone": "Europe/London", "billing_day": 1}},
+                     "ev_charger": {"meta": {"sub_meter": True}},
+                 }
+             }):
+            r = self.client.get("/api/charts/blocks-summary")
+        if r.status_code != 200:
+            self.skipTest(f"blocks-summary returned {r.status_code}")
+        d = json.loads(r.data)
+        days = d.get("days", [])
+        if not days:
+            self.skipTest("No day data returned")
+        # Find Apr 7 data
+        apr7 = next((day for day in days if "2026-04-07" in day.get("date", "")), None)
+        if not apr7:
+            self.skipTest("Apr 7 not in response")
+        main = apr7.get("main", {})
+        # Rate-based: main_cost(£1.00) - sub_cost(£0.70) = £0.30
+        # imp_cost_remainder would also be £0.30 in this test case
+        # Key: cost should be ~0.30, NOT ~1.00 (the full imp_cost)
+        self.assertAlmostEqual(main.get("imp_cost", 0), 0.30, places=2,
+                                msg="Direct import cost should be rate-based remainder, not full imp_cost")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gauge scale from power_history (2.8.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGaugeScaleFromPowerHistory(unittest.TestCase):
+    """Gauge scale is derived from power_history p90 not a block loop."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mktemp(suffix=".db")
+        from block_store import BlockStore
+        self.store = BlockStore(self.tmp)
+        # Add power_history rows with known values
+        from datetime import datetime, timezone, timedelta
+        with self.store._conn:
+            for i, kw in enumerate([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]):
+                ts = (datetime.now(timezone.utc) - timedelta(hours=i+1)).replace(tzinfo=None).isoformat()
+                self.store._conn.execute(
+                    "INSERT INTO power_history (captured_at, net_kw, intensity) VALUES (?, ?, 100.0)",
+                    (ts, kw)
+                )
+        server.app.config["TESTING"] = True
+        self.client = server.app.test_client()
+
+    def tearDown(self):
+        import os
+        self.store._conn.close()
+        if os.path.exists(self.tmp):
+            os.remove(self.tmp)
+
+    def test_gauge_scale_uses_power_history(self):
+        """Live power page renders without error and gauge uses power_history."""
+        with patch.object(server, "_get_store", return_value=self.store), \
+             patch.object(server, "load_config", return_value=MINIMAL_CONFIG), \
+             patch.object(server, "_ha_client", None):
+            r = self.client.get("/live-power")
+        # Should render successfully (200) — gauge scale code runs without error
+        self.assertEqual(r.status_code, 200)

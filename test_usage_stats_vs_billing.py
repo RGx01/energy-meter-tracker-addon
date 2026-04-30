@@ -1,6 +1,6 @@
 """
 Test suite: verifies that Usage Stats (api_blocks_summary logic) produces
-totals that match get_billing_totals_for_local_date_range (SQL ground truth)
+totals that match get_billing_totals_for_utc_range (SQL ground truth)
 for daily, monthly-billing and yearly views, including BST boundary days.
 
 Run:  python3 -m unittest test_usage_stats_vs_billing -v
@@ -15,7 +15,7 @@ eio = types.ModuleType("energy_engine_io"); eio.load_json = lambda *a,**k: {}
 sys.modules.setdefault("energy_engine_io", eio)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from block_store import BlockStore
+from block_store import BlockStore, local_date_range_to_utc_bounds, local_date_to_utc_bounds
 
 # Always import the real energy_charts — not a stub that another test suite
 # may have injected into sys.modules when running combined test discovery.
@@ -73,38 +73,34 @@ def make_store_with_submeters():
 def insert_block(store, cp_id, block_start_utc, imp_kwh, imp_cost,
                  exp_kwh=0.0, exp_cost=0.0, standing=0.50, carbon_g=None,
                  meter_id="electricity_main"):
-    """Insert one block row; local_date derived from UTC start."""
-    local_date = (datetime.fromisoformat(block_start_utc)
-                  .replace(tzinfo=ZoneInfo("UTC"))
-                  .astimezone(TZ).date().isoformat())
+    """Insert one block row."""
     store._conn.execute("""
         INSERT INTO blocks (
-            block_start, block_end, local_date, local_year, local_month, local_day,
+            block_start, block_end,
             meter_id, config_period_id, interpolated,
             imp_kwh, imp_kwh_grid, imp_kwh_remainder,
             imp_rate, imp_cost, imp_cost_remainder,
             imp_read_start, imp_read_end,
             exp_kwh, exp_rate, exp_cost,
             exp_read_start, exp_read_end, standing_charge, carbon_g)
-        VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,NULL,NULL,NULL,?,NULL,?,NULL,NULL,?,?)
+        VALUES (?,?,?,?,?,?,NULL,NULL,NULL,?,NULL,NULL,NULL,?,NULL,?,NULL,NULL,?,?)
     """, (block_start_utc,
           (datetime.fromisoformat(block_start_utc)+timedelta(minutes=30)).isoformat(),
-          local_date,
-          int(local_date[:4]), int(local_date[5:7]), int(local_date[8:10]),
           meter_id, cp_id, 0,
           imp_kwh, imp_cost, exp_kwh, exp_cost, standing, carbon_g))
     store._conn.commit()
 
 
-def sim_usage_stats_day(store, local_date_str):
+def sim_usage_stats_day(store, local_date_str, tz_name="Europe/London"):
     """
     Simulate what api_blocks_summary does for one local day:
-    - fetch blocks by local_date
+    - fetch blocks by UTC range derived from local date (using configured timezone)
     - get standing from first block
     - sum imp/exp kwh, cost and carbon_g from blocks directly
     Returns dict matching the row structure.
     """
-    blocks = store.get_blocks_for_local_date_range(local_date_str, local_date_str)
+    utc_s, utc_e = local_date_range_to_utc_bounds(local_date_str, local_date_str, tz_name)
+    blocks = store.get_blocks_for_utc_range(utc_s, utc_e)
     if not blocks:
         return None
 
@@ -163,9 +159,10 @@ def sim_usage_stats_day(store, local_date_str):
     }
 
 
-def sql_totals(store, first_date, last_date):
-    """Ground truth: SQL aggregation via local_date range."""
-    return store.get_billing_totals_for_local_date_range(first_date, last_date)
+def sql_totals(store, first_date, last_date, tz_name="Europe/London"):
+    """Ground truth: SQL aggregation via UTC range."""
+    utc_s, utc_e = local_date_range_to_utc_bounds(first_date, last_date, tz_name)
+    return store.get_billing_totals_for_utc_range(utc_s, utc_e, tz_name)
 
 
 def sum_daily_rows(rows):
@@ -468,7 +465,7 @@ class TestBillingChartVsUsageStats(unittest.TestCase):
             insert_block(self.store, self.cp,
                          f"2026-01-{day:02d}T00:30:00", 1.5, 0.368, standing=0.50)
 
-        blocks = self.store.get_blocks_for_local_date_range("2026-01-15", "2026-01-17")
+        blocks = self.store.get_blocks_for_utc_range(*local_date_range_to_utc_bounds("2026-01-15", "2026-01-17", "UTC"))
         p_start = datetime(2026, 1, 15, 0, 0, 0)
         p_end   = datetime(2026, 1, 18, 0, 0, 0)
 
@@ -495,7 +492,7 @@ class TestBillingChartVsUsageStats(unittest.TestCase):
         insert_block(self.store, self.cp, "2026-04-03T23:00:00", 0.5, 0.123, standing=0.50)
         insert_block(self.store, self.cp, "2026-04-04T06:00:00", 0.6, 0.147, standing=0.50)
 
-        blocks = self.store.get_blocks_for_local_date_range("2026-04-03", "2026-04-04")
+        blocks = self.store.get_blocks_for_utc_range(*local_date_range_to_utc_bounds("2026-04-03", "2026-04-04", "Europe/London"))
         p_start = datetime(2026, 4, 3, 0, 0, 0)   # local midnight Apr 3
         p_end   = datetime(2026, 4, 5, 0, 0, 0)   # local midnight Apr 5 (exclusive)
 
@@ -544,7 +541,6 @@ class TestBillSummaryMainImportRaw(unittest.TestCase):
     def _insert(self, block_start, main_imp, ev_imp, bat_imp, main_exp=0.0,
                 rate=0.07, exp_rate=0.12, sc=0.50):
         """Insert one set of blocks for a given timestamp."""
-        ld = block_start[:10]
         for meter_id, imp_kwh in [
             ("electricity_main", main_imp),
             ("ev_charger",       ev_imp),
@@ -552,13 +548,13 @@ class TestBillSummaryMainImportRaw(unittest.TestCase):
         ]:
             self.store._conn.execute("""
                 INSERT INTO blocks (
-                    block_start, block_end, local_date, local_year, local_month, local_day,
+                    block_start, block_end,
                     meter_id, config_period_id, interpolated,
                     imp_kwh, imp_kwh_grid, imp_kwh_remainder,
                     imp_rate, imp_cost, exp_kwh, exp_rate, exp_cost, standing_charge)
-                VALUES (?,?,?,2026,3,1, ?,?,0,
-                        ?,NULL,NULL, ?,?,?,?,?,?)
-            """, (block_start, block_start, ld,
+                VALUES (?,?,?,?,0,
+                        ?,NULL,NULL, ?,?, ?,?,?,?)
+            """, (block_start, block_start,
                   meter_id, self.cp,
                   imp_kwh, rate, round(imp_kwh * rate, 6),
                   main_exp if meter_id == "electricity_main" else 0.0,
@@ -568,7 +564,7 @@ class TestBillSummaryMainImportRaw(unittest.TestCase):
         self.store._conn.commit()
 
     def _summary(self):
-        blocks = self.store.get_blocks_for_local_date_range("2026-03-01", "2026-03-31")
+        blocks = self.store.get_blocks_for_utc_range(*local_date_range_to_utc_bounds("2026-03-01", "2026-03-31", "UTC"))
         return ec.calculate_billing_summary_for_period(
             blocks, datetime(2026, 3, 1), datetime(2026, 4, 1))
 
@@ -613,17 +609,17 @@ class TestBillSummaryMainImportRaw(unittest.TestCase):
         """main_import_raw groups correctly by rate."""
         # Two blocks at different rates
         self.store._conn.execute("""
-            INSERT INTO blocks (block_start, block_end, local_date, local_year, local_month, local_day,
+            INSERT INTO blocks (block_start, block_end,
                 meter_id, config_period_id, interpolated,
                 imp_kwh, imp_rate, imp_cost, standing_charge)
-            VALUES ('2026-03-01T00:00:00','2026-03-01T00:00:00','2026-03-01',2026,3,1,
+            VALUES ('2026-03-01T00:00:00','2026-03-01T00:00:00',
                     'electricity_main',?,0, 5.0,0.0700,0.3500,0.50)
         """, (self.cp,))
         self.store._conn.execute("""
-            INSERT INTO blocks (block_start, block_end, local_date, local_year, local_month, local_day,
+            INSERT INTO blocks (block_start, block_end,
                 meter_id, config_period_id, interpolated,
                 imp_kwh, imp_rate, imp_cost, standing_charge)
-            VALUES ('2026-03-01T06:00:00','2026-03-01T06:00:00','2026-03-01',2026,3,1,
+            VALUES ('2026-03-01T06:00:00','2026-03-01T06:00:00',
                     'electricity_main',?,0, 2.0,0.3231,0.6462,0.00)
         """, (self.cp,))
         self.store._conn.commit()
@@ -645,15 +641,15 @@ class TestBillSummaryMainImportRaw(unittest.TestCase):
         for i, kwh in enumerate([3.0, 4.0, 5.0]):
             ts = f'2026-03-01T{i:02d}:00:00'
             store2._conn.execute("""
-                INSERT INTO blocks (block_start, block_end, local_date, local_year, local_month, local_day,
+                INSERT INTO blocks (block_start, block_end,
                     meter_id, config_period_id, interpolated,
                     imp_kwh, imp_rate, imp_cost, standing_charge)
-                VALUES (?,?,'2026-03-01',2026,3,1,
+                VALUES (?,?,
                         'electricity_main',?,0, ?,0.07,?,0.50)
             """, (ts, ts, cp2, kwh, round(kwh * 0.07, 4)))
         store2._conn.commit()
 
-        blocks = store2.get_blocks_for_local_date_range("2026-03-01", "2026-03-31")
+        blocks = store2.get_blocks_for_utc_range(*local_date_range_to_utc_bounds("2026-03-01", "2026-03-31", "UTC"))
         s = ec.calculate_billing_summary_for_period(
             blocks, datetime(2026, 3, 1), datetime(2026, 4, 1))
 
@@ -699,10 +695,13 @@ class TestCarbonVsBlocks(unittest.TestCase):
         self.store, self.cp = make_store()
 
     def _db_carbon(self, first_date, last_date, meter_id="electricity_main"):
+        """Sum carbon_g using UTC bounds (Europe/London) for correct BST handling."""
+        utc_s, _ = local_date_to_utc_bounds(first_date, "Europe/London")
+        _, utc_e  = local_date_to_utc_bounds(last_date,  "Europe/London")
         row = self.store._conn.execute(
-            """SELECT SUM(carbon_g) as total FROM blocks
-               WHERE local_date >= ? AND local_date <= ? AND meter_id = ?""",
-            (first_date, last_date, meter_id)
+            "SELECT SUM(carbon_g) as total FROM blocks "
+            "WHERE block_start >= ? AND block_start < ? AND meter_id = ?",
+            (utc_s, utc_e, meter_id)
         ).fetchone()
         val = row["total"]
         return round(float(val), 4) if val is not None else None
@@ -818,9 +817,11 @@ class TestSubMeterCarbonAccounting(unittest.TestCase):
         self.store, self.cp = make_store_with_submeters()
 
     def _db_carbon(self, local_date, meter_id="electricity_main"):
+        """Sum carbon_g for a local date using UTC bounds (Europe/London)."""
+        utc_s, utc_e = local_date_to_utc_bounds(local_date, "Europe/London")
         row = self.store._conn.execute(
-            "SELECT SUM(carbon_g) FROM blocks WHERE local_date=? AND meter_id=?",
-            (local_date, meter_id)
+            "SELECT SUM(carbon_g) FROM blocks WHERE block_start >= ? AND block_start < ? AND meter_id=?",
+            (utc_s, utc_e, meter_id)
         ).fetchone()
         v = row[0]
         return round(float(v), 4) if v is not None else None
@@ -986,18 +987,17 @@ class TestLivePowerBillingCard(unittest.TestCase):
             "SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
 
     def _insert(self, main_imp, bat_imp, rate=0.07, exp=0.0, exp_rate=0.12, sc=0.50):
-        ld = "2026-04-27"
         ts = "2026-04-27T00:00:00"
         for meter_id, imp_kwh in [("electricity_main", main_imp), ("house_battery", bat_imp)]:
             self.store._conn.execute("""
                 INSERT INTO blocks (
-                    block_start, block_end, local_date, local_year, local_month, local_day,
+                    block_start, block_end,
                     meter_id, config_period_id, interpolated,
                     imp_kwh, imp_kwh_grid, imp_kwh_remainder,
                     imp_rate, imp_cost, exp_kwh, exp_rate, exp_cost, standing_charge)
-                VALUES (?,?,?,2026,4,27, ?,?,0,
-                        ?,NULL,NULL, ?,?,?,?,?,?)
-            """, (ts, ts, ld, meter_id, self.cp,
+                VALUES (?,?,?,?,0,
+                        ?,NULL,NULL, ?,?, ?,?,?,?)
+            """, (ts, ts, meter_id, self.cp,
                   imp_kwh, rate, round(imp_kwh * rate, 6),
                   exp if meter_id == "electricity_main" else 0.0,
                   exp_rate,
@@ -1006,7 +1006,7 @@ class TestLivePowerBillingCard(unittest.TestCase):
         self.store._conn.commit()
 
     def _get_billing_totals(self):
-        return self.store.get_billing_totals_for_local_date_range("2026-04-27", "2026-04-27")
+        return self.store.get_billing_totals_for_utc_range(*local_date_range_to_utc_bounds("2026-04-27", "2026-04-27", "UTC"))
 
     def _get_sub_kwh(self):
         """Simulate what _fmt_total's sub-meter SQL returns."""
@@ -1022,7 +1022,7 @@ class TestLivePowerBillingCard(unittest.TestCase):
                 JOIN meters m ON m.meter_id = b.meter_id
                   AND m.config_period_id = ({active_period_sq})
                 WHERE m.is_sub_meter = 1
-                  AND b.local_date >= '2026-04-27' AND b.local_date <= '2026-04-27'
+                  AND b.block_start >= '2026-04-27T00:00:00' AND b.block_start < '2026-04-28T00:00:00'
                 GROUP BY m.meter_id""")
         return [(r["meter_id"], float(r["kwh"]), float(r["cost"])) for r in cur.fetchall()]
 
@@ -1039,7 +1039,7 @@ class TestLivePowerBillingCard(unittest.TestCase):
                 JOIN meters m ON m.meter_id = b.meter_id
                   AND m.config_period_id = ({active_period_sq})
                 WHERE m.is_sub_meter = 0
-                  AND b.local_date >= '2026-04-27' AND b.local_date <= '2026-04-27'"""
+                  AND b.block_start >= '2026-04-27T00:00:00' AND b.block_start < '2026-04-28T00:00:00'"""
         ).fetchone()
         return float(cur["raw_kwh"]), float(cur["raw_cost"])
 
@@ -1075,11 +1075,11 @@ class TestLivePowerBillingCard(unittest.TestCase):
         # Only insert main meter block
         self.store._conn.execute("""
             INSERT INTO blocks (
-                block_start, block_end, local_date, local_year, local_month, local_day,
+                block_start, block_end,
                 meter_id, config_period_id, interpolated,
                 imp_kwh, imp_kwh_grid, imp_kwh_remainder,
                 imp_rate, imp_cost, standing_charge)
-            VALUES ('2026-04-27T00:00:00','2026-04-27T00:00:00','2026-04-27',2026,4,27,
+            VALUES ('2026-04-27T00:00:00','2026-04-27T00:00:00',
                     'electricity_main',?,0, 10.0,NULL,NULL, 0.07,0.70,0.50)
         """, (self.cp,))
         self.store._conn.commit()

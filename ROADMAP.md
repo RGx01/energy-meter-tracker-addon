@@ -145,14 +145,40 @@ The main meter avoids this by using boundary interpolation — it finds the near
 
 ---
 
-### 2.8.0 — Timezone Refactor & Performance
-**Theme: Correctness and speed**
+### 2.8.0 — Timezone Refactor, Performance & Usage Insights
+**Theme: Correctness, speed and deeper usage analysis**
 
-#### Timezone refactor
+#### Timezone refactor (coupled with performance)
 Drop `local_date`, `local_year`, `local_month`, `local_day` from `blocks` table. Engine fully UTC. `local_date_to_utc_bounds()` helper computes correct UTC window at query time using the configured timezone. Retroactively corrects wrong-timezone users without data migration.
 
-#### Billing/Usage Stats performance
-Rewrite `calculate_billing_summary_for_period` and `build_day_chart_html` to work on lightweight SQL rows rather than full block dicts reconstructed via `_rows_to_blocks`. Currently ~470ms per chart regeneration, ~276ms of which is Python dict construction. Direct SQL should reduce this to ~40ms. Coupled with the timezone refactor since both require changes to the data access layer.
+#### Billing/Usage Stats performance (coupled with timezone)
+Rewrite `calculate_billing_summary_for_period` and `build_day_chart_html` to work on lightweight SQL rows rather than full block dicts reconstructed via `_rows_to_blocks`. Currently ~470ms per chart regeneration. Direct SQL target ~40ms. Both require changes to the data access layer.
+
+#### Carbon accuracy — dropped
+Regional carbon intensity actuals are not available from the NESO API — the `actual`
+field only exists on the national endpoint. The regional endpoint (used by the engine)
+only ever returns `forecast`. Backfilling regional actuals is therefore not possible.
+The forecast values are directionally correct and sufficient for the Insights Carbon tab.
+The `intensity_actual` column remains in the schema but will not be populated.
+
+`_backfill_carbon_gaps` was removed as dead code. Its secondary function of seeding
+`_current_slot_mix` after a restart (so generation mix is stored for blocks finalising
+immediately after startup) is now replaced by a DB seed in `engine_startup` — reads
+the last 4 hours of `generation_mix` rows from the DB. If that seed is empty, an
+immediate `_tick_carbon_intensity` call is made to fetch fresh mix data.
+
+#### Sub-meter boundary interpolation
+Apply same pre/post boundary read logic to sub-meters as main meter at block finalise time. Fixes gap block attribution issue (documented in Known Engine Limitation). Requires careful interaction with seed/carry-forward mechanism.
+
+#### Generation mix UI
+- Live Power — stacked bar or donut showing current grid fuel split, updates on CI tick
+- Insights Carbon Summary — period-weighted average generation mix breakdown using `get_generation_mix_for_range()`
+
+#### Usage Insights tab
+New "Usage" tab on the Insights page alongside "Carbon":
+- **Cost breakdown** — total spend split by meter, standing charge as £ and %, effective rate (£/kWh)
+- **Usage patterns** — peak consumption window, highest consumption day, average daily import, self-sufficiency ratio (% of consumption from battery/solar vs grid)
+- **Tariff efficiency** — % of EV/battery charging during cheap rate periods, estimated saving vs peak rate (requires rate sensor history)
 
 ---
 
@@ -176,5 +202,24 @@ Extend the engine to support gas meter recording alongside electricity. Requires
 - Migration shim removal (`migrate_json_to_sqlite` and related code)
 - Meter colour customisation per meter (bidirectional aware)
 - API versioning
+
+---
+---
+
+## Backlog — Unscheduled Items
+
+### Device Decommissioning
+When a physical device (battery, EV charger, heat pump) is replaced or retired, the current
+workflow requires deleting the sub-meter entirely — which destroys all historical data.
+
+**Required:** A "decommission" option on sub-meter devices that:
+- Stops the engine polling for that meter's entities
+- Retains all historical block data for reporting
+- Marks the meter as inactive in config so it is excluded from live charts but visible in
+  historical billing/usage/carbon views with a clear "decommissioned" label
+- Allows the meter to be reactivated if the same device returns
+
+Workaround in the interim: remove the HA entity sensors from the meter config fields
+(leave the meter in place) — the engine will stop recording new data but history is preserved.
 
 ---

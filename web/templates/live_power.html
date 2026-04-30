@@ -731,6 +731,26 @@
 <div class="gauge-ci-row">
 <div class="summary-grid">
 
+  <!-- Generation Mix card — first card, only shown when postcode configured -->
+  {% if has_postcode %}
+  <div class="soc-card" id="mix-card" style="min-width:280px;max-width:420px;align-items:flex-start;">
+    <div class="card-title" style="font-size:12px;align-self:flex-start;">🌐 Current Grid Generation Mix</div>
+    <div style="display:flex;gap:12px;align-items:center;width:100%;">
+      <div id="mix-donut-wrap" style="position:relative;width:120px;height:120px;flex-shrink:0;">
+        <canvas id="mix-donut-canvas" width="120" height="120"></canvas>
+        <div id="mix-donut-centre" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;pointer-events:none;">
+          <div id="mix-centre-fuel" style="font-size:10px;color:var(--muted);"></div>
+          <div id="mix-centre-perc" style="font-size:16px;font-weight:700;color:var(--text);"></div>
+        </div>
+      </div>
+      <div style="flex:1;min-width:0;">
+        <div id="mix-legend" style="font-size:11px;display:flex;flex-direction:column;gap:2px;"></div>
+        <div id="mix-loading" style="color:var(--muted);font-size:12px;">Loading...</div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
   <!-- Main gauge -->
   <div class="power-card">
     <div class="card-title">⚡ Live Power</div>
@@ -822,6 +842,7 @@
       <div class="ph-toggle" id="ph-toggle">
         <button id="ph-btn-kw"  class="active" onclick="_phSetMode('kw')">kW</button>
         <button id="ph-btn-co2" onclick="_phSetMode('co2')">CO₂</button>
+        <button id="ph-btn-mix" onclick="_phSetMode('mix')">Mix</button>
       </div>
       {% endif %}
     </div>
@@ -836,6 +857,7 @@
         <i style="background:linear-gradient(to right,#ff6b6b,#00d4aa);"></i>
         Net carbon rate (gCO₂/min) — red = emitting, green = offsetting
       </span>
+      <span id="ph-legend-mix" style="display:none;font-size:11px;color:var(--muted);">Grid fuel mix — % of generation by source</span>
       <span id="power-history-status" style="margin-left:auto;font-size:11px;color:var(--muted);"></span>
     </div>
   </div>
@@ -886,8 +908,6 @@
 // ── Server-provided gauge config ──
 var GAUGE_MAX_IMP  = {{ gauge_max_imp | default(10) }};
 var GAUGE_MAX_EXP  = {{ gauge_max_exp | default(5) }};
-var RATE_LOW       = {{ rate_low | default(0.10) }};
-var RATE_HIGH      = {{ rate_high | default(0.25) }};
 var BLOCK_MINUTES  = {{ block_minutes | default(30) }};
 
 // ── Gauge helpers ──
@@ -997,6 +1017,10 @@ function updatePower() {
 
       // Battery SoC cards
       updateSocCards(d.soc_sensors || {});
+      // Generation mix donut
+      if (d.generation_mix && d.generation_mix.length) {
+        _updateMixCard(d.generation_mix);
+      }
     })
     .catch(function(err) {
       if (statusDot)  { statusDot.className = 'status-dot stale'; }
@@ -1625,7 +1649,8 @@ var _phCanvas   = document.getElementById('power-history-canvas');
 var _phHasCI    = {{ 'true' if has_postcode else 'false' }};
 var _phData     = [];   // [{captured_at, net_kw, intensity, carbon_gco2_min}]
 var _phTimer    = null;
-var _phMode     = 'kw'; // 'kw' or 'co2'
+var _phMode     = 'kw'; // 'kw', 'co2', or 'mix'
+var _phMixData  = [];   // [{block_start, fuels:{wind,solar,...}}]
 var _phZoomT0   = null; // null = default (now - 48h)
 var _phZoomSpan = null; // null = default (48h)
 
@@ -1647,6 +1672,7 @@ function _phResetZoom() {
   try {
     var saved = localStorage.getItem('emt_ph_mode');
     if (saved === 'co2' && _phHasCI) _phMode = 'co2';
+    if (saved === 'mix' && _phHasCI) _phMode = 'mix';
   } catch(e) {}
   _phApplyMode();
 })();
@@ -1661,6 +1687,8 @@ function _phSetMode(mode) {
 function _phUpdateTitle() {
   var title = (_phMode === 'co2' && _phHasCI)
     ? '☁️ 48-Hour Carbon Rate'
+    : (_phMode === 'mix' && _phHasCI)
+    ? '⚡ 48-Hour Generation Mix'
     : '📈 48-Hour Power History';
   // Update all instances — original and modal clone
   [document, _expandModal].forEach(function(ctx) {
@@ -1679,14 +1707,19 @@ function _phApplyMode() {
   function applyToContext(ctx) {
     var btnKw  = ctx.querySelector('#ph-btn-kw');
     var btnCo2 = ctx.querySelector('#ph-btn-co2');
+    var btnMix = ctx.querySelector('#ph-btn-mix');
     var legImp = ctx.querySelector('#ph-legend-import');
     var legExp = ctx.querySelector('#ph-legend-export');
     var legCo2 = ctx.querySelector('#ph-legend-co2');
+    var legMix = ctx.querySelector('#ph-legend-mix');
+    var isMix  = _phMode === 'mix';
     if (btnKw)  btnKw.classList.toggle('active',  _phMode === 'kw');
     if (btnCo2) btnCo2.classList.toggle('active', _phMode === 'co2');
-    if (legImp) legImp.style.display = isCo2 ? 'none' : '';
-    if (legExp) legExp.style.display = isCo2 ? 'none' : '';
-    if (legCo2) legCo2.style.display = isCo2 ? ''     : 'none';
+    if (btnMix) btnMix.classList.toggle('active', _phMode === 'mix');
+    if (legImp) legImp.style.display = (!isCo2 && !isMix) ? '' : 'none';
+    if (legExp) legExp.style.display = (!isCo2 && !isMix) ? '' : 'none';
+    if (legCo2) legCo2.style.display = isCo2 ? '' : 'none';
+    if (legMix) legMix.style.display = isMix ? '' : 'none';
   }
 
   applyToContext(document);
@@ -1706,6 +1739,167 @@ function _phGetTheme() {
     bg:     isDark ? '#1a1d2e' : '#ffffff',
   };
 }
+
+// ── Generation Mix helpers ────────────────────────────────────────────────────
+var _MIX_FUELS = ['wind','solar','nuclear','imports','biomass','gas','hydro','other','coal'];
+var _MIX_COLOURS = {
+  wind:'#3b82f6',
+  solar:'#facc15',
+  nuclear:'#7c3aed',
+  gas:'#f97316',
+  biomass:'#92400e',
+  hydro:'#38bdf8',
+  imports:'#9ca3af',
+  other:'#6b7280',
+  coal:'#374151'
+};
+function _mixFuelColour(fuel) { return _MIX_COLOURS[fuel] || '#9ca3af'; }
+function _mixFuelLabel(fuel)  {
+  return {wind:'Wind',solar:'Solar',nuclear:'Nuclear',imports:'Imports',
+          biomass:'Biomass',gas:'Gas',hydro:'Hydro',other:'Other',coal:'Coal'}[fuel] || fuel;
+}
+
+// ── Generation Mix donut ─────────────────────────────────────────────────────
+var _lastMixSlot = null; // avoid re-drawing identical data
+
+var _mixSegments = [];      // [{fuel, perc, startAngle, endAngle, colour}]
+var _mixDominant = null;    // default centre label data
+var _mixHoverFuel = null;   // currently hovered fuel
+
+function _drawMixDonut(mix) {
+  var canvas = document.getElementById('mix-donut-canvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var W = canvas.width, H = canvas.height;
+  var cx = W/2, cy = H/2, r = Math.min(W, H) / 2 - 8, inner = r * 0.55;
+
+  ctx.clearRect(0, 0, W, H);
+
+  if (!mix || !mix.length) {
+    document.getElementById('mix-loading').style.display = '';
+    return;
+  }
+  document.getElementById('mix-loading').style.display = 'none';
+
+  var data = mix.filter(function(d){ return d.perc > 0; })
+                .sort(function(a,b){ return b.perc - a.perc; });
+  var total = data.reduce(function(s, d){ return s + d.perc; }, 0);
+  if (total <= 0) return;
+
+  // Draw segments and store angle ranges for hit-testing
+  _mixSegments = [];
+  var startAngle = -Math.PI / 2;
+  data.forEach(function(d) {
+    var sweep = (d.perc / total) * Math.PI * 2;
+    var endAngle = startAngle + sweep;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, r, startAngle, endAngle);
+    ctx.closePath();
+    ctx.globalAlpha = 0.75;
+    ctx.fillStyle = _mixFuelColour(d.fuel);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    _mixSegments.push({fuel: d.fuel, perc: d.perc, col: _mixFuelColour(d.fuel),
+                       start: startAngle, end: endAngle});
+    startAngle = endAngle;
+  });
+
+  // Inner hole
+  ctx.beginPath();
+  ctx.arc(cx, cy, inner, 0, Math.PI * 2);
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--surface').trim() || '#1e2030';
+  ctx.fill();
+
+  _mixDominant = data[0];
+  _mixSetCentre(_mixDominant.fuel, _mixDominant.perc);
+
+  // Legend — show ALL fuels, compact
+  var legend = document.getElementById('mix-legend');
+  if (legend) {
+    legend.innerHTML = data.map(function(d) {
+      return '<div style="display:flex;align-items:center;gap:5px;">' +
+        '<span style="width:7px;height:7px;border-radius:50%;background:' + _mixFuelColour(d.fuel) + ';flex-shrink:0;"></span>' +
+        '<span style="color:var(--muted);font-size:10px;">' + _mixFuelLabel(d.fuel) + '</span>' +
+        '<span style="margin-left:auto;color:var(--text);font-weight:600;font-size:10px;">' + d.perc.toFixed(1) + '%</span>' +
+        '</div>';
+    }).join('');
+  }
+}
+
+function _mixSetCentre(fuel, perc) {
+  var centFuel = document.getElementById('mix-centre-fuel');
+  var centPerc = document.getElementById('mix-centre-perc');
+  if (centFuel) centFuel.textContent = _mixFuelLabel(fuel);
+  if (centPerc) { centPerc.textContent = perc.toFixed(0) + '%'; centPerc.style.color = _mixFuelColour(fuel); }
+}
+
+// Donut hover — hit test which segment the mouse is over
+(function() {
+  function initDonutHover() {
+    var canvas = document.getElementById('mix-donut-canvas');
+    if (!canvas) return;
+    var W = canvas.width, H = canvas.height;
+    var cx = W/2, cy = H/2;
+    var r = Math.min(W, H) / 2 - 8, inner = r * 0.55;
+
+    canvas.addEventListener('mousemove', function(e) {
+      if (!_mixSegments.length) return;
+      var rect = canvas.getBoundingClientRect();
+      var mx = (e.clientX - rect.left) * (W / rect.width);
+      var my = (e.clientY - rect.top)  * (H / rect.height);
+      var dx = mx - cx, dy = my - cy;
+      var dist = Math.sqrt(dx*dx + dy*dy);
+
+      if (dist < inner || dist > r) {
+        // Outside ring — restore dominant
+        if (_mixHoverFuel !== null) {
+          _mixHoverFuel = null;
+          if (_mixDominant) _mixSetCentre(_mixDominant.fuel, _mixDominant.perc);
+        }
+        return;
+      }
+
+      // Angle of mouse relative to canvas centre
+      var angle = Math.atan2(dy, dx);
+      // Normalise to same convention as drawing (start at -π/2)
+      if (angle < -Math.PI / 2) angle += Math.PI * 2;
+
+      var hit = null;
+      _mixSegments.forEach(function(seg) {
+        var s = seg.start, en = seg.end;
+        if (angle >= s && angle < en) hit = seg;
+      });
+
+      if (hit && hit.fuel !== _mixHoverFuel) {
+        _mixHoverFuel = hit.fuel;
+        _mixSetCentre(hit.fuel, hit.perc);
+      }
+    });
+
+    canvas.addEventListener('mouseleave', function() {
+      _mixHoverFuel = null;
+      if (_mixDominant) _mixSetCentre(_mixDominant.fuel, _mixDominant.perc);
+    });
+  }
+  // Init after DOM ready
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initDonutHover);
+  } else {
+    initDonutHover();
+  }
+})();
+
+function _updateMixCard(mix) {
+  if (!mix || !mix.length) return;
+  // Avoid re-rendering if identical to last
+  var sig = mix.map(function(d){ return d.fuel + ':' + d.perc; }).join(',');
+  if (sig === _lastMixSlot) return;
+  _lastMixSlot = sig;
+  _drawMixDonut(mix);
+}
+
+
 
 function _phDraw() {
   if (!_phCanvas) return;
@@ -2073,8 +2267,109 @@ function _phDraw() {
   // ── Dispatch ──────────────────────────────────────────────────────────────
   // Pre-compute visible Y extents and pass explicitly to avoid any closure issues
   var _visT0 = t0, _visTSpan = tSpan;
+  function drawMix() {
+    if (!_phMixData.length) {
+      ctx.fillStyle = th.text;
+      ctx.font = '12px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('Collecting mix data\u2026', W / 2, H / 2);
+      return;
+    }
+
+    var STACK_ORDER = ['wind','nuclear','hydro','solar','biomass','imports','other','gas','coal'];
+
+    // Filter to visible window (block resolution = 30 min so add half-hour padding)
+    var visible = _phMixData.filter(function(s) {
+      var ms = new Date(s.block_start + 'Z').getTime();
+      return ms >= t0 - 1800000 && ms <= t0 + tSpan + 1800000;
+    });
+
+    if (!visible.length) {
+      ctx.fillStyle = th.text;
+      ctx.font = '12px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('No mix data in this window', W / 2, H / 2);
+      return;
+    }
+
+    var fuelsToShow = STACK_ORDER.filter(function(f) {
+      return visible.some(function(s){ return (s.fuels[f] || 0) > 0.1; });
+    });
+
+    // Pre-compute stacked positions for every slot
+    var stacks = visible.map(function(slot) {
+      var cum = 0, out = {};
+      fuelsToShow.forEach(function(f) {
+        var pct = slot.fuels[f] || 0;
+        out[f] = { bot: cum, top: cum + pct };
+        cum += pct;
+      });
+      return out;
+    });
+
+    function tyPct(pct) { return PAD_T + CH * (1 - pct / 100); }
+
+    // Clip to plot area
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(PAD_L, PAD_T, CW, CH);
+    ctx.clip();
+
+    // Draw stacked areas bottom to top
+    fuelsToShow.forEach(function(fuel) {
+      var col = _mixFuelColour(fuel);
+      ctx.beginPath();
+      visible.forEach(function(slot, i) {
+        var x = tx(slot.block_start + 'Z');
+        var y = tyPct(stacks[i][fuel].top);
+        if (i === 0) ctx.moveTo(x, y);
+        else         ctx.lineTo(x, y);
+      });
+      for (var i = visible.length - 1; i >= 0; i--) {
+        ctx.lineTo(tx(visible[i].block_start + 'Z'), tyPct(stacks[i][fuel].bot));
+      }
+      ctx.closePath();
+      ctx.globalAlpha = 0.15;
+      ctx.fillStyle = col;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      // Crisp top-edge stroke line
+      ctx.beginPath();
+      visible.forEach(function(slot, i) {
+        var x = tx(slot.block_start + 'Z');
+        var y = tyPct(stacks[i][fuel].top);
+        if (i === 0) ctx.moveTo(x, y);
+        else         ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = col;
+      ctx.lineWidth   = 1.5;
+      ctx.stroke();
+    });
+
+    ctx.restore();
+
+    // Y-axis grid lines and labels
+    ctx.strokeStyle = th.grid;
+    ctx.lineWidth   = 1;
+    [0, 25, 50, 75, 100].forEach(function(pct) {
+      var y = tyPct(pct);
+      ctx.beginPath(); ctx.moveTo(PAD_L, y); ctx.lineTo(PAD_L + CW, y); ctx.stroke();
+      ctx.fillStyle = th.text;
+      ctx.font      = '10px sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText(pct + '%', PAD_L - 4, y + 3);
+    });
+
+    // X-axis — shared drawTimeAxis helper (same ticks as kW/CO₂)
+    drawTimeAxis();
+
+    drawNowMarker();
+  }
+
   if (_phMode === 'co2' && _phHasCI) {
     drawCo2();
+  } else if (_phMode === 'mix' && _phHasCI) {
+    drawMix();
   } else {
     drawKw(_visT0, _visTSpan);
   }
@@ -2092,6 +2387,16 @@ async function _phLoad() {
         ? _phData.length + ' readings'
         : 'No data yet';
     }
+    // Also load mix data
+    if (_phHasCI) {
+      try {
+        var mr = await fetch(apiUrl('/api/power/mix-history'));
+        if (mr.ok) {
+          var md = await mr.json();
+          _phMixData = md.slots || [];
+        }
+      } catch(me) { _phMixData = []; }
+    }
     _phDraw();
   } catch(e) {
     var statusEl = document.getElementById('power-history-status');
@@ -2099,10 +2404,24 @@ async function _phLoad() {
   }
 }
 
-// Redraw on theme change
-window.addEventListener('message', function(e) {
-  if (e.data && e.data.type === 'emt-theme') _phDraw();
-});
+// Redraw on theme change — observe data-theme attribute on <html>
+// live_power.html is the main page (not an iframe) so postMessage('emt-theme')
+// never arrives here. MutationObserver fires immediately when applyTheme()
+// sets data-theme, guaranteeing the canvas picks up the new --surface colour.
+(function() {
+  function onThemeChange() {
+    _phDraw();
+    _lastMixSlot = null;
+    if (_mixSegments.length) {
+      _drawMixDonut(_mixSegments.map(function(s){ return {fuel:s.fuel, perc:s.perc}; }));
+    }
+  }
+  new MutationObserver(function(mutations) {
+    mutations.forEach(function(m) {
+      if (m.attributeName === 'data-theme') onThemeChange();
+    });
+  }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+})();
 
 // Redraw on resize
 window.addEventListener('resize', function() {
@@ -2167,7 +2486,43 @@ setInterval(_phLoad, 30000);
 
     var rows = (_phMode === 'co2' && _phHasCI)
       ? _phData.filter(function(r) { return r.carbon_gco2_min != null && r.carbon_gco2_min !== 0; })
+      : _phMode === 'mix' ? [] // handled separately
       : _phData;
+
+    // Mix mode — find nearest block slot
+    if (_phMode === 'mix' && _phHasCI) {
+      var tMs = xToTime(mouseX);
+      var nearest_mix = null, bestDiff = Infinity;
+      _phMixData.forEach(function(slot) {
+        var slotMs = new Date(slot.block_start + 'Z').getTime();
+        var diff   = Math.abs(slotMs - tMs);
+        if (diff < bestDiff) { bestDiff = diff; nearest_mix = slot; }
+      });
+      if (nearest_mix) {
+        var s  = nearest_mix.block_start + 'Z';
+        var dt = new Date(s);
+        var timeStr = dt.toLocaleDateString([], {month:'numeric', day:'numeric'})
+                    + ' ' + dt.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+        var lines = ['<span style="color:var(--muted)">' + timeStr + '</span>'];
+        var fuels = nearest_mix.fuels || {};
+        var sorted = Object.keys(fuels).sort(function(a,b){ return (fuels[b]||0)-(fuels[a]||0); });
+        sorted.forEach(function(fuel) {
+          var pct = fuels[fuel] || 0;
+          if (pct < 0.5) return;
+          var col = _mixFuelColour(fuel);
+          lines.push('<span style="color:' + col + '">' + _mixFuelLabel(fuel) + ': ' + pct.toFixed(1) + '%</span>');
+        });
+        tip.innerHTML = lines.join('<br>');
+        tip.style.display = 'block';
+        var tipW = tip.offsetWidth, tipH = tip.offsetHeight, MARGIN = 12;
+        var left = mouseX + MARGIN, top = mouseY - tipH / 2;
+        if (left + tipW > rect.width - 4) left = mouseX - tipW - MARGIN;
+        if (top < 4) top = 4;
+        if (top + tipH > rect.height - 4) top = rect.height - tipH - 4;
+        tip.style.left = left + 'px'; tip.style.top = top + 'px';
+      } else { tip.style.display = 'none'; }
+      return;
+    }
 
     var pt = nearest(xToTime(mouseX), rows);
     if (!pt) { tip.style.display = 'none'; return; }

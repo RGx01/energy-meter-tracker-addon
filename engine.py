@@ -888,12 +888,9 @@ def generate_charts(store: "BlockStore"):
     block_minutes   = int(main_meta.get("block_minutes") or 30)
     currency_symbol = main_meta.get("currency_symbol", "£")
 
-    # Both charts need all blocks for now — phase 2 of optimisation will
-    # push date-range queries into the charting functions themselves.
-    # This is still a significant win: the store is queried once and both
-    # charts share the same list, vs the old approach of loading the full
-    # JSON file twice (once per chart call site).
-    blocks = store.get_all_blocks()
+    # Use lightweight block fetch — significantly faster than get_all_blocks()
+    # for large datasets as it skips full _rows_to_blocks reconstruction.
+    blocks = store.get_blocks_lightweight()
 
     try:
         html = energy_charts.generate_net_heatmap(blocks, timezone_name=timezone_name, block_minutes=block_minutes, currency=currency_symbol)
@@ -1016,7 +1013,29 @@ def _apply_pass2(block: dict) -> None:
             )
 
         remainder_kwh  = max(grid_remaining, 0.0)
+
+        # cost_remainder is computed as remainder_kwh × rate, NOT as main_cost − sub_costs.
+        #
+        # Why: both sub_import["cost"] (line above) and cost_remainder are derived from
+        # kwh × rate. This is intentionally consistent — both sides of the identity use
+        # the same arithmetic path.
+        #
+        # Why not main_cost − sub_costs: main_cost comes from actual meter register reads
+        # (a cumulative kWh delta interpolated to block boundaries), while sub-meter costs
+        # come from power sensor integration (kW polled at ~10s intervals). These are two
+        # independent measurement systems with different sensor resolutions and timing.
+        # Subtracting one from the other would silently absorb all sensor disagreement
+        # into cost_remainder, potentially making it negative on blocks where the sub-meter
+        # sensor over-reported relative to the main meter.
+        #
+        # The resulting ~0.01p/block discrepancy between cost_remainder + sub_costs and
+        # main_cost is an inherent measurement artefact of combining two sensor systems.
+        # Presentation layers (api_blocks_summary, billing charts) use rate-based
+        # subtraction (main_cost[rate] − sub_cost[rate]) for display, which avoids
+        # accumulating this artefact across periods. See block_store._aggregate_usage
+        # and web/server.py api_blocks_summary for the display-layer approach.
         remainder_cost = round(remainder_kwh * parent_rate, 6)
+
         parent_import["kwh_total"]      = grid_kwh
         parent_import["kwh_remainder"]  = remainder_kwh
         parent_import["cost_remainder"] = remainder_cost
@@ -1220,13 +1239,14 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
                                )) if start_iso else None
             if nearest_key:
                 mix = _current_slot_mix[nearest_key]
-                for meter_name in block.get("meters", {}):
-                    row = _store._conn.execute(
-                        "SELECT id FROM blocks WHERE block_start = ? AND meter_id = ? LIMIT 1",
-                        (start_iso, meter_name)
-                    ).fetchone()
-                    if row:
-                        _store.upsert_generation_mix(row["id"], mix)
+                # Store mix against main meter block only — mix is a grid property,
+                # not per-meter. Storing against all meters wastes ~3x space.
+                main_row = _store._conn.execute(
+                    "SELECT id FROM blocks WHERE block_start = ? AND meter_id = 'electricity_main' LIMIT 1",
+                    (start_iso,)
+                ).fetchone()
+                if main_row:
+                    _store.upsert_generation_mix(main_row["id"], mix)
     except Exception as _gme:
         logger.debug("finalise_block: generation mix storage failed: %s", _gme)
 
@@ -1675,7 +1695,16 @@ async def _engine_tick(ha: HAClient):
                 if v not in (None, "unknown", "unavailable"):
                     try:
                         fv = float(v)
-                        inv_val = round(fv / 1000.0 if abs(fv) > 100 else fv, 3)
+                        # Convert to kW using unit_of_measurement from HA attributes.
+                        # The meter config sensor picker only allows power sensors (W or kW),
+                        # so the unit is always known — no magnitude guessing needed.
+                        try:
+                            unit = (ha.get_attributes(power_s) or {}).get("unit_of_measurement", "")
+                        except Exception:
+                            unit = ""
+                        if unit.upper() == "W":
+                            fv = fv / 1000.0
+                        inv_val = round(fv, 3)
                     except (ValueError, TypeError):
                         pass
             if soc_val is not None or inv_val is not None:
@@ -1690,202 +1719,6 @@ async def _engine_tick(ha: HAClient):
 # ─────────────────────────────────────────────────────────────────────────────
 # Startup  (replaces @time_trigger("startup"))
 # ─────────────────────────────────────────────────────────────────────────────
-
-async def _backfill_carbon_gaps(store, cfg: dict) -> None:
-    """
-    Backfill NULL carbon_g blocks from the National Grid ESO historical API.
-    - First time a postcode is configured: backfills up to 60 days
-    - Subsequent restarts: only checks last 48 hours (matches CI prune window)
-    Only runs if a postcode is configured.
-    """
-    import urllib.request
-    import json as _json
-
-    postcode = _normalise_postcode(
-        cfg.get("meters", {})
-           .get("electricity_main", {})
-           .get("meta", {})
-           .get("postcode_prefix", "")
-    )
-    if not postcode:
-        return
-
-    # Determine if this is first run for this postcode
-    first_run = True
-    try:
-        meta_row = store._conn.execute(
-            "SELECT value FROM store_meta WHERE key = 'carbon_backfill_done'"
-        ).fetchone()
-        if meta_row and meta_row["value"] == postcode:
-            first_run = False
-    except Exception:
-        pass
-
-    # Window: full 60 days on first run, 48 hours on subsequent restarts
-    lookback_hours = 60 * 24 if first_run else 48
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-              ).strftime("%Y-%m-%dT%H:%M:%S")
-
-    null_rows = store._conn.execute(
-        """SELECT DISTINCT strftime('%Y-%m-%dT%H:00:00', block_start) as hour
-           FROM blocks
-           WHERE carbon_g IS NULL
-             AND meter_id = 'electricity_main'
-             AND block_start >= ?
-           ORDER BY hour""",
-        (cutoff,)
-    ).fetchall()
-
-    if not null_rows:
-        if first_run:
-            # Mark complete so future restarts use 48hr window
-            try:
-                with store._conn:
-                    store._conn.execute(
-                        "INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)",
-                        ("carbon_backfill_done", postcode)
-                    )
-            except Exception:
-                pass
-        logger.info("_backfill_carbon_gaps: no NULL carbon_g blocks found")
-        return
-
-    logger.info("_backfill_carbon_gaps: %d hour windows to backfill for %s (%s)",
-                len(null_rows), postcode, "first run" if first_run else "48hr check")
-
-    fetched_windows = set()
-    total_slots = 0
-    _slot_mix   = {}  # captured_at → generationmix list
-
-    for row in null_rows:
-        hour_str = row["hour"]
-        hour_dt  = datetime.fromisoformat(hour_str)
-        win_key  = hour_str[:13]
-        if win_key in fetched_windows:
-            continue
-        fetched_windows.add(win_key)
-
-        existing = store._conn.execute(
-            """SELECT intensity_actual FROM carbon_intensity
-               WHERE postcode = ?
-                 AND captured_at BETWEEN ? AND ?
-               LIMIT 1""",
-            (postcode,
-             (hour_dt - timedelta(minutes=30)).isoformat(),
-             (hour_dt + timedelta(minutes=30)).isoformat())
-        ).fetchone()
-        # Skip if we already have actual data for this window
-        # (forecast-only rows should still be fetched when slot is old enough for actuals)
-        hours_ago = (datetime.now(timezone.utc).replace(tzinfo=None) - hour_dt).total_seconds() / 3600
-        if existing and existing["intensity_actual"] is not None:
-            continue
-        if existing and hours_ago < 12:
-            # Too recent for actuals — skip, we have forecast already
-            continue
-
-        from_iso = hour_dt.strftime("%Y-%m-%dT%H:%MZ")
-        to_iso   = (hour_dt + timedelta(hours=48)).strftime("%Y-%m-%dT%H:%MZ")
-        # Mark all hours in this 48h window as fetched to avoid duplicate calls
-        for h in range(48):
-            fetched_windows.add((hour_dt + timedelta(hours=h)).strftime("%Y-%m-%dT%H"))
-
-        url = (f"https://api.carbonintensity.org.uk/regional/intensity"
-               f"/{from_iso}/{to_iso}/postcode/{postcode}")
-
-        try:
-            req = urllib.request.Request(url, headers={"Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = _json.loads(resp.read())
-
-            raw = data.get("data", [])
-            if isinstance(raw, dict):
-                entries = raw.get("data", [])
-            elif isinstance(raw, list) and raw:
-                entries = raw[0].get("data", []) if "data" in raw[0] else raw
-            else:
-                entries = []
-
-            slots_stored = 0
-            for slot in entries:
-                intensity_obj    = slot.get("intensity", {})
-                forecast         = intensity_obj.get("forecast")
-                actual           = intensity_obj.get("actual")
-                ci_index         = intensity_obj.get("index")
-                slot_from        = slot.get("from")
-                if slot_from and (forecast is not None or actual is not None):
-                    captured_at = slot_from.replace("Z", "").replace("+00:00", "")
-                    store.upsert_carbon_intensity(
-                        captured_at, postcode,
-                        float(forecast) if forecast is not None else None,
-                        ci_index,
-                        float(actual) if actual is not None else None
-                    )
-                    gen_mix = slot.get("generationmix", [])
-                    if gen_mix:
-                        _slot_mix[captured_at] = gen_mix
-                    slots_stored += 1
-            total_slots += slots_stored
-            logger.info("_backfill_carbon_gaps: fetched %d slots from %s",
-                        slots_stored, from_iso)
-
-        except Exception as e:
-            logger.warning("_backfill_carbon_gaps: API fetch failed for %s: %s", from_iso, e)
-
-        await asyncio.sleep(0.5)
-
-    # Recompute carbon_g for NULL blocks in window — main meter and sub-meters
-    if total_slots > 0:
-        updated = 0
-        null_blocks = store._conn.execute(
-            """SELECT id, meter_id, block_start, imp_kwh, exp_kwh
-               FROM blocks
-               WHERE carbon_g IS NULL
-                 AND block_start >= ?""",
-            (cutoff,)
-        ).fetchall()
-
-        with store._conn:
-            for block in null_blocks:
-                ci_row = store.get_nearest_carbon_intensity(block["block_start"], postcode)
-                if not ci_row or ci_row.get("intensity") is None:
-                    continue
-                imp_kwh   = block["imp_kwh"] or 0.0
-                exp_kwh   = block["exp_kwh"] or 0.0
-                intensity = float(ci_row["intensity"])
-                if block["meter_id"] == "electricity_main":
-                    carbon_g = round((imp_kwh - exp_kwh) * intensity, 4)
-                else:
-                    carbon_g = round(imp_kwh * intensity, 4)
-                store._conn.execute(
-                    "UPDATE blocks SET carbon_g = ? WHERE id = ?",
-                    (carbon_g, block["id"])
-                )
-                # Store generation mix for this block using nearest slot mix
-                captured_at = ci_row.get("captured_at")
-                if captured_at and captured_at in _slot_mix:
-                    store.upsert_generation_mix(block["id"], _slot_mix[captured_at])
-                elif _slot_mix:
-                    # Find nearest slot mix by timestamp
-                    nearest_key = min(_slot_mix.keys(),
-                                      key=lambda k: abs(
-                                          datetime.fromisoformat(k).timestamp() -
-                                          datetime.fromisoformat(block["block_start"]).timestamp()
-                                      ))
-                    store.upsert_generation_mix(block["id"], _slot_mix[nearest_key])
-                updated += 1
-        logger.info("_backfill_carbon_gaps: updated carbon_g on %d blocks", updated)
-    else:
-        logger.info("_backfill_carbon_gaps: no new CI data fetched")
-
-    # Mark complete — future restarts use 48hr window only
-    try:
-        with store._conn:
-            store._conn.execute(
-                "INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)",
-                ("carbon_backfill_done", postcode)
-            )
-    except Exception:
-        pass
 
 
 async def engine_startup(ha: HAClient):
@@ -2175,14 +2008,6 @@ async def engine_startup(ha: HAClient):
             # Record this version so we don't backup again until next upgrade
             with open(_ver_file, "w") as _vfw:
                 _vfw.write(_cur_ver)
-            # Clear CI backfill flag so historical backfill runs once for new version
-            try:
-                with _store._conn:
-                    _store._conn.execute(
-                        "DELETE FROM store_meta WHERE key = 'carbon_backfill_done'"
-                    )
-            except Exception:
-                pass
             logger.info(
                 "engine_startup: upgrade backup created for v%s: %s",
                 _cur_ver, os.path.basename(_bk_path)
@@ -2398,11 +2223,46 @@ async def engine_startup(ha: HAClient):
             else:
                 logger.info("engine_startup: no session gap detected")
 
-    # ── CI gap backfill ──────────────────────────────────────────────────
+    # ── Seed _current_slot_mix from recent DB data ───────────────────────
+    # _current_slot_mix is in-memory and lost on restart. Re-seed from
+    # generation_mix rows for the last 2 hours so that blocks finalising
+    # immediately after startup get mix data without waiting for the next
+    # CI tick (which fires every 30 min and might race with block finalise).
+    global _current_slot_mix
     try:
-        await _backfill_carbon_gaps(_store, config)
-    except Exception as _e:
-        logger.warning("engine_startup: CI backfill failed: %s", _e)
+        _seed_rows = _store._conn.execute(
+            """SELECT b.block_start, gm.fuel, gm.perc
+               FROM blocks b
+               JOIN generation_mix gm ON gm.block_id = b.id
+               WHERE b.meter_id = 'electricity_main'
+                 AND b.block_start >= datetime('now', '-4 hours')
+               ORDER BY b.block_start ASC, gm.fuel ASC"""
+        ).fetchall()
+        _seed_slots = {}
+        for row in _seed_rows:
+            bs = row["block_start"]
+            if bs not in _seed_slots:
+                _seed_slots[bs] = []
+            _seed_slots[bs].append({"fuel": row["fuel"], "perc": row["perc"]})
+        for bs, mix in _seed_slots.items():
+            _current_slot_mix[bs] = mix
+        if _seed_slots:
+            logger.info(
+                "engine_startup: seeded _current_slot_mix with %d slots from DB",
+                len(_seed_slots)
+            )
+    except Exception as _seed_err:
+        logger.warning("engine_startup: could not seed slot mix from DB: %s", _seed_err)
+
+    # ── Fire CI tick immediately so mix data is available for next finalise ─
+    # If seed was empty (fresh install or long downtime), fetch mix now rather
+    # than waiting up to 30 minutes for the scheduled CI tick.
+    if not _current_slot_mix:
+        try:
+            await _tick_carbon_intensity()
+            logger.info("engine_startup: immediate CI tick fired (no seed data)")
+        except Exception as _ci_err:
+            logger.warning("engine_startup: immediate CI tick failed: %s", _ci_err)
 
     # ── Startup charts ───────────────────────────────────────────────────
     generate_charts(_store)

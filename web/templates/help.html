@@ -221,6 +221,59 @@
     reading after to <strong>interpolate the missing blocks</strong>. Gaps longer than 12 hours
     are not interpolated — the blocks are left as zero to avoid misleading data.
   </p>
+  <div class="note-box">
+    ⓘ <strong>Sub-meter gap attribution:</strong> The main meter uses boundary interpolation to
+    correctly allocate energy to each block window. Sub-meters use raw cumulative deltas — if no
+    intermediate reads arrived during a gap, the full delta may be attributed to a single block
+    even if it spans multiple windows. This can cause a sub-meter to appear to exceed the parent
+    grid import for that block. The engine logs a WARNING and preserves the raw value. This is a
+    known limitation and will be improved in a future release.
+  </div>
+</div>
+
+<!-- ── Carbon intensity ─────────────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">🌿 Carbon Intensity</div>
+  <p>
+    When a <strong>postcode prefix</strong> is configured (e.g. <code>DE1</code>), the engine
+    fetches half-hourly regional carbon intensity data from the
+    <a href="https://carbonintensity.org.uk" target="_blank" style="color:var(--accent);">National Grid ESO API</a>.
+    Carbon intensity (gCO₂/kWh) is recorded against each block at the time of finalisation.
+  </p>
+  <ul>
+    <li><strong>Forecast vs actual</strong> — the API provides a forecast for upcoming slots and actual values ~24 hours later. Both are stored; actual is preferred when available.</li>
+    <li><strong>Generation mix</strong> — alongside intensity, the fuel type breakdown (wind, solar, gas, nuclear, biomass, hydro, imports) is stored per block. This data is the foundation for future generation mix features.</li>
+    <li><strong>Historical backfill</strong> — on first run with a postcode, the engine backfills up to 60 days of carbon data. Subsequent restarts check only the last 48 hours.</li>
+    <li><strong>Coverage</strong> — the Insights page shows the percentage of blocks with carbon data. Blocks from before a postcode was configured will not have carbon data.</li>
+  </ul>
+  <div class="note-box">
+    ⓘ Only UK postcodes are supported via the National Grid ESO regional API. Enter the outward
+    code only — e.g. <code>DE1</code> not <code>DE1 3AT</code>. The engine normalises the postcode
+    automatically on save.
+  </div>
+</div>
+
+<!-- ── Insights ──────────────────────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">📊 Insights</div>
+  <p>
+    The Insights page provides carbon analysis for any calendar month or year. Use the floating
+    toolbar to switch between Month and Year view, navigate with ← →, and compare against the
+    previous period or same period last year.
+  </p>
+  <ul>
+    <li><strong>Carbon Summary</strong> — net carbon emitted, your effective intensity vs grid average, export offset.</li>
+    <li><strong>Solar Export</strong> — carbon displaced by export, weighted by grid intensity at time of export.</li>
+    <li><strong>Direct Import</strong> — grid import attributable to house loads, excluding EV and battery charging.</li>
+    <li><strong>Battery Charging</strong> — carbon cost of grid energy used to charge the battery, including AC from grid and usable DC stored (adjusted for round-trip efficiency).</li>
+    <li><strong>EV Charging</strong> — carbon cost of EV charging with mileage estimate and petrol comparison.</li>
+    <li><strong>Heat Pump</strong> — carbon cost vs equivalent gas boiler.</li>
+  </ul>
+  <div class="note-box">
+    ⓘ Insights requires carbon intensity data. Blocks without carbon data (predating postcode
+    configuration) are excluded from carbon calculations. The coverage percentage is shown on the
+    Carbon Summary card.
+  </div>
 </div>
 
 <!-- ── Data storage ──────────────────────────────────────────────────────── -->
@@ -248,7 +301,7 @@
   <div class="card-title">🐳 Standalone Docker</div>
   <p>
     When running in standalone Docker mode, the add-on connects to your HA instance using a
-    Long-Lived Access Token. The UI is accessible directly at <code>http://&lt;host&gt;:8099</code>.
+    Long-Lived Access Token. The UI is accessible directly at the configured port (default <code>http://&lt;host&gt;:8099</code>).
   </p>
   <pre class="help-pre">panel_iframe:
   energy_meter:

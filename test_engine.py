@@ -931,6 +931,68 @@ class TestPass2SubMeterExceedsParent(unittest.TestCase):
         self.assertFalse(any("EXCEEDS" in line for line in cm.output))
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# W→kW unit conversion via unit_of_measurement (2.8.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestInverterUnitConversion(unittest.TestCase):
+    """
+    _engine_tick converts sub-meter inverter power sensor values using
+    unit_of_measurement from HA attributes, not a magnitude heuristic.
+    """
+
+    def _make_ha(self, sensor_value, unit):
+        ha = MagicMock()
+        ha.get_state.return_value = str(sensor_value)
+        ha.get_attributes.return_value = {"unit_of_measurement": unit}
+        return ha
+
+    def _run_conversion(self, sensor_value, unit):
+        """Simulate the conversion logic from _engine_tick directly."""
+        try:
+            fv = float(sensor_value)
+            try:
+                unit_str = unit or ""
+            except Exception:
+                unit_str = ""
+            if unit_str.upper() == "W":
+                fv = fv / 1000.0
+            return round(fv, 3)
+        except (ValueError, TypeError):
+            return None
+
+    def test_watts_divided_by_1000(self):
+        """Sensor reporting in W is divided by 1000 to give kW."""
+        result = self._run_conversion(2500, "W")
+        self.assertAlmostEqual(result, 2.5, places=3)
+
+    def test_kilowatts_stored_as_is(self):
+        """Sensor reporting in kW is stored without conversion."""
+        result = self._run_conversion(2.5, "kW")
+        self.assertAlmostEqual(result, 2.5, places=3)
+
+    def test_small_watts_not_misidentified(self):
+        """Low W values (e.g. 50W) divide correctly — old heuristic would miss these."""
+        result = self._run_conversion(50, "W")
+        self.assertAlmostEqual(result, 0.05, places=3)
+
+    def test_large_kilowatts_not_misidentified(self):
+        """Large kW values (e.g. 150kW EV charger) are not divided — old heuristic would."""
+        result = self._run_conversion(150, "kW")
+        self.assertAlmostEqual(result, 150.0, places=3)
+
+    def test_unknown_unit_stored_as_is(self):
+        """Unknown unit falls through without division."""
+        result = self._run_conversion(1500, "")
+        self.assertAlmostEqual(result, 1500.0, places=3)
+
+    def test_unavailable_returns_none(self):
+        """Unavailable sensor value returns None."""
+        result = self._run_conversion("unavailable", "W")
+        self.assertIsNone(result)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

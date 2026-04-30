@@ -110,10 +110,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     block_start      TEXT    NOT NULL,
     block_end        TEXT    NOT NULL,
-    local_date       TEXT    NOT NULL,
-    local_year       INTEGER NOT NULL,
-    local_month      INTEGER NOT NULL,
-    local_day        INTEGER NOT NULL,
+
     meter_id         TEXT    NOT NULL,
     config_period_id INTEGER NOT NULL,
     interpolated     INTEGER NOT NULL DEFAULT 0,
@@ -137,8 +134,7 @@ CREATE TABLE IF NOT EXISTS blocks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_blocks_start     ON blocks (block_start);
-CREATE INDEX IF NOT EXISTS idx_blocks_date      ON blocks (local_date);
-CREATE INDEX IF NOT EXISTS idx_blocks_ym        ON blocks (local_year, local_month);
+
 CREATE INDEX IF NOT EXISTS idx_blocks_meter     ON blocks (meter_id);
 CREATE INDEX IF NOT EXISTS idx_blocks_meter_dt  ON blocks (meter_id, block_start);
 CREATE INDEX IF NOT EXISTS idx_blocks_period    ON blocks (config_period_id);
@@ -248,14 +244,72 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
 
-def _local_date_parts(block_start_iso: str, tz_name: str) -> tuple[str, int, int, int]:
-    """Return (local_date, year, month, day) for a block start timestamp."""
+def local_date_to_utc_bounds(local_date: str, tz_name: str) -> tuple[str, str]:
+    """
+    Convert a local date string (YYYY-MM-DD) to a pair of UTC ISO strings
+    (utc_start_inclusive, utc_end_exclusive) representing the full local day
+    in the given timezone.
+
+    Handles DST correctly:
+      - BST start day (23 hours): returns 23hr window
+      - BST end day (25 hours): returns 25hr window
+      - GMT days: returns exact 24hr window aligned to midnight UTC
+
+    Returns naive ISO strings (no Z suffix) suitable for direct comparison
+    with block_start values stored in the database.
+
+    Example (Europe/London, BST):
+      local_date_to_utc_bounds('2026-04-15', 'Europe/London')
+      → ('2026-04-14T23:00:00', '2026-04-15T23:00:00')
+
+    Example (Europe/London, GMT):
+      local_date_to_utc_bounds('2026-01-15', 'Europe/London')
+      → ('2026-01-15T00:00:00', '2026-01-16T00:00:00')
+
+    Example (BST start day — 23 hours):
+      local_date_to_utc_bounds('2026-03-29', 'Europe/London')
+      → ('2026-03-28T23:00:00', '2026-03-29T23:00:00')
+
+    Example (BST end day — 25 hours):
+      local_date_to_utc_bounds('2026-10-25', 'Europe/London')
+      → ('2026-10-24T23:00:00', '2026-10-25T23:00:00')
+    """
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
         tz = ZoneInfo("UTC")
-    dt = datetime.fromisoformat(block_start_iso).replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
-    return dt.strftime("%Y-%m-%d"), dt.year, dt.month, dt.day
+
+    year, month, day = int(local_date[:4]), int(local_date[5:7]), int(local_date[8:10])
+
+    # Midnight at start of local day
+    local_start = datetime(year, month, day, 0, 0, 0, tzinfo=tz)
+    # Midnight at start of next local day — computed by advancing date then re-localising
+    next_day    = (datetime(year, month, day) + timedelta(days=1))
+    local_end   = datetime(next_day.year, next_day.month, next_day.day, 0, 0, 0, tzinfo=tz)
+
+    # Convert to UTC and strip tzinfo for DB comparison
+    utc_start = local_start.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    utc_end   = local_end.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+
+    return utc_start.isoformat(), utc_end.isoformat()
+
+
+def local_date_range_to_utc_bounds(first_local_date: str, last_local_date: str,
+                                    tz_name: str) -> tuple[str, str]:
+    """
+    Convert an inclusive local date range to UTC bounds for DB filtering.
+
+    Returns (utc_start_inclusive, utc_end_exclusive) covering all blocks
+    whose local date falls within [first_local_date, last_local_date].
+
+    Handles DST correctly across the full range — the UTC start uses the
+    offset at first_local_date, the UTC end uses the offset at last_local_date.
+    Both are computed independently so a range straddling a DST transition
+    (e.g. March 3 GMT → April 2 BST) is handled correctly.
+    """
+    utc_start, _ = local_date_to_utc_bounds(first_local_date, tz_name)
+    _, utc_end   = local_date_to_utc_bounds(last_local_date,  tz_name)
+    return utc_start, utc_end
 
 
 def _channel(meter_block: dict, channel_name: str) -> dict:
@@ -270,7 +324,7 @@ def _block_rows(block: dict, config_period_id: int, tz_name: str) -> list[dict]:
     block_start = block.get("start", "")
     block_end   = block.get("end", "")
     interpolated = 1 if block.get("interpolated") else 0
-    local_date, local_year, local_month, local_day = _local_date_parts(block_start, tz_name)
+
 
     rows = []
     for meter_id, meter_block in (block.get("meters") or {}).items():
@@ -281,10 +335,7 @@ def _block_rows(block: dict, config_period_id: int, tz_name: str) -> list[dict]:
         rows.append({
             "block_start":       block_start,
             "block_end":         block_end,
-            "local_date":        local_date,
-            "local_year":        local_year,
-            "local_month":       local_month,
-            "local_day":         local_day,
+
             "meter_id":          meter_id,
             "config_period_id":  config_period_id,
             "interpolated":      interpolated,
@@ -495,13 +546,47 @@ class BlockStore:
         self._ensure_schema()
         # Covering index for insights aggregation — created after migrations
         # so carbon_g and other late-added columns are guaranteed to exist
+        # Covering index for all insights/summary queries — avoids row fetches.
+        # Includes all columns used by _aggregate_insights, _aggregate_usage,
+        # and api_blocks_summary. Rebuilt if schema changes (DROP + CREATE).
+        _insights_idx_sql = (
+            "CREATE INDEX IF NOT EXISTS idx_blocks_insights "
+            "ON blocks (block_start, meter_id, config_period_id, "
+            "imp_kwh, imp_kwh_grid, imp_kwh_remainder, "
+            "imp_rate, imp_cost, imp_cost_remainder, "
+            "exp_kwh, exp_cost, "
+            "standing_charge, carbon_g)"
+        )
         try:
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_blocks_insights "
-                "ON blocks (block_start, meter_id, imp_kwh, exp_kwh, carbon_g, config_period_id)"
-            )
+            existing = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_blocks_insights'"
+            ).fetchone()
+            if existing and existing[0] and "standing_charge" not in existing[0]:
+                # Old narrow index — drop and recreate with full covering set
+                with self._conn:
+                    self._conn.execute("DROP INDEX IF EXISTS idx_blocks_insights")
+            with self._conn:
+                self._conn.execute(_insights_idx_sql)
         except Exception:
             pass
+        # 2.8.0 — drop timezone-baked local date columns (now computed at query time)
+        # Must drop indexes first — SQLite won't drop a column used in an index
+        for _drop_idx in ("idx_blocks_date", "idx_blocks_ym"):
+            try:
+                with self._conn:
+                    self._conn.execute(f"DROP INDEX IF EXISTS {_drop_idx}")
+            except Exception:
+                pass
+        for _drop_col in ("local_date", "local_year", "local_month", "local_day"):
+            try:
+                cols = [r["name"] for r in self._conn.execute(
+                    "PRAGMA table_info(blocks)"
+                ).fetchall()]
+                if _drop_col in cols:
+                    with self._conn:
+                        self._conn.execute(f"ALTER TABLE blocks DROP COLUMN {_drop_col}")
+            except Exception as _e:
+                pass  # SQLite < 3.35 or column already dropped
         # Migrate carbon_intensity: rename intensity → intensity_forecast, add intensity_actual
         try:
             cols = [r["name"] for r in self._conn.execute(
@@ -519,6 +604,20 @@ class BlockStore:
                     )
         except Exception:
             pass
+
+        # 2.8.0 — remove redundant generation_mix rows stored against sub-meter blocks.
+        # Mix is a grid property; only the main meter block needs it.
+        try:
+            with self._conn:
+                self._conn.execute("""
+                    DELETE FROM generation_mix
+                    WHERE block_id IN (
+                        SELECT id FROM blocks WHERE meter_id != 'electricity_main'
+                    )
+                """)
+        except Exception:
+            pass
+
         try:
             self._conn.execute("""
                 CREATE TABLE IF NOT EXISTS generation_mix (
@@ -919,11 +1018,12 @@ class BlockStore:
 
     def delete_blocks_for_date_range(
         self, from_date: str, to_date: str, meter_id: str | None = None,
-        from_time: str = "00:00", to_time: str = "23:59"
+        from_time: str = "00:00", to_time: str = "23:59", tz_name: str = "UTC"
     ) -> dict:
         """
-        Delete all blocks whose local_date falls within [from_date, to_date] inclusive,
+        Delete all blocks within [from_date, to_date] local date range (inclusive),
         optionally restricted by time-of-day (UTC HH:MM) within those dates.
+        Uses UTC bounds derived from local dates via local_date_range_to_utc_bounds().
         """
         if not from_date or not to_date:
             raise ValueError("from_date and to_date are required")
@@ -933,25 +1033,34 @@ class BlockStore:
         from_time = from_time or "00:00"
         to_time   = to_time   or "23:59"
 
-        if from_date == to_date:
-            # Same date — simple AND range on block_start time
-            where  = "local_date = ? AND TIME(block_start) >= ? AND TIME(block_start) <= ?"
-            params = [from_date, from_time, to_time]
-        else:
-            # Multi-date — first date from from_time, last date up to to_time, middle dates all
-            where  = """(
-                (local_date = ? AND TIME(block_start) >= ?) OR
-                (local_date = ? AND TIME(block_start) <= ?) OR
-                (local_date > ? AND local_date < ?)
-            )"""
-            params = [from_date, from_time, to_date, to_time, from_date, to_date]
+        utc_start, utc_end = local_date_range_to_utc_bounds(from_date, to_date, tz_name)
+
+        clauses = ["block_start >= ?", "block_start < ?"]
+        params  = [utc_start, utc_end]
+
+        if from_time != "00:00" and to_time != "23:59":
+            if from_time <= to_time:
+                clauses.append("TIME(block_start) >= ?")
+                clauses.append("TIME(block_start) <= ?")
+                params.extend([from_time, to_time])
+            else:
+                clauses.append("(TIME(block_start) >= ? OR TIME(block_start) <= ?)")
+                params.extend([from_time, to_time])
+        elif from_time != "00:00":
+            clauses.append("TIME(block_start) >= ?")
+            params.append(from_time)
+        elif to_time != "23:59":
+            clauses.append("TIME(block_start) <= ?")
+            params.append(to_time)
 
         if meter_id:
-            where  += " AND meter_id = ?"
+            clauses.append("meter_id = ?")
             params.append(meter_id)
 
+        where = " AND ".join(clauses)
+
         cur = self._conn.execute(
-            f"SELECT COUNT(*) as n, COUNT(DISTINCT local_date) as d FROM blocks WHERE {where}",
+            f"SELECT COUNT(*) as n, COUNT(DISTINCT date(block_start)) as d FROM blocks WHERE {where}",
             params
         )
         row = cur.fetchone()
@@ -965,32 +1074,43 @@ class BlockStore:
 
     def count_blocks_for_date_range(
         self, from_date: str, to_date: str, meter_id: str | None = None,
-        from_time: str = "00:00", to_time: str = "23:59"
+        from_time: str = "00:00", to_time: str = "23:59", tz_name: str = "UTC"
     ) -> dict:
         """
-        Preview how many blocks would be deleted for a given date/time range.
+        Preview how many blocks would be affected by delete_blocks_for_date_range.
         Returns {"blocks": N, "dates": N_distinct_dates}.
         """
         from_time = from_time or "00:00"
         to_time   = to_time   or "23:59"
 
-        if from_date == to_date:
-            where  = "local_date = ? AND TIME(block_start) >= ? AND TIME(block_start) <= ?"
-            params = [from_date, from_time, to_time]
-        else:
-            where  = """(
-                (local_date = ? AND TIME(block_start) >= ?) OR
-                (local_date = ? AND TIME(block_start) <= ?) OR
-                (local_date > ? AND local_date < ?)
-            )"""
-            params = [from_date, from_time, to_date, to_time, from_date, to_date]
+        utc_start, utc_end = local_date_range_to_utc_bounds(from_date, to_date, tz_name)
+
+        clauses = ["block_start >= ?", "block_start < ?"]
+        params  = [utc_start, utc_end]
+
+        if from_time != "00:00" and to_time != "23:59":
+            if from_time <= to_time:
+                clauses.append("TIME(block_start) >= ?")
+                clauses.append("TIME(block_start) <= ?")
+                params.extend([from_time, to_time])
+            else:
+                clauses.append("(TIME(block_start) >= ? OR TIME(block_start) <= ?)")
+                params.extend([from_time, to_time])
+        elif from_time != "00:00":
+            clauses.append("TIME(block_start) >= ?")
+            params.append(from_time)
+        elif to_time != "23:59":
+            clauses.append("TIME(block_start) <= ?")
+            params.append(to_time)
 
         if meter_id:
-            where  += " AND meter_id = ?"
+            clauses.append("meter_id = ?")
             params.append(meter_id)
 
+        where = " AND ".join(clauses)
+
         cur = self._conn.execute(
-            f"SELECT COUNT(*) as n, COUNT(DISTINCT local_date) as d FROM blocks WHERE {where}",
+            f"SELECT COUNT(*) as n, COUNT(DISTINCT date(block_start)) as d FROM blocks WHERE {where}",
             params
         )
         row = cur.fetchone()
@@ -1046,21 +1166,19 @@ class BlockStore:
         return periods
 
 
-    def get_billing_totals_for_local_date_range(self,
-                                                first_local_date: str,
-                                                last_local_date: str) -> dict:
+
+    def get_billing_totals_for_utc_range(self, utc_start: str, utc_end: str,
+                                          tz_name: str = "UTC") -> dict:
         """
-        Fast SQL aggregation of billing totals for a local calendar date range.
-        Uses local_date column (timezone-corrected at insert time) for both
-        kWh/cost and standing charge — correctly handles BST/GMT blocks at
-        23:xx UTC that belong to the next local calendar day.
+        UTC-based replacement for get_billing_totals_for_local_date_range.
+        Filters on block_start >= utc_start AND block_start < utc_end.
 
-        Mirrors PASS 3 logic to avoid double-counting sub-meter consumption:
-          - Main meter: imp_kwh_remainder (house-only), fallback imp_kwh_grid, fallback imp_kwh
-          - Sub-meters: imp_kwh_grid (grid portion), fallback imp_kwh
-          - Cost and export: main meter only
+        Use local_date_range_to_utc_bounds() to compute utc_start/utc_end
+        from local date strings. Handles DST correctly since bounds are
+        computed per-date using the configured timezone.
 
-        first_local_date / last_local_date: YYYY-MM-DD strings (inclusive).
+        Standing charge is summed per distinct local day — computed at
+        query time using strftime with the configured timezone offset.
         """
         active_period_sq = (
             "SELECT id FROM config_periods "
@@ -1086,45 +1204,50 @@ class BlockStore:
                JOIN meters m
                  ON m.meter_id = b.meter_id
                 AND m.config_period_id = ({active_period_sq})
-               WHERE b.local_date >= ? AND b.local_date <= ?""",
-            (first_local_date, last_local_date)
+               WHERE b.block_start >= ? AND b.block_start < ?""",
+            (utc_start, utc_end)
         )
         row = cur.fetchone()
 
-        # Standing charge: once per local calendar day, main meter only.
-        # Use MAX(standing_charge) per day — this picks the correct daily rate
-        # even if early blocks in the day have sc=0 (sensor not yet updated)
-        # or if the rate changed during the day (takes the latest value).
-        cur2 = self._conn.execute(
-            f"""SELECT SUM(daily_sc) as standing FROM (
-                 SELECT MAX(b.standing_charge) as daily_sc
-                 FROM blocks b
-                 JOIN meters m
-                   ON m.meter_id = b.meter_id
-                  AND m.config_period_id = ({active_period_sq})
-                 WHERE b.local_date >= ? AND b.local_date <= ?
-                   AND m.is_sub_meter = 0
-                 GROUP BY b.local_date
-               )""",
-            (first_local_date, last_local_date)
-        )
-        row2 = cur2.fetchone()
+        # Standing charge: once per distinct local day.
+        # Convert block_start to local date using the timezone offset at query time.
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo("UTC")
+
+        # Fetch all main-meter blocks in range and group by local date in Python
+        # (SQLite cannot do timezone-aware date conversion natively)
+        sc_rows = self._conn.execute(
+            f"""SELECT b.block_start, b.standing_charge
+               FROM blocks b
+               JOIN meters m ON m.meter_id = b.meter_id
+                 AND m.config_period_id = ({active_period_sq})
+               WHERE b.block_start >= ? AND b.block_start < ?
+                 AND m.is_sub_meter = 0
+               ORDER BY b.block_start""",
+            (utc_start, utc_end)
+        ).fetchall()
+
+        # Group by local date, take MAX standing_charge per day
+        daily_sc: dict = {}
+        for sc_row in sc_rows:
+            local_d = (datetime.fromisoformat(sc_row["block_start"])
+                       .replace(tzinfo=ZoneInfo("UTC"))
+                       .astimezone(tz)
+                       .strftime("%Y-%m-%d"))
+            sc_val = float(sc_row["standing_charge"] or 0)
+            if local_d not in daily_sc or sc_val > daily_sc[local_d]:
+                daily_sc[local_d] = sc_val
+        standing = round(sum(daily_sc.values()), 4)
 
         return {
             "imp_kwh":  round(float(row["imp_kwh"]  or 0), 4),
             "imp_cost": round(float(row["imp_cost"] or 0), 4),
             "exp_kwh":  round(float(row["exp_kwh"]  or 0), 4),
             "exp_cost": round(float(row["exp_cost"] or 0), 4),
-            "standing": round(float(row2["standing"] or 0), 4),
+            "standing": standing,
         }
-
-    def get_billing_totals_for_range(self, start: datetime, end: datetime) -> dict:
-        """Wrapper: converts naive datetime boundaries to local_date strings."""
-        from datetime import timezone
-        # The caller passes local naive datetimes — derive the local date range
-        start_date = start.date().isoformat()
-        end_date   = end.date().isoformat()
-        return self.get_billing_totals_for_local_date_range(start_date, end_date)
 
     # ── Current block (replaces current_block.json) ──────────────────────────
 
@@ -1927,7 +2050,6 @@ class BlockStore:
         sql = """
             INSERT OR IGNORE INTO blocks (
                 block_start, block_end,
-                local_date, local_year, local_month, local_day,
                 meter_id, config_period_id, interpolated,
                 imp_kwh, imp_kwh_grid, imp_kwh_remainder,
                 imp_rate, imp_cost, imp_cost_remainder,
@@ -1937,7 +2059,6 @@ class BlockStore:
                 standing_charge, carbon_g
             ) VALUES (
                 :block_start, :block_end,
-                :local_date, :local_year, :local_month, :local_day,
                 :meter_id, :config_period_id, :interpolated,
                 :imp_kwh, :imp_kwh_grid, :imp_kwh_remainder,
                 :imp_rate, :imp_cost, :imp_cost_remainder,
@@ -1958,7 +2079,6 @@ class BlockStore:
         sql = """
             INSERT OR REPLACE INTO blocks (
                 block_start, block_end,
-                local_date, local_year, local_month, local_day,
                 meter_id, config_period_id, interpolated,
                 imp_kwh, imp_kwh_grid, imp_kwh_remainder,
                 imp_rate, imp_cost, imp_cost_remainder,
@@ -1968,7 +2088,6 @@ class BlockStore:
                 standing_charge, carbon_g
             ) VALUES (
                 :block_start, :block_end,
-                :local_date, :local_year, :local_month, :local_day,
                 :meter_id, :config_period_id, :interpolated,
                 :imp_kwh, :imp_kwh_grid, :imp_kwh_remainder,
                 :imp_rate, :imp_cost, :imp_cost_remainder,
@@ -2015,6 +2134,122 @@ class BlockStore:
     def get_all_blocks(self) -> list[dict]:
         """Full export — used by chart generation during transition phase."""
         return self._select_blocks("", ())
+
+    def get_blocks_lightweight(self, utc_start: str | None = None,
+                                utc_end: str | None = None) -> list[dict]:
+        """
+        Lightweight block fetch for chart generation — returns minimal dicts
+        without full _rows_to_blocks reconstruction. Significantly faster than
+        get_all_blocks() for large datasets.
+
+        Returns dicts compatible with generate_net_heatmap and
+        generate_daily_import_export_charts:
+          - start, totals.import_kwh, totals.export_kwh
+          - meters[meter_id].carbon_g, .imp_kwh, .exp_kwh, .imp_cost, .exp_cost
+          - meters[meter_id].meta, .standing_charge, .channels
+
+        Filters to the given UTC range if provided.
+        """
+        where = ""
+        params: list = []
+        if utc_start and utc_end:
+            where = "WHERE b.block_start >= ? AND b.block_start < ?"
+            params = [utc_start, utc_end]
+        elif utc_start:
+            where = "WHERE b.block_start >= ?"
+            params = [utc_start]
+
+        rows = self._conn.execute(
+            f"""SELECT b.block_start, b.meter_id,
+                       b.imp_kwh, b.imp_kwh_grid, b.imp_kwh_remainder,
+                       b.imp_rate, b.imp_cost, b.imp_read_start, b.imp_read_end,
+                       b.exp_kwh, b.exp_rate, b.exp_cost,
+                       b.standing_charge, b.carbon_g, b.interpolated,
+                       m.is_sub_meter, m.parent_meter_id, m.device_label,
+                       m.inverter_possible, m.meter_type,
+                       cp.billing_day, cp.block_minutes, cp.timezone,
+                       cp.currency_symbol, cp.currency_code, cp.effective_from
+               FROM blocks b
+               JOIN config_periods cp ON b.config_period_id = cp.id
+               LEFT JOIN meters m ON m.meter_id = b.meter_id
+                 AND m.config_period_id = b.config_period_id
+               {where}
+               ORDER BY b.block_start, b.meter_id""",
+            params
+        ).fetchall()
+
+        # Group by block_start and reconstruct minimal block dicts
+        from collections import defaultdict as _dd
+        block_map: dict = {}
+        block_order: list = []
+
+        for row in rows:
+            bs = row["block_start"]
+            if bs not in block_map:
+                block_map[bs] = {
+                    "start":   bs,
+                    "end":     bs,  # approximate — not stored separately here
+                    "meters":  {},
+                    "totals":  {"import_kwh": 0.0, "export_kwh": 0.0,
+                                "import_cost": 0.0, "export_cost": 0.0},
+                    "_billing_day":    row["billing_day"],
+                    "_block_minutes":  row["block_minutes"],
+                    "_timezone":       row["timezone"],
+                    "_currency_symbol": row["currency_symbol"],
+                    "_currency_code":  row["currency_code"],
+                    "_effective_from": row["effective_from"],
+                }
+                block_order.append(bs)
+
+            b = block_map[bs]
+            mid = row["meter_id"]
+            is_sub = bool(row["is_sub_meter"])
+            imp = float(row["imp_kwh"] or 0)
+            exp = float(row["exp_kwh"] or 0)
+
+            b["meters"][mid] = {
+                "meta": {
+                    "sub_meter":        is_sub,
+                    "parent_meter":     row["parent_meter_id"],
+                    "device":           row["device_label"],
+                    "inverter_possible": bool(row["inverter_possible"]),
+                    "meter_type":       row["meter_type"],
+                    "block_minutes":    row["block_minutes"],
+                    "timezone":         row["timezone"],
+                    "currency_symbol":  row["currency_symbol"],
+                },
+                "carbon_g":      row["carbon_g"],
+                "imp_kwh":       imp,
+                "exp_kwh":       exp,
+                "imp_cost":      float(row["imp_cost"] or 0),
+                "exp_cost":      float(row["exp_cost"] or 0),
+                "standing_charge": float(row["standing_charge"] or 0),
+                "interpolated":  bool(row["interpolated"]),
+                "channels": {
+                    "import": {
+                        "kwh":           imp,
+                        "kwh_grid":      float(row["imp_kwh_grid"] or 0) if row["imp_kwh_grid"] is not None else None,
+                        "kwh_remainder": float(row["imp_kwh_remainder"] or 0) if row["imp_kwh_remainder"] is not None else None,
+                        "rate":          float(row["imp_rate"]) if row["imp_rate"] is not None else None,
+                        "cost":          float(row["imp_cost"] or 0),
+                        "read_start":    row["imp_read_start"],
+                        "read_end":      row["imp_read_end"],
+                    },
+                    "export": {
+                        "kwh":  exp,
+                        "rate": float(row["exp_rate"]) if row["exp_rate"] is not None else None,
+                        "cost": float(row["exp_cost"] or 0),
+                    },
+                },
+            }
+
+            if not is_sub:
+                b["totals"]["import_kwh"]  += imp
+                b["totals"]["export_kwh"]  += exp
+                b["totals"]["import_cost"] += float(row["imp_cost"] or 0)
+                b["totals"]["export_cost"] += float(row["exp_cost"] or 0)
+
+        return [block_map[bs] for bs in block_order]
 
     def get_last_block_before(self, block_start: str) -> Optional[dict]:
         """Return the most recently finalised block before the given block_start.
@@ -2082,33 +2317,54 @@ class BlockStore:
             (start_iso, end_iso)
         )
 
-    def get_blocks_for_local_date_range(self, first_local_date: str, last_local_date: str) -> list[dict]:
-        """Return all blocks whose local_date falls within [first, last] inclusive.
-        Uses the pre-computed local_date column so BST blocks at 23:xx UTC are
-        correctly included in the next local day rather than missed by a UTC boundary."""
+    # ── UTC-based query methods ───────────────────────────────────────────────
+
+    def get_blocks_for_utc_range(self, utc_start: str, utc_end: str,
+                                  meter_id: str | None = None) -> list[dict]:
+        """
+        Return all blocks where block_start >= utc_start AND block_start < utc_end.
+        utc_start / utc_end are naive ISO strings (no tzinfo) matching DB format.
+        Replaces get_blocks_for_local_date_range — use local_date_range_to_utc_bounds()
+        to compute the UTC bounds from local date strings.
+        """
+        if meter_id:
+            return self._select_blocks(
+                "WHERE b.block_start >= ? AND b.block_start < ? AND b.meter_id = ?",
+                (utc_start, utc_end, meter_id)
+            )
         return self._select_blocks(
-            "WHERE b.local_date >= ? AND b.local_date <= ?",
-            (first_local_date, last_local_date)
+            "WHERE b.block_start >= ? AND b.block_start < ?",
+            (utc_start, utc_end)
         )
 
-    def get_blocks_for_date(self, local_date: str) -> list[dict]:
-        """All blocks for a given YYYY-MM-DD local date."""
-        return self._select_blocks(
-            "WHERE b.local_date = ?", (local_date,)
-        )
-
-    def get_blocks_for_month(self, year: int, month: int) -> list[dict]:
-        """All blocks for a given local year/month."""
-        return self._select_blocks(
-            "WHERE b.local_year = ? AND b.local_month = ?", (year, month)
-        )
-
-    def get_local_dates(self) -> list[str]:
-        """Distinct local dates present — used by heatmap generation."""
-        cur = self._conn.execute(
-            "SELECT DISTINCT local_date FROM blocks ORDER BY local_date"
-        )
-        return [row["local_date"] for row in cur.fetchall()]
+    def get_dates_in_utc_range(self, utc_start: str, utc_end: str,
+                                tz_name: str) -> list[str]:
+        """
+        Return distinct local dates (YYYY-MM-DD) present within a UTC range,
+        computed at query time from block_start using the given timezone.
+        Replaces get_local_dates() — does not use the local_date column.
+        """
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo("UTC")
+        rows = self._conn.execute(
+            """SELECT DISTINCT block_start FROM blocks
+               WHERE block_start >= ? AND block_start < ?
+               ORDER BY block_start""",
+            (utc_start, utc_end)
+        ).fetchall()
+        seen = set()
+        dates = []
+        for row in rows:
+            dt = datetime.fromisoformat(row[0]).replace(
+                tzinfo=ZoneInfo("UTC")
+            ).astimezone(tz)
+            d = dt.strftime("%Y-%m-%d")
+            if d not in seen:
+                seen.add(d)
+                dates.append(d)
+        return dates
 
     def count_blocks(self) -> int:
         """Total distinct block count (by block_start)."""

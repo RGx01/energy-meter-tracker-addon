@@ -1,0 +1,23 @@
+# Python cache — never needed in the image
+__pycache__/
+*.pyc
+*.pyo
+
+# Test files — not needed in production image
+test_*.py
+test_harness.log
+test_results.json
+
+# Documentation — not needed in image
+CHANGELOG.md
+CONTRIBUTING.md
+DEVELOPMENT.md
+ROADMAP.md
+SQLITE_MIGRATION_PLAN.md
+
+# Dev/build artifacts
+.DS_Store
+.git/
+.gitignore
+Dockerfile.standalone
+*.zip

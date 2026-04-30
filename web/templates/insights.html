@@ -2,13 +2,15 @@
 
 {% block topbar %}
 <div class="topbar">
-  <div>
+  <div style="flex:1;">
     <h2>Insights</h2>
-    <div class="sub">Energy and carbon analysis</div>
+    <div class="sub">Energy, carbon and cost analysis</div>
   </div>
-  <div class="insights-tabs">
+  <div class="insights-tabs" style="flex:0 0 auto;">
     <button class="insights-tab active" data-tab="carbon" onclick="showInsightTab('carbon', this)">🌿 <span class="insights-tab-label">Carbon</span></button>
+    <button class="insights-tab" data-tab="usage" onclick="showInsightTab('usage', this)">💷 <span class="insights-tab-label">Usage</span></button>
   </div>
+  <div style="flex:1;"></div>
 </div>
 {% endblock %}
 
@@ -125,6 +127,10 @@
     color: var(--text);
     font-family: var(--mono);
     margin-bottom: 2px;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    flex-wrap: wrap;
   }
   .insight-sub {
     font-size: 13px;
@@ -325,6 +331,20 @@
         <div style="font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); margin-bottom:10px;">Net carbon per billing period</div>
         <div id="trend-chart" style="width:100%; overflow-x:auto;"></div>
       </div>
+      <!-- Generation mix bar — hidden when no mix data -->
+      <div id="mix-bar-wrap" style="display:none;margin-top:16px;">
+        <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);margin-bottom:8px;">
+          Grid generation mix this period
+        </div>
+        <div id="mix-bar" style="display:flex;height:10px;border-radius:5px;overflow:hidden;width:100%;gap:1px;"></div>
+        <div id="mix-bar-legend" style="display:flex;flex-wrap:wrap;gap:6px 12px;margin-top:8px;font-size:11px;"></div>
+        <!-- Comparison bars (shown when compare mode active) -->
+        <div id="mix-bar-cmp-wrap" style="display:none;margin-top:10px;">
+          <div style="font-size:11px;color:var(--muted);margin-bottom:4px;" id="mix-bar-cmp-label"></div>
+          <div id="mix-bar-cmp" style="display:flex;height:10px;border-radius:5px;overflow:hidden;width:100%;gap:1px;"></div>
+        </div>
+      </div>
+
       <div class="insight-footnote">
         Carbon intensity from <a href="https://carbonintensity.org.uk" target="_blank" rel="noopener">National Grid ESO</a>
         half-hourly regional API. Both figures are derived from recorded intensity at the time of each block.<br><br>
@@ -344,7 +364,7 @@
       <div class="insight-headline" id="sol-headline"></div>
       <div class="insight-sub"     id="sol-sub"></div>
       <div class="insight-grid">
-        <div class="insight-metric">
+        <div class="insight-metric" style="display:none;">
           <div class="insight-metric-label">Export offset</div>
           <div class="insight-metric-value" id="sol-offset"></div>
           <div class="insight-metric-unit">kgCO₂</div>
@@ -385,7 +405,7 @@
           <div class="insight-metric-value" id="house-kwh"></div>
           <div class="insight-metric-unit">kWh</div>
         </div>
-        <div class="insight-metric" id="house-carbon-wrap">
+        <div class="insight-metric" id="house-carbon-wrap" style="display:none;">
           <div class="insight-metric-label">Direct import carbon</div>
           <div class="insight-metric-value" id="house-carbon"></div>
           <div class="insight-metric-unit">kgCO₂</div>
@@ -424,7 +444,7 @@
       <div class="insight-headline" id="bat-headline"></div>
       <div class="insight-sub"     id="bat-sub"></div>
       <div class="insight-grid">
-        <div class="insight-metric">
+        <div class="insight-metric" id="bat-carbon-wrap" style="display:none;">
           <div class="insight-metric-label">Grid carbon to charge</div>
           <div class="insight-metric-value" id="bat-carbon"></div>
           <div class="insight-metric-unit">kgCO₂</div>
@@ -469,7 +489,7 @@
       <div class="insight-headline" id="hp-headline"></div>
       <div class="insight-sub"     id="hp-sub"></div>
       <div class="insight-grid">
-        <div class="insight-metric">
+        <div class="insight-metric" id="hp-carbon-wrap" style="display:none;">
           <div class="insight-metric-label">HP carbon</div>
           <div class="insight-metric-value" id="hp-carbon"></div>
           <div class="insight-metric-unit">kgCO₂</div>
@@ -505,7 +525,7 @@
       <div class="insight-headline" id="ev-headline"></div>
       <div class="insight-sub"     id="ev-sub"></div>
       <div class="insight-grid">
-        <div class="insight-metric">
+        <div class="insight-metric" id="ev-carbon-wrap" style="display:none;">
           <div class="insight-metric-label">EV carbon</div>
           <div class="insight-metric-value" id="ev-carbon"></div>
           <div class="insight-metric-unit">kgCO₂</div>
@@ -544,6 +564,150 @@
     
     </div><!-- /insights-body -->
 </div><!-- /tab-carbon -->
+<!-- ── Usage tab ──────────────────────────────────────────────────────────── -->
+<div id="tab-usage" style="display:none;">
+
+  <!-- Narrative comparison card — only shown when a comparison period is active -->
+  <div class="insight-card" id="ucard-narrative" style="display:none;">
+    <div class="insight-card-title" id="u-narrative-title">Compared to…</div>
+    <div id="u-narrative-headline" class="insight-headline" style="font-size:1.1rem;margin-bottom:8px;"></div>
+    <div id="u-narrative-bullets" style="margin-top:4px;"></div>
+  </div>
+
+  <!-- Cost & Earnings card -->
+  <div class="insight-card" id="ucard-cost">
+    <div class="insight-card-title">💷 Cost &amp; Earnings</div>
+    <div class="insight-headline" id="u-net-headline">—</div>
+    <div class="insight-sub" id="u-net-sub">Net cost this period.</div>
+    <div class="insight-grid">
+      <div class="insight-metric">
+        <div class="insight-metric-label">Grid Import</div>
+        <span class="insight-metric-value" id="u-imp-cost">—</span>
+        <span class="insight-metric-unit" id="u-currency-imp"></span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Export Earnings</div>
+        <span class="insight-metric-value" id="u-exp-cost">—</span>
+        <span class="insight-metric-unit" id="u-currency-exp"></span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Standing Charge</div>
+        <span class="insight-metric-value" id="u-standing">—</span>
+        <span class="insight-metric-unit" id="u-currency-sc"></span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Avg Import Rate</div>
+        <span class="insight-metric-value" id="u-avg-rate">—</span>
+        <span class="insight-metric-unit">p/kWh</span>
+      </div>
+    </div>
+    <div id="u-sc-note" class="insight-footnote" style="display:none;"></div>
+  </div>
+
+  <!-- Rate Period Usage card — only shown when >1 rate tier -->
+  <div class="insight-card" id="ucard-rates" style="display:none;">
+    <div class="insight-card-title">📊 Rate Period Usage</div>
+    <div class="insight-sub" id="u-rates-sub">How your import is distributed across tariff rate periods.</div>
+    <div id="u-rate-bars"></div>
+    <div class="insight-footnote">Rate periods are determined by the import rate recorded on each half-hour block. Percentages show share of total grid import kWh.</div>
+  </div>
+
+  <!-- Net Grid Position card -->
+  <div class="insight-card" id="ucard-grid">
+    <div class="insight-card-title">🔌 Grid Position</div>
+    <div class="insight-headline" id="u-net-grid-headline">—</div>
+    <div class="insight-sub" id="u-net-grid-sub"></div>
+    <div class="insight-grid">
+      <div class="insight-metric">
+        <div class="insight-metric-label">Grid Import</div>
+        <span class="insight-metric-value" id="u-imp-kwh">—</span>
+        <span class="insight-metric-unit">kWh</span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Export</div>
+        <span class="insight-metric-value" id="u-exp-kwh">—</span>
+        <span class="insight-metric-unit">kWh</span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Direct to House</div>
+        <span class="insight-metric-value" id="u-house-kwh">—</span>
+        <span class="insight-metric-unit">kWh</span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Net Exporter Days</div>
+        <span class="insight-metric-value" id="u-exporter-days">—</span>
+        <span class="insight-metric-unit" id="u-exporter-days-unit"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Peak Demand card -->
+  <div class="insight-card" id="ucard-peak">
+    <div class="insight-card-title">⚡ Peak Demand Window</div>
+    <div class="insight-headline" id="u-peak-headline">—</div>
+    <div class="insight-sub" id="u-peak-sub">The 2-hour window with the highest house grid import.</div>
+    <div class="insight-footnote" id="u-peak-footnote">Based on half-hour block totals converted to local time.</div>
+  </div>
+
+  <!-- Battery card — shown only if battery sub-meter configured -->
+  <div class="insight-card" id="ucard-battery" style="display:none;">
+    <div class="insight-card-title">🔋 Battery — <span id="u-bat-label"></span></div>
+    <div class="insight-sub">Grid energy used to charge the battery this period.</div>
+    <div class="insight-grid">
+      <div class="insight-metric">
+        <div class="insight-metric-label">Charged from Grid</div>
+        <span class="insight-metric-value" id="u-bat-kwh">—</span>
+        <span class="insight-metric-unit">kWh</span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Charging Cost</div>
+        <span class="insight-metric-value" id="u-bat-cost">—</span>
+        <span class="insight-metric-unit" id="u-currency-bat"></span>
+      </div>
+    </div>
+    <div id="u-bat-rates" class="insight-equiv" style="display:none;"></div>
+  </div>
+
+  <!-- EV card — shown only if EV sub-meter configured -->
+  <div class="insight-card" id="ucard-ev" style="display:none;">
+    <div class="insight-card-title">🚗 EV Charger — <span id="u-ev-label"></span></div>
+    <div class="insight-sub">Grid energy delivered to your vehicle this period.</div>
+    <div class="insight-grid">
+      <div class="insight-metric">
+        <div class="insight-metric-label">Charged from Grid</div>
+        <span class="insight-metric-value" id="u-ev-kwh">—</span>
+        <span class="insight-metric-unit">kWh</span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Charging Cost</div>
+        <span class="insight-metric-value" id="u-ev-cost">—</span>
+        <span class="insight-metric-unit" id="u-currency-ev"></span>
+      </div>
+    </div>
+    <div id="u-ev-rates" class="insight-equiv" style="display:none;"></div>
+  </div>
+
+  <!-- Heat Pump card — shown only if heat pump sub-meter configured -->
+  <div class="insight-card" id="ucard-hp" style="display:none;">
+    <div class="insight-card-title">♨️ Heat Pump — <span id="u-hp-label"></span></div>
+    <div class="insight-sub">Grid energy consumed by your heat pump this period.</div>
+    <div class="insight-grid">
+      <div class="insight-metric">
+        <div class="insight-metric-label">Electricity Used</div>
+        <span class="insight-metric-value" id="u-hp-kwh">—</span>
+        <span class="insight-metric-unit">kWh</span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Running Cost</div>
+        <span class="insight-metric-value" id="u-hp-cost">—</span>
+        <span class="insight-metric-unit" id="u-currency-hp"></span>
+      </div>
+    </div>
+    <div id="u-hp-rates" class="insight-equiv" style="display:none;"></div>
+  </div>
+
+</div><!-- /tab-usage -->
+
 
 <script>
 var _periods    = [];
@@ -555,10 +719,28 @@ var _calMonth   = new Date().getMonth() + 1;  // 1-12
 var _dataBounds = { earliest: null, latest: null };  // from /api/insights/data-bounds
 var _trendChart = null;
 
+var _activeInsightTab = 'carbon';
+
+function _insSaveState() {
+  try {
+    localStorage.setItem('emt_insights_state', JSON.stringify({
+      tab:     _activeInsightTab,
+      mode:    _insMode,
+      year:    _calYear,
+      month:   _calMonth,
+      compare: _insCompare
+    }));
+  } catch(e) {}
+}
+
 function showInsightTab(name, btn) {
+  _activeInsightTab = name;
   document.querySelectorAll('.insights-tab').forEach(function(b) { b.classList.remove('active'); });
   btn.classList.add('active');
   document.getElementById('tab-carbon').style.display = name === 'carbon' ? 'block' : 'none';
+  document.getElementById('tab-usage').style.display  = name === 'usage'  ? 'block' : 'none';
+  _insSaveState();
+  loadPeriod();
 }
 
 // ── Formatting ──────────────────────────────────────────────────────────────
@@ -641,6 +823,111 @@ function equivLines(carbon_g, a, period_start, period_end, data_start) {
 }
 
 // ── Render ──────────────────────────────────────────────────────────────────
+// ── Generation Mix bar helpers ────────────────────────────────────────────────
+var _INS_MIX_COLOURS = {
+  wind:'#3b82f6',
+  solar:'#facc15',
+  nuclear:'#7c3aed',
+  gas:'#f97316',
+  biomass:'#92400e',
+  hydro:'#38bdf8',
+  imports:'#9ca3af',
+  other:'#6b7280',
+  coal:'#374151'
+};
+var _INS_MIX_LABELS  = {
+  wind:'Wind', solar:'Solar', nuclear:'Nuclear', imports:'Imports',
+  biomass:'Biomass', gas:'Gas', hydro:'Hydro', other:'Other', coal:'Coal'
+};
+var _INS_MIX_ORDER = ['wind','solar','nuclear','biomass','hydro','imports','gas','other','coal'];
+
+function _renderMixBar(mix, barId, legendId) {
+  var barEl = document.getElementById(barId);
+  if (!barEl) return;
+  if (!mix || !mix.length) { barEl.style.display = 'none'; return; }
+  var total = mix.reduce(function(s,d){ return s + (d.perc||0); }, 0);
+  if (total <= 0) { barEl.style.display = 'none'; return; }
+
+  // Sort by _INS_MIX_ORDER for consistent visual stacking
+  var sorted = _INS_MIX_ORDER.map(function(f) {
+    var found = mix.find(function(m){ return m.fuel === f; });
+    return found || {fuel: f, perc: 0};
+  }).filter(function(d){ return d.perc > 0; });
+
+  barEl.innerHTML = sorted.map(function(d) {
+    var w = (d.perc / total * 100).toFixed(2);
+    var col = _INS_MIX_COLOURS[d.fuel] || '#9ca3af';
+    return '<div style="flex:0 0 ' + w + '%;height:100%;background:' + col +
+           ';min-width:' + (d.perc > 1 ? '2px' : '1px') + ';" ' +
+           'title="' + (_INS_MIX_LABELS[d.fuel]||d.fuel) + ': ' + d.perc.toFixed(1) + '%"></div>';
+  }).join('');
+
+  if (legendId) {
+    var legEl = document.getElementById(legendId);
+    if (legEl) {
+      legEl.innerHTML = sorted.slice(0, 6).map(function(d) {
+        var col = _INS_MIX_COLOURS[d.fuel] || '#9ca3af';
+        return '<span style="display:flex;align-items:center;gap:4px;">' +
+          '<span style="width:8px;height:8px;border-radius:50%;background:' + col + ';flex-shrink:0;"></span>' +
+          '<span style="color:var(--muted);">' + (_INS_MIX_LABELS[d.fuel]||d.fuel) + '</span>' +
+          '<span style="color:var(--text);font-weight:600;">' + d.perc.toFixed(1) + '%</span>' +
+          '</span>';
+      }).join('');
+    }
+  }
+}
+
+function _renderInsightsMix(d, cmpData, cmpLabel) {
+  var wrap = document.getElementById('mix-bar-wrap');
+  if (!wrap) return;
+  var mix = d.generation_mix;
+  if (!mix || !mix.length) { wrap.style.display = 'none'; return; }
+  wrap.style.display = '';
+  _renderMixBar(mix, 'mix-bar', 'mix-bar-legend');
+
+  // Comparison bar
+  var cmpWrap = document.getElementById('mix-bar-cmp-wrap');
+  if (cmpData && cmpData.generation_mix && cmpData.generation_mix.length && cmpLabel) {
+    _renderMixBar(cmpData.generation_mix, 'mix-bar-cmp', null);
+    var lbl = document.getElementById('mix-bar-cmp-label');
+    if (lbl) lbl.textContent = 'Compared to ' + cmpLabel + ':';
+    cmpWrap.style.display = '';
+  } else if (cmpWrap) {
+    cmpWrap.style.display = 'none';
+  }
+}
+
+// ── Mix change narrative for comparison panel ─────────────────────────────────
+function _mixChangeNarrative(mix, cmpMix) {
+  if (!mix || !mix.length || !cmpMix || !cmpMix.length) return null;
+  var changes = [];
+  mix.forEach(function(cur) {
+    var prev = cmpMix.find(function(m){ return m.fuel === cur.fuel; });
+    if (!prev) return;
+    var diff = (cur.perc || 0) - (prev.perc || 0);
+    if (Math.abs(diff) >= 5) {
+      changes.push({ fuel: cur.fuel, diff: diff, perc: cur.perc });
+    }
+  });
+  if (!changes.length) return null;
+  changes.sort(function(a,b){ return Math.abs(b.diff) - Math.abs(a.diff); });
+  var top = changes.slice(0, 2);
+  var highCarbon = ['gas','coal','other'];
+  return top.map(function(c) {
+    var lbl  = _INS_MIX_LABELS[c.fuel] || c.fuel;
+    var col  = _INS_MIX_COLOURS[c.fuel] || '#9ca3af';
+    var dir  = c.diff > 0 ? 'up' : 'down';
+    var isHC = highCarbon.indexOf(c.fuel) !== -1;
+    var impact = (isHC && c.diff > 0) ? ' — higher carbon intensity' :
+                 (isHC && c.diff < 0) ? ' — lower carbon intensity' :
+                 (!isHC && c.diff < 0) ? ' — higher carbon intensity' :
+                 (!isHC && c.diff > 0) ? ' — lower carbon intensity' : '';
+    return '→ <span style="color:' + col + '">' + lbl + '</span> was ' +
+           c.perc.toFixed(0) + '% of the mix (' + (c.diff > 0 ? '+' : '') +
+           c.diff.toFixed(0) + 'pp)' + impact + '.';
+  }).join(' ');
+}
+
 function renderInsights(d, _cmp) {
   document.getElementById('insights-loading').style.display = 'none';
   document.getElementById('insights-body').style.display    = 'none';
@@ -806,7 +1093,8 @@ function renderInsights(d, _cmp) {
   if (bat_sub && bat_sub[1].imp_kwh > 0.1) {
     var bat     = bat_sub[1];
     var bat_kg  = bat.carbon_g / 1000;
-    var bat_int = bat.avg_charge_intensity;
+    var bat_int = bat.avg_charge_intensity != null ? bat.avg_charge_intensity
+               : (bat.ci_imp_kwh > 0 ? bat.carbon_g / bat.ci_imp_kwh : null);
     var grid_avg = d.grid_avg_intensity;
 
     document.getElementById('card-battery').style.display = 'block';
@@ -922,7 +1210,8 @@ function renderInsights(d, _cmp) {
     var ev = ev_sub[1];
     var ev_kg  = ev.carbon_g / 1000;
     var ev_ci_kwh = ev.ci_imp_kwh || 0;
-    var ev_int = ev_ci_kwh > 0 ? Math.round(ev.carbon_g / ev_ci_kwh) : null;
+    var ev_int = ev.avg_charge_intensity != null ? Math.round(ev.avg_charge_intensity)
+               : (ev_ci_kwh > 0 ? Math.round(ev.carbon_g / ev_ci_kwh) : null);
     document.getElementById('card-ev').style.display = 'block';
     document.getElementById('ev-headline').textContent = ev_kg.toFixed(2) + ' kgCO₂';
     document.getElementById('ev-sub').textContent = 'Carbon attributable to EV charging this period.';
@@ -1007,6 +1296,13 @@ function renderInsights(d, _cmp) {
     }
   } catch(e) {
   }
+
+  // Mix bar
+  _renderInsightsMix(d, _cmp,
+    _insCompare === 'prev' ? 'last month' :
+    _insCompare === 'year' ? 'same month last year' :
+    _insCompare === 'lastyear' ? 'last year' : null
+  );
 
   renderTrend();
 }
@@ -1259,6 +1555,44 @@ function renderComparison(d, c) {
     panel.style.display = 'none';
     return;
   }
+  // House import delta
+  if (d.house_carbon_g != null && c.house_carbon_g != null) {
+    var houseKgDelta  = d.house_carbon_g - c.house_carbon_g;
+    var houseKwhDelta = d.house_imp_kwh  - c.house_imp_kwh;
+    if (Math.abs(houseKgDelta) > 100) {
+      var hKgPct = pct(d.house_carbon_g, c.house_carbon_g);
+      lines.push(line(
+        houseKgDelta < 0 ? '✓' : '↑',
+        'Direct house carbon <strong>' + sign(hKgPct) + hKgPct + '%</strong>'
+        + ' (' + (houseKwhDelta > 0 ? '+' : '') + houseKwhDelta.toFixed(0) + ' kWh, '
+        + (d.house_carbon_g/1000).toFixed(1) + ' vs ' + (c.house_carbon_g/1000).toFixed(1) + ' kgCO₂)',
+        houseKgDelta < 0
+      ));
+    }
+  }
+  // Battery charging delta
+  var _batCur = d.sub_meters ? Object.values(d.sub_meters).find(function(s){
+    return ['battery','inverter'].includes(s.meter_type); }) : null;
+  var _batCmp = c.sub_meters ? Object.values(c.sub_meters).find(function(s){
+    return ['battery','inverter'].includes(s.meter_type); }) : null;
+  if (_batCur && _batCmp && Math.abs((_batCur.carbon_g||0) - (_batCmp.carbon_g||0)) > 100) {
+    var batKgDelta  = ((_batCur.carbon_g||0) - (_batCmp.carbon_g||0)) / 1000;
+    var batKwhDelta = (_batCur.imp_kwh||0) - (_batCmp.imp_kwh||0);
+    var batIntDelta = (_batCur.avg_charge_intensity && _batCmp.avg_charge_intensity)
+                      ? _batCur.avg_charge_intensity - _batCmp.avg_charge_intensity : null;
+    var batMsg = 'Battery charging: ' + (batKwhDelta > 0 ? '+' : '') + batKwhDelta.toFixed(0) + ' kWh';
+    if (batIntDelta !== null && Math.abs(batIntDelta) > 5) {
+      batMsg += ', grid was ' + (batIntDelta < 0 ? 'cleaner' : 'dirtier') +
+                ' (' + Math.round(_batCur.avg_charge_intensity) + ' vs ' +
+                Math.round(_batCmp.avg_charge_intensity) + ' gCO₂/kWh)';
+    }
+    batMsg += ' (' + (batKgDelta > 0 ? '+' : '') + batKgDelta.toFixed(1) + ' kgCO₂).';
+    lines.push(line(batKgDelta < 0 ? '✓' : '↑', batMsg, batKgDelta < 0));
+  }
+  // Add mix change narrative if available
+  var mixNarr = _mixChangeNarrative(d.generation_mix, c.generation_mix);
+  if (mixNarr) lines.push(mixNarr);
+
   document.getElementById('cmp-panel-title').textContent = 'Compared to ' + cmpLabel;
   document.getElementById('cmp-panel-lines').innerHTML = lines.map(function(l) {
     return '<div>' + l + '</div>';
@@ -1266,29 +1600,57 @@ function renderComparison(d, c) {
   panel.style.display = '';
 
   // ── Delta badges (subtle, secondary to narrative) ─────────────────────────
+  // lowerBetter: true/false = coloured, null = always grey (volume — no direction)
   function addBadge(elId, val, cmpVal, lowerBetter) {
     var el = document.getElementById(elId);
-    if (!el || val == null || !cmpVal) return;
+    if (!el || val == null || cmpVal == null || cmpVal === 0) return;
     var p = pct(val, cmpVal);
     if (p === null) return;
-    var c2 = col(p, lowerBetter);
-    el.insertAdjacentHTML('afterend',
-      '<span class="ins-delta" style="font-size:11px;margin-left:6px;color:' + c2 + ';">'
+    var c2 = (lowerBetter === null) ? 'var(--muted)' : col(p, lowerBetter);
+    el.insertAdjacentHTML('beforeend',
+      '<span class="ins-delta" style="font-size:11px;margin-left:6px;color:' + c2 + '">'
       + sign(p) + p + '%</span>');
   }
-  addBadge('sum-net-headline',  d.carbon_g_net,         c.carbon_g_net,         true);
-  addBadge('sum-eff-int',       d.effective_intensity,  c.effective_intensity,  true);
-  addBadge('sum-ci-imp-kwh',    d.ci_imp_kwh,           c.ci_imp_kwh,           true);
-  if (evKwh)  addBadge('ev-kwh',  evKwh,  evCmpKwh,  false);
-  if (batKwh) addBadge('bat-kwh', batKwh, batCmpKwh, false);
-  if (hpKwh)  addBadge('hp-kwh',  hpKwh,  hpCmpKwh,  true);
-  addBadge('house-kwh', d.house_imp_kwh, c.house_imp_kwh, true);
+
+  // ── Carbon tab badges ─────────────────────────────────────────────────────
+  addBadge('sum-net-headline',  d.carbon_g_net,          c.carbon_g_net,          true);
+  addBadge('sum-eff-int',       d.effective_intensity,   c.effective_intensity,   true);
+  addBadge('sum-ci-imp-kwh',    d.ci_imp_kwh,            c.ci_imp_kwh,            null);  // volume
+  addBadge('sum-imp',           d.carbon_g_imp,          c.carbon_g_imp,          true);
+  addBadge('sum-exp',           d.carbon_g_exp,          c.carbon_g_exp,          false); // more offset = better
+  addBadge('house-kwh',         d.house_imp_kwh,         c.house_imp_kwh,         null);  // volume
+  addBadge('house-carbon',      d.house_carbon_g,        c.house_carbon_g,        true);
+  addBadge('house-intensity',   d.house_avg_intensity,   c.house_avg_intensity,   true);
+  addBadge('sol-kwh',           d.exp_kwh,               c.exp_kwh,               false);
+  addBadge('sol-offset',        d.carbon_g_exp,          c.carbon_g_exp,          false);
+  if (evKwh)  addBadge('ev-kwh',  evKwh,  evCmpKwh,  null);  // volume
+  if (batKwh) addBadge('bat-kwh', batKwh, batCmpKwh, null);  // volume
+  if (hpKwh)  addBadge('hp-kwh',  hpKwh,  hpCmpKwh,  null);  // volume
+  // Headline carbon badges for sub-device cards
+  var evCgCmp  = c.sub_meters ? Object.values(c.sub_meters).find(function(s){ return ['ev_charger','ev'].includes(s.meter_type); }) : null;
+  var batCgCmp = c.sub_meters ? Object.values(c.sub_meters).find(function(s){ return ['battery','inverter'].includes(s.meter_type); }) : null;
+  var hpCgCmp  = c.sub_meters ? Object.values(c.sub_meters).find(function(s){ return s.meter_type === 'heat_pump'; }) : null;
+  var evCg     = d.sub_meters ? Object.values(d.sub_meters).find(function(s){ return ['ev_charger','ev'].includes(s.meter_type); }) : null;
+  var batCg    = d.sub_meters ? Object.values(d.sub_meters).find(function(s){ return ['battery','inverter'].includes(s.meter_type); }) : null;
+  var hpCg     = d.sub_meters ? Object.values(d.sub_meters).find(function(s){ return s.meter_type === 'heat_pump'; }) : null;
+  if (evCg  && evCgCmp) {
+    addBadge('ev-headline',  evCg.carbon_g,              evCgCmp.carbon_g,              true);
+    addBadge('ev-intensity', evCg.avg_charge_intensity,  evCgCmp.avg_charge_intensity,  true);
+  }
+  if (batCg && batCgCmp) {
+    addBadge('bat-headline',  batCg.carbon_g,             batCgCmp.carbon_g,             true);
+    addBadge('bat-intensity', batCg.avg_charge_intensity, batCgCmp.avg_charge_intensity, true);
+  }
+  if (hpCg  && hpCgCmp)  addBadge('hp-headline', hpCg.carbon_g, hpCgCmp.carbon_g, true);
+  // Grid average intensity — the baseline everything is measured against
+  addBadge('sum-grid-int', d.grid_avg_intensity, c.grid_avg_intensity, true);
 }
 
 // ── Period nav ───────────────────────────────────────────────────────────────
 function insSetMode(mode, el) {
   _insMode    = mode;
   _insCompare = null;
+  _insCompareManuallyCleared = false;
   document.querySelectorAll('#ins-mode-seg .bar-seg-btn').forEach(function(b) {
     b.classList.toggle('active', b === el);
   });
@@ -1298,12 +1660,16 @@ function insSetMode(mode, el) {
   document.getElementById('ins-compare-seg').style.display      = mode === 'month' ? '' : 'none';
   document.getElementById('ins-compare-year-seg').style.display = mode === 'year'  ? '' : 'none';
   document.getElementById('ins-cmp-sep').style.display          = '';
+  _insSaveState();
   updatePeriodNav();
   loadPeriod();
 }
 
+var _insCompareManuallyCleared = false;
+
 function insSetCompare(cmp, el) {
   _insCompare = (_insCompare === cmp) ? null : cmp;  // toggle
+  _insCompareManuallyCleared = (_insCompare === null);  // track manual clear
   document.querySelectorAll('#ins-compare-seg .bar-seg-btn, #ins-compare-year-seg .bar-seg-btn').forEach(function(b) {
     b.classList.remove('active');
   });
@@ -1312,6 +1678,7 @@ function insSetCompare(cmp, el) {
 }
 
 function navPeriod(dir) {
+  _insSaveState();
   if (_insMode === 'month') {
     _calMonth += dir;
     if (_calMonth > 12) { _calMonth = 1;  _calYear++; }
@@ -1347,6 +1714,10 @@ function updatePeriodNav() {
     document.querySelector('#ins-compare-seg .bar-seg-btn:nth-child(2)').disabled = !hasLastYear;
     if (_insCompare === 'prev' && !hasPrevMonth) { _insCompare = null; }
     if (_insCompare === 'year' && !hasLastYear)  { _insCompare = null; }
+    // Auto-default to prev month comparison when nothing is active and it's available
+    if (_insCompare === null && hasPrevMonth && !_insCompareManuallyCleared) {
+      _insCompare = 'prev';
+    }
     // Re-sync active state
     document.querySelectorAll('#ins-compare-seg .bar-seg-btn').forEach(function(b) {
       b.classList.remove('active');
@@ -1362,6 +1733,10 @@ function updatePeriodNav() {
     var hasLastYear = earliest ? (_calYear - 1) >= earliest.getFullYear() : false;
     document.querySelector('#ins-compare-year-seg .bar-seg-btn').disabled = !hasLastYear;
     if (_insCompare === 'lastyear' && !hasLastYear) { _insCompare = null; }
+    // Auto-default to last year comparison when nothing is active and it's available
+    if (_insCompare === null && hasLastYear && !_insCompareManuallyCleared) {
+      _insCompare = 'lastyear';
+    }
     document.querySelector('#ins-compare-year-seg .bar-seg-btn').classList.toggle('active', _insCompare === 'lastyear');
   }
 
@@ -1373,6 +1748,7 @@ function updatePeriodNav() {
 async function loadPeriod() {
   document.getElementById('insights-body').style.display = 'none';
   document.getElementById('no-carbon').style.display     = 'none';
+  document.getElementById('tab-usage').style.display     = 'none';
   document.getElementById('insights-loading').style.display = 'block';
   document.getElementById('insights-loading').textContent = 'Loading…';
 
@@ -1382,19 +1758,22 @@ async function loadPeriod() {
 
   try {
     var url, cmpUrl;
+    var isUsage = (_activeInsightTab === 'usage');
+    var apiBase = isUsage ? '/api/usage' : '/api/insights';
+
     if (_insMode === 'month') {
-      url = apiUrl('/api/insights/calendar-month?year=' + _calYear + '&month=' + _calMonth);
+      url = apiUrl(apiBase + '/calendar-month?year=' + _calYear + '&month=' + _calMonth);
       if (compareMode === 'prev') {
         var pm = _calMonth - 1, py = _calYear;
         if (pm < 1) { pm = 12; py--; }
-        cmpUrl = apiUrl('/api/insights/calendar-month?year=' + py + '&month=' + pm);
+        cmpUrl = apiUrl(apiBase + '/calendar-month?year=' + py + '&month=' + pm);
       } else if (compareMode === 'year') {
-        cmpUrl = apiUrl('/api/insights/calendar-month?year=' + (_calYear - 1) + '&month=' + _calMonth);
+        cmpUrl = apiUrl(apiBase + '/calendar-month?year=' + (_calYear - 1) + '&month=' + _calMonth);
       }
     } else {
-      url    = apiUrl('/api/insights/calendar-year?year=' + _calYear);
+      url = apiUrl(apiBase + '/calendar-year?year=' + _calYear);
       if (compareMode === 'lastyear') {
-        cmpUrl = apiUrl('/api/insights/calendar-year?year=' + (_calYear - 1));
+        cmpUrl = apiUrl(apiBase + '/calendar-year?year=' + (_calYear - 1));
       }
     }
 
@@ -1410,7 +1789,11 @@ async function loadPeriod() {
     }
 
     document.getElementById('insights-loading').style.display = 'none';
-    renderInsights(d, cmpData);
+    if (isUsage) {
+      renderUsage(d, cmpData);
+    } else {
+      renderInsights(d, cmpData);
+    }
   } catch(e) {
     document.getElementById('insights-loading').textContent = 'Failed to load insights: ' + e.message;
   }
@@ -1485,6 +1868,38 @@ async function initInsights() {
       _periods = (pd.periods || []).filter(function(p) { return p.has_carbon; });
     }
 
+    // Restore last position
+    try {
+      var _saved = JSON.parse(localStorage.getItem('emt_insights_state') || '{}');
+      if (_saved.mode   && ['bill','month','year'].indexOf(_saved.mode) !== -1) _insMode = _saved.mode;
+      if (_saved.year   && _saved.year > 2000)  _calYear  = _saved.year;
+      if (_saved.month  && _saved.month >= 1 && _saved.month <= 12) _calMonth = _saved.month;
+      if (_saved.compare) {
+        _insCompare = _saved.compare;
+      } else if (_saved.hasOwnProperty('compare')) {
+        // compare was explicitly saved as null — respect it, suppress auto-default
+        _insCompareManuallyCleared = true;
+      }
+      if (_saved.tab    && ['carbon','usage'].indexOf(_saved.tab) !== -1) {
+        _activeInsightTab = _saved.tab;
+        var tabBtn = document.querySelector('.insights-tab[data-tab="' + _saved.tab + '"]');
+        if (tabBtn) {
+          document.querySelectorAll('.insights-tab').forEach(function(b) { b.classList.remove('active'); });
+          tabBtn.classList.add('active');
+        }
+        document.getElementById('tab-carbon').style.display = _saved.tab === 'carbon' ? 'block' : 'none';
+        document.getElementById('tab-usage').style.display  = _saved.tab === 'usage'  ? 'block' : 'none';
+      }
+      // Restore compare button state
+      if (_saved.compare) {
+        document.querySelectorAll('.bar-seg-btn').forEach(function(b) {
+          if (b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'" + _saved.compare + "'") !== -1) {
+            b.classList.add('active');
+          }
+        });
+      }
+    } catch(e) {}
+
     updatePeriodNav();
     loadPeriod();
 
@@ -1493,6 +1908,439 @@ async function initInsights() {
   }
 }
 
+
+// ── Usage Insights Renderer ──────────────────────────────────────────────────
+function fmtCost(v, decimals) {
+  if (v == null) return '—';
+  return Math.abs(v).toFixed(decimals != null ? decimals : 2);
+}
+function fmtRate(v) {
+  if (v == null) return '—';
+  return (v * 100).toFixed(2);  // convert £/kWh to p/kWh
+}
+function fmtHour(h) {
+  var pad = function(n) { return n < 10 ? '0' + n : '' + n; };
+  return pad(h) + ':00–' + pad((h + 2) % 24) + ':00';
+}
+
+function renderUsageTierBars(tiers, totalKwh, containerId, currency) {
+  var el = document.getElementById(containerId);
+  if (!el || !tiers || !tiers.length) return;
+  // Sort cheapest first
+  var sorted = tiers.slice().sort(function(a,b) { return a.rate - b.rate; });
+  var html = '';
+  sorted.forEach(function(t, i) {
+    var pct     = totalKwh > 0 ? (t.kwh / totalKwh * 100) : 0;
+    var pctDisp = pct < 1 ? pct.toFixed(1) : Math.round(pct);
+    var rateP   = (t.rate * 100).toFixed(2);
+    // Bar width: minimum 2px so even 0% tiers show a sliver
+    var barW    = Math.max(pct, 0.3);
+    // Colour: cheapest = accent, others step through muted palette
+    var colours = ['var(--accent)', 'var(--warning, #f59e0b)', 'var(--danger, #ef4444)', 'var(--muted)'];
+    var col     = colours[Math.min(i, colours.length - 1)];
+    html +=
+      '<div style="margin-bottom:14px;">' +
+        '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;">' +
+          '<span style="font-family:var(--mono);font-size:13px;color:var(--text);">' + rateP + 'p/kWh</span>' +
+          '<span style="font-size:12px;color:var(--muted);">' +
+            t.kwh.toFixed(1) + ' kWh &nbsp;·&nbsp; ' +
+            (currency || '£') + t.cost.toFixed(2) + ' &nbsp;·&nbsp; ' +
+            '<strong style="color:var(--text);">' + pctDisp + '%</strong>' +
+          '</span>' +
+        '</div>' +
+        '<div style="height:5px;background:var(--bg);border-radius:3px;overflow:visible;">' +
+          '<div style="height:100%;width:' + barW + '%;min-width:3px;background:' + col + ';border-radius:3px;transition:width 0.4s;"></div>' +
+        '</div>' +
+      '</div>';
+  });
+  el.innerHTML = html;
+}
+
+function renderSubDeviceRates(tiers, totalKwh, containerId, currency) {
+  var el = document.getElementById(containerId);
+  if (!el || !tiers || !tiers.length) { if(el) el.style.display='none'; return; }
+  var lines = tiers.map(function(t) {
+    var pct = totalKwh > 0 ? Math.round(t.kwh / totalKwh * 100) : 0;
+    return (t.rate * 100).toFixed(2) + 'p/kWh: ' + t.kwh.toFixed(1) + ' kWh (' + pct + '%)';
+  });
+  el.textContent = 'Rate breakdown: ' + lines.join(' · ');
+  el.style.display = '';
+}
+
+function generateUsageNarrative(cur, prev, cmpLabel) {
+  // Returns {headline, bullets[]} explaining what drove the cost difference
+  var deltas = [];
+  var currency = '£';
+
+  var costDelta = cur.net_cost - prev.net_cost;  // positive = worse
+
+  function fmtCostAbs(v) { return currency + Math.abs(v).toFixed(2); }
+
+  // ── Import cost ───────────────────────────────────────────────────────────
+  var impDelta = cur.imp_cost - prev.imp_cost;
+  if (Math.abs(impDelta) > 0.50) {
+    var kwhDelta   = cur.imp_kwh - prev.imp_kwh;
+    var rateChanged = cur.weighted_rate && prev.weighted_rate &&
+                      Math.abs(cur.weighted_rate - prev.weighted_rate) > 0.002;
+    var kwhMoved    = Math.abs(kwhDelta) >= 10;
+    var kwhSign     = kwhDelta > 0 ? '+' : '';
+    var msg;
+
+    if (rateChanged && !kwhMoved) {
+      // Rate changed, volume similar
+      var rateDir = cur.weighted_rate < prev.weighted_rate ? 'cheaper' : 'more expensive';
+      msg = 'Your average import rate was approximately ' +
+            Math.abs(fmtRate(cur.weighted_rate) - fmtRate(prev.weighted_rate)).toFixed(0) +
+            'p/kWh ' + rateDir + ' on average' +
+            (impDelta > 0 ? ', increasing' : ', reducing') + ' import cost by ' +
+            fmtCostAbs(impDelta) + '.';
+    } else if (rateChanged && kwhMoved && Math.sign(kwhDelta) !== Math.sign(impDelta)) {
+      // Volume up but cost down (or vice versa) — rate change dominant
+      var rateDir2 = cur.weighted_rate < prev.weighted_rate ? 'cheaper' : 'more expensive';
+      msg = 'Grid import ' + (kwhDelta > 0 ? 'increased' : 'decreased') + ' by ' +
+            Math.abs(kwhDelta).toFixed(0) + ' kWh' +
+            ' but rates were approximately ' +
+            Math.abs(fmtRate(cur.weighted_rate) - fmtRate(prev.weighted_rate)).toFixed(0) +
+            'p/kWh ' + rateDir2 + ' on average' +
+            ', so import cost ' + (impDelta < 0 ? 'fell' : 'rose') +
+            ' by ' + fmtCostAbs(impDelta) + '.';
+    } else if (rateChanged && kwhMoved) {
+      // Both moved in same direction
+      var rateDir3 = cur.weighted_rate < prev.weighted_rate ? 'cheaper' : 'more expensive';
+      msg = 'Grid import ' + (kwhDelta > 0 ? 'increased' : 'decreased') + ' by ' +
+            Math.abs(kwhDelta).toFixed(0) + ' kWh, with rates approximately ' +
+            Math.abs(fmtRate(cur.weighted_rate) - fmtRate(prev.weighted_rate)).toFixed(0) +
+            'p/kWh ' + rateDir3 + ' on average, ' +
+            (impDelta > 0 ? 'adding ' : 'saving ') + fmtCostAbs(impDelta) + '.';
+    } else {
+      // Volume drove cost, rate stable
+      msg = 'Grid import ' + (kwhDelta > 0 ? 'increased' : 'decreased') + ' by ' +
+            Math.abs(kwhDelta).toFixed(0) + ' kWh, ' +
+            (impDelta > 0 ? 'adding ' : 'saving ') + fmtCostAbs(impDelta) + ' in import cost.';
+    }
+    deltas.push({ magnitude: Math.abs(impDelta), text: msg });
+  }
+
+  // ── Export earnings ───────────────────────────────────────────────────────
+  var expDelta    = cur.exp_cost - prev.exp_cost;  // positive = earned more
+  var expKwhDelta = cur.exp_kwh  - prev.exp_kwh;
+  if (Math.abs(expDelta) > 0.50) {
+    deltas.push({
+      magnitude: Math.abs(expDelta),
+      text: 'Export earnings ' + (expDelta > 0 ? 'increased' : 'decreased') + ' by ' +
+            fmtCostAbs(expDelta) +
+            ' (' + (expKwhDelta > 0 ? '+' : '') + expKwhDelta.toFixed(0) + ' kWh exported)' +
+            (expDelta < 0 && expKwhDelta < 0 ? ' — likely less solar generation.' : '.')
+    });
+  }
+
+  // ── Standing charge ───────────────────────────────────────────────────────
+  var scDelta = cur.standing_charge - prev.standing_charge;
+  if (Math.abs(scDelta) > 0.20) {
+    var daysDiff = Math.abs((cur.total_days || 0) - (prev.total_days || 0));
+    deltas.push({
+      magnitude: Math.abs(scDelta),
+      text: 'Standing charge ' + (scDelta > 0 ? 'increased' : 'decreased') + ' by ' +
+            fmtCostAbs(scDelta) +
+            (daysDiff > 1
+              ? ' (' + (cur.total_days || '?') + ' days vs ' + (prev.total_days || '?') + ' days).'
+              : '.')
+    });
+  }
+
+  // ── Sub-meter devices ────────────────────────────────────────────────────
+  var curSubs  = cur.sub_meters  || {};
+  var prevSubs = prev.sub_meters || {};
+  var allMids  = Object.keys(curSubs).concat(
+    Object.keys(prevSubs).filter(function(m){ return !curSubs[m]; })
+  );
+  allMids.forEach(function(mid) {
+    var cs = curSubs[mid]  || { imp_kwh: 0, imp_cost: 0, label: mid, meter_type: '', rate_tiers: [] };
+    var ps = prevSubs[mid] || { imp_kwh: 0, imp_cost: 0, label: mid, meter_type: '', rate_tiers: [] };
+    var subCostDelta = (cs.imp_cost || 0) - (ps.imp_cost || 0);
+    var subKwhDelta  = (cs.imp_kwh  || 0) - (ps.imp_kwh  || 0);
+    if (Math.abs(subCostDelta) < 0.50 && Math.abs(subKwhDelta) < 10) return;
+    var label    = cs.label || ps.label || mid;
+    var type     = (cs.meter_type || ps.meter_type || '').toLowerCase();
+    var typeHint = type === 'ev' || type === 'ev_charger' ? ' — EV charging' :
+                   type === 'battery' || type === 'inverter' ? ' — battery charging' :
+                   type === 'heat_pump' ? ' — heat pump' : '';
+    var kwhSign  = subKwhDelta > 0 ? '+' : '';
+
+    // Detect rate change by comparing effective avg rate (cost/kwh) — this is a weighted
+    // average across tiers, so we express it as "approx Xp/kWh cheaper/more expensive"
+    // rather than implying a specific rate changed.
+    var curRate  = cs.imp_kwh  > 0.1 ? cs.imp_cost  / cs.imp_kwh  : null;
+    var prevRate = ps.imp_kwh  > 0.1 ? ps.imp_cost  / ps.imp_kwh  : null;
+    var devRateDiff = (curRate && prevRate) ? curRate - prevRate : null;  // negative = cheaper
+    var devRateChanged = devRateDiff !== null && Math.abs(devRateDiff) > 0.002;
+    var kwhMoved = Math.abs(subKwhDelta) >= 5;
+    var subMsg;
+
+    // Rate description: "approximately Xp/kWh cheaper/more expensive on average"
+    function fmtRateDiff(diff) {
+      var dir = diff < 0 ? 'cheaper' : 'more expensive';
+      return 'approximately ' + Math.abs(diff * 100).toFixed(0) + 'p/kWh ' + dir + ' on average';
+    }
+
+    var costDiverged = kwhMoved && Math.sign(subKwhDelta) !== Math.sign(subCostDelta);
+    if (!kwhMoved && Math.abs(subCostDelta) >= 0.50) {
+      // Cost changed without significant volume change — rate driven
+      subMsg = label + typeHint + ' cost ' + (subCostDelta > 0 ? 'increased' : 'decreased') +
+               ' by ' + fmtCostAbs(subCostDelta) + ' despite similar usage' +
+               (devRateChanged ? ' (' + fmtRateDiff(devRateDiff) + ').' : '.');
+    } else if (costDiverged || (devRateChanged && kwhMoved)) {
+      // Volume moved with a rate change — always state cost outcome regardless of size
+      var ratePart = devRateChanged
+                     ? ' (' + fmtRateDiff(devRateDiff) + ')'
+                     : ' (rate changed between periods)';
+      subMsg = label + typeHint + ' used ' + kwhSign + subKwhDelta.toFixed(0) + ' kWh' +
+               ' but cost ' + (subCostDelta > 0 ? fmtCostAbs(subCostDelta) + ' more' :
+                                                   fmtCostAbs(subCostDelta) + ' less') +
+               ratePart + '.';
+    } else {
+      subMsg = label + typeHint + ' used ' + kwhSign + subKwhDelta.toFixed(0) + ' kWh, ' +
+               (subCostDelta > 0 ? 'adding ' : 'saving ') + fmtCostAbs(subCostDelta) + '.';
+    }
+    deltas.push({ magnitude: Math.abs(subCostDelta) || Math.abs(subKwhDelta * 0.1), text: subMsg });
+  });
+
+  // ── House direct import ──────────────────────────────────────────────────
+  // Must be after curSubs/prevSubs are defined above
+  var houseKwhDelta = (cur.house_imp_kwh || 0) - (prev.house_imp_kwh || 0);
+  if (Math.abs(houseKwhDelta) >= 10) {
+    // Estimate house cost delta: total imp_cost minus sub-meter costs
+    var curHouseCost  = (cur.imp_cost  || 0) - Object.values(curSubs).reduce(function(s,m){ return s+(m.imp_cost||0); }, 0);
+    var prevHouseCost = (prev.imp_cost || 0) - Object.values(prevSubs).reduce(function(s,m){ return s+(m.imp_cost||0); }, 0);
+    var houseCostDelta = curHouseCost - prevHouseCost;
+    var houseText = 'Direct house import ' + (houseKwhDelta > 0 ? 'increased' : 'decreased') +
+                    ' by ' + Math.abs(houseKwhDelta).toFixed(0) + ' kWh';
+    if (Math.abs(houseCostDelta) >= 0.50) {
+      houseText += ', ' + (houseCostDelta > 0 ? 'adding ' : 'saving ') + currency + Math.abs(houseCostDelta).toFixed(2) + '.';
+    } else {
+      houseText += ' — similar overall cost.';
+    }
+    deltas.push({
+      magnitude: Math.abs(houseKwhDelta) * 0.05,  // weight below cost items
+      text: houseText
+    });
+  }
+
+  // ── Headline ─────────────────────────────────────────────────────────────
+  var headline;
+  var absDelta = Math.abs(costDelta);
+  if (absDelta < 0.50) {
+    headline = 'Cost was similar to ' + cmpLabel + '.';
+  } else if (costDelta > 0) {
+    headline = currency + absDelta.toFixed(2) + ' more than ' + cmpLabel + '.';
+  } else {
+    headline = currency + absDelta.toFixed(2) + ' less than ' + cmpLabel + '.';
+  }
+
+  // Sort by magnitude, take top 5 — covers export, import, battery, EV, house
+  deltas.sort(function(a, b) { return b.magnitude - a.magnitude; });
+  return { headline: headline, bullets: deltas.slice(0, 5).map(function(d){ return d.text; }) };
+}
+
+function renderUsage(d, cmpData) {
+  document.getElementById('tab-usage').style.display = 'block';
+  // Hide all device cards first
+  ['ucard-battery','ucard-ev','ucard-hp','ucard-narrative'].forEach(function(id) {
+    document.getElementById(id).style.display = 'none';
+  });
+
+  var currency = '£';  // default — could be passed from config if needed
+
+  // ── Cost & Earnings ───────────────────────────────────────────────────────
+  var netPositive = d.net_cost >= 0;
+  var netAbs = Math.abs(d.net_cost);
+  document.getElementById('u-net-headline').textContent =
+    (netPositive ? '' : '−') + currency + netAbs.toFixed(2);
+  document.getElementById('u-net-headline').style.color =
+    netPositive ? 'var(--text)' : 'var(--success)';
+  document.getElementById('u-net-sub').textContent =
+    (netPositive
+      ? 'Net cost this period — import + standing charge minus export earnings.'
+      : 'Net earnings this period — you exported more than you spent on import.');
+
+  ['u-currency-imp','u-currency-exp','u-currency-sc'].forEach(function(id) {
+    document.getElementById(id).textContent = currency;
+  });
+  document.getElementById('u-imp-cost').textContent = fmtCost(d.imp_cost);
+  document.getElementById('u-exp-cost').textContent = fmtCost(d.exp_cost);
+  document.getElementById('u-standing').textContent = fmtCost(d.standing_charge);
+  document.getElementById('u-avg-rate').textContent = fmtRate(d.weighted_rate);
+
+  if (d.total_days > 0 && d.standing_charge > 0) {
+    var scNote = document.getElementById('u-sc-note');
+    scNote.textContent = 'Standing charge: ' + currency +
+      (d.standing_charge / d.total_days).toFixed(4) + '/day × ' + d.total_days + ' days.';
+    scNote.style.display = '';
+  }
+
+  // ── Rate Period Usage ────────────────────────────────────────────────────
+  var rateTiers = d.rate_tiers || [];
+  if (rateTiers.length > 1) {
+    document.getElementById('ucard-rates').style.display = 'block';
+    renderUsageTierBars(rateTiers, d.imp_kwh, 'u-rate-bars', currency);
+  } else {
+    document.getElementById('ucard-rates').style.display = 'none';
+  }
+
+  // ── Grid Position ─────────────────────────────────────────────────────────
+  var netKwh = d.net_grid_kwh;
+  var netExp = netKwh < 0;
+  document.getElementById('u-net-grid-headline').textContent =
+    (netExp ? '−' : '+') + Math.abs(netKwh).toFixed(1) + ' kWh';
+  document.getElementById('u-net-grid-headline').style.color =
+    netExp ? 'var(--success)' : 'var(--text)';
+  document.getElementById('u-net-grid-sub').textContent =
+    netExp
+      ? 'Net exporter this period — you exported more than you imported from the grid.'
+      : 'Net importer this period — grid import exceeded export.';
+  document.getElementById('u-imp-kwh').textContent   = (d.imp_kwh || 0).toFixed(1);
+  document.getElementById('u-exp-kwh').textContent   = (d.exp_kwh || 0).toFixed(1);
+  document.getElementById('u-house-kwh').textContent = (d.house_imp_kwh || 0).toFixed(1);
+  var expDays = d.net_exporter_days || 0;
+  document.getElementById('u-exporter-days').textContent      = expDays;
+  document.getElementById('u-exporter-days-unit').textContent = expDays === 1 ? 'day' : 'days';
+
+  // ── Peak Demand Window ────────────────────────────────────────────────────
+  if (d.peak_window_start != null) {
+    document.getElementById('u-peak-headline').textContent = fmtHour(d.peak_window_start);
+    document.getElementById('u-peak-sub').textContent =
+      'Highest house grid draw: ' + (d.peak_window_kwh || 0).toFixed(1) +
+      ' kWh in the ' + fmtHour(d.peak_window_start) + ' window.';
+    // Dynamic footnote — only mention device types that are configured
+    var subTypes = Object.values(d.sub_meters || {}).map(function(s) { return (s.meter_type||'').toLowerCase(); });
+    var excl = [];
+    if (subTypes.some(function(t){ return t==='ev'||t==='ev_charger'; }))    excl.push('EV charging');
+    if (subTypes.some(function(t){ return t==='battery'||t==='inverter'; })) excl.push('battery charging');
+    if (subTypes.some(function(t){ return t==='heat_pump'; }))               excl.push('heat pump');
+    var fnEl = document.getElementById('u-peak-footnote');
+    if (fnEl) {
+      fnEl.textContent = (excl.length
+        ? excl.join(' and ') + ' excluded — '
+        : '') + 'based on half-hour block totals converted to local time.';
+    }
+  }
+
+  // ── Sub-meter device cards ────────────────────────────────────────────────
+  var subs = d.sub_meters || {};
+  Object.keys(subs).forEach(function(mid) {
+    var sm = subs[mid];
+    var type = (sm.meter_type || '').toLowerCase();
+    var label = sm.label || mid;
+
+    if (type === 'battery' || type === 'inverter') {
+      document.getElementById('ucard-battery').style.display = 'block';
+      document.getElementById('u-bat-label').textContent     = label;
+      document.getElementById('u-bat-kwh').textContent       = (sm.imp_kwh || 0).toFixed(1);
+      document.getElementById('u-bat-cost').textContent      = fmtCost(sm.imp_cost);
+      document.getElementById('u-currency-bat').textContent  = currency;
+      renderSubDeviceRates(sm.rate_tiers, sm.imp_kwh, 'u-bat-rates', currency);
+    } else if (type === 'ev' || type === 'ev_charger') {
+      document.getElementById('ucard-ev').style.display      = 'block';
+      document.getElementById('u-ev-label').textContent      = label;
+      document.getElementById('u-ev-kwh').textContent        = (sm.imp_kwh || 0).toFixed(1);
+      document.getElementById('u-ev-cost').textContent       = fmtCost(sm.imp_cost);
+      document.getElementById('u-currency-ev').textContent   = currency;
+      renderSubDeviceRates(sm.rate_tiers, sm.imp_kwh, 'u-ev-rates', currency);
+    } else if (type === 'heat_pump') {
+      document.getElementById('ucard-hp').style.display      = 'block';
+      document.getElementById('u-hp-label').textContent      = label;
+      document.getElementById('u-hp-kwh').textContent        = (sm.imp_kwh || 0).toFixed(1);
+      document.getElementById('u-hp-cost').textContent       = fmtCost(sm.imp_cost);
+      document.getElementById('u-currency-hp').textContent   = currency;
+      renderSubDeviceRates(sm.rate_tiers, sm.imp_kwh, 'u-hp-rates', currency);
+    }
+  });
+
+  // ── Delta badges on Usage metric values ─────────────────────────────────
+  // lowerBetter: true/false = coloured, null = grey (volume — no direction judgement)
+  function uBadge(elId, val, cmpVal, lowerBetter) {
+    var el = document.getElementById(elId);
+    if (!el || val == null || cmpVal == null || cmpVal === 0) return;
+    var existing = el.nextElementSibling;
+    if (existing && existing.classList.contains('ins-delta')) existing.remove();
+    var p = Math.round((val - cmpVal) / Math.abs(cmpVal) * 100);
+    var c2;
+    if (lowerBetter === null) {
+      c2 = 'var(--muted)';
+    } else {
+      c2 = (Math.abs(p) < 3) ? 'var(--muted)'
+         : ((lowerBetter ? p < 0 : p > 0) ? '#00d4aa' : '#ff6b6b');
+    }
+    el.insertAdjacentHTML('beforeend',
+      '<span class="ins-delta" style="font-size:11px;margin-left:6px;color:' + c2 + '">'
+      + (p > 0 ? '+' : '') + p + '%</span>');
+  }
+
+  if (cmpData && !cmpData.error) {
+    var cmpSubs = cmpData.sub_meters || {};
+    // Cost & Earnings — cost is directional, standing charge is fixed so neutral
+    uBadge('u-net-headline', d.net_cost,        cmpData.net_cost,        true);
+    uBadge('u-imp-cost',     d.imp_cost,        cmpData.imp_cost,        true);
+    uBadge('u-exp-cost',     d.exp_cost,        cmpData.exp_cost,        false);
+    uBadge('u-standing',     d.standing_charge, cmpData.standing_charge, null);
+    // Grid position — all volume
+    uBadge('u-imp-kwh',      d.imp_kwh,         cmpData.imp_kwh,         null);
+    uBadge('u-exp-kwh',      d.exp_kwh,         cmpData.exp_kwh,         null);
+    uBadge('u-house-kwh',    d.house_imp_kwh,   cmpData.house_imp_kwh,   null);
+    // Device cards — kWh neutral, cost directional
+    Object.keys(subs).forEach(function(mid) {
+      var sm  = subs[mid];
+      var cmp = cmpSubs[mid];
+      if (!cmp) return;
+      var type = (sm.meter_type || '').toLowerCase();
+      if (type === 'battery' || type === 'inverter') {
+        uBadge('u-bat-kwh',  sm.imp_kwh,  cmp.imp_kwh,  null);
+        uBadge('u-bat-cost', sm.imp_cost, cmp.imp_cost, true);
+      } else if (type === 'ev' || type === 'ev_charger') {
+        uBadge('u-ev-kwh',   sm.imp_kwh,  cmp.imp_kwh,  null);
+        uBadge('u-ev-cost',  sm.imp_cost, cmp.imp_cost, true);
+      } else if (type === 'heat_pump') {
+        uBadge('u-hp-kwh',   sm.imp_kwh,  cmp.imp_kwh,  null);
+        uBadge('u-hp-cost',  sm.imp_cost, cmp.imp_cost, true);
+      }
+    });
+  }
+
+  // ── Narrative comparison ──────────────────────────────────────────────────
+  if (cmpData && !cmpData.error) {
+    // Use actual period name (e.g. "March 2026") for consistency with Carbon tab
+    var cmpLabel = cmpData.period_label ||
+                   (_insCompare === 'prev' ? 'last month' :
+                    _insCompare === 'year' ? 'same month last year' :
+                    _insCompare === 'lastyear' ? 'last year' : 'previous period');
+    var narrative = generateUsageNarrative(d, cmpData, cmpLabel);
+    document.getElementById('u-narrative-title').textContent = 'Compared to ' + cmpLabel;
+    document.getElementById('u-narrative-headline').textContent = narrative.headline;
+    var bulletsHtml = narrative.bullets.map(function(b) {
+      return '<div style="display:flex;gap:8px;margin-bottom:6px;">' +
+             '<span style="color:var(--accent);flex-shrink:0;">→</span>' +
+             '<span style="color:var(--muted);font-size:13px;">' + b + '</span>' +
+             '</div>';
+    }).join('');
+    document.getElementById('u-narrative-bullets').innerHTML = bulletsHtml;
+    document.getElementById('ucard-narrative').style.display = 'block';
+  }
+}
+
 initInsights();
+
+// Redraw trend chart on container resize (e.g. browser zoom)
+(function() {
+  var trendWrap = document.getElementById('trend-chart');
+  if (!trendWrap || typeof ResizeObserver === 'undefined') return;
+  var _trendResizeTimer = null;
+  new ResizeObserver(function() {
+    // Debounce — only redraw after resize settles
+    clearTimeout(_trendResizeTimer);
+    _trendResizeTimer = setTimeout(function() {
+      if (typeof renderTrend === 'function') renderTrend();
+    }, 150);
+  }).observe(trendWrap);
+})();
 </script>
 {% endblock %}
