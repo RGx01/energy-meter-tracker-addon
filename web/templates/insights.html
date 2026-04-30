@@ -724,8 +724,7 @@ function _insSaveState() {
       mode:    _insMode,
       year:    _calYear,
       month:   _calMonth,
-      compare: _insCompare,
-      compareManuallyClearedAt: _insCompareManuallyCleared ? Date.now() : null
+      compare: _insCompare
     }));
   } catch(e) {}
 }
@@ -1810,8 +1809,8 @@ async function initInsights() {
       if (_saved.month  && _saved.month >= 1 && _saved.month <= 12) _calMonth = _saved.month;
       if (_saved.compare) {
         _insCompare = _saved.compare;
-      } else if (_saved.hasOwnProperty('compareManuallyClearedAt')) {
-        // User explicitly cleared compare — respect it
+      } else if (_saved.hasOwnProperty('compare')) {
+        // compare was explicitly saved as null — respect it, suppress auto-default
         _insCompareManuallyCleared = true;
       }
       if (_saved.tab    && ['carbon','usage'].indexOf(_saved.tab) !== -1) {
