@@ -36,33 +36,24 @@ A Home Assistant add-on that records your electricity usage in precise configura
 - Publishes four cumulative sensors back to Home Assistant
 - Serves a local web UI on port 8099 for configuration, charts, insights, live power and data management
 - Records grid carbon intensity at every block (🇬🇧 UK, postcode required) for per-period carbon accounting
-- Carbon Insights: house consumption, solar offset, EV mileage and gCO₂/mile, battery charging behaviour, heat pump vs gas comparison
+- Carbon Insights: house consumption, solar offset, EV mileage and gCO₂/mile, battery charging behaviour, heat pump vs gas comparison, grid generation mix breakdown
+- Usage Insights: cost breakdown by meter, rate period distribution, grid position, peak demand window, per-device costs with period comparison narrative
 
-## What's new in 2.7.0
+## What's new in 2.8.0
 
-- **⚡ Live Power — sub-meter cards** — battery, EV charger and heat pump sub-meters now show dedicated cards on the Live Power page. Battery cards show SoC with a colour-coded icon (green/amber/red) and a bidirectional inverter gauge (teal = discharging, purple = charging). EV charger cards show a unidirectional charge gauge with V2X support. Heat pump cards show a power gauge.
+- **💡 Usage Insights** — a new Usage tab on the Insights page alongside Carbon. Shows cost breakdown, rate period distribution, grid position (net kWh, net exporter days), peak demand window, and per-device costs for Battery, EV Charger and Heat Pump. When comparing to a previous period, a narrative card explains the top drivers of cost change in plain English.
 
-- **Meter Type** — sub-meters now have an explicit type field (🔋 Battery / 🚗 EV Charger / ♨️ Heat Pump) in Settings → Meter Config. Setting the type unlocks the contextual sensor fields needed for Live Power cards. **Meter type is permanent once data has been recorded** — choose carefully.
+- **🌐 Current Grid Generation Mix** — new card on the Live Power page showing a donut chart of the current half-hour's fuel split (wind, solar, nuclear, gas etc.). Hover any segment to see the percentage in the centre. 🇬🇧 UK only.
 
-- **More reliable restarts** — the engine now waits for all configured sensors to report before starting, and fetches carbon intensity data before gap filling. Gap fill blocks now carry correct rates, standing charges and carbon intensity rather than zeroes.
+- **⚡ 48-Hour Generation Mix chart** — third mode on the 48-hour power history chart (kW / CO₂ / **Mix**). Stacked area chart showing % of generation by fuel type with the same zoom and hover tooltip as the other modes. 🇬🇧 UK only.
 
-- **Standing charge BST fix** — users in BST (UTC+1) may see corrected standing charge figures for some historical days in the billing chart and Usage Stats. This is correct data, not a regression.
+- **Generation mix in Carbon Insights** — a stacked bar in the Carbon Summary card shows the period's imp_kwh-weighted fuel mix. When comparing periods, a second bar appears so you can see how the mix changed, with narrative lines explaining the carbon impact.
 
-- **Sub-meter cascade delete** — removing a sub-meter from config now permanently deletes all its historical block data. A confirmation prompt makes this clear before proceeding.
+- **Billing chart performance** — browser JavaScript parsing reduced from 5.8 MB → 76 KB (77×). Charts now load near-instantly on slow devices.
 
-- **Delete Blocks time pickers** — the Delete Blocks page now accepts from/to times (local time) in addition to dates, allowing precise block removal within a single day.
+- **Timezone refactor** — local date columns dropped from the database. All queries compute UTC bounds at query time, retroactively correcting any blocks stored under the wrong timezone.
 
-### Upgrading to 2.7.0 — action required
-
-**Existing users** need to set the Meter Type for each sub-meter before the new Live Power cards will appear. The type dropdown is available for existing meters that don't yet have a type set — once set and saved it locks permanently.
-
-1. Go to **Settings → Meter Config**
-2. Open each device card
-3. Select the correct type from the **Meter Type** dropdown (🔋 Battery / 🚗 EV Charger / ♨️ Heat Pump)
-4. Configure the sensor fields that appear (SoC sensor, inverter power sensor etc.)
-5. Save — the Live Power page will reload and show the new cards
-
-> ⚠️ Meter type locks permanently once set and data has been recorded. If you set the wrong type you must use **Add Device** to add a replacement, then delete the incorrectly typed device and all its data.
+- **Direct import cost fix** — Usage Stats "Direct import" cost now correctly excludes EV and battery charging costs, matching the billing chart.
 
 ## Requirements
 
@@ -157,7 +148,7 @@ Access the UI at `http://<your-ha-ip>:8099`
 |------|-------------|
 | ⚙️ Settings | Meter Config tab (main meter, sub-meters, sensors, postcode) and Carbon tab (assumption overrides for insights calculations) |
 | 📊 Charts | Billing chart, net energy heatmap and usage stats |
-| 🌿 Insights | Carbon analysis by billing period — house consumption, solar offset, EV mileage, battery behaviour, heat pump vs gas |
+| 💡 Insights | Carbon and Usage analysis — Carbon tab: house consumption, solar offset, EV mileage, battery behaviour, heat pump vs gas, grid generation mix. Usage tab: cost breakdown, rate periods, grid position, peak demand, per-device costs with period comparison narrative |
 | ⚡ Live Power | Live power gauge, billing cards and carbon intensity forecast |
 | 🗄️ Data Management | Backups, restore, historical corrections and block deletion |
 | 📋 Logs | Live add-on log viewer |
@@ -222,6 +213,8 @@ It provides:
 - **Sub-meter cards** — battery, EV charger and heat pump sub-meters show dedicated cards with live gauges once a Meter Type and sensors are configured in Settings → Meter Config
 - **Billing cards** — Today, This Bill and This Year with full sub-meter breakdown; figures match the Billing chart exactly; This Bill uses your billing history to show the correct period even if your billing day has changed
 - **Carbon intensity** (🇬🇧 UK only) — add your outward postcode prefix (e.g. `DE1`) in Meter Config to enable a 48-hour forecast strip from the National Grid API
+- **Current Grid Generation Mix** (🇬🇧 UK only) — donut chart showing the current half-hour's fuel split. Hover any segment to highlight it. Updates every 30 minutes with the CI data
+- **48-hour generation mix** (🇬🇧 UK only) — third mode on the 48-hour history chart showing % of generation by fuel type as a stacked area chart
 
 ### Configuring Live Power
 

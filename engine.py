@@ -2223,6 +2223,47 @@ async def engine_startup(ha: HAClient):
             else:
                 logger.info("engine_startup: no session gap detected")
 
+    # ── Seed _current_slot_mix from recent DB data ───────────────────────
+    # _current_slot_mix is in-memory and lost on restart. Re-seed from
+    # generation_mix rows for the last 2 hours so that blocks finalising
+    # immediately after startup get mix data without waiting for the next
+    # CI tick (which fires every 30 min and might race with block finalise).
+    global _current_slot_mix
+    try:
+        _seed_rows = _store._conn.execute(
+            """SELECT b.block_start, gm.fuel, gm.perc
+               FROM blocks b
+               JOIN generation_mix gm ON gm.block_id = b.id
+               WHERE b.meter_id = 'electricity_main'
+                 AND b.block_start >= datetime('now', '-4 hours')
+               ORDER BY b.block_start ASC, gm.fuel ASC"""
+        ).fetchall()
+        _seed_slots = {}
+        for row in _seed_rows:
+            bs = row["block_start"]
+            if bs not in _seed_slots:
+                _seed_slots[bs] = []
+            _seed_slots[bs].append({"fuel": row["fuel"], "perc": row["perc"]})
+        for bs, mix in _seed_slots.items():
+            _current_slot_mix[bs] = mix
+        if _seed_slots:
+            logger.info(
+                "engine_startup: seeded _current_slot_mix with %d slots from DB",
+                len(_seed_slots)
+            )
+    except Exception as _seed_err:
+        logger.warning("engine_startup: could not seed slot mix from DB: %s", _seed_err)
+
+    # ── Fire CI tick immediately so mix data is available for next finalise ─
+    # If seed was empty (fresh install or long downtime), fetch mix now rather
+    # than waiting up to 30 minutes for the scheduled CI tick.
+    if not _current_slot_mix:
+        try:
+            await _tick_carbon_intensity()
+            logger.info("engine_startup: immediate CI tick fired (no seed data)")
+        except Exception as _ci_err:
+            logger.warning("engine_startup: immediate CI tick failed: %s", _ci_err)
+
     # ── Startup charts ───────────────────────────────────────────────────
     generate_charts(_store)
     logger.info("engine_startup: complete")

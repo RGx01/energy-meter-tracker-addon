@@ -1,5 +1,57 @@
 # Changelog
 
+## [2.8.0] — 2026-04-30
+
+### Added
+
+- **Usage Insights tab** — new 💷 Usage tab on the Insights page alongside Carbon. Shows Cost & Earnings (net cost, import cost, export earnings, standing charge, weighted average rate), Rate Period Usage (how import is distributed across tariff rate tiers — only shown when >1 rate), Grid Position (net kWh, import, export, direct-to-house, net exporter days), Peak Demand Window (2-hour local-time window with highest house grid draw), and per-device cards for Battery, EV Charger and Heat Pump (shown only when that meter type is configured).
+
+- **Usage Insights narrative comparison** — when a comparison period is selected, a "Compared to [period]" card appears above the usage cards with plain-English sentences covering the top drivers of cost change. Identifies whether rate changes or volume changes drove import cost differences, and correctly handles the case where increased EV charging kWh coincided with a cheaper rate (volume up, cost down).
+
+- **Generation mix card on Live Power** — new 🌐 Current Grid Generation Mix card sits as the first card in the gauge row. Shows a donut chart of the current half-hour's fuel split (wind, solar, nuclear, gas, biomass, hydro, imports, other, coal). Hovering a segment updates the centre label to show that fuel's percentage. Full legend with all fuels. Updates on the same 5-second poll cycle. Only shown when a postcode is configured. 🇬🇧 UK only.
+
+- **48-hour generation mix chart** — third toggle on the 48-hour power history chart: kW / CO₂ / **Mix**. Stacked area chart showing % of generation by fuel type over the last 48 hours, with the same zoom, tooltip and now-marker infrastructure as kW and CO₂ modes. Clean fuels (wind, nuclear, solar) stack at the bottom; dirty fuels (gas, coal) sit prominently at the top. Semi-transparent fills with crisp 1.5px stroke lines per fuel boundary. 🇬🇧 UK only.
+
+- **Generation mix in Carbon Insights** — a horizontal stacked bar at the bottom of the Carbon Summary card shows the imp_kwh-weighted average fuel split for the period, using the same canonical colour palette as Live Power. When a comparison period is selected, a second bar appears below labelled "Compared to [period]:" so the two period mixes can be compared visually. The comparison panel also gains mix-change narrative lines for the top 2 fuels that shifted ≥5pp, noting the carbon impact direction (e.g. "Gas was 27.8% of the mix (−5.8pp) — lower carbon intensity").
+
+- **Canonical fuel colour palette** — consistent across Live Power and Insights: wind (#3b82f6 blue), solar (#facc15 gold), nuclear (#7c3aed deep purple), gas (#f97316 orange), biomass (#92400e brown), hydro (#38bdf8 sky blue), imports (#9ca3af grey), other (#6b7280 dark grey), coal (#374151 charcoal). Follows Ember/NESO/Our World in Data convention.
+
+- **Insights tab state persistence** — active tab (Carbon/Usage), period mode (Month/Year), year, month and compare mode are saved to `localStorage` on every navigation and restored on page load. Navigating ← → saves position after the update, not before.
+
+- **Insights auto-default comparison** — when no comparison is saved, the most recent available comparison period is automatically selected (prev month in Month mode, last year in Year mode). Manually toggling a comparison off is remembered for the session.
+
+- **Insights icon** — sidebar navigation icon updated to 💡 (from 🌿 which is now the Carbon tab). Usage tab uses 💷.
+
+- **`/api/power/mix-history`** — new endpoint returning generation mix per 30-minute block for the last 48 hours, grouped by `block_start`. Consumed by the Mix chart tab.
+
+- **`generation_mix` field in `/api/power`** — current grid fuel split added to the live power response, consumed by the donut card.
+
+- **`generation_mix` field in `/api/insights/*`** — `_aggregate_insights` now includes imp_kwh-weighted average generation mix for the period in all insight endpoints.
+
+### Changed
+
+- **Billing chart performance** — `build_day_chart_html` now outputs chart data as `<script type="application/json">` blocks instead of inline JavaScript. A single shared `_buildDayChart()` function reads the JSON and constructs Plotly traces only when a section becomes visible. JavaScript parsed by browser reduced from **5,842 KB → 76 KB** (77× reduction). Total file size reduced from **6,610 KB → 2,649 KB**.
+
+- **Timezone refactor** — `local_date`, `local_year`, `local_month`, `local_day` columns dropped from the `blocks` table. All queries now compute UTC bounds at query time via `local_date_to_utc_bounds(local_date, tz_name)`. Retroactively corrects wrong-timezone users without data migration.
+
+- **Covering index** — `idx_blocks_insights` widened from 6 to 13 columns, making `_aggregate_insights`, `_aggregate_usage` and `api_blocks_summary` all run as covering index scans (zero row fetches). Existing narrow index is detected and rebuilt automatically on first open.
+
+- **Direct import cost** — `api_blocks_summary` (Usage Stats chart) now uses rate-based subtraction (`main_cost[rate] - sub_cost[rate]`) matching `calculate_billing_summary_for_period` and 2.7.1 behaviour. Previously used full `imp_cost`, inflating "Direct import" by including EV and battery charging costs.
+
+- **W→kW unit conversion** — sub-meter inverter power sensor conversion now uses `unit_of_measurement` from HA attributes instead of a magnitude heuristic (`abs(fv) > 100`). Correctly handles 50W sensors (too small for old heuristic) and 150kW EV chargers (too large for old heuristic).
+
+- **Gauge scale** — Live Power gauge scale derived from `power_history` p90 percentile rather than a 7-day block loop. Faster and more accurate.
+
+- **Generation mix storage** — mix data now stored only against `electricity_main` blocks, not against sub-meter blocks. Pre-2.8.0 redundant rows (stored 3× per block) are deleted on first open. Frees ~830 KB for a typical 3-meter installation.
+
+- **Generation mix seed on startup** — `_current_slot_mix` (in-memory dict lost on restart) is now seeded from the last 4 hours of `generation_mix` DB rows on startup. If the seed is empty, `_tick_carbon_intensity` fires immediately rather than waiting up to 30 minutes. Fixes mix data gaps after rebuilds.
+
+- **Carbon accuracy feature dropped** — the planned `intensity_actual` backfill from NESO was removed. The NESO regional API does not provide an `actual` field — only `forecast`. Regional actuals do not exist. The `_backfill_carbon_gaps` function (196 lines) has been deleted. The `intensity_actual` column remains in the schema but will not be populated.
+
+- **Sub-meter export sections in billing summary** — `calculate_billing_summary_for_period` skips sub-meter export channels. Previously both `import` and `export` channels were included for sub-meters, causing export earnings to appear inflated in billing summaries.
+
+---
+
 ## [2.7.1] — 2026-04-28
 
 ### Added

@@ -161,6 +161,12 @@ only ever returns `forecast`. Backfilling regional actuals is therefore not poss
 The forecast values are directionally correct and sufficient for the Insights Carbon tab.
 The `intensity_actual` column remains in the schema but will not be populated.
 
+`_backfill_carbon_gaps` was removed as dead code. Its secondary function of seeding
+`_current_slot_mix` after a restart (so generation mix is stored for blocks finalising
+immediately after startup) is now replaced by a DB seed in `engine_startup` — reads
+the last 4 hours of `generation_mix` rows from the DB. If that seed is empty, an
+immediate `_tick_carbon_intensity` call is made to fetch fresh mix data.
+
 #### Sub-meter boundary interpolation
 Apply same pre/post boundary read logic to sub-meters as main meter at block finalise time. Fixes gap block attribution issue (documented in Known Engine Limitation). Requires careful interaction with seed/carry-forward mechanism.
 

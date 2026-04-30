@@ -3248,3 +3248,168 @@ class TestLocalDateRangeToUtcBounds(unittest.TestCase):
         start_s, end_s = local_date_to_utc_bounds('2026-04-15', 'UTC')
         self.assertEqual(start_r, start_s)
         self.assertEqual(end_r,   end_s)
+# ─────────────────────────────────────────────────────────────────────────────
+# Generation Mix (2.8.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGenerationMix(unittest.TestCase):
+    """Tests for upsert_generation_mix and get_generation_mix_for_range."""
+
+    def setUp(self):
+        self.store = BlockStore(":memory:")
+        with self.store._conn:
+            self.store._conn.execute(
+                "INSERT INTO config_periods (billing_day, block_minutes, timezone, "
+                "currency_symbol, currency_code, effective_from) "
+                "VALUES (1, 30, 'UTC', '£', 'GBP', '2026-01-01')"
+            )
+            self.cp_id = self.store._conn.execute(
+                "SELECT id FROM config_periods LIMIT 1"
+            ).fetchone()[0]
+
+    def _insert_block(self, block_start, meter_id, imp_kwh, is_sub=False):
+        with self.store._conn:
+            if is_sub:
+                self.store._conn.execute(
+                    "INSERT OR IGNORE INTO meters (meter_id, config_period_id, is_sub_meter) "
+                    "VALUES (?, ?, 1)", (meter_id, self.cp_id)
+                )
+            self.store._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                "imp_kwh, exp_kwh) VALUES (?, ?, ?, ?, ?, 0.0)",
+                (block_start, block_start, meter_id, self.cp_id, imp_kwh)
+            )
+            return self.store._conn.execute(
+                "SELECT id FROM blocks WHERE block_start=? AND meter_id=?",
+                (block_start, meter_id)
+            ).fetchone()[0]
+
+    MIX_A = [{"fuel": "wind", "perc": 60.0}, {"fuel": "gas", "perc": 40.0}]
+    MIX_B = [{"fuel": "wind", "perc": 20.0}, {"fuel": "gas", "perc": 80.0}]
+
+    def test_upsert_and_retrieve(self):
+        """Stored mix rows are retrievable via generation_mix table."""
+        bid = self._insert_block("2026-04-01T00:00:00", "electricity_main", 10.0)
+        self.store.upsert_generation_mix(bid, self.MIX_A)
+        rows = self.store._conn.execute(
+            "SELECT fuel, perc FROM generation_mix WHERE block_id=? ORDER BY fuel",
+            (bid,)
+        ).fetchall()
+        self.assertEqual(len(rows), 2)
+        fuels = {r["fuel"]: r["perc"] for r in rows}
+        self.assertAlmostEqual(fuels["wind"], 60.0)
+        self.assertAlmostEqual(fuels["gas"],  40.0)
+
+    def test_upsert_replaces_existing(self):
+        """Re-upserting same block_id replaces previous mix."""
+        bid = self._insert_block("2026-04-01T00:00:00", "electricity_main", 10.0)
+        self.store.upsert_generation_mix(bid, self.MIX_A)
+        self.store.upsert_generation_mix(bid, self.MIX_B)
+        rows = self.store._conn.execute(
+            "SELECT fuel, perc FROM generation_mix WHERE block_id=? ORDER BY fuel",
+            (bid,)
+        ).fetchall()
+        fuels = {r["fuel"]: r["perc"] for r in rows}
+        self.assertAlmostEqual(fuels["wind"], 20.0)
+        self.assertAlmostEqual(fuels["gas"],  80.0)
+
+    def test_get_generation_mix_for_range_weighted_average(self):
+        """Weighted average correctly weights by imp_kwh."""
+        # Block 1: 10 kWh, mix A (60% wind, 40% gas)
+        # Block 2: 30 kWh, mix B (20% wind, 80% gas)
+        # Expected weighted wind: (10*60 + 30*20) / 40 = 1200/40 = 30%
+        # Expected weighted gas:  (10*40 + 30*80) / 40 = 2800/40 = 70%
+        bid1 = self._insert_block("2026-04-01T00:00:00", "electricity_main", 10.0)
+        bid2 = self._insert_block("2026-04-01T00:30:00", "electricity_main", 30.0)
+        self.store.upsert_generation_mix(bid1, self.MIX_A)
+        self.store.upsert_generation_mix(bid2, self.MIX_B)
+        result = self.store.get_generation_mix_for_range(
+            "2026-04-01T00:00:00", "2026-04-02T00:00:00"
+        )
+        fuels = {r["fuel"]: r["perc"] for r in result}
+        self.assertAlmostEqual(fuels["wind"], 30.0, places=1)
+        self.assertAlmostEqual(fuels["gas"],  70.0, places=1)
+
+    def test_get_generation_mix_empty_range(self):
+        """Range with no blocks returns empty list."""
+        result = self.store.get_generation_mix_for_range(
+            "2025-01-01T00:00:00", "2025-01-02T00:00:00"
+        )
+        self.assertEqual(result, [])
+
+    def test_get_generation_mix_main_meter_only(self):
+        """Mix is only stored/retrieved for electricity_main, not sub-meters."""
+        bid_main = self._insert_block("2026-04-01T00:00:00", "electricity_main", 10.0)
+        bid_sub  = self._insert_block("2026-04-01T00:00:00", "ev_charger", 5.0, is_sub=True)
+        self.store.upsert_generation_mix(bid_main, self.MIX_A)
+        # Do NOT store mix for sub-meter (engine no longer does this)
+        result = self.store.get_generation_mix_for_range(
+            "2026-04-01T00:00:00", "2026-04-02T00:00:00",
+            meter_id="electricity_main"
+        )
+        fuels = {r["fuel"]: r["perc"] for r in result}
+        self.assertIn("wind", fuels)
+        # Sub-meter query should return empty
+        sub_result = self.store.get_generation_mix_for_range(
+            "2026-04-01T00:00:00", "2026-04-02T00:00:00",
+            meter_id="ev_charger"
+        )
+        self.assertEqual(sub_result, [])
+
+    def test_migration_removes_sub_meter_mix_rows(self):
+        """Opening a DB with sub-meter mix rows removes them on first open."""
+        import tempfile, os
+        tmp = tempfile.mktemp(suffix=".db")
+        try:
+            store = BlockStore(tmp)
+            with store._conn:
+                store._conn.execute(
+                    "INSERT INTO config_periods (billing_day, block_minutes, timezone, "
+                    "currency_symbol, currency_code, effective_from) "
+                    "VALUES (1, 30, 'UTC', '£', 'GBP', '2026-01-01')"
+                )
+                cp_id = store._conn.execute(
+                    "SELECT id FROM config_periods LIMIT 1"
+                ).fetchone()[0]
+                # Insert main and sub-meter blocks
+                store._conn.execute(
+                    "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                    "imp_kwh, exp_kwh) VALUES ('2026-04-01T00:00:00', '2026-04-01T00:30:00', "
+                    "'electricity_main', ?, 10.0, 0.0)", (cp_id,)
+                )
+                store._conn.execute(
+                    "INSERT OR IGNORE INTO meters (meter_id, config_period_id, is_sub_meter) "
+                    "VALUES ('ev_charger', ?, 1)", (cp_id,)
+                )
+                store._conn.execute(
+                    "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                    "imp_kwh, exp_kwh) VALUES ('2026-04-01T00:00:00', '2026-04-01T00:30:00', "
+                    "'ev_charger', ?, 5.0, 0.0)", (cp_id,)
+                )
+                main_id = store._conn.execute(
+                    "SELECT id FROM blocks WHERE meter_id='electricity_main'"
+                ).fetchone()[0]
+                sub_id  = store._conn.execute(
+                    "SELECT id FROM blocks WHERE meter_id='ev_charger'"
+                ).fetchone()[0]
+                # Manually insert sub-meter mix rows (simulating pre-2.8.0 data)
+                store._conn.execute(
+                    "INSERT INTO generation_mix (block_id, fuel, perc) VALUES (?, 'wind', 55.0)",
+                    (main_id,)
+                )
+                store._conn.execute(
+                    "INSERT INTO generation_mix (block_id, fuel, perc) VALUES (?, 'wind', 55.0)",
+                    (sub_id,)
+                )
+            store._conn.close()
+
+            # Re-open — migration should delete sub-meter rows
+            store2 = BlockStore(tmp)
+            count = store2._conn.execute(
+                "SELECT COUNT(*) FROM generation_mix"
+            ).fetchone()[0]
+            self.assertEqual(count, 1, "Only main meter mix row should remain after migration")
+            store2._conn.close()
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
