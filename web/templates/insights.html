@@ -327,6 +327,20 @@
         <div style="font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); margin-bottom:10px;">Net carbon per billing period</div>
         <div id="trend-chart" style="width:100%; overflow-x:auto;"></div>
       </div>
+      <!-- Generation mix bar — hidden when no mix data -->
+      <div id="mix-bar-wrap" style="display:none;margin-top:16px;">
+        <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);margin-bottom:8px;">
+          Grid generation mix this period
+        </div>
+        <div id="mix-bar" style="display:flex;height:10px;border-radius:5px;overflow:hidden;width:100%;gap:1px;"></div>
+        <div id="mix-bar-legend" style="display:flex;flex-wrap:wrap;gap:6px 12px;margin-top:8px;font-size:11px;"></div>
+        <!-- Comparison bars (shown when compare mode active) -->
+        <div id="mix-bar-cmp-wrap" style="display:none;margin-top:10px;">
+          <div style="font-size:11px;color:var(--muted);margin-bottom:4px;" id="mix-bar-cmp-label"></div>
+          <div id="mix-bar-cmp" style="display:flex;height:10px;border-radius:5px;overflow:hidden;width:100%;gap:1px;"></div>
+        </div>
+      </div>
+
       <div class="insight-footnote">
         Carbon intensity from <a href="https://carbonintensity.org.uk" target="_blank" rel="noopener">National Grid ESO</a>
         half-hourly regional API. Both figures are derived from recorded intensity at the time of each block.<br><br>
@@ -806,6 +820,111 @@ function equivLines(carbon_g, a, period_start, period_end, data_start) {
 }
 
 // ── Render ──────────────────────────────────────────────────────────────────
+// ── Generation Mix bar helpers ────────────────────────────────────────────────
+var _INS_MIX_COLOURS = {
+  wind:'#3b82f6',
+  solar:'#facc15',
+  nuclear:'#7c3aed',
+  gas:'#f97316',
+  biomass:'#92400e',
+  hydro:'#38bdf8',
+  imports:'#9ca3af',
+  other:'#6b7280',
+  coal:'#374151'
+};
+var _INS_MIX_LABELS  = {
+  wind:'Wind', solar:'Solar', nuclear:'Nuclear', imports:'Imports',
+  biomass:'Biomass', gas:'Gas', hydro:'Hydro', other:'Other', coal:'Coal'
+};
+var _INS_MIX_ORDER = ['wind','solar','nuclear','biomass','hydro','imports','gas','other','coal'];
+
+function _renderMixBar(mix, barId, legendId) {
+  var barEl = document.getElementById(barId);
+  if (!barEl) return;
+  if (!mix || !mix.length) { barEl.style.display = 'none'; return; }
+  var total = mix.reduce(function(s,d){ return s + (d.perc||0); }, 0);
+  if (total <= 0) { barEl.style.display = 'none'; return; }
+
+  // Sort by _INS_MIX_ORDER for consistent visual stacking
+  var sorted = _INS_MIX_ORDER.map(function(f) {
+    var found = mix.find(function(m){ return m.fuel === f; });
+    return found || {fuel: f, perc: 0};
+  }).filter(function(d){ return d.perc > 0; });
+
+  barEl.innerHTML = sorted.map(function(d) {
+    var w = (d.perc / total * 100).toFixed(2);
+    var col = _INS_MIX_COLOURS[d.fuel] || '#9ca3af';
+    return '<div style="flex:0 0 ' + w + '%;height:100%;background:' + col +
+           ';min-width:' + (d.perc > 1 ? '2px' : '1px') + ';" ' +
+           'title="' + (_INS_MIX_LABELS[d.fuel]||d.fuel) + ': ' + d.perc.toFixed(1) + '%"></div>';
+  }).join('');
+
+  if (legendId) {
+    var legEl = document.getElementById(legendId);
+    if (legEl) {
+      legEl.innerHTML = sorted.slice(0, 6).map(function(d) {
+        var col = _INS_MIX_COLOURS[d.fuel] || '#9ca3af';
+        return '<span style="display:flex;align-items:center;gap:4px;">' +
+          '<span style="width:8px;height:8px;border-radius:50%;background:' + col + ';flex-shrink:0;"></span>' +
+          '<span style="color:var(--muted);">' + (_INS_MIX_LABELS[d.fuel]||d.fuel) + '</span>' +
+          '<span style="color:var(--text);font-weight:600;">' + d.perc.toFixed(1) + '%</span>' +
+          '</span>';
+      }).join('');
+    }
+  }
+}
+
+function _renderInsightsMix(d, cmpData, cmpLabel) {
+  var wrap = document.getElementById('mix-bar-wrap');
+  if (!wrap) return;
+  var mix = d.generation_mix;
+  if (!mix || !mix.length) { wrap.style.display = 'none'; return; }
+  wrap.style.display = '';
+  _renderMixBar(mix, 'mix-bar', 'mix-bar-legend');
+
+  // Comparison bar
+  var cmpWrap = document.getElementById('mix-bar-cmp-wrap');
+  if (cmpData && cmpData.generation_mix && cmpData.generation_mix.length && cmpLabel) {
+    _renderMixBar(cmpData.generation_mix, 'mix-bar-cmp', null);
+    var lbl = document.getElementById('mix-bar-cmp-label');
+    if (lbl) lbl.textContent = 'Compared to ' + cmpLabel + ':';
+    cmpWrap.style.display = '';
+  } else if (cmpWrap) {
+    cmpWrap.style.display = 'none';
+  }
+}
+
+// ── Mix change narrative for comparison panel ─────────────────────────────────
+function _mixChangeNarrative(mix, cmpMix) {
+  if (!mix || !mix.length || !cmpMix || !cmpMix.length) return null;
+  var changes = [];
+  mix.forEach(function(cur) {
+    var prev = cmpMix.find(function(m){ return m.fuel === cur.fuel; });
+    if (!prev) return;
+    var diff = (cur.perc || 0) - (prev.perc || 0);
+    if (Math.abs(diff) >= 5) {
+      changes.push({ fuel: cur.fuel, diff: diff, perc: cur.perc });
+    }
+  });
+  if (!changes.length) return null;
+  changes.sort(function(a,b){ return Math.abs(b.diff) - Math.abs(a.diff); });
+  var top = changes.slice(0, 2);
+  var highCarbon = ['gas','coal','other'];
+  return top.map(function(c) {
+    var lbl  = _INS_MIX_LABELS[c.fuel] || c.fuel;
+    var col  = _INS_MIX_COLOURS[c.fuel] || '#9ca3af';
+    var dir  = c.diff > 0 ? 'up' : 'down';
+    var isHC = highCarbon.indexOf(c.fuel) !== -1;
+    var impact = (isHC && c.diff > 0) ? ' — higher carbon intensity' :
+                 (isHC && c.diff < 0) ? ' — lower carbon intensity' :
+                 (!isHC && c.diff < 0) ? ' — higher carbon intensity' :
+                 (!isHC && c.diff > 0) ? ' — lower carbon intensity' : '';
+    return '→ <span style="color:' + col + '">' + lbl + '</span> was ' +
+           c.perc.toFixed(0) + '% of the mix (' + (c.diff > 0 ? '+' : '') +
+           c.diff.toFixed(0) + 'pp)' + impact + '.';
+  }).join(' ');
+}
+
 function renderInsights(d, _cmp) {
   document.getElementById('insights-loading').style.display = 'none';
   document.getElementById('insights-body').style.display    = 'none';
@@ -1173,6 +1292,13 @@ function renderInsights(d, _cmp) {
   } catch(e) {
   }
 
+  // Mix bar
+  _renderInsightsMix(d, _cmp,
+    _insCompare === 'prev' ? 'last month' :
+    _insCompare === 'year' ? 'same month last year' :
+    _insCompare === 'lastyear' ? 'last year' : null
+  );
+
   renderTrend();
 }
 function _trendNavTo(idx) {
@@ -1424,6 +1550,10 @@ function renderComparison(d, c) {
     panel.style.display = 'none';
     return;
   }
+  // Add mix change narrative if available
+  var mixNarr = _mixChangeNarrative(d.generation_mix, c.generation_mix);
+  if (mixNarr) lines.push(mixNarr);
+
   document.getElementById('cmp-panel-title').textContent = 'Compared to ' + cmpLabel;
   document.getElementById('cmp-panel-lines').innerHTML = lines.map(function(l) {
     return '<div>' + l + '</div>';
@@ -1454,6 +1584,7 @@ function renderComparison(d, c) {
 function insSetMode(mode, el) {
   _insMode    = mode;
   _insCompare = null;
+  _insCompareManuallyCleared = false;
   document.querySelectorAll('#ins-mode-seg .bar-seg-btn').forEach(function(b) {
     b.classList.toggle('active', b === el);
   });
@@ -1463,6 +1594,7 @@ function insSetMode(mode, el) {
   document.getElementById('ins-compare-seg').style.display      = mode === 'month' ? '' : 'none';
   document.getElementById('ins-compare-year-seg').style.display = mode === 'year'  ? '' : 'none';
   document.getElementById('ins-cmp-sep').style.display          = '';
+  _insSaveState();
   updatePeriodNav();
   loadPeriod();
 }

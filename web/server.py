@@ -815,6 +815,22 @@ def api_power():
             except Exception:
                 pass
 
+        # Current generation mix from latest block
+        current_mix = []
+        try:
+            _mix_store = _get_store()
+            _mix_rows = _mix_store._conn.execute(
+                """SELECT gm.fuel, gm.perc
+                   FROM generation_mix gm
+                   JOIN blocks b ON b.id = gm.block_id
+                   WHERE b.meter_id = 'electricity_main'
+                   ORDER BY b.block_start DESC
+                   LIMIT 9"""
+            ).fetchall()
+            current_mix = [{"fuel": r["fuel"], "perc": r["perc"]} for r in _mix_rows]
+        except Exception:
+            pass
+
         return jsonify({
             "import_kw":        imp_kw,
             "export_kw":        exp_kw,
@@ -824,6 +840,7 @@ def api_power():
             "has_power_sensor": bool(power_sensor),
             "rate":             current_rate,
             "soc_sensors":      _build_soc_response(soc_sensors, _ha_client),
+            "generation_mix":   current_mix,
         })
     except Exception as e:
         logger.error("api_power: %s", e)
@@ -1104,6 +1121,37 @@ def api_power_history():
         return jsonify({"rows": rows})
     except Exception as e:
         logger.error("api_power_history: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/power/mix-history")
+def api_power_mix_history():
+    """
+    Return generation mix per block for the last 48 hours.
+    Returns: { slots: [{block_start, fuels: {wind, solar, gas, ...}}] }
+    """
+    try:
+        store = _get_store()
+        rows = store._conn.execute(
+            """SELECT b.block_start, gm.fuel, gm.perc
+               FROM blocks b
+               JOIN generation_mix gm ON gm.block_id = b.id
+               WHERE b.meter_id = 'electricity_main'
+                 AND b.block_start >= datetime('now', '-48 hours')
+               ORDER BY b.block_start ASC, gm.fuel ASC"""
+        ).fetchall()
+        from collections import defaultdict as _dd
+        slots_d = {}; order = []
+        for r in rows:
+            bs = r["block_start"]
+            if bs not in slots_d:
+                slots_d[bs] = {}; order.append(bs)
+            slots_d[bs][r["fuel"]] = r["perc"]
+        return jsonify({"slots": [
+            {"block_start": bs, "fuels": slots_d[bs]} for bs in order
+        ]})
+    except Exception as e:
+        logger.error("api_power_mix_history: %s", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -2692,10 +2740,18 @@ def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
         ).fetchone()
         sub_totals[mid]["data_start"] = row["first_block"][:10] if row and row["first_block"] else data_start
 
+    # Generation mix — imp_kwh-weighted average for this period
+    generation_mix = []
+    try:
+        generation_mix = store.get_generation_mix_for_range(utc_start, utc_end)
+    except Exception:
+        pass
+
     return {
         "has_carbon":           has_carbon,
         "carbon_coverage_pct":  coverage_pct,
         "data_start":           data_start,
+        "generation_mix":       generation_mix,
         "imp_kwh":              round(main_imp_kwh, 3),
         "exp_kwh":              round(main_exp_kwh, 3),
         "ci_imp_kwh":           round(main_ci_imp_kwh, 3),
