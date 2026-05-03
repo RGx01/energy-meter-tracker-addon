@@ -2353,18 +2353,30 @@ function insExportPdf() {
   var period  = label ? label.textContent.trim() : '';
   var genDate = new Date().toLocaleDateString([], {year:'numeric', month:'long', day:'numeric'});
 
-  // Collect visible report sections only
-  // Carbon tab: #insights-body content when carbon active
-  // Usage tab:  #usage-body content when usage active
-  var cmpEl  = document.getElementById('cmp-panel');
-  var cmpHtml = (cmpEl && cmpEl.style.display !== 'none') ? cmpEl.outerHTML : '';
+  // Collect visible content for the report
+  function elHtml(id) {
+    var el = document.getElementById(id);
+    if (!el || el.style.display === 'none') return '';
+    return el.outerHTML;
+  }
 
-  // Get the active tab body — clone and force all children visible for capture
-  var activeBodyId = _activeInsightTab === 'usage' ? 'tab-usage' : 'insights-body';
-  var bodyEl = document.getElementById(activeBodyId);
-  var reportHtml = cmpHtml + (bodyEl ? bodyEl.outerHTML : '');
+  var reportHtml = '';
 
-  // Open new tab with clean report — no auto-print (user can Cmd+P / Ctrl+P)
+  if (_activeInsightTab === 'usage') {
+    // Usage: comparison panel (if active) + only visible cards
+    var cmpEl = document.getElementById('cmp-panel');
+    if (cmpEl && cmpEl.style.display !== 'none') reportHtml += cmpEl.outerHTML;
+    // Each usage card checked individually
+    ['ucard-narrative','ucard-cost','ucard-rates','ucard-grid',
+     'ucard-peak','ucard-battery','ucard-ev','ucard-hp'].forEach(function(id) {
+      reportHtml += elHtml(id);
+    });
+  } else {
+    // Carbon: insights-body contains cmp-panel — capture whole body once
+    var bodyEl = document.getElementById('insights-body');
+    if (bodyEl) reportHtml = bodyEl.outerHTML;
+  }
+
   var win = window.open('', '_blank');
   if (!win) { alert('Please allow pop-ups for this page to export PDF.'); return; }
 
