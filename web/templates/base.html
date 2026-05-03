@@ -9,7 +9,7 @@
     })();
   </script>
   <meta charset="UTF-8">
-    <link rel="icon" type="image/png" href="/static/icon.png">
+    <link rel="icon" type="image/png" href="{{ request.environ.get('SCRIPT_NAME', '') }}/static/icon.png">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Energy Meter Tracker</title>
 
