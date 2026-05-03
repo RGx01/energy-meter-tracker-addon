@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.8.2] — 2026-05-03
+
+### Fixed
+
+- **PDF export — Carbon duplicate comparison panel** — the "Compared to" panel was appearing twice in Carbon Insights PDF because `#cmp-panel` lives inside `#insights-body` and was also being captured separately. Carbon PDF now captures `#insights-body` once.
+
+- **PDF export — Usage narrative shown when no comparison selected** — `#ucard-narrative` was included in the PDF via `outerHTML` even when hidden (`display:none`). Usage PDF now checks each card's `style.display` individually before including it, so only visible cards appear in the report.
+
+---
+
 ## [2.8.1] — 2026-05-03
 
 ### Added
@@ -21,6 +31,10 @@
 - **48-hour generation mix chart** — data source changed from `generation_mix` (block-resolution, joined to blocks) to the new `mix_history` table (CI-tick resolution). Chart stays current within ~15 minutes regardless of block size.
 
 - **Carbon Insights comparison badges** — Grid Export kWh metric now shows a % comparison badge when a comparison period is selected. Badges on device card headlines (Battery, EV, HP) now appear inline with the value using `display:flex` rather than dropping to a new line.
+
+- **Charts — Net view data table** — the redundant "Net" column (identical to the Total column) has been removed. The data table now shows Import and Export as separate columns; the Total column is Import − Export.
+
+- **Charts — period not recalled on return** — `barLoadState` was checking `st.month.year` which was never saved, so the billing period selection was never restored. Fixed to restore from `st.bKey` directly.
 
 ---
 
