@@ -1455,8 +1455,12 @@ async def _tick_carbon_intensity() -> float | None:
                 slot["intensity_actual"]
             )
             if slot.get("generationmix"):
-                _current_slot_mix[slot["captured_at"]] = slot["generationmix"]
+                mix = slot["generationmix"]
+                _current_slot_mix[slot["captured_at"]] = mix
+                # Write to mix_history at CI-tick resolution (independent of block size)
+                _store.upsert_mix_history(slot["captured_at"], mix)
         _store.prune_carbon_intensity(days=4)
+        _store.prune_mix_history(hours=48)
         _last_ci_fetch = now
         logger.info("_tick_carbon_intensity: stored %d slots for %s", len(slots), postcode)
     except urllib.error.HTTPError as e:
@@ -2251,6 +2255,15 @@ async def engine_startup(ha: HAClient):
                 "engine_startup: seeded _current_slot_mix with %d slots from DB",
                 len(_seed_slots)
             )
+            # Also backfill mix_history from generation_mix if mix_history is sparse
+            try:
+                mh_count = _store._conn.execute("SELECT COUNT(*) FROM mix_history").fetchone()[0]
+                if mh_count == 0:
+                    logger.info("engine_startup: backfilling mix_history from generation_mix")
+                    for bs, mix in _seed_slots.items():
+                        _store.upsert_mix_history(bs, mix)
+            except Exception as _mh_err:
+                logger.warning("engine_startup: mix_history backfill failed: %s", _mh_err)
     except Exception as _seed_err:
         logger.warning("engine_startup: could not seed slot mix from DB: %s", _seed_err)
 

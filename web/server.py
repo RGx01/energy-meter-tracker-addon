@@ -1127,29 +1127,14 @@ def api_power_history():
 @app.route("/api/power/mix-history")
 def api_power_mix_history():
     """
-    Return generation mix per block for the last 48 hours.
-    Returns: { slots: [{block_start, fuels: {wind, solar, gas, ...}}] }
+    Return generation mix for the last 48 hours at CI-tick resolution (~15 min).
+    Uses mix_history table (written per CI tick, independent of block size).
+    Returns: { slots: [{captured_at, fuels: {wind, solar, gas, ...}}] }
     """
     try:
         store = _get_store()
-        rows = store._conn.execute(
-            """SELECT b.block_start, gm.fuel, gm.perc
-               FROM blocks b
-               JOIN generation_mix gm ON gm.block_id = b.id
-               WHERE b.meter_id = 'electricity_main'
-                 AND b.block_start >= datetime('now', '-48 hours')
-               ORDER BY b.block_start ASC, gm.fuel ASC"""
-        ).fetchall()
-        from collections import defaultdict as _dd
-        slots_d = {}; order = []
-        for r in rows:
-            bs = r["block_start"]
-            if bs not in slots_d:
-                slots_d[bs] = {}; order.append(bs)
-            slots_d[bs][r["fuel"]] = r["perc"]
-        return jsonify({"slots": [
-            {"block_start": bs, "fuels": slots_d[bs]} for bs in order
-        ]})
+        slots = store.get_mix_history(hours=48)
+        return jsonify({"slots": slots})
     except Exception as e:
         logger.error("api_power_mix_history: %s", e)
         return jsonify({"error": str(e)}), 500

@@ -211,6 +211,7 @@
     text-transform: uppercase;
   }
   .postcode-field:focus { outline:none; border-color:var(--accent); }
+
 </style>
 
 <!-- Floating insights toolbar -->
@@ -230,6 +231,9 @@
   </div>
   <div class="bar-seg" id="ins-compare-year-seg" style="display:none;">
     <button class="bar-seg-btn" onclick="insSetCompare('lastyear', this)">vs Last Year</button>
+  </div>
+  <div style="margin-left:auto;">
+    <button class="ins-nav-btn" onclick="insExportPdf()" title="Export as PDF" style="padding:4px 10px;font-size:12px;">⬇ PDF</button>
   </div>
 </div>
 
@@ -719,6 +723,7 @@ var _calMonth   = new Date().getMonth() + 1;  // 1-12
 var _dataBounds = { earliest: null, latest: null };  // from /api/insights/data-bounds
 var _trendChart = null;
 
+var _EMT_VERSION = "{{ app_version or '2.8.1' }}";
 var _activeInsightTab = 'carbon';
 
 function _insSaveState() {
@@ -1603,7 +1608,14 @@ function renderComparison(d, c) {
   // lowerBetter: true/false = coloured, null = always grey (volume — no direction)
   function addBadge(elId, val, cmpVal, lowerBetter) {
     var el = document.getElementById(elId);
-    if (!el || val == null || cmpVal == null || cmpVal === 0) return;
+    if (!el || val == null || cmpVal == null) return;
+    if (cmpVal === 0 && val === 0) return;
+    if (cmpVal === 0) {
+      // New this period — show as new entry rather than % change
+      el.insertAdjacentHTML('beforeend',
+        '<span class="ins-delta" style="font-size:11px;margin-left:6px;color:#00d4aa;">new</span>');
+      return;
+    }
     var p = pct(val, cmpVal);
     if (p === null) return;
     var c2 = (lowerBetter === null) ? 'var(--muted)' : col(p, lowerBetter);
@@ -1616,6 +1628,7 @@ function renderComparison(d, c) {
   addBadge('sum-net-headline',  d.carbon_g_net,          c.carbon_g_net,          true);
   addBadge('sum-eff-int',       d.effective_intensity,   c.effective_intensity,   true);
   addBadge('sum-ci-imp-kwh',    d.ci_imp_kwh,            c.ci_imp_kwh,            null);  // volume
+  addBadge('sum-ci-exp-kwh',    d.ci_exp_kwh,            c.ci_exp_kwh,            null);  // volume — Grid Export kWh
   addBadge('sum-imp',           d.carbon_g_imp,          c.carbon_g_imp,          true);
   addBadge('sum-exp',           d.carbon_g_exp,          c.carbon_g_exp,          false); // more offset = better
   addBadge('house-kwh',         d.house_imp_kwh,         c.house_imp_kwh,         null);  // volume
@@ -2260,7 +2273,14 @@ function renderUsage(d, cmpData) {
   // lowerBetter: true/false = coloured, null = grey (volume — no direction judgement)
   function uBadge(elId, val, cmpVal, lowerBetter) {
     var el = document.getElementById(elId);
-    if (!el || val == null || cmpVal == null || cmpVal === 0) return;
+    if (!el || val == null || cmpVal == null) return;
+    if (cmpVal === 0 && val === 0) return;
+    if (cmpVal === 0) {
+      // New this period — show as new entry rather than % change
+      el.insertAdjacentHTML('beforeend',
+        '<span class="ins-delta" style="font-size:11px;margin-left:6px;color:#00d4aa;">new</span>');
+      return;
+    }
     var existing = el.nextElementSibling;
     if (existing && existing.classList.contains('ins-delta')) existing.remove();
     var p = Math.round((val - cmpVal) / Math.abs(cmpVal) * 100);
@@ -2325,6 +2345,79 @@ function renderUsage(d, cmpData) {
     document.getElementById('u-narrative-bullets').innerHTML = bulletsHtml;
     document.getElementById('ucard-narrative').style.display = 'block';
   }
+}
+
+function insExportPdf() {
+  var label   = document.getElementById('ins-period-label');
+  var tab     = _activeInsightTab === 'usage' ? 'Usage Insights' : 'Carbon Insights';
+  var period  = label ? label.textContent.trim() : '';
+  var genDate = new Date().toLocaleDateString([], {year:'numeric', month:'long', day:'numeric'});
+
+  // Collect visible report sections only
+  // Carbon tab: #insights-body content when carbon active
+  // Usage tab:  #usage-body content when usage active
+  var cmpEl  = document.getElementById('cmp-panel');
+  var cmpHtml = (cmpEl && cmpEl.style.display !== 'none') ? cmpEl.outerHTML : '';
+
+  // Get the active tab body — clone and force all children visible for capture
+  var activeBodyId = _activeInsightTab === 'usage' ? 'tab-usage' : 'insights-body';
+  var bodyEl = document.getElementById(activeBodyId);
+  var reportHtml = cmpHtml + (bodyEl ? bodyEl.outerHTML : '');
+
+  // Open new tab with clean report — no auto-print (user can Cmd+P / Ctrl+P)
+  var win = window.open('', '_blank');
+  if (!win) { alert('Please allow pop-ups for this page to export PDF.'); return; }
+
+  win.document.write('<!DOCTYPE html><html><head>' +
+    '<meta charset="UTF-8">' +
+    '<title>EMT ' + _EMT_VERSION + ' — ' + tab + ' — ' + period + '</title>' +
+    '<style>' +
+    '  body{font-family:-apple-system,sans-serif;margin:0;padding:24px;color:#111;background:#fff;max-width:1000px;}' +
+    '  .report-header{display:flex;align-items:center;gap:14px;border-bottom:2px solid #00a080;padding-bottom:12px;margin-bottom:20px;}' +
+    '  .report-header img{width:44px;height:44px;object-fit:contain;}' +
+    '  .report-header h1{margin:0;font-size:18px;color:#00a080;}' +
+    '  .report-header .sub{font-size:12px;color:#555;margin-top:3px;}' +
+    '  .report-date{margin-left:auto;font-size:11px;color:#888;text-align:right;}' +
+    '  .report-version{font-size:10px;color:#aaa;}' +
+    '  :root{--accent:#00d4aa;--text:#111;--muted:#555;--surface:#fff;--bg:#f5f5f5;--border:#ddd;--radius:8px;--mono:ui-monospace,monospace;--sans:-apple-system,sans-serif;}' +
+    '  .insight-card{border:1px solid #ddd;border-radius:8px;padding:16px;margin-bottom:16px;break-inside:avoid;}' +
+    '  .insight-card-title{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#555;margin-bottom:10px;}' +
+    '  .insight-headline{font-size:20px;font-weight:700;color:#111;font-family:ui-monospace,monospace;margin-bottom:2px;display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;}' +
+    '  .insight-sub{font-size:12px;color:#555;margin-bottom:8px;}' +
+    '  .insight-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin:10px 0;}' +
+    '  .insight-metric{background:#f9f9f9;border:1px solid #eee;border-radius:6px;padding:8px 10px;}' +
+    '  .insight-metric-label{font-size:10px;color:#777;text-transform:uppercase;letter-spacing:.04em;margin-bottom:3px;}' +
+    '  .insight-metric-value{font-size:15px;font-weight:700;color:#111;font-family:ui-monospace,monospace;}' +
+    '  .insight-metric-unit{font-size:10px;color:#777;margin-top:2px;}' +
+    '  .ins-delta{font-size:10px;margin-left:4px;}' +
+    '  .insight-equiv{font-size:11px;color:#555;margin:6px 0;}' +
+    '  .insight-footnote{font-size:10px;color:#aaa;margin-top:10px;}' +
+    '  .insight-note,.insight-tip{font-size:11px;color:#555;background:#f5f5f5;padding:7px 10px;border-radius:5px;margin:6px 0;}' +
+    '  #period-nav,.ins-nav-btn,.ins-toolbar,.no-print,#trend-wrap,#trend-chart,canvas{display:none!important;}' +
+    '  #cmp-panel{border:1px solid #ddd;border-radius:8px;padding:14px;margin-bottom:14px;}' +
+    '  .ucard{border:1px solid #ddd;border-radius:8px;padding:14px;margin-bottom:12px;break-inside:avoid;}' +
+    '  .ucard-title{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#555;margin-bottom:8px;}' +
+    '  .ucard-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:6px;margin:8px 0;}' +
+    '  .ucard-metric{background:#f9f9f9;border:1px solid #eee;border-radius:5px;padding:7px 9px;}' +
+    '  .ucard-metric-label{font-size:10px;color:#777;margin-bottom:3px;}' +
+    '  .ucard-metric-value{font-size:13px;font-weight:700;color:#111;font-family:ui-monospace,monospace;}' +
+    '  .rate-bar-wrap,.rate-bar-row{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:11px;}' +
+    '  .rate-bar{height:8px;border-radius:4px;background:#00d4aa;}' +
+    '  @media print{@page{margin:12mm;size:A4;}body{padding:0;}}' +
+    '</style>' +
+    '</head><body>' +
+    '<div class="report-header">' +
+    '  <img src="/static/icon.png">' +
+    '  <div><h1>Energy Meter Tracker</h1>' +
+    '    <div class="sub">' + tab + ' — ' + period + '</div>' +
+    '  </div>' +
+    '  <div class="report-date">Generated ' + genDate + '<br>' +
+    '    <span class="report-version">EMT v' + _EMT_VERSION + '</span>' +
+    '  </div>' +
+    '</div>' +
+    reportHtml +
+    '</body></html>');
+  win.document.close();
 }
 
 initInsights();
