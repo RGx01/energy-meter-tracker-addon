@@ -211,6 +211,16 @@ CREATE TABLE IF NOT EXISTS generation_mix (
     PRIMARY KEY (block_id, fuel)
 );
 
+-- High-resolution generation mix (CI-tick cadence ~15min, 48hr retention).
+-- Independent of block size — updated every CI tick so chart stays current.
+CREATE TABLE IF NOT EXISTS mix_history (
+    captured_at TEXT NOT NULL,  -- CI slot time (UTC, e.g. '2026-05-01T06:30')
+    fuel        TEXT NOT NULL,
+    perc        REAL NOT NULL,
+    PRIMARY KEY (captured_at, fuel)
+);
+CREATE INDEX IF NOT EXISTS idx_mix_history_time ON mix_history (captured_at);
+
 -- High-resolution net power history (engine-tick cadence ~10s, 48hr retention).
 -- Only written when a power sensor is configured. intensity is denormalised from
 -- the nearest carbon_intensity row at capture time.
@@ -627,6 +637,29 @@ class BlockStore:
                     PRIMARY KEY (block_id, fuel)
                 )
             """)
+            # 2.8.0 — create mix_history for CI-tick resolution mix (independent of block size)
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS mix_history (
+                    captured_at TEXT NOT NULL,
+                    fuel        TEXT NOT NULL,
+                    perc        REAL NOT NULL,
+                    PRIMARY KEY (captured_at, fuel)
+                )
+            """)
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mix_history_time ON mix_history (captured_at)"
+            )
+            # Backfill mix_history from generation_mix for existing users upgrading
+            filled = self._conn.execute("SELECT COUNT(*) FROM mix_history").fetchone()[0]
+            if filled == 0:
+                self._conn.execute("""
+                    INSERT OR IGNORE INTO mix_history (captured_at, fuel, perc)
+                    SELECT b.block_start, gm.fuel, gm.perc
+                    FROM generation_mix gm
+                    JOIN blocks b ON b.id = gm.block_id
+                    WHERE b.meter_id = 'electricity_main'
+                      AND b.block_start >= datetime('now', '-48 hours')
+                """)
         except Exception:
             pass
         logger.debug("BlockStore opened: %s", db_path)
@@ -763,6 +796,47 @@ class BlockStore:
         return cur.rowcount
 
     # ── Generation mix ────────────────────────────────────────────────────────
+
+    def upsert_mix_history(self, captured_at: str, mix: list[dict]) -> None:
+        """Write CI-tick generation mix to mix_history (48hr rolling store)."""
+        with self._conn:
+            for entry in mix:
+                self._conn.execute(
+                    """INSERT INTO mix_history (captured_at, fuel, perc)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(captured_at, fuel) DO UPDATE SET perc=excluded.perc""",
+                    (captured_at, entry.get("fuel", ""), entry.get("perc", 0.0))
+                )
+
+    def prune_mix_history(self, hours: int = 48) -> None:
+        """Delete mix_history rows older than `hours` hours."""
+        from datetime import datetime, timezone, timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M")
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM mix_history WHERE captured_at < ?", (cutoff,)
+            )
+
+    def get_mix_history(self, hours: int = 48) -> list:
+        """Return mix_history slots for the last `hours` hours."""
+        from datetime import datetime, timezone, timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M")
+        rows = self._conn.execute(
+            """SELECT captured_at, fuel, perc
+               FROM mix_history
+               WHERE captured_at >= ?
+               ORDER BY captured_at ASC, fuel ASC""",
+            (cutoff,)
+        ).fetchall()
+        slots: dict = {}
+        order: list = []
+        for r in rows:
+            ca = r["captured_at"]
+            if ca not in slots:
+                slots[ca] = {}
+                order.append(ca)
+            slots[ca][r["fuel"]] = r["perc"]
+        return [{"captured_at": ca, "fuels": slots[ca]} for ca in order]
 
     def upsert_generation_mix(self, block_id: int, mix: list[dict]) -> None:
         """

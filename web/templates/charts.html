@@ -702,9 +702,9 @@ function barLoadState(availableYears) {
     if (['kwh','cost','co2'].indexOf(st.metric) !== -1)       barMetric = st.metric;
     if (['totals','net'].indexOf(st.view) !== -1)              barView   = st.view;
     if (typeof st.calendar === 'boolean')                      barCalendar = st.calendar;
-    // Restore daily month only if it has data
-    if (st.month && st.month.year && st.month.month) {
-      var hasData = barData.some(function(r){ return r.year===st.month.year && r.month===st.month.month; });
+    // Restore billing period selection (bKey e.g. "2026-04-15")
+    if (st.bKey) {
+      var hasData = barData.some(function(r){ return barBillingKey(r).bKey === st.bKey; });
       if (hasData) barDailyMonth = st.bKey;
     }
     // Restore active years — only keep those that still exist in the data
@@ -1396,7 +1396,8 @@ function barBuildTable() {
   // Build column headers
   var cols = []; // [{key, label}]
   if (barView === 'net') {
-    cols.push({key:'net', label: barMetric==='co2' ? 'Net CO₂' : 'Net'});
+    cols.push({key:'net_imp', label: barMetric==='co2' ? 'Import CO₂' : 'Import'});
+    cols.push({key:'net_exp', label: barMetric==='co2' ? 'Export offset' : 'Export', color: barExportColor});
     if (barMetric === 'co2') cols.push({key:'avg_intensity', label:'Avg intensity'});
   } else {
     if (barMetric === 'co2') {
@@ -1419,6 +1420,14 @@ function barBuildTable() {
       var imp = barMetric === 'kwh' ? agg.imp_kwh : (agg.imp_cost + barStandingVal(agg));
       var exp = barMetric === 'kwh' ? agg.exp_kwh : agg.exp_cost;
       return imp - exp;
+    }
+    if (col.key === 'net_imp') {
+      if (barMetric === 'co2') { var v = agg.carbon_g_net; return (v != null && v > 0) ? v : 0; }
+      return barMetric === 'kwh' ? (agg.imp_kwh || 0) : ((agg.imp_cost || 0) + barStandingVal(agg));
+    }
+    if (col.key === 'net_exp') {
+      if (barMetric === 'co2') { var v = agg.carbon_g_net; return (v != null && v < 0) ? Math.abs(v) : 0; }
+      return barMetric === 'kwh' ? (agg.exp_kwh || 0) : (agg.exp_cost || 0);
     }
     if (col.key === 'co2_total') return agg.carbon_g_total != null ? agg.carbon_g_total : null;
     if (col.key === 'avg_intensity') return agg.avg_intensity != null ? agg.avg_intensity : null;
@@ -1480,7 +1489,12 @@ function barBuildTable() {
       } else {
         if (v != null) {
           colTotals[c.key] = (colTotals[c.key] || 0) + v;
-          rowTotal += v;
+          // Only 'net' column contributes to row total and grand total
+          // net_imp and net_exp are supplementary display columns
+          // Import adds, Export subtracts — Total column shows net (imp - exp)
+          if (c.key === 'net_imp') rowTotal += v;
+          else if (c.key === 'net_exp') rowTotal -= v;
+          else if (c.key !== 'avg_intensity') rowTotal += v;
           _rowHasVal = true;
         }
         fmtd = v != null ? barFmt(v) : '—';

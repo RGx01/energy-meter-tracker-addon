@@ -1,5 +1,29 @@
 # Changelog
 
+## [2.8.1] — 2026-05-03
+
+### Added
+
+- **Favicon** — browser tab now shows the EMT icon (`icon.png`) in all pages.
+
+- **Timezone auto-detect in setup wizard** — the timezone field in Meter Config now defaults to the browser's local timezone via `Intl.DateTimeFormat().resolvedOptions().timeZone` rather than UTC. Existing meters are unaffected.
+
+- **PDF export on Insights** — "⬇ PDF" button on the Insights toolbar opens a new browser tab containing a clean, print-ready report with the EMT logo, period label, app version, and the full Carbon or Usage tab content. No navigation or sidebar included. Print from the new tab to save as PDF.
+
+- **Generation mix history table** (`mix_history`) — new table storing generation mix at CI-tick resolution (~15 min) independently of block size. Previously mix was stored only at block finalisation (30 min in production), causing the 48-hour mix chart to lag by up to 60+ minutes. Now lags by at most one CI tick interval. Existing installations are backfilled from `generation_mix` on first open.
+
+- **Usage Stats Net view — Import/Export columns** — the data table in the Net tab now shows Import and Export as separate columns alongside the Total (net) figure, for kWh, £ Cost and CO₂. The chart is unchanged.
+
+### Changed
+
+- **Gauge arc background** — the background arc on Live Power gauges (main power gauge and all SoC device cards) now uses `var(--border)` via CSS class rather than a hardcoded dark colour. In light theme the arc is now correctly light grey rather than black.
+
+- **48-hour generation mix chart** — data source changed from `generation_mix` (block-resolution, joined to blocks) to the new `mix_history` table (CI-tick resolution). Chart stays current within ~15 minutes regardless of block size.
+
+- **Carbon Insights comparison badges** — Grid Export kWh metric now shows a % comparison badge when a comparison period is selected. Badges on device card headlines (Battery, EV, HP) now appear inline with the value using `display:flex` rather than dropping to a new line.
+
+---
+
 ## [2.8.0] — 2026-04-30
 
 ### Added
