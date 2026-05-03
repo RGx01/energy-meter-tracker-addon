@@ -328,6 +328,7 @@
 }
 
 /* ── Gauge ── */
+.gauge-arc-bg { stroke: var(--border); }
 .gauge-wrap {
   position: relative;
   width: 100%;
@@ -758,7 +759,7 @@
     <div class="gauge-wrap">
       <svg viewBox="0 0 220 120" xmlns="http://www.w3.org/2000/svg">
         <!-- Background arc -->
-        <path d="M 20 110 A 90 90 0 0 1 200 110" fill="none" stroke="#2a2d3a" stroke-width="14" stroke-linecap="round"/>
+        <path d="M 20 110 A 90 90 0 0 1 200 110" class="gauge-arc-bg" fill="none" stroke="#2a2d3a" stroke-width="14" stroke-linecap="round"/>
         <!-- Zero marker -->
         <line x1="110" y1="24" x2="110" y2="36" stroke="#6b7080" stroke-width="2"/>
         <!-- Value arc — drawn from centre outward -->
@@ -1162,7 +1163,7 @@ function buildSocCard(meterId, info) {
       '<div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;align-self:flex-start;margin-top:4px;">' + gaugeLabel + '</div>' +
       '<div class="inv-gauge-wrap">' +
         '<svg viewBox="0 0 220 120" xmlns="http://www.w3.org/2000/svg">' +
-          '<path d="M 20 110 A 90 90 0 0 1 200 110" fill="none" stroke="#2a2d3a" stroke-width="14" stroke-linecap="round"/>' +
+          '<path d="M 20 110 A 90 90 0 0 1 200 110" class="gauge-arc-bg" fill="none" stroke="#2a2d3a" stroke-width="14" stroke-linecap="round"/>' +
           '<line x1="' + zeroMarkerX1 + '" y1="' + zeroMarkerY1 + '" x2="' + zeroMarkerX2 + '" y2="' + zeroMarkerY2 + '" stroke="#6b7080" stroke-width="2"/>' +
           '<path id="inv-arc-' + meterId + '" d="M 20 110 A 90 90 0 0 1 200 110" fill="none" stroke="#7c6af7" stroke-width="14" stroke-linecap="round"' +
             ' stroke-dasharray="0 283" stroke-dashoffset="' + initOffset + '" transform-origin="110 110"/>' +
@@ -2280,7 +2281,7 @@ function _phDraw() {
 
     // Filter to visible window (block resolution = 30 min so add half-hour padding)
     var visible = _phMixData.filter(function(s) {
-      var ms = new Date(s.block_start + 'Z').getTime();
+      var ms = new Date(s.captured_at + 'Z').getTime();
       return ms >= t0 - 1800000 && ms <= t0 + tSpan + 1800000;
     });
 
@@ -2320,13 +2321,13 @@ function _phDraw() {
       var col = _mixFuelColour(fuel);
       ctx.beginPath();
       visible.forEach(function(slot, i) {
-        var x = tx(slot.block_start + 'Z');
+        var x = tx(slot.captured_at + 'Z');
         var y = tyPct(stacks[i][fuel].top);
         if (i === 0) ctx.moveTo(x, y);
         else         ctx.lineTo(x, y);
       });
       for (var i = visible.length - 1; i >= 0; i--) {
-        ctx.lineTo(tx(visible[i].block_start + 'Z'), tyPct(stacks[i][fuel].bot));
+        ctx.lineTo(tx(visible[i].captured_at + 'Z'), tyPct(stacks[i][fuel].bot));
       }
       ctx.closePath();
       ctx.globalAlpha = 0.15;
@@ -2336,7 +2337,7 @@ function _phDraw() {
       // Crisp top-edge stroke line
       ctx.beginPath();
       visible.forEach(function(slot, i) {
-        var x = tx(slot.block_start + 'Z');
+        var x = tx(slot.captured_at + 'Z');
         var y = tyPct(stacks[i][fuel].top);
         if (i === 0) ctx.moveTo(x, y);
         else         ctx.lineTo(x, y);
@@ -2494,12 +2495,12 @@ setInterval(_phLoad, 30000);
       var tMs = xToTime(mouseX);
       var nearest_mix = null, bestDiff = Infinity;
       _phMixData.forEach(function(slot) {
-        var slotMs = new Date(slot.block_start + 'Z').getTime();
+        var slotMs = new Date(slot.captured_at + 'Z').getTime();
         var diff   = Math.abs(slotMs - tMs);
         if (diff < bestDiff) { bestDiff = diff; nearest_mix = slot; }
       });
       if (nearest_mix) {
-        var s  = nearest_mix.block_start + 'Z';
+        var s  = nearest_mix.captured_at + 'Z';
         var dt = new Date(s);
         var timeStr = dt.toLocaleDateString([], {month:'numeric', day:'numeric'})
                     + ' ' + dt.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});

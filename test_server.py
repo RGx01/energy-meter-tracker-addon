@@ -2572,37 +2572,15 @@ class TestApiPowerMixHistory(unittest.TestCase):
 
     def setUp(self):
         import tempfile
+        from datetime import datetime, timezone, timedelta
         self.tmp = tempfile.mktemp(suffix=".db")
         from block_store import BlockStore
         self.store = BlockStore(self.tmp)
-        with self.store._conn:
-            self.store._conn.execute(
-                "INSERT INTO config_periods (billing_day, block_minutes, timezone, "
-                "currency_symbol, currency_code, effective_from) "
-                "VALUES (1, 30, 'UTC', '£', 'GBP', '2026-01-01')"
-            )
-            cp_id = self.store._conn.execute(
-                "SELECT id FROM config_periods LIMIT 1"
-            ).fetchone()[0]
-            # Insert recent main meter block (within 48 hours)
-            from datetime import datetime, timezone, timedelta
-            recent = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(tzinfo=None).isoformat()
-            self.store._conn.execute(
-                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
-                "imp_kwh, exp_kwh) VALUES (?, ?, 'electricity_main', ?, 10.0, 0.0)",
-                (recent[:16], recent[:16], cp_id)
-            )
-            bid = self.store._conn.execute(
-                "SELECT id FROM blocks WHERE meter_id='electricity_main'"
-            ).fetchone()[0]
-            self.store._conn.execute(
-                "INSERT INTO generation_mix (block_id, fuel, perc) VALUES (?, 'wind', 65.0)",
-                (bid,)
-            )
-            self.store._conn.execute(
-                "INSERT INTO generation_mix (block_id, fuel, perc) VALUES (?, 'gas', 35.0)",
-                (bid,)
-            )
+        recent = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M")
+        self.store.upsert_mix_history(recent, [
+            {"fuel": "wind", "perc": 65.0},
+            {"fuel": "gas",  "perc": 35.0},
+        ])
         server.app.config["TESTING"] = True
         self.client = server.app.test_client()
 
@@ -2623,13 +2601,13 @@ class TestApiPowerMixHistory(unittest.TestCase):
         d = json.loads(r.data)
         self.assertIn("slots", d)
 
-    def test_slot_has_block_start_and_fuels(self):
+    def test_slot_has_captured_at_and_fuels(self):
         with patch.object(server, "_get_store", return_value=self.store):
             r = self.client.get("/api/power/mix-history")
         d = json.loads(r.data)
         self.assertGreater(len(d["slots"]), 0)
         slot = d["slots"][0]
-        self.assertIn("block_start", slot)
+        self.assertIn("captured_at", slot)
         self.assertIn("fuels", slot)
         self.assertIn("wind", slot["fuels"])
         self.assertAlmostEqual(slot["fuels"]["wind"], 65.0)

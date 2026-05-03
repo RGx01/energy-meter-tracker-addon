@@ -3413,3 +3413,114 @@ class TestGenerationMix(unittest.TestCase):
         finally:
             if os.path.exists(tmp):
                 os.remove(tmp)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mix_history table (2.8.1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestMixHistory(unittest.TestCase):
+    """Tests for mix_history CI-tick resolution storage."""
+
+    def setUp(self):
+        self.store = BlockStore(":memory:")
+
+    def test_upsert_and_get(self):
+        """Stored mix is retrievable via get_mix_history."""
+        from datetime import datetime, timezone, timedelta
+        recent = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M")
+        self.store.upsert_mix_history(recent, [
+            {"fuel": "wind", "perc": 60.0},
+            {"fuel": "gas",  "perc": 40.0},
+        ])
+        slots = self.store.get_mix_history(hours=48)
+        self.assertEqual(len(slots), 1)
+        self.assertEqual(slots[0]["captured_at"], recent)
+        self.assertAlmostEqual(slots[0]["fuels"]["wind"], 60.0)
+        self.assertAlmostEqual(slots[0]["fuels"]["gas"],  40.0)
+
+    def test_upsert_replaces_existing(self):
+        """Re-upserting same captured_at replaces previous perc values."""
+        ts = "2026-05-01T06:30"
+        self.store.upsert_mix_history(ts, [{"fuel": "wind", "perc": 60.0}])
+        self.store.upsert_mix_history(ts, [{"fuel": "wind", "perc": 75.0}])
+        slots = self.store.get_mix_history(hours=48*365)
+        fuels = {s["fuels"]["wind"] for s in slots if s["captured_at"] == ts}
+        self.assertIn(75.0, fuels)
+        self.assertNotIn(60.0, fuels)
+
+    def test_multiple_slots_ordered(self):
+        """get_mix_history returns slots in chronological order."""
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        for h in [3, 1, 2]:
+            ts = (now - timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M")
+            self.store.upsert_mix_history(ts, [{"fuel": "wind", "perc": float(h * 10)}])
+        slots = self.store.get_mix_history(hours=48)
+        times = [s["captured_at"] for s in slots]
+        self.assertEqual(times, sorted(times))
+
+    def test_prune_removes_old_rows(self):
+        """prune_mix_history removes rows older than the specified window."""
+        # Insert one old slot (3 days ago) and one recent slot (1 hour ago)
+        old_ts    = "2020-01-01T00:00"
+        from datetime import datetime, timezone, timedelta
+        recent_ts = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M")
+        self.store.upsert_mix_history(old_ts,    [{"fuel": "wind", "perc": 50.0}])
+        self.store.upsert_mix_history(recent_ts, [{"fuel": "wind", "perc": 70.0}])
+        self.store.prune_mix_history(hours=48)
+        count = self.store._conn.execute("SELECT COUNT(*) FROM mix_history").fetchone()[0]
+        self.assertEqual(count, 1)
+        remaining = self.store._conn.execute(
+            "SELECT captured_at FROM mix_history"
+        ).fetchone()[0]
+        self.assertEqual(remaining, recent_ts)
+
+    def test_get_mix_history_empty(self):
+        """get_mix_history returns empty list when no data exists."""
+        slots = self.store.get_mix_history(hours=48)
+        self.assertEqual(slots, [])
+
+    def test_migration_backfills_from_generation_mix(self):
+        """mix_history is backfilled from generation_mix on first open when empty."""
+        import tempfile, os
+        tmp = tempfile.mktemp(suffix=".db")
+        try:
+            store = BlockStore(tmp)
+            with store._conn:
+                store._conn.execute(
+                    "INSERT INTO config_periods (billing_day, block_minutes, timezone, "
+                    "currency_symbol, currency_code, effective_from) "
+                    "VALUES (1, 30, 'UTC', '£', 'GBP', '2026-01-01')"
+                )
+                cp_id = store._conn.execute(
+                    "SELECT id FROM config_periods LIMIT 1"
+                ).fetchone()[0]
+                from datetime import datetime, timezone, timedelta
+                recent = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime(
+                    "%Y-%m-%dT%H:%M:%S"
+                )
+                store._conn.execute(
+                    "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                    "imp_kwh, exp_kwh) VALUES (?, ?, 'electricity_main', ?, 10.0, 0.0)",
+                    (recent, recent, cp_id)
+                )
+                bid = store._conn.execute(
+                    "SELECT id FROM blocks WHERE meter_id='electricity_main'"
+                ).fetchone()[0]
+                store._conn.execute(
+                    "INSERT INTO generation_mix (block_id, fuel, perc) VALUES (?, 'wind', 65.0)",
+                    (bid,)
+                )
+            store._conn.close()
+
+            # Re-open — migration should backfill mix_history from generation_mix
+            store2 = BlockStore(tmp)
+            count = store2._conn.execute(
+                "SELECT COUNT(*) FROM mix_history"
+            ).fetchone()[0]
+            self.assertGreater(count, 0, "mix_history should be backfilled from generation_mix")
+            store2._conn.close()
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
