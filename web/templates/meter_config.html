@@ -1374,7 +1374,7 @@ function startWizard() {
     supplier:      mainMeta.supplier   || '',
     billing_day:   mainMeta.billing_day || 1,
     block_minutes: mainMeta.block_minutes || 30,
-    timezone:      mainMeta.timezone || 'UTC',
+    timezone:      mainMeta.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
     importRead:    imp.read                      || '',
     importRate:    imp.rate                      || '',
     standingCharge: imp.standing_charge_sensor   || '',
