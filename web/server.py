@@ -1192,7 +1192,8 @@ def api_retire_meter(meter_id: str):
 
 @app.route("/api/meter/<meter_id>/unretire", methods=["POST"])
 def api_unretire_meter(meter_id: str):
-    """Clear retirement status from a sub-meter."""
+    """Clear retirement status from a sub-meter.
+    Returns 409 Conflict if the sensor is already in use by another active meter."""
     try:
         store = _get_store()
         store.unretire_meter(meter_id)
@@ -1204,6 +1205,10 @@ def api_unretire_meter(meter_id: str):
             pass
         logger.info("api_unretire_meter: %s unretired", meter_id)
         return jsonify({"ok": True, "meter_id": meter_id})
+    except ValueError as e:
+        # Sensor conflict — return 409 so the UI can show a meaningful message
+        logger.warning("api_unretire_meter: conflict — %s", e)
+        return jsonify({"error": str(e), "conflict": True}), 409
     except Exception as e:
         logger.error("api_unretire_meter: %s", e)
         return jsonify({"error": str(e)}), 500
