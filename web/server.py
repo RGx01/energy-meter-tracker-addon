@@ -694,8 +694,13 @@ def api_power():
         # Find power sensor and sub-meter sensors from config
         power_sensor = bat_sensor = ev_sensor = None
         soc_sensors = {}  # {meter_id: {soc, inverter_power}}
+        from datetime import datetime as _dt2
+        _today = _dt2.now().strftime("%Y-%m-%d")
         for m_id, m_data in meters_cfg.items():
             meta = (m_data or {}).get("meta", {}) or {}
+            # Skip retired sub-meters — don't show their cards on Live Power
+            if meta.get("sub_meter") and meta.get("retired_at") and meta["retired_at"] <= _today:
+                continue
             if not meta.get("sub_meter"):
                 power_sensor = meta.get("power_sensor")
             elif _is_meter_type(meta, m_id, "battery"):
@@ -1137,6 +1142,58 @@ def api_power_mix_history():
         return jsonify({"slots": slots})
     except Exception as e:
         logger.error("api_power_mix_history: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/engine/meter-reset-detected")
+def api_meter_reset_detected():
+    """Returns whether a meter read reset was detected (possible replacement/move).
+    Clears the flag on read — call once per page load."""
+    try:
+        detected = engine.get_and_clear_meter_reset()
+        return jsonify({"detected": detected})
+    except Exception as e:
+        return jsonify({"detected": False, "error": str(e)})
+
+
+@app.route("/api/meter/<meter_id>/retire", methods=["POST"])
+def api_retire_meter(meter_id: str):
+    """Retire a sub-meter from a given date. Preserves all historical data."""
+    try:
+        data = request.get_json(force=True) or {}
+        retired_at = data.get("retired_at")
+        retired_reason = data.get("retired_reason", "")
+        if not retired_at:
+            return jsonify({"error": "retired_at is required (YYYY-MM-DD)"}), 400
+        store = _get_store()
+        # Verify it's a sub-meter
+        row = store._conn.execute(
+            "SELECT is_sub_meter FROM meters WHERE meter_id = ?", (meter_id,)
+        ).fetchone()
+        if not row:
+            return jsonify({"error": f"Meter '{meter_id}' not found"}), 404
+        if not row["is_sub_meter"]:
+            return jsonify({"error": "Cannot retire the main meter"}), 400
+        store.retire_meter(meter_id, retired_at, retired_reason)
+        engine.reset_store()
+        logger.info("api_retire_meter: %s retired at %s (%s)", meter_id, retired_at, retired_reason)
+        return jsonify({"ok": True, "meter_id": meter_id, "retired_at": retired_at})
+    except Exception as e:
+        logger.error("api_retire_meter: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/meter/<meter_id>/unretire", methods=["POST"])
+def api_unretire_meter(meter_id: str):
+    """Clear retirement status from a sub-meter."""
+    try:
+        store = _get_store()
+        store.unretire_meter(meter_id)
+        engine.reset_store()
+        logger.info("api_unretire_meter: %s unretired", meter_id)
+        return jsonify({"ok": True, "meter_id": meter_id})
+    except Exception as e:
+        logger.error("api_unretire_meter: %s", e)
         return jsonify({"error": str(e)}), 500
 
 

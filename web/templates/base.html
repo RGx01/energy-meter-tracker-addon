@@ -455,6 +455,13 @@
   </aside>
 
   <div class="main">
+  <!-- Meter reset advisory banner -->
+  <div class="meter-reset-banner" id="meter-reset-banner">
+    <span>⚠️ <strong>Meter read reset detected</strong> — your import meter reading dropped significantly after a gap.
+    This may indicate a meter replacement or property move.
+    If so, consider <a href="{{ request.environ.get('SCRIPT_NAME', '') }}/billing-history">creating a new billing period</a>.</span>
+    <button onclick="dismissMeterResetBanner()">Dismiss</button>
+  </div>
     <div id="mobile-topbar" style="display:none;background:var(--surface);border-bottom:1px solid var(--border);padding:10px 16px;">
       <button class="hamburger" onclick="toggleSidebar()">&#9776;</button>
     </div>
@@ -497,6 +504,27 @@ window.addEventListener('message', function(e) {
     applyTheme(e.data.theme);
   }
 });
+// ── Meter reset advisory notification ──────────────────────────────────────
+(function() {
+  if (sessionStorage.getItem('meterResetDismissed')) return;
+  var base = "{{ request.environ.get('SCRIPT_NAME', '') }}";
+  fetch(base + '/api/engine/meter-reset-detected')
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.detected) {
+        var banner = document.getElementById('meter-reset-banner');
+        if (banner) banner.classList.add('visible');
+      }
+    })
+    .catch(function() {});
+})();
+
+function dismissMeterResetBanner() {
+  var banner = document.getElementById('meter-reset-banner');
+  if (banner) banner.classList.remove('visible');
+  sessionStorage.setItem('meterResetDismissed', '1');
+}
+
 // Sync global theme toggle icon on load
 (function() {
   var theme = document.documentElement.getAttribute('data-theme') || 'dark';

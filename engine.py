@@ -60,6 +60,15 @@ def get_store() -> BlockStore:
         raise RuntimeError("BlockStore not initialised — engine_startup() has not run")
     return _store
 
+
+def get_and_clear_meter_reset() -> bool:
+    """Return True if a meter read reset was detected since last call, then clear the flag.
+    Used by the web server to surface an advisory notification to the user."""
+    global _meter_reset_detected
+    val = _meter_reset_detected
+    _meter_reset_detected = False
+    return val
+
 CHART_DIR          = "/data/energy_meter_tracker"   # accessible from HA /local/
 BLOCK_MINUTES      = 30  # default — overridden at runtime from config
 
@@ -74,6 +83,7 @@ _engine_loop_lock:         asyncio.Lock = None   # initialised in setup()
 _engine_paused:            bool         = False
 _last_ci_fetch:            datetime | None = None   # UTC — last carbon intensity fetch
 _current_slot_mix:         dict            = {}      # captured_at → generationmix list
+_meter_reset_detected:     bool            = False   # set when post-gap read < pre-gap read (possible meter replacement)
 
 
 def setup():
@@ -1583,7 +1593,42 @@ async def _engine_tick(ha: HAClient):
                         missing_windows[0] if missing_windows else None,
                         missing_windows[-1] if missing_windows else None)
 
-            if missing_windows:
+            GAP_FILL_LIMIT_HOURS = 12
+            gap_hours = len(missing_windows) * block_minutes / 60.0 if missing_windows else 0.0
+
+            if missing_windows and gap_hours > GAP_FILL_LIMIT_HOURS:
+                # Gap exceeds 12-hour limit — skip gap-fill entirely.
+                # The first resumed block will calculate its delta from post-gap
+                # reads correctly. Handles: extended outages, meter replacement,
+                # moving property — all produce gaps > 12 hours naturally.
+                logger.warning(
+                    "gap fill: gap of %.1f hours exceeds %d-hour limit — "
+                    "gap-fill skipped. Data absent for this window.",
+                    gap_hours, GAP_FILL_LIMIT_HOURS
+                )
+                # ── Detect possible meter replacement ────────────────────────
+                # If post-gap read is significantly lower than pre-gap read,
+                # flag it so the UI can suggest creating a new billing period.
+                global _meter_reset_detected
+                try:
+                    main_pre  = pre_reads.get("electricity_main", {}).get("import", {})
+                    main_post = post_reads.get("electricity_main", {}).get("import", {})
+                    pre_val  = float(main_pre.get("value",  0)) if isinstance(main_pre,  dict) else None
+                    post_val = float(main_post.get("value", 0)) if isinstance(main_post, dict) else None
+                    RESET_THRESHOLD_KWH = 50.0
+                    if pre_val is not None and post_val is not None:
+                        if post_val < pre_val - RESET_THRESHOLD_KWH:
+                            logger.warning(
+                                "gap fill: meter read reset detected — "
+                                "pre-gap=%.3f kWh post-gap=%.3f kWh (drop=%.1f kWh). "
+                                "Possible meter replacement or property move.",
+                                pre_val, post_val, pre_val - post_val
+                            )
+                            _meter_reset_detected = True
+                except Exception as _re:
+                    logger.debug("gap fill: meter reset check failed: %s", _re)
+
+            elif missing_windows:
                 config     = load_config()
                 # Get last known standing charge from most recent finalised main-meter block
                 last_sc = 0.0
@@ -1811,9 +1856,13 @@ async def engine_startup(ha: HAClient):
                 logger.info("engine_startup: power sensor subscribed for cache: %s", ps)
             break
 
-    # Subscribe to SoC sensors for all battery sub-meters
+    # Subscribe to SoC sensors for all battery sub-meters (skip retired meters)
     for mid, mcfg in config.get("meters", {}).items():
         if mcfg.get("meta", {}).get("sub_meter", False):
+            # Skip retired meters — don't subscribe to their sensors
+            if _store.is_meter_retired(mid):
+                logger.info("engine_startup: skipping retired meter %s", mid)
+                continue
             soc_s = mcfg.get("meta", {}).get("soc_sensor")
             if soc_s:
                 ha.subscribe_state(soc_s, lambda entity_id, new_val, full_state: None)

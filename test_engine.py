@@ -997,3 +997,52 @@ class TestInverterUnitConversion(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12-hour gap-fill limit and meter reset detection (2.9.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGapFillLimit(unittest.TestCase):
+    """Tests for the 12-hour gap-fill limit."""
+
+    def test_gap_within_limit_returns_windows(self):
+        """A gap under 12 hours should produce missing windows."""
+        from datetime import datetime, timezone, timedelta
+        last_read = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+        now = datetime.now(timezone.utc)
+        windows = engine.detect_gap(last_read, now, block_minutes=30)
+        self.assertGreater(len(windows), 0)
+        gap_hours = len(windows) * 30 / 60.0
+        self.assertLessEqual(gap_hours, 12.0)
+
+    def test_gap_exceeds_limit(self):
+        """A gap over 12 hours should be detected as exceeding the limit."""
+        from datetime import datetime, timezone, timedelta
+        last_read = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+        now = datetime.now(timezone.utc)
+        windows = engine.detect_gap(last_read, now, block_minutes=30)
+        gap_hours = len(windows) * 30 / 60.0
+        self.assertGreater(gap_hours, 12.0)
+
+    def test_meter_replacement_gap_hours(self):
+        """A meter replacement gap (days) should far exceed the 12-hour limit."""
+        from datetime import datetime, timezone, timedelta
+        last_read = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        now = datetime.now(timezone.utc)
+        windows = engine.detect_gap(last_read, now, block_minutes=30)
+        gap_hours = len(windows) * 30 / 60.0
+        self.assertGreater(gap_hours, 12.0)
+        self.assertGreater(gap_hours, 48.0)
+
+    def test_get_and_clear_meter_reset(self):
+        """get_and_clear_meter_reset returns flag state and clears it."""
+        # Access via the already-imported engine module (imported at top of file)
+        engine._meter_reset_detected = True
+        self.assertTrue(engine.get_and_clear_meter_reset())
+        # Flag should be cleared after reading
+        self.assertFalse(engine.get_and_clear_meter_reset())
+
+    def test_meter_reset_flag_default_false(self):
+        """_meter_reset_detected should default to False."""
+        engine._meter_reset_detected = False
+        self.assertFalse(engine.get_and_clear_meter_reset())
