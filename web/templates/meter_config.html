@@ -1898,11 +1898,21 @@ function closeUnretireModal() {
 function confirmUnretire() {
   if (!_unretireMeterId) return;
   fetch(BASE_PATH + '/api/meter/' + encodeURIComponent(_unretireMeterId) + '/unretire', {method:'POST'})
-    .then(function(r){ return r.json(); })
-    .then(function(d){
+    .then(function(r){ return r.json().then(function(d){ return {status: r.status, data: d}; }); })
+    .then(function(res){
       closeUnretireModal();
-      if (d.ok) { window.location.reload(); }
-      else { alert('Error: ' + (d.error || 'Unknown error')); }
+      if (res.data.ok) {
+        window.location.reload();
+      } else if (res.status === 409) {
+        // Sensor conflict — show a specific message
+        alert(
+          'Cannot resume recording.\n\n' +
+          (res.data.error || 'A sensor used by this device is already in use by another active device.') +
+          '\n\nTo unretire this device, first retire or reconfigure the device that is using the same sensor.'
+        );
+      } else {
+        alert('Error: ' + (res.data.error || 'Unknown error'));
+      }
     });
 }
 

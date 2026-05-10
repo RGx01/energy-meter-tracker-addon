@@ -3597,6 +3597,42 @@ class TestDeviceRetirement(unittest.TestCase):
         retired = self.store.get_retired_meters()
         self.assertEqual(retired, [])
 
+    def test_unretire_raises_on_sensor_conflict(self):
+        """unretire_meter raises ValueError if the sensor is already in use by an active meter."""
+        cp_id = self.store._conn.execute(
+            "SELECT id FROM config_periods LIMIT 1"
+        ).fetchone()[0]
+        # Add a second active sub-meter using the same read_sensor
+        self.store._conn.execute(
+            "INSERT INTO meters (config_period_id, meter_id, is_sub_meter, device_label, meter_type) "
+            "VALUES (?, 'ev_charger_2', 1, 'Zappi 2', 'ev')", (cp_id,)
+        )
+        # Give both meters the same read_sensor in meter_channels
+        m1_id = self.store._conn.execute(
+            "SELECT id FROM meters WHERE meter_id='ev_charger'"
+        ).fetchone()[0]
+        m2_id = self.store._conn.execute(
+            "SELECT id FROM meters WHERE meter_id='ev_charger_2'"
+        ).fetchone()[0]
+        self.store._conn.execute(
+            "INSERT OR REPLACE INTO meter_channels (meter_id, channel, read_sensor) "
+            "VALUES (?, 'import', 'sensor.zappi_kwh')", (m1_id,)
+        )
+        self.store._conn.execute(
+            "INSERT OR REPLACE INTO meter_channels (meter_id, channel, read_sensor) "
+            "VALUES (?, 'import', 'sensor.zappi_kwh')", (m2_id,)
+        )
+        self.store._conn.commit()
+
+        # Retire ev_charger
+        self.store.retire_meter('ev_charger', '2026-05-01')
+        # ev_charger_2 is active and using the same sensor
+        # Attempting to unretire ev_charger should raise ValueError
+        with self.assertRaises(ValueError) as ctx:
+            self.store.unretire_meter('ev_charger')
+        self.assertIn('sensor.zappi_kwh', str(ctx.exception))
+        self.assertIn('ev_charger_2', str(ctx.exception))
+
     def test_retire_only_affects_sub_meters(self):
         """retire_meter only updates sub-meters (is_sub_meter=1)."""
         # Add a main meter

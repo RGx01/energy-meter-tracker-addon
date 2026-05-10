@@ -856,7 +856,30 @@ class BlockStore:
             )
 
     def unretire_meter(self, meter_id: str) -> None:
-        """Clear retirement status from a sub-meter."""
+        """Clear retirement status from a sub-meter.
+        Raises ValueError if any active meter already uses the same read sensor."""
+        # Check for sensor conflicts with active (non-retired) meters
+        conflicts = self._conn.execute(
+            """SELECT m.meter_id, mc.read_sensor
+               FROM meters m
+               JOIN meter_channels mc ON mc.meter_id = m.id
+               WHERE m.retired_at IS NULL
+                 AND m.meter_id != ?
+                 AND mc.read_sensor IN (
+                     SELECT mc2.read_sensor FROM meter_channels mc2
+                     JOIN meters m2 ON m2.id = mc2.meter_id
+                     WHERE m2.meter_id = ?
+                       AND mc2.read_sensor IS NOT NULL
+                 )""",
+            (meter_id, meter_id)
+        ).fetchall()
+        if conflicts:
+            sensors = ", ".join(set(r["read_sensor"] for r in conflicts))
+            meters  = ", ".join(set(r["meter_id"]   for r in conflicts))
+            raise ValueError(
+                f"Cannot unretire — sensor(s) {sensors} already in use by active meter(s): {meters}. "
+                f"Retire or reconfigure the conflicting meter first."
+            )
         with self._conn:
             self._conn.execute(
                 "UPDATE meters SET retired_at = NULL, retired_reason = NULL WHERE meter_id = ?",
