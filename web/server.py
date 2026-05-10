@@ -1151,6 +1151,8 @@ def api_meter_reset_detected():
     Clears the flag on read — call once per page load."""
     try:
         detected = engine.get_and_clear_meter_reset()
+        if detected:
+            logger.warning("api_meter_reset_detected: meter reset flag was set — serving advisory to UI")
         return jsonify({"detected": detected})
     except Exception as e:
         return jsonify({"detected": False, "error": str(e)})
@@ -1175,7 +1177,12 @@ def api_retire_meter(meter_id: str):
         if not row["is_sub_meter"]:
             return jsonify({"error": "Cannot retire the main meter"}), 400
         store.retire_meter(meter_id, retired_at, retired_reason)
-        engine.reset_store()
+        try:
+            import engine as _eng_retire
+            if hasattr(_eng_retire, "reset_store"):
+                _eng_retire.reset_store()
+        except Exception:
+            pass
         logger.info("api_retire_meter: %s retired at %s (%s)", meter_id, retired_at, retired_reason)
         return jsonify({"ok": True, "meter_id": meter_id, "retired_at": retired_at})
     except Exception as e:
@@ -1189,7 +1196,12 @@ def api_unretire_meter(meter_id: str):
     try:
         store = _get_store()
         store.unretire_meter(meter_id)
-        engine.reset_store()
+        try:
+            import engine as _eng_unretire
+            if hasattr(_eng_unretire, "reset_store"):
+                _eng_unretire.reset_store()
+        except Exception:
+            pass
         logger.info("api_unretire_meter: %s unretired", meter_id)
         return jsonify({"ok": True, "meter_id": meter_id})
     except Exception as e:

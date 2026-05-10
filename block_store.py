@@ -1754,6 +1754,10 @@ class BlockStore:
                     meta["inverter_power_invert"] = True
                 if m["device_power_sensor"]:
                     meta["device_power_sensor"] = m["device_power_sensor"]
+                if m["retired_at"]:
+                    meta["retired_at"] = m["retired_at"]
+                if m["retired_reason"]:
+                    meta["retired_reason"] = m["retired_reason"]
             except IndexError:
                 pass
 

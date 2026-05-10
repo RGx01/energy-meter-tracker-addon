@@ -1,5 +1,35 @@
 # Changelog
 
+## [2.9.0] — 2026-05-10
+
+### Added
+
+- **Device retirement** — sub-meters can now be archived from a specific date without deleting historical data. Use the new **Archive** button on any sub-meter card in Settings → Meter Config. A retirement date and optional reason can be set. Retired devices stop recording, disappear from Live Power, and are excluded from future sensor subscriptions — but all historical blocks are preserved and still appear in charts and insights for periods when they were active. Retirement can be reversed via the **↩ Unretire** button.
+
+- **Sensor reuse after retirement** — retiring a sub-meter frees its sensor entity IDs for use on a new sub-meter. Add the replacement device via the normal Add Device flow; EMT treats the two meters as independent.
+
+- **12-hour gap-fill limit** — gap-fill is now skipped for session gaps longer than 12 hours. Previously EMT would interpolate across any gap length, producing misleading kWh and cost data for extended outages (CAD failure, HA device failure). Gaps within 12 hours still gap-fill as before. For gaps beyond 12 hours the first resumed block calculates its delta from the post-gap reads directly — correct by definition, with no fabricated data.
+
+- **Meter reset detection** — when a gap exceeds 12 hours and the post-gap import read is significantly lower than the pre-gap read (> 50 kWh drop), EMT displays an advisory banner suggesting the user create a new billing period. This covers meter replacement at the current address and moving to a new property — both produce a multi-day HAN re-pairing gap followed by a near-zero cumulative read. The banner is dismissible and shown once per browser session.
+
+### Fixed
+
+- **PDF export — Usage tab showing carbon comparison narrative** — the carbon comparison panel (`cmp-panel`) lives inside the Carbon Insights container and was being incorrectly captured in Usage PDF exports, causing the carbon comparison bullets to appear at the top of Usage reports. Usage PDF now captures only the eight `ucard-*` elements directly.
+
+- **Meter reset advisory banner — always visible** — the CSS rule hiding the banner by default (`display:none`) was missing, causing the banner to always appear regardless of whether a reset had been detected. Fixed.
+
+- **Meter reset advisory banner — stale flag on reconnect** — the `_meter_reset_detected` flag was not cleared between engine reconnects within the same process, causing a false positive advisory after HA WebSocket reconnection. Flag is now reset at the start of every `engine_startup` call.
+
+---
+
+## [2.8.3] — 2026-05-07
+
+### Fixed
+
+- **PDF export — Usage tab showing carbon comparison narrative** — the `cmp-panel` element (which contains carbon comparison bullets) lives inside `insights-body` (Carbon's container) and was being captured separately for the Usage PDF, causing the carbon narrative to appear at the top of Usage reports. Usage PDF now captures only the eight `ucard-*` elements directly, skipping `cmp-panel` entirely. The usage comparison narrative (`ucard-narrative`) is already included in that list and is correctly excluded when no comparison period is active.
+
+---
+
 ## [2.8.2] — 2026-05-03
 
 ### Fixed
@@ -31,6 +61,8 @@
 - **48-hour generation mix chart** — data source changed from `generation_mix` (block-resolution, joined to blocks) to the new `mix_history` table (CI-tick resolution). Chart stays current within ~15 minutes regardless of block size.
 
 - **Carbon Insights comparison badges** — Grid Export kWh metric now shows a % comparison badge when a comparison period is selected. Badges on device card headlines (Battery, EV, HP) now appear inline with the value using `display:flex` rather than dropping to a new line.
+
+### Fixed
 
 - **Charts — Net view data table** — the redundant "Net" column (identical to the Total column) has been removed. The data table now shows Import and Export as separate columns; the Total column is Import − Export.
 

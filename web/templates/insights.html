@@ -2363,10 +2363,9 @@ function insExportPdf() {
   var reportHtml = '';
 
   if (_activeInsightTab === 'usage') {
-    // Usage: comparison panel (if active) + only visible cards
-    var cmpEl = document.getElementById('cmp-panel');
-    if (cmpEl && cmpEl.style.display !== 'none') reportHtml += cmpEl.outerHTML;
-    // Each usage card checked individually
+    // Usage: cmp-panel contains carbon bullets — do NOT include it here.
+    // The usage comparison narrative is inside ucard-narrative instead.
+    // Each usage card checked individually — elHtml skips hidden ones.
     ['ucard-narrative','ucard-cost','ucard-rates','ucard-grid',
      'ucard-peak','ucard-battery','ucard-ev','ucard-hp'].forEach(function(id) {
       reportHtml += elHtml(id);

@@ -1787,6 +1787,9 @@ async def engine_startup(ha: HAClient):
     # ── Checkpoint WAL immediately after opening ──────────────────────────
     # Ensures all committed blocks are flushed from WAL into the main DB file.
     # Cheap and always safe — runs on every startup.
+    global _meter_reset_detected
+    _meter_reset_detected = False  # Reset on every startup so reconnects don't carry stale state
+
     try:
         _store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         logger.info("engine_startup: WAL checkpoint complete")
@@ -2219,8 +2222,40 @@ async def engine_startup(ha: HAClient):
                             except (ValueError, TypeError):
                                 pass
 
-                if _has_preload_read:
-                    # We have sensor data — fill gap immediately using preloaded states
+                # ── 12-hour gap-fill limit ────────────────────────────────
+                _startup_gap_hours = len(missing_windows) * _lb_bm / 60.0
+                if _startup_gap_hours > 12:
+                    logger.warning(
+                        "engine_startup: gap of %.1f hours exceeds 12-hour limit — "
+                        "gap-fill skipped. Data will be absent for this window.",
+                        _startup_gap_hours
+                    )
+                    # ── Detect possible meter replacement ─────────────────────
+                    try:
+                        _su_pre  = pre_reads.get("electricity_main", {}).get("import", {})
+                        _su_post = _preload_post_reads.get("electricity_main", {}).get("import", {})
+                        _su_pre_val  = float(_su_pre.get("value",  0)) if isinstance(_su_pre,  dict) else None
+                        _su_post_val = float(_su_post.get("value", 0)) if isinstance(_su_post, dict) else None
+                        if _su_pre_val is not None and _su_post_val is not None:
+                            if _su_post_val < _su_pre_val - 50.0:
+                                logger.warning(
+                                    "engine_startup: meter read reset detected — "
+                                    "pre-gap=%.3f kWh post-gap=%.3f kWh (drop=%.1f kWh). "
+                                    "Possible meter replacement or property move.",
+                                    _su_pre_val, _su_post_val, _su_pre_val - _su_post_val
+                                )
+                                _meter_reset_detected = True
+                    except Exception as _su_re:
+                        logger.debug("engine_startup: meter reset check failed: %s", _su_re)
+                    # Reset current_block to current window — don't leave stale start
+                    _cb_bm = int(get_block_minutes())
+                    _cb_start2, _cb_end2 = get_block_window(
+                        datetime.now(timezone.utc).replace(tzinfo=None), block_minutes=_cb_bm
+                    )
+                    _store.save_current_block(create_block(_cb_start2, _cb_end2, block_minutes=_cb_bm))
+
+                elif _has_preload_read:
+                    # We have sensor data and gap is within limit — fill immediately
                     logger.info("engine_startup: filling gap immediately using preloaded sensor states")
                     _startup_sc = 0.0
                     try:
