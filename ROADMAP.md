@@ -60,136 +60,69 @@ Heatmap metric toggle (kWh / gCO₂ / gCO₂/kWh). Effective intensity column in
 ### 2.5.x — Stability & Mobile
 Touch zoom, mobile topbar collapse, orientation fixes, billing landscape fix, chart height fix, Y axis duplicate labels, stale test timestamp, storage monitoring card.
 
----
+### 2.6.0 — Carbon Insights & Navigation Refactor ✅
+Insights page with Carbon tab (six adaptive cards). Settings page with Meter Config and Carbon tabs. Navigation refactor. DB as sole source of truth. Restore reliability fixes. 
 
-### 2.6.0 — Carbon Insights & Navigation Refactor ✅ shipped
-**Theme: Make per-block carbon data meaningful and surface it in a dedicated Insights page**
+### 2.6.1 ✅
+Logo click toggles theme. Sub-meter rate weighted average fix. Session gap detection block_minutes fix. 1.x Docker upgrade fix.
 
-#### What shipped
-- **Insights page** — Carbon tab with six adaptive cards: Carbon Summary, House Consumption, Solar Export Offset, EV Charging, Battery Charging Behaviour, Heat Pump. Billing period trend chart with click-to-navigate. Period prev/next navigation.
-- **Settings page** — Meter Config tab + Carbon tab (equivalence assumptions with citations, EV/battery/heat pump efficiency, export displacement methodology). Postcode inline prompt.
-- **Navigation refactor** — sidebar restructured: ⚙️ Settings | 📊 Charts | 🌿 Insights | ⚡ Live Power | 🗄️ Data Management | 📋 Logs | 📖 Help. Routes renamed for clarity.
-- **DB as sole source of truth** — `load_config()` never falls back to `meters_config.json` when `blocks.db` exists.
-- **Restore reliability** — six fixes to gap detection, gap fill, config persistence after restore, and catch-up rollover contamination. Full diagnostics logging added.
-- **Sub-meter rate wording** — clarified as one-time copy at setup, not a live link.
+### 2.6.2 ✅
+Theme toggle consolidated to logo. Logo size increased. Insights mobile improvements. GitHub wiki link added to Help.
 
-### 2.6.1 ✅ shipped
-- Logo click toggles light/dark theme
-- Sub-meter rate using weighted average instead of last rate (tariff boundary bug)
-- Session gap detection using wrong `block_minutes` on non-30-minute setups
-- 1.x.x / 2.0.x Docker upgrade showing wizard and losing sensor config
+### 2.6.3 ✅
+Usage Stats data table scrollable with sticky headers and totals. Sortable date column. Zebra shading. Billing chart day order toggle. Heatmap viewport fix. CI fetch ordering fix.
 
-### 2.6.2 ✅ shipped
-- Theme toggles consolidated to logo only (sidebar footer and charts toolbar buttons removed)
-- Logo size increased
-- Insights mobile topbar compacted
-- Insights metric labels simplified
-- GitHub wiki link added to Help page
+### 2.7.0 ✅
+Battery SoC dial, inverter power gauge, EV/Heat Pump power gauge on Live Power. Sub-meter card layout. Meter type selector. Add Device modal redesign. Config change reason in Billing History.
 
-### 2.6.3 ✅ shipped
-- Usage Stats data table scrollable on desktop with chart fixed above
-- Sticky column headers and totals row pinned in table header
-- Sortable date column (↑/↓, newest first default, localStorage)
-- Alternate row zebra shading (light and dark mode)
-- Colour dots in column headers matching chart legend
-- Billing chart day order toggle (↓ Newest first / ↑ Oldest first)
-- Heatmap fills available desktop viewport (was hardcoded 31 rows)
-- Heatmap metric buttons larger on mobile
-- Carbon intensity fetched before catch-up block finalisation (CI ordering fix)
-- Deprecated `armhf`/`armv7` arch values removed from config.yaml
+### 2.7.1 ✅
+CI gap backfill. PASS 2 applied to gap-fill blocks. Sub-meter spike detection. Insights calendar navigation. Narrative comparison panel. Data-bounds gating. Main meter cascade delete. Postcode normalisation. Direct import terminology. 464 tests.
 
+### 2.8.0 — Timezone Refactor, Performance & Usage Insights ✅
+Timezone refactor (UTC throughout, local_date columns dropped). Billing chart performance (5.8 MB → 76 KB JS). Usage Insights tab (cost breakdown, rate period distribution, grid position, peak demand window, device costs, comparison narrative). Generation mix donut on Live Power and 48-hour mix chart. Generation mix in Carbon Insights.
 
-### 2.7.0 ✅ shipped
-- Battery SoC dial, inverter power gauge, EV/Heat Pump power gauge on Live Power
-- Sub-meter card layout with V2X bidirectional gauge
-- Sub-meter history endpoint (95th percentile max_kw)
-- Meter type selector in Meter Config (locked after data recorded)
-- Device power sensor field for EV/HP sub-meters
-- Add Device modal redesign
-- Config change reason in Billing History
+### 2.8.1 ✅
+Favicon. Timezone auto-detect in wizard. PDF export on Insights. Generation mix history at CI-tick resolution. Usage Stats Net view Import/Export columns. Gauge arc light theme fix. Charts period recall fix.
 
-### 2.7.1 ✅ shipped
-- CI gap backfill (first run 60 days, subsequent 48hr, postcode-keyed)
-- PASS 2 applied to gap-fill blocks (`_apply_pass2` extracted and shared)
-- Sub-meter spike detection in gap fill — clips impossible values, logs ERROR
-- Insights calendar month/year navigation with floating toolbar
-- Narrative comparison panel (vs last month / same month last year / last year)
-- Data-bounds gating — compare buttons disabled when no data exists
-- Main meter cascade delete — wipes DB, creates backup, restarts engine
-- Postcode normalisation — strips to outward code everywhere
-- Direct import terminology throughout (billing cards, charts, insights, help)
-- Grid import double-count fix in Live Power billing card
-- Billing sub-meter breakdown rows restored
-- Billing chart sort order toggle
-- Regenerate Charts hidden on Usage Stats tab
-- Live Power gauge improvements — alignment, pill position, layout A/B, heat pump orange arc
-- `_aggregate_insights` 7× performance improvement (direct SQL + covering index)
-- New API endpoints: `/api/insights/calendar-month`, `/api/insights/calendar-year`, `/api/insights/data-bounds`, `/api/meter/main/reset`
-- 464 tests passing (16 new tests)
+### 2.8.2 ✅
+PDF export fixes — carbon report duplicate panel, usage report hidden card exclusion.
+
+### 2.8.3 — incorporated into 2.9.0
+Usage PDF showing carbon comparison narrative fix.
+
+### 2.9.0 — Gap-fill Limit, Meter Reset Advisory & Device Retirement ✅
+- **12-hour gap-fill limit** — gaps > 12 hours are not gap-filled. Handles extended CAD/HA outages, meter replacement, moving property. Short gaps (power cuts, brief restarts) still gap-fill as before.
+- **Meter reset advisory** — when a gap > 12 hours is followed by a significantly lower import read, an advisory banner suggests creating a new billing period. Covers meter replacement and moving property (both produce a multi-day HAN re-pairing gap).
+- **Device retirement** — sub-meters can be archived from a specific date without deleting historical data. Sensor entity IDs freed for reuse. Retirement reversible. Main meter cannot be retired.
+- **PDF fix** — Usage Insights PDF no longer shows carbon comparison narrative.
+- 556 tests passing.
 
 ---
 
 ## Planned
 
-### Known Engine Limitation — Sub-meter Late Finalise
-
-When the addon restarts during active charging, blocks that finalise late (after a restart) use the raw cumulative delta for sub-meters. If no intermediate reads arrived during the gap, this delta can span multiple block windows — e.g. a Zappi charging at 7kW for 72 minutes with no reads may attribute all 8.4 kWh to a single 30-minute block rather than distributing it across the two or three affected blocks.
-
-The main meter avoids this by using boundary interpolation — it finds the nearest reads on either side of each block boundary and computes an exact energy value for each window. Sub-meters currently don't have this applied at late finalise time.
-
-**Symptom:** `PASS 2: ev_charger sub-meter X.XX kWh EXCEEDS parent grid import Y.YY kWh` WARNING in logs. The energy is preserved (not clipped) but is attributed to the wrong block.
-
-**Correct fix:** Apply boundary interpolation to sub-meters at block finalise time using the same pre/post read pair logic as the main meter. The seed value from the previous block's `read_end` serves as the pre-boundary read; the first post-restart read serves as the post-boundary read. This would correctly distribute the energy across each block window proportionally.
-
-**Why not fixed yet:** Requires careful handling of the seed/carry-forward mechanism for sub-meters and interaction with the gap fill path. Likely coupled with the timezone refactor in 2.8.0 since both require changes to how block boundaries are computed.
-
----
-
-### 2.8.0 — Timezone Refactor, Performance & Usage Insights
-**Theme: Correctness, speed and deeper usage analysis**
-
-#### Timezone refactor (coupled with performance)
-Drop `local_date`, `local_year`, `local_month`, `local_day` from `blocks` table. Engine fully UTC. `local_date_to_utc_bounds()` helper computes correct UTC window at query time using the configured timezone. Retroactively corrects wrong-timezone users without data migration.
-
-#### Billing/Usage Stats performance (coupled with timezone)
-Rewrite `calculate_billing_summary_for_period` and `build_day_chart_html` to work on lightweight SQL rows rather than full block dicts reconstructed via `_rows_to_blocks`. Currently ~470ms per chart regeneration. Direct SQL target ~40ms. Both require changes to the data access layer.
-
-#### Carbon accuracy — dropped
-Regional carbon intensity actuals are not available from the NESO API — the `actual`
-field only exists on the national endpoint. The regional endpoint (used by the engine)
-only ever returns `forecast`. Backfilling regional actuals is therefore not possible.
-The forecast values are directionally correct and sufficient for the Insights Carbon tab.
-The `intensity_actual` column remains in the schema but will not be populated.
-
-`_backfill_carbon_gaps` was removed as dead code. Its secondary function of seeding
-`_current_slot_mix` after a restart (so generation mix is stored for blocks finalising
-immediately after startup) is now replaced by a DB seed in `engine_startup` — reads
-the last 4 hours of `generation_mix` rows from the DB. If that seed is empty, an
-immediate `_tick_carbon_intensity` call is made to fetch fresh mix data.
+### 2.10.0 — Sub-meter Boundary Interpolation
 
 #### Sub-meter boundary interpolation
-Apply same pre/post boundary read logic to sub-meters as main meter at block finalise time. Fixes gap block attribution issue (documented in Known Engine Limitation). Requires careful interaction with seed/carry-forward mechanism.
 
-#### Generation mix UI
-- Live Power — stacked bar or donut showing current grid fuel split, updates on CI tick
-- Insights Carbon Summary — period-weighted average generation mix breakdown using `get_generation_mix_for_range()`
+**Problem:** Sub-meters currently use raw reads bracketing the block window rather than interpolated boundary values. The last pre-boundary read is carried as a seed into the next block so no kWh is lost — but it appears in a slightly different block than it should. For a 60-second update device the maximum misalignment per boundary is ~0.12 kWh at 7.4 kW.
 
-#### Usage Insights tab
-New "Usage" tab on the Insights page alongside "Carbon":
-- **Cost breakdown** — total spend split by meter, standing charge as £ and %, effective rate (£/kWh)
-- **Usage patterns** — peak consumption window, highest consumption day, average daily import, self-sufficiency ratio (% of consumption from battery/solar vs grid)
-- **Tariff efficiency** — % of EV/battery charging during cheap rate periods, estimated saving vs peak rate (requires rate sensor history)
+**Key constraint:** This only affects the **distribution** of kWh between adjacent blocks, never the period total. Sub-meter calibration drift (CT clamps, inverter sensors) has the same property — drift shifts costs between device cards and the Direct Import remainder but never changes the billing total. PASS 2 enforces `sum(sub-meters) + remainder = main meter import` at every block.
 
----
+**Design:**
+- Block finalisation writes a **provisional** sub-meter figure when there is no post-boundary read yet
+- The first post-boundary sub-meter read triggers a **retrospective amendment** of the previous block:
+  - Interpolate the sub-meter to the exact boundary using the bracketing pre/post reads
+  - Re-run PASS 2 with the corrected sub-meter figure
+  - Re-write the amended block to the DB
+  - Republish HA sensors with corrected cumulative totals
+- Amendment must not cascade — subsequent blocks already have their own reads and are unaffected
 
-### 2.9.0 — Meter Replacement
-**Theme: Handle real-world meter changes gracefully**
-
-When a physical meter is replaced, cumulative reads reset to zero. The engine clips negative deltas to zero but affected blocks are wrong. Explicit user-triggered correction flow via Billing History with preview and confirmation.
+**Affected code:** `finalise_block` PASS 1 sub-meter path, `_apply_pass2`, `block_store.py` (provisional flag), HA sensor publish.
 
 ---
 
-### 2.10.0 — Gas Meters
+### 2.11.0 — Gas Meters
 **Theme: Whole-home energy tracking**
 
 Extend the engine to support gas meter recording alongside electricity. Requires a design spike — gas uses m³/ft³ with calorific value conversion, different billing periods, and slower sensor updates.
@@ -204,22 +137,21 @@ Extend the engine to support gas meter recording alongside electricity. Requires
 - API versioning
 
 ---
----
 
-## Backlog — Unscheduled Items
+## Backlog — Unscheduled
 
-### Device Decommissioning
-When a physical device (battery, EV charger, heat pump) is replaced or retired, the current
-workflow requires deleting the sub-meter entirely — which destroys all historical data.
+### Bill PDF reader for extended outage backfill
 
-**Required:** A "decommission" option on sub-meter devices that:
-- Stops the engine polling for that meter's entities
-- Retains all historical block data for reporting
-- Marks the meter as inactive in config so it is excluded from live charts but visible in
-  historical billing/usage/carbon views with a clear "decommissioned" label
-- Allows the meter to be reactivated if the same device returns
+When a CAD or HA device fails for weeks, EMT has no data for that window. The only authoritative source is the supplier bill. A PDF reader could parse the bill, extract total kWh and rate period breakdown, and distribute the missing kWh across the gap window using the user's historical consumption pattern. All backfilled blocks would be flagged as bill-derived. Needs a pluggable parser per supplier and careful design to prevent data corruption — no user-typed kWh values.
 
-Workaround in the interim: remove the HA entity sensors from the meter config fields
-(leave the meter in place) — the engine will stop recording new data but history is preserved.
+### Per-device weighted generation mix in Usage Insights
 
----
+The generation mix bar in Carbon Insights shows the grid-wide average for the period. For devices that charge predominantly during specific conditions (e.g. battery charges overnight when the grid is cleaner), a device-specific weighted mix would be more accurate and informative.
+
+### Sub-meter replacement auto-detection
+
+When a device is replaced and reuses the same sensor entity ID, the cumulative read resets to zero. EMT currently relies on the user to retire the old device and add a new one. Auto-detection of a significant mid-block read drop on a sub-meter could prompt the user automatically — similar to the main meter reset detection added in 2.9.0.
+
+### Historical rate correction from bill
+
+Populate missing or incorrect rate data from a supplier PDF — useful when the rate sensor was misconfigured for a period and block costs are wrong even though kWh figures are correct.
