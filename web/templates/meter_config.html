@@ -162,6 +162,43 @@
   </div>
 </div>
 
+<!-- ── Retire Device Modal ────────────────────────────────────────────────── -->
+<div id="retire-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+  <div style="background:var(--surface);border-radius:8px;padding:24px;max-width:420px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.3);">
+    <h3 style="margin:0 0 8px;font-size:16px;">Archive Device</h3>
+    <p style="font-size:13px;color:var(--muted);margin:0 0 16px;">
+      The device will stop recording from the retirement date. All historical data is preserved.
+      The sensors can be reused for a new device after retirement.
+    </p>
+    <div style="margin-bottom:12px;">
+      <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px;">RETIREMENT DATE</label>
+      <input type="date" id="retire-date" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--fg);font-size:13px;box-sizing:border-box;">
+    </div>
+    <div style="margin-bottom:16px;">
+      <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px;">REASON (OPTIONAL)</label>
+      <input type="text" id="retire-reason" placeholder="e.g. Device replaced, EV sold…" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--fg);font-size:13px;box-sizing:border-box;">
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button onclick="closeRetireModal()" class="btn btn-sm">Cancel</button>
+      <button onclick="confirmRetire()" class="btn btn-sm" style="background:var(--accent);color:#000;font-weight:600;">Archive Device</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Unretire Device Modal ──────────────────────────────────────────────── -->
+<div id="unretire-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+  <div style="background:var(--surface);border-radius:8px;padding:24px;max-width:400px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.3);">
+    <h3 style="margin:0 0 8px;font-size:16px;">Resume Recording</h3>
+    <p style="font-size:13px;color:var(--muted);margin:0 0 20px;">
+      This device will resume recording from the next block. The retirement date and reason will be cleared.
+    </p>
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button onclick="closeUnretireModal()" class="btn btn-sm">Cancel</button>
+      <button onclick="confirmUnretire()" class="btn btn-sm" style="background:var(--accent);color:#000;font-weight:600;">Resume Recording</button>
+    </div>
+  </div>
+</div>
+
 <!-- ── Delete Confirmation Modal ─────────────────────────────────────────── -->
 <div id="delete-device-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;overflow-y:auto;">
   <div style="max-width:480px;margin:120px auto;padding:0 16px;">
@@ -598,10 +635,24 @@ function buildSubCard(meterId, meter) {
         (isBattery ? '🔋' : isEV ? '🚗' : isHeatPump ? '♨️' : '⚡') +
         ' ' + esc((meta.device || 'Device').toUpperCase()) + '</span>' +
       '</div>' +
-      '<button class="btn btn-danger btn-sm js-remove-meter" data-meter="' + meterId + '">✕ Remove</button>' +
+      '<div style="display:flex;gap:8px;">' +
+        (meta.retired_at
+          ? '<span style="font-size:11px;background:rgba(249,115,22,0.15);color:#f97316;padding:3px 8px;border-radius:4px;">Retired ' + meta.retired_at + '</span>' +
+            '<button class="btn btn-sm js-unretire-meter" data-meter="' + meterId + '" style="font-size:12px;">↩ Unretire</button>'
+          : '<button class="btn btn-sm js-retire-meter" data-meter="' + meterId + '" style="font-size:12px;color:var(--muted);">Archive</button>') +
+        '<button class="btn btn-danger btn-sm js-remove-meter" data-meter="' + meterId + '">✕ Remove</button>' +
+      '</div>' +
     '</div>' +
 
-    '<div class="info-box">' +
+    (meta.retired_at ? (
+      '<div style="padding:10px 0;font-size:12px;color:var(--muted);">' +
+        '📦 Archived ' + meta.retired_at +
+        (meta.retired_reason ? ' — ' + esc(meta.retired_reason) : '') +
+        '. Historical data is preserved.' +
+      '</div>'
+    ) : '') +
+
+    (!meta.retired_at ? '<div class="info-box">' +
       '<strong>Sub-meter sensor requirements</strong>' +
       '<ul>' +
         '<li>The <strong>read sensor</strong> must be <strong>cumulative kWh (import only)</strong> — not net, not export, not watts</li>' +
@@ -695,7 +746,7 @@ function buildSubCard(meterId, meter) {
         buildEntityInput(meterId+'__import__read', imp.read||'', meterId, 'import', 'read') + '</div>' +
       '<div class="form-group"><label>Rate Sensor ' + (mainImportRate ? '(default: one-time copy from main meter at setup — update here if your sub-meter has a different rate or you retrospectively change rates)' : '') + '</label>' +
         buildEntityInput(meterId+'__import__rate', rateVal, meterId, 'import', 'rate') + '</div>' +
-    '</div>';
+    '</div>' : '');  // end of !meta.retired_at conditional
 
   return div;
 }
@@ -837,6 +888,14 @@ function onContainerChange(e) {
 function onContainerClick(e) {
   var el = e.target.closest('button');
   if (!el) return;
+  if (el.classList.contains('js-retire-meter')) {
+    openRetireModal(el.dataset.meter);
+    return;
+  }
+  if (el.classList.contains('js-unretire-meter')) {
+    openUnretireModal(el.dataset.meter);
+    return;
+  }
   if (el.classList.contains('js-remove-meter')) {
     var mid = el.dataset.meter;
     var mData = config.meters[mid] || {};
@@ -1805,6 +1864,63 @@ function showError(msg) {
   var el = document.getElementById('alert-error');
   el.textContent = '✕ ' + msg;
   el.classList.add('show');
+}
+
+// ── Device retirement ─────────────────────────────────────────────────────
+var _retireMeterId = null;
+
+function openRetireModal(meterId) {
+  _retireMeterId = meterId;
+  var today = new Date().toISOString().split('T')[0];
+  document.getElementById('retire-date').value = today;
+  document.getElementById('retire-reason').value = '';
+  var modal = document.getElementById('retire-modal');
+  modal.style.display = 'flex';
+}
+
+function closeRetireModal() {
+  document.getElementById('retire-modal').style.display = 'none';
+  _retireMeterId = null;
+}
+
+var _unretireMeterId = null;
+
+function openUnretireModal(meterId) {
+  _unretireMeterId = meterId;
+  document.getElementById('unretire-modal').style.display = 'flex';
+}
+
+function closeUnretireModal() {
+  document.getElementById('unretire-modal').style.display = 'none';
+  _unretireMeterId = null;
+}
+
+function confirmUnretire() {
+  if (!_unretireMeterId) return;
+  fetch(BASE_PATH + '/api/meter/' + encodeURIComponent(_unretireMeterId) + '/unretire', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      closeUnretireModal();
+      if (d.ok) { window.location.reload(); }
+      else { alert('Error: ' + (d.error || 'Unknown error')); }
+    });
+}
+
+function confirmRetire() {
+  var date = document.getElementById('retire-date').value;
+  var reason = document.getElementById('retire-reason').value;
+  if (!date) { alert('Please select a retirement date.'); return; }
+  if (!_retireMeterId) return;
+  fetch(BASE_PATH + '/api/meter/' + encodeURIComponent(_retireMeterId) + '/retire', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({retired_at: date, retired_reason: reason})
+  })
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.ok) { closeRetireModal(); window.location.reload(); }
+      else { alert('Error: ' + (d.error || 'Unknown error')); }
+    });
 }
 </script>
 {% endblock %}

@@ -27,9 +27,9 @@ A Home Assistant add-on that records your electricity usage in precise configura
 <table>
   <tr>
     <td align="center" width="33%">
-      <a href="screenshots/billing-chart.png">
-        <img src="screenshots/billing-chart.png" width="240" alt="Billing Chart"><br>
-        <sub><b>Billing Chart</b></sub>
+      <a href="screenshots/live-power.png">
+        <img src="screenshots/live-power.png" width="240" alt="Live Power"><br>
+        <sub><b>Live Power</b></sub>
       </a>
     </td>
     <td align="center" width="33%">
@@ -47,9 +47,9 @@ A Home Assistant add-on that records your electricity usage in precise configura
   </tr>
   <tr>
     <td align="center" width="33%">
-      <a href="screenshots/live-power.png">
-        <img src="screenshots/live-power.png" width="240" alt="Live Power"><br>
-        <sub><b>Live Power</b></sub>
+      <a href="screenshots/billing-chart.png">
+        <img src="screenshots/billing-chart.png" width="240" alt="Billing Chart"><br>
+        <sub><b>Billing Chart</b></sub>
       </a>
     </td>
     <td align="center" width="33%">
@@ -98,6 +98,16 @@ Full documentation is on the **[GitHub Wiki](https://github.com/RGx01/energy-met
 | [Data Management](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Data-Management) | Backups, restore, corrections |
 | [Sensor Requirements](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Sensor-Requirements-and-Known-Limitations) | Sensor types, units, known limitations |
 | [Carbon Intensity](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Carbon-Intensity) | How carbon data is fetched and used |
+
+---
+
+## What's new in 2.9
+
+### 2.9.0
+- **📦 Device retirement** — archive a sub-meter without deleting its history. Use the new **Archive** button on any sub-meter card in Settings → Meter Config. The device stops recording, disappears from Live Power, and its sensor entity IDs are freed for reuse. All historical blocks are preserved and still appear in charts and insights. Retirement can be reversed via **↩ Unretire**.
+- **⏱ 12-hour gap-fill limit** — gaps longer than 12 hours are no longer gap-filled. Previously EMT would interpolate across any gap length, producing misleading data for extended CAD or HA outages. Short gaps (power cuts, brief restarts) still gap-fill as before.
+- **⚠️ Meter reset advisory** — when a gap exceeds 12 hours and the post-gap import read is significantly lower than before, EMT shows an advisory banner suggesting you create a new billing period. Covers meter replacement and moving to a new property.
+- **PDF fix** — Usage Insights PDF no longer shows the carbon comparison narrative at the top of the report.
 
 ---
 
