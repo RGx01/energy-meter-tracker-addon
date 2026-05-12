@@ -549,11 +549,18 @@ def capture_samples(ha: HAClient, block: dict, now: datetime):
     if "meters" not in block:
         block["meters"] = {}
 
+    today_iso = now.strftime("%Y-%m-%d")
     for meter_id, meter_cfg in config.get("meters", {}).items():
+        # Skip retired sub-meters — don't record any reads after retirement date
+        meta = meter_cfg.get("meta", {})
+        if meta.get("sub_meter") and meta.get("retired_at"):
+            if meta["retired_at"] <= today_iso:
+                continue
+
         meter_block = block["meters"].setdefault(
             meter_id, {"meta": {}, "channels": {}, "interpolated": False}
         )
-        meter_block["meta"] = meter_cfg.get("meta", {})
+        meter_block["meta"] = meta
 
         for channel_id, channel_cfg in meter_cfg.get("channels", {}).items():
             channel_block = meter_block["channels"].setdefault(
@@ -702,6 +709,13 @@ def build_gap_blocks(
         for meter_name, meter_cfg in config.get("meters", {}).items():
             meter_meta  = meter_cfg.get("meta", {})
             is_sub      = meter_meta.get("sub_meter", False)
+
+            # Skip retired sub-meters in gap-fill blocks
+            if is_sub and meter_meta.get("retired_at"):
+                window_date = window_start.strftime("%Y-%m-%d")
+                if meter_meta["retired_at"] <= window_date:
+                    continue
+
             meter_block = {
                 "channels": {}, "meta": meter_meta,
                 "interpolated": True, "standing_charge": last_standing_charge,
