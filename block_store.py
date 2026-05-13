@@ -721,6 +721,21 @@ class BlockStore:
                 except Exception:
                     pass  # already exists or table missing — migrate will handle it
 
+        # Clear inverter_possible for all existing meters — feature removed in 2.9.0
+        # All sub-meters now use the protected queue in PASS 2 regardless of this flag
+        try:
+            if "inverter_possible" in [r[1] for r in self._conn.execute(
+                "PRAGMA table_info(meters)"
+            ).fetchall()]:
+                n = self._conn.execute(
+                    "UPDATE meters SET inverter_possible=0 WHERE inverter_possible=1"
+                ).rowcount
+                if n:
+                    self._conn.commit()
+                    logger.info("_ensure_schema: cleared %d inverter_possible flag(s) (deprecated)", n)
+        except Exception:
+            pass
+
         # Create is_gap_seed index only if column exists (deferred for upgrade compat)
         cr_cols = [r[1] for r in self._conn.execute(
             "PRAGMA table_info(current_reads)"

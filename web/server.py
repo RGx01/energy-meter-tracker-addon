@@ -2711,7 +2711,7 @@ def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
                     "imp_kwh": 0.0, "carbon_g": 0.0, "ci_blocks": 0,
                     "ci_imp_kwh": 0.0, "total_blocks": 0,
                     "meter_type": _meter_type(mid, meters_cfg.get(mid, {})),
-                    "inverter_possible": bool(_m_meta.get("inverter_possible")),
+                    # inverter_possible removed — deprecated in 2.9.0
                     "ci_kwh_weighted": 0.0, "ci_kwh_duration": 0.0,
                 }
             sub_totals[mid]["imp_kwh"]      += b_imp

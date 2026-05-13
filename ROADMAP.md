@@ -120,6 +120,10 @@ Usage PDF showing carbon comparison narrative fix.
 
 **Affected code:** `finalise_block` PASS 1 sub-meter path, `_apply_pass2`, `block_store.py` (provisional flag), HA sensor publish.
 
+**2.9.0 context:** PASS 2 now clips live blocks hard — sub-meters can never exceed grid import on a live block. `inverter_possible` was removed so there is only one queue (protected). The amendment path in 2.10.0 is therefore simpler — one queue, already-bounded figures. The just-unretired sub-meter protection (pre_reads removal for last block > 12 hours) handles a separate edge case and does not interact with the boundary interpolation path.
+
+**Note on carbon/mileage:** Sub-meter `carbon_g` uses raw `imp_kwh` (confirmed correct in 2.9.0 — includes solar/battery charged kWh with grid CI as the proxy). The boundary interpolation fix refines `imp_kwh_grid` (cost attribution only). `carbon_g` calculation remains based on raw `imp_kwh` and is unaffected by this fix.
+
 ---
 
 ### 2.11.0 — Gas Meters
@@ -140,9 +144,19 @@ Extend the engine to support gas meter recording alongside electricity. Requires
 
 ## Backlog — Unscheduled
 
-### Bill PDF reader for extended outage backfill
+### Extended outage backfill
 
-When a CAD or HA device fails for weeks, EMT has no data for that window. The only authoritative source is the supplier bill. A PDF reader could parse the bill, extract total kWh and rate period breakdown, and distribute the missing kWh across the gap window using the user's historical consumption pattern. All backfilled blocks would be flagged as bill-derived. Needs a pluggable parser per supplier and careful design to prevent data corruption — no user-typed kWh values.
+When a CAD or HA device fails for weeks, EMT has no data for that window. Several backfill sources are possible, in order of accuracy:
+
+**Supplier API (preferred)** — suppliers with open APIs (e.g. Octopus Energy) can return actual half-hourly consumption data. EMT already stores MPAN in `meter_channels`. This would fill gaps with real data at block resolution, no distribution algorithm needed, and rate data is available from the same API. Pluggable per supplier.
+
+**Supplier PDF bill** — parse the bill to extract total kWh and rate period breakdown, then distribute the missing kWh across the gap window using the user's historical consumption pattern (same time-of-day, same day-of-week from surrounding periods). Less accurate than API data. Needs a pluggable parser per supplier (Octopus, British Gas, EDF etc.) — PDF formats vary significantly.
+
+**Constraints for both approaches:**
+- All backfilled blocks flagged as `interpolated=2` (externally sourced) distinct from live and gap-fill blocks
+- User reviews and confirms the proposed fill before blocks are written
+- No user-typed kWh values — must come from a verified external source to prevent data corruption
+- Sub-meter attribution uses historical device proportions for the gap window
 
 ### Per-device weighted generation mix in Usage Insights
 
