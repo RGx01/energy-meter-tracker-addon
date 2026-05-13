@@ -114,10 +114,7 @@
             <input type="checkbox" id="ad-v2x">
             <label for="ad-v2x">V2X / Vehicle-to-Grid capable — <span style="font-weight:400;color:var(--muted);">shows bidirectional gauge on Live Power (use import-only sensor regardless)</span></label>
           </div>
-          <div class="checkbox-row" style="margin-top:6px;">
-            <input type="checkbox" id="ad-ev-inverter-possible">
-            <label for="ad-ev-inverter-possible">Inverter possible — <span style="font-weight:400;color:var(--muted);">tick if this device uses battery and grid</span></label>
-          </div>
+
         </div>
       </div>
 
@@ -698,15 +695,7 @@ function buildSubCard(meterId, meter) {
           '<label for="v2x-' + meterId + '">V2X / Vehicle-to-Grid capable</label>' +
         '</div></div>'
       : '') +
-    // Inverter possible — EV only (heat pumps cannot generate, batteries auto-set)
-    (isEV
-      ? '<div style="display:flex;gap:24px;margin-bottom:16px;">' +
-          '<div class="checkbox-row">' +
-            '<input type="checkbox" id="inv-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="v2x_capable" ' + (meta.v2x_capable?'checked':'') + '>' +
-            '<label for="inv-' + meterId + '">Inverter possible — <span style="font-weight:400;color:var(--muted);">tick if this device uses battery and grid</span></label>' +
-          '</div>' +
-        '</div>'
-      : '') +
+    // inverter_possible removed in 2.9.0
 
     // SoC sensor and inverter power sensor — only shown for battery type meters
     (isBattery
@@ -1065,8 +1054,7 @@ function addDevice(type) {
   });
   document.getElementById('ad-invert').checked = false;
   document.getElementById('ad-v2x').checked    = false;
-  document.getElementById('ad-ev-inverter-possible').checked = false;
-  document.getElementById('ad-hp-inverter-possible').checked = false;
+  // ad-ev-inverter-possible and ad-hp-inverter-possible removed in 2.9.0
 
   // Pre-fill rate from main meter
   var mainMeters = Object.keys(config.meters||{}).filter(function(k) { return !config.meters[k].meta.sub_meter; });
