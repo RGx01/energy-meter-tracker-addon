@@ -112,7 +112,7 @@
           </div>
           <div class="checkbox-row" style="margin-top:8px;">
             <input type="checkbox" id="ad-v2x">
-            <label for="ad-v2x">V2X / Vehicle-to-Grid capable — <span style="font-weight:400;color:var(--muted);">enables bidirectional gauge</span></label>
+            <label for="ad-v2x">V2X / Vehicle-to-Grid capable — <span style="font-weight:400;color:var(--muted);">shows bidirectional gauge on Live Power (use import-only sensor regardless)</span></label>
           </div>
           <div class="checkbox-row" style="margin-top:6px;">
             <input type="checkbox" id="ad-ev-inverter-possible">
@@ -129,10 +129,7 @@
             <input type="text" id="ad-hp-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="ad-entity" data-field="hp">
             <div id="ad-hp-sensor_drop" class="entity-drop"></div>
           </div>
-          <div class="checkbox-row" style="margin-top:8px;">
-            <input type="checkbox" id="ad-hp-inverter-possible">
-            <label for="ad-hp-inverter-possible">Inverter possible — <span style="font-weight:400;color:var(--muted);">tick if this device uses battery and grid</span></label>
-          </div>
+          
         </div>
       </div>
 
@@ -701,11 +698,11 @@ function buildSubCard(meterId, meter) {
           '<label for="v2x-' + meterId + '">V2X / Vehicle-to-Grid capable</label>' +
         '</div></div>'
       : '') +
-    // Inverter possible — hidden for battery (auto-set), shown for all other types
-    (!isBattery
+    // Inverter possible — EV only (heat pumps cannot generate, batteries auto-set)
+    (isEV
       ? '<div style="display:flex;gap:24px;margin-bottom:16px;">' +
           '<div class="checkbox-row">' +
-            '<input type="checkbox" id="inv-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="inverter_possible" ' + (meta.inverter_possible?'checked':'') + '>' +
+            '<input type="checkbox" id="inv-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="v2x_capable" ' + (meta.v2x_capable?'checked':'') + '>' +
             '<label for="inv-' + meterId + '">Inverter possible — <span style="font-weight:400;color:var(--muted);">tick if this device uses battery and grid</span></label>' +
           '</div>' +
         '</div>'
@@ -1115,7 +1112,7 @@ function confirmAddDevice() {
     meter_type:        type,
     device:            devName,
     parent_meter:      mainMeters[0] || '',
-    inverter_possible: type === 'battery',
+    // inverter_possible removed
   };
 
   if (type === 'battery') {
@@ -1128,11 +1125,11 @@ function confirmAddDevice() {
     var evp = document.getElementById('ad-ev-sensor').value.trim();
     if (evp) meta.device_power_sensor = evp;
     if (document.getElementById('ad-v2x').checked) meta.v2x_capable = true;
-    if (document.getElementById('ad-ev-inverter-possible').checked) meta.inverter_possible = true;
+    // inverter_possible removed
   } else if (type === 'heat_pump') {
     var hpp = document.getElementById('ad-hp-sensor').value.trim();
     if (hpp) meta.device_power_sensor = hpp;
-    if (document.getElementById('ad-hp-inverter-possible').checked) meta.inverter_possible = true;
+
   }
 
   config.meters[id] = {
@@ -1610,7 +1607,7 @@ function wizStepSubSensors() {
             '<small style="color:var(--muted);">Live charger power in W or kW. ⓘ Informational only.</small></div>' +
           '<div class="checkbox-row" style="margin-bottom:16px;">' +
             '<input type="checkbox" id="wiz-sub-' + devId + '-v2x" ' + (sd.v2x_capable ? 'checked' : '') + '>' +
-            '<label for="wiz-sub-' + devId + '-v2x">V2X / Vehicle-to-Grid capable — <span style="font-weight:400;color:var(--muted);">enables bidirectional gauge</span></label>' +
+            '<label for="wiz-sub-' + devId + '-v2x">V2X / Vehicle-to-Grid capable — <span style="font-weight:400;color:var(--muted);">shows bidirectional gauge on Live Power (use import-only sensor regardless)</span></label>' +
           '</div>'
         : devId === 'heat'
         ? '<div class="form-group"><label>Heat Pump Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — shows live kW on Live Power page)</span></label>' +
@@ -1791,9 +1788,9 @@ async function wizApplyAndClose() {
 
   // Build sub-meters
   var devDefaults = {
-    ev:      { inverter_possible: false, v2x_capable: false, meter_type: 'ev' },
-    battery: { inverter_possible: true,  v2x_capable: false, meter_type: 'battery' },
-    heat:    { inverter_possible: false, v2x_capable: false, meter_type: 'heat_pump' },
+    ev:      { v2x_capable: false, meter_type: 'ev' },
+    battery: { v2x_capable: false, meter_type: 'battery' },
+    heat:    { v2x_capable: false, meter_type: 'heat_pump' },
   };
 
   // Find existing sub-meter IDs that match each device type by meter_type field
@@ -1818,7 +1815,7 @@ async function wizApplyAndClose() {
         meter_type:        def.meter_type,
         device:            sd.name || '',
         parent_meter:      mainId,
-        inverter_possible: def.inverter_possible,
+        // inverter_possible removed
         v2x_capable:       def.v2x_capable,
         ...(devId === 'battery' && sd.soc ? { soc_sensor: sd.soc } : {}),
         ...(devId === 'battery' && sd.inverter_power ? { inverter_power_sensor: sd.inverter_power } : {}),

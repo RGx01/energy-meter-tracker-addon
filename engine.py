@@ -71,6 +71,7 @@ def get_and_clear_meter_reset() -> bool:
 
 CHART_DIR          = "/data/energy_meter_tracker"   # accessible from HA /local/
 BLOCK_MINUTES      = 30  # default — overridden at runtime from config
+GAP_FILL_LIMIT_HOURS = 12  # gaps longer than this are not gap-filled
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Module-level state
@@ -977,8 +978,15 @@ def _apply_pass2(block: dict) -> None:
             if not sub_import:
                 continue
             delta = sub_import.get("kwh", 0.0)
-            if meta.get("v2x_capable") and delta < 0:
-                logger.info("PASS 2: %s discharging %.4f kWh (V2X), excluded", meter_name, abs(delta))
+            if delta < 0:
+                # Negative delta on a sub-meter means the sensor is reporting net rather than
+                # cumulative import — which is a misconfiguration. Log and skip rather than
+                # recording negative kWh. The sensor requirement is import-only cumulative.
+                logger.warning(
+                    "PASS 2: %s negative delta %.4f kWh — sub-meter sensor appears to be "
+                    "net rather than cumulative import. Check sensor configuration.",
+                    meter_name, delta
+                )
                 continue
             if delta == 0.0:
                 continue
@@ -986,21 +994,32 @@ def _apply_pass2(block: dict) -> None:
                 "meter_name": meter_name, "meter_block": meter_block,
                 "sub_import": sub_import, "kwh": delta,
             }
-            (protected if not meta.get("inverter_possible", False) else unprotected).append(entry)
+            protected.append(entry)  # all sub-meters are protected (inverter_possible removed)
 
         protected.sort(key=lambda x: x["kwh"], reverse=True)
         unprotected.sort(key=lambda x: x["kwh"], reverse=True)
 
+        is_interpolated = block.get("interpolated", False)
         for entry in protected:
             claimed = min(entry["kwh"], grid_remaining)
             if entry["kwh"] > grid_kwh:
-                logger.warning(
-                    "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
-                    "may be a gap block attribution issue or misconfigured sensor. "
-                    "Recording as-is.",
-                    entry["meter_name"], entry["kwh"], grid_kwh,
-                )
-                claimed = entry["kwh"]  # do not clip — preserve energy
+                if is_interpolated:
+                    # Gap-fill block — preserve energy attribution even if it exceeds
+                    # grid import (gap attribution issues are expected)
+                    logger.warning(
+                        "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
+                        "gap block attribution issue, recording as-is.",
+                        entry["meter_name"], entry["kwh"], grid_kwh,
+                    )
+                    claimed = entry["kwh"]
+                else:
+                    # Live block — clip to grid import (sub-meter cannot exceed grid)
+                    logger.warning(
+                        "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
+                        "clipping to grid import (live block).",
+                        entry["meter_name"], entry["kwh"], grid_kwh,
+                    )
+                    claimed = grid_remaining  # already set to min above
             elif claimed < entry["kwh"]:
                 logger.warning(
                     "PASS 2: %s protected load %.4f kWh clipped to %.4f kWh",
@@ -1019,14 +1038,22 @@ def _apply_pass2(block: dict) -> None:
             claimed    = min(entry["kwh"], grid_remaining)
             battery    = entry["kwh"] - claimed
             if entry["kwh"] > grid_kwh:
-                logger.warning(
-                    "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
-                    "may be a gap block attribution issue or misconfigured sensor. "
-                    "Recording as-is.",
-                    entry["meter_name"], entry["kwh"], grid_kwh,
-                )
-                claimed = entry["kwh"]  # do not clip — preserve energy
-                battery = 0.0
+                if is_interpolated:
+                    logger.warning(
+                        "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
+                        "gap block attribution issue, recording as-is.",
+                        entry["meter_name"], entry["kwh"], grid_kwh,
+                    )
+                    claimed = entry["kwh"]
+                    battery = 0.0
+                else:
+                    logger.warning(
+                        "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
+                        "clipping to grid import (live block).",
+                        entry["meter_name"], entry["kwh"], grid_kwh,
+                    )
+                    # claimed already = min(kwh, grid_remaining) from above
+                    battery = entry["kwh"] - claimed
             grid_remaining = max(grid_remaining - claimed, 0.0)
             entry["sub_import"]["kwh_grid"]    = claimed
             entry["sub_import"]["kwh_battery"] = battery
@@ -1607,7 +1634,7 @@ async def _engine_tick(ha: HAClient):
                         missing_windows[0] if missing_windows else None,
                         missing_windows[-1] if missing_windows else None)
 
-            GAP_FILL_LIMIT_HOURS = 12
+            # GAP_FILL_LIMIT_HOURS defined at module level
             gap_hours = len(missing_windows) * block_minutes / 60.0 if missing_windows else 0.0
 
             if missing_windows and gap_hours > GAP_FILL_LIMIT_HOURS:
@@ -2202,6 +2229,35 @@ async def engine_startup(ha: HAClient):
                 pre_reads, last_rates = extract_last_reads(last_block)
                 logger.info("engine_startup: pre_reads=%s", pre_reads)
                 logger.info("engine_startup: last_rates=%s", last_rates)
+
+                # ── Detect just-unretired sub-meters ─────────────────────
+                # A sub-meter unretired after a long absence has a last block
+                # from days/weeks ago. Including it in pre_reads causes a
+                # massive delta spike on the first resumed block — the engine
+                # tries to reconcile the entire retirement gap in one block.
+                # Fix: remove any sub-meter whose last block is > 12 hours
+                # old from pre_reads so it starts fresh from live reads.
+                for _mid in list(pre_reads.keys()):
+                    if _mid == "electricity_main":
+                        continue
+                    _last_sub = _store._conn.execute(
+                        "SELECT MAX(block_end) as last_end FROM blocks WHERE meter_id=?",
+                        (_mid,)
+                    ).fetchone()
+                    if not _last_sub or not _last_sub["last_end"]:
+                        continue
+                    _last_dt  = datetime.fromisoformat(_last_sub["last_end"])
+                    _now_utc  = datetime.now(timezone.utc).replace(tzinfo=None)
+                    _gap_hrs  = (_now_utc - _last_dt).total_seconds() / 3600
+                    if _gap_hrs > GAP_FILL_LIMIT_HOURS:
+                        logger.warning(
+                            "engine_startup: sub-meter %s last block %.1f hours ago — "
+                            "removing from pre_reads to prevent delta spike on resume "
+                            "(possible unretire or extended absence).",
+                            _mid, _gap_hrs
+                        )
+                        del pre_reads[_mid]
+                        last_rates.pop(_mid, None)
                 # Clear stale reads from before the restart — if we leave them in,
                 # the sub-meter's channel reads will span the restart gap, producing
                 # a false large delta on the first post-restart block (e.g. 10 kWh

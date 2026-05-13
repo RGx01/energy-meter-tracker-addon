@@ -878,11 +878,12 @@ class TestPass2SubMeterExceedsParent(unittest.TestCase):
     a sub-meter delta to span more than one block window.
     """
 
-    def _make_block(self, main_kwh, sub_kwh):
+    def _make_block(self, main_kwh, sub_kwh, interpolated=False):
         """Build a minimal block dict with one sub-meter."""
         return {
             "start": "2026-04-29T00:00:00",
             "end":   "2026-04-29T00:30:00",
+            "interpolated": interpolated,
             "meters": {
                 "electricity_main": {
                     "meta": {"sub_meter": False},
@@ -906,26 +907,33 @@ class TestPass2SubMeterExceedsParent(unittest.TestCase):
         }
 
     def test_warns_when_sub_exceeds_parent(self):
-        """WARNING logged when sub-meter kWh > parent grid import * 1.05."""
+        """WARNING logged when sub-meter kWh > parent grid import."""
         block = self._make_block(main_kwh=3.659, sub_kwh=5.01)
         with self.assertLogs("engine", level="WARNING") as cm:
             engine._apply_pass2(block)
         self.assertTrue(any("EXCEEDS" in line for line in cm.output))
 
-    def test_energy_not_clipped(self):
-        """kwh_grid must equal the raw sub_kwh — no energy lost."""
-        block = self._make_block(main_kwh=3.659, sub_kwh=5.01)
-        import logging
+    def test_live_block_clipped_to_grid(self):
+        """Live block: sub-meter exceeding grid import is clipped to grid import."""
+        block = self._make_block(main_kwh=3.659, sub_kwh=5.01, interpolated=False)
         with self.assertLogs("engine", level="WARNING"):
             engine._apply_pass2(block)
         ev_import = block["meters"]["ev_charger"]["channels"]["import"]
+        # Should be clipped to grid_remaining (= main_kwh = 3.659)
+        self.assertAlmostEqual(ev_import["kwh_grid"], 3.659, places=3)
+
+    def test_gap_block_energy_preserved(self):
+        """Gap (interpolated) block: sub-meter exceeding grid is preserved as-is."""
+        block = self._make_block(main_kwh=3.659, sub_kwh=5.01, interpolated=True)
+        with self.assertLogs("engine", level="WARNING"):
+            engine._apply_pass2(block)
+        ev_import = block["meters"]["ev_charger"]["channels"]["import"]
+        # Should NOT be clipped for gap blocks
         self.assertAlmostEqual(ev_import["kwh_grid"], 5.01, places=4)
 
     def test_no_warning_within_tolerance(self):
-        """No warning when sub-meter is within 5% of parent."""
+        """No warning when sub-meter is within grid import."""
         block = self._make_block(main_kwh=3.659, sub_kwh=3.5)
-        # Should not raise — no WARNING logged
-        import logging
         with self.assertLogs("engine", level="INFO") as cm:
             engine._apply_pass2(block)
         self.assertFalse(any("EXCEEDS" in line for line in cm.output))

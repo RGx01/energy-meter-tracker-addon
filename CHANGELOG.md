@@ -1,24 +1,34 @@
 # Changelog
 
-## [2.9.0] — 2026-05-10
+## [2.9.0] — 2026-05-13
 
 ### Added
 
-- **Device retirement** — sub-meters can now be archived from a specific date without deleting historical data. Use the new **Archive** button on any sub-meter card in Settings → Meter Config. A retirement date and optional reason can be set. Retired devices stop recording, disappear from Live Power, and are excluded from future sensor subscriptions — but all historical blocks are preserved and still appear in charts and insights for periods when they were active. Retirement can be reversed via the **↩ Unretire** button.
+- **Device retirement** — sub-meters can be archived from a specific date without deleting historical data. Use the **Archive** button on any sub-meter card in Settings → Meter Config. Retired devices stop recording, disappear from Live Power, and their sensor entity IDs are freed for reuse by a replacement device. The engine skips retired meters in `capture_samples` and `build_gap_blocks` from the retirement date onward. Retirement is reversible via **↩ Unretire** — with a conflict check that prevents unretiring a device whose sensors are already in use by an active meter.
 
-- **Sensor reuse after retirement** — retiring a sub-meter frees its sensor entity IDs for use on a new sub-meter. Add the replacement device via the normal Add Device flow; EMT treats the two meters as independent.
+- **12-hour gap-fill limit** — gaps longer than 12 hours are no longer gap-filled. Short gaps (power cuts, brief restarts) still gap-fill as before. Extended outages (CAD failure, HA device failure) are correctly left as absent data rather than fabricated interpolation. `GAP_FILL_LIMIT_HOURS = 12` is a module-level constant applied consistently to both the `engine_startup` immediate gap-fill path and the `_engine_tick` deferred gap-fill path.
 
-- **12-hour gap-fill limit** — gap-fill is now skipped for session gaps longer than 12 hours. Previously EMT would interpolate across any gap length, producing misleading kWh and cost data for extended outages (CAD failure, HA device failure). Gaps within 12 hours still gap-fill as before. For gaps beyond 12 hours the first resumed block calculates its delta from the post-gap reads directly — correct by definition, with no fabricated data.
+- **Meter reset advisory** — when a gap exceeds 12 hours and the post-gap import read is significantly lower than the pre-gap read (> 50 kWh drop), an orange advisory banner suggests creating a new billing period. Covers meter replacement and moving to a new property. Banner is dismissible for the browser session. Flag is reset at the start of every `engine_startup` call so reconnects never carry stale state.
 
-- **Meter reset detection** — when a gap exceeds 12 hours and the post-gap import read is significantly lower than the pre-gap read (> 50 kWh drop), EMT displays an advisory banner suggesting the user create a new billing period. This covers meter replacement at the current address and moving to a new property — both produce a multi-day HAN re-pairing gap followed by a near-zero cumulative read. The banner is dismissible and shown once per browser session.
+- **Just-unretired sub-meter protection** — when a sub-meter is unretired after a long absence, the engine detects this (last block > 12 hours old) and removes the sub-meter from `pre_reads` on startup, preventing the entire retirement-period accumulation from being dumped into the first resumed block.
 
 ### Fixed
 
-- **PDF export — Usage tab showing carbon comparison narrative** — the carbon comparison panel (`cmp-panel`) lives inside the Carbon Insights container and was being incorrectly captured in Usage PDF exports, causing the carbon comparison bullets to appear at the top of Usage reports. Usage PDF now captures only the eight `ucard-*` elements directly.
+- **PDF export — Usage tab showing carbon comparison narrative** — the carbon comparison panel (`cmp-panel`) lives inside the Carbon Insights container and was being incorrectly captured in Usage PDF exports. Usage PDF now captures only the eight `ucard-*` elements directly.
 
-- **Meter reset advisory banner — always visible** — the CSS rule hiding the banner by default (`display:none`) was missing, causing the banner to always appear regardless of whether a reset had been detected. Fixed.
+### Changed
 
-- **Meter reset advisory banner — stale flag on reconnect** — the `_meter_reset_detected` flag was not cleared between engine reconnects within the same process, causing a false positive advisory after HA WebSocket reconnection. Flag is now reset at the start of every `engine_startup` call.
+- **PASS 2 — live blocks clip to grid import** — when a sub-meter's kWh exceeds the parent grid import on a live block, it is now clipped to the actual grid import. Gap-fill blocks (`interpolated=True`) retain the previous preserve-as-is behaviour since attribution across a gap is expected to be imperfect.
+
+- **PASS 2 — sub-meter negative delta** — a negative delta on a sub-meter indicates the read sensor is reporting net rather than cumulative import (a misconfiguration). PASS 2 now logs a WARNING and skips the block.
+
+- **`inverter_possible` removed** — the flag had no meaningful effect on energy attribution. All sub-meters use the protected queue in PASS 2. The column is retained in the DB schema for backward compatibility but always written as 0. A startup migration clears any existing `inverter_possible=1` flags.
+
+- **V2X checkbox** — now clearly documented as affecting only the Live Power gauge direction (bidirectional vs unidirectional). No effect on kWh recording or cost attribution. Sub-meter sensors must always be cumulative import only regardless of V2X capability.
+
+- **EV Insights — "AC from grid" relabelled to "AC delivered"** — the figure includes all energy delivered to the vehicle regardless of source (grid, solar, battery). Carbon is calculated using grid CI as the proxy for all sources, consistent with the export offset methodology.
+
+- **Sub-meter carbon uses raw `imp_kwh`** — Carbon Insights EV and battery cards use the raw device sensor reading (before PASS 2 clipping) for carbon and mileage calculations. Grid cost remains clipped. Solar or battery charged sessions contribute correctly to mileage estimates even though their grid cost is zero.
 
 ---
 
