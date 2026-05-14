@@ -3650,3 +3650,73 @@ class TestDeviceRetirement(unittest.TestCase):
         ).fetchone()
         # Should NOT be retired (is_sub_meter = 0)
         self.assertIsNone(row['retired_at'])
+
+    def test_retire_clears_current_reads(self):
+        """retire_meter deletes current_reads entries for the retired meter."""
+        # Seed some current_reads entries for the sub-meter
+        self.store._conn.execute(
+            """INSERT INTO current_reads
+               (captured_at, meter_id, channel, channel_type, value, standing_charge, is_gap_seed)
+               VALUES ('2026-05-01T12:00:00', 'ev_charger', 'import', 'read', 100.0, 0.0, 0)"""
+        )
+        self.store._conn.execute(
+            """INSERT INTO current_reads
+               (captured_at, meter_id, channel, channel_type, value, standing_charge, is_gap_seed)
+               VALUES ('2026-05-01T12:00:00', 'ev_charger', 'import', 'rate', 0.30, None, 0)"""
+        )
+        self.store._conn.commit()
+
+        # Verify they exist before retirement
+        count_before = self.store._conn.execute(
+            "SELECT COUNT(*) FROM current_reads WHERE meter_id='ev_charger'"
+        ).fetchone()[0]
+        self.assertEqual(count_before, 2)
+
+        # Retire the meter
+        self.store.retire_meter('ev_charger', '2026-05-01')
+
+        # current_reads should be cleared for this meter
+        count_after = self.store._conn.execute(
+            "SELECT COUNT(*) FROM current_reads WHERE meter_id='ev_charger'"
+        ).fetchone()[0]
+        self.assertEqual(count_after, 0)
+
+    def test_load_current_block_skips_retired_meter_reads(self):
+        """load_current_block does not include reads for retired meters."""
+        import json
+        from datetime import datetime, timezone
+
+        # Seed a current_block with a retirement date in the past
+        self.store._conn.execute(
+            """INSERT OR REPLACE INTO current_block
+               (id, block_start, block_end, last_checkpoint, interpolated)
+               VALUES (1, '2026-05-01T12:00:00', '2026-05-01T12:30:00',
+                       '2026-05-01T12:00:00', 0)"""
+        )
+        # Write current_reads for both an active meter and a retired meter
+        self.store._conn.execute(
+            """INSERT INTO current_reads
+               (captured_at, meter_id, channel, channel_type, value, standing_charge, is_gap_seed)
+               VALUES ('2026-05-01T12:00:00', 'electricity_main', 'import', 'read', 1000.0, 0.5, 0)"""
+        )
+        self.store._conn.execute(
+            """INSERT INTO current_reads
+               (captured_at, meter_id, channel, channel_type, value, standing_charge, is_gap_seed)
+               VALUES ('2026-05-01T12:00:00', 'ev_charger', 'import', 'rate', 0.30, None, 0)"""
+        )
+        self.store._conn.commit()
+
+        # Retire the EV meter before the block date
+        self.store.retire_meter('ev_charger', '2026-04-30')
+
+        # Re-seed the rate entry (retire_meter clears current_reads, so add it back to test loading)
+        self.store._conn.execute(
+            """INSERT INTO current_reads
+               (captured_at, meter_id, channel, channel_type, value, standing_charge, is_gap_seed)
+               VALUES ('2026-05-01T12:00:00', 'ev_charger', 'import', 'rate', 0.30, None, 0)"""
+        )
+        self.store._conn.commit()
+
+        cb = self.store.load_current_block()
+        self.assertIn('electricity_main', cb.get('meters', {}))
+        self.assertNotIn('ev_charger', cb.get('meters', {}))

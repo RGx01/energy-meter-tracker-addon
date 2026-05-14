@@ -862,12 +862,19 @@ class BlockStore:
         return [{"captured_at": ca, "fuels": slots[ca]} for ca in order]
 
     def retire_meter(self, meter_id: str, retired_at: str, retired_reason: str = "") -> None:
-        """Mark a sub-meter as retired from the given date. Historical data is preserved."""
+        """Mark a sub-meter as retired from the given date. Historical data is preserved.
+        Also clears any stale current_reads entries so the engine does not record
+        cost/rate data for the retired meter after this point."""
         with self._conn:
             self._conn.execute(
                 """UPDATE meters SET retired_at = ?, retired_reason = ?
                    WHERE meter_id = ? AND is_sub_meter = 1""",
                 (retired_at, retired_reason or None, meter_id)
+            )
+            # Clear live read/rate accumulation for this meter
+            self._conn.execute(
+                "DELETE FROM current_reads WHERE meter_id = ?",
+                (meter_id,)
             )
 
     def unretire_meter(self, meter_id: str) -> None:
@@ -1533,8 +1540,23 @@ class BlockStore:
             else:
                 meter_rates[mid][ch].append(entry)
 
+        # Get retirement dates for all meters so we can filter stale reads
+        _retired = {}
+        try:
+            for _r in self._conn.execute(
+                "SELECT meter_id, retired_at FROM meters WHERE retired_at IS NOT NULL"
+            ).fetchall():
+                _retired[_r["meter_id"]] = _r["retired_at"]
+        except Exception:
+            pass
+
+        _block_date = (row["block_start"] or "")[:10]  # YYYY-MM-DD
+
         all_meter_ids = set(list(meter_reads.keys()) + list(meter_rates.keys()))
         for mid in all_meter_ids:
+            # Skip retired sub-meters — don't load their stale reads back into the block
+            if mid in _retired and _retired[mid] <= _block_date:
+                continue
             channels = {}
             for ch in set(list(meter_reads[mid].keys()) + list(meter_rates[mid].keys())):
                 channels[ch] = {
