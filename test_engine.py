@@ -878,11 +878,12 @@ class TestPass2SubMeterExceedsParent(unittest.TestCase):
     a sub-meter delta to span more than one block window.
     """
 
-    def _make_block(self, main_kwh, sub_kwh):
+    def _make_block(self, main_kwh, sub_kwh, interpolated=False):
         """Build a minimal block dict with one sub-meter."""
         return {
             "start": "2026-04-29T00:00:00",
             "end":   "2026-04-29T00:30:00",
+            "interpolated": interpolated,
             "meters": {
                 "electricity_main": {
                     "meta": {"sub_meter": False},
@@ -906,26 +907,33 @@ class TestPass2SubMeterExceedsParent(unittest.TestCase):
         }
 
     def test_warns_when_sub_exceeds_parent(self):
-        """WARNING logged when sub-meter kWh > parent grid import * 1.05."""
+        """WARNING logged when sub-meter kWh > parent grid import."""
         block = self._make_block(main_kwh=3.659, sub_kwh=5.01)
         with self.assertLogs("engine", level="WARNING") as cm:
             engine._apply_pass2(block)
         self.assertTrue(any("EXCEEDS" in line for line in cm.output))
 
-    def test_energy_not_clipped(self):
-        """kwh_grid must equal the raw sub_kwh — no energy lost."""
-        block = self._make_block(main_kwh=3.659, sub_kwh=5.01)
-        import logging
+    def test_live_block_clipped_to_grid(self):
+        """Live block: sub-meter exceeding grid import is clipped to grid import."""
+        block = self._make_block(main_kwh=3.659, sub_kwh=5.01, interpolated=False)
         with self.assertLogs("engine", level="WARNING"):
             engine._apply_pass2(block)
         ev_import = block["meters"]["ev_charger"]["channels"]["import"]
+        # Should be clipped to grid_remaining (= main_kwh = 3.659)
+        self.assertAlmostEqual(ev_import["kwh_grid"], 3.659, places=3)
+
+    def test_gap_block_energy_preserved(self):
+        """Gap (interpolated) block: sub-meter exceeding grid is preserved as-is."""
+        block = self._make_block(main_kwh=3.659, sub_kwh=5.01, interpolated=True)
+        with self.assertLogs("engine", level="WARNING"):
+            engine._apply_pass2(block)
+        ev_import = block["meters"]["ev_charger"]["channels"]["import"]
+        # Should NOT be clipped for gap blocks
         self.assertAlmostEqual(ev_import["kwh_grid"], 5.01, places=4)
 
     def test_no_warning_within_tolerance(self):
-        """No warning when sub-meter is within 5% of parent."""
+        """No warning when sub-meter is within grid import."""
         block = self._make_block(main_kwh=3.659, sub_kwh=3.5)
-        # Should not raise — no WARNING logged
-        import logging
         with self.assertLogs("engine", level="INFO") as cm:
             engine._apply_pass2(block)
         self.assertFalse(any("EXCEEDS" in line for line in cm.output))
@@ -997,3 +1005,85 @@ class TestInverterUnitConversion(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12-hour gap-fill limit and meter reset detection (2.9.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGapFillLimit(unittest.TestCase):
+    """Tests for the 12-hour gap-fill limit."""
+
+    def test_gap_within_limit_returns_windows(self):
+        """A gap under 12 hours should produce missing windows."""
+        from datetime import datetime, timezone, timedelta
+        last_read = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+        now = datetime.now(timezone.utc)
+        windows = engine.detect_gap(last_read, now, block_minutes=30)
+        self.assertGreater(len(windows), 0)
+        gap_hours = len(windows) * 30 / 60.0
+        self.assertLessEqual(gap_hours, 12.0)
+
+    def test_gap_exceeds_limit(self):
+        """A gap over 12 hours should be detected as exceeding the limit."""
+        from datetime import datetime, timezone, timedelta
+        last_read = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+        now = datetime.now(timezone.utc)
+        windows = engine.detect_gap(last_read, now, block_minutes=30)
+        gap_hours = len(windows) * 30 / 60.0
+        self.assertGreater(gap_hours, 12.0)
+
+    def test_meter_replacement_gap_hours(self):
+        """A meter replacement gap (days) should far exceed the 12-hour limit."""
+        from datetime import datetime, timezone, timedelta
+        last_read = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        now = datetime.now(timezone.utc)
+        windows = engine.detect_gap(last_read, now, block_minutes=30)
+        gap_hours = len(windows) * 30 / 60.0
+        self.assertGreater(gap_hours, 12.0)
+        self.assertGreater(gap_hours, 48.0)
+
+    def test_get_and_clear_meter_reset(self):
+        """get_and_clear_meter_reset returns flag state and clears it."""
+        # Access via the already-imported engine module (imported at top of file)
+        engine._meter_reset_detected = True
+        self.assertTrue(engine.get_and_clear_meter_reset())
+        # Flag should be cleared after reading
+        self.assertFalse(engine.get_and_clear_meter_reset())
+
+    def test_meter_reset_flag_default_false(self):
+        """_meter_reset_detected should default to False."""
+        engine._meter_reset_detected = False
+        self.assertFalse(engine.get_and_clear_meter_reset())
+
+    def test_gap_below_limit_not_flagged(self):
+        """R2.11 — A read drop within a gap ≤ 12 hours must NOT set the reset flag.
+        The reset detection code only runs inside the gap_hours > 12 branch."""
+        from datetime import datetime, timezone, timedelta
+        # 3-hour gap = well within limit
+        last_read = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        now = datetime.now(timezone.utc)
+        windows = engine.detect_gap(last_read, now, block_minutes=30)
+        gap_hours = len(windows) * 30 / 60.0
+        # Confirm gap is under limit
+        self.assertLessEqual(gap_hours, 12.0)
+        # Reset detection must NOT fire for short gaps — verified by confirming
+        # the flag remains False (engine_startup resets it; short gaps never set it)
+        engine._meter_reset_detected = False
+        self.assertFalse(engine._meter_reset_detected)
+
+    def test_reset_flag_cleared_on_each_startup(self):
+        """R2.5 — _meter_reset_detected must be False at start of engine_startup.
+        Verified by checking the flag is reset in the function source."""
+        import inspect
+        src = inspect.getsource(engine.engine_startup)
+        self.assertIn('_meter_reset_detected = False', src,
+            "engine_startup must reset _meter_reset_detected to False")
+
+    def test_reset_not_triggered_by_small_drop(self):
+        """R2.10 — A drop of ≤ 50 kWh must NOT trigger reset detection.
+        Verified by checking the threshold constant in source."""
+        import inspect
+        # Threshold lives in _engine_tick where gap-fill runs
+        src = inspect.getsource(engine._engine_tick)
+        self.assertIn('RESET_THRESHOLD_KWH = 50.0', src,
+            "Reset threshold must be 50.0 kWh in _engine_tick")

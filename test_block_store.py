@@ -3524,3 +3524,199 @@ class TestMixHistory(unittest.TestCase):
         finally:
             if os.path.exists(tmp):
                 os.remove(tmp)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Device retirement (2.9.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDeviceRetirement(unittest.TestCase):
+    """Tests for sub-meter retirement functionality."""
+
+    def setUp(self):
+        self.store = BlockStore(":memory:")
+        # Add a config period and a sub-meter
+        with self.store._conn:
+            self.store._conn.execute(
+                "INSERT INTO config_periods (billing_day, block_minutes, timezone, "
+                "currency_symbol, currency_code, effective_from) "
+                "VALUES (1, 30, 'UTC', '£', 'GBP', '2026-01-01')"
+            )
+            cp_id = self.store._conn.execute(
+                "SELECT id FROM config_periods LIMIT 1"
+            ).fetchone()[0]
+            self.store._conn.execute(
+                "INSERT INTO meters (config_period_id, meter_id, is_sub_meter, "
+                "device_label, meter_type) VALUES (?, 'ev_charger', 1, 'Zappi', 'ev')",
+                (cp_id,)
+            )
+
+    def test_retire_meter_sets_retired_at(self):
+        """retire_meter sets the retired_at date on the meter."""
+        self.store.retire_meter('ev_charger', '2026-05-01', 'EV sold')
+        row = self.store._conn.execute(
+            "SELECT retired_at, retired_reason FROM meters WHERE meter_id='ev_charger'"
+        ).fetchone()
+        self.assertEqual(row['retired_at'], '2026-05-01')
+        self.assertEqual(row['retired_reason'], 'EV sold')
+
+    def test_unretire_meter_clears_retired_at(self):
+        """unretire_meter clears retired_at and retired_reason."""
+        self.store.retire_meter('ev_charger', '2026-05-01')
+        self.store.unretire_meter('ev_charger')
+        row = self.store._conn.execute(
+            "SELECT retired_at FROM meters WHERE meter_id='ev_charger'"
+        ).fetchone()
+        self.assertIsNone(row['retired_at'])
+
+    def test_is_meter_retired_before_date(self):
+        """is_meter_retired returns False before the retirement date."""
+        self.store.retire_meter('ev_charger', '2026-06-01')
+        self.assertFalse(self.store.is_meter_retired('ev_charger', as_of='2026-05-31'))
+
+    def test_is_meter_retired_on_date(self):
+        """is_meter_retired returns True on and after the retirement date."""
+        self.store.retire_meter('ev_charger', '2026-05-01')
+        self.assertTrue(self.store.is_meter_retired('ev_charger', as_of='2026-05-01'))
+        self.assertTrue(self.store.is_meter_retired('ev_charger', as_of='2026-12-31'))
+
+    def test_is_meter_retired_not_retired(self):
+        """is_meter_retired returns False for an active meter."""
+        self.assertFalse(self.store.is_meter_retired('ev_charger'))
+
+    def test_get_retired_meters(self):
+        """get_retired_meters returns only meters with retirement dates."""
+        self.store.retire_meter('ev_charger', '2026-05-01', 'EV sold')
+        retired = self.store.get_retired_meters()
+        self.assertEqual(len(retired), 1)
+        self.assertEqual(retired[0]['meter_id'], 'ev_charger')
+        self.assertEqual(retired[0]['retired_at'], '2026-05-01')
+
+    def test_get_retired_meters_empty(self):
+        """get_retired_meters returns empty list when no meters are retired."""
+        retired = self.store.get_retired_meters()
+        self.assertEqual(retired, [])
+
+    def test_unretire_raises_on_sensor_conflict(self):
+        """unretire_meter raises ValueError if the sensor is already in use by an active meter."""
+        cp_id = self.store._conn.execute(
+            "SELECT id FROM config_periods LIMIT 1"
+        ).fetchone()[0]
+        # Add a second active sub-meter using the same read_sensor
+        self.store._conn.execute(
+            "INSERT INTO meters (config_period_id, meter_id, is_sub_meter, device_label, meter_type) "
+            "VALUES (?, 'ev_charger_2', 1, 'Zappi 2', 'ev')", (cp_id,)
+        )
+        # Give both meters the same read_sensor in meter_channels
+        m1_id = self.store._conn.execute(
+            "SELECT id FROM meters WHERE meter_id='ev_charger'"
+        ).fetchone()[0]
+        m2_id = self.store._conn.execute(
+            "SELECT id FROM meters WHERE meter_id='ev_charger_2'"
+        ).fetchone()[0]
+        self.store._conn.execute(
+            "INSERT OR REPLACE INTO meter_channels (meter_id, channel, read_sensor) "
+            "VALUES (?, 'import', 'sensor.zappi_kwh')", (m1_id,)
+        )
+        self.store._conn.execute(
+            "INSERT OR REPLACE INTO meter_channels (meter_id, channel, read_sensor) "
+            "VALUES (?, 'import', 'sensor.zappi_kwh')", (m2_id,)
+        )
+        self.store._conn.commit()
+
+        # Retire ev_charger
+        self.store.retire_meter('ev_charger', '2026-05-01')
+        # ev_charger_2 is active and using the same sensor
+        # Attempting to unretire ev_charger should raise ValueError
+        with self.assertRaises(ValueError) as ctx:
+            self.store.unretire_meter('ev_charger')
+        self.assertIn('sensor.zappi_kwh', str(ctx.exception))
+        self.assertIn('ev_charger_2', str(ctx.exception))
+
+    def test_retire_only_affects_sub_meters(self):
+        """retire_meter only updates sub-meters (is_sub_meter=1)."""
+        # Add a main meter
+        cp_id = self.store._conn.execute(
+            "SELECT id FROM config_periods LIMIT 1"
+        ).fetchone()[0]
+        self.store._conn.execute(
+            "INSERT INTO meters (config_period_id, meter_id, is_sub_meter) "
+            "VALUES (?, 'electricity_main', 0)", (cp_id,)
+        )
+        # Try to retire it
+        self.store.retire_meter('electricity_main', '2026-05-01')
+        row = self.store._conn.execute(
+            "SELECT retired_at FROM meters WHERE meter_id='electricity_main'"
+        ).fetchone()
+        # Should NOT be retired (is_sub_meter = 0)
+        self.assertIsNone(row['retired_at'])
+
+    def test_retire_clears_current_reads(self):
+        """retire_meter deletes current_reads entries for the retired meter."""
+        # Seed some current_reads entries for the sub-meter
+        self.store._conn.execute(
+            """INSERT INTO current_reads
+               (captured_at, meter_id, channel, channel_type, value, standing_charge, is_gap_seed)
+               VALUES ('2026-05-01T12:00:00', 'ev_charger', 'import', 'read', 100.0, 0.0, 0)"""
+        )
+        self.store._conn.execute(
+            """INSERT INTO current_reads
+               (captured_at, meter_id, channel, channel_type, value, standing_charge, is_gap_seed)
+               VALUES ('2026-05-01T12:00:00', 'ev_charger', 'import', 'rate', 0.30, None, 0)"""
+        )
+        self.store._conn.commit()
+
+        # Verify they exist before retirement
+        count_before = self.store._conn.execute(
+            "SELECT COUNT(*) FROM current_reads WHERE meter_id='ev_charger'"
+        ).fetchone()[0]
+        self.assertEqual(count_before, 2)
+
+        # Retire the meter
+        self.store.retire_meter('ev_charger', '2026-05-01')
+
+        # current_reads should be cleared for this meter
+        count_after = self.store._conn.execute(
+            "SELECT COUNT(*) FROM current_reads WHERE meter_id='ev_charger'"
+        ).fetchone()[0]
+        self.assertEqual(count_after, 0)
+
+    def test_load_current_block_skips_retired_meter_reads(self):
+        """load_current_block does not include reads for retired meters."""
+        import json
+        from datetime import datetime, timezone
+
+        # Seed a current_block with a retirement date in the past
+        self.store._conn.execute(
+            """INSERT OR REPLACE INTO current_block
+               (id, block_start, block_end, last_checkpoint, interpolated)
+               VALUES (1, '2026-05-01T12:00:00', '2026-05-01T12:30:00',
+                       '2026-05-01T12:00:00', 0)"""
+        )
+        # Write current_reads for both an active meter and a retired meter
+        self.store._conn.execute(
+            """INSERT INTO current_reads
+               (captured_at, meter_id, channel, channel_type, value, standing_charge, is_gap_seed)
+               VALUES ('2026-05-01T12:00:00', 'electricity_main', 'import', 'read', 1000.0, 0.5, 0)"""
+        )
+        self.store._conn.execute(
+            """INSERT INTO current_reads
+               (captured_at, meter_id, channel, channel_type, value, standing_charge, is_gap_seed)
+               VALUES ('2026-05-01T12:00:00', 'ev_charger', 'import', 'rate', 0.30, None, 0)"""
+        )
+        self.store._conn.commit()
+
+        # Retire the EV meter before the block date
+        self.store.retire_meter('ev_charger', '2026-04-30')
+
+        # Re-seed the rate entry (retire_meter clears current_reads, so add it back to test loading)
+        self.store._conn.execute(
+            """INSERT INTO current_reads
+               (captured_at, meter_id, channel, channel_type, value, standing_charge, is_gap_seed)
+               VALUES ('2026-05-01T12:00:00', 'ev_charger', 'import', 'rate', 0.30, None, 0)"""
+        )
+        self.store._conn.commit()
+
+        cb = self.store.load_current_block()
+        self.assertIn('electricity_main', cb.get('meters', {}))
+        self.assertNotIn('ev_charger', cb.get('meters', {}))

@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS meters (
     soc_sensor         TEXT,               -- HA entity_id for battery SoC % (informational)
     inverter_power_sensor TEXT,            -- HA entity_id for inverter power W/kW (informational)
     device_power_sensor TEXT,              -- HA entity_id for EV/heat pump power W/kW (informational)
+    retired_at          TEXT,              -- ISO date from which this meter is retired (NULL = active)
+    retired_reason      TEXT,              -- optional note e.g. "Device replaced", "Moved property"
     FOREIGN KEY (config_period_id) REFERENCES config_periods(id),
     UNIQUE (config_period_id, meter_id)
 );
@@ -445,6 +447,10 @@ def _row_to_block(rows: list[sqlite3.Row]) -> dict:
                     meta["inverter_power_invert"] = True
                 if row["device_power_sensor"]:
                     meta["device_power_sensor"] = row["device_power_sensor"]
+                if row["retired_at"]:
+                    meta["retired_at"] = row["retired_at"]
+                if row["retired_reason"]:
+                    meta["retired_reason"] = row["retired_reason"]
             except IndexError:
                 pass  # older DB without these columns
         except IndexError:
@@ -700,6 +706,8 @@ class BlockStore:
             ("soc_sensor",           "meters",         "TEXT",               _m_cols),
             ("inverter_power_sensor","meters",         "TEXT",               _m_cols),
             ("device_power_sensor",  "meters",         "TEXT",               _m_cols),
+            ("retired_at",            "meters",         "TEXT",               _m_cols),
+            ("retired_reason",        "meters",         "TEXT",               _m_cols),
             ("supplier",              "config_periods",  "TEXT",              _cp_cols),
             ("mpan",             "meter_channels",  "TEXT",              _mc_cols),
             ("tariff",           "meter_channels",  "TEXT",              _mc_cols),
@@ -712,6 +720,21 @@ class BlockStore:
                     self._conn.commit()
                 except Exception:
                     pass  # already exists or table missing — migrate will handle it
+
+        # Clear inverter_possible for all existing meters — feature removed in 2.9.0
+        # All sub-meters now use the protected queue in PASS 2 regardless of this flag
+        try:
+            if "inverter_possible" in [r[1] for r in self._conn.execute(
+                "PRAGMA table_info(meters)"
+            ).fetchall()]:
+                n = self._conn.execute(
+                    "UPDATE meters SET inverter_possible=0 WHERE inverter_possible=1"
+                ).rowcount
+                if n:
+                    self._conn.commit()
+                    logger.info("_ensure_schema: cleared %d inverter_possible flag(s) (deprecated)", n)
+        except Exception:
+            pass
 
         # Create is_gap_seed index only if column exists (deferred for upgrade compat)
         cr_cols = [r[1] for r in self._conn.execute(
@@ -837,6 +860,72 @@ class BlockStore:
                 order.append(ca)
             slots[ca][r["fuel"]] = r["perc"]
         return [{"captured_at": ca, "fuels": slots[ca]} for ca in order]
+
+    def retire_meter(self, meter_id: str, retired_at: str, retired_reason: str = "") -> None:
+        """Mark a sub-meter as retired from the given date. Historical data is preserved.
+        Also clears any stale current_reads entries so the engine does not record
+        cost/rate data for the retired meter after this point."""
+        with self._conn:
+            self._conn.execute(
+                """UPDATE meters SET retired_at = ?, retired_reason = ?
+                   WHERE meter_id = ? AND is_sub_meter = 1""",
+                (retired_at, retired_reason or None, meter_id)
+            )
+            # Clear live read/rate accumulation for this meter
+            self._conn.execute(
+                "DELETE FROM current_reads WHERE meter_id = ?",
+                (meter_id,)
+            )
+
+    def unretire_meter(self, meter_id: str) -> None:
+        """Clear retirement status from a sub-meter.
+        Raises ValueError if any active meter already uses the same read sensor."""
+        # Check for sensor conflicts with active (non-retired) meters
+        conflicts = self._conn.execute(
+            """SELECT m.meter_id, mc.read_sensor
+               FROM meters m
+               JOIN meter_channels mc ON mc.meter_id = m.id
+               WHERE m.retired_at IS NULL
+                 AND m.meter_id != ?
+                 AND mc.read_sensor IN (
+                     SELECT mc2.read_sensor FROM meter_channels mc2
+                     JOIN meters m2 ON m2.id = mc2.meter_id
+                     WHERE m2.meter_id = ?
+                       AND mc2.read_sensor IS NOT NULL
+                 )""",
+            (meter_id, meter_id)
+        ).fetchall()
+        if conflicts:
+            sensors = ", ".join(set(r["read_sensor"] for r in conflicts))
+            meters  = ", ".join(set(r["meter_id"]   for r in conflicts))
+            raise ValueError(
+                f"Cannot unretire — sensor(s) {sensors} already in use by active meter(s): {meters}. "
+                f"Retire or reconfigure the conflicting meter first."
+            )
+        with self._conn:
+            self._conn.execute(
+                "UPDATE meters SET retired_at = NULL, retired_reason = NULL WHERE meter_id = ?",
+                (meter_id,)
+            )
+
+    def get_retired_meters(self) -> list:
+        """Return all meters with a retirement date set."""
+        rows = self._conn.execute(
+            """SELECT meter_id, device_label, meter_type, retired_at, retired_reason
+               FROM meters WHERE retired_at IS NOT NULL ORDER BY retired_at DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def is_meter_retired(self, meter_id: str, as_of: str | None = None) -> bool:
+        """Return True if the meter is retired as of the given date (default: today)."""
+        from datetime import datetime, timezone
+        check_date = as_of or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        row = self._conn.execute(
+            "SELECT retired_at FROM meters WHERE meter_id = ?", (meter_id,)
+        ).fetchone()
+        if not row or row["retired_at"] is None:
+            return False
+        return row["retired_at"] <= check_date
 
     def upsert_generation_mix(self, block_id: int, mix: list[dict]) -> None:
         """
@@ -1451,8 +1540,23 @@ class BlockStore:
             else:
                 meter_rates[mid][ch].append(entry)
 
+        # Get retirement dates for all meters so we can filter stale reads
+        _retired = {}
+        try:
+            for _r in self._conn.execute(
+                "SELECT meter_id, retired_at FROM meters WHERE retired_at IS NOT NULL"
+            ).fetchall():
+                _retired[_r["meter_id"]] = _r["retired_at"]
+        except Exception:
+            pass
+
+        _block_date = (row["block_start"] or "")[:10]  # YYYY-MM-DD
+
         all_meter_ids = set(list(meter_reads.keys()) + list(meter_rates.keys()))
         for mid in all_meter_ids:
+            # Skip retired sub-meters — don't load their stale reads back into the block
+            if mid in _retired and _retired[mid] <= _block_date:
+                continue
             channels = {}
             for ch in set(list(meter_reads[mid].keys()) + list(meter_rates[mid].keys())):
                 channels[ch] = {
@@ -1621,7 +1725,9 @@ class BlockStore:
                        soc_sensor              = excluded.soc_sensor,
                        inverter_power_sensor   = excluded.inverter_power_sensor,
                        inverter_power_invert   = excluded.inverter_power_invert,
-                       device_power_sensor     = excluded.device_power_sensor""",
+                       device_power_sensor     = excluded.device_power_sensor,
+                       retired_at              = COALESCE(meters.retired_at, excluded.retired_at),
+                       retired_reason          = COALESCE(meters.retired_reason, excluded.retired_reason)""",
                 (period_id, meter_id, is_sub, parent, device,
                  protected, inv_poss, power_s, postcode, v2x,
                  meter_type, soc_s, inv_pwr_s, inv_invert, dev_pwr_s)
@@ -1708,6 +1814,10 @@ class BlockStore:
                     meta["inverter_power_invert"] = True
                 if m["device_power_sensor"]:
                     meta["device_power_sensor"] = m["device_power_sensor"]
+                if m["retired_at"]:
+                    meta["retired_at"] = m["retired_at"]
+                if m["retired_reason"]:
+                    meta["retired_reason"] = m["retired_reason"]
             except IndexError:
                 pass
 
