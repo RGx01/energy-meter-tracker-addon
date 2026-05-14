@@ -3720,3 +3720,176 @@ class TestDeviceRetirement(unittest.TestCase):
         cb = self.store.load_current_block()
         self.assertIn('electricity_main', cb.get('meters', {}))
         self.assertNotIn('ev_charger', cb.get('meters', {}))
+
+class TestProvisionalBlocks(unittest.TestCase):
+    """Tests for 2.10.0 imp_provisional column and get_provisional_sub_meter_blocks."""
+
+    def setUp(self):
+        self.store = BlockStore(":memory:")
+        with self.store._conn:
+            self.store._conn.execute(
+                "INSERT INTO config_periods (billing_day, block_minutes, timezone, "
+                "currency_symbol, currency_code, effective_from) "
+                "VALUES (1, 30, 'UTC', '£', 'GBP', '2026-01-01')"
+            )
+            cp_id = self.store._conn.execute(
+                "SELECT id FROM config_periods LIMIT 1"
+            ).fetchone()[0]
+            self.store._conn.execute(
+                "INSERT INTO meters (config_period_id, meter_id, is_sub_meter, "
+                "device_label, meter_type) "
+                "VALUES (?, 'electricity_main', 0, 'Main', 'electricity')",
+                (cp_id,)
+            )
+            self.store._conn.execute(
+                "INSERT INTO meters (config_period_id, meter_id, is_sub_meter, "
+                "parent_meter_id, device_label, meter_type) "
+                "VALUES (?, 'ev_charger', 1, 'electricity_main', 'Zappi', 'ev')",
+                (cp_id,)
+            )
+
+    def _make_block(self, provisional=False,
+                    block_start="2026-05-01T09:00:00",
+                    block_end="2026-05-01T09:30:00"):
+        ev_mb = {
+            "meta": {"sub_meter": True, "parent_meter": "electricity_main"},
+            "channels": {
+                "import": {
+                    "kwh": 0.5, "kwh_grid": 0.5, "rate": 0.30,
+                    "cost": 0.15, "read_start": 100.0, "read_end": 100.5,
+                },
+            },
+            "standing_charge": 0.0,
+        }
+        if provisional:
+            ev_mb["provisional"] = True
+        return {
+            "start": block_start, "end": block_end,
+            "interpolated": False,
+            "meters": {
+                "electricity_main": {
+                    "meta": {"sub_meter": False},
+                    "channels": {
+                        "import": {
+                            "kwh": 2.0, "kwh_remainder": 1.5,
+                            "rate": 0.30, "cost": 0.60,
+                            "cost_remainder": 0.45,
+                            "read_start": 1000.0, "read_end": 1002.0,
+                        },
+                        "export": {
+                            "kwh": 0.0, "rate": 0.12, "cost": 0.0,
+                            "read_start": 0.0, "read_end": 0.0,
+                        },
+                    },
+                    "standing_charge": 0.45,
+                },
+                "ev_charger": ev_mb,
+            },
+        }
+
+    # ── schema ────────────────────────────────────────────────────────────────
+
+    def test_imp_provisional_column_exists(self):
+        """imp_provisional column must exist on the blocks table."""
+        cols = [row[1] for row in self.store._conn.execute(
+            "PRAGMA table_info(blocks)"
+        ).fetchall()]
+        self.assertIn("imp_provisional", cols)
+
+    def test_imp_provisional_default_zero(self):
+        """imp_provisional defaults to 0 for a non-provisional block."""
+        self.store.append_block(self._make_block(provisional=False))
+        row = self.store._conn.execute(
+            "SELECT imp_provisional FROM blocks WHERE meter_id='ev_charger'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], 0)
+
+    def test_imp_provisional_set_to_one(self):
+        """imp_provisional is stored as 1 for a provisional block."""
+        self.store.append_block(self._make_block(provisional=True))
+        row = self.store._conn.execute(
+            "SELECT imp_provisional FROM blocks WHERE meter_id='ev_charger'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], 1)
+
+    def test_main_meter_never_provisional(self):
+        """Main meter rows always have imp_provisional=0 regardless of sub-meter flag."""
+        self.store.append_block(self._make_block(provisional=True))
+        row = self.store._conn.execute(
+            "SELECT imp_provisional FROM blocks WHERE meter_id='electricity_main'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], 0)
+
+    # ── get_provisional_sub_meter_blocks ──────────────────────────────────────
+
+    def test_returns_empty_when_no_provisional_blocks(self):
+        """Returns empty list when no provisional sub-meter blocks exist."""
+        self.store.append_block(self._make_block(provisional=False))
+        result = self.store.get_provisional_sub_meter_blocks()
+        self.assertEqual(result, [])
+
+    def test_returns_provisional_block(self):
+        """Returns the provisional block with provisional=True on the meter."""
+        self.store.append_block(self._make_block(provisional=True))
+        result = self.store.get_provisional_sub_meter_blocks()
+        self.assertEqual(len(result), 1)
+        ev = result[0]["meters"].get("ev_charger")
+        self.assertIsNotNone(ev)
+        self.assertTrue(ev.get("provisional"))
+
+    def test_returns_only_most_recent_provisional_per_meter(self):
+        """Returns only the most recent provisional block per sub-meter."""
+        blk1 = self._make_block(provisional=True,
+                                 block_start="2026-05-01T09:00:00",
+                                 block_end="2026-05-01T09:30:00")
+        blk2 = self._make_block(provisional=True,
+                                 block_start="2026-05-01T09:30:00",
+                                 block_end="2026-05-01T10:00:00")
+        self.store.append_block(blk1)
+        self.store.append_block(blk2)
+        result = self.store.get_provisional_sub_meter_blocks()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["start"], "2026-05-01T09:30:00")
+
+    def test_amendment_clears_provisional_flag(self):
+        """append_block_replace with provisional=False clears imp_provisional."""
+        self.store.append_block(self._make_block(provisional=True))
+        # Confirm it's provisional
+        self.assertEqual(len(self.store.get_provisional_sub_meter_blocks()), 1)
+        # Amend — same block, provisional cleared
+        self.store.append_block_replace(self._make_block(provisional=False))
+        self.assertEqual(len(self.store.get_provisional_sub_meter_blocks()), 0)
+
+    def test_row_to_block_sets_provisional_true(self):
+        """Loading a provisional block from DB sets meter_block['provisional']=True."""
+        self.store.append_block(self._make_block(provisional=True))
+        import datetime
+        blocks = self.store.get_blocks_for_range(
+            datetime.datetime(2026, 5, 1, 9, 0),
+            datetime.datetime(2026, 5, 1, 9, 30),
+        )
+        self.assertTrue(blocks)
+        ev = blocks[0]["meters"].get("ev_charger")
+        self.assertIsNotNone(ev)
+        self.assertTrue(ev.get("provisional"))
+
+    def test_row_to_block_no_provisional_key_when_false(self):
+        """Loading a non-provisional block does not set provisional key."""
+        self.store.append_block(self._make_block(provisional=False))
+        import datetime
+        blocks = self.store.get_blocks_for_range(
+            datetime.datetime(2026, 5, 1, 9, 0),
+            datetime.datetime(2026, 5, 1, 9, 30),
+        )
+        self.assertTrue(blocks)
+        ev = blocks[0]["meters"].get("ev_charger")
+        self.assertIsNotNone(ev)
+        self.assertFalse(ev.get("provisional", False))
+
+    def test_returns_empty_when_no_provisional_blocks_exist_at_all(self):
+        """get_provisional_sub_meter_blocks returns [] on a fresh store."""
+        result = self.store.get_provisional_sub_meter_blocks()
+        self.assertEqual(result, [])

@@ -1,5 +1,32 @@
 # Changelog
 
+## [2.10.0] — 2026-05-14
+
+### Added
+
+- **Sub-meter boundary interpolation** — sub-meter blocks that were written without a post-boundary read are now retrospectively corrected when the post-boundary read arrives in the next engine tick (typically within 10 seconds of block close).
+
+  Previously, when a 60-second sub-meter sensor hadn't fired by the time the block boundary was reached, the provisional kWh figure used the last pre-boundary read as the closing value. The corrected figure is now calculated by linearly interpolating the sub-meter value to the exact block boundary using the bracketing pre- and post-boundary reads, matching the boundary interpolation already applied to the main meter.
+
+  The maximum misalignment per boundary on a 60-second sensor running at 7.4 kW is ~0.12 kWh — this fix eliminates that misalignment.
+
+  **Key properties:**
+  - Only the **distribution** between adjacent blocks is corrected — the period total is conserved.
+  - PASS 2 (`sum(sub-meters) + remainder = main meter import`) is re-run after each amendment so the corrected sub-meter figure is always grid-authoritative.
+  - Amendment is **non-cascading** — only the immediately-previous block is touched. Subsequent blocks already have their own reads and are unaffected.
+  - Gap-fill (interpolated) blocks are **excluded** from provisional marking — only live blocks are amended.
+  - Sub-meter `carbon_g` is calculated from raw `imp_kwh` and is unaffected by this fix.
+
+- **`imp_provisional` column in `blocks` table** — a new `INTEGER NOT NULL DEFAULT 0` column flags sub-meter blocks written without a post-boundary read. Cleared to 0 on amendment. Existing databases are upgraded automatically on first start (incremental migration, no data loss).
+
+- **`BlockStore.get_provisional_sub_meter_blocks()`** — returns the most-recent provisional sub-meter block per sub-meter, used by the amendment path in `_engine_tick`.
+
+### Tests
+
+- **17 new tests** covering provisional flag detection in `finalise_block`, `imp_provisional` round-trip through the DB, amendment triggering, boundary interpolation correctness, PASS 2 re-run, cost consistency, period-total conservation, and no-op behaviour when the post-boundary read has not yet arrived. Total: **122 tests passing**.
+
+---
+
 ## [2.9.0] — 2026-05-13
 
 ### Added
