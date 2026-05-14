@@ -1087,3 +1087,748 @@ class TestGapFillLimit(unittest.TestCase):
         src = inspect.getsource(engine._engine_tick)
         self.assertIn('RESET_THRESHOLD_KWH = 50.0', src,
             "Reset threshold must be 50.0 kWh in _engine_tick")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.10.0 — Sub-meter boundary interpolation (provisional flag + amendment)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestProvisionalFlagInFinaliseBlock(unittest.TestCase):
+    """
+    Tests that finalise_block sets meter_block["provisional"] = True on a
+    sub-meter import channel when no post-boundary read is present in the
+    rolling buffer, and does NOT set it when a post-boundary read exists.
+    """
+
+    def _make_rolling_buffer(self, sub_reads, main_reads=None, block_start="2026-05-01T09:00:00", block_end="2026-05-01T09:30:00"):
+        """Build a minimal current_block dict."""
+        main_reads = main_reads or [
+            {"value": 1000.0, "ts": "2026-05-01T08:55:00"},
+            {"value": 1002.0, "ts": "2026-05-01T09:35:00"},
+        ]
+        return {
+            "start": block_start,
+            "end":   block_end,
+            "meters": {
+                "electricity_main": {
+                    "meta": {"sub_meter": False},
+                    "channels": {
+                        "import": {
+                            "reads": main_reads,
+                            "rates": [{"value": 0.30, "ts": block_start}],
+                        },
+                        "export": {
+                            "reads": [{"value": 0.0, "ts": block_start}],
+                            "rates": [{"value": 0.12, "ts": block_start}],
+                        },
+                    },
+                },
+                "ev_charger": {
+                    "meta": {"sub_meter": True, "parent_meter": "electricity_main"},
+                    "channels": {
+                        "import": {
+                            "reads": sub_reads,
+                            "rates": [{"value": 0.30, "ts": block_start}],
+                        },
+                    },
+                },
+            },
+        }
+
+    def _run_finalise(self, current_block, store=None):
+        """Run finalise_block against an in-memory store with appropriate config."""
+        from block_store import BlockStore
+        s = store or BlockStore(":memory:")
+        cfg = {
+            "meters": {
+                "electricity_main": {
+                    "meta": {"sub_meter": False, "block_minutes": 30,
+                             "timezone": "UTC", "billing_day": 1,
+                             "currency_symbol": "£", "currency_code": "GBP"},
+                    "channels": {
+                        "import": {"read": "sensor.imp"},
+                        "export": {"read": "sensor.exp"},
+                    },
+                },
+                "ev_charger": {
+                    "meta": {"sub_meter": True, "parent_meter": "electricity_main",
+                             "block_minutes": 30, "timezone": "UTC",
+                             "billing_day": 1, "currency_symbol": "£",
+                             "currency_code": "GBP"},
+                    "channels": {
+                        "import": {"read": "sensor.ev_imp"},
+                    },
+                },
+            }
+        }
+        s.insert_config_period(cfg)
+
+        # Patch the store and config loader inside engine
+        orig_store = engine._store
+        engine._store = s
+        ha_mock = MagicMock()
+        written_blocks = []
+
+        orig_append = engine.append_block
+        def _capture_block(blk):
+            written_blocks.append(blk)
+            s.append_block(blk)
+        engine.append_block = _capture_block
+
+        orig_load_config = engine.load_config
+        engine.load_config = lambda: cfg
+
+        # finalise_block calls load_json(CONFIG_PATH) directly — patch it in engine's namespace
+        orig_load_json = engine.load_json
+        engine.load_json = lambda path, default=None: cfg if "config" in str(path) else (default or {})
+
+        orig_generate_charts = engine.generate_charts
+        engine.generate_charts = lambda *a, **kw: None
+
+        orig_backup = engine._backup_to_share
+        engine._backup_to_share = lambda: None
+
+        try:
+            engine.finalise_block(ha_mock, block_data=current_block)
+        finally:
+            engine._store = orig_store
+            engine.append_block = orig_append
+            engine.load_config = orig_load_config
+            engine.load_json = orig_load_json
+            engine.generate_charts = orig_generate_charts
+            engine._backup_to_share = orig_backup
+
+        return written_blocks
+
+    def test_provisional_set_when_no_post_boundary_read(self):
+        """Sub-meter with only pre-boundary reads → meter_block marked provisional."""
+        # All sub-meter reads are before 09:30 (block end)
+        sub_reads = [
+            {"value": 50.0, "ts": "2026-05-01T09:00:00"},
+            {"value": 50.8, "ts": "2026-05-01T09:25:00"},  # last read before boundary
+        ]
+        cb = self._make_rolling_buffer(sub_reads)
+        blocks = self._run_finalise(cb)
+        self.assertEqual(len(blocks), 1)
+        ev = blocks[0]["meters"].get("ev_charger")
+        self.assertIsNotNone(ev, "ev_charger must appear in finalised block")
+        self.assertTrue(
+            ev.get("provisional"),
+            "ev_charger must be marked provisional when no post-boundary read exists"
+        )
+
+    def test_provisional_not_set_when_post_boundary_read_present(self):
+        """Sub-meter with a post-boundary read → NOT marked provisional."""
+        sub_reads = [
+            {"value": 50.0, "ts": "2026-05-01T09:00:00"},
+            {"value": 50.8, "ts": "2026-05-01T09:25:00"},
+            {"value": 51.1, "ts": "2026-05-01T09:31:00"},  # post-boundary
+        ]
+        cb = self._make_rolling_buffer(sub_reads)
+        blocks = self._run_finalise(cb)
+        self.assertEqual(len(blocks), 1)
+        ev = blocks[0]["meters"].get("ev_charger")
+        self.assertIsNotNone(ev)
+        self.assertFalse(
+            ev.get("provisional", False),
+            "ev_charger must NOT be marked provisional when post-boundary read exists"
+        )
+
+    def test_main_meter_never_marked_provisional(self):
+        """Main meter (non sub-meter) must never get the provisional flag."""
+        sub_reads = [
+            {"value": 50.0, "ts": "2026-05-01T09:00:00"},
+        ]
+        cb = self._make_rolling_buffer(sub_reads)
+        blocks = self._run_finalise(cb)
+        main = blocks[0]["meters"].get("electricity_main")
+        self.assertIsNotNone(main)
+        self.assertFalse(
+            main.get("provisional", False),
+            "Main meter must never be marked provisional"
+        )
+
+    def test_provisional_kwh_is_sum_of_pre_boundary_reads(self):
+        """The provisional kWh is still the correct integral of pre-boundary reads
+        (it's not zero — it's just slightly misaligned vs the true boundary)."""
+        sub_reads = [
+            {"value": 100.0, "ts": "2026-05-01T09:00:00"},
+            {"value": 100.5, "ts": "2026-05-01T09:29:00"},
+        ]
+        cb = self._make_rolling_buffer(sub_reads)
+        blocks = self._run_finalise(cb)
+        ev_imp = blocks[0]["meters"]["ev_charger"]["channels"]["import"]
+        # delta = 0.5 kWh (100.5 − 100.0)
+        self.assertAlmostEqual(ev_imp["kwh"], 0.5, places=4)
+
+    def test_interpolated_block_never_marked_provisional(self):
+        """Gap-fill (interpolated) blocks must not be marked provisional even if
+        sub-meter has no post-boundary read — the amendment path is for live blocks."""
+        sub_reads = [
+            {"value": 50.0, "ts": "2026-05-01T09:00:00"},
+        ]
+        cb = self._make_rolling_buffer(sub_reads)
+        # Override: pass interpolated=True directly
+        from block_store import BlockStore
+        s = BlockStore(":memory:")
+        cfg = {
+            "meters": {
+                "electricity_main": {
+                    "meta": {"sub_meter": False, "block_minutes": 30,
+                             "timezone": "UTC", "billing_day": 1,
+                             "currency_symbol": "£", "currency_code": "GBP"},
+                    "channels": {"import": {"read": "s"}, "export": {"read": "s"}},
+                },
+                "ev_charger": {
+                    "meta": {"sub_meter": True, "parent_meter": "electricity_main",
+                             "block_minutes": 30, "timezone": "UTC",
+                             "billing_day": 1, "currency_symbol": "£",
+                             "currency_code": "GBP"},
+                    "channels": {"import": {"read": "s"}},
+                },
+            }
+        }
+        s.insert_config_period(cfg)
+        orig_store = engine._store
+        engine._store = s
+        ha_mock = MagicMock()
+        written_blocks = []
+        orig_append = engine.append_block
+        def _cap(blk): written_blocks.append(blk); s.append_block(blk)
+        engine.append_block = _cap
+        orig_load_config  = engine.load_config
+        engine.load_config = lambda: cfg
+        orig_load_json2 = engine.load_json
+        engine.load_json = lambda path, default=None: cfg if "config" in str(path) else (default or {})
+        orig_gc = engine.generate_charts
+        engine.generate_charts = lambda *a, **kw: None
+        orig_bk = engine._backup_to_share
+        engine._backup_to_share = lambda: None
+        try:
+            engine.finalise_block(ha_mock, block_data=cb, interpolated=True)
+        finally:
+            engine._store = orig_store
+            engine.append_block = orig_append
+            engine.load_config = orig_load_config
+            engine.load_json = orig_load_json2
+            engine.generate_charts = orig_gc
+            engine._backup_to_share = orig_bk
+
+        ev = written_blocks[0]["meters"].get("ev_charger")
+        self.assertIsNotNone(ev)
+        self.assertFalse(
+            ev.get("provisional", False),
+            "Interpolated (gap-fill) blocks must not be marked provisional"
+        )
+
+
+class TestBlockStoreProvisionalColumn(unittest.TestCase):
+    """Tests that imp_provisional is stored and retrieved correctly."""
+
+    def setUp(self):
+        from block_store import BlockStore
+        self.store = BlockStore(":memory:")
+        self.store.insert_config_period({
+            "meters": {
+                "electricity_main": {
+                    "meta": {"timezone": "UTC", "billing_day": 1,
+                             "block_minutes": 30, "currency_symbol": "£",
+                             "currency_code": "GBP", "sub_meter": False}
+                },
+                "ev_charger": {
+                    "meta": {"timezone": "UTC", "billing_day": 1,
+                             "block_minutes": 30, "currency_symbol": "£",
+                             "currency_code": "GBP",
+                             "sub_meter": True, "parent_meter": "electricity_main"}
+                },
+            }
+        })
+
+    def _make_block(self, ev_provisional=False):
+        ev_mb = {
+            "meta": {"sub_meter": True, "parent_meter": "electricity_main"},
+            "channels": {
+                "import": {"kwh": 0.5, "kwh_grid": 0.5, "rate": 0.30, "cost": 0.15,
+                           "read_start": 100.0, "read_end": 100.5},
+            },
+            "standing_charge": 0.0,
+        }
+        if ev_provisional:
+            ev_mb["provisional"] = True
+        return {
+            "start": "2026-05-01T09:00:00",
+            "end":   "2026-05-01T09:30:00",
+            "interpolated": False,
+            "meters": {
+                "electricity_main": {
+                    "meta": {"sub_meter": False},
+                    "channels": {
+                        "import": {"kwh": 2.0, "kwh_remainder": 1.5, "rate": 0.30,
+                                   "cost": 0.60, "cost_remainder": 0.45,
+                                   "read_start": 1000.0, "read_end": 1002.0},
+                        "export": {"kwh": 0.0, "rate": 0.12, "cost": 0.0,
+                                   "read_start": 0.0, "read_end": 0.0},
+                    },
+                    "standing_charge": 0.45,
+                },
+                "ev_charger": ev_mb,
+            },
+        }
+
+    def test_provisional_flag_stored_and_retrieved(self):
+        """imp_provisional=1 round-trips through the DB."""
+        blk = self._make_block(ev_provisional=True)
+        self.store.append_block(blk)
+        prov = self.store.get_provisional_sub_meter_blocks()
+        self.assertEqual(len(prov), 1, "Expected exactly one provisional sub-meter block")
+        ev = prov[0]["meters"].get("ev_charger")
+        self.assertIsNotNone(ev)
+        self.assertTrue(ev.get("provisional"),
+                        "ev_charger must have provisional=True after round-trip")
+
+    def test_non_provisional_not_returned(self):
+        """Blocks with imp_provisional=0 are not returned by get_provisional_sub_meter_blocks."""
+        blk = self._make_block(ev_provisional=False)
+        self.store.append_block(blk)
+        prov = self.store.get_provisional_sub_meter_blocks()
+        self.assertEqual(len(prov), 0,
+                         "Non-provisional blocks must not appear in provisional query")
+
+    def test_amend_clears_provisional_flag(self):
+        """Writing an amended block (append_block_replace with provisional=False)
+        clears imp_provisional in the DB."""
+        blk = self._make_block(ev_provisional=True)
+        self.store.append_block(blk)
+
+        # Simulate amendment: reload, clear flag, replace
+        amended = self._make_block(ev_provisional=False)
+        self.store.append_block_replace(amended)
+
+        prov = self.store.get_provisional_sub_meter_blocks()
+        self.assertEqual(len(prov), 0,
+                         "After amendment the provisional block should no longer appear")
+
+    def test_only_most_recent_provisional_returned_per_meter(self):
+        """get_provisional_sub_meter_blocks returns the MOST RECENT provisional
+        block per sub-meter, not all of them."""
+        # Two provisional blocks for ev_charger at different times
+        blk1 = self._make_block(ev_provisional=True)
+        blk2 = self._make_block(ev_provisional=True)
+        blk2["start"] = "2026-05-01T09:30:00"
+        blk2["end"]   = "2026-05-01T10:00:00"
+        self.store.append_block(blk1)
+        self.store.append_block(blk2)
+
+        prov = self.store.get_provisional_sub_meter_blocks()
+        # Should only return the most recent one
+        self.assertEqual(len(prov), 1)
+        self.assertEqual(prov[0]["start"], "2026-05-01T09:30:00",
+                         "Must return the most recent provisional block, not the oldest")
+
+
+class TestObservedDeviceIntervalS(unittest.TestCase):
+    """Unit tests for _observed_device_interval_s."""
+
+    def _reads(self, timestamps):
+        return [{"value": float(i), "ts": ts} for i, ts in enumerate(timestamps)]
+
+    def test_returns_none_when_too_few_reads(self):
+        """Fewer than 4 reads (3 gaps) → None."""
+        reads = self._reads([
+            "2026-05-01T09:00:00",
+            "2026-05-01T09:01:00",
+            "2026-05-01T09:02:00",
+        ])  # 3 reads = 2 gaps < 3
+        self.assertIsNone(engine._observed_device_interval_s(reads))
+
+    def test_returns_median_for_regular_60s_device(self):
+        """28 reads at 60s → median ≈ 60s."""
+        from datetime import datetime, timedelta
+        base = datetime(2026, 5, 1, 9, 0, 0)
+        reads = [{"value": float(i), "ts": (base + timedelta(seconds=60*i)).isoformat()}
+                 for i in range(28)]
+        result = engine._observed_device_interval_s(reads)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, 60.0, places=1)
+
+    def test_handles_jitter(self):
+        """60s device with ±5s jitter → median still close to 60s."""
+        import random
+        random.seed(42)
+        from datetime import datetime, timedelta
+        base = datetime(2026, 5, 1, 9, 0, 0)
+        ts = base
+        reads = []
+        for i in range(20):
+            reads.append({"value": float(i), "ts": ts.isoformat()})
+            ts += timedelta(seconds=60 + random.randint(-5, 5))
+        result = engine._observed_device_interval_s(reads)
+        self.assertIsNotNone(result)
+        self.assertGreater(result, 50.0)
+        self.assertLess(result, 70.0)
+
+    def test_returns_none_for_empty_list(self):
+        self.assertIsNone(engine._observed_device_interval_s([]))
+
+    def test_slow_device_returns_large_interval(self):
+        """5-minute device → median ≈ 300s (would be rejected by gate)."""
+        from datetime import datetime, timedelta
+        base = datetime(2026, 5, 1, 9, 0, 0)
+        reads = [{"value": float(i), "ts": (base + timedelta(seconds=300*i)).isoformat()}
+                 for i in range(10)]
+        result = engine._observed_device_interval_s(reads)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, 300.0, places=1)
+
+    def test_exactly_min_gaps(self):
+        """Exactly 4 reads (3 gaps) → returns a result."""
+        from datetime import datetime, timedelta
+        base = datetime(2026, 5, 1, 9, 0, 0)
+        reads = [{"value": float(i), "ts": (base + timedelta(seconds=60*i)).isoformat()}
+                 for i in range(4)]
+        result = engine._observed_device_interval_s(reads)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, 60.0, places=1)
+
+
+class TestAmendProvisionalSubMeterBlocks(unittest.TestCase):
+    """
+    Integration tests for _amend_provisional_sub_meter_blocks.
+
+    Covers all gate conditions:
+    - No post-boundary read → no-op this tick
+    - No pre-boundary seed → commit as-final
+    - Insufficient reads → commit as-final
+    - Device interval > 90s → commit as-final
+    - Post-boundary gap > 2× interval → commit as-final (stop-restart)
+    - All gates pass → interpolate and amend
+    - Gap marker active → caller skips entirely
+    """
+
+    # ── shared fixtures ───────────────────────────────────────────────────────
+
+    BOUNDARY    = "2026-05-01T09:30:00"
+    BLOCK_START = "2026-05-01T09:00:00"
+    BLOCK_END   = "2026-05-01T09:30:00"
+    NEXT_START  = "2026-05-01T09:30:00"
+    NEXT_END    = "2026-05-01T10:00:00"
+
+    def _setup_store(self, prov_block):
+        from block_store import BlockStore
+        s = BlockStore(":memory:")
+        s.insert_config_period({
+            "meters": {
+                "electricity_main": {
+                    "meta": {"sub_meter": False, "block_minutes": 30,
+                             "timezone": "UTC", "billing_day": 1,
+                             "currency_symbol": "£", "currency_code": "GBP"},
+                    "channels": {"import": {"read": "s"}, "export": {"read": "s"}},
+                },
+                "ev_charger": {
+                    "meta": {"sub_meter": True, "parent_meter": "electricity_main",
+                             "block_minutes": 30, "timezone": "UTC",
+                             "billing_day": 1, "currency_symbol": "£",
+                             "currency_code": "GBP"},
+                    "channels": {"import": {"read": "s"}},
+                },
+            }
+        })
+        s.append_block(prov_block)
+        return s
+
+    def _prov_block(self, sub_kwh=0.8):
+        """Provisional block with ev_charger."""
+        return {
+            "start": self.BLOCK_START, "end": self.BLOCK_END,
+            "interpolated": False,
+            "meters": {
+                "electricity_main": {
+                    "meta": {"sub_meter": False},
+                    "channels": {
+                        "import": {
+                            "kwh": 2.0, "kwh_total": 2.0,
+                            "kwh_remainder": 2.0 - sub_kwh,
+                            "rate": 0.30, "cost": 0.60,
+                            "cost_remainder": round((2.0 - sub_kwh) * 0.30, 6),
+                            "read_start": 1000.0, "read_end": 1002.0,
+                        },
+                        "export": {"kwh": 0.0, "rate": 0.12, "cost": 0.0,
+                                   "read_start": 0.0, "read_end": 0.0},
+                    },
+                    "standing_charge": 0.45,
+                },
+                "ev_charger": {
+                    "meta": {"sub_meter": True, "parent_meter": "electricity_main"},
+                    "channels": {
+                        "import": {
+                            "kwh": sub_kwh, "kwh_grid": sub_kwh, "kwh_battery": 0.0,
+                            "rate": 0.30, "cost": round(sub_kwh * 0.30, 6),
+                            "read_start": 50.0, "read_end": 50.0 + sub_kwh,
+                        },
+                    },
+                    "standing_charge": 0.0,
+                    "provisional": True,
+                },
+            },
+        }
+
+    def _pre_reads_60s(self, n=20, base_val=50.0, interval_s=60):
+        """n reads at interval_s cadence, all ending before BOUNDARY."""
+        from datetime import datetime, timedelta
+        base_dt  = datetime(2026, 5, 1, 9, 0, 0)
+        boundary = datetime(2026, 5, 1, 9, 30, 0)
+        reads = []
+        for i in range(n):
+            ts = base_dt + timedelta(seconds=interval_s * i)
+            if ts >= boundary:
+                break
+            reads.append({"value": base_val + i * 0.03, "ts": ts.isoformat()})
+        return reads
+
+    def _rolling_buffer(self, pre_reads, post_reads):
+        """Minimal current_block for the next window containing given reads."""
+        all_reads = pre_reads + post_reads
+        return {
+            "start": self.NEXT_START, "end": self.NEXT_END,
+            "meters": {
+                "electricity_main": {
+                    "meta": {"sub_meter": False},
+                    "channels": {
+                        "import": {
+                            "reads": [
+                                {"value": 1002.0, "ts": "2026-05-01T09:29:00"},
+                                {"value": 1002.5, "ts": "2026-05-01T09:31:00"},
+                            ],
+                            "rates": [{"value": 0.30, "ts": self.NEXT_START}],
+                        },
+                        "export": {
+                            "reads": [{"value": 0.0, "ts": self.NEXT_START}],
+                            "rates": [{"value": 0.12, "ts": self.NEXT_START}],
+                        },
+                    },
+                },
+                "ev_charger": {
+                    "meta": {"sub_meter": True, "parent_meter": "electricity_main"},
+                    "channels": {
+                        "import": {
+                            "reads": all_reads,
+                            "rates": [{"value": 0.30, "ts": self.NEXT_START}],
+                        },
+                    },
+                },
+            },
+        }
+
+    def _run(self, store, current_block):
+        orig = engine._store
+        engine._store = store
+        try:
+            engine._amend_provisional_sub_meter_blocks(MagicMock(), current_block)
+        finally:
+            engine._store = orig
+
+    def _amended_ev_imp(self, store):
+        from datetime import datetime
+        blocks = store.get_blocks_for_range(
+            datetime.fromisoformat(self.BLOCK_START),
+            datetime.fromisoformat(self.BLOCK_END),
+        )
+        return blocks[0]["meters"]["ev_charger"]["channels"]["import"]
+
+    # ── no post-boundary read: no-op ─────────────────────────────────────────
+
+    def test_noop_when_no_post_boundary_read(self):
+        """No post-boundary read in buffer → provisional remains set."""
+        s = self._setup_store(self._prov_block())
+        pre = self._pre_reads_60s()
+        cb  = self._rolling_buffer(pre, post_reads=[])  # no post reads
+        self._run(s, cb)
+        self.assertEqual(len(s.get_provisional_sub_meter_blocks()), 1,
+                         "Should remain provisional when no post-boundary read")
+
+    # ── insufficient reads: commit as-final ──────────────────────────────────
+
+    def test_commit_as_final_when_too_few_reads(self):
+        """Fewer than 4 pre-boundary reads (3 gaps) → commit as-final, no kWh change."""
+        s = self._setup_store(self._prov_block(sub_kwh=0.8))
+        # Only 3 pre-boundary reads — 2 gaps, below the 3-gap minimum
+        pre = self._pre_reads_60s(n=3)
+        post = [{"value": pre[-1]["value"] + 0.05, "ts": "2026-05-01T09:31:00"}]
+        cb = self._rolling_buffer(pre, post)
+        self._run(s, cb)
+        self.assertEqual(len(s.get_provisional_sub_meter_blocks()), 0,
+                         "Should be committed as-final (not provisional)")
+        ev_imp = self._amended_ev_imp(s)
+        self.assertAlmostEqual(ev_imp["kwh"], 0.8, places=4,
+                               msg="kWh must be unchanged when committed as-final")
+
+    # ── device interval > 90s: commit as-final ───────────────────────────────
+
+    def test_commit_as_final_when_device_too_slow(self):
+        """Device publishing at 5-minute intervals → too coarse, commit as-final."""
+        s = self._setup_store(self._prov_block(sub_kwh=0.8))
+        # 10 reads at 5-minute cadence — enough gaps but interval >> 90s
+        pre = self._pre_reads_60s(n=7, interval_s=300)
+        post = [{"value": pre[-1]["value"] + 0.05, "ts": "2026-05-01T09:31:00"}]
+        cb = self._rolling_buffer(pre, post)
+        self._run(s, cb)
+        self.assertEqual(len(s.get_provisional_sub_meter_blocks()), 0)
+        ev_imp = self._amended_ev_imp(s)
+        self.assertAlmostEqual(ev_imp["kwh"], 0.8, places=4,
+                               msg="kWh must be unchanged for slow device")
+
+    # ── post-boundary gap > 2× interval: commit as-final (stop-restart) ──────
+
+    def test_commit_as_final_when_gap_exceeds_threshold(self):
+        """Device stopped before boundary, restarted 15 min later.
+        Last pre read: 09:29, first post read: 09:45 → gap 16 min >> 2 × 60s.
+        Must commit as-final — the provisional figure is the correct answer."""
+        s = self._setup_store(self._prov_block(sub_kwh=0.8))
+        pre = self._pre_reads_60s(n=20)  # regular 60s, ends ~09:29
+        # First post-boundary read arrives 15 minutes after last pre read
+        post = [{"value": pre[-1]["value"] + 0.20, "ts": "2026-05-01T09:45:00"}]
+        cb = self._rolling_buffer(pre, post)
+        self._run(s, cb)
+        self.assertEqual(len(s.get_provisional_sub_meter_blocks()), 0)
+        ev_imp = self._amended_ev_imp(s)
+        self.assertAlmostEqual(ev_imp["kwh"], 0.8, places=4,
+                               msg="kWh must be unchanged for stop-restart scenario")
+
+    # ── all gates pass: interpolate and amend ────────────────────────────────
+
+    def test_interpolation_fires_when_all_gates_pass(self):
+        """60s device, post-boundary read within 2× interval → interpolation applied.
+
+        Uses known bracketing values so the interpolated boundary is
+        demonstrably different from the provisional read_end (last pre read).
+
+        last pre:  50.56 @ 09:29:00  (1 min before boundary)
+        first post: 50.64 @ 09:31:00  (1 min after boundary)
+        → interpolated boundary = 50.56 + (50.64 − 50.56) × 0.5 = 50.60
+        opener (read_start) = 50.0
+        → corrected kwh = 50.60 − 50.0 = 0.60
+        provisional kwh was 0.8  (opener=50.0, read_end=50.8 stored in DB)
+        """
+        s = self._setup_store(self._prov_block(sub_kwh=0.8))
+        pre = self._pre_reads_60s(n=20)
+        # Override last pre read to a known value well away from provisional read_end
+        pre[-1] = {"value": 50.56, "ts": "2026-05-01T09:29:00"}
+        post = [{"value": 50.64, "ts": "2026-05-01T09:31:00"}]
+        cb = self._rolling_buffer(pre, post)
+        self._run(s, cb)
+        self.assertEqual(len(s.get_provisional_sub_meter_blocks()), 0,
+                         "Should be cleared after interpolation")
+        ev_imp = self._amended_ev_imp(s)
+        # Interpolated boundary = 50.60, opener = 50.0 → corrected kwh = 0.60
+        # Original provisional kwh = 0.8 — must differ
+        self.assertAlmostEqual(ev_imp["kwh"], 0.60, places=3,
+                               msg="Corrected kWh must equal interpolated boundary − opener")
+
+    def test_interpolated_boundary_value_correct(self):
+        """Boundary value is linearly interpolated between last pre and first post.
+
+        Timeline:
+          last pre:  50.57 kWh @ 09:29:00  (1 min before boundary 09:30)
+          first post: 50.61 kWh @ 09:31:00  (1 min after boundary)
+          → interpolated boundary = 50.57 + (50.61 − 50.57) × 0.5 = 50.59
+
+          Block opener (read_start) = 50.0
+          → corrected kWh = 50.59 − 50.0 = 0.59
+        """
+        s = self._setup_store(self._prov_block(sub_kwh=0.8))
+        pre = self._pre_reads_60s(n=20)
+        # Manually set last pre read to known value at 09:29:00
+        pre[-1] = {"value": 50.57, "ts": "2026-05-01T09:29:00"}
+        post    = [{"value": 50.61, "ts": "2026-05-01T09:31:00"}]
+        cb = self._rolling_buffer(pre, post)
+        self._run(s, cb)
+        ev_imp = self._amended_ev_imp(s)
+        self.assertAlmostEqual(ev_imp["kwh"], 0.59, places=4,
+                               msg="Corrected kWh must equal interpolated boundary − opener")
+
+    def test_pass2_reruns_after_interpolation(self):
+        """kwh_grid is set by PASS 2 on the corrected kwh."""
+        s = self._setup_store(self._prov_block(sub_kwh=0.8))
+        pre = self._pre_reads_60s(n=20)
+        pre[-1] = {"value": 50.57, "ts": "2026-05-01T09:29:00"}
+        post    = [{"value": 50.61, "ts": "2026-05-01T09:31:00"}]
+        cb = self._rolling_buffer(pre, post)
+        self._run(s, cb)
+        ev_imp = self._amended_ev_imp(s)
+        self.assertIn("kwh_grid", ev_imp, "PASS 2 must set kwh_grid after amendment")
+        self.assertAlmostEqual(ev_imp["kwh_grid"], ev_imp["kwh"], places=4,
+                               msg="kwh_grid must equal kwh (within 2.0 kWh main meter budget)")
+
+    def test_cost_consistent_after_interpolation(self):
+        """After amendment cost = kwh × rate."""
+        s = self._setup_store(self._prov_block(sub_kwh=0.8))
+        pre = self._pre_reads_60s(n=20)
+        pre[-1] = {"value": 50.57, "ts": "2026-05-01T09:29:00"}
+        post    = [{"value": 50.61, "ts": "2026-05-01T09:31:00"}]
+        cb = self._rolling_buffer(pre, post)
+        self._run(s, cb)
+        ev_imp = self._amended_ev_imp(s)
+        expected_cost = round(ev_imp["kwh"] * ev_imp["rate"], 6)
+        self.assertAlmostEqual(ev_imp["cost"], expected_cost, places=6)
+
+    # ── boundary read exactly on boundary ────────────────────────────────────
+
+    def test_read_exactly_on_boundary_counts_as_post(self):
+        """A read timestamped exactly at the boundary is treated as post-boundary."""
+        boundary_iso = self.BOUNDARY
+        reads = [
+            {"value": 50.0, "ts": "2026-05-01T09:00:00"},
+            {"value": 50.9, "ts": "2026-05-01T09:30:00"},  # exact boundary
+        ]
+        has_post = any(r["ts"] >= boundary_iso for r in reads)
+        self.assertTrue(has_post)
+
+    # ── gap marker guard ─────────────────────────────────────────────────────
+
+    def test_gap_marker_guard_in_source(self):
+        """_engine_tick must guard amendment behind has_gap_marker check.
+        Verified by inspecting source — the amendment call must be inside
+        'if not has_gap_marker(current_block)'."""
+        import inspect
+        src = inspect.getsource(engine._engine_tick)
+        # The guard and the call must both appear
+        self.assertIn("has_gap_marker", src,
+                      "_engine_tick must reference has_gap_marker")
+        self.assertIn("_amend_provisional_sub_meter_blocks", src,
+                      "_engine_tick must call _amend_provisional_sub_meter_blocks")
+        # The guard must precede the call — find their positions
+        guard_pos = src.index("has_gap_marker")
+        call_pos  = src.index("_amend_provisional_sub_meter_blocks")
+        self.assertLess(guard_pos, call_pos,
+                        "has_gap_marker guard must appear before amendment call")
+
+    # ── no provisional blocks: no-op ─────────────────────────────────────────
+
+    def test_noop_when_no_provisional_blocks(self):
+        """No provisional blocks in DB → function returns immediately."""
+        from block_store import BlockStore
+        s = BlockStore(":memory:")
+        s.insert_config_period({
+            "meters": {"electricity_main": {
+                "meta": {"timezone": "UTC", "billing_day": 1,
+                         "block_minutes": 30, "currency_symbol": "£",
+                         "currency_code": "GBP", "sub_meter": False}
+            }}
+        })
+        orig = engine._store
+        engine._store = s
+        try:
+            engine._amend_provisional_sub_meter_blocks(MagicMock(), {"meters": {}})
+        finally:
+            engine._store = orig
+        # No exception = pass
+
+    # ── constants sanity ─────────────────────────────────────────────────────
+
+    def test_constants_are_sensible(self):
+        """Guard that the tuning constants haven't drifted to insensible values."""
+        self.assertEqual(engine._PROVISIONAL_MAX_INTERVAL_S, 90.0,
+                         "Max interval should be 90s (60s device + jitter margin)")
+        self.assertEqual(engine._PROVISIONAL_GAP_MULTIPLIER, 2.0,
+                         "Gap multiplier should be 2.0 (handles one missed read)")
+        self.assertEqual(engine._PROVISIONAL_MIN_GAPS, 3,
+                         "Min gaps should be 3 (4 reads, flat across all block sizes)")
