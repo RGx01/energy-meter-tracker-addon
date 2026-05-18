@@ -1,29 +1,31 @@
 # Changelog
 
-## [2.10.0] — 2026-05-14
+## [2.10.0] — 2026-05-18
 
 ### Added
 
-- **Sub-meter boundary interpolation** — sub-meter blocks that were written without a post-boundary read are now retrospectively corrected when the post-boundary read arrives in the next engine tick (typically within 10 seconds of block close).
+- **Per-day data table** — expandable half-hourly data table below each daily chart, showing Total Import, Grid Export, Direct Import, and per-device kWh and cost at each rate. Lazy-built on first open. State persists across the 2-minute auto-refresh via postMessage.
+- **Show Data / Hide Data button** — added to the billing floating toolbar (after Latest first / Oldest first). Toggles all data tables for the current period open or closed in one click. Per-day toggles remain available on each individual chart. Button label updates dynamically to reflect current state.
+- **PDF export** — ⬇ PDF button on all three chart tabs:
+  - *Billing Charts* — captures the current period and view (Bill / vs Prev / vs Last Year). Billing summary tables rendered with full styling. Daily sections show the sidebar (date, totals, per-meter breakdown with colours) alongside a Plotly chart image captured via `Plotly.toImage()`. Open data tables included below each chart. Respects current sort order and table open/close state.
+  - *Heatmaps* — exports the active metric heatmap as a PNG image via `Plotly.toImage()`, with active metric label shown.
+  - *Usage Stats* — exports the bar chart image, the full toolbar showing selected options (period, metric, view, standing charge), and the data table.
+  - All tabs: EMT logo embedded as data URL, generated timestamp, version number. Light theme forced regardless of system dark mode setting. Loading spinner shown in the popup window while charts are being captured.
+- **Sub-meter boundary interpolation** — provisional blocks are retrospectively amended when the first post-boundary read arrives from a sub-meter. Corrects up to ~0.12 kWh per-boundary misalignment at 7.4 kW charge rate without affecting period billing totals.
 
-  Previously, when a 60-second sub-meter sensor hadn't fired by the time the block boundary was reached, the provisional kWh figure used the last pre-boundary read as the closing value. The corrected figure is now calculated by linearly interpolating the sub-meter value to the exact block boundary using the bracketing pre- and post-boundary reads, matching the boundary interpolation already applied to the main meter.
+### Fixed
 
-  The maximum misalignment per boundary on a 60-second sensor running at 7.4 kW is ~0.12 kWh — this fix eliminates that misalignment.
-
-  **Key properties:**
-  - Only the **distribution** between adjacent blocks is corrected — the period total is conserved.
-  - PASS 2 (`sum(sub-meters) + remainder = main meter import`) is re-run after each amendment so the corrected sub-meter figure is always grid-authoritative.
-  - Amendment is **non-cascading** — only the immediately-previous block is touched. Subsequent blocks already have their own reads and are unaffected.
-  - Gap-fill (interpolated) blocks are **excluded** from provisional marking — only live blocks are amended.
-  - Sub-meter `carbon_g` is calculated from raw `imp_kwh` and is unaffected by this fix.
-
-- **`imp_provisional` column in `blocks` table** — a new `INTEGER NOT NULL DEFAULT 0` column flags sub-meter blocks written without a post-boundary read. Cleared to 0 on amendment. Existing databases are upgraded automatically on first start (incremental migration, no data loss).
-
-- **`BlockStore.get_provisional_sub_meter_blocks()`** — returns the most-recent provisional sub-meter block per sub-meter, used by the amendment path in `_engine_tick`.
-
-### Tests
-
-- **17 new tests** covering provisional flag detection in `finalise_block`, `imp_provisional` round-trip through the DB, amendment triggering, boundary interpolation correctness, PASS 2 re-run, cost consistency, period-total conservation, and no-op behaviour when the post-boundary read has not yet arrived. Total: **122 tests passing**.
+- **Grid Export legend label** was displaying "Direct Import Grid Export" — now correctly shows "Grid Export".
+- **Daily chart iframe** now loads via a Blob URL instead of `srcdoc`, removing the WebKit ~64 KB size limit that caused blank charts on year view.
+- **Direct Import kWh** was incorrect on days where devices drew from the house battery — now uses `kwh_remainder` (the authoritative engine pass-2 remainder) rather than a subtraction from total import.
+- **Device kWh** throughout (billing sidebar, data tables, PDF) now shows grid-attributed consumption only (`kwh_grid`), consistent with the Usage Stats tab.
+- **Billing summary cost accumulation** — period totals now accumulate per-day values rounded to display precision (2dp cost, 3dp kWh) rather than raw floats. Period totals now agree exactly with the sum of displayed daily figures.
+- **Usage Stats Totals row** now equals the sum of displayed daily rows for all columns, including devices and export.
+- **Rounding consistency** — all cost and kWh totals now use a single rounding strategy throughout: raw block costs are accumulated as floats and rounded once to display precision at the end, matching how Octopus bills (sum raw slot costs, round once). This eliminates ±£0.01 drift between the billing summary, sidebar, usage stats, and live power billing cards.
+- **Live Power billing card totals** — the Today / This Bill / This Year headline figures now always equal the sum of the displayed line items. Previously the headline was computed from raw float SQL values while each row was independently rounded to 2dp for display, causing the headline to disagree by ±£0.01. All row costs are now rounded to 2dp before display, and the headline is recomputed from those same rounded values.
+- **Usage Stats period totals** — costs and standing charge sent from the server to the JS at higher precision (4dp) per day rather than being pre-rounded to 2dp. Previously: sub-meter costs rounded to 2dp/day causing ±£0.01 period error; standing charge rounded to 2dp/day causing a systematic error of £0.004/day × number of days (£0.07 over a 16-day period at £0.5046/day). All daily values now sent at 4dp so the JS sums them correctly before rounding once at the end.
+- **Billing chart sidebar sub-meter totals** — the per-meter cost totals in the billing period summary sidebar were computed by rounding each individual half-hourly slot cost to 4dp before summing. With enough blocks (e.g. a full day of EV charging across 9 slots), the accumulated rounding error was sufficient to tip the displayed total by ±£0.01 vs the raw sum. Fixed by summing raw slot values and rounding once at the end.
+- **Regenerate Charts button removed** — chart generation is handled automatically on each block boundary; the manual trigger is no longer needed.
 
 ---
 

@@ -878,10 +878,13 @@ def api_billing():
 
         def _fmt_total(totals, label_imp, label_exp, start_date=None, end_date=None):
             """Format SQL totals into billing card total + rows."""
-            imp_cost = totals["imp_cost"]
-            exp_cost = totals["exp_cost"]
-            standing = totals["standing"]
-            total    = round(imp_cost + standing - exp_cost, 2)
+            imp_cost = round(float(totals["imp_cost"]), 2)
+            exp_cost = round(float(totals["exp_cost"]), 2)
+            standing = round(float(totals["standing"]), 2)
+            # Round raw sum once — matches billing chart and Octopus billing methodology.
+            # Do not round each component separately before summing (that introduces
+            # intermediate rounding error over long periods).
+            total    = round(float(totals["imp_cost"]) + float(totals["standing"]) - float(totals["exp_cost"]), 2)
             rows = []
 
             # Sub-meter breakdown rows
@@ -910,7 +913,7 @@ def api_billing():
                 for sr in sub_cur.fetchall():
                     mid   = sr["meter_id"]
                     kwh   = float(sr["kwh"])
-                    cost  = float(sr["cost"])
+                    cost  = round(float(sr["cost"]), 2)
                     meta  = (cfg.get("meters", {}).get(mid, {}).get("meta") or {})
                     device = meta.get("device") or mid
                     sub_rows.append({"label": f"↳ {device} ({kwh:.3f} kWh)",
@@ -939,13 +942,15 @@ def api_billing():
             grid_imp_kwh   = max(0.0, raw_grid_kwh  - sub_kwh_total)
             grid_imp_cost  = max(0.0, raw_grid_cost - sub_cost_total)
 
+            total_imp_cost = round(total_imp_cost, 2)
+            grid_imp_cost  = round(grid_imp_cost,  2)
             if total_imp_kwh > 0.001 or total_imp_cost > 0.001:
                 rows.append({"label": f"{label_imp} ({total_imp_kwh:.3f} kWh)",
                              "cost": total_imp_cost, "bold": True})
             if grid_imp_kwh > 0.001 or grid_imp_cost > 0.001:
                 rows.append({"label": f"Direct import ({grid_imp_kwh:.3f} kWh)",
                              "cost": grid_imp_cost, "bold": False})
-            # Sub-meter rows
+            # Sub-meter rows (already rounded when built)
             rows.extend(sub_rows)
             # Export and standing charge
             if totals["exp_kwh"] > 0.001:
@@ -953,6 +958,9 @@ def api_billing():
                              "cost": -exp_cost, "bold": False})
             if standing > 0.001:
                 rows.append({"label": "Standing Charge", "cost": standing, "bold": False})
+            # Recompute total from the same rounded values the rows display so
+            # the headline figure always equals the sum of visible line items.
+            total = round(total_imp_cost + standing - exp_cost, 2)
             return total, rows
 
         today_local_date = now_local.date().isoformat()
@@ -1022,7 +1030,7 @@ def api_billing():
             return [{"label": r["label"], "cost": r["cost"], "bold": r.get("bold", False)}
                     for r in rows]
 
-        return jsonify({
+        resp = jsonify({
             "currency":     currency,
             "today_total":  today_total,
             "today_rows":   fmt_rows(today_rows),
@@ -1034,6 +1042,10 @@ def api_billing():
             "year_rows":    fmt_rows(year_rows),
             "year_period":  f"1 Jan → {now_local.strftime('%d %b %Y')}",
         })
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        resp.headers["Pragma"]        = "no-cache"
+        resp.headers["Expires"]       = "0"
+        return resp
     except Exception as e:
         logger.error("api_billing: %s", e)
         return jsonify({"error": str(e)}), 500
@@ -1767,14 +1779,25 @@ def api_blocks_summary():
             }}
             for _mid, _st in _dd["subs"].items():
                 meters_out[_mid] = {
-                    "imp_kwh":  round(_st["imp_kwh"],  4),
+                    "imp_kwh":  round(_st["imp_kwh"],  3),
                     "imp_cost": round(_st["imp_cost"], 4),
-                    "exp_kwh":  round(_st["exp_kwh"],  4),
+                    "exp_kwh":  round(_st["exp_kwh"],  3),
                     "exp_cost": round(_st["exp_cost"], 4),
                     "carbon_g": round(_st["carbon_g"], 4) if _st["carbon_g"] is not None and _st["carbon_g"] != 0.0 else None,
                 }
 
             _bp_entry = _bp_start_by_date.get(_ds)
+            # Keep all values at 4dp so the JS can sum across days without
+            # accumulating per-day rounding error. Display rounding (2dp)
+            # happens in the JS via .toFixed(2) at render time.
+            _main_imp_kwh  = round(_m["imp_kwh"],  4)
+            _main_imp_cost = round(_m["imp_cost"], 4)
+            _main_exp_kwh  = round(_m["exp_kwh"],  4)
+            _main_exp_cost = round(_m["exp_cost"], 4)
+            meters_out["electricity_main"]["imp_kwh"]  = _main_imp_kwh
+            meters_out["electricity_main"]["imp_cost"] = _main_imp_cost
+            meters_out["electricity_main"]["exp_kwh"]  = _main_exp_kwh
+            meters_out["electricity_main"]["exp_cost"] = _main_exp_cost
             rows.append({
                 "year":                  d.year,
                 "month":                 d.month,
@@ -1784,10 +1807,10 @@ def api_blocks_summary():
                 "billing_period_end":    _bp_entry[1] if _bp_entry else None,
                 "standing":     round(_dd["standing"], 4),
                 "meters":       meters_out,
-                "imp_kwh":  round(_m["imp_kwh"]  + sum(m["imp_kwh"]  for mid,m in meters_out.items() if mid != "electricity_main"), 4),
-                "exp_kwh":  round(_m["exp_kwh"],  4),
-                "imp_cost": round(_m["imp_cost"] + sum(m["imp_cost"] for mid,m in meters_out.items() if mid != "electricity_main"), 4),
-                "exp_cost": round(_m["exp_cost"], 4),
+                "imp_kwh":  round(_main_imp_kwh  + sum(m["imp_kwh"]  for mid,m in meters_out.items() if mid != "electricity_main"), 4),
+                "exp_kwh":  round(_main_exp_kwh,  4),
+                "imp_cost": round(_main_imp_cost + sum(m["imp_cost"] for mid,m in meters_out.items() if mid != "electricity_main"), 4),
+                "exp_cost": round(_main_exp_cost, 4),
                 "carbon_g_net":   round(_m["carbon_g"], 4) if _m["carbon_g"] is not None else None,
                 "carbon_g_total": round(_m["carbon_g"], 4) if _m["carbon_g"] is not None else None,
                 "avg_intensity":  _avg_intensity,
@@ -1809,13 +1832,58 @@ def api_blocks_summary():
             if _postcode:
                 break
 
+        # ── Pre-compute period totals from raw SQL ───────────────────────────
+        # Summing daily 4dp rows in JS accumulates rounding error over long
+        # periods (e.g. 97 days → ±£0.01). Instead, compute the exact total
+        # for each unique billing period from raw SQL and send alongside rows.
+        # The JS uses these for grand-total display, daily rows for bar heights.
+        _period_keys = set()
+        for _row in rows:
+            _period_keys.add((_row["billing_period_start"], _row["billing_period_end"]))
+
+        period_totals = {}
+        for (_bps, _bpe) in _period_keys:
+            if not _bps or not _bpe:
+                continue
+            try:
+                _pt_utc_s, _pt_utc_e = local_date_range_to_utc_bounds(_bps, _bpe, tz_name)
+                _pt = store.get_billing_totals_for_utc_range(_pt_utc_s, _pt_utc_e, tz_name)
+                _pt_key = _bps
+                period_totals[_pt_key] = {
+                    "imp_cost": round(float(_pt["imp_cost"]), 4),
+                    "exp_cost": round(float(_pt["exp_cost"]), 4),
+                    "standing": round(float(_pt["standing"]), 4),
+                    "net":      round(float(_pt["imp_cost"]) + float(_pt["standing"]) - float(_pt["exp_cost"]), 2),
+                }
+            except Exception as _pte:
+                logger.warning("period_totals computation failed for %s: %s", _bps, _pte)
+
+        # Also compute a single total for the full date range shown
+        # (used by yearly/calendar views where billing_period_start = day itself)
+        if rows:
+            _all_utc_s2_start = min(_row["billing_period_start"] for _row in rows if _row.get("billing_period_start"))
+            _all_utc_s2_end   = max(_row["billing_period_end"]   for _row in rows if _row.get("billing_period_end")) if any(_row.get("billing_period_end") for _row in rows) else None
+            if _all_utc_s2_end:
+                try:
+                    _full_utc_s, _full_utc_e = local_date_range_to_utc_bounds(_all_utc_s2_start, _all_utc_s2_end, tz_name)
+                    _full_t = store.get_billing_totals_for_utc_range(_full_utc_s, _full_utc_e, tz_name)
+                    period_totals["_full"] = {
+                        "imp_cost": round(float(_full_t["imp_cost"]), 4),
+                        "exp_cost": round(float(_full_t["exp_cost"]), 4),
+                        "standing": round(float(_full_t["standing"]), 4),
+                        "net":      round(float(_full_t["imp_cost"]) + float(_full_t["standing"]) - float(_full_t["exp_cost"]), 2),
+                    }
+                except Exception:
+                    pass
+
         return jsonify({
-            "currency":     currency,
-            "billing_day":  billing_day,
-            "rows":         rows,
-            "meters":       meters_list,
-            "export_color": export_color,
-            "has_postcode": bool(_postcode),
+            "currency":      currency,
+            "billing_day":   billing_day,
+            "rows":          rows,
+            "meters":        meters_list,
+            "export_color":  export_color,
+            "has_postcode":  bool(_postcode),
+            "period_totals": period_totals,
         })
     except Exception as e:
         logger.error("api_blocks_summary: %s", e)
