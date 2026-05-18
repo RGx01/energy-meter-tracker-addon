@@ -1090,3 +1090,212 @@ class TestLivePowerBillingCard(unittest.TestCase):
         self.assertAlmostEqual(grid_imp, raw_kwh, places=3,
             msg="With no sub-meters Grid Import must equal Total Import")
         self.assertAlmostEqual(grid_imp, 10.0, places=3)
+
+class TestNonRoundStandingCharge(unittest.TestCase):
+    """
+    Standing charge of £0.504559/day must not be rounded to 2dp per day
+    before summing — that would give £0.50 × N days instead of the correct
+    sum. Over 16 days: £8.00 vs £8.07. Verifies server.py sends standing
+    at 4dp so the JS period total agrees with get_billing_totals_for_utc_range.
+    """
+
+    STANDING = 0.504559   # real-world value from production DB
+
+    def setUp(self):
+        self.store, self.cp = make_store()
+
+    def _insert_days(self, n_days, start_date="2026-05-03"):
+        """Insert one block per day for n_days with non-round standing charge."""
+        d = datetime.fromisoformat(start_date + "T23:00:00")  # BST: 23:00 UTC = midnight local
+        for _ in range(n_days):
+            insert_block(self.store, self.cp,
+                         d.strftime("%Y-%m-%dT%H:%M:%S"),
+                         imp_kwh=1.0, imp_cost=0.33,
+                         standing=self.STANDING)
+            d += timedelta(days=1)
+
+    def test_single_day_non_round_standing(self):
+        """Single day: standing at 4dp precision passes through correctly."""
+        self.store, self.cp = make_store()
+        insert_block(self.store, self.cp, "2026-05-03T23:00:00",
+                     imp_kwh=1.0, imp_cost=0.33, standing=self.STANDING)
+
+        row = sim_usage_stats_day(self.store, "2026-05-04")
+        sql = sql_totals(self.store, "2026-05-04", "2026-05-04")
+
+        # row["standing"] should be the raw value at 4dp, not 0.50
+        self.assertAlmostEqual(row["standing"], round(self.STANDING, 4), places=4,
+            msg=f"Single day standing should be {round(self.STANDING,4)}, not 0.50")
+        assert_match(self, "single day non-round standing", row, sql)
+
+    def test_multiday_standing_sum_not_rounded_per_day(self):
+        """
+        16-day period: sum of daily standing charges must not accumulate
+        the error from rounding each day to 2dp.
+
+        Wrong (old): round(0.504559, 2) * 16 = 0.50 * 16 = 8.00
+        Right (new): 0.504559 * 16 = 8.072938, round once = 8.07
+        """
+        self._insert_days(16)
+
+        # Simulate Usage Stats: sum daily rows
+        rows = []
+        d = datetime.fromisoformat("2026-05-04")
+        for _ in range(16):
+            row = sim_usage_stats_day(self.store, d.strftime("%Y-%m-%d"))
+            if row:
+                rows.append(row)
+            d += timedelta(days=1)
+
+        daily_sum = sum_daily_rows(rows)
+        sql = sql_totals(self.store, "2026-05-04",
+                         (datetime.fromisoformat("2026-05-04") + timedelta(days=15)).strftime("%Y-%m-%d"))
+
+        # The key assertion: standing must NOT be £8.00 (2dp-rounded per day)
+        wrong_answer = round(round(self.STANDING, 2) * 16, 4)
+        self.assertNotAlmostEqual(daily_sum["standing"], wrong_answer, places=2,
+            msg=f"Standing should NOT be {wrong_answer} (2dp-per-day rounding error)")
+
+        # It must match the SQL ground truth
+        assert_match(self, "16-day non-round standing", daily_sum, sql, tol=0.005)
+
+    def test_multiday_net_total_matches_live_power(self):
+        """
+        Period net total (imp + standing - exp) from Usage Stats must match
+        Live Power get_billing_totals_for_utc_range, including non-round standing.
+        This is the real-world scenario that produced -£3.21 vs -£3.14.
+        """
+        # 16 days, with export so net goes negative
+        d = datetime.fromisoformat("2026-05-03T23:00:00")
+        for _ in range(16):
+            insert_block(self.store, self.cp,
+                         d.strftime("%Y-%m-%dT%H:%M:%S"),
+                         imp_kwh=2.0, imp_cost=0.66,
+                         exp_kwh=3.5, exp_cost=0.42,
+                         standing=self.STANDING)
+            d += timedelta(days=1)
+
+        rows = []
+        d = datetime.fromisoformat("2026-05-04")
+        for _ in range(16):
+            row = sim_usage_stats_day(self.store, d.strftime("%Y-%m-%d"))
+            if row:
+                rows.append(row)
+            d += timedelta(days=1)
+
+        daily_sum = sum_daily_rows(rows)
+        sql = sql_totals(self.store, "2026-05-04",
+                         (datetime.fromisoformat("2026-05-04") + timedelta(days=15)).strftime("%Y-%m-%d"))
+
+        # Net total: imp + standing - exp
+        us_net  = round(daily_sum["imp_cost"] + daily_sum["standing"] - daily_sum["exp_cost"], 2)
+        lp_net  = round(sql["imp_cost"] + sql["standing"] - sql["exp_cost"], 2)
+
+        self.assertEqual(us_net, lp_net,
+            msg=f"Usage Stats net £{us_net:.2f} must equal Live Power net £{lp_net:.2f}. "
+                f"Difference of £{abs(us_net-lp_net):.2f} indicates standing charge rounding per day.")
+
+
+class TestNonRoundImportExportCost(unittest.TestCase):
+    """
+    imp_cost and exp_cost sent from server must be at 4dp per day, not 2dp.
+    With 2dp per day, summing across 16 days accumulates rounding error.
+
+    Tests use a direct SQL net calculation (imp_cost + standing - exp_cost
+    on main meter) to match what all three surfaces should show, avoiding
+    the complexity of reconstructing the server's rate-based subtraction logic
+    in the test helper.
+    """
+
+    def setUp(self):
+        self.store, self.cp = make_store_with_submeters()
+
+    def _insert_period(self, n_days, imp_cost=0.656743, exp_cost=0.421789,
+                       standing=0.504559, start="2026-05-03"):
+        """Insert n_days of main-meter blocks with non-round costs."""
+        from datetime import datetime, timedelta
+        d = datetime.fromisoformat(start + "T23:00:00")
+        for _ in range(n_days):
+            ts = d.strftime("%Y-%m-%dT%H:%M:%S")
+            insert_block(self.store, self.cp, ts,
+                         imp_kwh=2.0, imp_cost=imp_cost,
+                         exp_kwh=3.5, exp_cost=exp_cost,
+                         standing=standing, meter_id="electricity_main")
+            d += timedelta(days=1)
+
+    def _sql_net(self, first_date, last_date):
+        """Ground truth: imp_cost + standing - exp_cost from SQL."""
+        sql = sql_totals(self.store, first_date, last_date)
+        return round(sql["imp_cost"] + sql["standing"] - sql["exp_cost"], 2)
+
+    def _us_net(self, first_date, last_date):
+        """
+        Simulate Usage Stats net: sum daily (imp_cost + standing - exp_cost)
+        at 4dp per day, then round once. This matches the JS barGetDataForPeriod
+        which rounds the period aggregate to 4dp then displays at 2dp.
+        """
+        from datetime import datetime, timedelta
+        rows = []
+        d = datetime.fromisoformat(first_date)
+        end = datetime.fromisoformat(last_date)
+        while d <= end:
+            row = sim_usage_stats_day(self.store, d.strftime("%Y-%m-%d"))
+            if row:
+                rows.append(row)
+            d += timedelta(days=1)
+        # JS sums at 4dp precision (standing already 4dp from server)
+        # imp_cost and exp_cost also now 4dp from server
+        total_imp  = round(sum(r["imp_cost"] for r in rows), 4)
+        total_exp  = round(sum(r["exp_cost"] for r in rows), 4)
+        total_sc   = round(sum(r["standing"] for r in rows), 4)
+        return round(total_imp + total_sc - total_exp, 2)
+
+    def test_single_day_net_matches_sql(self):
+        """Single day: Usage Stats net matches Live Power SQL."""
+        self._insert_period(1)
+        us  = self._us_net("2026-05-04", "2026-05-04")
+        sql = self._sql_net("2026-05-04", "2026-05-04")
+        self.assertEqual(us, sql,
+            msg=f"Single day: US net £{us:.2f} != SQL £{sql:.2f}")
+
+    def test_multiday_standing_not_rounded_per_day(self):
+        """
+        16 days with £0.504559/day standing: the period standing sum must be
+        £8.07 (sum raw then round once), not £8.00 (round to 2dp per day first).
+        Directly verifies the standing charge fix.
+        """
+        self._insert_period(16)
+        last = (datetime.fromisoformat("2026-05-04") + timedelta(days=15)).strftime("%Y-%m-%d")
+
+        from datetime import datetime as _dt, timedelta as _td
+        rows = []
+        d = _dt.fromisoformat("2026-05-04")
+        for _ in range(16):
+            row = sim_usage_stats_day(self.store, d.strftime("%Y-%m-%d"))
+            if row:
+                rows.append(row)
+            d += _td(days=1)
+
+        # standing should be 4dp per day — sum to ~8.0736, round to 8.07
+        total_sc_4dp = round(sum(r["standing"] for r in rows), 4)
+        wrong_sc_2dp = round(round(0.504559, 2) * 16, 2)  # would be 8.00
+
+        self.assertNotEqual(round(total_sc_4dp, 2), wrong_sc_2dp,
+            msg=f"Standing {round(total_sc_4dp,2):.2f} should not equal {wrong_sc_2dp:.2f} "
+                f"(the 2dp-per-day rounding error)")
+        self.assertAlmostEqual(total_sc_4dp, 0.504559 * 16, delta=0.001,
+            msg=f"Standing period sum {total_sc_4dp:.4f} should be ~{0.504559*16:.4f}")
+
+    def test_multiday_net_all_surfaces_agree(self):
+        """
+        Real-world scenario: 16 days of non-round costs.
+        Usage Stats net must equal Live Power net (SQL ground truth).
+        This is the scenario that produced -3.11 / -3.22 / -3.14 / -3.15.
+        """
+        self._insert_period(16, imp_cost=0.656743, exp_cost=0.421789, standing=0.504559)
+        last = (datetime.fromisoformat("2026-05-04") + timedelta(days=15)).strftime("%Y-%m-%d")
+        us  = self._us_net("2026-05-04", last)
+        sql = self._sql_net("2026-05-04", last)
+        self.assertEqual(us, sql,
+            msg=f"Usage Stats net £{us:.2f} != Live Power net £{sql:.2f}. "
+                f"Difference of £{abs(us-sql):.2f} indicates per-day rounding in imp/exp/standing.")

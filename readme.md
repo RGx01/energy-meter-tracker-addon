@@ -80,6 +80,7 @@ A Home Assistant add-on that records your electricity usage in precise configura
 - Records grid carbon intensity at every block (🇬🇧 UK, postcode required) for per-period carbon accounting
 - **Carbon Insights** — house consumption, solar offset, EV mileage and gCO₂/mile, battery charging behaviour, heat pump vs gas comparison, grid generation mix breakdown
 - **Usage Insights** — cost breakdown by meter, rate period distribution, grid position, peak demand window, per-device costs with period comparison narrative in plain English
+- Exports any chart tab as a PDF report — Billing (with per-day data tables and billing summary), Heatmaps, and Usage Stats
 
 ---
 
@@ -98,6 +99,17 @@ Full documentation is on the **[GitHub Wiki](https://github.com/RGx01/energy-met
 | [Data Management](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Data-Management) | Backups, restore, corrections |
 | [Sensor Requirements](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Sensor-Requirements-and-Known-Limitations) | Sensor types, units, known limitations |
 | [Carbon Intensity](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Carbon-Intensity) | How carbon data is fetched and used |
+
+---
+
+## What's new in 2.10
+
+### 2.10.0
+- **📋 Per-day data table** — expand any day on the Billing chart to see a half-hourly breakdown of import, export, direct import and per-device kWh and cost. Toggle all tables open/closed at once with the **Show Data / Hide Data** button in the floating toolbar. State persists across the 2-minute auto-refresh.
+- **⬇ PDF export** — export any chart tab as a print-ready report. Billing exports capture the current period, view (Bill / vs Prev / vs Last Year), billing summary, daily chart images and any open data tables. Heatmap and Usage Stats tabs export the chart image, toolbar state and data table. Open via the ⬇ PDF button in the topbar.
+- **Sub-meter boundary interpolation** — provisional blocks are retrospectively corrected when the first post-boundary read arrives, eliminating up to ~0.12 kWh per-boundary misalignment at 7.4 kW without affecting period totals.
+- **Rounding fixes** — billing summary period totals, usage stats totals row, and Live Power billing card headlines now always agree exactly with the sum of their displayed line items.
+- **Bug fixes** — Grid Export legend label, daily chart iframe blank on year view (WebKit size limit), Direct Import kWh attribution, device kWh grid-only consistency.
 
 ---
 
