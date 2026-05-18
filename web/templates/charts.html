@@ -275,7 +275,7 @@
     <button class="chart-tab"        data-chart="heatmap" onclick="showChart('heatmap', this)" title="Heatmaps">🔥<span class="tab-label"> Heatmaps</span></button>
     <button class="chart-tab"        data-chart="bar"     onclick="showChart('bar', this)" title="Usage Stats">📈<span class="tab-label"> Usage Stats</span></button>
   </div>
-  <button class="btn btn-secondary" onclick="regenerate()" title="Regenerate Charts">↺<span class="btn-regen-text"> Regenerate Charts</span></button>
+  <button class="btn btn-secondary" onclick="chartsPdfExport()" title="Export current view as PDF" id="charts-pdf-btn">⬇ PDF</button>
 </div>
 {% endblock %}
 
@@ -286,8 +286,7 @@
   <span class="toggle-chevron">▼</span>
 </button>
 
-<div id="alert-success" class="alert alert-success" style="margin: 8px 16px 0;">✓ Charts regenerated successfully.</div>
-<div id="alert-error"   class="alert alert-danger"   style="margin: 8px 16px 0;"></div>
+<div id="alert-error" class="alert alert-danger" style="margin: 8px 16px 0;"></div>
 
 {% if block_count == 0 %}
 <div style="background:rgba(180,83,9,0.1);border:1px solid rgba(180,83,9,0.4);border-radius:var(--radius);padding:16px 20px;margin:16px 16px 0;display:flex;align-items:center;gap:14px;">
@@ -311,7 +310,6 @@
     <div class="chart-placeholder">
       <span class="icon">📊</span>
       <span>No chart data yet — charts generate after the first block finalises.</span>
-      <button class="btn btn-secondary" onclick="regenerate()">Try Regenerate</button>
     </div>
   {% endif %}
 </div>
@@ -393,6 +391,7 @@
 <script>
 var chartsLoaded = {};
 var _activeChart = 'daily';
+var _EMT_VERSION = "{{ app_version or '2.10.0' }}";
 function getChartHeight() {
   // .content has padding:0 on the charts page so clientHeight = full usable height
   var contentEl = document.querySelector('.content');
@@ -528,6 +527,18 @@ function _injectChartHtml(name, html) {
   iframe.className = 'chart-iframe';
   iframe.style.cssText = 'width:100%;height:' + h + ';border:none;display:block;';
   el.style.height = h;
+
+  // Capture open table IDs from the existing iframe before replacing it
+  var _openTables = [];
+  var existing = el.querySelector('iframe');
+  if (existing && existing.contentDocument) {
+    existing.contentDocument.querySelectorAll('.day-data-tables').forEach(function(t) {
+      if (t.style.display !== 'none' && t.style.display !== '') {
+        _openTables.push(t.id);
+      }
+    });
+  }
+
   function _nudgeIframe(ifrm) {
     // Send the actual container width to the iframe after it loads so
     // scaleChart inside uses the correct value rather than window.innerWidth
@@ -535,9 +546,11 @@ function _injectChartHtml(name, html) {
     var _w = (document.querySelector('.main-content') || document.body).getBoundingClientRect().width;
     if (ifrm.contentWindow) {
       ifrm.contentWindow.postMessage({ type: 'emt-resize', width: _w }, '*');
+      if (_openTables.length) {
+        ifrm.contentWindow.postMessage({ type: 'emt-restore-tables', open: _openTables }, '*');
+      }
     }
   }
-  var existing = el.querySelector('iframe');
   if (existing) {
     iframe.style.opacity = '0';
     el.appendChild(iframe);
@@ -550,8 +563,11 @@ function _injectChartHtml(name, html) {
     el.appendChild(iframe);
     iframe.onload = function() { _nudgeIframe(iframe); };
   }
-  // Set srcdoc after appending so iframe has correct dimensions
-  iframe.srcdoc = html;
+  // Use a Blob URL instead of srcdoc to avoid WebKit's srcdoc size limit
+  var blob = new Blob([html], {type: 'text/html'});
+  var blobUrl = URL.createObjectURL(blob);
+  iframe.src = blobUrl;
+  iframe.addEventListener('load', function() { URL.revokeObjectURL(blobUrl); }, {once: true});
   chartsLoaded[name] = true;
   delete _pendingHtml[name];
 }
@@ -618,8 +634,7 @@ function showChart(name, btn) {
   document.getElementById('chart-bar').style.display     = name === 'bar'     ? 'flex' : 'none';
   _activeChart = name;
   // Hide regenerate button on Usage Stats — it auto-refreshes live data
-  var regenBtn = document.querySelector('[onclick="regenerate()"][title="Regenerate Charts"]');
-  if (regenBtn) regenBtn.style.visibility = name === 'bar' ? 'hidden' : '';
+
   if (name === 'bar') {
     barInit();
   } else {
@@ -636,25 +651,405 @@ function showChart(name, btn) {
   // Note: emt-resize is sent via _injectChartHtml's onload — no need to send here
 }
 
-async function regenerate() {
-  hideAlerts();
-  try {
-    const r    = await fetch(apiUrl('/api/charts/regenerate'), { method: 'POST' });
-    const data = await r.json();
-    if (data.ok) {
-      show('alert-success');
-      chartsLoaded = {};
-      loadChartContent('daily');
-    } else {
-      showError(data.error || 'Regeneration failed');
+// ── PDF Export ────────────────────────────────────────────────────────────────
+function chartsPdfExport() {
+  // Open popup SYNCHRONOUSLY (required for Safari's popup whitelist)
+  var win = window.open('', '_blank');
+  if (!win) { alert('Please allow pop-ups for this page to export PDF.'); return; }
+
+  // Write loading page — leave document OPEN (no win.document.close()) so we can
+  // update it later via win.document.body.innerHTML without a second write() call
+  win.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Generating PDF\u2026</title>' +
+    '<style>' +
+    'body{font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;' +
+    'min-height:100vh;margin:0;background:#f9f9f9;color:#333;}' +
+    '.loader{text-align:center;}' +
+    '.spinner{width:48px;height:48px;border:4px solid #ddd;border-top-color:#00a080;' +
+    'border-radius:50%;animation:spin 0.8s linear infinite;margin:0 auto 16px;}' +
+    '@keyframes spin{to{transform:rotate(360deg)}}' +
+    'h2{margin:0 0 8px;color:#00a080;}p{color:#777;font-size:13px;margin:0;}' +
+    '</style></head>' +
+    '<body><div class="loader"><div class="spinner"></div>' +
+    '<h2>Generating PDF\u2026</h2><p>Capturing charts, please wait.</p></div></body></html>');
+  // Do NOT call win.document.close() here — keep stream open so _doPdfExport can overwrite
+
+  // Fetch logo as data URL (async, popup already open and showing spinner)
+  var iconSrc = '';
+  var iconImg = new Image();
+  iconImg.crossOrigin = 'anonymous';
+  iconImg.onload = function() {
+    try {
+      var canvas = document.createElement('canvas');
+      canvas.width = iconImg.width; canvas.height = iconImg.height;
+      canvas.getContext('2d').drawImage(iconImg, 0, 0);
+      iconSrc = canvas.toDataURL('image/png');
+    } catch(e) {}
+    _doPdfExport(win, iconSrc);
+  };
+  iconImg.onerror = function() { _doPdfExport(win, ''); };
+  iconImg.src = BASE_PATH + '/static/icon.png';
+}
+
+function _doPdfExport(win, iconSrc) {
+  var genDate   = new Date().toLocaleString();
+  var tabLabels = { daily: 'Billing Charts', heatmap: 'Heatmaps', bar: 'Usage Stats' };
+  var tabLabel  = tabLabels[_activeChart] || _activeChart;
+
+  var commonStyles =
+    // Force light theme — override all CSS variables and media queries
+    ':root{color-scheme:light;' +
+    '--bg:#fff;--surface:#fff;--text:#111;--muted:#555;--border:#ddd;--accent:#00d4aa;' +
+    '--accent-dark:#00a080;--sidebar-bg:#f9f9f9;}' +
+    'html,body{background:#fff!important;color:#111!important;}' +
+    'body{font-family:-apple-system,sans-serif;margin:0;padding:24px;color:#111;background:#fff;}' +
+    '.report-header{display:flex;align-items:center;gap:14px;border-bottom:2px solid #00a080;padding-bottom:12px;margin-bottom:20px;}' +
+    '.report-header img{width:44px;height:44px;object-fit:contain;}' +
+    '.report-header h1{margin:0;font-size:18px;color:#00a080;}' +
+    '.report-header .sub{font-size:12px;color:#555;margin-top:3px;}' +
+    '.report-date{margin-left:auto;font-size:11px;color:#888;text-align:right;}' +
+    '.report-version{font-size:10px;color:#aaa;}' +
+    '@media print{@page{margin:12mm;size:A4 landscape;}body{padding:0;}}' +
+    // Override any dark mode media queries in iframe styles
+    '@media(prefers-color-scheme:dark){' +
+    ':root{--bg:#fff!important;--surface:#fff!important;--text:#111!important;--muted:#555!important;--border:#ddd!important;}' +
+    'html,body{background:#fff!important;color:#111!important;}}';
+
+  var header =
+    '<div class="report-header">' +
+    (iconSrc ? '<img src="' + iconSrc + '">' : '') +
+    '<div><h1>Energy Meter Tracker</h1><div class="sub">' + tabLabel + '</div></div>' +
+    '<div class="report-date">Generated ' + genDate + '<br><span class="report-version">EMT v' + _EMT_VERSION + '</span></div>' +
+    '</div>';
+
+  function _getIframe(name) {
+    var id = name === 'daily' ? 'chart-daily-content' : 'chart-heatmap-content';
+    var el = document.getElementById(id);
+    return el ? el.querySelector('iframe') : null;
+  }
+
+  // ── Billing Charts ─────────────────────────────────────────────────────────
+  if (_activeChart === 'daily') {
+    var ifrm = _getIframe('daily');
+    if (!ifrm || !ifrm.contentDocument) {
+      win.close(); alert('Billing chart not loaded yet.'); return;
     }
-  } catch(e) {
-    showError(e.message);
+    var iDoc = ifrm.contentDocument;
+    var iWin = ifrm.contentWindow;
+
+    // Get current mode from active pmode-btn
+    var activeMode = 'month';
+    var activeModeBtn = iDoc.querySelector('.pmode-btn.active');
+    if (activeModeBtn) activeMode = activeModeBtn.dataset.mode || 'month';
+
+    // Get active section via select value (exact match)
+    var modeSelectMap = { month:'period-select-month', calmonth:'period-select-calmonth', quarter:'period-select-quarter', year:'period-select-year' };
+    var selectEl = iDoc.getElementById(modeSelectMap[activeMode] || 'period-select-month');
+    var activeSectionId = selectEl ? selectEl.value : null;
+    var visibleSection = activeSectionId ? iDoc.getElementById(activeSectionId) : null;
+    if (!visibleSection) {
+      var allSections = Array.from(iDoc.querySelectorAll('.period-section'));
+      for (var _si = 0; _si < allSections.length; _si++) {
+        if (allSections[_si].style.visibility === 'visible') { visibleSection = allSections[_si]; break; }
+      }
+    }
+    if (!visibleSection) { win.close(); alert('No visible billing period found.'); return; }
+
+    var currentView = 'vanilla';
+    try { currentView = iWin.sessionStorage.getItem('energyView') || 'vanilla'; } catch(e) {}
+
+    // Extract iframe styles, patching out position:fixed/sticky which breaks print layout
+    var iframeStyles = Array.from(iDoc.querySelectorAll('style')).map(function(s) {
+      return s.textContent
+        .replace(/position\s*:\s*fixed/g, 'position:static')
+        .replace(/position\s*:\s*sticky/g, 'position:static')
+        .replace(/overflow\s*:\s*hidden/g, 'overflow:visible')
+        .replace(/overflow\s*:\s*scroll/g, 'overflow:visible')
+        .replace(/overflow\s*:\s*auto/g, 'overflow:visible');
+    }).join('\n');
+
+    // Force light theme — override CSS variables and dark mode media queries
+    var lightThemeOverride =
+      ':root{color-scheme:light;background:#fff;color:#111;' +
+      '--bg:#fff;--surface:#f9f9f9;--text:#111;--muted:#555;--border:#ddd;' +
+      '--card-bg:#fff;--hover:#f5f5f5;}' +
+      'html,body{background:#fff!important;color:#111!important;}' +
+      // Strip dark mode overrides by re-asserting light values inside the query
+      '@media(prefers-color-scheme:dark){' +
+      ':root{--bg:#fff!important;--surface:#f9f9f9!important;--text:#111!important;' +
+      '--muted:#555!important;--border:#ddd!important;--card-bg:#fff!important;}' +
+      'html,body{background:#fff!important;color:#111!important;}}';
+    iframeStyles = lightThemeOverride + '\n' + iframeStyles;
+
+    // PDF-specific overrides
+    var pdfOverrides =
+      '.period-nav,.day-tbl-toolbar,.day-tbl-toggle,.pmode-btn,.view-btn,' +
+      '.period-mode-toggle,.period-select-wrap,.nav-right,.sticky-bill-strip,' +
+      '#sticky-bill-strip,.chart-tab-bar,.pdf-btn,.expand-btn,' +
+      'button:not(.no-hide){display:none!important;}' +
+      '.period-section{visibility:visible!important;position:relative!important;}' +
+      '.bill-toggle-body{display:block!important;}' +
+      '.bill-view{display:none!important;}' +
+      '.bill-view[data-view="' + currentView + '"]{display:block!important;}' +
+      'body{overflow:visible!important;background:#fff!important;}' +
+      '.day-chart-wrap{break-inside:avoid;}' +
+      '.chart-container{margin-bottom:4px;}' +
+      '.day-data-tables{display:none!important;}' + // hide data tables in chart section (shown separately below chart)
+      '@media print{@page{margin:12mm;size:A4;}body{padding:0;}}';
+
+    // Collect chart containers from visible section that need image capture
+    var chartContainers = Array.from(visibleSection.querySelectorAll('.chart-container'));
+    var chartImages = {}; // chartId → dataUrl
+
+    // Async: capture all charts, then write PDF
+    var chartPromises = chartContainers.map(function(container) {
+      var plotDiv = container.querySelector('.js-plotly-plot') || container.querySelector('[id]');
+      var cid = container.id || (plotDiv && plotDiv.id);
+      if (!cid || !iWin.Plotly) return Promise.resolve();
+      var div = iDoc.getElementById(cid) || plotDiv;
+      if (!div || !div._fullLayout) return Promise.resolve();
+      return iWin.Plotly.toImage(div, {
+        format: 'png',
+        width: Math.max(div.offsetWidth || 700, 700),
+        height: Math.max(div.offsetHeight || 220, 220)
+      }).then(function(url) {
+        chartImages[cid] = url;
+      }).catch(function() {});
+    });
+
+    Promise.all(chartPromises).then(function() {
+      var reportHtml = '';
+
+      // Billing summaries
+      var billToggles = visibleSection.querySelectorAll('.bill-toggle');
+      billToggles.forEach(function(toggle) {
+        var summaryEl = toggle.querySelector('.bill-toggle-summary');
+        var bodyEl    = toggle.querySelector('.bill-toggle-body');
+        var activeView = null;
+        if (bodyEl) {
+          var views = bodyEl.querySelectorAll('.bill-view');
+          for (var v = 0; v < views.length; v++) {
+            if (views[v].dataset.view === currentView) { activeView = views[v]; break; }
+          }
+          if (!activeView && views.length) activeView = views[0];
+        }
+        reportHtml += '<div style="margin-bottom:24px;break-inside:avoid;">';
+        if (summaryEl) reportHtml += '<div style="font-size:14px;font-weight:700;color:#00a080;margin-bottom:10px;border-bottom:2px solid #00a080;padding-bottom:6px;">' +
+          summaryEl.innerText.replace(/^[▶▼◀▸]\s*/, '').trim() + '</div>';
+        if (activeView) reportHtml += activeView.innerHTML;
+        else if (bodyEl) reportHtml += bodyEl.innerHTML;
+        reportHtml += '</div>';
+      });
+
+      // Daily sections with chart images
+      visibleSection.querySelectorAll('.day-chart-wrap').forEach(function(wrap) {
+        var summaryEl = wrap.querySelector('.chart-summary');
+        var tableEl   = wrap.querySelector('.day-data-tables');
+        if (!summaryEl) return;
+
+        var dayLabel = summaryEl.querySelector('.day-label');
+        var stotals  = summaryEl.querySelector('.stotals');
+        var scols    = summaryEl.querySelector('.scols');
+
+        // Find chart image
+        var chartContainer = wrap.querySelector('.chart-container');
+        var plotDiv = chartContainer ? (chartContainer.querySelector('.js-plotly-plot') || chartContainer.firstElementChild) : null;
+        var cid = chartContainer ? (chartContainer.id || (plotDiv && plotDiv.id)) : null;
+        var imgUrl = cid ? chartImages[cid] : null;
+
+        // Build stotals as block lines — spans are display:block via CSS (not inline style)
+        // so we must force display:block explicitly
+        var stotalsHtml = '';
+        if (stotals) {
+          stotals.querySelectorAll('span').forEach(function(sp) {
+            var t = sp.innerText.trim();
+            if (!t) return;
+            var inlineStyle = sp.getAttribute('style') || '';
+            // Ensure display:block so each stat is on its own line
+            stotalsHtml += '<div style="display:block;' + inlineStyle + '">' + t + '</div>';
+          });
+          if (!stotalsHtml) stotalsHtml = '<div>' + stotals.innerText.trim() + '</div>';
+        }
+
+        // Build scols sidebar — each .scol is a meter, spans are display:block via CSS
+        var scolsHtml = '';
+        if (scols) {
+          scols.querySelectorAll('.scol').forEach(function(col) {
+            // Get colour from first span's inline style
+            var firstSpan = col.querySelector('span');
+            var borderColor = '#00a080';
+            if (firstSpan) {
+              var m = (firstSpan.getAttribute('style') || '').match(/color\s*:\s*([^;]+)/);
+              if (m) borderColor = m[1].trim();
+            }
+            scolsHtml += '<div style="margin-top:6px;padding-left:8px;border-left:3px solid ' + borderColor + ';display:flex;flex-direction:column;gap:1px;">';
+            col.querySelectorAll('span').forEach(function(sp) {
+              var t = sp.innerText.trim();
+              if (!t) return;
+              var inlineStyle = sp.getAttribute('style') || '';
+              scolsHtml += '<div style="display:block;' + inlineStyle + '">' + t + '</div>';
+            });
+            scolsHtml += '</div>';
+          });
+        }
+
+        var sidebarHtml =
+          '<div style="min-width:160px;max-width:220px;flex-shrink:0;font-size:11px;">' +
+          (dayLabel ? '<div style="font-size:13px;font-weight:700;color:#00a080;margin-bottom:4px;">' + dayLabel.innerText.trim() + '</div>' : '') +
+          (stotalsHtml ? '<div style="display:flex;flex-direction:column;gap:1px;margin-bottom:6px;">' + stotalsHtml + '</div>' : '') +
+          (scolsHtml ? scolsHtml : '') +
+          '</div>';
+
+        var chartHtml = imgUrl
+          ? '<div style="flex:1;min-width:0;"><img src="' + imgUrl + '" style="width:100%;height:auto;display:block;"></div>'
+          : '<div style="flex:1;"></div>';
+
+        reportHtml += '<div style="margin-bottom:16px;break-inside:avoid;padding-bottom:12px;border-bottom:1px solid #eee;">';
+        reportHtml += '<div style="display:flex;gap:12px;align-items:flex-start;">' + sidebarHtml + chartHtml + '</div>';
+        if (tableEl && tableEl._built) {
+          reportHtml += '<div style="font-size:10px;overflow-x:auto;margin-top:8px;">' + tableEl.innerHTML + '</div>';
+        }
+        reportHtml += '</div>';
+      });
+
+      win.document.open();
+      win.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8">' +
+        '<title>EMT — ' + tabLabel + '</title>' +
+        '<style>' + commonStyles + '</style>' +
+        '<style>' + iframeStyles + '</style>' +
+        '<style>' + pdfOverrides + '</style>' +
+        '</head><body>' + header + reportHtml + '</body></html>');
+      win.document.close();
+    });
+
+  // ── Heatmaps ───────────────────────────────────────────────────────────────
+  } else if (_activeChart === 'heatmap') {
+    var ifrm = _getIframe('heatmap');
+    if (!ifrm || !ifrm.contentDocument) {
+      win.close(); alert('Heatmap not loaded yet.'); return;
+    }
+    var iDoc  = ifrm.contentDocument;
+    var iWin  = ifrm.contentWindow;
+
+    // Capture heatmap as image via Plotly toImage if available, else canvas
+    var hmDiv = iDoc.getElementById('heatmap');
+    var hmImg = null;
+    if (hmDiv && iWin.Plotly && typeof iWin.Plotly.toImage === 'function') {
+      // Async path — use Plotly.toImage
+      iWin.Plotly.toImage(hmDiv, {format:'png', width: hmDiv.offsetWidth || 1100, height: hmDiv.offsetHeight || 700}).then(function(imgUrl) {
+        // Capture toolbar state from iframe
+        var activeMetrics = [];
+        iDoc.querySelectorAll('.hm-metric-btn.active').forEach(function(b) { activeMetrics.push(b.textContent.trim()); });
+        var toolbarHtml = activeMetrics.length
+          ? '<div style="font-size:12px;color:#555;margin-bottom:12px;padding:6px 10px;background:#f5f5f5;border-radius:4px;border:1px solid #ddd;">Metric: <strong>' + activeMetrics.join(' · ') + '</strong></div>'
+          : '';
+        win.document.open();
+      win.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8">' +
+          '<title>EMT — ' + tabLabel + '</title>' +
+          '<style>' + commonStyles + '</style>' +
+          '</head><body>' + header + toolbarHtml +
+          '<img src="' + imgUrl + '" style="max-width:100%;border:1px solid #eee;border-radius:6px;">' +
+          '</body></html>');
+        win.document.close();
+      }).catch(function() {
+        // Fallback: just show the iframe body
+        win.document.open();
+      win.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8">' +
+          '<title>EMT — ' + tabLabel + '</title>' +
+          '<style>' + commonStyles + 'body{overflow:visible;}.period-nav{position:static;}</style>' +
+          Array.from(iDoc.querySelectorAll('style')).map(function(s){return s.outerHTML;}).join('') +
+          '</head><body>' + header + iDoc.body.innerHTML + '</body></html>');
+        win.document.close();
+      });
+      return; // async — return early
+    } else {
+      // No Plotly.toImage — extract raw body
+      win.document.open();
+      win.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8">' +
+        '<title>EMT — ' + tabLabel + '</title>' +
+        '<style>' + commonStyles + 'body{overflow:visible;}.period-nav{position:static;}</style>' +
+        Array.from(iDoc.querySelectorAll('style')).map(function(s){return s.outerHTML;}).join('') +
+        '</head><body>' + header + iDoc.body.innerHTML + '</body></html>');
+      win.document.close();
+    }
+
+  // ── Usage Stats ────────────────────────────────────────────────────────────
+  } else if (_activeChart === 'bar') {
+    var canvas  = document.getElementById('barChart');
+    var imgData = (canvas && typeof canvas.toDataURL === 'function') ? canvas.toDataURL('image/png') : null;
+    var tblEl   = document.getElementById('bar-table');
+    var tblHtml = tblEl ? tblEl.outerHTML : '<p>No data table.</p>';
+
+    // Clone the actual toolbar HTML, stripping onclick handlers, marking active state visually
+    var barToolbar = document.querySelector('.bar-toolbar');
+    var toolbarHtml = '';
+    if (barToolbar) {
+      var clone = barToolbar.cloneNode(true);
+      // Remove onclick attrs and make active buttons visually distinct via inline style
+      clone.querySelectorAll('[onclick]').forEach(function(el) { el.removeAttribute('onclick'); });
+      clone.querySelectorAll('.bar-seg-btn.active').forEach(function(el) {
+        el.style.background = '#00a080';
+        el.style.color = '#fff';
+        el.style.fontWeight = '600';
+      });
+      clone.querySelectorAll('.bar-seg-btn:not(.active)').forEach(function(el) {
+        el.style.background = '#f0f0f0';
+        el.style.color = '#555';
+      });
+      // Replace checkboxes with visible text indicators — native checkbox checked
+      // state doesn't render reliably in PDF/print popup windows.
+      clone.querySelectorAll('input[type=checkbox]').forEach(function(el) {
+        var liveEl = el.id ? document.getElementById(el.id) : null;
+        var isChecked = liveEl ? liveEl.checked : el.checked;
+        var indicator = document.createElement('span');
+        indicator.textContent = isChecked ? '☑' : '☐';
+        indicator.style.cssText = 'font-size:14px;line-height:1;margin-right:2px;';
+        el.parentNode.insertBefore(indicator, el);
+        el.style.display = 'none';
+      });
+      // Also make the standing charge label text visible in the clone
+      clone.querySelectorAll('#bar-standing-wrap, [id$="-standing-wrap"]').forEach(function(el) {
+        el.style.display = 'flex';
+        // Remove the ::after pseudo-element workaround by showing the real text
+        el.querySelectorAll('span').forEach(function(s) { s.style.display = ''; });
+      });
+      clone.style.position = 'static';
+      clone.style.marginBottom = '16px';
+      toolbarHtml = clone.outerHTML;
+    }
+
+    var barStyles =
+      'table{border-collapse:collapse;width:100%;font-size:11px;font-family:ui-monospace,monospace;}' +
+      'th,td{border:1px solid #ddd;padding:4px 8px;text-align:right;}' +
+      'th{background:#f5f5f5;font-weight:600;text-align:center;}' +
+      'td:first-child,th:first-child{text-align:left;}' +
+      'tr.totals-row{font-weight:700;background:#f0faf7;}' +
+      'tr:nth-child(even){background:#fafafa;}' +
+      '.col-total{font-weight:600;background:#f5f5f5;}' +
+      '.bar-legend-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;}' +
+      '.bar-toolbar{display:flex;flex-wrap:wrap;gap:8px;padding:8px;background:#f9f9f9;border:1px solid #ddd;border-radius:6px;margin-bottom:16px;}' +
+      '.bar-toolbar-right{margin-left:auto;}' +
+      '.bar-seg{display:flex;gap:2px;}' +
+      '.bar-seg-btn{padding:3px 10px;border-radius:4px;border:none;cursor:default;font-size:12px;}';
+
+    var chartSection = imgData
+      ? '<img src="' + imgData + '" style="max-width:100%;margin-bottom:20px;border:1px solid #eee;border-radius:6px;">'
+      : '<p style="color:#888;">Chart image not available.</p>';
+
+    win.document.open();
+      win.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8">' +
+      '<title>EMT — ' + tabLabel + '</title>' +
+      '<style>' + commonStyles + barStyles + '</style>' +
+      '</head><body>' +
+      header + toolbarHtml + chartSection +
+      '<div style="margin-top:16px;">' + tblHtml + '</div>' +
+      '</body></html>');
+    win.document.close();
   }
 }
 
 // ── Usage Stats Bar Chart ─────────────────────────────────────────────────────
 var barData = null;
+var barPeriodTotals = {};
 var barSortDesc = (localStorage.getItem('emt_bar_sort_desc') !== 'false'); // default newest first
 var barCurrency = '£';
 var barPeriod = 'daily';
@@ -726,6 +1121,7 @@ async function barInit() {
     var json = await r.json();
     if (json.error) throw new Error(json.error);
     barData        = json.rows || [];
+    barPeriodTotals = json.period_totals || {};
     barCurrency    = json.currency || '£';
     barBillingDay  = json.billing_day || 1;
     barMeters      = json.meters  || [];
@@ -932,15 +1328,36 @@ function barAggRows(filterFn) {
       if (m.carbon_g_exp != null && m.carbon_g_exp !== undefined) result.meters[mid].carbon_g_exp = (result.meters[mid].carbon_g_exp || 0) + m.carbon_g_exp;
     });
   });
-  // Round
-  result.standing = Math.round(result.standing * 10000) / 10000;
+  // Round kWh and carbon from daily sums
   result.imp_kwh  = Math.round(result.imp_kwh  * 10000) / 10000;
   result.exp_kwh  = Math.round(result.exp_kwh  * 10000) / 10000;
-  result.imp_cost = Math.round(result.imp_cost * 10000) / 10000;
-  result.exp_cost = Math.round(result.exp_cost * 10000) / 10000;
   if (result.carbon_g_net   != null) result.carbon_g_net   = Math.round(result.carbon_g_net   * 100) / 100;
   if (result.carbon_g_total != null) result.carbon_g_total = Math.round(result.carbon_g_total * 100) / 100;
   if (_aiHasData && _aiKwh > 0) result.avg_intensity = Math.round((_aiCarbon / _aiKwh) * 10) / 10;
+
+  // For cost totals, use pre-computed SQL period total when available.
+  // Summing daily 4dp rows accumulates rounding error over long periods (97+ days → ±£0.01).
+  // The server sends exact SQL totals in barPeriodTotals keyed by billing_period_start.
+  var _bKeys = [...new Set(filtered.map(function(r){ return r.billing_period_start; }).filter(Boolean))];
+  var _ptKey = null;
+  if (_bKeys.length === 1 && barPeriodTotals[_bKeys[0]]) {
+    // Single billing period — use its exact SQL total
+    _ptKey = _bKeys[0];
+  } else if (_bKeys.length > 1 && barPeriodTotals['_full']) {
+    // Multiple billing periods (year/calendar view) — use the full range total
+    _ptKey = '_full';
+  }
+  if (_ptKey && barPeriodTotals[_ptKey]) {
+    var _pt = barPeriodTotals[_ptKey];
+    result.imp_cost = _pt.imp_cost;
+    result.exp_cost = _pt.exp_cost;
+    result.standing = _pt.standing;
+  } else {
+    // Fallback: sum daily rows (short periods where error is negligible)
+    result.standing = Math.round(result.standing * 10000) / 10000;
+    result.imp_cost = Math.round(result.imp_cost * 10000) / 10000;
+    result.exp_cost = Math.round(result.exp_cost * 10000) / 10000;
+  }
   return result;
 }
 
@@ -1488,21 +1905,26 @@ function barBuildTable() {
         if (v != null) _rowHasVal = true;
       } else {
         if (v != null) {
-          colTotals[c.key] = (colTotals[c.key] || 0) + v;
-          // Only 'net' column contributes to row total and grand total
-          // net_imp and net_exp are supplementary display columns
-          // Import adds, Export subtracts — Total column shows net (imp - exp)
-          if (c.key === 'net_imp') rowTotal += v;
-          else if (c.key === 'net_exp') rowTotal -= v;
-          else if (c.key !== 'avg_intensity') rowTotal += v;
+          // Round to display precision before accumulating so column totals
+          // match the sum of displayed cell values
+          var vr = barMetric === 'cost' ? (Math.round(v * 10000) / 10000)
+                 : barMetric === 'kwh'  ? (Math.round(v * 1000)  / 1000)
+                 : v;
+          colTotals[c.key] = (colTotals[c.key] || 0) + vr;
+          if (c.key === 'net_imp') rowTotal += vr;
+          else if (c.key === 'net_exp') rowTotal -= vr;
+          else if (c.key !== 'avg_intensity') rowTotal += vr;
           _rowHasVal = true;
         }
         fmtd = v != null ? barFmt(v) : '—';
       }
       html += '<td>' + fmtd + '</td>';
     });
-    if (_rowHasVal) grandTotal += rowTotal;
-    html += '<td class="col-total">' + (_rowHasVal ? barFmt(rowTotal) : '—') + '</td>';
+    var rowTotalFmt = barMetric === 'cost' ? (Math.round(rowTotal * 100) / 100)
+                    : barMetric === 'kwh'  ? (Math.round(rowTotal * 1000) / 1000)
+                    : rowTotal;
+    if (_rowHasVal) grandTotal += rowTotalFmt;
+    html += '<td class="col-total">' + (_rowHasVal ? barFmt(rowTotalFmt) : '—') + '</td>';
     html += '</tr>';
   });
 
@@ -1528,10 +1950,19 @@ function barBuildTable() {
         : null;
       _totalsHtml += '<td>' + (_ai != null ? _ai + ' gCO₂/kWh' : '—') + '</td>';
     } else {
-      _totalsHtml += '<td>' + (colTotals[c.key] != null ? barFmt(colTotals[c.key]) : '—') + '</td>';
+      var tot = colTotals[c.key];
+      if (tot != null) {
+        tot = barMetric === 'cost' ? (Math.round(tot * 100) / 100)
+            : barMetric === 'kwh'  ? (Math.round(tot * 1000) / 1000)
+            : tot;
+      }
+      _totalsHtml += '<td>' + (tot != null ? barFmt(tot) : '—') + '</td>';
     }
   });
-  _totalsHtml += '<td class="col-total">' + barFmt(grandTotal) + '</td>';
+  var grandTotalFmt = barMetric === 'cost' ? (Math.round(grandTotal * 100) / 100)
+                    : barMetric === 'kwh'  ? (Math.round(grandTotal * 1000) / 1000)
+                    : grandTotal;
+  _totalsHtml += '<td class="col-total">' + barFmt(grandTotalFmt) + '</td>';
   _totalsHtml += '</tr>';
 
   html += '</tbody>';
@@ -1672,7 +2103,6 @@ function show(id) {
   setTimeout(() => document.getElementById(id)?.classList.remove('show'), 4000);
 }
 function hideAlerts() {
-  document.getElementById('alert-success').classList.remove('show');
   document.getElementById('alert-error').classList.remove('show');
 }
 function showError(msg) {

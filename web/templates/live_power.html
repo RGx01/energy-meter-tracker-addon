@@ -1413,7 +1413,7 @@ function msUntilNextBillingRefresh() {
 
 function refreshBilling() {
   // Reload just the billing section by fetching a new page and extracting the cards
-  fetch(apiUrl('/api/billing'))
+  fetch(apiUrl('/api/billing') + '?t=' + Date.now())
     .then(function(r) { return r.json(); })
     .then(function(d) {
       updateBillingCard('today',  d.today_total,  d.today_rows,  d.today_date,  d.currency);

@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     exp_read_end     REAL,
     standing_charge  REAL    NOT NULL DEFAULT 0,
     carbon_g         REAL,               -- net gCO2 for this block (NULL if no CI data)
+    imp_provisional  INTEGER NOT NULL DEFAULT 0,  -- 1 = sub-meter kWh written without post-boundary read; 0 = final
     FOREIGN KEY (config_period_id) REFERENCES config_periods(id),
     UNIQUE (block_start, meter_id)
 );
@@ -370,6 +371,8 @@ def _block_rows(block: dict, config_period_id: int, tz_name: str) -> list[dict]:
             "standing_charge":   float(meter_block.get("standing_charge") or 0),
             # carbon footprint (NULL if no CI data available)
             "carbon_g":          meter_block.get("carbon_g"),
+            # provisional: 1 if sub-meter was written without a post-boundary read
+            "imp_provisional":   1 if meter_block.get("provisional") else 0,
         })
     return rows
 
@@ -478,6 +481,13 @@ def _row_to_block(rows: list[sqlite3.Row]) -> dict:
                 imp_ch["kwh_remainder"] = row["imp_kwh_remainder"]
             if row["imp_cost_remainder"] is not None:
                 imp_ch["cost_remainder"] = row["imp_cost_remainder"]
+            # Expose provisional flag so the amendment path can identify blocks
+            # written without a post-boundary sub-meter read.
+            try:
+                if row["imp_provisional"]:
+                    meter_block["provisional"] = True
+            except (IndexError, KeyError):
+                pass
             meter_block["channels"]["import"] = imp_ch
 
         if row["exp_kwh"] is not None:
@@ -712,6 +722,7 @@ class BlockStore:
             ("mpan",             "meter_channels",  "TEXT",              _mc_cols),
             ("tariff",           "meter_channels",  "TEXT",              _mc_cols),
             ("carbon_g",         "blocks",          "REAL",              _b_cols),
+            ("imp_provisional",  "blocks",          "INTEGER NOT NULL DEFAULT 0", _b_cols),
             ("carbon_gco2_min",  "power_history",   "REAL",              _ph_cols),
         ]:
             if _col not in _col_set:
@@ -2240,7 +2251,7 @@ class BlockStore:
                 imp_read_start, imp_read_end,
                 exp_kwh, exp_rate, exp_cost,
                 exp_read_start, exp_read_end,
-                standing_charge, carbon_g
+                standing_charge, carbon_g, imp_provisional
             ) VALUES (
                 :block_start, :block_end,
                 :meter_id, :config_period_id, :interpolated,
@@ -2249,7 +2260,7 @@ class BlockStore:
                 :imp_read_start, :imp_read_end,
                 :exp_kwh, :exp_rate, :exp_cost,
                 :exp_read_start, :exp_read_end,
-                :standing_charge, :carbon_g
+                :standing_charge, :carbon_g, :imp_provisional
             )
         """
         with self._conn:
@@ -2269,7 +2280,7 @@ class BlockStore:
                 imp_read_start, imp_read_end,
                 exp_kwh, exp_rate, exp_cost,
                 exp_read_start, exp_read_end,
-                standing_charge, carbon_g
+                standing_charge, carbon_g, imp_provisional
             ) VALUES (
                 :block_start, :block_end,
                 :meter_id, :config_period_id, :interpolated,
@@ -2278,7 +2289,7 @@ class BlockStore:
                 :imp_read_start, :imp_read_end,
                 :exp_kwh, :exp_rate, :exp_cost,
                 :exp_read_start, :exp_read_end,
-                :standing_charge, :carbon_g
+                :standing_charge, :carbon_g, :imp_provisional
             )
         """
         with self._conn:
@@ -2297,6 +2308,48 @@ class BlockStore:
         tz_name = cp["timezone"] if cp else "UTC"
         rows = _block_rows(block, period_id, tz_name)
         self._insert_block_rows_replace(rows)
+
+    def get_provisional_sub_meter_blocks(self) -> list[dict]:
+        """Return the most-recent block for each sub-meter that has imp_provisional=1.
+
+        Used by the 2.10.0 boundary interpolation amendment path: after each
+        engine tick we check whether a post-boundary read has arrived for any
+        sub-meter whose previous block was written as provisional (no post-boundary
+        read at block-close time).  Returns one single-meter block dict per
+        provisional sub-meter row.
+        """
+        try:
+            cur = self._conn.execute(
+                """
+                SELECT b.*, cp.billing_day, cp.block_minutes, cp.timezone,
+                       cp.currency_symbol, cp.currency_code, cp.effective_from,
+                       m.is_sub_meter, m.parent_meter_id, m.device_label,
+                       m.inverter_possible, m.power_sensor, m.postcode_prefix,
+                       m.v2x_capable, m.meter_type, m.soc_sensor,
+                       m.inverter_power_sensor, m.inverter_power_invert,
+                       m.device_power_sensor, m.retired_at, m.retired_reason
+                FROM blocks b
+                JOIN config_periods cp ON b.config_period_id = cp.id
+                LEFT JOIN meters m ON m.meter_id = b.meter_id
+                                   AND m.config_period_id = b.config_period_id
+                WHERE b.imp_provisional = 1
+                  AND m.is_sub_meter = 1
+                  AND b.block_start = (
+                      SELECT MAX(b2.block_start) FROM blocks b2
+                      WHERE b2.meter_id = b.meter_id AND b2.imp_provisional = 1
+                  )
+                ORDER BY b.block_start, b.meter_id
+                """
+            )
+            rows = cur.fetchall()
+        except Exception:
+            return []
+        result = []
+        for row in rows:
+            blk = _row_to_block([row])
+            if blk:
+                result.append(blk)
+        return result
 
     def _select_blocks(self, where: str, params: tuple) -> list[dict]:
         sql = f"""

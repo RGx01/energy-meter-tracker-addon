@@ -1097,6 +1097,309 @@ def _apply_pass2(block: dict) -> None:
         )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.10.0 — Sub-meter boundary interpolation amendment
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Maximum median inter-read interval (seconds) for a sub-meter to be eligible
+# for boundary interpolation.  Devices publishing slower than this are too
+# coarse — the linear interpolation assumption breaks down and the provisional
+# figure (last pre-boundary read) is the best available estimate.
+# 90 s gives 60 s devices a comfortable jitter margin.
+_PROVISIONAL_MAX_INTERVAL_S: float = 90.0
+
+# A post-boundary read is only used for interpolation if it arrives within
+# this multiple of the observed device interval after the boundary.  Catches
+# the stop-then-restart case: if the device genuinely stopped before the
+# boundary and restarted 15 min later, the gap is >> 2× interval and we
+# correctly leave the provisional figure unchanged.
+_PROVISIONAL_GAP_MULTIPLIER: float = 2.0
+
+# Minimum number of inter-read gaps required to compute a reliable median
+# device interval.  3 gaps (4 reads) gives a median robust against one
+# outlier on a stable periodic signal — sufficient regardless of block size.
+# Larger blocks naturally provide more gaps but the minimum stays flat.
+_PROVISIONAL_MIN_GAPS: int = 3
+
+
+def _observed_device_interval_s(reads: list) -> float | None:
+    """Return the median inter-read gap in seconds from a list of read dicts.
+
+    Returns None if there are fewer than (_PROVISIONAL_MIN_GAPS + 1) reads
+    (i.e. fewer than 4 reads / 3 gaps).  3 gaps is the minimum needed for a
+    median robust against one outlier on a stable periodic signal, and holds
+    across all block sizes — a 5-minute block with a 60s device still yields
+    ~4 reads, which is sufficient.
+    Each read dict must have a 'ts' key containing an ISO timestamp string.
+    """
+    if len(reads) < _PROVISIONAL_MIN_GAPS + 1:
+        return None
+    sorted_reads = sorted(reads, key=lambda r: r["ts"])
+    gaps = []
+    for i in range(1, len(sorted_reads)):
+        try:
+            t0 = datetime.fromisoformat(sorted_reads[i - 1]["ts"])
+            t1 = datetime.fromisoformat(sorted_reads[i]["ts"])
+            gap_s = (t1 - t0).total_seconds()
+            if gap_s > 0:
+                gaps.append(gap_s)
+        except (ValueError, KeyError):
+            continue
+    if len(gaps) < _PROVISIONAL_MIN_GAPS:
+        return None
+    gaps.sort()
+    mid = len(gaps) // 2
+    return gaps[mid] if len(gaps) % 2 else (gaps[mid - 1] + gaps[mid]) / 2.0
+
+
+def _commit_provisional_as_final(ha: HAClient, full_block: dict,
+                                  meter_name: str, block_start_iso: str,
+                                  block_end_iso: str) -> None:
+    """Clear the provisional flag on *meter_name* in *full_block*, re-run PASS 2,
+    write back to DB, and republish HA sensors.
+
+    The kWh figure is left exactly as originally computed — this path is taken
+    when interpolation is not appropriate (device too slow, gap too large,
+    gap-fill in progress, insufficient reads).  PASS 2 is re-run for
+    correctness but produces the same result as the original write.
+    """
+    full_block["meters"][meter_name].pop("provisional", None)
+    _apply_pass2(full_block)
+    try:
+        append_block_replace(full_block)
+        logger.info(
+            "_amend_provisional: block %s → %s committed as-final for %s "
+            "(no interpolation applied)",
+            block_start_iso, block_end_iso, meter_name,
+        )
+    except Exception as _we:
+        logger.error(
+            "_amend_provisional: DB write failed committing as-final for %s: %s",
+            meter_name, _we,
+        )
+        return
+    try:
+        engine_totals = _store.get_cumulative_totals()
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(_deferred_sensor_update(ha, engine_totals))
+    except Exception as _se:
+        logger.warning("_amend_provisional: sensor republish failed: %s", _se)
+
+
+def _amend_provisional_sub_meter_blocks(ha: HAClient, current_block: dict) -> None:
+    """Retrospectively correct provisional sub-meter blocks.
+
+    Called each engine tick after reads are captured, but only when no gap
+    marker is active (gap-seed reads must not be used as interpolation anchors).
+
+    For each sub-meter whose previous block was written as provisional (no
+    post-boundary read was available at close time), we:
+
+      1. Check the device's observed publishing interval from the provisional
+         block's own reads (≥ 6 reads required; median ≤ 90 s required).
+      2. Check whether the first post-boundary read in the current rolling
+         buffer arrived within 2 × that interval of the boundary.
+      3. If both checks pass → interpolate to the boundary and amend the block.
+      4. If either check fails → commit the provisional figure as-final without
+         changing the kWh (the last pre-boundary read is the best estimate).
+
+    Amendment is strictly non-cascading — only the immediately-previous
+    block is touched.  Subsequent blocks already have their own reads and
+    are unaffected.
+
+    Gap-fill safety: the caller (_engine_tick) must not call this function
+    when a gap marker is active.  Gap-seed reads look identical to real reads
+    in the rolling buffer dict and must never be used as interpolation anchors.
+    """
+    provisional_blocks = _store.get_provisional_sub_meter_blocks()
+    if not provisional_blocks:
+        return
+
+    for prov_block in provisional_blocks:
+        block_start_iso = prov_block.get("start", "")
+        block_end_iso   = prov_block.get("end", "")
+        if not block_start_iso or not block_end_iso:
+            continue
+
+        block_end_dt = datetime.fromisoformat(block_end_iso)
+        boundary_iso = block_end_iso  # boundary == block end
+
+        for meter_name, meter_block in prov_block.get("meters", {}).items():
+            if not meter_block.get("provisional"):
+                continue
+            meta = meter_block.get("meta", {})
+            if not meta.get("sub_meter"):
+                continue
+
+            old_imp_ch = meter_block.get("channels", {}).get("import", {})
+            old_rate   = old_imp_ch.get("rate", 0.0) or 0.0
+            opener_val = old_imp_ch.get("read_start", 0.0)
+
+            # ── Load full block from DB for PASS 2 ────────────────────────
+            full_block = _store.get_last_block_before(block_end_iso)
+            if not full_block or full_block.get("start") != block_start_iso:
+                try:
+                    blocks_here = _store.get_blocks_for_range(
+                        datetime.fromisoformat(block_start_iso),
+                        datetime.fromisoformat(block_end_iso),
+                    )
+                    full_block = blocks_here[-1] if blocks_here else None
+                except Exception as _e:
+                    logger.warning(
+                        "_amend_provisional: block reload failed for %s: %s",
+                        meter_name, _e,
+                    )
+                    full_block = None
+
+            if not full_block or full_block.get("start") != block_start_iso:
+                logger.warning(
+                    "_amend_provisional: could not reload block %s from DB; "
+                    "skipping %s",
+                    block_start_iso, meter_name,
+                )
+                continue
+
+            # ── Gate 1: device interval from provisional block's own reads ─
+            # The provisional block's reads are in the prov_block meter_block,
+            # but those reads are not stored to the DB — they live in the
+            # current_reads table while the block is live and are discarded
+            # after finalise.  We infer the interval from the rolling buffer's
+            # pre-boundary reads, which include the full set of reads carried
+            # into the current block as seeds plus any new reads.
+            cb_meter = (current_block.get("meters") or {}).get(meter_name, {})
+            cb_reads  = (cb_meter.get("channels") or {}).get("import", {}).get("reads", [])
+            pre_reads  = [r for r in cb_reads if r.get("ts", "") <  boundary_iso]
+            post_reads = [r for r in cb_reads if r.get("ts", "") >= boundary_iso]
+
+            if not post_reads:
+                # No post-boundary read yet — nothing to do this tick.
+                logger.debug(
+                    "_amend_provisional: %s — no post-boundary read yet",
+                    meter_name,
+                )
+                continue
+
+            if not pre_reads:
+                # Post-boundary read exists but no pre-boundary seed in buffer.
+                # Commit as-final — cannot interpolate without an opener.
+                logger.warning(
+                    "_amend_provisional: %s — post-boundary read present but no "
+                    "pre-boundary seed; committing provisional as-final",
+                    meter_name,
+                )
+                _commit_provisional_as_final(
+                    ha, full_block, meter_name, block_start_iso, block_end_iso,
+                )
+                continue
+
+            last_pre   = sorted(pre_reads,  key=lambda r: r["ts"])[-1]
+            first_post = sorted(post_reads, key=lambda r: r["ts"])[0]
+
+            # Observed interval: use all pre-boundary reads available in the
+            # buffer, which covers the provisional block window.
+            median_interval = _observed_device_interval_s(pre_reads)
+
+            if median_interval is None:
+                logger.info(
+                    "_amend_provisional: %s — insufficient reads (%d) to "
+                    "characterise device interval; committing provisional as-final",
+                    meter_name, len(pre_reads),
+                )
+                _commit_provisional_as_final(
+                    ha, full_block, meter_name, block_start_iso, block_end_iso,
+                )
+                continue
+
+            if median_interval > _PROVISIONAL_MAX_INTERVAL_S:
+                logger.warning(
+                    "_amend_provisional: %s — device interval %.1fs exceeds "
+                    "%.0fs limit; device too coarse for boundary interpolation. "
+                    "Committing provisional as-final",
+                    meter_name, median_interval, _PROVISIONAL_MAX_INTERVAL_S,
+                )
+                _commit_provisional_as_final(
+                    ha, full_block, meter_name, block_start_iso, block_end_iso,
+                )
+                continue
+
+            # ── Gate 2: post-boundary read must be within 2 × interval ────
+            try:
+                gap_s = (
+                    datetime.fromisoformat(first_post["ts"]) -
+                    datetime.fromisoformat(last_pre["ts"])
+                ).total_seconds()
+            except (ValueError, KeyError):
+                gap_s = float("inf")
+
+            threshold_s = _PROVISIONAL_GAP_MULTIPLIER * median_interval
+            if gap_s > threshold_s:
+                logger.info(
+                    "_amend_provisional: %s — post-boundary gap %.1fs exceeds "
+                    "%.1fs (%.0f × %.1fs interval); device likely stopped before "
+                    "boundary. Committing provisional as-final",
+                    meter_name, gap_s, threshold_s,
+                    _PROVISIONAL_GAP_MULTIPLIER, median_interval,
+                )
+                _commit_provisional_as_final(
+                    ha, full_block, meter_name, block_start_iso, block_end_iso,
+                )
+                continue
+
+            # ── Both gates passed — interpolate to boundary ────────────────
+            if last_pre["ts"] == first_post["ts"]:
+                boundary_val = last_pre["value"]
+            else:
+                interp = interpolate_value(last_pre, first_post, block_end_dt)
+                boundary_val = interp["value"] if interp else last_pre["value"]
+
+            corrected_kwh = max(boundary_val - opener_val, 0.0)
+            amended_imp = {
+                "kwh":        corrected_kwh,
+                "rate":       old_rate,
+                "cost":       round(corrected_kwh * old_rate, 6),
+                "read_start": opener_val,
+                "read_end":   boundary_val,
+            }
+            if "meta" in old_imp_ch:
+                amended_imp["meta"] = old_imp_ch["meta"]
+
+            logger.info(
+                "_amend_provisional: %s  interpolated — "
+                "old_kwh=%.4f  new_kwh=%.4f  boundary=%.4f  "
+                "gap=%.1fs  interval=%.1fs",
+                meter_name, old_imp_ch.get("kwh", 0.0), corrected_kwh,
+                boundary_val, gap_s, median_interval,
+            )
+
+            full_block["meters"][meter_name]["channels"]["import"] = amended_imp
+            full_block["meters"][meter_name].pop("provisional", None)
+            _apply_pass2(full_block)
+
+            try:
+                append_block_replace(full_block)
+                logger.info(
+                    "_amend_provisional: block %s → %s amended for %s",
+                    block_start_iso, block_end_iso, meter_name,
+                )
+            except Exception as _we:
+                logger.error(
+                    "_amend_provisional: DB write failed for %s: %s",
+                    meter_name, _we,
+                )
+                continue
+
+            try:
+                engine_totals = _store.get_cumulative_totals()
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(_deferred_sensor_update(ha, engine_totals))
+            except Exception as _se:
+                logger.warning(
+                    "_amend_provisional: sensor republish failed: %s", _se,
+                )
+
+
 def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: bool = False,
                    last_known_rates: dict | None = None):
     cb = block_data if block_data is not None else _store.load_current_block()
@@ -1177,6 +1480,7 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
 
             if reads and not is_sub:
                 pre_open  = select_opening_read(reads, block_start_dt)
+                pre_open  = select_opening_read(reads, block_start_dt)
                 post_open = select_closing_read(reads, block_start_dt)
                 if pre_open and post_open and pre_open["ts"] != post_open["ts"]:
                     interpolated_opener = interpolate_value(pre_open, post_open, block_start_dt)
@@ -1216,6 +1520,20 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
                 result["meta"] = channel_cfg_meta
 
             meter_block["channels"][channel_name] = result
+
+            # ── 2.10.0: provisional detection for sub-meter import ──────────
+            # A sub-meter block is provisional when it was closed without a
+            # post-boundary read.  The first post-boundary read in the NEXT
+            # block's window will trigger a retrospective amendment.
+            if is_sub and channel_name == "import" and not interpolated:
+                has_post = any(r["ts"] >= boundary_iso for r in reads)
+                if not has_post:
+                    meter_block["provisional"] = True
+                    logger.info(
+                        "finalise_block: %s import marked provisional "
+                        "(no post-boundary read — will amend when read arrives)",
+                        meter_name,
+                    )
 
         block["meters"][meter_name] = meter_block
 
@@ -1576,6 +1894,16 @@ async def _engine_tick(ha: HAClient):
 
     if not _read_queue and (periodic_checkpoint or near_boundary):
         capture_samples(ha, current_block, now)
+
+    # ── 2.10.0: amend provisional sub-meter blocks ────────────────────────
+    # Skip entirely when a gap marker is active — gap-seed reads in the
+    # rolling buffer look identical to real reads and must never be used
+    # as interpolation anchors for boundary correction.
+    if not has_gap_marker(current_block):
+        try:
+            _amend_provisional_sub_meter_blocks(ha, current_block)
+        except Exception as _amp_e:
+            logger.warning("_engine_tick: provisional amendment failed: %s", _amp_e)
 
     # Deferred gap filling
     # Pre-populate with rates from the last finalised block so finalise_block

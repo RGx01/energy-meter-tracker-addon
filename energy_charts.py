@@ -592,12 +592,15 @@ def get_all_year_periods(blocks, tz=None):
 def calculate_billing_summary_for_period(blocks, period_start, period_end):
     meter_summary  = defaultdict(lambda: defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "read_start": None, "read_end": None}))
     meter_totals   = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "read_start": None, "read_end": None})
-    main_import_raw = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0})  # rate -> totals before sub-meter subtraction
+    main_import_raw = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0})
+    main_export_raw = {"kwh": 0.0, "cost": 0.0}  # raw main meter export totals
     standing_by_day = defaultdict(float)
     charged_days   = set()
-    meter_meta     = {}   # display_key -> {site, device, mpan, tariff, is_submeter}
+    meter_meta     = {}
 
-    for block in sorted([b for b in blocks if b and b.get("start")], key=lambda b: b["start"]):
+    sorted_blocks = sorted([b for b in blocks if b and b.get("start")], key=lambda b: b["start"])
+
+    for block in sorted_blocks:
         # block["start"] is a UTC ISO string; parse it and convert to local naive
         # so BST blocks at 23:xx UTC compare correctly against local period boundaries.
         _block_utc = datetime.fromisoformat(block["start"])
@@ -613,10 +616,11 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
         if not (period_start <= block_start < period_end):
             continue
 
+        day_key = block_start.date()
         meters = block.get("meters", {}) or {}
 
-        # ── Pass 1: accumulate sub-meter kwh/cost per rate so we can subtract from main ──
-        sub_by_rate = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0})  # rate -> {kwh, cost}
+        # ── Pass 1: accumulate sub-meter grid-attributed kwh/cost per rate ──
+        sub_by_rate = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0})
         for meter_name, meter in meters.items():
             if not (meter or {}).get("meta", {}).get("sub_meter"):
                 continue
@@ -626,7 +630,8 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
                 try:
                     channel = channel or {}
                     rate = round(float(channel.get("rate_used", channel.get("rate")) or 0.0), 4)
-                    sub_by_rate[rate]["kwh"]  += float(channel.get("kwh") or 0.0)
+                    # Use kwh_grid (grid-attributed portion) not kwh (total device consumption)
+                    sub_by_rate[rate]["kwh"]  += float(channel.get("kwh_grid", channel.get("kwh")) or 0.0)
                     sub_by_rate[rate]["cost"] += float(channel.get("cost") or 0.0)
                 except Exception:
                     pass
@@ -651,33 +656,43 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
                 try:
                     channel = channel or {}
                     channel_m = (channel.get("meta", {}) or {})
-                    disp_key = f"{display_name} / {channel_name.replace('_', ' ').title()}"
-                    if disp_key not in meter_meta:
-                        meter_meta[disp_key] = {
-                            "site":        meter_m.get("site"),
-                            "device":      meter_m.get("device"),
-                            "mpan":        channel_m.get("mpan"),
-                            "tariff":      channel_m.get("tariff"),
-                            "is_submeter": bool(meter_m.get("sub_meter")),
-                        }
+
                     kwh  = float(channel.get("kwh_total", channel.get("kwh")) or 0.0)
                     cost = float(channel.get("cost") or 0.0)
                     rate = round(float(channel.get("rate_used", channel.get("rate")) or 0.0), 4)
                     is_export = channel_name.lower().endswith("export")
 
                     if is_export:
+                        if is_main_import:
+                            main_export_raw["kwh"]  += float(channel.get("kwh") or 0.0)
+                            main_export_raw["cost"] += float(channel.get("cost") or 0.0)
                         cost = -abs(cost)
                     elif is_main_import:
-                        # Store raw total before sub-meter subtraction (for bill summary header)
+                        # Store raw total before sub-meter subtraction
                         main_import_raw[rate]["kwh"]  += kwh
                         main_import_raw[rate]["cost"] += cost
-                        # Subtract sub-meter contribution at this rate from main import
-                        kwh  = max(0.0, kwh  - sub_by_rate[rate]["kwh"])
-                        cost = max(0.0, cost - sub_by_rate[rate]["cost"])
+                        # Use kwh_remainder directly when available
+                        if "kwh_remainder" in channel:
+                            kwh  = float(channel["kwh_remainder"])
+                            cost = max(0.0, cost - sub_by_rate[rate]["cost"])
+                        else:
+                            kwh  = max(0.0, kwh  - sub_by_rate[rate]["kwh"])
+                            cost = max(0.0, cost - sub_by_rate[rate]["cost"])
 
                     key = f"{display_name} / {channel_name.replace('_', ' ').title()}"
+                    if key not in meter_meta:
+                        meter_meta[key] = {
+                            "site":        meter_m.get("site"),
+                            "device":      meter_m.get("device"),
+                            "mpan":        channel_m.get("mpan"),
+                            "tariff":      channel_m.get("tariff"),
+                            "is_submeter": bool(meter_m.get("sub_meter")),
+                        }
                     meter_summary[key][rate]["kwh"]  += kwh
                     meter_summary[key][rate]["cost"] += cost
+                    meter_totals[key]["kwh"]         += kwh
+                    meter_totals[key]["cost"]        += cost
+                    meter_totals[key]["is_submeter"]  = bool(meter_m.get("sub_meter"))
 
                     if not meter_m.get("sub_meter"):
                         rs = channel.get("read_start")
@@ -686,13 +701,6 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
                             meter_summary[key][rate]["read_start"] = rs
                         if re is not None:
                             meter_summary[key][rate]["read_end"] = re
-
-                    meter_totals[key]["kwh"]        += kwh
-                    meter_totals[key]["cost"]       += cost
-                    meter_totals[key]["is_submeter"] = bool(meter_m.get("sub_meter"))
-                    if not meter_m.get("sub_meter"):
-                        rs = channel.get("read_start")
-                        re = channel.get("read_end")
                         if meter_totals[key]["read_start"] is None or (rs is not None and rs < meter_totals[key]["read_start"]):
                             meter_totals[key]["read_start"] = rs
                         if re is not None:
@@ -700,10 +708,7 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
                 except Exception:
                     pass
 
-        day_key = block_start.date()
-        # Use MAX standing_charge per day from main meter only — same as SQL billing query.
-        # The first BST block arrives at 23:00 UTC the previous night and may have sc=0.
-        # Sub-meters always have sc=0 — skip them to avoid corrupting totals.
+        # Standing charge
         for meter in (meters or {}).values():
             if (meter or {}).get("meta", {}).get("sub_meter"):
                 continue
@@ -714,8 +719,27 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
                 standing_by_day.setdefault(day_key, 0.0)
         charged_days.add(day_key)
 
+    # ── Round accumulated raw values once at the end ──
+    # This matches how Octopus bills: sum raw block costs, round once to 2dp.
+    # No intermediate per-day rounding — that would introduce cumulative error.
+    for key in meter_summary:
+        for rate in meter_summary[key]:
+            meter_summary[key][rate]["kwh"]  = round(meter_summary[key][rate]["kwh"],  3)
+            meter_summary[key][rate]["cost"] = round(meter_summary[key][rate]["cost"], 2)
+        meter_totals[key]["kwh"]  = round(meter_totals[key]["kwh"],  3)
+        meter_totals[key]["cost"] = round(meter_totals[key]["cost"], 2)
     total_standing = sum(standing_by_day.values())
-    total_cost = sum(t["cost"] for t in meter_totals.values()) + total_standing
+    # Compute total_cost from raw (pre-display-rounding) main meter totals.
+    # main_import_raw and meter_totals export are rounded to 2dp below for display,
+    # but total_cost must use the raw sums to avoid intermediate rounding error
+    # accumulating over long periods (e.g. 97 days → ±£0.01).
+    _raw_main_imp = sum(v["cost"] for rate, v in main_import_raw.items())
+    _raw_main_exp = main_export_raw["cost"]
+    total_cost = round(_raw_main_imp + total_standing - _raw_main_exp, 2)
+    # Now round main_import_raw for display (render_billing_summary uses these)
+    for rate in main_import_raw:
+        main_import_raw[rate]["kwh"]  = round(main_import_raw[rate]["kwh"],  3)
+        main_import_raw[rate]["cost"] = round(main_import_raw[rate]["cost"], 2)
 
     # Collect main meter read_start / read_end for the raw import header
     _main_key = next((k for k in meter_totals if "Electricity Main / Import" in k
@@ -744,18 +768,24 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
 # ─────────────────────────────────────────────────────────────
 
 def _bill_rate_rows(channels, currency):
-    """Render rate breakdown rows for a channel dict {rate: {kwh, cost}}."""
+    """Render rate breakdown rows for a channel dict {rate: {kwh, cost}}.
+    Returns (html, total_kwh, total_cost) where totals are sum of rounded per-rate values."""
     rows = ""
+    total_kwh = 0.0
+    total_cost = 0.0
     for rate in sorted(channels):
         d = channels[rate]
-        cost_val = d["cost"]
+        kwh      = round(d["kwh"],  3)
+        cost_val = round(d["cost"], 2)
+        total_kwh  += kwh
+        total_cost += cost_val
         cost_str = f"({-cost_val:.2f})" if cost_val < 0 else f"{cost_val:.2f}"
         rows += f"""
             <tr>
               <td></td><td>{rate:.4f}</td>
-              <td>{d['kwh']:.3f}</td><td>{cost_str}</td>
+              <td>{kwh:.3f}</td><td>{cost_str}</td>
             </tr>"""
-    return rows
+    return rows, round(total_kwh, 3), round(total_cost, 2)
 
 
 def _bill_total_row(kwh, cost):
@@ -823,10 +853,8 @@ def render_billing_summary(summary, currency='£', site_name=None):
         <tr class="channel-header">
           <td></td><td>Rate ({currency}/kWh)</td><td>kWh</td><td>Cost ({currency})</td>
         </tr>"""
-        html += _bill_rate_rows(channels, currency)
+        html += _bill_rate_rows(channels, currency)[0]
         html += _bill_total_row(totals["kwh"], totals["cost"])
-
-    # ── Import — total grid (raw, before sub-meter subtraction) ──
     if remainder_keys or submeter_keys:
         # Build raw totals from main_import_raw
         raw_kwh  = sum(d["kwh"]  for d in main_import_raw.values())
@@ -857,8 +885,9 @@ def render_billing_summary(summary, currency='£', site_name=None):
         <tr class="channel-header">
           <td></td><td>Rate ({currency}/kWh)</td><td>kWh</td><td>Cost ({currency})</td>
         </tr>"""
-        html += _bill_rate_rows(main_import_raw, currency)
-        html += _bill_total_row(raw_kwh, raw_cost)
+        _rate_html, raw_kwh_r, raw_cost_r = _bill_rate_rows(main_import_raw, currency)
+        html += _rate_html
+        html += _bill_total_row(raw_kwh_r, raw_cost_r)
 
         # ── Sub-meter breakdown (indented) ──
         if submeter_keys or remainder_keys:
@@ -878,10 +907,9 @@ def render_billing_summary(summary, currency='£', site_name=None):
         <tr class="channel-header submeter-indent">
           <td></td><td>Rate ({currency}/kWh)</td><td>kWh</td><td>Cost ({currency})</td>
         </tr>"""
-                html += _bill_rate_rows(channels, currency)
-                html += _bill_total_row(totals["kwh"], totals["cost"])
-
-            # Sub-meters
+                _rate_html, tot_kwh_r, tot_cost_r = _bill_rate_rows(channels, currency)
+                html += _rate_html
+                html += _bill_total_row(tot_kwh_r, tot_cost_r)
             for meter_name in submeter_keys:
                 channels = summary["meters"][meter_name]
                 totals   = summary["totals"].get(meter_name, {})
@@ -894,10 +922,9 @@ def render_billing_summary(summary, currency='£', site_name=None):
         <tr class="channel-header submeter-indent">
           <td></td><td>Rate ({currency}/kWh)</td><td>kWh</td><td>Cost ({currency})</td>
         </tr>"""
-                html += _bill_rate_rows(channels, currency)
-                html += _bill_total_row(totals["kwh"], totals["cost"])
-
-    # ── Standing charge ──
+                _rate_html, tot_kwh_r, tot_cost_r = _bill_rate_rows(channels, currency)
+                html += _rate_html
+                html += _bill_total_row(tot_kwh_r, tot_cost_r)
     if summary["standing"]:
         rate_groups = {}
         for day_date, amount in sorted(summary["standing"].items()):
@@ -929,13 +956,16 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
     slots = 1440 // block_minutes
     meter_kwh    = defaultdict(lambda: [0.0] * slots)
     meter_rate   = defaultdict(lambda: [0.0] * slots)
+    meter_cost   = defaultdict(lambda: [0.0] * slots)
+    slot_ti_kwh  = [0.0] * slots
+    slot_ti_cost = [0.0] * slots
+    slot_ti_rate = [0.0] * slots
     summary_kwh  = defaultdict(float)
     summary_cost = defaultdict(float)
     summary_rates = defaultdict(lambda: defaultdict(float))
-    meter_display_name = {}   # meter_key -> human label from meta
+    meter_display_name = {}
 
     def _f(v, default=0.0):
-        """Return float, treating None and non-numeric as default."""
         try:
             return float(v) if v is not None else default
         except (TypeError, ValueError):
@@ -948,42 +978,68 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
             main_import = (main.get("channels", {}) or {}).get("import", {}) or {}
             main_export = (main.get("channels", {}) or {}).get("export", {}) or {}
 
-            main_kwh  = _f(main_import.get("kwh_total", main_import.get("kwh")))
-            main_cost = _f(main_import.get("cost"))
-
-            for meter_name, meter in meters.items():
-                if (meter or {}).get("meta", {}).get("sub_meter"):
-                    sub = ((meter.get("channels", {}) or {}).get("import", {}) or {})
-                    main_kwh  -= _f(sub.get("kwh"))
-                    main_cost -= _f(sub.get("cost"))
-
-            main_kwh  = max(main_kwh, 0.0)
-            main_cost = max(main_cost, 0.0)
+            # Use kwh_remainder when available (engine PASS 2 remainder — same field
+            # usage stats uses). Fall back to subtraction for legacy blocks.
+            if "kwh_remainder" in main_import:
+                main_kwh  = _f(main_import["kwh_remainder"])
+                main_cost = _f(main_import.get("cost"))
+                # Cost: subtract sub-meter costs (no cost_remainder stored per-block)
+                for meter_name, meter in meters.items():
+                    if (meter or {}).get("meta", {}).get("sub_meter"):
+                        sub = ((meter.get("channels", {}) or {}).get("import", {}) or {})
+                        main_cost -= _f(sub.get("cost"))
+                main_cost = max(main_cost, 0.0)
+            else:
+                main_kwh  = _f(main_import.get("kwh_total", main_import.get("kwh")))
+                main_cost = _f(main_import.get("cost"))
+                for meter_name, meter in meters.items():
+                    if (meter or {}).get("meta", {}).get("sub_meter"):
+                        sub = ((meter.get("channels", {}) or {}).get("import", {}) or {})
+                        main_kwh  -= _f(sub.get("kwh_grid", sub.get("kwh")))
+                        main_cost -= _f(sub.get("cost"))
+                main_kwh  = max(main_kwh, 0.0)
+                main_cost = max(main_cost, 0.0)
             main_rate = _f(main_import.get("rate_used", main_import.get("rate")))
 
             meter_kwh["electricity_main"][hh]  = main_kwh
             meter_rate["electricity_main"][hh] = main_rate
+            meter_cost["electricity_main"][hh] = main_cost
             summary_kwh["electricity_main"]   += main_kwh
             summary_cost["electricity_main"]  += main_cost
             summary_rates["electricity_main"][round(main_rate, 4)] += main_kwh
             if "electricity_main" not in meter_display_name:
                 meter_display_name["electricity_main"] = "Direct import"
 
+            # Total import: use kwh_total from engine if available (authoritative),
+            # otherwise sum remainder + sub-meter grid portions only.
+            ti_kwh_has_total = "kwh_total" in main_import
+            ti_kwh  = _f(main_import.get("kwh_total")) if ti_kwh_has_total else main_kwh
+            ti_cost = main_cost  # remainder cost; sub-meter costs added below
+
             for meter_name, meter in meters.items():
                 if (meter or {}).get("meta", {}).get("sub_meter"):
                     sub      = ((meter.get("channels", {}) or {}).get("import", {}) or {})
-                    sub_kwh  = _f(sub.get("kwh"))
+                    sub_kwh      = _f(sub.get("kwh"))
+                    sub_kwh_grid = _f(sub.get("kwh_grid", sub_kwh))  # grid-attributed portion
                     sub_cost = _f(sub.get("cost"))
                     sub_rate = _f(sub.get("rate"))
-                    meter_kwh[meter_name][hh]  = sub_kwh
+                    meter_kwh[meter_name][hh]  = sub_kwh_grid  # grid-attributed, matches usage stats
                     meter_rate[meter_name][hh] = sub_rate
-                    summary_kwh[meter_name]   += sub_kwh
+                    meter_cost[meter_name][hh] = sub_cost
+                    summary_kwh[meter_name]   += sub_kwh_grid
                     summary_cost[meter_name]  += sub_cost
-                    summary_rates[meter_name][round(sub_rate, 4)] += sub_kwh
+                    summary_rates[meter_name][round(sub_rate, 4)] += sub_kwh_grid
                     if meter_name not in meter_display_name:
                         meta = (meter or {}).get("meta", {}) or {}
                         label = meta.get("device") or meter_name.replace("_", " ").title()
                         meter_display_name[meter_name] = label
+                    if not ti_kwh_has_total:
+                        ti_kwh += sub_kwh_grid
+                    ti_cost += sub_cost
+
+            slot_ti_kwh[hh]  = ti_kwh
+            slot_ti_cost[hh] = ti_cost
+            slot_ti_rate[hh] = main_rate
 
             if main_export:
                 exp_kwh  = abs(_f(main_export.get("kwh")))
@@ -992,6 +1048,7 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                 exp_name = "electricity_main_export"
                 meter_kwh[exp_name][hh]  = -exp_kwh
                 meter_rate[exp_name][hh] = exp_rate
+                meter_cost[exp_name][hh] = exp_cost
                 summary_kwh[exp_name]   += exp_kwh
                 summary_cost[exp_name]  += exp_cost
                 summary_rates[exp_name][round(exp_rate, 4)] += exp_kwh
@@ -1027,7 +1084,6 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
         return out
 
     house_kwh  = summary_kwh.get("electricity_main", 0.0)
-    house_cost = summary_cost.get("electricity_main", 0.0)
     exp_kwh    = summary_kwh.get("electricity_main_export", 0.0)
     exp_cost   = summary_cost.get("electricity_main_export", 0.0)
 
@@ -1046,10 +1102,31 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                 out += cs(f'{kwh:.3f} kWh @ {currency}{rate:.4f}', color, size="0.8em")
         return out
 
+    # ── Per-meter totals rounded to display precision ──────────────────────
+    # Sum per-slot values at display precision (3dp kWh, 4dp cost) so the
+    # sidebar, data table totals row, and any future views all use the same
+    # single rounding path.
+    meter_totals = {}
+    for meter in meter_kwh:
+        kwh_sum  = sum(abs(v) for v in meter_kwh[meter])
+        cost_sum = sum(abs(v) for v in meter_cost[meter])
+        meter_totals[meter] = {
+            "kwh":  round(kwh_sum, 3),
+            "cost": round(cost_sum, 4),
+        }
+
+    house_cost = meter_totals.get("electricity_main", {}).get("cost", 0.0)
+    ti_total = {
+        "kwh":  round(sum(meter_totals[m]["kwh"]  for m in meter_totals if not m.endswith("_export")), 3),
+        "cost": round(sum(meter_totals[m]["cost"] for m in meter_totals if not m.endswith("_export")), 4),
+    }
+    # Use rounded totals for the import summary line too
+    total_import_cost_display = ti_total["cost"]
+
     totals_html = ''
     if total_import > 0:
         totals_html += cs(f'Total import: {total_import:.3f} kWh', main_color)
-        totals_html += cs(f'Import cost: {currency}{total_import_cost:.2f}', main_color)
+        totals_html += cs(f'Import cost: {currency}{total_import_cost_display:.2f}', main_color)
     if exp_kwh > 0:
         totals_html += cs(f'Total export: {exp_kwh:.3f} kWh', export_color)
         totals_html += cs(f'Export credit: {currency}{exp_cost:.2f}', export_color)
@@ -1070,7 +1147,7 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
 
         for meter_name in sub_meter_names:
             sub_kwh  = summary_kwh.get(meter_name, 0.0)
-            sub_cost = summary_cost.get(meter_name, 0.0)
+            sub_cost = meter_totals.get(meter_name, {}).get("cost", 0.0)
             if sub_kwh > 0.0001:
                 sub_color = meter_colors.get(meter_name, "#e377c2")
                 label     = meter_display_name.get(meter_name, meter_name.replace("_", " ").title())
@@ -1102,13 +1179,16 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
         _ys = meter_kwh[meter]
         customdata = [[x_ranges[i], total_hh_kwh[i], abs(_ys[i])] for i in range(slots)]
 
-        nice_name = meter_display_name.get(
-                        meter,
-                        meter.replace("_", " ")
-                             .replace("electricity main", "Direct import")
-                             .replace("export", "Grid Export")
-                             .title()
-                    )
+        if meter == "electricity_main_export":
+            nice_name = meter_display_name.get(meter, "Grid Export")
+        else:
+            nice_name = meter_display_name.get(
+                            meter,
+                            meter.replace("_", " ")
+                                 .replace("electricity main", "Direct import")
+                                 .replace("export", "Grid Export")
+                                 .title()
+                        )
         raw_rates = meter_rate[meter]
         last_nonzero = max((i for i, v in enumerate(raw_rates) if v != 0.0), default=None)
         if last_nonzero is not None:
@@ -1164,13 +1244,16 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
     for meter in sorted(meter_kwh.keys()):
         bar_color  = meter_colors.get(meter, "#333333")
         line_color = adjust_color(bar_color, 0.8)
-        nice_name  = meter_display_name.get(
-            meter,
-            meter.replace("_", " ")
-                 .replace("electricity main", "Direct import")
-                 .replace("export", "Grid Export")
-                 .title()
-        )
+        if meter == "electricity_main_export":
+            nice_name = meter_display_name.get(meter, "Grid Export")
+        else:
+            nice_name = meter_display_name.get(
+                meter,
+                meter.replace("_", " ")
+                     .replace("electricity main", "Direct import")
+                     .replace("export", "Grid Export")
+                     .title()
+            )
         raw_rates = meter_rate[meter]
         last_nonzero = max((i for i, v in enumerate(raw_rates) if v != 0.0), default=None)
         if last_nonzero is not None:
@@ -1181,6 +1264,7 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
             trunc_x_line    = [i - 0.5 for i in range(slots + 1)]
         meters_data[meter] = {
             "y":            meter_kwh[meter],
+            "cost":         meter_cost[meter],
             "rate":         truncated_rates,
             "rate_x":       trunc_x_line,
             "has_rate":     any(v != 0.0 for v in raw_rates),
@@ -1191,22 +1275,32 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
         }
 
     chart_data = {
-        "x_labels":    x_labels,
-        "x_ranges":    x_ranges,
-        "slots":       slots,
+        "x_labels":      x_labels,
+        "x_ranges":      x_ranges,
+        "slots":         slots,
         "block_minutes": block_minutes,
-        "currency":    currency,
-        "meters":      meters_data,
+        "currency":      currency,
+        "meters":        meters_data,
+        "ti_kwh":        slot_ti_kwh,
+        "ti_cost":       slot_ti_cost,
+        "ti_rate":       slot_ti_rate,
+        "meter_totals":  meter_totals,
+        "ti_total":      ti_total,
     }
     chart_data_json = json.dumps(chart_data, separators=(',', ':'))
 
     chart_id      = f"{chart_prefix}chart_{day.replace('-', '_')}"
     chart_id_safe = chart_id.replace('-', '_')
+    table_id      = f"tbl_{chart_id_safe}"
 
     return f"""
 <div class="day-chart-wrap">
   {summary_html}
   <div id="{chart_id}" class="chart-container"></div>
+  <div id="{table_id}" class="day-data-tables" style="display:none;"></div>
+  <div class="day-tbl-toolbar">
+    <button class="day-tbl-toggle" onclick="toggleDayTables('{table_id}',this)">&#9776; Data</button>
+  </div>
   <script type="application/json" id="data_{chart_id}">{chart_data_json}</script>
   <script>
   (function() {{
@@ -1491,6 +1585,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     <button class="view-btn vs-year-btn" data-view="vs-year" onclick="showView('vs-year')">vs Last Year</button>
     <button class="view-btn censor-btn" id="censor-toggle" onclick="toggleCensor()" title="Blur sensitive info">&#128065; Censor</button>
     <button class="view-btn" id="sort-toggle" onclick="toggleSortOrder()" title="Toggle period order">↓ Latest first</button>
+    <button class="view-btn" id="expand-all-btn" onclick="toggleAllTables()" title="Show or hide all data tables">Show Data</button>
   </div>
 </div>"""
 
@@ -2197,6 +2292,78 @@ body {{
   flex: 1 1 0;
   min-width: 0;
 }}
+/* ── Day data table ───────────────────────────── */
+.day-chart-wrap {{ flex-wrap: wrap; }}
+.day-data-tables {{
+  flex: 0 0 100%;
+  overflow-x: auto;
+  border-top: 1px solid var(--border);
+}}
+.day-meter-table {{ width: 100%; }}
+.day-meter-table table {{
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 11px;
+  white-space: nowrap;
+}}
+.day-meter-table th {{
+  padding: 3px 8px;
+  text-align: right;
+  font-weight: 600;
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  background: var(--bg);
+}}
+.day-meter-table th:first-child {{ text-align: left; position: sticky; left: 0; z-index: 2; }}
+.day-meter-table th[colspan] {{ text-align: center; }}
+.day-meter-table td {{
+  padding: 2px 8px;
+  text-align: right;
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  color: var(--text);
+}}
+.day-meter-table td:first-child {{
+  text-align: left;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  position: sticky;
+  left: 0;
+  background: var(--surface);
+  z-index: 1;
+}}
+.day-meter-table tr:hover td {{ background: rgba(0,212,170,0.06); }}
+.day-meter-table tr:hover td:first-child {{ background: var(--surface); }}
+.day-meter-table tfoot td {{
+  font-weight: 700;
+  color: var(--accent);
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}}
+.day-tbl-toolbar {{
+  flex: 0 0 100%;
+  padding: 3px 8px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}}
+.day-tbl-toggle {{
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.15s;
+}}
+.day-tbl-toggle:hover, .day-tbl-toggle.active {{
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}}
 /* ── Landscape mobile — let period-nav scroll off for more chart space ── */
 @media (max-height: 500px) and (orientation: landscape) {{
   .period-nav {{
@@ -2650,6 +2817,111 @@ function toggleTheme() {{
   }}
 }}
 
+function toggleAllTables() {{
+  var tables = document.querySelectorAll('.day-data-tables');
+  var anyOpen = Array.from(tables).some(function(t) {{ return t.style.display === 'block' || t.style.display === 'flex'; }});
+  var btn = document.getElementById('expand-all-btn');
+  tables.forEach(function(t) {{
+    if (anyOpen) {{
+      t.style.display = 'none';
+    }} else {{
+      if (!t._built) {{
+        var chartId = t.id.replace(/^tbl_/, '');
+        var dataEl  = document.getElementById('data_' + chartId);
+        if (dataEl) _buildTableContent(t, dataEl.textContent);
+      }}
+      t.style.display = 'flex';
+    }}
+  }});
+  var nowOpen = !anyOpen;
+  if (btn) {{
+    btn.classList.toggle('active', nowOpen);
+    btn.textContent = nowOpen ? 'Hide Data' : 'Show Data';
+  }}
+}}
+
+function _buildTableContent(wrap, jsonText) {{
+  var d; try {{ d = JSON.parse(jsonText); }} catch(e) {{ return; }}
+  var cur = d.currency || '\xa3';
+  var exportKey = 'electricity_main_export';
+  var directKey = 'electricity_main';
+  var deviceKeys = Object.keys(d.meters).filter(function(k) {{
+    return k !== exportKey && k !== directKey;
+  }}).sort();
+  var orderedKeys = [exportKey, directKey].concat(deviceKeys).filter(function(k) {{ return d.meters[k]; }});
+  var colNames = ['Total Import'].concat(orderedKeys.map(function(k) {{ return d.meters[k].nice_name; }}));
+  var numMeters = colNames.length;
+
+  var html = '<div class="day-meter-table"><table><thead>';
+  html += '<tr><th rowspan="2">Period</th>';
+  colNames.forEach(function(n) {{ html += '<th colspan="3">' + n + '</th>'; }});
+  html += '</tr><tr>';
+  for (var c = 0; c < numMeters; c++) {{ html += '<th>Rate</th><th>kWh</th><th>' + cur + '</th>'; }}
+  html += '</tr></thead><tbody>';
+
+  for (var i = 0; i < d.slots; i++) {{
+    html += '<tr><td>' + d.x_ranges[i].split(' - ')[0] + '</td>';
+    var ti_kwh  = parseFloat(Math.abs(d.ti_kwh  ? (d.ti_kwh[i]  || 0) : 0).toFixed(3));
+    var ti_cost = parseFloat(Math.abs(d.ti_cost ? (d.ti_cost[i] || 0) : 0).toFixed(4));
+    var ti_rate = d.ti_rate ? (d.ti_rate[i] || 0) : 0;
+    html += '<td>' + (ti_rate ? (cur + ti_rate.toFixed(4)) : '—') + '</td>';
+    html += '<td>' + ti_kwh.toFixed(3) + '</td>';
+    html += '<td>' + (ti_cost >= 0.00005 ? (cur + ti_cost.toFixed(4)) : '—') + '</td>';
+    orderedKeys.forEach(function(k) {{
+      var m    = d.meters[k];
+      var kwh  = parseFloat(Math.abs(m.y[i] || 0).toFixed(3));
+      var cost = parseFloat(Math.abs((m.cost && m.cost[i]) || 0).toFixed(4));
+      var rr   = m.rate;
+      var rate = rr[i] !== undefined ? rr[i] : (rr[rr.length-1] || 0);
+      html += '<td>' + (rate ? (cur + rate.toFixed(4)) : '—') + '</td>';
+      html += '<td>' + kwh.toFixed(3) + '</td>';
+      html += '<td>' + (cost >= 0.00005 ? (cur + cost.toFixed(4)) : '—') + '</td>';
+    }});
+    html += '</tr>';
+  }}
+
+  html += '</tbody><tfoot><tr><td>Total</td>';
+  var tot_ti_kwh = 0, tot_ti_cost = 0;
+  orderedKeys.forEach(function(k) {{
+    var t = (d.meter_totals && d.meter_totals[k]) || {{kwh:0,cost:0}};
+    if (!d.meters[k].is_export) {{ tot_ti_kwh += t.kwh; tot_ti_cost += t.cost; }}
+  }});
+  html += '<td></td><td>' + tot_ti_kwh.toFixed(3) + '</td><td>' + cur + tot_ti_cost.toFixed(2) + '</td>';
+  orderedKeys.forEach(function(k) {{
+    var t = (d.meter_totals && d.meter_totals[k]) || {{kwh:0,cost:0}};
+    html += '<td></td><td>' + t.kwh.toFixed(3) + '</td><td>' + cur + t.cost.toFixed(2) + '</td>';
+  }});
+  html += '</tr></tfoot></table></div>';
+  wrap.innerHTML = html;
+  wrap._built = true;
+}}
+
+function toggleDayTables(tableId, btn) {{
+  var wrap = document.getElementById(tableId);
+  if (!wrap) return;
+  var open = wrap.style.display === 'none' || wrap.style.display === '';
+  if (open) {{
+    if (!wrap._built) {{
+      var dataEl = document.getElementById('data_' + tableId.replace(/^tbl_/, ''));
+      if (!dataEl) return;
+      _buildTableContent(wrap, dataEl.textContent);
+    }}
+    wrap.style.display = 'flex';
+    if (btn) btn.classList.add('active');
+  }} else {{
+    wrap.style.display = 'none';
+    if (btn) btn.classList.remove('active');
+  }}
+  // Sync the global Show/Hide Data button label
+  var allTables = document.querySelectorAll('.day-data-tables');
+  var anyOpen = Array.from(allTables).some(function(t) {{ return t.style.display === 'flex' || t.style.display === 'block'; }});
+  var globalBtn = document.getElementById('expand-all-btn');
+  if (globalBtn) {{
+    globalBtn.classList.toggle('active', anyOpen);
+    globalBtn.textContent = anyOpen ? 'Hide Data' : 'Show Data';
+  }}
+}}
+
 function toggleCensor() {{
   var on = document.body.classList.toggle('censor-on');
   var btn = document.getElementById('censor-toggle');
@@ -2753,13 +3025,36 @@ function showView(view) {{
   // The parent's ResizeObserver detects the sidebar toggle and posts the
   // new available width — we use it to relayout charts without reloading.
   window.addEventListener('message', function(e) {{
-    if (!e.data || e.data.type !== 'emt-resize') return;
-    var w = e.data.width || window.innerWidth;
-    if (typeof _scaleDayCharts === 'function') _scaleDayCharts();
-    // Use parent-provided width directly — window.innerWidth inside an iframe
-    // can lag behind the actual rendered width during layout passes, causing
-    // Plotly to scale to a stale value.
-    if (typeof scaleChart === 'function') scaleChart(w);
+    if (!e.data) return;
+    if (e.data.type === 'emt-resize') {{
+      var w = e.data.width || window.innerWidth;
+      if (typeof _scaleDayCharts === 'function') _scaleDayCharts();
+      if (typeof scaleChart === 'function') scaleChart(w);
+    }}
+    if (e.data.type === 'emt-restore-tables' && Array.isArray(e.data.open)) {{
+      e.data.open.forEach(function(id) {{
+        var wrap = document.getElementById(id);
+        if (!wrap) return;
+        var btn = document.querySelector('.day-tbl-toggle[onclick*="' + id + '"]');
+        var chartId = id.replace(/^tbl_/, '');
+        function _tryOpen() {{
+          if (wrap.style.display === 'none' || !wrap.style.display) {{
+            toggleDayTables(id, btn);
+          }}
+        }}
+        if (!window._pendingCharts || !window._pendingCharts[chartId]) {{
+          _tryOpen();
+        }} else {{
+          var tries = 0;
+          var poll = setInterval(function() {{
+            if (!window._pendingCharts || !window._pendingCharts[chartId] || ++tries > 40) {{
+              clearInterval(poll);
+              _tryOpen();
+            }}
+          }}, 75);
+        }}
+      }});
+    }}
   }});
 }})();
 </script>

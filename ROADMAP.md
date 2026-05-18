@@ -97,34 +97,14 @@ Usage PDF showing carbon comparison narrative fix.
 - **PDF fix** — Usage Insights PDF no longer shows carbon comparison narrative.
 - 556 tests passing.
 
+### 2.10.0 — Sub-meter Boundary Interpolation ✅
+- **Provisional block amendment** — sub-meter blocks written without a post-boundary read are retrospectively corrected (boundary-interpolated) within ~10 seconds of the post-boundary read arriving. PASS 2 re-run after each amendment. Non-cascading.
+- **`imp_provisional` DB column** — flags provisional sub-meter rows; cleared on amendment. Auto-migrated on first start.
+- 122 tests passing.
+
 ---
 
 ## Planned
-
-### 2.10.0 — Sub-meter Boundary Interpolation
-
-#### Sub-meter boundary interpolation
-
-**Problem:** Sub-meters currently use raw reads bracketing the block window rather than interpolated boundary values. The last pre-boundary read is carried as a seed into the next block so no kWh is lost — but it appears in a slightly different block than it should. For a 60-second update device the maximum misalignment per boundary is ~0.12 kWh at 7.4 kW.
-
-**Key constraint:** This only affects the **distribution** of kWh between adjacent blocks, never the period total. Sub-meter calibration drift (CT clamps, inverter sensors) has the same property — drift shifts costs between device cards and the Direct Import remainder but never changes the billing total. PASS 2 enforces `sum(sub-meters) + remainder = main meter import` at every block.
-
-**Design:**
-- Block finalisation writes a **provisional** sub-meter figure when there is no post-boundary read yet
-- The first post-boundary sub-meter read triggers a **retrospective amendment** of the previous block:
-  - Interpolate the sub-meter to the exact boundary using the bracketing pre/post reads
-  - Re-run PASS 2 with the corrected sub-meter figure
-  - Re-write the amended block to the DB
-  - Republish HA sensors with corrected cumulative totals
-- Amendment must not cascade — subsequent blocks already have their own reads and are unaffected
-
-**Affected code:** `finalise_block` PASS 1 sub-meter path, `_apply_pass2`, `block_store.py` (provisional flag), HA sensor publish.
-
-**2.9.0 context:** PASS 2 now clips live blocks hard — sub-meters can never exceed grid import on a live block. `inverter_possible` was removed so there is only one queue (protected). The amendment path in 2.10.0 is therefore simpler — one queue, already-bounded figures. The just-unretired sub-meter protection (pre_reads removal for last block > 12 hours) handles a separate edge case and does not interact with the boundary interpolation path.
-
-**Note on carbon/mileage:** Sub-meter `carbon_g` uses raw `imp_kwh` (confirmed correct in 2.9.0 — includes solar/battery charged kWh with grid CI as the proxy). The boundary interpolation fix refines `imp_kwh_grid` (cost attribution only). `carbon_g` calculation remains based on raw `imp_kwh` and is unaffected by this fix.
-
----
 
 ### 2.11.0 — Gas Meters
 **Theme: Whole-home energy tracking**
