@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.10.1] — 2026-05-20
+
+### Fixed
+
+- **Silent startup crash** — if the web server failed to initialise, the addon would exit without logging any error, making diagnosis impossible. Added exception handling around web server startup in `main.py` and `server.py` so any failure is now logged with a full traceback. Also redirected stderr to stdout to capture crashes in background threads. No functional change for working installations — adds three informational log lines on startup.
+
+---
+
 ## [2.10.0] — 2026-05-18
 
 ### Added
