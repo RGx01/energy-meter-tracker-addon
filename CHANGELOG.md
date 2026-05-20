@@ -1,10 +1,17 @@
 # Changelog
 
+## [2.10.2] — 2026-05-20
+
+### Fixed
+
+- **Fresh install hang** — on a brand new installation with no existing data, the addon would hang indefinitely at startup and never serve the UI. Root cause: the SQLite online backup API (`conn.backup()`) was called during the upgrade-backup routine on startup. On a freshly-created WAL-mode database, `executescript()` during schema creation leaves an open read transaction that the backup API cannot acquire a lock around, causing it to block forever. Fixed by skipping the upgrade backup on fresh installs with zero blocks — there is nothing to back up, and the version is recorded so the backup runs correctly on the next actual upgrade.
+- **Startup diagnostics** — if the web server fails to initialise after engine startup, the failure is now logged with a full traceback rather than exiting silently. stderr is also redirected to stdout to capture crashes in background threads. No functional change for working installations.
+
 ## [2.10.1] — 2026-05-20
 
 ### Fixed
 
-- **Silent startup crash** — if the web server failed to initialise, the addon would exit without logging any error, making diagnosis impossible. Added exception handling around web server startup in `main.py` and `server.py` so any failure is now logged with a full traceback. Also redirected stderr to stdout to capture crashes in background threads. No functional change for working installations — adds three informational log lines on startup.
+- Diagnostic logging only — no functional fix. Superseded by 2.10.2.
 
 ---
 
