@@ -130,9 +130,16 @@ def start():
 
 
 def _run():
-    from waitress import serve
-    _port = int(os.environ.get("EMT_PORT") or "8099")
-    serve(app, host="0.0.0.0", port=_port, threads=4)
+    import logging as _logging
+    _log = _logging.getLogger("server")
+    try:
+        from waitress import serve
+        _port = int(os.environ.get("EMT_PORT") or "8099")
+        _log.info("server: waitress binding on port %d", _port)
+        serve(app, host="0.0.0.0", port=_port, threads=4)
+    except Exception as _e:
+        _log.critical("server: waitress failed: %s", _e, exc_info=True)
+        raise
 
 
 # ── Settings defaults ─────────────────────────────────────────────────────────

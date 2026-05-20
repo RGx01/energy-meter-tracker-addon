@@ -68,8 +68,15 @@ async def main():
     ha._on_reconnect = on_reconnect
 
     # 4 — Start Flask config UI + chart server in background thread
-    server.init(DATA_DIR, CHART_DIR, ha)
-    server.start()
+    try:
+        logger.info("main: initialising web server")
+        server.init(DATA_DIR, CHART_DIR, ha)
+        logger.info("main: starting web server")
+        server.start()
+        logger.info("main: web server started OK")
+    except Exception as e:
+        logger.critical("main: web server failed to start: %s", e, exc_info=True)
+        sys.exit(1)
 
     # 5 — Run engine loop + WebSocket listener concurrently
     logger.info("Starting engine loop and WebSocket listener")
@@ -86,4 +93,7 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Redirect stderr to stdout so any silent crashes are captured by the
+    # addon log handler rather than disappearing into the void.
+    sys.stderr = sys.stdout
     asyncio.run(main())
