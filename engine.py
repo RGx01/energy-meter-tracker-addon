@@ -2296,7 +2296,7 @@ async def engine_startup(ha: HAClient):
         using a prod DB with sensors not present in the dev HA instance.
         """
         import asyncio as _aio
-        deadline = _aio.get_event_loop().time() + _SENSOR_TIMEOUT
+        deadline = _aio.get_running_loop().time() + _SENSOR_TIMEOUT
         pending = {e for e in _read_sensors
                    if ha.get_state(e) in ("unknown", "unavailable")}
         missing = {e for e in _read_sensors if ha.get_state(e) is None}
@@ -2308,7 +2308,7 @@ async def engine_startup(ha: HAClient):
             return
         logger.info("engine_startup: waiting for %d sensor(s): %s", len(pending), pending)
         while pending:
-            remaining = deadline - _aio.get_event_loop().time()
+            remaining = deadline - _aio.get_running_loop().time()
             if remaining <= 0:
                 logger.warning("engine_startup: sensor wait timeout — %d sensor(s) still unavailable: %s",
                                len(pending), pending)
@@ -2322,10 +2322,14 @@ async def engine_startup(ha: HAClient):
         """Fetch CI data at startup with timeout — runs in executor to avoid blocking event loop."""
         import asyncio as _aio
         import urllib.error
+        # Extract postcode on the main thread BEFORE entering the executor.
+        # _get_postcode() calls load_config() which accesses the SQLite connection.
+        # Calling it from inside run_in_executor causes a cross-thread SQLite access
+        # that can deadlock on a fresh install where the DB was just created.
         postcode = _get_postcode()
         if not postcode:
-            return
-        loop = _aio.get_event_loop()
+                return
+        loop = _aio.get_running_loop()
         def _do_fetch():
             try:
                 slots = _fetch_carbon_intensity(postcode)
@@ -2418,25 +2422,37 @@ async def engine_startup(ha: HAClient):
             ensure_dir(_bk_dir)
             _bk_ts   = _dt2.utcnow().strftime("%Y%m%dT%H%M%S")
             _bk_path = f"{_bk_dir}/{_bk_ts}_upgrade_{_cur_ver}.zip"
-            with _zf.ZipFile(_bk_path, "w", _zf.ZIP_DEFLATED) as _bkz:
+            # Skip backup on a fresh install with no blocks — nothing to back up,
+            # and the SQLite backup API can hang on a newly-created WAL database.
+            if _store.count_blocks() == 0:
+                logger.info("engine_startup: skipping upgrade backup — no blocks (fresh install)")
+                with open(_ver_file, "w") as _vfw:
+                    _vfw.write(_cur_ver)
+            else:
+              with _zf.ZipFile(_bk_path, "w", _zf.ZIP_DEFLATED) as _bkz:
+                # Commit any pending transactions before backup to avoid WAL lock
+                try:
+                    _store._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except Exception:
+                    pass
                 _store.backup(BLOCKS_DB_PATH + ".upgrade_bak")
                 _bkz.write(BLOCKS_DB_PATH + ".upgrade_bak", "blocks.db")
                 os.remove(BLOCKS_DB_PATH + ".upgrade_bak")
                 _cfg_src = os.path.join(DATA_DIR, "meters_config.json")
                 if os.path.exists(_cfg_src):
                     _bkz.write(_cfg_src, "meters_config.json")
-            # Keep only the 20 most recent zips
-            _all_zips = sorted(_gl.glob(f"{_bk_dir}/*.zip"))
-            for _old_zip in _all_zips[:-20]:
-                try: os.remove(_old_zip)
-                except Exception: pass
-            # Record this version so we don't backup again until next upgrade
-            with open(_ver_file, "w") as _vfw:
-                _vfw.write(_cur_ver)
-            logger.info(
-                "engine_startup: upgrade backup created for v%s: %s",
-                _cur_ver, os.path.basename(_bk_path)
-            )
+              # Keep only the 20 most recent zips
+              _all_zips = sorted(_gl.glob(f"{_bk_dir}/*.zip"))
+              for _old_zip in _all_zips[:-20]:
+                  try: os.remove(_old_zip)
+                  except Exception: pass
+              # Record this version so we don't backup again until next upgrade
+              with open(_ver_file, "w") as _vfw:
+                  _vfw.write(_cur_ver)
+              logger.info(
+                  "engine_startup: upgrade backup created for v%s: %s",
+                  _cur_ver, os.path.basename(_bk_path)
+              )
         else:
             logger.info("engine_startup: no upgrade detected (v%s), skipping upgrade backup", _cur_ver)
     except Exception as _sbe:
