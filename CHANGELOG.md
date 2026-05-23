@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.10.4] — 2026-05-23
+
+### Fixed
+
+- **Unified cost accounting methodology** — introduced a single consistent method across all surfaces: block costs are summed per day at 4dp, a `net_cost` is computed per day as `round(imp + standing - exp, 2)`, and daily nets are summed for period/monthly/yearly totals. This guarantees parts always sum to their totals at every aggregation level. Removed `barPeriodTotals` from `charts.html` and `server.py` — it was a workaround that introduced its own inconsistencies by substituting SQL aggregates for daily row sums.
+
+- **Live Power billing card total** — `_fmt_total` now computes its headline total as `round(total_imp_cost + standing - exp_cost, 2)` from the already-rounded-to-2dp display values, so the headline always equals the sum of visible line items.
+
+- **Billing chart `total_cost`** — `calculate_billing_summary_for_period` now computes `total_cost` from daily net_cost values (same method as Usage Stats) rather than from period-level rounded meter totals. Without sub-meters all surfaces agree exactly. With sub-meters the billing chart may differ by ±£0.01 from Usage Stats because the billing chart does per-block sub-meter subtraction (required for its per-rate display) while Usage Stats does per-day subtraction — both are internally self-consistent.
+
+- **Usage Stats grand total** — data table grand total now sums `agg.net_cost` across displayed buckets rather than re-deriving from component columns, ensuring the grand total always equals the sum of displayed row totals.
+
+---
+
 ## [2.10.3] — 2026-05-20
 
 ### Fixed

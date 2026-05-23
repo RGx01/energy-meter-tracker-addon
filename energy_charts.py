@@ -594,6 +594,14 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
     meter_totals   = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "read_start": None, "read_end": None})
     main_import_raw = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0})
     main_export_raw = {"kwh": 0.0, "cost": 0.0}  # raw main meter export totals
+    # Main-meter-only daily accumulators for total_cost.
+    # Matches _fmt_total in server.py: raw main meter imp/exp/sc per day,
+    # rounded to 4dp, net_cost = round(imp + sc - exp, 2) per day, summed.
+    # Sub-meter per-block subtraction is used for the detailed rate breakdown
+    # display only — not for total_cost.
+    _main_day_imp = defaultdict(float)
+    _main_day_exp = defaultdict(float)
+    _main_day_sc  = defaultdict(float)
     standing_by_day = defaultdict(float)
     charged_days   = set()
     meter_meta     = {}
@@ -715,6 +723,7 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
             sc = float((meter or {}).get("standing_charge") or 0.0)
             if sc > 0:
                 standing_by_day[day_key] = max(standing_by_day[day_key], sc)
+                # (standing charge accumulated into _main_day_sc below)
             elif day_key not in charged_days:
                 standing_by_day.setdefault(day_key, 0.0)
         charged_days.add(day_key)
@@ -728,18 +737,65 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
             meter_summary[key][rate]["cost"] = round(meter_summary[key][rate]["cost"], 2)
         meter_totals[key]["kwh"]  = round(meter_totals[key]["kwh"],  3)
         meter_totals[key]["cost"] = round(meter_totals[key]["cost"], 2)
-    total_standing = sum(standing_by_day.values())
-    # Compute total_cost from raw (pre-display-rounding) main meter totals.
-    # main_import_raw and meter_totals export are rounded to 2dp below for display,
-    # but total_cost must use the raw sums to avoid intermediate rounding error
-    # accumulating over long periods (e.g. 97 days → ±£0.01).
-    _raw_main_imp = sum(v["cost"] for rate, v in main_import_raw.items())
-    _raw_main_exp = main_export_raw["cost"]
-    total_cost = round(_raw_main_imp + total_standing - _raw_main_exp, 2)
-    # Now round main_import_raw for display (render_billing_summary uses these)
+    total_standing = round(sum(standing_by_day.values()), 2)
+    # Round main_import_raw for display
     for rate in main_import_raw:
         main_import_raw[rate]["kwh"]  = round(main_import_raw[rate]["kwh"],  3)
         main_import_raw[rate]["cost"] = round(main_import_raw[rate]["cost"], 2)
+    # total_cost = sum of daily net_cost values.
+    # Same method as api_blocks_summary: round each day's imp/sc/exp to 4dp,
+    # compute net = round(imp + sc - exp, 2) per day, sum across days.
+    # This ensures billing chart total agrees with Usage Stats at every level.
+    # Populate main-meter-only daily accumulators from blocks.
+    # Raw main meter imp/exp/sc per day — no sub-meter adjustment.
+    # Derive timezone from first block metadata (same as main loop does per-block).
+    _first_tz_name = None
+    for _fb in sorted_blocks:
+        _fmeta = ((_fb.get("meters") or {}).get("electricity_main") or {})
+        _first_tz_name = (_fmeta.get("meta") or {}).get("timezone") or _fb.get("_timezone")
+        if _first_tz_name:
+            break
+    try:
+        from zoneinfo import ZoneInfo as _ZI2
+        _main_tz = _ZI2(_first_tz_name or "UTC")
+    except Exception:
+        from zoneinfo import ZoneInfo as _ZI2
+        _main_tz = _ZI2("UTC")
+    for _blk in sorted_blocks:
+        _blk_dt = datetime.fromisoformat(_blk["start"])
+        _blk_local = _blk_dt.replace(tzinfo=timezone.utc).astimezone(_main_tz).replace(tzinfo=None)
+        if not (period_start <= _blk_local < period_end):
+            continue
+        _blk_day = _blk_local.date()
+        _blk_meters = _blk.get("meters", {}) or {}
+        for _blk_mid, _blk_meter in _blk_meters.items():
+            _blk_meta = (_blk_meter or {}).get("meta", {}) or {}
+            if _blk_meta.get("sub_meter"):
+                continue  # main meter only
+            _blk_sc = float((_blk_meter or {}).get("standing_charge") or 0.0)
+            if _blk_sc > _main_day_sc[_blk_day]:
+                _main_day_sc[_blk_day] = _blk_sc
+            for _blk_ch_name, _blk_ch in ((_blk_meter or {}).get("channels", {}) or {}).items():
+                if not _blk_ch:
+                    continue
+                _blk_cost = float((_blk_ch or {}).get("cost") or 0.0)
+                if _blk_ch_name.lower().endswith("export"):
+                    _main_day_exp[_blk_day] += abs(_blk_cost)
+                else:
+                    _main_day_imp[_blk_day] += _blk_cost
+
+    # Compute total_cost from raw main meter daily values —
+    # same method as _fmt_total in server.py.
+    _daily_nets = [
+        round(
+            round(_main_day_imp[_d], 4)
+            + round(_main_day_sc.get(_d, 0.0), 4)
+            - round(_main_day_exp.get(_d, 0.0), 4),
+            2
+        )
+        for _d in sorted(_main_day_imp)
+    ]
+    total_cost = round(sum(_daily_nets), 2)
 
     # Collect main meter read_start / read_end for the raw import header
     _main_key = next((k for k in meter_totals if "Electricity Main / Import" in k
