@@ -883,15 +883,52 @@ def api_billing():
 
         from block_store import local_date_range_to_utc_bounds, local_date_to_utc_bounds
 
-        def _fmt_total(totals, label_imp, label_exp, start_date=None, end_date=None):
+        def _fmt_total(totals, label_imp, label_exp, start_date=None, end_date=None,
+                       utc_s=None, utc_e=None):
             """Format SQL totals into billing card total + rows."""
             imp_cost = round(float(totals["imp_cost"]), 2)
             exp_cost = round(float(totals["exp_cost"]), 2)
             standing = round(float(totals["standing"]), 2)
-            # Round raw sum once — matches billing chart and Octopus billing methodology.
-            # Do not round each component separately before summing (that introduces
-            # intermediate rounding error over long periods).
-            total    = round(float(totals["imp_cost"]) + float(totals["standing"]) - float(totals["exp_cost"]), 2)
+            # Compute total using same daily net_cost method as api_blocks_summary.
+            # SQL raw-sum-round-once can differ from daily-4dp-net-sum by ±£0.01
+            # over long periods. Summing daily nets ensures Live Power agrees with
+            # Usage Stats at every aggregation level.
+            if utc_s and utc_e:
+                # Compute total from daily net_cost values using Python timezone
+                # handling — same method as api_blocks_summary. SQLite localtime
+                # doesn't handle BST/GMT correctly.
+                from collections import defaultdict as _dd
+                from datetime import datetime as _dt, timezone as _tz2
+                from zoneinfo import ZoneInfo as _ZI
+                _tz_obj = _ZI(tz_name)
+                _braw = store._conn.execute(
+                    """SELECT b.block_start, b.imp_cost, b.exp_cost, b.standing_charge,
+                              m.is_sub_meter
+                       FROM blocks b JOIN meters m ON m.meter_id = b.meter_id
+                       WHERE b.block_start >= ? AND b.block_start < ?""",
+                    (utc_s, utc_e)
+                ).fetchall()
+                _by_d = _dd(lambda: {"imp": 0.0, "exp": 0.0, "sc": 0.0})
+                for _br in _braw:
+                    _d = _dt.fromisoformat(_br["block_start"]).replace(
+                        tzinfo=_tz2.utc).astimezone(_tz_obj).strftime("%Y-%m-%d")
+                    _is_sub = bool(_br["is_sub_meter"])
+                    # Only use main meter (not sub-meters) — main meter imp_cost
+                    # already represents the full grid draw. Sub-meter costs are
+                    # a breakdown of that draw, not additional consumption.
+                    if not _is_sub:
+                        _by_d[_d]["imp"] += float(_br["imp_cost"] or 0)
+                        _by_d[_d]["exp"] += float(_br["exp_cost"] or 0)
+                        _sc = float(_br["standing_charge"] or 0)
+                        if _sc > _by_d[_d]["sc"]: _by_d[_d]["sc"] = _sc
+                _daily_nets = [
+                    round(round(_by_d[_d]["imp"], 4) + round(_by_d[_d]["sc"], 4)
+                          - round(_by_d[_d]["exp"], 4), 2)
+                    for _d in sorted(_by_d)
+                ]
+                total = round(sum(_daily_nets), 2)
+            else:
+                total = round(imp_cost + standing - exp_cost, 2)
             rows = []
 
             # Sub-meter breakdown rows
@@ -965,9 +1002,11 @@ def api_billing():
                              "cost": -exp_cost, "bold": False})
             if standing > 0.001:
                 rows.append({"label": "Standing Charge", "cost": standing, "bold": False})
-            # Recompute total from the same rounded values the rows display so
-            # the headline figure always equals the sum of visible line items.
-            total = round(total_imp_cost + standing - exp_cost, 2)
+            # Keep total as raw-sum-round-once (computed above from totals["imp_cost"] etc.)
+            # This matches billing chart and Octopus billing methodology.
+            # The displayed row values are rounded to 2dp independently, so in edge cases
+            # the headline may differ from the sum of visible line items by £0.01 —
+            # this is preferable to disagreeing with the billing chart.
             return total, rows
 
         today_local_date = now_local.date().isoformat()
@@ -976,7 +1015,8 @@ def api_billing():
         _today_utc_s, _today_utc_e = local_date_to_utc_bounds(today_local_date, tz_name)
         today_t = store.get_billing_totals_for_utc_range(_today_utc_s, _today_utc_e, tz_name)
         today_total, today_rows = _fmt_total(today_t, "Total Import", "Total Import",
-                                              today_local_date, today_local_date)
+                                              today_local_date, today_local_date,
+                                              utc_s=_today_utc_s, utc_e=_today_utc_e)
 
         # Billing period — find current period from config history
         _bp_periods = _ec.get_billing_periods_from_config_periods(
@@ -1022,7 +1062,8 @@ def api_billing():
         month_t = store.get_billing_totals_for_utc_range(_month_utc_s, _month_utc_e, tz_name)
 
         month_total, month_rows = _fmt_total(month_t, "Total Import", "Total Import",
-                                              period_start_date.isoformat(), today_local_date)
+                                              period_start_date.isoformat(), today_local_date,
+                                              utc_s=_month_utc_s, utc_e=_month_utc_e)
 
         # Calendar year — from Jan 1 local to today local
         year_start_date = now_local.date().replace(month=1, day=1).isoformat()
@@ -1031,7 +1072,8 @@ def api_billing():
         )
         year_t = store.get_billing_totals_for_utc_range(_year_utc_s, _year_utc_e, tz_name)
         year_total, year_rows = _fmt_total(year_t, "Total Import", "Total Import",
-                                            year_start_date, today_local_date)
+                                            year_start_date, today_local_date,
+                                            utc_s=_year_utc_s, utc_e=_year_utc_e)
 
         def fmt_rows(rows):
             return [{"label": r["label"], "cost": r["cost"], "bold": r.get("bold", False)}
@@ -1818,6 +1860,11 @@ def api_blocks_summary():
                 "exp_kwh":  round(_main_exp_kwh,  4),
                 "imp_cost": round(_main_imp_cost + sum(m["imp_cost"] for mid,m in meters_out.items() if mid != "electricity_main"), 4),
                 "exp_cost": round(_main_exp_cost, 4),
+                "net_cost": round(
+                    round(_main_imp_cost + sum(m["imp_cost"] for mid,m in meters_out.items() if mid != "electricity_main"), 4)
+                    + round(_dd["standing"], 4)
+                    - round(_main_exp_cost, 4),
+                    2),
                 "carbon_g_net":   round(_m["carbon_g"], 4) if _m["carbon_g"] is not None else None,
                 "carbon_g_total": round(_m["carbon_g"], 4) if _m["carbon_g"] is not None else None,
                 "avg_intensity":  _avg_intensity,
@@ -1839,50 +1886,6 @@ def api_blocks_summary():
             if _postcode:
                 break
 
-        # ── Pre-compute period totals from raw SQL ───────────────────────────
-        # Summing daily 4dp rows in JS accumulates rounding error over long
-        # periods (e.g. 97 days → ±£0.01). Instead, compute the exact total
-        # for each unique billing period from raw SQL and send alongside rows.
-        # The JS uses these for grand-total display, daily rows for bar heights.
-        _period_keys = set()
-        for _row in rows:
-            _period_keys.add((_row["billing_period_start"], _row["billing_period_end"]))
-
-        period_totals = {}
-        for (_bps, _bpe) in _period_keys:
-            if not _bps or not _bpe:
-                continue
-            try:
-                _pt_utc_s, _pt_utc_e = local_date_range_to_utc_bounds(_bps, _bpe, tz_name)
-                _pt = store.get_billing_totals_for_utc_range(_pt_utc_s, _pt_utc_e, tz_name)
-                _pt_key = _bps
-                period_totals[_pt_key] = {
-                    "imp_cost": round(float(_pt["imp_cost"]), 4),
-                    "exp_cost": round(float(_pt["exp_cost"]), 4),
-                    "standing": round(float(_pt["standing"]), 4),
-                    "net":      round(float(_pt["imp_cost"]) + float(_pt["standing"]) - float(_pt["exp_cost"]), 2),
-                }
-            except Exception as _pte:
-                logger.warning("period_totals computation failed for %s: %s", _bps, _pte)
-
-        # Also compute a single total for the full date range shown
-        # (used by yearly/calendar views where billing_period_start = day itself)
-        if rows:
-            _all_utc_s2_start = min(_row["billing_period_start"] for _row in rows if _row.get("billing_period_start"))
-            _all_utc_s2_end   = max(_row["billing_period_end"]   for _row in rows if _row.get("billing_period_end")) if any(_row.get("billing_period_end") for _row in rows) else None
-            if _all_utc_s2_end:
-                try:
-                    _full_utc_s, _full_utc_e = local_date_range_to_utc_bounds(_all_utc_s2_start, _all_utc_s2_end, tz_name)
-                    _full_t = store.get_billing_totals_for_utc_range(_full_utc_s, _full_utc_e, tz_name)
-                    period_totals["_full"] = {
-                        "imp_cost": round(float(_full_t["imp_cost"]), 4),
-                        "exp_cost": round(float(_full_t["exp_cost"]), 4),
-                        "standing": round(float(_full_t["standing"]), 4),
-                        "net":      round(float(_full_t["imp_cost"]) + float(_full_t["standing"]) - float(_full_t["exp_cost"]), 2),
-                    }
-                except Exception:
-                    pass
-
         return jsonify({
             "currency":      currency,
             "billing_day":   billing_day,
@@ -1890,7 +1893,6 @@ def api_blocks_summary():
             "meters":        meters_list,
             "export_color":  export_color,
             "has_postcode":  bool(_postcode),
-            "period_totals": period_totals,
         })
     except Exception as e:
         logger.error("api_blocks_summary: %s", e)

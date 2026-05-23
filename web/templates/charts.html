@@ -1088,7 +1088,6 @@ function _doPdfExport(win, iconSrc) {
 
 // ── Usage Stats Bar Chart ─────────────────────────────────────────────────────
 var barData = null;
-var barPeriodTotals = {};
 var barSortDesc = (localStorage.getItem('emt_bar_sort_desc') !== 'false'); // default newest first
 var barCurrency = '£';
 var barPeriod = 'daily';
@@ -1160,7 +1159,6 @@ async function barInit() {
     var json = await r.json();
     if (json.error) throw new Error(json.error);
     barData        = json.rows || [];
-    barPeriodTotals = json.period_totals || {};
     barCurrency    = json.currency || '£';
     barBillingDay  = json.billing_day || 1;
     barMeters      = json.meters  || [];
@@ -1335,7 +1333,7 @@ function barGetDatasets(labels, aggList) {
 
 function barAggRows(filterFn) {
   var filtered = barData.filter(filterFn);
-  var result = { standing:0, imp_kwh:0, exp_kwh:0, imp_cost:0, exp_cost:0,
+  var result = { standing:0, imp_kwh:0, exp_kwh:0, imp_cost:0, exp_cost:0, net_cost:0,
                  carbon_g_net: null, carbon_g_total: null, avg_intensity: null, meters:{} };
   // For avg_intensity: accumulate numerator/denominator for weighted average
   var _aiCarbon = 0, _aiKwh = 0, _aiHasData = false;
@@ -1345,6 +1343,7 @@ function barAggRows(filterFn) {
     result.exp_kwh   += row.exp_kwh   || 0;
     result.imp_cost  += row.imp_cost  || 0;
     result.exp_cost  += row.exp_cost  || 0;
+    result.net_cost  += row.net_cost  || 0;
     // carbon_g: NULL-aware — only accumulate when data exists (post-2.3.0 blocks)
     if (row.carbon_g_net != null)   result.carbon_g_net   = (result.carbon_g_net   || 0) + row.carbon_g_net;
     if (row.carbon_g_total != null) result.carbon_g_total = (result.carbon_g_total || 0) + row.carbon_g_total;
@@ -1374,29 +1373,13 @@ function barAggRows(filterFn) {
   if (result.carbon_g_total != null) result.carbon_g_total = Math.round(result.carbon_g_total * 100) / 100;
   if (_aiHasData && _aiKwh > 0) result.avg_intensity = Math.round((_aiCarbon / _aiKwh) * 10) / 10;
 
-  // For cost totals, use pre-computed SQL period total when available.
-  // Summing daily 4dp rows accumulates rounding error over long periods (97+ days → ±£0.01).
-  // The server sends exact SQL totals in barPeriodTotals keyed by billing_period_start.
-  var _bKeys = [...new Set(filtered.map(function(r){ return r.billing_period_start; }).filter(Boolean))];
-  var _ptKey = null;
-  if (_bKeys.length === 1 && barPeriodTotals[_bKeys[0]]) {
-    // Single billing period — use its exact SQL total
-    _ptKey = _bKeys[0];
-  } else if (_bKeys.length > 1 && barPeriodTotals['_full']) {
-    // Multiple billing periods (year/calendar view) — use the full range total
-    _ptKey = '_full';
-  }
-  if (_ptKey && barPeriodTotals[_ptKey]) {
-    var _pt = barPeriodTotals[_ptKey];
-    result.imp_cost = _pt.imp_cost;
-    result.exp_cost = _pt.exp_cost;
-    result.standing = _pt.standing;
-  } else {
-    // Fallback: sum daily rows (short periods where error is negligible)
-    result.standing = Math.round(result.standing * 10000) / 10000;
-    result.imp_cost = Math.round(result.imp_cost * 10000) / 10000;
-    result.exp_cost = Math.round(result.exp_cost * 10000) / 10000;
-  }
+  // Round period totals from accumulated daily values.
+  // One method everywhere: sum daily rows, round at period level.
+  // net_cost is the sum of per-day rounded nets — ensures parts sum to whole.
+  result.standing = Math.round(result.standing * 10000) / 10000;
+  result.imp_cost = Math.round(result.imp_cost * 10000) / 10000;
+  result.exp_cost = Math.round(result.exp_cost * 10000) / 10000;
+  result.net_cost = Math.round(result.net_cost * 100)   / 100;
   return result;
 }
 
@@ -1959,9 +1942,13 @@ function barBuildTable() {
       }
       html += '<td>' + fmtd + '</td>';
     });
-    var rowTotalFmt = barMetric === 'cost' ? (Math.round(rowTotal * 100) / 100)
-                    : barMetric === 'kwh'  ? (Math.round(rowTotal * 1000) / 1000)
-                    : rowTotal;
+    // In cost mode use agg.net_cost directly — it is pre-rounded per day and
+    // summed consistently. Re-deriving from column vr values gives a different
+    // result because column values are rounded independently then summed.
+    var rowTotalFmt = barMetric === 'cost'
+      ? (agg.net_cost != null ? Math.round(agg.net_cost * 100) / 100 : Math.round(rowTotal * 100) / 100)
+      : barMetric === 'kwh' ? (Math.round(rowTotal * 1000) / 1000)
+      : rowTotal;
     if (_rowHasVal) grandTotal += rowTotalFmt;
     html += '<td class="col-total">' + (_rowHasVal ? barFmt(rowTotalFmt) : '—') + '</td>';
     html += '</tr>';
@@ -2001,6 +1988,14 @@ function barBuildTable() {
   var grandTotalFmt = barMetric === 'cost' ? (Math.round(grandTotal * 100) / 100)
                     : barMetric === 'kwh'  ? (Math.round(grandTotal * 1000) / 1000)
                     : grandTotal;
+  // In cost mode, use sum of per-bucket net_cost values for grand total.
+  // net_cost per bucket = sum of daily net_cost values (pre-rounded per day).
+  // This ensures: parts sum to daily total, daily totals sum to period total.
+  if (barMetric === 'cost') {
+    var _netSum = 0;
+    aggList.forEach(function(agg) { _netSum += agg.net_cost || 0; });
+    grandTotalFmt = Math.round(_netSum * 100) / 100;
+  }
   _totalsHtml += '<td class="col-total">' + barFmt(grandTotalFmt) + '</td>';
   _totalsHtml += '</tr>';
 
