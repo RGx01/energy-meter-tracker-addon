@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.10.3] — 2026-05-20
+
+### Fixed
+
+- **PDF dark theme charts** — billing charts and heatmap PDFs were rendering in dark theme when the user had dark mode enabled. `Plotly.toImage()` captures the chart exactly as rendered in the iframe DOM, so forcing light colours in the popup window CSS had no effect on the captured images. Fixed by calling `Plotly.relayout()` on the chart with light background and font colours immediately before capture, then restoring the original colours afterwards. The iframe is hidden during this operation so the user does not see the colour change. Only `paper_bgcolor`, `plot_bgcolor` and `font.color` are changed — touching axis configuration caused chart traces to be discarded, mangling the chart until Plotly re-rendered.
+
+---
+
 ## [2.10.2] — 2026-05-20
 
 ### Fixed
