@@ -807,13 +807,35 @@ function _doPdfExport(win, iconSrc) {
       if (!cid || !iWin.Plotly) return Promise.resolve();
       var div = iDoc.getElementById(cid) || plotDiv;
       if (!div || !div._fullLayout) return Promise.resolve();
-      return iWin.Plotly.toImage(div, {
-        format: 'png',
-        width: Math.max(div.offsetWidth || 700, 700),
-        height: Math.max(div.offsetHeight || 220, 220)
+      var _fl = div._fullLayout || {};
+      var _savedBg = _fl.paper_bgcolor; var _savedPl = _fl.plot_bgcolor;
+      var _savedFont = (_fl.font || {}).color;
+      // Hide iframe during relayout so user doesn't see the colour change
+      var _iframeEl = document.getElementById('chart-daily-content') && document.getElementById('chart-daily-content').querySelector('iframe');
+      if (_iframeEl) _iframeEl.style.visibility = 'hidden';
+      // Only change background and font colours — touching axis config mangles traces
+      return iWin.Plotly.relayout(div, {
+        paper_bgcolor: '#ffffff',
+        plot_bgcolor:  '#f8f9fa',
+        'font.color':  '#111111'
+      }).then(function() {
+        return iWin.Plotly.toImage(div, {
+          format:'png',
+          width:Math.max(div.offsetWidth||700,700),
+          height:Math.max(div.offsetHeight||220,220)
+        });
       }).then(function(url) {
         chartImages[cid] = url;
-      }).catch(function() {});
+        return iWin.Plotly.relayout(div, {
+          paper_bgcolor: _savedBg,
+          plot_bgcolor:  _savedPl,
+          'font.color':  _savedFont || ''
+        });
+      }).then(function() {
+        if (_iframeEl) _iframeEl.style.visibility = '';
+      }).catch(function() {
+        if (_iframeEl) _iframeEl.style.visibility = '';
+      });
     });
 
     Promise.all(chartPromises).then(function() {
@@ -935,7 +957,24 @@ function _doPdfExport(win, iconSrc) {
     var hmImg = null;
     if (hmDiv && iWin.Plotly && typeof iWin.Plotly.toImage === 'function') {
       // Async path — use Plotly.toImage
-      iWin.Plotly.toImage(hmDiv, {format:'png', width: hmDiv.offsetWidth || 1100, height: hmDiv.offsetHeight || 700}).then(function(imgUrl) {
+      var _hmFl = hmDiv._fullLayout || {};
+      var _hmSavedBg = _hmFl.paper_bgcolor; var _hmSavedPl = _hmFl.plot_bgcolor;
+      var _hmSavedFont = (_hmFl.font || {}).color;
+      var _hmIframeEl = document.getElementById('chart-heatmap-content') && document.getElementById('chart-heatmap-content').querySelector('iframe');
+      if (_hmIframeEl) _hmIframeEl.style.visibility = 'hidden';
+      iWin.Plotly.relayout(hmDiv, {
+        paper_bgcolor: '#ffffff',
+        plot_bgcolor:  '#f8f9fa',
+        'font.color':  '#111111'
+      }).then(function() {
+        return iWin.Plotly.toImage(hmDiv, {format:'png', width: hmDiv.offsetWidth || 1100, height: hmDiv.offsetHeight || 700});
+      }).then(function(imgUrl) {
+        iWin.Plotly.relayout(hmDiv, {
+          paper_bgcolor: _hmSavedBg,
+          plot_bgcolor:  _hmSavedPl,
+          'font.color':  _hmSavedFont || ''
+        }).then(function(){ if (_hmIframeEl) _hmIframeEl.style.visibility = ''; })
+          .catch(function(){ if (_hmIframeEl) _hmIframeEl.style.visibility = ''; });
         // Capture toolbar state from iframe
         var activeMetrics = [];
         iDoc.querySelectorAll('.hm-metric-btn.active').forEach(function(b) { activeMetrics.push(b.textContent.trim()); });
