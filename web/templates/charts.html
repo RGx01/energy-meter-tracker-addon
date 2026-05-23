@@ -608,6 +608,10 @@ setInterval(function() {
   var name = activeTab.dataset.chart || (activeTab.textContent.indexOf('Heatmap') !== -1 ? 'heatmap' : 'daily');
   if (name === 'daily' || name === 'heatmap') {
     loadChartContent(name, true);
+  } else if (name === 'bar') {
+    // Force re-fetch by resetting TTL — barInit will re-fetch and re-render
+    barLastFetch = 0;
+    barInit();
   }
 }, 120000);
 
@@ -633,7 +637,7 @@ function showChart(name, btn) {
   document.getElementById('chart-heatmap').style.display = name === 'heatmap' ? 'block' : 'none';
   document.getElementById('chart-bar').style.display     = name === 'bar'     ? 'flex' : 'none';
   _activeChart = name;
-  // Hide regenerate button on Usage Stats — it auto-refreshes live data
+  // Hide regenerate button on Usage Stats — it auto-refreshes via setInterval
 
   if (name === 'bar') {
     barInit();
