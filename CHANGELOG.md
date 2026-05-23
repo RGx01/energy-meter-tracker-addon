@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.10.5] — 2026-05-23
+
+### Fixed
+
+- **Usage Stats auto-refresh** — the Usage Stats tab was not included in the 2-minute auto-refresh interval that refreshes the Billing and Heatmaps tabs. Users would see stale data unless they manually switched away and back. Fixed by including the `bar` tab in the `setInterval` refresh, forcing a re-fetch of `api/blocks_summary` every 2 minutes when Usage Stats is the active tab.
+
+---
+
 ## [2.10.4] — 2026-05-23
 
 ### Fixed
