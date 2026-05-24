@@ -1,19 +1,23 @@
 # Development Guide — Volume 3
 
-Covers decisions made during 2.10.0 development and the design for 2.11.0 Octopus API integration.
+Covers decisions made during 2.10.x development and the design for 3.0.0 Kraken API integration.
 
 ---
 
-## 2.10.0 — Key Decisions and Fixes
+## 2.10.x — Key Decisions and Fixes
 
-### Rounding Methodology (Critical)
+### Rounding Methodology — Approach and Revision History
 
-All cost calculations across every surface now follow a single principle:
-**accumulate raw float block costs, round once to 2dp at the final display step.**
+The 2.10.x series went through several iterations on cost accounting methodology.
+Understanding what was tried, what broke, and what shipped is important context
+for future work.
 
-This matches how Octopus actually bills (sum raw slot costs, round once) and eliminates systematic ±£0.01 drift between surfaces.
+#### 2.10.0 — Raw float accumulation, round once
 
-**Surfaces affected and their code paths:**
+Initial approach: accumulate raw float block costs, round once to 2dp at the
+final display step.
+
+**Surfaces affected:**
 
 | Surface | File | Function |
 |---------|------|----------|
@@ -25,63 +29,167 @@ This matches how Octopus actually bills (sum raw slot costs, round once) and eli
 
 **Key implementation details:**
 
-- `calculate_billing_summary_for_period`: removed `_day_accum` per-day rounding. Raw block costs accumulate directly into `meter_summary` and `meter_totals`. `main_import_raw` and `main_export_raw` track raw main meter totals separately so `total_cost` is computed from unrounded values before the display-rounding pass. Round once at end: 2dp cost, 3dp kWh.
+- `calculate_billing_summary_for_period`: removed `_day_accum` per-day rounding.
+  Raw block costs accumulate directly into `meter_summary` and `meter_totals`.
+  `main_import_raw` and `main_export_raw` track raw main meter totals separately
+  so `total_cost` is computed from unrounded values before the display-rounding
+  pass. Round once at end: 2dp cost, 3dp kWh.
 
-- `build_day_chart_html`: `meter_totals` built with `sum(abs(v) for v in meter_cost[meter])` — raw sum then `round(cost_sum, 4)`. Previously used `sum(round(abs(v), 4) for v in ...)` which accumulated rounding error across slots.
+- `build_day_chart_html`: `meter_totals` built with
+  `sum(abs(v) for v in meter_cost[meter])` — raw sum then `round(cost_sum, 4)`.
 
-- `_fmt_total`: `total = round(float(imp_cost) + float(standing) - float(exp_cost), 2)` — raw sum round once. Previously rounded each component to 2dp before summing.
+- `_fmt_total`: `total = round(float(imp_cost) + float(standing) - float(exp_cost), 2)`
+  — raw sum round once.
 
-- `api_blocks_summary`: all per-day values sent at **4dp** (previously 2dp for imp_cost/exp_cost, 2dp for standing). Includes `period_totals` dict with pre-computed SQL totals for each billing period and `_full` range total. JS `barAggRows` uses `barPeriodTotals` for cost display instead of summing daily rows, eliminating accumulated rounding error over long periods (97+ days → ±£0.01 without this).
+- `api_blocks_summary`: all per-day values sent at **4dp**. Includes
+  `period_totals` dict with pre-computed SQL totals for each billing period.
+  JS `barAggRows` uses `barPeriodTotals` for period-level cost display to avoid
+  accumulated rounding error over long periods.
 
-- `main_export_raw`: added as a separate accumulator in `calculate_billing_summary_for_period` so `_raw_main_exp` reads unrounded export totals. Previously read from already-rounded `meter_totals`.
+#### 2.10.3 — barPeriodTotals grand total bug found
+
+`barPeriodTotals` (pre-computed SQL totals) were being applied to individual
+day rows in daily view because the billing period key matched even for a single
+day — `_bKeys.length === 1` was true and the entire period's SQL total was
+substituted. Partial fix: only use `barPeriodTotals` when filtered row count
+matches the period's total row count.
+
+#### 2.10.4 — Unified net_cost methodology (partial)
+
+Attempted to unify all three surfaces onto a single method:
+block costs summed into 4dp daily rows, `net_cost = round(imp + standing - exp, 2)`
+per day, daily nets summed for period/yearly totals. `barPeriodTotals` removed
+entirely from `charts.html` and `server.py`.
+
+**What actually shipped:**
+- `charts.html` (Usage Stats) — adopted `net_cost` accumulation. Grand total
+  is `sum(agg.net_cost)` across displayed buckets. `barPeriodTotals` removed.
+- `server.py` `_fmt_total` — adopted `round(total_imp_cost + standing - exp_cost, 2)`
+  from already-rounded display values.
+- `energy_charts.py` — **reverted**. The billing chart `total_cost` was found
+  wrong after adopting `net_cost` at that layer. `energy_charts.py` kept the
+  raw float accumulate/round-once approach from 2.10.0.
+
+**Net result as of 2.10.4/2.10.5:**
+
+| Surface | Method |
+|---------|--------|
+| Billing chart (energy_charts.py) | Raw float accumulate, round once at display |
+| Live Power billing cards (`_fmt_total`) | `round(imp + standing - exp, 2)` from 2dp display values |
+| Usage Stats (`charts.html`) | `net_cost = round(imp + standing - exp, 2)` per day, summed |
+
+The billing chart and Usage Stats can therefore differ by ±£0.01 on periods
+with sub-meters, because they use different arithmetic paths. Both are
+internally self-consistent. This is a known and accepted artefact documented
+in the `_apply_pass2` comment in `engine.py`.
+
+#### Why cost_remainder is kwh × rate not main_cost − sub_costs
+
+`cost_remainder` in PASS 2 is computed as `remainder_kwh × parent_rate`, not
+as `main_cost − sub_costs`. This is intentional:
+
+`main_cost` comes from actual meter register reads (cumulative kWh delta
+interpolated to block boundaries). Sub-meter costs come from power sensor
+integration (kW polled at ~10s intervals). These are two independent
+measurement systems. Subtracting one from the other absorbs all sensor
+disagreement into `cost_remainder`, potentially making it negative.
+
+The ~0.01p/block discrepancy is an inherent measurement artefact. Presentation
+layers use rate-based subtraction (`main_cost[rate] − sub_cost[rate]`) for
+display, avoiding accumulation across periods.
 
 ### Live Power Billing Card Cache Bug
 
-`api/billing` was missing `Cache-Control: no-store` headers. Browser cached the response, causing billing cards to show stale data even after the scheduled `refreshBilling()` call fired at 1 minute past each block boundary. Also added `?t=Date.now()` cache-busting to the fetch call in `live_power.html`.
+`api/billing` was missing `Cache-Control: no-store` headers, causing stale
+billing card data after block boundaries. Fixed by adding no-store headers and
+`?t=Date.now()` cache-busting in `live_power.html`.
 
-**Confirmed with screenshots:** at 13:03 (post-boundary) Live Power showed stale values while Usage Stats at 13:04 already showed the 13:00 block. Returning to Live Power at 13:05 (fresh page load) showed correct updated values.
+### Fresh Install Hang (2.10.2)
 
-### PDF Export Fixes
+On a fresh installation with no existing data, the addon hung indefinitely at
+startup. Root cause: `conn.backup()` called during the upgrade-backup routine
+on a freshly-created WAL-mode database where `executescript()` during schema
+creation left an open read transaction. Fixed by skipping the upgrade backup on
+fresh installs with zero blocks.
 
-- **Billing tab**: captures current period and view (Bill/vs Prev/vs Last Year), billing summary, daily chart images via `Plotly.toImage()`, open data tables. Light theme forced.
+### PDF Export
+
+- **Billing tab**: captures current period/view, billing summary, daily chart
+  images via `Plotly.toImage()`, open data tables. Light theme forced.
 - **Heatmaps tab**: active metric heatmap via `Plotly.toImage()`.
-- **Usage Stats tab**: chart image, toolbar state, data table. Checkbox state fix: `cloneNode(true)` copies DOM attributes but not JS-set `.checked` property. Fixed by replacing checkboxes with Unicode ☑/☐ indicators in the PDF clone.
+- **Usage Stats tab**: chart image, toolbar state, data table. Checkbox state
+  fix: `cloneNode(true)` copies DOM attributes but not JS-set `.checked`
+  property. Fixed by replacing checkboxes with Unicode ☑/☐ in PDF clone.
 
-### Files Changed in 2.10.0
+### Usage Stats Auto-refresh Bug (2.10.5)
 
-- `energy_charts.py` — billing summary rounding, sidebar rounding, PDF export, per-day data table, Show/Hide Data button, Blob URL iframe fix, Grid Export label fix, kwh_remainder usage
-- `server.py` — Live Power card rounding, api_blocks_summary precision, period_totals, no-cache headers on api/billing
-- `charts.html` — PDF export (all tabs), barAggRows period_totals, barPeriodTotals JS var, checkbox PDF fix
+The 2-minute auto-refresh timer used `textContent.indexOf('Daily')` to detect
+the active tab — stopped working when the billing tab was renamed from "Daily
+Usage" to "Billing" in earlier versions. With the Usage Stats tab also present,
+the fallback refreshed the heatmap instead of billing when Usage Stats was
+active, and Usage Stats itself never refreshed. Fixed by adding `data-chart`
+attributes to tab buttons and including the `bar` tab in the refresh interval.
+
+### Files Changed Across 2.10.x
+
+- `energy_charts.py` — billing summary rounding (raw float, kept), sidebar
+  rounding, PDF export, per-day data table, Show/Hide Data button
+- `server.py` — `_fmt_total` (net_cost method), `api_blocks_summary` precision,
+  `period_totals` removed in 2.10.4, no-cache headers on `api/billing`
+- `charts.html` — PDF export, `barAggRows` net_cost accumulation, `barPeriodTotals`
+  removed in 2.10.4, auto-refresh fix in 2.10.5
 - `live_power.html` — cache-busting timestamp on billing fetch
-- `block_store.py` — unchanged in 2.10.0
-- `engine.py` — unchanged in 2.10.0
+- `engine.py` — fresh install hang fix (2.10.2), cost_remainder comment added
+- `main.py` — startup error handling (2.10.2)
 
 ### Test Suite
 
-`test_usage_stats_vs_billing.py` — 46 tests covering:
+`test_usage_stats_vs_billing.py` — covers:
 - Daily/monthly/yearly billing vs SQL agreement
 - Non-round standing charge (£0.504559/day) over 16+ days
 - Sub-meter cost precision over multi-day periods
 - Live Power net total vs Usage Stats net total agreement
-- The real-world scenario that produced -£3.11 / -£3.22 / -£3.14 / -£3.15 discrepancies
+- BST/GMT transition handling for standing charge grouping
+- The real-world scenario that produced -£3.11 / -£3.22 / -£3.14 / -£3.15
+  discrepancies
 
 ---
 
-## 2.11.0 — Kraken API Integration Design
+## 3.0.0 — Kraken API Integration
+
+### Why 3.0.0
+
+Pure API mode removes the requirement for a CAD or HA main meter sensor. Up to
+2.x, EMT has implicitly required hardware investment to monitor the grid
+boundary — a CAD, a Hildebrand Glow, or a CT clamp feeding an HA sensor. From
+3.0.0 a user can install EMT, enter their Octopus credentials, and get a fully
+functional billing and usage dashboard with zero additional hardware beyond
+their smart meter. This changes who the software is for, not just what it does.
+That warrants a major version bump.
+
+The 2.x HA sensor path is completely unchanged and remains fully supported.
+Config is backwards compatible — `kraken_api` is a new optional block.
+No breaking changes to schema, API, or existing behaviour.
 
 ### Vision
 
-The unique value of EMT is insight **behind the meter** — sub-meter attribution, device-level carbon, battery/EV accounting — that any supplier API can never provide because they only see the grid boundary. The Kraken platform API adds complementary value: authoritative billing figures, tariff history, and (with a compatible smart device) near-real-time live power without a CAD/HA dependency.
+The unique value of EMT is insight **behind the meter** — sub-meter
+attribution, device-level carbon, battery/EV accounting — that any supplier API
+can never provide because they only see the grid boundary. The Kraken platform
+API adds complementary value: authoritative settled kWh figures from DCC, and
+(for users without BottlecapDave or a CAD) rates and live power.
 
-**Kraken, not Octopus:** Kraken Technology (formerly part of Octopus Energy) is now a separate platform that powers multiple energy suppliers — Octopus Energy, EDF, and others. The API (both REST and GraphQL), authentication mechanism (`obtainKrakenToken`), and data structures are Kraken platform concepts, not Octopus-specific. EMT targets the Kraken platform. Octopus is the first supported supplier because it's the most common among EMT users, but EDF and other Kraken-powered suppliers follow the same pattern with only the base URL and supplier name differing.
-
-The goal is not to replace HA sensor data but to **augment it** — using the Kraken API as an authoritative cross-check for main meter data and as an alternative live power source, while HA sensors continue to provide the sub-meter detail that makes EMT uniquely useful.
+**Kraken, not Octopus:** Kraken Technology is a separate platform powering
+multiple energy suppliers — Octopus Energy, EDF, and others. The API (REST and
+GraphQL), authentication (`obtainKrakenToken`), and data structures are Kraken
+platform concepts. Octopus is first because it's the most common among EMT
+users; other Kraken-powered suppliers differ only in base URL.
 
 ### What the Kraken API Provides
 
 #### REST API
 
-Base URL is supplier-specific (e.g. `https://api.octopus.energy/v1/` for Octopus, different for EDF). Auth: HTTP Basic, API key as username, empty password. The endpoint structure and response format are identical across Kraken-powered suppliers.
+Auth: HTTP Basic, API key as username, empty password.
 
 | Endpoint | Returns | Notes |
 |----------|---------|-------|
@@ -90,142 +198,340 @@ Base URL is supplier-specific (e.g. `https://api.octopus.energy/v1/` for Octopus
 | `/v1/products/<product>/electricity-tariffs/<tariff>/standard-unit-rates/` | Rate periods with `valid_from`/`valid_to`, `value_inc_vat` | Agile: one record per half-hour |
 | `/v1/products/<product>/electricity-tariffs/<tariff>/standing-charges/` | Daily standing charge periods | |
 
-**Critical limitation:** The consumption endpoint returns only `consumption` (kWh) — no rate, no cost, no indication of whether the reading is provisional or finalised. There is no `is_estimated` field in the REST API.
+**Critical limitation:** No `is_estimated` flag. No programmatic way to
+determine if a reading is provisional — recency implies provisional by
+convention (blocks < 48h treated as provisional).
 
-**Data latency:** Typically 24-48 hours for SMETS2, potentially longer for SMETS1. There is no programmatic way to determine if a block is final — recency implies provisional by convention.
+**Data latency:** Typically 24-48h for SMETS2, potentially longer for SMETS1.
 
-**Rate limit:** 100 calls per hour, **shared across all Octopus API usage** including the Octopus app and other integrations. Hard constraint on polling frequency.
+**Rate limit:** 100 calls/hour, **shared across all Octopus API usage**
+including the Octopus app and other integrations.
 
 #### GraphQL API
 
-Endpoint is supplier-specific (e.g. `https://api.octopus.energy/v1/graphql/` for Octopus). Auth: JWT token obtained via the `obtainKrakenToken` mutation — the mutation name is Kraken-native and identical across all Kraken-powered suppliers. Tokens are short-lived.
+Endpoint: `https://api.octopus.energy/v1/graphql/` (Octopus).
+Auth: JWT token via `obtainKrakenToken` mutation.
 
-**Key queries:**
+Key query:
 
 ```graphql
-# Live power (requires Octopus Mini)
 smartMeterTelemetry(
   deviceId: "<METER_GUID>"
-  grouping: TEN_SECONDS
-  start: "2026-05-18T00:00:00+01:00"
-  end: "2026-05-18T01:00:00+01:00"
+  grouping: THIRTY_SECONDS
+  start: "..."
+  end: "..."
 ) {
   readAt
   consumptionDelta   # kWh since last reading
   demand             # instantaneous watts
-  costDelta          # cost since last reading
+  costDelta          # display only — not used for block costing
   consumption        # cumulative kWh
 }
+```
 
-# Account/meter discovery
-account(accountNumber: "<ACCOUNT>") {
-  electricityAgreements(active: true) {
-    meterPoint {
-      meters(includeInactive: false) {
-        smartDevices { deviceId }  # GUID for smartMeterTelemetry
-      }
-    }
+GraphQL provides live power via Mini/SMETS2 HAN. It does **not** provide
+settled consumption blocks — that is REST only.
+
+### The BottlecapDave Boundary
+
+Most Octopus Energy users running EMT already have the BottlecapDave unofficial
+HA integration installed. EMT already reads rates from it today via `rate_sensor`
+in `meter_channels` config.
+
+BottlecapDave already provides via HA sensors, at zero cost to EMT's API quota:
+
+| Data | BottlecapDave sensor |
+|------|----------------------|
+| Current rate (p/kWh inc VAT) | `*_current_rate` — updated every 15 min |
+| Standing charge (p/day) | `*_current_standing_charge` |
+| Full day rate schedule | `*_current_day_rates` event |
+| IO dispatch corrections applied | Already in rate schedule |
+| Live power via Mini | `*_current_consumption` |
+
+**Calling Kraken rate or standing charge endpoints when BottlecapDave is
+already doing so burns shared quota performing identical work twice.**
+
+The only data the Kraken REST API provides that BottlecapDave does not is
+**settled half-hourly consumption kWh from DCC** at per-block granularity.
+BottlecapDave's previous accumulative consumption is daily total only.
+This is the unique value of the Kraken integration.
+
+### Revised Data Source Map
+
+| Data | BottlecapDave user | Pure API user |
+|------|--------------------|---------------|
+| Main meter imp_kwh per block | Kraken REST (settled, ~48h) | Kraken REST (settled, ~48h) |
+| Main meter rate | HA sensor (BottlecapDave) | Kraken REST rate endpoint |
+| Standing charge | HA sensor (BottlecapDave) | Kraken REST standing charge endpoint |
+| IO dispatch rate correction | HA sensor (already applied) | Kraken GraphQL dispatches (future) |
+| Sub-meter kWh | HA sensors only | HA sensors only (or absent) |
+| Live power (watts) | HA Mini sensor or CAD | Kraken GraphQL Mini |
+
+### API Call Budget
+
+For a BottlecapDave user (most existing users):
+
+| Operation | Frequency | Calls/hour |
+|-----------|-----------|------------|
+| Consumption endpoint (import) | Every 6h | 0.17 |
+| Consumption endpoint (export) | Every 6h | 0.17 |
+| Rate/standing charge endpoints | **Never** (HA sensor) | 0 |
+| GraphQL Mini | **Never** (BottlecapDave sensor) | 0 |
+| **Total** | | **~0.3/hour** |
+
+For a pure API user with Mini:
+
+| Operation | Frequency | Calls/hour |
+|-----------|-----------|------------|
+| Consumption (import + export) | Every 6h | ~0.3 |
+| Rate + standing charge (cached) | Daily | ~0.08 |
+| GraphQL Mini live poll | Every 90s | ~40 |
+| **Total** | | **~40/hour** |
+
+### Ingester Rate Lookup — Conditional on HA Sensor
+
+The ingester only calls Kraken rate endpoints if no HA rate sensor is configured:
+
+```python
+def _should_fetch_rates(self, cfg: dict) -> bool:
+    """Only fetch rates from Kraken if BottlecapDave / HA rate sensor absent."""
+    return not cfg.get("rate_sensor")
+```
+
+For BottlecapDave users the rate already on the block (written by the engine
+from the HA sensor at boundary time) is used as-is. The ingester upserts only
+`imp_kwh` and `is_provisional`, leaving `imp_rate` and `imp_cost` unchanged.
+
+### Sub-meter Attribution in API Mode — PASS 2 Re-run
+
+#### The Problem
+
+In HA mode, main meter and sub-meter reads arrive simultaneously at block
+boundary. PASS 2 runs immediately with real figures on both sides.
+
+In API mode, main meter kWh arrives from Kraken ~48h later. At boundary time:
+
+| Data | Available? |
+|------|------------|
+| Sub-meter imp_kwh | ✅ Yes (HA sensor) |
+| Main meter imp_kwh | ❌ No (~48h delay) |
+| kwh_grid, kwh_remainder | ❌ Cannot compute correctly |
+
+#### Design: Write Provisional, Re-run PASS 2 at Kraken Finalise
+
+**At boundary time:**
+1. Write block with HA main meter read if available (hybrid), or `imp_kwh = NULL` (pure API)
+2. In hybrid mode: run PASS 2 provisionally — attribution is approximate but usable
+3. In pure API mode: **skip PASS 2 entirely** if `imp_kwh = NULL` — do not
+   produce misleading zero `kwh_grid` figures
+4. Mark block `is_provisional = 1`, `needs_pass2_rerun = 0`
+
+**At Kraken finalise time (~48h later):**
+1. Ingester upserts authoritative `imp_kwh`, sets `is_provisional = 0`
+2. Sets `needs_pass2_rerun = 1` if sub-meter siblings exist
+3. Engine tick drains the queue: loads full block, re-runs `_apply_pass2`,
+   writes corrected attribution columns, clears flag
+
+Sub-meter `imp_kwh` is never modified — only the derived attribution columns
+(`kwh_grid`, `kwh_battery`, `cost`, `kwh_remainder`, `cost_remainder`) are
+updated.
+
+#### PASS 2 Re-run: Clip Correction
+
+| Scenario | Effect |
+|----------|--------|
+| Provisional main meter too high | Sub-meter `kwh_grid` clipped down; `kwh_battery` increases |
+| Provisional main meter NULL (pure API) | Full attribution computed for first time |
+| Authoritative main meter < total sub-meter kWh | All sub-meters clipped; `kwh_remainder` → 0; WARNING logged |
+
+#### New BlockStore Methods Required
+
+```python
+def drain_pass2_queue(self) -> list[dict]: ...      # fetch flagged blocks, clear flag atomically
+def get_block_by_id(self, block_id: int) -> Optional[dict]: ...
+def upsert_kraken_block(self, block: dict) -> None: ...  # sets needs_pass2_rerun=1 if sub-meter siblings exist
+def get_block_by_start(self, block_start_iso: str, meter_id: str) -> Optional[dict]: ...
+def get_timed_out_provisionals(self, cutoff_iso: str) -> list[dict]: ...
+def finalise_timed_out_provisionals(self, cutoff_iso: str) -> int: ...
+```
+
+#### New Engine Function
+
+```python
+def _drain_pass2_queue(ha: HAClient) -> None:
+    """Called from engine_loop_task on each tick — lightweight when queue empty."""
+    blocks = _store.drain_pass2_queue()
+    for full_block in blocks:
+        _apply_pass2(full_block)
+        append_block_replace(full_block)
+    if blocks:
+        loop.create_task(_deferred_sensor_update(ha, _store.get_cumulative_totals()))
+```
+
+#### Boundary Read Retention
+
+No change needed. The block row contains everything PASS 2 needs
+(`imp_kwh` per meter, `imp_rate`). The re-run reads from DB, not from
+in-memory reads.
+
+### Provisional Block Display Policy
+
+#### Current State
+
+`is_provisional` exists on `blocks` but is unused by every query surface.
+In HA mode this is invisible — provisional state is transient (seconds to
+minutes). In API mode every block < 48h is genuinely provisional.
+
+Two additional concerns:
+
+**Missing DCC data.** If a block never receives a Kraken upsert it stays
+provisional indefinitely. Without a policy it silently accumulates in billing
+totals.
+
+**No sub-meter attribution until settlement.** In pure API mode, PASS 2 is
+skipped until Kraken arrives. `kwh_grid` and `kwh_remainder` are NULL for up
+to 48h. Charting these would show misleading attribution.
+
+#### Two-Tier Display
+
+**Tier 1 — Accuracy-critical (finalised blocks only):**
+- Billing chart (period totals, daily breakdown, bill summary)
+- Usage Stats cost columns and period totals
+- Live Power billing cards (today/month/year cost)
+- Insights aggregations
+
+**Tier 2 — Recency-critical (all blocks, provisional distinguished):**
+- Usage Stats kWh bar chart segments
+- Current in-progress block on Live Power
+- 48-hour generation mix chart
+
+#### Visual Treatment
+
+Provisional blocks on Tier 2 surfaces:
+- Reduced opacity (0.4–0.5) on bar chart segments
+- Hatching pattern (CSS diagonal stripe)
+- Tooltip: "⏳ Provisional — awaiting supplier settlement" (kWh only, no cost)
+- Banner when range includes provisional blocks:
+  `"⏳ Data for the last [N] hours is awaiting supplier settlement and is
+  not included in cost totals. Figures will update automatically once confirmed."`
+
+Banner suppressed in HA-only mode. Shown only when `kraken_api.enabled = true`.
+
+#### Query Layer Changes
+
+All cost-aggregating methods gain `finalised_only: bool = False`.
+When `True`, WHERE clause adds `AND b.is_provisional = 0`.
+Defaults `False` — HA-only behaviour completely unchanged.
+Server.py passes `True` when `kraken_api.enabled`.
+
+Methods affected: `get_billing_totals_for_utc_range()`, `_aggregate_insights()`,
+`api_blocks_summary()` cost columns.
+
+`get_blocks_lightweight()` adds `b.is_provisional` to SELECT for chart layer.
+
+#### Provisional Timeout (DCC Gap Handling)
+
+Blocks that never receive a Kraken upsert must eventually be finalised in place.
+Daily sweep in ingester (configurable via `kraken_gap_timeout_days`, default 30):
+
+```python
+def _finalise_timed_out_provisionals(self) -> int:
+    cutoff = (now_utc - timedelta(days=PROVISIONAL_TIMEOUT_DAYS)).isoformat()
+    # UPDATE blocks SET is_provisional=0 WHERE is_provisional=1
+    #   AND block_start < cutoff AND source != 'kraken_api'
+    # Log WARNING for each block timed out
+```
+
+Blocks with `source = 'kraken_api'` and `is_provisional = 1` are within their
+expected 48h window — not timed out.
+
+### Schema Changes
+
+New columns via `ALTER TABLE` in `_migrate()`:
+
+| Column | Table | Type | Default | Purpose |
+|--------|-------|------|---------|---------|
+| `source` | `blocks` | TEXT | NULL | `'ha_sensor'` or `'kraken_api'` |
+| `is_provisional` | `blocks` | INTEGER | 0 | 1 = main meter not yet DCC-settled |
+| `needs_pass2_rerun` | `blocks` | INTEGER | 0 | 1 = Kraken upserted, PASS 2 pending |
+
+Note: `imp_provisional` (existing) = sub-meter boundary read missing, clears in
+minutes. `is_provisional` (new) = main meter not DCC-settled, clears ~48h.
+Different semantics, different columns.
+
+Unique index for `upsert_kraken_block` ON CONFLICT:
+
+```sql
+CREATE UNIQUE INDEX IF NOT EXISTS idx_blocks_start_meter
+    ON blocks(block_start, meter_id);
+```
+
+Check for duplicates before adding — deduplicate if any exist (keep highest
+`block_id`).
+
+### BottlecapDave Detection at Auto-Discover
+
+Auto-discover checks HA entity registry for BottlecapDave sensors matching
+the discovered MPAN/serial before reporting quota implications.
+
+Sequence: discover MPAN/serial → construct expected sensor names →
+`ha_client.get_state("sensor.octopus_energy_electricity_<serial>_<mpan>_current_rate")`
+→ report findings in settings UI.
+
+Settings UI outcome:
+
+```
+✓ Octopus Energy integration detected in Home Assistant
+  Rate data will be read from HA sensors (no API quota used)
+  ✓ Home Mini detected in HA — live power from HA sensor (no API quota used)
+```
+
+vs.
+
+```
+⚠ No Octopus Energy integration detected
+  Rates will be fetched from Supplier API (~2 calls/day)
+  ✓ Home Mini registered on account
+    Live power will be polled via Supplier API (~40 calls/hour at 90s)
+```
+
+New config fields set at auto-discover time:
+
+```json
+{
+  "kraken_api": {
+    "ha_rate_sensor_detected": true,
+    "ha_standing_charge_sensor_detected": true,
+    "ha_mini_sensor_detected": false,
+    "ha_mini_sensor_entity_id": null
   }
 }
 ```
 
-**GraphQL provides what REST cannot:**
-- Live power (watts) via Octopus Mini — updates every ~30 seconds
-- `costDelta` alongside consumption — rate already applied by Octopus
-- `demand` (instantaneous W) for live power gauge
-- Access to Octopus Mini data — the REST consumption endpoint only returns published DCC settlement data, not Mini data
+### Live Power Source Priority
 
-**GraphQL is the right choice** for consumption and live power. REST remains appropriate for tariff rate lookups.
+1. HA CAD sensor (existing behaviour, unchanged)
+2. BottlecapDave Mini sensor via HA (read via ha_client, zero API calls)
+3. Kraken GraphQL Mini poll (only if neither above is available)
 
-### Architecture: Augmentation Not Replacement
+### Known Limitations in 3.0.0
 
-Sub-meter data (Zappi, Solax etc.) is **not available from Octopus** — they only see the grid boundary. The Octopus API cannot replace HA sensors for sub-meter users. The correct framing is:
+**Intelligent Octopus — pure API mode:** The REST rate endpoint returns standard
+off-peak/peak rates. Dispatch-period corrections require GraphQL dispatch
+overlay. For BottlecapDave users this is already handled. For pure API users on
+IO, block costs will use standard rates; dispatch corrections are a future
+enhancement.
 
-| Data | Source |
-|------|--------|
-| Main meter import/export kWh | Octopus API (authoritative) OR HA sensor (real-time) |
-| Live power (watts) | Octopus Mini via GraphQL OR HA sensor |
-| Sub-meter kWh (Zappi, Solax etc.) | HA sensors only — Octopus cannot see these |
-| Tariff rates | Octopus REST API (authoritative) |
-| Carbon intensity | National Grid ESO API (unchanged) |
+**Mini vs DCC settlement:** Mini HAN data and DCC settlement data can differ.
+EMT uses REST consumption for blocks and Mini for live power display only.
 
-**Two deployment modes:**
+**Multi-property accounts:** Not supported in 3.0.0. Error shown at auto-discover.
 
-1. **HA-only** — existing behaviour, unchanged.
-
-2. **API mode** — main meter from Octopus API (authoritative). Sub-meters from HA sensors if configured, absent if not — this is just configuration, not a separate mode. Live power from Octopus Mini if `meter_device_id` is configured, absent if not. The code handles missing sub-meters and missing Mini gracefully in both cases — it's the same code path whether sub-meters are absent because the user has no devices, or because they're running API-only with no HA.
-
-### Provisional Block Strategy
-
-Since the REST API provides no `is_estimated` flag:
-
-- Blocks with `block_start` < 48 hours ago: `is_provisional = 1`
-- Blocks ≥ 48 hours old: `is_provisional = 0` (finalised)
-- On each poll: re-fetch last 48 hours and update any block where `consumption` changed
-- On daily reconciliation: re-fetch last 14 days to catch delayed revisions
-
-The existing `is_provisional` column in `blocks` supports this already.
-
-### Rate Attribution
-
-Consumption endpoint returns kWh only — rate must be looked up separately.
-
-**Tariff code discovery:**
-
-Both a tariff code (e.g. `E-1R-FLUX-IMPORT-23-02-14-A`) and product code (e.g. `FLUX-IMPORT-23-02-14`) are needed to construct the rate endpoint URL:
-`/v1/products/<product_code>/electricity-tariffs/<tariff_code>/standard-unit-rates/`
-
-Both are auto-discoverable from the account endpoint — the `agreements` array on each meter point includes the tariff code with `valid_from`/`valid_to` dates. The product code is embedded in the tariff code (everything between the rate type and the region suffix, e.g. stripping `E-1R-` prefix and `-A` region suffix).
-
-**Tariff history:** A user may have changed tariff mid-history. The account endpoint returns the full agreement history, so the ingester can reconstruct which tariff applied at any historical point — critical for accurate backfill.
-
-**Export tariffs:** Export has its own separate tariff code on its own MPAN (e.g. `E-1R-FLUX-EXPORT-23-02-14-A`). Export rates must be fetched from a separate rate endpoint. Both import and export tariff codes are discoverable from the account endpoint.
-
-**Rate lookup process:**
-
-1. Fetch full tariff agreement history from account endpoint
-2. For each consumption block, find the tariff code valid at `interval_start`
-3. Fetch the rate schedule for that tariff covering the required date range
-4. Build sorted rate schedule: `(valid_from, valid_to, rate_inc_vat)`
-5. Binary search for rate valid at each `interval_start`
-6. Agile: one rate record per half-hour, 1:1 with consumption records
-7. Flux/Go: time-of-use bands
-8. Fixed-rate: single record
-
-Compute `imp_cost = consumption × (rate_inc_vat / 100)` at ingestion time. Rates from Octopus are in pence/kWh inc VAT; divide by 100 for £/kWh consistent with existing EMT convention.
-
-**Known limitation — Intelligent Octopus:** Off-peak rates during smart charge dispatches are not reflected in the standard rate endpoint — they only appear via GraphQL. Users on Intelligent Octopus tariffs will have dispatch periods attributed the standard rate rather than the off-peak dispatch rate. This is a known limitation for 2.11.0; a GraphQL dispatch rate lookup path can be added in a later version.
-
-### Live Power via Octopus Mini
-
-The `smartMeterTelemetry` GraphQL query provides `demand` (watts) and `consumptionDelta` (kWh) at ~30 second granularity. This maps onto the existing Live Power page:
-- `demand` → live power gauge (W)
-- `consumptionDelta` → 48-hour generation mix chart accumulation
-- `costDelta` → live cost accumulation
-
-**Rate limit constraint:** At 30-second polling, live power alone consumes 120 calls/hour, exceeding the 100/hour limit. Realistic options:
-- Poll every 60-90 seconds (60-90 calls/hour, leaving headroom for other calls)
-- Confirm with Octopus whether the limit can be raised for dedicated integrations
-- The HA Octopus Energy integration FAQ notes the 100/hour limit can be increased via account settings
-
-### User Setup Flow
-
-Users should not need to understand GraphQL, MPANs, tariff codes, product codes or meter GUIDs — these are implementation details. The setup flow from the user's perspective:
-
-1. **Enter API key** — available from their Octopus dashboard (users of other Octopus integrations already have this)
-2. **Enter account number** — on their bill, format `A-AAAA1111`
-3. **Click Auto-discover** — EMT hits the account endpoint and derives everything else: MPAN, serial numbers, tariff code, product code, tariff history, and Mini device GUID if a Mini is registered
-4. **Done** — user confirms what was found, saves
-
-Discovered values (MPAN, tariff code etc.) are shown as read-only for transparency but are not user-input fields.
-
-**Multiple properties:** 2.11.0 supports single-property accounts only. If the account has multiple properties, show an error: "Multiple properties detected on this account — please contact support." Multi-property support can be added in a later version.
-
-**Mini detection:** If no Mini device is found during auto-discover, live power via Octopus API is simply not enabled. A note in the UI explains that an Octopus Mini would enable this feature.
+**SMETS1 meters:** Data latency may exceed 48h. The provisional timeout
+(`kraken_gap_timeout_days`, default 30) handles this by eventually finalising
+blocks in place.
 
 ### Configuration Schema
-
-The user only inputs `api_key` and `account_number`. Everything else is populated by auto-discover and stored in `meters_config.json`:
 
 ```json
 {
@@ -243,72 +549,91 @@ The user only inputs `api_key` and `account_number`. Everything else is populate
     "import_product_code": "FLUX-IMPORT-23-02-14",
     "export_tariff_code": "E-1R-FLUX-EXPORT-23-02-14-A",
     "export_product_code": "FLUX-EXPORT-23-02-14",
+    "ha_rate_sensor_detected": true,
+    "ha_standing_charge_sensor_detected": true,
+    "ha_mini_sensor_detected": false,
+    "ha_mini_sensor_entity_id": null,
     "poll_interval_hours": 6,
-    "live_poll_interval_seconds": 60,
-    "backfill_days": 90
+    "live_poll_interval_seconds": 90,
+    "backfill_days": 90,
+    "kraken_gap_timeout_days": 30
   }
 }
 ```
 
-- `supplier` — selects the base URLs for REST and GraphQL. Known values: `octopus`, `edf`. Determines `base_url` automatically; never user-entered.
-- `export_mpan`/`export_serial`/`export_tariff_code`/`export_product_code` — absent if no export meter found
-- `meter_device_id` — absent if no compatible smart device found; omitting disables API live power
-- `poll_interval_hours` — how often to fetch new consumption blocks from REST API
-- `live_poll_interval_seconds` — how often to poll smart device via GraphQL for live power
-- `backfill_days` — how far back to fetch on first run
-
-**Supplier base URLs** (maintained in `kraken_api_client.py`):
-
-```python
-KRAKEN_SUPPLIERS = {
-    "octopus": {
-        "rest_base":    "https://api.octopus.energy/v1",
-        "graphql_url":  "https://api.octopus.energy/v1/graphql/",
-    },
-    "edf": {
-        "rest_base":    "https://api.edfenergy.com/v1",   # confirm
-        "graphql_url":  "https://api.edfenergy.com/v1/graphql/",  # confirm
-    },
-}
-```
-
-EDF URLs need confirmation — the pattern is assumed to be the same as Octopus but must be verified before enabling EDF support.
-
 ### New Files
 
-- `kraken_api_client.py` — thin wrapper for REST and GraphQL, JWT token management, rate limit tracking. Supplier-agnostic: base URL is a constructor parameter derived from the configured supplier.
-- `kraken_ingester.py` — polling logic, block construction from API data, rate lookup, upsert into `blocks.db`. Supplier-agnostic.
+- `kraken_api_client.py` — REST + GraphQL client, JWT token management, rate
+  limit tracking, supplier routing, `auto_discover()`, `test_connection()`
+- `kraken_ingester.py` — polling loop, conditional rate lookup, block upsert,
+  provisional timeout sweep, live poll task
 
 ### Files to Modify
 
-- `main.py` — new asyncio task for Kraken ingester and smart device live poller
-- `engine.py` — in API+HA mode, skip main meter block writing from HA sensor if Kraken API provides it; still write sub-meter blocks from HA
-- `server.py` — Live Power page: smart device data path alongside existing HA path
-- `web/templates/live_power.html` — handle Kraken smart device live data format
-- `web/templates/settings.html` — Kraken API section: supplier dropdown, credentials, auto-discover, connection test
-- `block_store.py` — consider adding `source` column to `blocks` (`ha_sensor` vs `kraken_api`) for debugging
+- `block_store.py` — schema migration, new methods, `finalised_only` parameter
+- `engine.py` — `_drain_pass2_queue()`, call from `engine_loop_task`
+- `main.py` — ingester asyncio tasks, mode detection
+- `server.py` — Kraken API routes, Live Power source priority,
+  `finalised_only` flag on aggregations
+- `web/templates/settings.html` — Supplier API tab (third tab)
+- `web/templates/live_power.html` — Kraken Mini fallback data path
+- `web/templates/charts.html` — provisional block visual treatment
 
-### Open Questions Before Coding
+### Open Questions
 
-1. **Rate limit** — can it be raised via account settings for dedicated integrations? The HA integration notes this as possible.
+1. **Rate limit increase** — can the 100/hour limit be raised for dedicated
+   integrations? BottlecapDave FAQ notes this is possible via account settings.
+   Relevant mainly for pure API users with Mini live poll.
 
-2. **Mini vs settlement data** — are REST consumption data and GraphQL Mini data the same readings once settled, or can they differ? Mini uploads every 10 seconds but settlements go through DCC. Need to verify against a real account.
+2. **Mini vs settlement agreement** — do REST consumption figures and Mini HAN
+   figures agree once settled? Needs verification against a real account.
 
-3. **Export MPAN** — always a separate MPAN, or a register on the import MPAN for some meter types? Account endpoint should clarify.
+3. **Export MPAN** — always a separate MPAN, or a register on the import MPAN
+   for some meter types? Account endpoint should confirm during testing.
 
-4. **Mode arbitration** — if both HA sensor and Octopus API provide main meter data for the same block, which wins? Proposal: Octopus API data is authoritative once ≥48h old; HA sensor data used for recent blocks not yet available in API.
+4. **GraphQL token lifetime** — assumed 55 minutes. `kraken_api_client.py` uses
+   5-minute refresh buffer. Needs confirmation against a real account.
 
-5. **Sub-meter absence in API-only mode** — billing chart, Usage Stats and Insights handle missing sub-meters gracefully already (they're optional everywhere). Confirm no hardcoded assumptions about sub-meter presence.
-
-6. **GraphQL token lifetime** — how long do JWT tokens last? Need refresh strategy in `octopus_api_client.py`.
+5. **BottlecapDave rate sensor, no CAD** — user has BottlecapDave but no HA
+   main meter sensor. Consumption from Kraken, rate from BottlecapDave HA sensor.
+   This path should work via `rate_sensor` detection logic but needs explicit
+   test coverage.
 
 ### Suggested Development Order
 
-1. `kraken_api_client.py` — REST + GraphQL client with token management, rate limit tracking, and supplier routing. Fully unit-tested against mocked responses. Verify EDF endpoint URLs before enabling EDF support.
-2. `kraken_ingester.py` — block construction, rate lookup, upsert logic.
-3. Settings UI — credential entry, auto-discover (account → MPAN/serial/tariff/device ID), connection test
-4. `main.py` — new asyncio ingester task, mode detection
-5. Data Management UI — sync status, last sync timestamp, manual sync button
-6. API mode integration — graceful handling of absent sub-meters and absent Mini; main meter arbitration between API and HA sensor data in engine
-8. Live power via Mini — GraphQL polling, live power page adaptation, rate limit management
-9. End-to-end test with a real Octopus account
+1. **Schema migration** — `source`, `is_provisional`, `needs_pass2_rerun`
+   columns; unique index on `(block_start, meter_id)`
+
+2. **BlockStore new methods** — `upsert_kraken_block`, `get_block_by_start`,
+   `get_block_by_id`, `drain_pass2_queue`, `get_timed_out_provisionals`,
+   `finalise_timed_out_provisionals`; `finalised_only` parameter on aggregations
+
+3. **PASS 2 re-run queue** — `_drain_pass2_queue()` in engine, call from
+   `engine_loop_task` — required before ingester goes live
+
+4. **`kraken_api_client.py`** — REST + GraphQL client, unit-tested against
+   mocked responses
+
+5. **`kraken_ingester.py`** — consumption-only first (no rate fetching),
+   provisional timeout sweep
+
+6. **Settings UI** — credential entry, auto-discover, BottlecapDave detection,
+   quota impact display, connection test
+
+7. **main.py integration** — ingester task, mode detection
+
+8. **Provisional block UI** — `finalised_only` queries, visual treatment on
+   charts, provisional banner
+
+9. **Pure API rate fetching** — REST rate and standing charge endpoints, cached,
+   only when no HA rate sensor configured
+
+10. **End-to-end test** — real Octopus account, second EMT instance on separate
+    port and DB, both hybrid (with BottlecapDave) and pure API paths verified.
+    Key checks: CAD kWh vs settled DCC kWh per block over 90-day backfill;
+    PASS 2 re-run cycle observed within short provisional window
+
+11. **GraphQL Mini live poll** — only after 1–10 are solid; only for pure API
+    users where BottlecapDave Mini sensor absent
+
+12. **IO dispatch rate correction for pure API users** — future version
