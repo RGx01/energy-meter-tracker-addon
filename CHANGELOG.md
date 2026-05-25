@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.10.6] — 2026-05-25
+
+### Fixed
+
+- **Gap block double-counting kWh** — when the engine filled a gap after a restart, the last gap block's `read_end` was set to an interpolated value that could exceed the first real block's `read_start` after the gap. This caused the same register space to be counted in both the gap block and the real block, producing a block sum that exceeded the meter register delta — physically impossible. Affects both import and export channels equally; more visible on export where the total is smaller. Fixed by anchoring the last gap window's `read_end` to the actual `post_read` value rather than an interpolated estimate. Note: blocks already written with the old behaviour are not retroactively corrected — use the Corrections page to adjust affected blocks if needed.
+
+- **Export start/end reads missing from billing chart** — the billing summary showed register start and end reads for import (e.g. `Start: 29169.095  End: 29966.750`) but not for export. Root cause: `get_blocks_lightweight` in `block_store.py` omitted `exp_read_start` and `exp_read_end` from both the SQL query and the export channel dict. Added both fields — export register reads now appear in the billing summary alongside import.
+
+---
+
+## [2.10.6] — 2026-05-23
+
+### Fixed
+
+- **Sub-meter sensor reset handling** — when a sub-meter sensor resets mid-block (e.g. a daily-reset cumulative kWh sensor such as Teslemetry's Powerwall battery import), the engine previously skipped the block entirely, recording zero consumption. The engine now detects the reset from the negative delta and uses the post-reset value directly as the block's kWh. This applies to any sub-meter that resets for any reason — daily midnight resets, plug reconnects, or any other cause. No configuration change required.
+
+---
+
 ## [2.10.5] — 2026-05-23
 
 ### Fixed
