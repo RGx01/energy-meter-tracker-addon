@@ -739,7 +739,16 @@ def build_gap_blocks(
                         if gap_hours > 12:
                             skip_reason = f"gap too large ({gap_hours:.1f}hrs)"
                         elif post_read["value"] <= pre_read["value"]:
-                            skip_reason = f"possible reset ({pre_read['value']} → {post_read['value']})"
+                            # Reset detected — use post_read value directly as kWh
+                            # accumulated since the reset (handles daily-reset sensors
+                            # and any other cumulative sensor that resets mid-block).
+                            sub_kwh = max(round(post_read["value"], 6), 0.0)
+                            logger.info(
+                                "build_gap_blocks: %s/%s reset detected (%.4f → %.4f) "
+                                "using post-reset value %.4f kWh",
+                                meter_name, channel_name,
+                                pre_read["value"], post_read["value"], sub_kwh
+                            )
                         else:
                             opener   = interpolate_value(pre_read, post_read, window_start)
                             closer   = interpolate_value(pre_read, post_read, window_end)
@@ -802,7 +811,15 @@ def build_gap_blocks(
                     continue
 
                 opener = interpolate_value(pre_read, post_read, window_start)
-                closer = interpolate_value(pre_read, post_read, window_end)
+                # For the last gap window, anchor read_end to the actual post_read
+                # value rather than an interpolated value. An interpolated closer can
+                # exceed the next real block's read_start, causing the same register
+                # space to be counted in both the gap block and the real block.
+                _is_last_window = ((window_start, window_end) == missing_windows[-1])
+                if _is_last_window:
+                    closer = {"value": post_read["value"], "ts": post_read["ts"]}
+                else:
+                    closer = interpolate_value(pre_read, post_read, window_end)
                 kwh    = max(round(closer["value"] - opener["value"], 6), 0.0)
                 rate   = _rate_value(last_known_rates.get(meter_name, {}).get(channel_name, 0.0))
                 cost   = round(kwh * rate, 6)
@@ -979,15 +996,16 @@ def _apply_pass2(block: dict) -> None:
                 continue
             delta = sub_import.get("kwh", 0.0)
             if delta < 0:
-                # Negative delta on a sub-meter means the sensor is reporting net rather than
-                # cumulative import — which is a misconfiguration. Log and skip rather than
-                # recording negative kWh. The sensor requirement is import-only cumulative.
-                logger.warning(
-                    "PASS 2: %s negative delta %.4f kWh — sub-meter sensor appears to be "
-                    "net rather than cumulative import. Check sensor configuration.",
+                # Reset detected mid-block — read_end is the kWh accumulated since
+                # the reset. Use it directly rather than skipping the block.
+                delta = sub_import.get("read_end", 0.0)
+                logger.info(
+                    "PASS 2: %s reset detected, using post-reset read_end %.4f kWh",
                     meter_name, delta
                 )
-                continue
+                if delta <= 0.0:
+                    continue
+                sub_import["kwh"] = delta
             if delta == 0.0:
                 continue
             entry = {
