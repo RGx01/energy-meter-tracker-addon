@@ -532,6 +532,77 @@ class TestBuildGapBlocks(unittest.TestCase):
         blocks = engine.build_gap_blocks(windows, pre, post, rates, self.config)
         self.assertEqual(len(blocks), 2)
 
+    def test_last_gap_block_read_end_does_not_exceed_post_read(self):
+        """
+        The last gap window's read_end must equal the actual post_read value,
+        not an interpolated estimate. An interpolated read_end can exceed the
+        next real block's read_start, causing the same register space to be
+        counted in both the gap block and the real block (double-counting).
+        """
+        # post_read arrives after window_end so interpolation would place
+        # closer > post_read["value"] at window_end if unclamped.
+        # pre=1000 at 09:15, post=1002 at 10:45, window_end=10:00
+        # Linear interpolation at 10:00: 1000 + (1002-1000) * (45/90) = 1001.0
+        # But post_read["value"] is 1002 — the last window must use 1002, not 1001.
+        pre  = {"electricity_main": {
+            "import": read(1000.0, "2026-01-01T09:15:00"),
+            "export": read(500.0,  "2026-01-01T09:15:00"),
+        }}
+        post = {"electricity_main": {
+            "import": read(1002.0, "2026-01-01T10:45:00"),
+            "export": read(502.0,  "2026-01-01T10:45:00"),
+        }}
+        rates = {"electricity_main": {"import": 0.25, "export": 0.10}}
+        # Single window — this IS the last window
+        blocks = engine.build_gap_blocks(self.window, pre, post, rates, self.config)
+        self.assertEqual(len(blocks), 1)
+        imp_ch = blocks[0]["meters"]["electricity_main"]["channels"]["import"]
+        exp_ch = blocks[0]["meters"]["electricity_main"]["channels"]["export"]
+        # read_end must equal post_read value exactly — not an interpolated estimate
+        self.assertAlmostEqual(imp_ch["read_end"], 1002.0, places=4,
+            msg="Last gap window import read_end must equal post_read value")
+        self.assertAlmostEqual(exp_ch["read_end"], 502.0, places=4,
+            msg="Last gap window export read_end must equal post_read value")
+
+    def test_gap_block_sum_does_not_exceed_register_delta(self):
+        """
+        Sum of block kWh across all gap windows must not exceed the register
+        delta (post_read - pre_read). Double-counting from interpolation
+        overlap would cause this invariant to be violated.
+        """
+        windows = [
+            (dt("2026-01-01T09:30:00"), dt("2026-01-01T10:00:00")),
+            (dt("2026-01-01T10:00:00"), dt("2026-01-01T10:30:00")),
+            (dt("2026-01-01T10:30:00"), dt("2026-01-01T11:00:00")),
+        ]
+        pre  = {"electricity_main": {
+            "import": read(1000.0, "2026-01-01T09:00:00"),
+            "export": read(500.0,  "2026-01-01T09:00:00"),
+        }}
+        post = {"electricity_main": {
+            "import": read(1006.0, "2026-01-01T11:30:00"),
+            "export": read(503.0,  "2026-01-01T11:30:00"),
+        }}
+        rates = {"electricity_main": {"import": 0.25, "export": 0.10}}
+        blocks = engine.build_gap_blocks(windows, pre, post, rates, self.config)
+        self.assertEqual(len(blocks), 3)
+
+        total_imp = sum(b["meters"]["electricity_main"]["channels"]["import"]["kwh"] for b in blocks)
+        total_exp = sum(b["meters"]["electricity_main"]["channels"]["export"]["kwh"] for b in blocks)
+        reg_imp_delta = 1006.0 - 1000.0
+        reg_exp_delta = 503.0  - 500.0
+
+        self.assertLessEqual(total_imp, reg_imp_delta + 0.001,
+            msg=f"Gap block import sum {total_imp:.4f} must not exceed register delta {reg_imp_delta:.4f}")
+        self.assertLessEqual(total_exp, reg_exp_delta + 0.001,
+            msg=f"Gap block export sum {total_exp:.4f} must not exceed register delta {reg_exp_delta:.4f}")
+
+        # Also verify last block's read_end equals post_read value
+        last_imp = blocks[-1]["meters"]["electricity_main"]["channels"]["import"]
+        last_exp = blocks[-1]["meters"]["electricity_main"]["channels"]["export"]
+        self.assertAlmostEqual(last_imp["read_end"], 1006.0, places=4)
+        self.assertAlmostEqual(last_exp["read_end"], 503.0,  places=4)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # extract_last_reads

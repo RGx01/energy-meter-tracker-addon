@@ -2401,6 +2401,7 @@ class BlockStore:
                        b.imp_kwh, b.imp_kwh_grid, b.imp_kwh_remainder,
                        b.imp_rate, b.imp_cost, b.imp_read_start, b.imp_read_end,
                        b.exp_kwh, b.exp_rate, b.exp_cost,
+                       b.exp_read_start, b.exp_read_end,
                        b.standing_charge, b.carbon_g, b.interpolated,
                        m.is_sub_meter, m.parent_meter_id, m.device_label,
                        m.inverter_possible, m.meter_type,
@@ -2473,9 +2474,11 @@ class BlockStore:
                         "read_end":      row["imp_read_end"],
                     },
                     "export": {
-                        "kwh":  exp,
-                        "rate": float(row["exp_rate"]) if row["exp_rate"] is not None else None,
-                        "cost": float(row["exp_cost"] or 0),
+                        "kwh":        exp,
+                        "rate":       float(row["exp_rate"]) if row["exp_rate"] is not None else None,
+                        "cost":       float(row["exp_cost"] or 0),
+                        "read_start": row["exp_read_start"],
+                        "read_end":   row["exp_read_end"],
                     },
                 },
             }
