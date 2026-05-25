@@ -257,24 +257,36 @@ def load_config():
     db_path = os.path.join(DATA_DIR, "blocks.db") if DATA_DIR else None
     db_exists = db_path and os.path.exists(db_path)
 
-    try:
-        store = _get_store()
-        cp = store._conn.execute(
-            "SELECT id FROM config_periods "
-            "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
-        ).fetchone()
-        if cp:
-            return store.config_from_db(cp["id"])
-        # DB exists but no config period yet — fresh DB, not a JSON fallback scenario
-        if db_exists:
-            logger.warning("load_config: blocks.db exists but no active config period found")
-            return {"schema_version": "1.0", "meters": {}}
-    except Exception as e:
-        logger.error("load_config: failed to read config from DB: %s", e)
-        # Only fall back to JSON if no DB exists at all
-        if db_exists:
-            logger.error("load_config: DB exists but config read failed — returning empty config")
-            return {"schema_version": "1.0", "meters": {}}
+    _load_attempts = 3
+    for _attempt in range(_load_attempts):
+        try:
+            store = _get_store()
+            cp = store._conn.execute(
+                "SELECT id FROM config_periods "
+                "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+            ).fetchone()
+            if cp:
+                return store.config_from_db(cp["id"])
+            # DB exists but no config period — may be a transient WAL lock.
+            # Retry before concluding there is genuinely no config period.
+            if db_exists and _attempt < _load_attempts - 1:
+                import time as _time
+                _time.sleep(0.1)
+                continue
+            if db_exists:
+                logger.warning("load_config: blocks.db exists but no active config period found")
+                return {"schema_version": "1.0", "meters": {}}
+        except Exception as e:
+            if _attempt < _load_attempts - 1:
+                import time as _time
+                _time.sleep(0.1)
+                continue
+            logger.error("load_config: failed to read config from DB: %s", e)
+            # Only fall back to JSON if no DB exists at all
+            if db_exists:
+                logger.error("load_config: DB exists but config read failed — returning empty config")
+                return {"schema_version": "1.0", "meters": {}}
+        break
 
     # True fresh install: no DB yet, try meters_config.json
     p = config_path()
@@ -1889,6 +1901,7 @@ def api_blocks_summary():
         return jsonify({
             "currency":      currency,
             "billing_day":   billing_day,
+            "block_minutes": int(main_meta.get("block_minutes") or 30),
             "rows":          rows,
             "meters":        meters_list,
             "export_color":  export_color,

@@ -601,19 +601,38 @@ async function loadChartContent(name, force) {
 
 // Auto-refresh charts every 2 minutes — force reload of active chart
 // and clear cached state for all charts so switching tabs fetches fresh data
-setInterval(function() {
-  chartsLoaded = {};  // clear all — forces re-fetch on next tab switch too
-  var activeTab = document.querySelector('.chart-tab.active');
-  if (!activeTab) return;
-  var name = activeTab.dataset.chart || (activeTab.textContent.indexOf('Heatmap') !== -1 ? 'heatmap' : 'daily');
-  if (name === 'daily' || name === 'heatmap') {
-    loadChartContent(name, true);
-  } else if (name === 'bar') {
-    // Force re-fetch by resetting TTL — barInit will re-fetch and re-render
-    barLastFetch = 0;
-    barInit();
-  }
-}, 120000);
+// Refresh all tabs at 1 minute past each block boundary — same timing as
+// Live Power billing card refresh. This avoids hitting the DB during active
+// block finalisation which can cause WAL lock conflicts and partial responses.
+function msUntilNextBarRefresh() {
+  var now  = new Date();
+  var mins = now.getMinutes();
+  var secs = now.getSeconds();
+  var ms   = now.getMilliseconds();
+  var bm   = barBlockMinutes || 30;
+  var elapsed   = ((mins % bm) * 60 + secs) * 1000 + ms;
+  var blockMs   = bm * 60 * 1000;
+  return (blockMs - elapsed) + 60 * 1000;  // 1 minute after next boundary
+}
+
+function scheduleChartRefresh() {
+  var delay = msUntilNextBarRefresh();
+  setTimeout(function() {
+    chartsLoaded = {};  // clear all — forces re-fetch on next tab switch too
+    var activeTab = document.querySelector('.chart-tab.active');
+    if (activeTab) {
+      var name = activeTab.dataset.chart || (activeTab.textContent.indexOf('Heatmap') !== -1 ? 'heatmap' : 'daily');
+      if (name === 'daily' || name === 'heatmap') {
+        loadChartContent(name, true);
+      } else if (name === 'bar') {
+        barLastFetch = 0;
+        barInit();
+      }
+    }
+    scheduleChartRefresh();  // reschedule for next boundary
+  }, delay);
+}
+scheduleChartRefresh();
 
 function toggleTopbar() {
   var main = document.querySelector('.main');
@@ -1105,6 +1124,7 @@ var barChartInstance = null;
 var barInited = false;
 var barLastFetch = 0;        // timestamp of last successful fetch
 var BAR_TTL_MS = 5 * 60 * 1000;  // re-fetch if data older than 5 minutes
+var barBlockMinutes = 30;    // populated from api/blocks_summary response
 var barMeters = [];       // [{id, label, color, is_sub}]
 var barExportColor = '#ff7f0e';
 
@@ -1189,6 +1209,7 @@ async function barInit() {
     barLoadState(years);
     // Sync control UI to restored state
     barSyncUI();
+    barBlockMinutes = json.block_minutes || 30;
     barInited = true;
     barLastFetch = Date.now();
     // Clear any previous transient error
