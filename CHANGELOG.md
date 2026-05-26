@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.10.7] — 2026-05-25
+
+### Fixed
+
+- **Usage Stats refresh timing** — the 2-minute `setInterval` added in 2.10.5 could fire mid-block while the engine was actively finalising, hitting a WAL lock and returning a partial or invalid response from `api/blocks_summary`. This caused missing import values and incorrect bar colours until the page was refreshed. Replaced the dumb interval with a boundary-aware `scheduleChartRefresh()` that fires 1 minute after each block boundary — the same timing as the Live Power billing card refresh — when the engine is quiescent and the DB is safe to read. All three tabs (Billing, Heatmaps, Usage Stats) now refresh at the same time. `block_minutes` added to `api/blocks_summary` response so the scheduler uses the correct interval for any block size.
+
+- **Transient WAL lock in server `load_config`** — if the engine held a write lock on `blocks.db` at the exact moment the server's `load_config` executed its config period query, the query returned no result and `load_config` fell through to returning an empty config. `api/blocks_summary` then used this empty config, producing a response with no meters — causing missing import values and wrong bar colours in Usage Stats. Fixed by retrying the config period query up to 3 times with a 100ms delay before concluding there is no active config period. A genuine no-config-period state (fresh install) takes 300ms longer to detect; a transient lock clears within the first retry.
+
+---
+
 ## [2.10.6] — 2026-05-25
 
 ### Fixed
