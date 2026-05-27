@@ -1,12 +1,26 @@
 # Changelog
 
+## [2.10.8] — 2026-05-26
+
+*Final step in the unified cost accounting architecture — see 2.10.4 for the full story.*
+
+### Fixed
+
+- **Unified cost accounting — single implementation** — 2.10.4 through 2.10.7 established the correct methodology (daily net_cost = `round(imp + sc - exp, 2)`, summed across days) and applied it consistently across all surfaces. However, Live Power (`_fmt_total`), Usage Stats (`api_blocks_summary`) and the billing chart (`calculate_billing_summary_for_period`) still had three separate implementations of that logic — any future change to one risked drifting the others back out of alignment, as had happened repeatedly. This release extracts the logic into a single `BlockStore.compute_period_net()` method. `_fmt_total` and `calculate_billing_summary_for_period` now call it directly. There is one implementation and one place to change. All three surfaces are guaranteed to agree.
+
+- **Heatmap grey gap at browser zoom above 100%** — when the heatmap was scaled down by `transform: scale()` (triggered when the chart width exceeds the available viewport width at higher browser zoom), the desktop path set `#scroll` height from `window.innerHeight - 120` without accounting for the scale factor. The scaled content was visually shorter than the scroll container, leaving a grey gap below. Fixed by applying the same `targetH = ceil(vh / scale)` calculation the mobile path already used correctly, capped at actual content height to prevent overscroll.
+
+- **Tab switching marks previous tab stale when width changes** — switching between Billing and Heatmaps now marks the previously active tab stale if the container width has changed since the iframe was created, ensuring a fresh iframe load with correct viewport dimensions on the next switch. Fixes resize issues after window resize or zoom change between tab switches. No reload if width is unchanged.
+
+---
+
 ## [2.10.7] — 2026-05-25
 
 ### Fixed
 
-- **Usage Stats refresh timing** — the 2-minute `setInterval` added in 2.10.5 could fire mid-block while the engine was actively finalising, hitting a WAL lock and returning a partial or invalid response from `api/blocks_summary`. This caused missing import values and incorrect bar colours until the page was refreshed. Replaced the dumb interval with a boundary-aware `scheduleChartRefresh()` that fires 1 minute after each block boundary — the same timing as the Live Power billing card refresh — when the engine is quiescent and the DB is safe to read. All three tabs (Billing, Heatmaps, Usage Stats) now refresh at the same time. `block_minutes` added to `api/blocks_summary` response so the scheduler uses the correct interval for any block size.
+- **Usage Stats refresh timing** — the 2-minute `setInterval` added in 2.10.5 could fire mid-block while the engine was actively finalising, hitting a WAL lock and returning a partial or invalid response from `api/blocks_summary`. This caused missing import values and incorrect bar colours until the page was refreshed. Replaced with a boundary-aware `scheduleChartRefresh()` that fires 1 minute after each block boundary — the same timing as the Live Power billing card refresh — when the engine is quiescent and the DB is safe to read. All three tabs (Billing, Heatmaps, Usage Stats) now refresh together. `block_minutes` added to `api/blocks_summary` response so the scheduler uses the correct interval for any block size.
 
-- **Transient WAL lock in server `load_config`** — if the engine held a write lock on `blocks.db` at the exact moment the server's `load_config` executed its config period query, the query returned no result and `load_config` fell through to returning an empty config. `api/blocks_summary` then used this empty config, producing a response with no meters — causing missing import values and wrong bar colours in Usage Stats. Fixed by retrying the config period query up to 3 times with a 100ms delay before concluding there is no active config period. A genuine no-config-period state (fresh install) takes 300ms longer to detect; a transient lock clears within the first retry.
+- **Transient WAL lock in `load_config`** — if the engine held a write lock on `blocks.db` at the exact moment the server's `load_config` queried the config period, the query returned no result and `load_config` returned an empty config. `api/blocks_summary` then produced a response with no meters, causing missing import values and wrong bar colours in Usage Stats. Fixed by retrying the config period query up to 3 times with a 100ms delay before concluding there is no active config period.
 
 ---
 
@@ -14,39 +28,31 @@
 
 ### Fixed
 
-- **Gap block double-counting kWh** — when the engine filled a gap after a restart, the last gap block's `read_end` was set to an interpolated value that could exceed the first real block's `read_start` after the gap. This caused the same register space to be counted in both the gap block and the real block, producing a block sum that exceeded the meter register delta — physically impossible. Affects both import and export channels equally; more visible on export where the total is smaller. Fixed by anchoring the last gap window's `read_end` to the actual `post_read` value rather than an interpolated estimate. Note: blocks already written with the old behaviour are not retroactively corrected — use the Corrections page to adjust affected blocks if needed.
+- **Sub-meter sensor reset handling** — when a sub-meter sensor resets mid-block (e.g. a daily-reset cumulative kWh sensor such as Teslemetry's Powerwall battery import), the engine previously skipped the block entirely, recording zero consumption. The engine now detects the reset from the negative delta and uses the post-reset value directly as the block's kWh. Applies to any reset cause — daily midnight, plug reconnect, or any other. No configuration change required.
 
-- **Export start/end reads missing from billing chart** — the billing summary showed register start and end reads for import (e.g. `Start: 29169.095  End: 29966.750`) but not for export. Root cause: `get_blocks_lightweight` in `block_store.py` omitted `exp_read_start` and `exp_read_end` from both the SQL query and the export channel dict. Added both fields — export register reads now appear in the billing summary alongside import.
+- **Gap block double-counting kWh** — when the engine filled a gap after a restart, the last gap block's `read_end` was set to an interpolated value that could exceed the next real block's `read_start`, causing the same register space to be counted in both blocks. The block sum could exceed the meter register delta — physically impossible. Fixed by anchoring the last gap window's `read_end` to the actual `post_read` value. Affects both import and export. Blocks written before this fix are not retroactively corrected.
 
----
-
-## [2.10.6] — 2026-05-23
-
-### Fixed
-
-- **Sub-meter sensor reset handling** — when a sub-meter sensor resets mid-block (e.g. a daily-reset cumulative kWh sensor such as Teslemetry's Powerwall battery import), the engine previously skipped the block entirely, recording zero consumption. The engine now detects the reset from the negative delta and uses the post-reset value directly as the block's kWh. This applies to any sub-meter that resets for any reason — daily midnight resets, plug reconnects, or any other cause. No configuration change required.
+- **Export register reads missing from billing chart** — `get_blocks_lightweight` omitted `exp_read_start` and `exp_read_end` from both the SQL query and the export channel dict. Export now shows Start/End register reads in the billing summary alongside import.
 
 ---
 
 ## [2.10.5] — 2026-05-23
 
+*Part of the unified cost accounting evolution — see 2.10.4.*
+
 ### Fixed
 
-- **Usage Stats auto-refresh** — the Usage Stats tab was not included in the 2-minute auto-refresh interval that refreshes the Billing and Heatmaps tabs. Users would see stale data unless they manually switched away and back. Fixed by including the `bar` tab in the `setInterval` refresh, forcing a re-fetch of `api/blocks_summary` every 2 minutes when Usage Stats is the active tab.
+- **Usage Stats auto-refresh** — the Usage Stats tab was not included in the 2-minute auto-refresh interval that refreshes Billing and Heatmaps. Users would see stale data unless they manually switched tabs. Fixed by including `bar` in the refresh. Superseded in 2.10.7 by boundary-aware scheduling.
 
 ---
 
 ## [2.10.4] — 2026-05-23
 
+*This release began a sequence of improvements — 2.10.4 through 2.10.8 — that progressively unified cost accounting across all surfaces of EMT (Live Power billing cards, Usage Stats, and the billing chart). Each release closed a specific gap. 2.10.8 completed the work by extracting the single canonical implementation into `BlockStore.compute_period_net()`.*
+
 ### Fixed
 
-- **Unified cost accounting methodology** — introduced a single consistent method across all surfaces: block costs are summed per day at 4dp, a `net_cost` is computed per day as `round(imp + standing - exp, 2)`, and daily nets are summed for period/monthly/yearly totals. This guarantees parts always sum to their totals at every aggregation level. Removed `barPeriodTotals` from `charts.html` and `server.py` — it was a workaround that introduced its own inconsistencies by substituting SQL aggregates for daily row sums.
-
-- **Live Power billing card total** — `_fmt_total` now computes its headline total as `round(total_imp_cost + standing - exp_cost, 2)` from the already-rounded-to-2dp display values, so the headline always equals the sum of visible line items.
-
-- **Billing chart `total_cost`** — `calculate_billing_summary_for_period` now computes `total_cost` from daily net_cost values (same method as Usage Stats) rather than from period-level rounded meter totals. Without sub-meters all surfaces agree exactly. With sub-meters the billing chart may differ by ±£0.01 from Usage Stats because the billing chart does per-block sub-meter subtraction (required for its per-rate display) while Usage Stats does per-day subtraction — both are internally self-consistent.
-
-- **Usage Stats grand total** — data table grand total now sums `agg.net_cost` across displayed buckets rather than re-deriving from component columns, ensuring the grand total always equals the sum of displayed row totals.
+- **Unified cost accounting methodology** — established the canonical method: block costs are summed per local day at 4dp, `net_cost = round(imp + sc - exp, 2)` per day, daily nets summed for all period totals. This guarantees parts always sum to totals at every aggregation level. Removed `barPeriodTotals` — a workaround that substituted SQL aggregates for daily row sums and introduced its own inconsistencies. Applied the method to Usage Stats (`net_cost` field per row, grand total from `agg.net_cost`), the billing chart (`total_cost` from daily nets), and Live Power (`_fmt_total` from daily nets). Sub-meter handling was not yet fully consistent across surfaces — resolved in 2.10.8.
 
 ---
 

@@ -901,44 +901,10 @@ def api_billing():
             imp_cost = round(float(totals["imp_cost"]), 2)
             exp_cost = round(float(totals["exp_cost"]), 2)
             standing = round(float(totals["standing"]), 2)
-            # Compute total using same daily net_cost method as api_blocks_summary.
-            # SQL raw-sum-round-once can differ from daily-4dp-net-sum by ±£0.01
-            # over long periods. Summing daily nets ensures Live Power agrees with
-            # Usage Stats at every aggregation level.
+            # Compute total via BlockStore.compute_period_net —
+            # single implementation shared by Live Power, Usage Stats and billing chart.
             if utc_s and utc_e:
-                # Compute total from daily net_cost values using Python timezone
-                # handling — same method as api_blocks_summary. SQLite localtime
-                # doesn't handle BST/GMT correctly.
-                from collections import defaultdict as _dd
-                from datetime import datetime as _dt, timezone as _tz2
-                from zoneinfo import ZoneInfo as _ZI
-                _tz_obj = _ZI(tz_name)
-                _braw = store._conn.execute(
-                    """SELECT b.block_start, b.imp_cost, b.exp_cost, b.standing_charge,
-                              m.is_sub_meter
-                       FROM blocks b JOIN meters m ON m.meter_id = b.meter_id
-                       WHERE b.block_start >= ? AND b.block_start < ?""",
-                    (utc_s, utc_e)
-                ).fetchall()
-                _by_d = _dd(lambda: {"imp": 0.0, "exp": 0.0, "sc": 0.0})
-                for _br in _braw:
-                    _d = _dt.fromisoformat(_br["block_start"]).replace(
-                        tzinfo=_tz2.utc).astimezone(_tz_obj).strftime("%Y-%m-%d")
-                    _is_sub = bool(_br["is_sub_meter"])
-                    # Only use main meter (not sub-meters) — main meter imp_cost
-                    # already represents the full grid draw. Sub-meter costs are
-                    # a breakdown of that draw, not additional consumption.
-                    if not _is_sub:
-                        _by_d[_d]["imp"] += float(_br["imp_cost"] or 0)
-                        _by_d[_d]["exp"] += float(_br["exp_cost"] or 0)
-                        _sc = float(_br["standing_charge"] or 0)
-                        if _sc > _by_d[_d]["sc"]: _by_d[_d]["sc"] = _sc
-                _daily_nets = [
-                    round(round(_by_d[_d]["imp"], 4) + round(_by_d[_d]["sc"], 4)
-                          - round(_by_d[_d]["exp"], 4), 2)
-                    for _d in sorted(_by_d)
-                ]
-                total = round(sum(_daily_nets), 2)
+                total = store.compute_period_net(utc_s, utc_e, tz_name)
             else:
                 total = round(imp_cost + standing - exp_cost, 2)
             rows = []
@@ -2183,7 +2149,7 @@ def api_config_history_update(period_id):
                 bm        = int(main_meta.get("block_minutes") or 30)
                 currency  = main_meta.get("currency_symbol", "£")
                 os.makedirs(CHART_DIR, exist_ok=True)
-                html = _ec.generate_daily_import_export_charts(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency, cfg=cfg)
+                html = _ec.generate_daily_import_export_charts(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency, cfg=cfg, store=store)
                 with open(os.path.join(CHART_DIR, "daily_usage.html"), "w") as f:
                     f.write(html)
                 logger.info("api_config_history_update: charts regenerated")
@@ -2254,7 +2220,7 @@ def api_config_history_delete(period_id):
                 currency = main_meta.get("currency_symbol", "£")
                 os.makedirs(CHART_DIR, exist_ok=True)
                 html = _ec.generate_daily_import_export_charts(
-                    blocks, timezone_name=tz_name, block_minutes=bm, currency=currency, cfg=load_config()
+                    blocks, timezone_name=tz_name, block_minutes=bm, currency=currency, cfg=load_config(), store=store
                 )
                 with open(os.path.join(CHART_DIR, "daily_usage.html"), "w") as f:
                     f.write(html)
@@ -3635,7 +3601,7 @@ def api_regenerate_charts():
         html = energy_charts.generate_net_heatmap(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency)
         with open(os.path.join(CHART_DIR, "net_heatmap.html"), "w") as f:
             f.write(html)
-        html = energy_charts.generate_daily_import_export_charts(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency, cfg=cfg)
+        html = energy_charts.generate_daily_import_export_charts(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency, cfg=cfg, store=store)
         with open(os.path.join(CHART_DIR, "daily_usage.html"), "w") as f:
             f.write(html)
         logger.info("server: charts regenerated on demand")
