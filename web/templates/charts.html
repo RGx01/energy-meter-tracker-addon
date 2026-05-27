@@ -613,24 +613,28 @@ function msUntilNextBarRefresh() {
   var bm   = barBlockMinutes || 30;
   var elapsed   = ((mins % bm) * 60 + secs) * 1000 + ms;
   var blockMs   = bm * 60 * 1000;
-  return (blockMs - elapsed) + 60 * 1000;  // 1 minute after next boundary
+  return (blockMs - elapsed) + 90 * 1000;  // 90 seconds after next boundary — ensures block is fully written
 }
 
 function scheduleChartRefresh() {
   var delay = msUntilNextBarRefresh();
   setTimeout(function() {
-    chartsLoaded = {};  // clear all — forces re-fetch on next tab switch too
-    var activeTab = document.querySelector('.chart-tab.active');
-    if (activeTab) {
-      var name = activeTab.dataset.chart || (activeTab.textContent.indexOf('Heatmap') !== -1 ? 'heatmap' : 'daily');
-      if (name === 'daily' || name === 'heatmap') {
-        loadChartContent(name, true);
-      } else if (name === 'bar') {
-        barLastFetch = 0;
-        barInit();
+    try {
+      chartsLoaded = {};  // clear all — forces re-fetch on next tab switch too
+      barLastFetch = 0;   // always reset bar TTL so next barInit() always fetches fresh data
+      var activeTab = document.querySelector('.chart-tab.active');
+      if (activeTab) {
+        var name = activeTab.dataset.chart || (activeTab.textContent.indexOf('Heatmap') !== -1 ? 'heatmap' : 'daily');
+        if (name === 'daily' || name === 'heatmap') {
+          loadChartContent(name, true);
+        } else if (name === 'bar') {
+          barInit();
+        }
       }
+    } catch(e) {
+      console.error('scheduleChartRefresh error:', e);
     }
-    scheduleChartRefresh();  // reschedule for next boundary
+    scheduleChartRefresh();  // always reschedule regardless of errors
   }, delay);
 }
 scheduleChartRefresh();
