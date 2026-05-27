@@ -589,7 +589,7 @@ def get_all_year_periods(blocks, tz=None):
     return periods
 
 
-def calculate_billing_summary_for_period(blocks, period_start, period_end):
+def calculate_billing_summary_for_period(blocks, period_start, period_end, store=None, tz_name=None):
     meter_summary  = defaultdict(lambda: defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "read_start": None, "read_end": None}))
     meter_totals   = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "read_start": None, "read_end": None})
     main_import_raw = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0})
@@ -784,18 +784,29 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end):
                 else:
                     _main_day_imp[_blk_day] += _blk_cost
 
-    # Compute total_cost from raw main meter daily values —
-    # same method as _fmt_total in server.py.
-    _daily_nets = [
-        round(
-            round(_main_day_imp[_d], 4)
-            + round(_main_day_sc.get(_d, 0.0), 4)
-            - round(_main_day_exp.get(_d, 0.0), 4),
-            2
+    # Compute total_cost via BlockStore.compute_period_net — the single shared
+    # implementation used by Live Power, Usage Stats and billing chart.
+    # Fall back to local accumulation if store not provided.
+    if store is not None and tz_name:
+        _utc_s = min(b["start"] for b in sorted_blocks if b.get("start"))
+        _utc_e_dt = max(
+            datetime.fromisoformat(b["start"]) for b in sorted_blocks if b.get("start")
         )
-        for _d in sorted(_main_day_imp)
-    ]
-    total_cost = round(sum(_daily_nets), 2)
+        # utc_e must be past the last block — add 30 minutes
+        from datetime import timedelta as _timedelta
+        _utc_e = (_utc_e_dt + _timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S")
+        total_cost = store.compute_period_net(_utc_s, _utc_e, tz_name)
+    else:
+        _daily_nets = [
+            round(
+                round(_main_day_imp[_d], 4)
+                + round(_main_day_sc.get(_d, 0.0), 4)
+                - round(_main_day_exp.get(_d, 0.0), 4),
+                2
+            )
+            for _d in sorted(_main_day_imp)
+        ]
+        total_cost = round(sum(_daily_nets), 2)
 
     # Collect main meter read_start / read_end for the raw import header
     _main_key = next((k for k in meter_totals if "Electricity Main / Import" in k
@@ -1374,7 +1385,7 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
 # Main entry point
 # ─────────────────────────────────────────────────────────────
 
-def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minutes=None, currency='£', cfg=None):
+def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minutes=None, currency='£', cfg=None, store=None):
 
     if not blocks:
         return "<html><body><p>No data available.</p></body></html>"
@@ -1460,7 +1471,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
 
     for i, (p_start, p_end) in enumerate(periods):
         period_blocks = _blocks_for_period(p_start, p_end)
-        summary   = calculate_billing_summary_for_period(period_blocks, p_start, p_end)
+        summary   = calculate_billing_summary_for_period(period_blocks, p_start, p_end, store=store, tz_name=timezone_name)
         is_current = p_start.date() <= today < p_end.date()
         is_prev    = (len(periods) > 1) and (i == len(periods) - 2) and not is_current
 
@@ -1503,7 +1514,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     quarter_sections = []
     for i, (q_start, q_end) in enumerate(get_all_quarter_periods(blocks, tz=_tz)):
         quarter_blocks = _blocks_for_period(q_start, q_end)
-        summary    = calculate_billing_summary_for_period(quarter_blocks, q_start, q_end)
+        summary    = calculate_billing_summary_for_period(quarter_blocks, q_start, q_end, store=store, tz_name=timezone_name)
         is_current = q_start.date() <= today < q_end.date()
         q_num      = (q_start.month - 1) // 3 + 1
         quarter_sections.append({
@@ -1523,7 +1534,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     # ── Year periods ──
     year_sections = []
     for i, (y_start, y_end) in enumerate(get_all_year_periods(blocks, tz=_tz)):
-        summary    = calculate_billing_summary_for_period(blocks, y_start, y_end)
+        summary    = calculate_billing_summary_for_period(blocks, y_start, y_end, store=store, tz_name=timezone_name)
         is_current = y_start.date() <= today < y_end.date()
         year_sections.append({
             "index":      i,
@@ -1542,7 +1553,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     # ── Calendar month periods ──
     calmonth_sections = []
     for i, (cm_start, cm_end) in enumerate(get_all_calmonth_periods(blocks, tz=_tz)):
-        summary    = calculate_billing_summary_for_period(blocks, cm_start, cm_end)
+        summary    = calculate_billing_summary_for_period(blocks, cm_start, cm_end, store=store, tz_name=timezone_name)
         is_current = cm_start.date() <= today < cm_end.date()
         calmonth_sections.append({
             "index":      i,

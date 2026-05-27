@@ -1341,6 +1341,57 @@ class BlockStore:
 
 
 
+    def compute_period_net(self, utc_s: str, utc_e: str, tz_name: str) -> float:
+        """Compute net cost for a UTC period — single source of truth used by
+        both Live Power (_fmt_total in server.py) and the billing chart
+        (calculate_billing_summary_for_period in energy_charts.py).
+
+        net_cost per day = round(
+            round(direct + sub_4s, 4) + round(sc, 4) - round(exp, 4), 2)
+        where direct = round(max(0, main_imp - sum(raw_subs)), 4)
+        and sub_4s = sum(round(sub, 4) for each sub-meter).
+        Summed across all days in the period.
+        """
+        from collections import defaultdict
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+
+        tz_obj = ZoneInfo(tz_name)
+        rows = self._conn.execute(
+            """SELECT b.block_start, b.imp_cost, b.exp_cost, b.standing_charge,
+                      m.is_sub_meter, m.meter_id
+               FROM blocks b JOIN meters m ON m.meter_id = b.meter_id
+               WHERE b.block_start >= ? AND b.block_start < ?""",
+            (utc_s, utc_e)
+        ).fetchall()
+
+        by_d     = defaultdict(lambda: {"main_imp": 0.0, "exp": 0.0, "sc": 0.0})
+        sub_by_d = defaultdict(lambda: defaultdict(float))
+
+        for r in rows:
+            d = datetime.fromisoformat(r["block_start"]).replace(
+                tzinfo=timezone.utc).astimezone(tz_obj).strftime("%Y-%m-%d")
+            cost = float(r["imp_cost"] or 0)
+            if not bool(r["is_sub_meter"]):
+                by_d[d]["main_imp"] += cost
+                by_d[d]["exp"] += float(r["exp_cost"] or 0)
+                sc = float(r["standing_charge"] or 0)
+                if sc > by_d[d]["sc"]: by_d[d]["sc"] = sc
+            else:
+                sub_by_d[d][r["meter_id"]] += cost
+
+        daily_nets = []
+        for d in sorted(by_d):
+            raw_subs = list(sub_by_d[d].values())
+            direct   = round(max(0.0, by_d[d]["main_imp"] - sum(raw_subs)), 4)
+            sub_4s   = sum(round(v, 4) for v in raw_subs)
+            imp_4    = round(direct + sub_4s, 4)
+            sc_4     = round(by_d[d]["sc"], 4)
+            exp_4    = round(by_d[d]["exp"], 4)
+            daily_nets.append(round(imp_4 + sc_4 - exp_4, 2))
+
+        return round(sum(daily_nets), 2)
+
     def get_billing_totals_for_utc_range(self, utc_start: str, utc_end: str,
                                           tz_name: str = "UTC") -> dict:
         """
