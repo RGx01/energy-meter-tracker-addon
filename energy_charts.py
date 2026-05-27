@@ -3543,17 +3543,21 @@ function scaleChart(overrideW) {{
       outer.style.height = targetH + 'px';
       scroll.style.height = targetH + 'px';
     }} else {{
-      outer.style.height = 'auto';
+      // Desktop scaling (browser zoom). #outer is scaled down by `scale` so its
+      // visual height = layout height * scale. Set scroll to fill the iframe by
+      // using the same targetH approach as mobile — layout height = vh / scale,
+      // capped at actual content height to avoid overscroll.
       var scrollH = {n_rows} * {row_height} + {margin_t} + {margin_b};
-      var maxH = Math.floor((window.innerHeight - 120) / {row_height}) * {row_height} + {margin_t} + {margin_b};
-      scroll.style.height = Math.min(scrollH, maxH) + 'px';
+      var targetH = Math.ceil(vh / scale);
+      var clampedH = Math.min(targetH, scrollH);
+      outer.style.height = clampedH + 'px';
+      scroll.style.height = clampedH + 'px';
     }}
   }} else {{
     outer.style.transform = '';
     outer.style.transformOrigin = '';
     outer.style.width = '';
     outer.style.height = '';
-    // nav clear not needed — inside #scroll
     var scrollH = {n_rows} * {row_height} + {margin_t} + {margin_b};
     var maxH = Math.floor((window.innerHeight - 120) / {row_height}) * {row_height} + {margin_t} + {margin_b};
     scroll.style.height = Math.min(scrollH, maxH) + 'px';
