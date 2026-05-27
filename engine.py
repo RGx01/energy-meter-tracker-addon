@@ -941,7 +941,7 @@ def generate_charts(store: "BlockStore"):
     except Exception as e:
         logger.error("generate_charts: heatmap error: %s", e)
     try:
-        html = energy_charts.generate_daily_import_export_charts(blocks, timezone_name=timezone_name, block_minutes=block_minutes, currency=currency_symbol, cfg=config)
+        html = energy_charts.generate_daily_import_export_charts(blocks, timezone_name=timezone_name, block_minutes=block_minutes, currency=currency_symbol, cfg=config, store=store)
         io_save_file(f"{CHART_DIR}/daily_usage.html", html)
         logger.info("generate_charts: daily usage chart written (tz=%s, bm=%s, currency=%s)", timezone_name, block_minutes, currency_symbol)
     except Exception as e:
