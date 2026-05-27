@@ -544,6 +544,7 @@ function _injectChartHtml(name, html) {
     // scaleChart inside uses the correct value rather than window.innerWidth
     // which may still be settling at load time.
     var _w = (document.querySelector('.main-content') || document.body).getBoundingClientRect().width;
+    ifrm._lastSentWidth = _w;
     if (ifrm.contentWindow) {
       ifrm.contentWindow.postMessage({ type: 'emt-resize', width: _w }, '*');
       if (_openTables.length) {
@@ -650,6 +651,7 @@ function updateToggleLabel(name) {
 
 function showChart(name, btn) {
   _suppressResize = true;
+  var _prevChart = _activeChart;  // capture before overwrite
   document.querySelectorAll('.chart-tab').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
   document.getElementById('chart-daily').style.display   = name === 'daily'   ? 'block' : 'none';
@@ -667,11 +669,26 @@ function showChart(name, btn) {
     } else {
       loadChartContent(name);
     }
+    // Mark the previously active tab stale so switching back forces a fresh
+    // load with the correct current viewport dimensions. This ensures resize
+    // at any browser zoom level — the fresh iframe measures the correct
+    // window.innerWidth on load rather than relying on a resize nudge.
+    // If the container width has changed since the previous tab's iframe was
+    // created, mark it stale so switching back forces a fresh load at the
+    // correct dimensions. This handles browser zoom changes between tab switches
+    // without forcing a reload on every switch.
+    if (_prevChart && _prevChart !== name && (_prevChart === 'daily' || _prevChart === 'heatmap')) {
+      var _prevCId = _prevChart === 'daily' ? 'chart-daily-content' : 'chart-heatmap-content';
+      var _prevIfrm = document.getElementById(_prevCId) && document.getElementById(_prevCId).querySelector('iframe');
+      var _curW = (document.querySelector('.main-content') || document.body).getBoundingClientRect().width;
+      if (!_prevIfrm || Math.abs(_curW - (_prevIfrm._lastSentWidth || 0)) > 10) {
+        chartsLoaded[_prevChart] = false;
+      }
+    }
   }
   try { localStorage.setItem('emt_chart_tab', name); } catch(e) {}
   updateToggleLabel(name);
   setTimeout(function() { _suppressResize = false; }, 200);
-  // Note: emt-resize is sent via _injectChartHtml's onload — no need to send here
 }
 
 // ── PDF Export ────────────────────────────────────────────────────────────────

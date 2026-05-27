@@ -8,6 +8,10 @@
 
 - **Unified cost accounting — single implementation** — 2.10.4 through 2.10.7 established the correct methodology (daily net_cost = `round(imp + sc - exp, 2)`, summed across days) and applied it consistently across all surfaces. However, Live Power (`_fmt_total`), Usage Stats (`api_blocks_summary`) and the billing chart (`calculate_billing_summary_for_period`) still had three separate implementations of that logic — any future change to one risked drifting the others back out of alignment, as had happened repeatedly. This release extracts the logic into a single `BlockStore.compute_period_net()` method. `_fmt_total` and `calculate_billing_summary_for_period` now call it directly. There is one implementation and one place to change. All three surfaces are guaranteed to agree.
 
+- **Heatmap grey gap at browser zoom above 100%** — when the heatmap was scaled down by `transform: scale()` (triggered when the chart width exceeds the available viewport width at higher browser zoom), the desktop path set `#scroll` height from `window.innerHeight - 120` without accounting for the scale factor. The scaled content was visually shorter than the scroll container, leaving a grey gap below. Fixed by applying the same `targetH = ceil(vh / scale)` calculation the mobile path already used correctly, capped at actual content height to prevent overscroll.
+
+- **Tab switching marks previous tab stale when width changes** — switching between Billing and Heatmaps now marks the previously active tab stale if the container width has changed since the iframe was created, ensuring a fresh iframe load with correct viewport dimensions on the next switch. Fixes resize issues after window resize or zoom change between tab switches. No reload if width is unchanged.
+
 ---
 
 ## [2.10.7] — 2026-05-25
