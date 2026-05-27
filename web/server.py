@@ -121,6 +121,7 @@ def init(data_dir: str, chart_dir: str, ha_client):
     _ha_client = ha_client
 
 
+
 def start():
     """Start Flask in a background daemon thread."""
     t = threading.Thread(target=_run, daemon=True, name="flask")
