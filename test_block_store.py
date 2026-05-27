@@ -3662,7 +3662,7 @@ class TestDeviceRetirement(unittest.TestCase):
         self.store._conn.execute(
             """INSERT INTO current_reads
                (captured_at, meter_id, channel, channel_type, value, standing_charge, is_gap_seed)
-               VALUES ('2026-05-01T12:00:00', 'ev_charger', 'import', 'rate', 0.30, None, 0)"""
+               VALUES ('2026-05-01T12:00:00', 'ev_charger', 'import', 'rate', 0.30, NULL, 0)"""
         )
         self.store._conn.commit()
 
@@ -3702,7 +3702,7 @@ class TestDeviceRetirement(unittest.TestCase):
         self.store._conn.execute(
             """INSERT INTO current_reads
                (captured_at, meter_id, channel, channel_type, value, standing_charge, is_gap_seed)
-               VALUES ('2026-05-01T12:00:00', 'ev_charger', 'import', 'rate', 0.30, None, 0)"""
+               VALUES ('2026-05-01T12:00:00', 'ev_charger', 'import', 'rate', 0.30, NULL, 0)"""
         )
         self.store._conn.commit()
 
@@ -3713,7 +3713,7 @@ class TestDeviceRetirement(unittest.TestCase):
         self.store._conn.execute(
             """INSERT INTO current_reads
                (captured_at, meter_id, channel, channel_type, value, standing_charge, is_gap_seed)
-               VALUES ('2026-05-01T12:00:00', 'ev_charger', 'import', 'rate', 0.30, None, 0)"""
+               VALUES ('2026-05-01T12:00:00', 'ev_charger', 'import', 'rate', 0.30, NULL, 0)"""
         )
         self.store._conn.commit()
 
