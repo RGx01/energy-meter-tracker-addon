@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.10.9] — 2026-06-03
+
+### Fixed
+
+- **Rogue sub-meter kWh from identical pre/post reads** — when HA restarted briefly during an active block, the gap-fill logic detected identical pre and post reads on sub-meters (sensor value unchanged during the outage) and incorrectly treated this as a daily sensor reset. The reset handler used the full cumulative register value as the block's kWh (e.g. 5798.914 kWh for a battery, 19.38 kWh for an EV charger) instead of a delta of zero. Fixed by splitting the `post_read <= pre_read` condition into two cases: `==` (unchanged sensor, delta is zero) and `<` (genuine register reset, use post_read value).
+
+- **Double gap fill on rapid HA reconnects** — if HA disconnected and reconnected twice in quick succession, `engine_startup` ran twice and both runs detected and filled the same gap. The second fill overwrote the first with slightly different interpolated values. Fixed by checking for an existing interpolated block before writing a gap block — if one already exists for that window, the gap fill is skipped.
+
+---
+
 ## [2.10.8] — 2026-05-26
 
 *Final step in the unified cost accounting architecture — see 2.10.4 for the full story.*
