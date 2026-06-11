@@ -1369,10 +1369,21 @@ def build_gap_blocks(
                         gap_hours = (post_ts - pre_ts).total_seconds() / 3600
                         if gap_hours > 12:
                             skip_reason = f"gap too large ({gap_hours:.1f}hrs)"
-                        elif post_read["value"] <= pre_read["value"]:
-                            # Reset detected — use post_read value directly as kWh
-                            # accumulated since the reset (handles daily-reset sensors
-                            # and any other cumulative sensor that resets mid-block).
+                        elif post_read["value"] == pre_read["value"]:
+                            # Identical reads — sensor didn't change during the gap
+                            # (e.g. brief HA outage with no actual consumption).
+                            # Delta is zero — do not use the register value as kWh.
+                            sub_kwh = 0.0
+                            logger.info(
+                                "build_gap_blocks: %s/%s unchanged (%.4f → %.4f) "
+                                "— zero delta for gap block",
+                                meter_name, channel_name,
+                                pre_read["value"], post_read["value"]
+                            )
+                        elif post_read["value"] < pre_read["value"]:
+                            # Genuine reset — register dropped. Use post_read value
+                            # directly as kWh accumulated since reset (handles
+                            # daily-reset sensors and any cumulative sensor reset).
                             sub_kwh = max(round(post_read["value"], 6), 0.0)
                             logger.info(
                                 "build_gap_blocks: %s/%s reset detected (%.4f → %.4f) "
@@ -5227,6 +5238,24 @@ async def engine_startup(ha: HAClient):
                     # Add CI to gap blocks from the carbon_intensity table
                     _postcode = _get_postcode()
                     for _gb in _startup_gap_blocks:
+                        # Skip if an interpolated block already exists for this window —
+                        # prevents double gap-fill when engine_startup runs twice in rapid
+                        # succession due to consecutive HA disconnects.
+                        _gb_start = _gb.get("start")
+                        if _gb_start:
+                            _existing = _store._conn.execute(
+                                """SELECT block_start FROM blocks
+                                   WHERE meter_id = 'electricity_main'
+                                     AND block_start = ?
+                                     AND interpolated = 1""",
+                                (_gb_start,)
+                            ).fetchone()
+                            if _existing:
+                                logger.info(
+                                    "engine_startup: gap block %s already exists (interpolated) — skipping",
+                                    _gb_start
+                                )
+                                continue
                         try:
                             if _postcode:
                                 _ci = _store.get_nearest_carbon_intensity(
