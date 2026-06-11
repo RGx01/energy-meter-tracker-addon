@@ -53,8 +53,13 @@ def inject_globals():
         cfg = load_config()
         for m_data in cfg.get("meters", {}).values():
             if not (m_data.get("meta") or {}).get("sub_meter"):
-                has_power_sensor = bool((m_data.get("meta") or {}).get("power_sensor"))
-                has_postcode     = bool((m_data.get("meta") or {}).get("postcode_prefix", "").strip())
+                _meta = (m_data.get("meta") or {})
+                # A live-power source is a configured power_sensor entity (device
+                # sensor or auto-adopted BCD) OR the Octopus Mini opted in as the
+                # source (power_source=="mini" — not an HA entity, polled via API).
+                has_power_sensor = (bool(_effective_power_sensor(_meta))
+                                    or _meta.get("power_source") == "mini")
+                has_postcode     = bool(_meta.get("postcode_prefix", "").strip())
                 break
     except Exception:
         pass
@@ -119,6 +124,23 @@ def init(data_dir: str, chart_dir: str, ha_client):
     DATA_DIR   = data_dir
     CHART_DIR  = chart_dir
     _ha_client = ha_client
+
+
+def _run_on_engine_loop(coro, timeout: float = 30.0):
+    """Run an async coroutine on the ENGINE's running event loop and block this
+    (Flask) thread on the result.
+
+    This is the ONLY correct way for a sync route to await something that uses
+    the engine's aiohttp session (HA client, Kraken client): those objects bind
+    their connector/timeout to the loop they were created on. Spinning up a
+    fresh loop with run_until_complete() raises "Timeout context manager should
+    be used inside a task". Raises RuntimeError if the loop isn't available.
+    """
+    import asyncio as _asyncio
+    if not (_event_loop and _event_loop.is_running()):
+        raise RuntimeError("engine event loop not running")
+    fut = _asyncio.run_coroutine_threadsafe(coro, _event_loop)
+    return fut.result(timeout=timeout)
 
 
 
@@ -622,8 +644,21 @@ def live_power_page():
         month_period = year_period = today_date = ""
         gauge_max_imp = 10; gauge_max_exp = 5
 
-    # Check if power sensor is configured
-    has_power_sensor = bool(main_meta.get("power_sensor"))
+    # Check if a live-power source is configured: a power_sensor entity OR the
+    # Octopus Mini opted in as the source (power_source=="mini").
+    mini_chosen = main_meta.get("power_source") == "mini"
+    has_power_sensor = bool(_effective_power_sensor(main_meta)) or mini_chosen
+
+    # Mini opt-in offer: a Mini is present AND there's no cheaper live source
+    # (no power_sensor entity, no BCD demand sensor). Cheap — no GraphQL here.
+    mini_device = bool(_mini_device_id())
+    bcd_found = False
+    try:
+        import engine as _eng_mini
+        bcd_found = bool(((_eng_mini._detected_integrations or {}).get("bcd") or {}).get("found"))
+    except Exception:
+        pass
+    mini_available = mini_device and not main_meta.get("power_sensor") and not bcd_found
 
     return render_template(
         "live_power.html",
@@ -639,6 +674,8 @@ def live_power_page():
         year_rows=year_rows,
         year_period=year_period,
         has_power_sensor=has_power_sensor,
+        mini_available=mini_available,
+        mini_chosen=mini_chosen,
         gauge_max_imp=gauge_max_imp,
         gauge_max_exp=gauge_max_exp,
         block_minutes=int(main_meta.get("block_minutes") or 30),
@@ -700,6 +737,55 @@ def _build_soc_response(soc_sensors, ha_client):
     return result
 
 
+def _mini_device_id():
+    """The discovered Octopus Mini deviceId (from the engine's boundary reader),
+    or None when no Mini is present / not yet probed."""
+    try:
+        import engine as _eng
+        reader = getattr(_eng, "_kraken_mini_reader", None)
+        return getattr(reader, "device_id", None) if reader else None
+    except Exception:
+        return None
+
+
+def _mini_live_demand_kw():
+    """Latest Mini demand in kW, read from the engine's cache (the engine polls
+    the Mini server-side, page-independently). Returns None when there's no recent
+    reading. No GraphQL call here — the engine is the single poller."""
+    try:
+        import engine as _eng
+        import time as _time
+        d = getattr(_eng, "_last_mini_demand", None) or {}
+        kw = d.get("kw")
+        wall = d.get("wall", 0.0)
+        if kw is None:
+            return None
+        # Treat readings older than a few poll gaps as stale (Mini stopped / gone).
+        if (_time.time() - wall) > 180.0:
+            return None
+        return kw
+    except Exception:
+        return None
+
+
+def _bcd_demand_sensor():
+    """BottlecapDave's current_demand entity (live-power sensor) when BCD is
+    detected, else None. Used to auto-adopt BCD as the power sensor when the user
+    hasn't configured one of their own — it's a free local feed, no API quota."""
+    try:
+        import engine as _eng
+        bcd = (_eng._detected_integrations or {}).get("bcd") or {}
+        return bcd.get("demand_sensor") if bcd.get("found") else None
+    except Exception:
+        return None
+
+
+def _effective_power_sensor(main_meta):
+    """Resolve the live-power sensor entity: the user's configured power_sensor,
+    or — when none is set — BottlecapDave's current_demand (auto-adopted)."""
+    return (main_meta or {}).get("power_sensor") or _bcd_demand_sensor()
+
+
 @app.route("/api/power")
 def api_power():
     """Returns live power (kW) from configured power sensor or derived from reads."""
@@ -713,6 +799,8 @@ def api_power():
 
         # Find power sensor and sub-meter sensors from config
         power_sensor = bat_sensor = ev_sensor = None
+        power_source = None  # e.g. "mini" — Octopus Mini opted in as the live source
+        postcode_prefix = None
         soc_sensors = {}  # {meter_id: {soc, inverter_power}}
         from datetime import datetime as _dt2
         _today = _dt2.now().strftime("%Y-%m-%d")
@@ -723,6 +811,8 @@ def api_power():
                 continue
             if not meta.get("sub_meter"):
                 power_sensor = meta.get("power_sensor")
+                power_source = meta.get("power_source")
+                postcode_prefix = meta.get("postcode_prefix")
             elif _is_meter_type(meta, m_id, "battery"):
                 bat_sensor = ((m_data.get("channels") or {}).get("import") or {}).get("read")
                 if meta.get("soc_sensor") or meta.get("inverter_power_sensor"):
@@ -759,9 +849,24 @@ def api_power():
             if val in (None, "unknown", "unavailable"):
                 return None
             try:
-                return round(float(val), 3)  # already in kW
+                fv = float(val)
             except (ValueError, TypeError):
                 return None
+            # Respect the sensor's unit rather than assuming kW: BCD's
+            # current_demand (and many power sensors) report in watts.
+            unit = ""
+            try:
+                attrs = _ha_client.get_attributes(entity_id)
+                unit = ((attrs or {}).get("unit_of_measurement") or "")
+            except Exception:
+                pass
+            u = unit.upper()
+            if u == "W":
+                fv = fv / 1000.0
+            elif u != "KW":
+                # No/unknown unit — small magnitudes are kW, large are W.
+                fv = fv / 1000.0 if abs(fv) > 100 else fv
+            return round(fv, 3)
 
         def derive_kw(reads):
             if not reads or len(reads) < 2:
@@ -800,9 +905,17 @@ def api_power():
             elif _is_meter_type(cfg_meta, m_id, "ev"):
                 ev_kw = derive_kw(ch.get("import", {}).get("reads", []))
 
-        if power_sensor:
-            # Main meter — use direct power sensor (already in kW, +ve import, -ve export)
-            net_kw = sensor_kw(power_sensor)
+        effective_ps = power_sensor or _bcd_demand_sensor()
+        mini_active = (not effective_ps) and power_source == "mini" and bool(_mini_device_id())
+        if effective_ps:
+            # Main meter — direct power sensor: the user's own, or BCD's
+            # current_demand auto-adopted (kW after sensor_kw's unit handling).
+            net_kw = sensor_kw(effective_ps)
+            imp_kw = max(0.0, net_kw)  if net_kw is not None else None
+            exp_kw = max(0.0, -net_kw) if net_kw is not None else None
+        elif mini_active:
+            # Main meter — Octopus Mini live demand (kW), polled by the engine.
+            net_kw = _mini_live_demand_kw()
             imp_kw = max(0.0, net_kw)  if net_kw is not None else None
             exp_kw = max(0.0, -net_kw) if net_kw is not None else None
         else:
@@ -856,19 +969,66 @@ def api_power():
         except Exception:
             pass
 
+        # Mini availability for the Overview opt-in toggle: a Mini is present AND
+        # there's no cheaper live source (no power_sensor entity, no BCD demand).
+        mini_present = bool(_mini_device_id())
+        bcd_present = False
+        try:
+            import engine as _eng
+            bcd_present = bool(((_eng._detected_integrations or {}).get("bcd") or {}).get("found"))
+        except Exception:
+            pass
+        mini_available = mini_present and not power_sensor and not bcd_present
+
         return jsonify({
             "import_kw":        imp_kw,
             "export_kw":        exp_kw,
             "battery_kw":       bat_kw,
             "ev_kw":            ev_kw,
             "max_kw":           10,
-            "has_power_sensor": bool(power_sensor),
+            "has_power_sensor": bool(effective_ps) or bool(mini_active),
+            "mini_active":      bool(mini_active),
+            "mini_available":   bool(mini_available),
             "rate":             current_rate,
             "soc_sensors":      _build_soc_response(soc_sensors, _ha_client),
             "generation_mix":   current_mix,
         })
     except Exception as e:
         logger.error("api_power: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/power-source/mini", methods=["POST"])
+def api_power_source_mini():
+    """Opt the Octopus Mini in/out as the live-power source on the main meter
+    (sets/clears meta.power_source == 'mini'). When on, the Overview gauge is
+    driven by polling smartMeterTelemetry — which consumes the GraphQL query
+    allowance, so this is strictly opt-in."""
+    try:
+        data = request.get_json(force=True) or {}
+        enabled = bool(data.get("enabled"))
+        cfg = load_config()
+        main_id = None
+        for m_id, m_data in (cfg.get("meters") or {}).items():
+            if not ((m_data or {}).get("meta") or {}).get("sub_meter"):
+                main_id = m_id
+                break
+        if not main_id:
+            return jsonify({"error": "no main meter configured"}), 404
+        meta = cfg["meters"][main_id].setdefault("meta", {})
+        if enabled:
+            if meta.get("power_sensor"):
+                # never override a real device sensor
+                return jsonify({"error": "a power sensor is already configured"}), 409
+            meta["power_source"] = "mini"
+        else:
+            meta.pop("power_source", None)
+        save_config(cfg)
+        logger.info("api_power_source_mini: Mini live source %s",
+                    "enabled" if enabled else "disabled")
+        return jsonify({"ok": True, "enabled": enabled})
+    except Exception as e:
+        logger.error("api_power_source_mini: %s", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -1290,6 +1450,30 @@ def api_meter_main_reset():
             with open(cfg_p, "w") as f:
                 _j.dump({"meters": {}}, f, indent=2)
 
+        # Remove generated chart HTML — otherwise the old charts linger and the
+        # Billing/Charts pages show stale data from the wiped setup.
+        _chart_dir = CHART_DIR or DATA_DIR
+        if _chart_dir:
+            for _cf in ("net_heatmap.html", "daily_usage.html"):
+                _cp = os.path.join(_chart_dir, _cf)
+                try:
+                    if os.path.exists(_cp):
+                        os.remove(_cp)
+                        logger.info("api_meter_main_reset: removed stale chart %s", _cf)
+                except OSError as _ce:
+                    logger.warning("api_meter_main_reset: could not remove %s: %s",
+                                   _cf, _ce)
+
+        # Clear stored API credentials — they live outside the DB (so they're
+        # not in backups), which means a DB wipe alone leaves them orphaned and
+        # the API wrongly re-activates on next start. A reset means start over.
+        try:
+            import engine as _eng
+            _eng.save_kraken_credentials("", None)   # empty key clears the file
+            logger.info("api_meter_main_reset: cleared stored API credentials")
+        except Exception as _ke:
+            logger.warning("api_meter_main_reset: could not clear credentials: %s", _ke)
+
         logger.info("api_meter_main_reset: database wiped — restarting addon")
 
         # Trigger addon restart via supervisor API — runs in background thread
@@ -1709,7 +1893,9 @@ def api_blocks_summary():
                 _m["imp_kwh"] += _m_imp  # kwh accumulates normally
                 _m["exp_kwh"]  += _exp
                 _m["exp_cost"] += _cost_exp
-                if _sc > _dd["standing"]:
+                # Start-of-day standing charge: first non-zero of the day
+                # (rows ascending). Not MAX (over-bills when charge decreases).
+                if _sc > 0 and not _dd["standing"]:
                     _dd["standing"] = _sc
                 if _cg is not None:
                     _m["carbon_g"] = (_m["carbon_g"] or 0.0) + _cg
@@ -2608,12 +2794,18 @@ def settings_page():
     cfg   = load_config()
     tz_select_html = '<select class="js-meta" data-key="timezone"><option value="UTC">UTC</option><option value="Europe/London">Europe/London (UK)</option><option value="Europe/Dublin">Europe/Dublin (Ireland)</option><option value="Europe/Lisbon">Europe/Lisbon (Portugal)</option><option value="Europe/Paris">Europe/Paris (France, Belgium, Netherlands)</option><option value="Europe/Berlin">Europe/Berlin (Germany, Austria)</option><option value="Europe/Amsterdam">Europe/Amsterdam</option><option value="Europe/Rome">Europe/Rome (Italy)</option><option value="Europe/Madrid">Europe/Madrid (Spain)</option><option value="Europe/Stockholm">Europe/Stockholm (Sweden, Norway, Denmark)</option><option value="Europe/Helsinki">Europe/Helsinki (Finland)</option><option value="Europe/Warsaw">Europe/Warsaw (Poland)</option><option value="Europe/Athens">Europe/Athens (Greece)</option><option value="Europe/Istanbul">Europe/Istanbul (Turkey)</option><option value="Europe/Moscow">Europe/Moscow (Russia)</option><option value="America/New_York">America/New_York (US Eastern)</option><option value="America/Chicago">America/Chicago (US Central)</option><option value="America/Denver">America/Denver (US Mountain)</option><option value="America/Los_Angeles">America/Los_Angeles (US Pacific)</option><option value="America/Toronto">America/Toronto (Canada Eastern)</option><option value="America/Vancouver">America/Vancouver (Canada Pacific)</option><option value="America/Sao_Paulo">America/Sao_Paulo (Brazil)</option><option value="Asia/Dubai">Asia/Dubai (UAE)</option><option value="Asia/Kolkata">Asia/Kolkata (India)</option><option value="Asia/Singapore">Asia/Singapore</option><option value="Asia/Tokyo">Asia/Tokyo (Japan)</option><option value="Asia/Shanghai">Asia/Shanghai (China)</option><option value="Australia/Sydney">Australia/Sydney</option><option value="Australia/Perth">Australia/Perth</option><option value="Pacific/Auckland">Pacific/Auckland (New Zealand)</option></select>'
     has_data = bool(store.count_blocks())
+    try:
+        import engine as _eng
+        _ds_mode = _eng.get_data_source_mode()
+    except Exception:
+        _ds_mode = "cad"
     return render_template(
         "meter_config.html",
         config=cfg,
         active="settings",
         tz_select_html=tz_select_html,
-        has_data=has_data
+        has_data=has_data,
+        data_source_mode=_ds_mode
     )
 
 
@@ -2648,6 +2840,216 @@ def api_settings_post():
             saved[key] = val
     store.save_settings(saved)
     return jsonify({"ok": True})
+
+
+@app.route("/api/detect-bcd", methods=["GET"])
+def api_detect_bcd():
+    """Scan HA states for a BottlecapDave Octopus integration and report what
+    EMT can pre-fill (account, MPANs, rate/standing-charge sensors, Mini
+    presence). BCD is OPTIONAL — when absent this cleanly returns {found:false}
+    and the wizard proceeds on the pure-API path. Never fails hard."""
+    try:
+        import engine as _eng
+        from kraken_api_client import detect_bottlecapdave
+        if _ha_client is None:
+            return jsonify({"found": False, "detail": "no_ha_client"})
+        states = _run_on_engine_loop(_ha_client.get_all_states(), timeout=20.0)
+        result = detect_bottlecapdave(states or [])
+        return jsonify(result)
+    except Exception as e:
+        # Detection failure must never block setup — fall back to pure-API path.
+        return jsonify({"found": False, "detail": str(e)})
+
+
+@app.route("/api/data-source-mode", methods=["GET"])
+def api_data_source_mode_get():
+    """Return the current data-source mode and derived capability flags."""
+    try:
+        import engine as _eng
+        mode = _eng.get_data_source_mode()
+        return jsonify({"mode": mode,
+                        "uses_api": _eng.mode_uses_api(mode),
+                        "uses_mini": _eng.mode_uses_mini(mode)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/data-source-mode", methods=["POST"])
+def api_data_source_mode_post():
+    """Set the data-source mode (derived by the setup survey).
+
+    Enforces supplier gating: an API-backed mode (cad+api / api / api+mini) is
+    rejected unless the supplier is API-capable. The supplier is taken from the
+    request if present, else from the saved config's main meter. This is the
+    authoritative gate — the wizard UI hides the API path for non-API suppliers,
+    but we never trust the UI alone.
+    """
+    try:
+        import engine as _eng
+        data = request.get_json(force=True) or {}
+        requested_mode = data.get("mode")
+        if _eng.mode_uses_api(requested_mode):
+            supplier = data.get("supplier")
+            if supplier is None:
+                # Fall back to the saved config's supplier.
+                try:
+                    _cfg = load_config()
+                    for _m in (_cfg.get("meters") or {}).values():
+                        if (_m.get("meta") or {}).get("sub_meter"):
+                            continue
+                        supplier = (_m.get("meta") or {}).get("supplier")
+                        break
+                except Exception:
+                    supplier = None
+            if not _eng.supplier_is_api_capable(supplier):
+                return jsonify({
+                    "error": "supplier_not_api_capable",
+                    "detail": ("mode %r requires an API-capable supplier; "
+                               "supplier %r is local-only"
+                               % (requested_mode, supplier or ""))
+                }), 400
+            # Guard: an API mode needs credentials present (Change Setup cad→api
+            # must not strand the user on an API mode with nothing to poll).
+            if not _eng.has_kraken_credentials():
+                return jsonify({
+                    "error": "no_credentials",
+                    "detail": ("mode %r requires Kraken API credentials, but none "
+                               "are configured" % (requested_mode,))
+                }), 400
+        mode = _eng.set_data_source_mode(requested_mode)
+        return jsonify({"ok": True, "mode": mode})
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/kraken-config", methods=["GET"])
+def api_kraken_config_get():
+    """Report whether API credentials are configured and the current connection
+    status. NEVER returns the API key itself."""
+    try:
+        import engine as _eng
+        env = _eng._kraken_env()
+        configured = bool(env.get("api_key"))
+        return jsonify({
+            "configured": configured,
+            "account_number": env.get("account_number"),
+            "connected": _eng.kraken_available(),
+            "mini": _eng._kraken_mini_reader is not None,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/kraken-config", methods=["POST"])
+def api_kraken_config_post():
+    """Save API credentials to the credentials file (outside the DB/backups),
+    then run discovery immediately and return the live result. Sending an empty
+    api_key disconnects (clears the file)."""
+    try:
+        import engine as _eng
+        data = request.get_json(force=True) or {}
+        api_key = data.get("api_key")
+        account = data.get("account_number")
+        base_url = data.get("base_url")
+        _eng.save_kraken_credentials(api_key, account, base_url)
+        if not (api_key or "").strip():
+            # Full disconnect, not just a file delete: stop polling, tear down the
+            # live client + Mini, wipe API-derived state, land on cad. (Deleting
+            # the file alone left the in-memory client polling until restart.)
+            result = _run_on_engine_loop(_eng.disconnect_kraken(), timeout=30.0)
+            return jsonify({"ok": result.get("ok", True), "connected": False,
+                            "disconnected": True, "mode": result.get("mode")})
+        result = _run_on_engine_loop(_eng.connect_kraken_now(), timeout=45.0)
+        return jsonify(result), (200 if result.get("ok") else 400)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/disconnect-kraken", methods=["POST"])
+def api_disconnect_kraken():
+    """Destructive 'Disconnect Octopus' action (MODE-UI §5): clear API
+    credentials + API-derived state, stop polling immediately, tear down the live
+    client/Mini, and land on local-sensor mode ('cad'). Historical DCC-settled
+    billing data and the billing source are KEPT. The UI confirms before calling
+    this. See engine.disconnect_kraken."""
+    try:
+        import engine as _eng
+        result = _run_on_engine_loop(_eng.disconnect_kraken(), timeout=30.0)
+        return jsonify(result), (200 if result.get("ok") else 500)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/billing-source", methods=["GET"])
+def api_billing_source_get():
+    """Return the current global billing source and unsettled-block count."""
+    try:
+        import engine as _eng
+        store = _get_store()
+        source = _eng._get_billing_source()
+        unsettled = store.count_unsettled_blocks()
+        return jsonify({"source": source, "unsettled": unsettled,
+                        "api_available": _eng.kraken_available()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/billing-source", methods=["POST"])
+def api_billing_source_post():
+    """Set the global billing source (cad/dcc). When it changes, all blocks are
+    flagged for PASS 2 re-run (the drain re-materialises billing); the response
+    carries the flagged count so the UI can warn that recalculation takes time.
+    """
+    try:
+        import engine as _eng
+        data = request.get_json(force=True) or {}
+        new_source = (data.get("source") or "").lower()
+        result = _eng.apply_billing_source_change(new_source)
+        return jsonify({"ok": True, **result})
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/unsettled-blocks")
+def api_unsettled_blocks():
+    """View-only report of main-meter blocks with no DCC import settlement
+    (running on CAD fallback). Relevant when billing_source='dcc'. Returns a
+    capped list plus the full count."""
+    try:
+        store = _get_store()
+        limit = int(request.args.get("limit", 500))
+        count = store.count_unsettled_blocks()
+        rows = store.get_unsettled_blocks(limit=limit)
+        out = [{"block_start": r["block_start"],
+                "imp_kwh": r["imp_kwh"],
+                "exp_kwh": r["exp_kwh"],
+                "is_provisional": bool(r["is_provisional"])}
+               for r in rows]
+        return jsonify({"count": count, "limit": limit, "blocks": out})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/retry-settlement", methods=["POST"])
+def api_retry_settlement():
+    """User-triggered re-fetch of DCC over oldest-unsettled → now, to settle
+    late/old gaps on demand. Requires a configured Kraken API. Runs the async
+    retry on the engine's event loop (server handlers are sync)."""
+    try:
+        import engine as _eng
+        if not _eng.kraken_available():
+            return jsonify({"ok": False, "reason": "no_api",
+                            "error": "No supplier API configured"}), 400
+        result = _run_on_engine_loop(_eng.retry_settlement_for_unsettled(),
+                                     timeout=120.0)
+        status = 200 if result.get("ok") else 400
+        return jsonify(result), status
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/insights/periods")
@@ -3150,7 +3552,10 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
         house_imp_kwh  += h_imp
         house_imp_cost += h_cost
 
-        # Standing charge — once per local day
+        # Standing charge — start-of-day value. Take the earliest block's
+        # charge, but don't let a leading zero (e.g. an early gap-filled block)
+        # shadow the real value: only set once with the first NON-zero seen,
+        # falling back to 0 only if the whole day is zero. Not MAX.
         try:
             local_d = (_dt.fromisoformat(bs)
                        .replace(tzinfo=_ZI("UTC"))
@@ -3159,7 +3564,7 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
         except Exception:
             local_d = bs[:10]
         if sc > 0:
-            if local_d not in daily_sc or sc > daily_sc[local_d]:
+            if not daily_sc.get(local_d):      # unset or still 0
                 daily_sc[local_d] = sc
         elif local_d not in daily_sc:
             daily_sc[local_d] = 0.0
@@ -3976,7 +4381,8 @@ def _corrections_time_to_utc(time_str: str, tz_name: str,
 
 
 def _corrections_build_where(corr_type, from_date, to_date, channel,
-                              from_time_utc, to_time_utc, meter_id, tz_name="UTC"):
+                              from_time_utc, to_time_utc, meter_id, tz_name="UTC",
+                              api_settled_only=False):
     """
     Build WHERE clause and params for corrections queries.
 
@@ -4036,7 +4442,43 @@ def _corrections_build_where(corr_type, from_date, to_date, channel,
     if col:
         clauses.append(f"{col} IS NOT NULL")
 
+    if api_settled_only and corr_type == "rate":
+        # API+ gate: only DCC-settled blocks (imp_kwh_api/exp_kwh_api populated)
+        # may have their rate corrected. An unsettled block's kWh — and its
+        # overlay-derived rate — are still going to be rewritten at settlement,
+        # which would clobber the correction.
+        settled_col = "imp_kwh_api" if channel == "import" else "exp_kwh_api"
+        clauses.append(f"{settled_col} IS NOT NULL")
+
     return " AND ".join(clauses), params, col
+
+
+def _corrections_api_gate_active() -> bool:
+    """True when the data-source mode uses the DCC API, so rate corrections must
+    be gated to settled blocks. Pure CAD (no API) has no DCC reconciliation to
+    clobber a correction, so it returns False and corrections apply immediately.
+    """
+    try:
+        import engine as _eng
+        return bool(_eng.mode_uses_api(_eng.get_data_source_mode()))
+    except Exception:
+        return False
+
+
+def _corrections_unreconciled_count(store, from_date, to_date, channel,
+                                    from_time_utc, to_time_utc, meter_id,
+                                    tz_name) -> int:
+    """Count in-window rate blocks NOT yet DCC-settled — the ones a gated rate
+    correction will skip — so the UI can tell the user to retry after settlement.
+    """
+    settled_col = "imp_kwh_api" if channel == "import" else "exp_kwh_api"
+    where, params, _ = _corrections_build_where(
+        "rate", from_date, to_date, channel,
+        from_time_utc, to_time_utc, meter_id, tz_name, api_settled_only=False)
+    row = store._conn.execute(
+        f"SELECT COUNT(*) AS n FROM blocks WHERE {where} AND {settled_col} IS NULL",
+        params).fetchone()
+    return int((row["n"] if row else 0) or 0)
 
 
 @app.route("/api/corrections/meters", methods=["GET"])
@@ -4107,6 +4549,20 @@ def api_corrections_preview():
             from_time_utc, to_time_utc, meter_id, tz_name
         )
 
+        # API+ gate: rate corrections only touch DCC-settled blocks (see
+        # _corrections_build_where). Pure CAD applies immediately.
+        gate = corr_type == "rate" and _corrections_api_gate_active()
+        skipped = 0
+        if gate:
+            where, params, col = _corrections_build_where(
+                corr_type, from_date, to_date, channel,
+                from_time_utc, to_time_utc, meter_id, tz_name,
+                api_settled_only=True
+            )
+            skipped = _corrections_unreconciled_count(
+                store, from_date, to_date, channel,
+                from_time_utc, to_time_utc, meter_id, tz_name)
+
         if corr_type == "standing":
             cur = store._conn.execute(
                 f"""SELECT COUNT(DISTINCT date(block_start)) as days,
@@ -4165,7 +4621,9 @@ def api_corrections_preview():
                     "new_cost":      new_cost,
                 })
 
-            return jsonify({"blocks": blocks_out})
+            return jsonify({"blocks": blocks_out,
+                            "skipped_unreconciled": skipped,
+                            "api_gated": gate})
 
     except Exception as e:
         logger.error("api_corrections_preview: %s", e)
@@ -4229,6 +4687,21 @@ def api_corrections_apply():
             from_time_utc, to_time_utc, meter_id, tz_name
         )
 
+        # API+ gate: a rate correction only touches DCC-settled blocks; unsettled
+        # ones would be clobbered at settlement, so skip + report them. Pure CAD
+        # applies immediately.
+        gate = corr_type == "rate" and _corrections_api_gate_active()
+        skipped = 0
+        if gate:
+            where, params, col = _corrections_build_where(
+                corr_type, from_date, to_date, channel,
+                from_time_utc, to_time_utc, meter_id, tz_name,
+                api_settled_only=True
+            )
+            skipped = _corrections_unreconciled_count(
+                store, from_date, to_date, channel,
+                from_time_utc, to_time_utc, meter_id, tz_name)
+
         if corr_type == "standing":
             cur = store._conn.execute(
                 f"UPDATE blocks SET standing_charge = ? WHERE {where}",
@@ -4274,7 +4747,8 @@ def api_corrections_apply():
                 channel, value, recalc_cost, updated, from_date, to_date
             )
 
-        return jsonify({"ok": True, "updated_blocks": updated})
+        return jsonify({"ok": True, "updated_blocks": updated,
+                        "skipped_unreconciled": skipped, "api_gated": gate})
     except Exception as e:
         logger.error("api_corrections_apply: %s", e)
         return jsonify({"error": str(e)}), 500

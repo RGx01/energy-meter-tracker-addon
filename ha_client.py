@@ -263,6 +263,24 @@ class HAClient:
             all_states = await resp.json()
         return sorted(s.get("entity_id", "") for s in all_states)
 
+    async def get_all_states(self) -> list[dict]:
+        """Return the full states list: dicts of {entity_id, state, attributes}.
+
+        Used by BottlecapDave auto-detection (3.0.0), which needs entity_ids
+        and their attributes together; one REST round-trip beats N attribute
+        fetches. Returns [] on failure rather than raising.
+        """
+        try:
+            async with self._session.get(f"{HA_REST_URL}/states") as resp:
+                if resp.status != 200:
+                    logger.warning("ha_client: get_all_states failed (%d)",
+                                   resp.status)
+                    return []
+                return await resp.json()
+        except Exception as e:
+            logger.warning("ha_client: get_all_states error: %s", e)
+            return []
+
     async def get_entity_attributes(self, entity_id: str) -> dict:
         """
         Fetch the full state object for entity_id via REST and return its

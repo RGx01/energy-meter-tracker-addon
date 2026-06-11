@@ -708,12 +708,14 @@
 {% block topbar %}
 <div class="topbar">
   <div>
-    <h2>Live Power</h2>
-    <div class="sub">Live power &amp; billing at a glance</div>
+    <h2>Overview</h2>
+    <div class="sub">Your energy at a glance</div>
   </div>
   <div style="font-size:12px;color:var(--muted);">
+    {% if has_power_sensor %}
     <span class="status-dot live" id="status-dot"></span>
     <span id="status-text">Connecting...</span>
+    {% endif %}
   </div>
 </div>
 {% endblock %}
@@ -721,13 +723,44 @@
 {% block content %}
 
 <!-- ── Live Power ── -->
-{% if not has_power_sensor %}
-<div class="card" style="text-align:center;padding:32px;margin-bottom:12px;">
-  <div style="font-size:32px;margin-bottom:12px;">⚡</div>
-  <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No power sensor configured</div>
-  <div style="color:var(--muted);font-size:13px;">Add a power sensor in <a href="{{ url_for('settings_page') }}" style="color:var(--accent);">Meter Config</a> to enable the live power gauge.</div>
+{% if mini_available and not mini_chosen %}
+<div class="card" id="mini-enable" style="display:flex;align-items:flex-start;gap:10px;padding:12px 14px;margin-bottom:12px;font-size:13px;">
+  <span style="font-size:16px;line-height:1.4;">⚡</span>
+  <span style="flex:1;color:var(--muted);">An <strong>Octopus Mini</strong> was found on your account. Use it to show a live power gauge here?<br>
+    <span style="color:var(--warning);">Heads up:</span> this polls the Octopus API about once a minute while the page is open and <strong>consumes your query allowance intensively</strong>.</span>
+  <button onclick="setMiniSource(true)" class="btn btn-primary btn-sm" style="flex-shrink:0;">Enable</button>
 </div>
-{% else %}
+{% elif not has_power_sensor %}
+<div class="card" id="power-hint" style="display:flex;align-items:center;gap:10px;padding:10px 14px;margin-bottom:12px;font-size:13px;">
+  <span style="font-size:16px;">💡</span>
+  <span style="flex:1;color:var(--muted);">Add a power sensor in <a href="{{ url_for('settings_page') }}" style="color:var(--accent);">Meter Config</a> to show a live power gauge here.</span>
+  <button onclick="dismissPowerHint()" aria-label="Dismiss" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:18px;line-height:1;padding:0 4px;">&times;</button>
+</div>
+<script>
+function dismissPowerHint(){var e=document.getElementById('power-hint');if(e){e.style.display='none';}try{localStorage.setItem('emt_hide_power_hint','1');}catch(_){}}
+(function(){try{if(localStorage.getItem('emt_hide_power_hint')==='1'){var e=document.getElementById('power-hint');if(e){e.style.display='none';}}}catch(_){}})();
+</script>
+{% endif %}
+
+{% if mini_chosen %}
+<div id="mini-active-note" style="font-size:12px;color:var(--muted);margin-bottom:10px;">
+  ⚡ Live power from your <strong>Octopus Mini</strong> · <a href="#" onclick="setMiniSource(false);return false;" style="color:var(--accent);">disable</a>
+</div>
+{% endif %}
+
+{% if mini_available or mini_chosen %}
+<script>
+function setMiniSource(enabled){
+  fetch(apiUrl('/api/power-source/mini'), {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({enabled: enabled})
+  }).then(function(r){ return r.json(); })
+    .then(function(d){ if(d && d.ok){ location.reload(); } else { alert((d && d.error) || 'Could not update the Mini setting.'); } })
+    .catch(function(){ alert('Could not update the Mini setting.'); });
+}
+</script>
+{% endif %}
+
 <div class="live-power-page">
 <div class="gauge-ci-row">
 <div class="summary-grid">
@@ -752,6 +785,7 @@
   </div>
   {% endif %}
 
+  {% if has_power_sensor %}
   <!-- Main gauge -->
   <div class="power-card">
     <div class="card-title">⚡ Live Power</div>
@@ -792,10 +826,10 @@
 
   <!-- Battery SoC cards — rendered dynamically by updatePower() -->
   <div id="soc-cards-container" style="display:contents;"></div>
+  {% endif %}
 
 </div><!-- /.summary-grid -->
 
-{% if has_postcode or has_power_sensor %}
 <!-- ── CI card slot (moves here in layout-a, stays in wide-row in layout-b) ── -->
 <!-- In layout-a JS moves #carbon-card-wrap here; in layout-b it stays in wide-row -->
 </div><!-- /.gauge-ci-row -->
@@ -829,7 +863,7 @@
   </div>
   {% endif %}
 
-  {% if has_power_sensor %}
+  {% if has_power_sensor or has_postcode %}
   <!-- Rolling Power Chart -->
   <div class="card power-history-card expandable-card" id="power-history-card-wrap">
     <button class="expand-btn" id="ph-expand-btn" title="Expand" onclick="_expandCard('ph')">
@@ -841,9 +875,11 @@
       <span id="ph-title">📈 48-Hour Power History</span>
       {% if has_postcode %}
       <div class="ph-toggle" id="ph-toggle">
+        {% if has_power_sensor %}
         <button id="ph-btn-kw"  class="active" onclick="_phSetMode('kw')">kW</button>
         <button id="ph-btn-co2" onclick="_phSetMode('co2')">CO₂</button>
-        <button id="ph-btn-mix" onclick="_phSetMode('mix')">Mix</button>
+        {% endif %}
+        <button id="ph-btn-mix" {% if not has_power_sensor %}class="active"{% endif %} onclick="_phSetMode('mix')">Mix</button>
       </div>
       {% endif %}
     </div>
@@ -866,8 +902,6 @@
 
 </div><!-- /.wide-row -->
 </div><!-- /.live-power-page -->
-{% endif %}
-{% endif %}
 
 <!-- ── Billing Summary ── -->
 
@@ -1385,12 +1419,14 @@ function updateSocCards(socSensors) {
   if (expEl) expEl.textContent = fmtKw(GAUGE_MAX_EXP);
 })();
 
-// Poll immediately then every 5 seconds
-// Stagger initial API calls to avoid saturating the Waitress thread pool.
-// updatePower is immediate (drives the live gauge).
-// Billing, carbon and power history are deferred slightly.
+// Poll the live gauge. A local sensor is cheap → 5s. The Mini reads the engine's
+// server-side polled value (the engine is the single Mini poller, page-independent),
+// so 60s is plenty and there's no per-page GraphQL cost to bound.
+{% if has_power_sensor %}
+var POWER_POLL_MS = {% if mini_chosen %}60000{% else %}5000{% endif %};
 updatePower();
-pollTimer = setInterval(updatePower, 5000);
+pollTimer = setInterval(updatePower, POWER_POLL_MS);
+{% endif %}
 // Initial layout adjustment — runs after first card render settles
 setTimeout(_adjustGridLayout, 500);
 
@@ -1611,7 +1647,7 @@ function loadCarbonAndSchedule() {
 setTimeout(function() { loadCarbonAndSchedule(); }, 600);
 {% endif %}
 
-{% if has_power_sensor %}
+{% if has_power_sensor or has_postcode %}
 // ── Rolling power history chart ──────────────────────────────────────────────
 // ── Layout switcher ──────────────────────────────────────────────────────
 function _applyLayout() {
@@ -1675,6 +1711,9 @@ function _phResetZoom() {
     if (saved === 'co2' && _phHasCI) _phMode = 'co2';
     if (saved === 'mix' && _phHasCI) _phMode = 'mix';
   } catch(e) {}
+  {% if not has_power_sensor %}
+  _phMode = 'mix';  // no power readings → generation mix is the only meaningful view
+  {% endif %}
   _phApplyMode();
 })();
 
@@ -1921,7 +1960,12 @@ function _phDraw() {
   var CW    = W - PAD_L;
   var CH    = H - PAD_T - PAD_B;
 
-  if (!_phData || _phData.length < 2) {
+  var _phMixMode = (_phMode === 'mix' && _phHasCI);
+  var _haveMix   = _phMixMode && _phMixData && _phMixData.length;
+  if ((!_phData || _phData.length < 2) && !_haveMix) {
+    // Mix mode draws from generation-mix data, not power readings, so it renders
+    // with no power history (postcode-only Overview). Only bail when there is
+    // genuinely nothing to show.
     ctx.fillStyle = th.text;
     ctx.font = '12px sans-serif';
     ctx.textAlign = 'center';
@@ -2378,16 +2422,12 @@ function _phDraw() {
 
 async function _phLoad() {
   try {
+    {% if has_power_sensor %}
     var r = await fetch(apiUrl('/api/power/history'));
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var d = await r.json();
     _phData = d.rows || [];
-    var statusEl = document.getElementById('power-history-status');
-    if (statusEl) {
-      statusEl.textContent = _phData.length > 0
-        ? _phData.length + ' readings'
-        : 'No data yet';
-    }
+    {% endif %}
     // Also load mix data
     if (_phHasCI) {
       try {
@@ -2397,6 +2437,18 @@ async function _phLoad() {
           _phMixData = md.slots || [];
         }
       } catch(me) { _phMixData = []; }
+    }
+    var statusEl = document.getElementById('power-history-status');
+    if (statusEl) {
+      {% if has_power_sensor %}
+      statusEl.textContent = _phData.length > 0
+        ? _phData.length + ' readings'
+        : 'No data yet';
+      {% else %}
+      statusEl.textContent = (_phMixData && _phMixData.length)
+        ? _phMixData.length + ' slots'
+        : '';
+      {% endif %}
     }
     _phDraw();
   } catch(e) {
@@ -2433,8 +2485,26 @@ window.addEventListener('resize', function() {
 
 // Load immediately then refresh every 30s (synced with power poll cadence)
 // Power history — defer 900ms
+{% if has_power_sensor or has_postcode %}
 setTimeout(function() { _phLoad(); }, 900);
 setInterval(_phLoad, 30000);
+{% endif %}
+
+{% if has_postcode and not has_power_sensor %}
+// Postcode-only Overview: the power poll that normally feeds the generation-mix
+// donut doesn't run (no power sensor), so drive the donut directly from the
+// current grid mix. Power-independent; helpers are defined above.
+(function() {
+  function loadMix() {
+    fetch(apiUrl('/api/power'))
+      .then(function(r) { return r.json(); })
+      .then(function(d) { if (d && d.generation_mix) _updateMixCard(d.generation_mix); })
+      .catch(function() {});
+  }
+  loadMix();
+  setInterval(loadMix, 60000);
+})();
+{% endif %}
 
 // ── Hover tooltip ────────────────────────────────────────────────────────────
 (function() {
