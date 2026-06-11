@@ -262,6 +262,53 @@ class TestDailyVsSql(unittest.TestCase):
         assert_match(self, "export day", row, sql)
 
 
+class TestNoSubMeterDailyKwh(unittest.TestCase):
+    """Regression: on a no-sub-meter (API/Mini) setup, blocks store imp_kwh but
+    leave imp_kwh_remainder/imp_kwh_grid NULL. The daily billing chart must show
+    the real import kWh, not 0.000 — previously it read a remainder field that
+    was absent/zero while still showing a cost, giving 'cost but no kWh'."""
+
+    def setUp(self):
+        self.store, self.cp = make_store()
+
+    def test_daily_chart_shows_kwh_for_no_submeter_block(self):
+        # The real api+mini/CAD no-sub-meter case: imp_kwh_remainder is NULL
+        # (the engine never sets it without sub-meters). get_blocks_lightweight
+        # must omit the key when NULL (matching _row_to_block) so the chart reads
+        # the real kwh, not a present-None remainder treated as zero. This was
+        # the "cost but no kWh" billing bug.
+        self.store._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, "
+            "config_period_id, interpolated, imp_kwh, imp_kwh_grid, "
+            "imp_kwh_remainder, imp_rate, imp_cost, imp_read_start, "
+            "imp_read_end, exp_kwh, exp_rate, exp_cost, exp_read_start, "
+            "exp_read_end, standing_charge, carbon_g) "
+            "VALUES (?,?,?,?,0,?,NULL,NULL,?,?,NULL,NULL,0,NULL,0,NULL,NULL,?,NULL)",
+            ("2026-01-10T21:00:00", "2026-01-10T21:30:00", "electricity_main",
+             self.cp, 0.053, 0.3231, 0.0171, 0.50))
+        self.store._conn.commit()
+        blocks = self.store.get_blocks_lightweight()
+        # Confirm the reconstructed channel OMITS kwh_remainder (matches _row_to_block)
+        imp = blocks[0]["meters"]["electricity_main"]["channels"]["import"]
+        self.assertNotIn("kwh_remainder", imp,
+            "lightweight must omit NULL kwh_remainder so charts read the real kwh")
+        self.assertAlmostEqual(imp["kwh"], 0.053, places=3)
+        html = ec.generate_daily_import_export_charts(
+            blocks, timezone_name="Europe/London", block_minutes=30,
+            currency="£", store=self.store)
+        import re
+        self.assertRegex(
+            html, r"0\.053\s*,|,\s*0\.053",
+            "per-slot import kWh array must contain the real value, not 0")
+
+    def test_usage_stats_and_block_kwh_agree(self):
+        # Sanity: usage-stats sums the same imp_kwh the chart should show.
+        insert_block(self.store, self.cp, "2026-01-10T21:00:00",
+                     0.053, 0.0171, standing=0.50)
+        row = sim_usage_stats_day(self.store, "2026-01-10")
+        self.assertAlmostEqual(row["imp_kwh"], 0.053, places=3)
+
+
 class TestMonthlyBillingVsSql(unittest.TestCase):
     """
     Summing daily Usage Stats rows for a billing period must equal
@@ -1416,3 +1463,63 @@ class TestNetCostConsistency(unittest.TestCase):
         for r in rows:
             expected = round(r["imp_cost"] + r["standing"] - r["exp_cost"], 2)
             self.assertEqual(r["net_cost"], expected)
+
+class TestMixedSourceBillingAgreement(unittest.TestCase):
+    """A billing period spanning a data-source-mode change (Change Setup, or DCC
+    settlement catching up) holds blocks of mixed ORIGIN: source ha_sensor (cad),
+    kraken_api (DCC-settled), kraken_mini (provisional). Data-source mode is
+    invisible to billing — on a sub-less meter every origin stores its billable
+    kWh in imp_kwh (settlement normalises the authoritative value there) — so the
+    three consumers (SQL ground truth, billing-chart render, usage-stats sum) must
+    agree on a mixed period exactly as on a single-source one. Pins that the mode
+    mix introduces no divergence; the reconciliation harness otherwise never tags
+    source."""
+
+    def setUp(self):
+        self.store, self.cp = make_store()
+
+    def _set_source(self, block_start_utc, source):
+        self.store._conn.execute("UPDATE blocks SET source=? WHERE block_start=?",
+                                 (source, block_start_utc))
+        self.store._conn.commit()
+
+    def _render_totals(self, blocks, p_start, p_end):
+        s = ec.calculate_billing_summary_for_period(blocks, p_start, p_end)
+        imp_kwh = imp_cost = 0.0
+        for key, t in (s.get("totals") or {}).items():
+            if not t.get("is_submeter") and "export" not in key.lower():
+                imp_kwh += t.get("kwh", 0)
+                imp_cost += t.get("cost", 0)
+        return {"imp_kwh": round(imp_kwh, 4), "imp_cost": round(imp_cost, 4),
+                "standing": round(s.get("total_standing", 0), 4)}
+
+    def test_mixed_source_period_all_methods_agree(self):
+        # Jan (GMT) period: day 1 cad, day 2 DCC + a mini-provisional block.
+        insert_block(self.store, self.cp, "2026-01-15T00:00:00", 2.0, 0.490, standing=0.50)
+        insert_block(self.store, self.cp, "2026-01-15T00:30:00", 1.5, 0.368, standing=0.50)
+        insert_block(self.store, self.cp, "2026-01-16T00:00:00", 2.2, 0.539, standing=0.50)
+        insert_block(self.store, self.cp, "2026-01-16T00:30:00", 0.5, 0.123, standing=0.50)
+        self._set_source("2026-01-15T00:00:00", "ha_sensor")
+        self._set_source("2026-01-15T00:30:00", "ha_sensor")
+        self._set_source("2026-01-16T00:00:00", "kraken_api")
+        self._set_source("2026-01-16T00:30:00", "kraken_mini")
+
+        utc_s, utc_e = local_date_range_to_utc_bounds("2026-01-15", "2026-01-16", "UTC")
+        sql    = self.store.get_billing_totals_for_utc_range(utc_s, utc_e, "Europe/London")
+        blocks = self.store.get_blocks_for_utc_range(utc_s, utc_e)
+        render = self._render_totals(blocks, datetime(2026, 1, 15), datetime(2026, 1, 17))
+        usage  = sum_daily_rows([sim_usage_stats_day(self.store, d)
+                                 for d in ("2026-01-15", "2026-01-16")])
+
+        for k in ("imp_kwh", "imp_cost"):
+            self.assertAlmostEqual(sql[k], render[k], places=3,
+                msg=f"SQL vs billing-chart disagree on {k} for a mixed-source period")
+            self.assertAlmostEqual(sql[k], usage[k], places=3,
+                msg=f"SQL vs usage-stats disagree on {k} for a mixed-source period")
+        self.assertAlmostEqual(sql["imp_kwh"], 6.2, places=3)
+        self.assertAlmostEqual(sql["standing"], 1.00, places=3,
+            msg="Standing once per local day across the mode boundary")
+
+
+if __name__ == "__main__":
+    unittest.main()

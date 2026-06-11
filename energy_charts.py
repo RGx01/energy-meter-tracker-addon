@@ -679,7 +679,10 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
                         # Store raw total before sub-meter subtraction
                         main_import_raw[rate]["kwh"]  += kwh
                         main_import_raw[rate]["cost"] += cost
-                        # Use kwh_remainder directly when available
+                        # Use kwh_remainder directly when available. With no
+                        # sub-meters this key is absent (NULL in DB, omitted by
+                        # reconstruction), so the raw kwh is kept unchanged —
+                        # api+mini blocks are identical to CAD here.
                         if "kwh_remainder" in channel:
                             kwh  = float(channel["kwh_remainder"])
                             cost = max(0.0, cost - sub_by_rate[rate]["cost"])
@@ -722,8 +725,10 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
                 continue
             sc = float((meter or {}).get("standing_charge") or 0.0)
             if sc > 0:
-                standing_by_day[day_key] = max(standing_by_day[day_key], sc)
-                # (standing charge accumulated into _main_day_sc below)
+                # Start-of-day: keep the first non-zero charge seen (blocks are
+                # processed in ascending order). Not MAX (over-bills on a drop).
+                if not standing_by_day.get(day_key):
+                    standing_by_day[day_key] = sc
             elif day_key not in charged_days:
                 standing_by_day.setdefault(day_key, 0.0)
         charged_days.add(day_key)
@@ -773,7 +778,8 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
             if _blk_meta.get("sub_meter"):
                 continue  # main meter only
             _blk_sc = float((_blk_meter or {}).get("standing_charge") or 0.0)
-            if _blk_sc > _main_day_sc[_blk_day]:
+            if _blk_sc > 0 and not _main_day_sc.get(_blk_day):
+                # Start-of-day (first non-zero, ascending order); not MAX.
                 _main_day_sc[_blk_day] = _blk_sc
             for _blk_ch_name, _blk_ch in ((_blk_meter or {}).get("channels", {}) or {}).items():
                 if not _blk_ch:
@@ -1046,7 +1052,10 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
             main_export = (main.get("channels", {}) or {}).get("export", {}) or {}
 
             # Use kwh_remainder when available (engine PASS 2 remainder — same field
-            # usage stats uses). Fall back to subtraction for legacy blocks.
+            # usage stats uses). With no sub-meters this key is absent (NULL in DB,
+            # omitted by both block reconstruction paths), so this falls through to
+            # the main meter's kwh — api+mini blocks are structurally identical to
+            # CAD here, so no mode-specific handling is needed.
             if "kwh_remainder" in main_import:
                 main_kwh  = _f(main_import["kwh_remainder"])
                 main_cost = _f(main_import.get("cost"))

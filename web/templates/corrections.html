@@ -228,7 +228,12 @@ function corrPreview() {
     }
 
     var blocks = d.blocks || [];
-    if (blocks.length === 0) { prev.innerHTML = '<span style="color:var(--muted);">No blocks found matching those filters.</span>'; return; }
+    if (blocks.length === 0) {
+      prev.innerHTML = (d.skipped_unreconciled > 0)
+        ? '<span style="color:var(--muted);">' + d.skipped_unreconciled.toLocaleString() + ' block(s) in this range aren\'t DCC-settled yet, so rate corrections can\'t apply to them. Re-run after settlement.</span>'
+        : '<span style="color:var(--muted);">No blocks found matching those filters.</span>';
+      return;
+    }
 
     var newVal = parseFloat(value);
     var totalCurCost = 0, totalNewCost = 0;
@@ -256,7 +261,12 @@ function corrPreview() {
     var totalCol    = totalChange >= 0 ? 'var(--danger)' : 'var(--success)';
     var needsScroll = blocks.length > 10;
 
-    prev.innerHTML =
+    var skipNote = (d.skipped_unreconciled > 0)
+      ? '<div style="margin-bottom:10px;padding:8px 10px;border-radius:6px;background:var(--surface-2,#1c1c1c);color:var(--muted);font-size:12px;">'
+        + d.skipped_unreconciled.toLocaleString() + ' block(s) in this range aren\'t DCC-settled yet and are left out — rate corrections apply once their kWh is reconciled. Re-run after settlement.</div>'
+      : '';
+
+    prev.innerHTML = skipNote +
       '<div style="margin-bottom:10px;font-size:13px;"><strong>' + blocks.length + ' blocks</strong> will be updated. Total cost change: <span style="color:' + totalCol + ';font-weight:600;">' + totalSign + sym + Math.abs(totalChange).toFixed(4) + '</span></div>' +
       '<div style="' + (needsScroll ? 'max-height:300px;overflow-y:auto;' : '') + '">' +
       '<table style="width:100%;border-collapse:collapse;">' +
@@ -312,7 +322,10 @@ function corrApply() {
   .then(function(d) {
     applyBtn.disabled = false;
     if (d.error) { result.innerHTML = '<span style="color:var(--danger);">Error: ' + escHtml(d.error) + '</span>'; return; }
-    result.innerHTML = '<span style="color:var(--accent);">✓ Updated <strong>' + d.updated_blocks.toLocaleString() + '</strong> blocks successfully.</span>';
+    var applySkip = (d.skipped_unreconciled > 0)
+      ? ' <span style="color:var(--muted);">(' + d.skipped_unreconciled.toLocaleString() + ' left out — not DCC-settled yet; re-run after settlement.)</span>'
+      : '';
+    result.innerHTML = '<span style="color:var(--accent);">✓ Updated <strong>' + d.updated_blocks.toLocaleString() + '</strong> blocks successfully.</span>' + applySkip;
     applyBtn.style.display = 'none';
     document.getElementById('corr-preview').style.display = 'none';
   })

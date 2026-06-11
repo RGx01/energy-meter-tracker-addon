@@ -68,16 +68,16 @@
   </div>
 </div>
 
-<!-- ── Main meter vs sub-meters ──────────────────────────────────────────── -->
+<!-- ── Main meter vs devices ──────────────────────────────────────────── -->
 <div class="card help-section">
-  <div class="card-title">⚖️ Main Meter &amp; Sub-meters</div>
+  <div class="card-title">⚖️ Main Meter &amp; Devices</div>
   <p>
     The <strong>main meter</strong> reads directly from your smart meter via a Consumer Access
     Device (CAD) and is the authoritative source of truth for how much energy crossed the grid boundary.
   </p>
   <p>
-    <strong>Sub-meters</strong> track individual devices — a home battery, EV charger, or heat pump.
-    Each sub-meter has a <strong>Meter Type</strong> which enables additional configuration and
+    <strong>Devices</strong> let you track individual loads — a home battery, EV charger, or heat pump.
+    Each device has a <strong>Meter Type</strong> which enables additional configuration and
     drives the Live Power page display:
   </p>
   <ul>
@@ -89,23 +89,23 @@
   <div class="two-col">
     <div class="note-box">
       <strong>Direct import</strong><br>
-      In each block, sub-meter consumption is subtracted from the main meter's total import.
+      In each block, device consumption is subtracted from the main meter's total import.
       Whatever is left is <em>direct import</em> — the portion of grid import not accounted for
-      by any sub-meter. This is what's used for billing calculations.
+      by any device. This is what's used for billing calculations.
     </div>
     <div class="note-box">
       <strong>Inverter possible</strong><br>
       Devices marked <em>inverter possible</em> may show consumption from battery discharge rather
       than grid. The engine allocates grid energy to protected loads first, then to inverter devices.
       This flag is set automatically for Battery type meters and can be enabled manually for any
-      sub-meter (e.g. an EV fed by a battery inverter).
+      device (e.g. an EV fed by a battery inverter).
     </div>
   </div>
 
   <div class="warn-box">
-    ⚠️ <strong>Export sub-metering and solar generation are not yet supported.</strong> Individual
+    ⚠️ <strong>Per-device export tracking and solar generation are not yet supported.</strong> Individual
     device export (e.g. battery discharging to grid, V2G from a V2X-capable EV) is not yet broken
-    down by sub-meter. Solar generation tracking is planned for a future release.
+    down by device. Solar generation tracking is planned for a future release.
   </div>
 </div>
 
@@ -114,12 +114,12 @@
   <div class="card-title">⚙️ Meter Configuration</div>
   <p>
     Meter IDs are assigned automatically and not shown in the UI — the <strong>Device Name</strong>
-    (for sub-meters) and <strong>Site Name</strong> (for the main meter) are the user-facing identifiers
+    (for devices) and <strong>Site Name</strong> (for the main meter) are the user-facing identifiers
     used throughout charts and reports. Names must be unique, 40 characters or fewer, and contain only
     letters, numbers, spaces and <code>' - &amp; ( ) .</code>
   </p>
   <p>
-    <strong>Deleting a sub-meter permanently removes all associated historical data</strong> from the
+    <strong>Deleting a device permanently removes all associated historical data</strong> from the
     database. There is no recovery path — ensure you have a backup before deleting.
   </p>
   <p>
@@ -129,7 +129,7 @@
 
   <div class="two-col">
     <div>
-      <p><strong>Battery sub-meter sensors</strong></p>
+      <p><strong>Battery sensors</strong></p>
       <ul>
         <li><strong>Read sensor</strong> — cumulative kWh consumed (required)</li>
         <li><strong>SoC sensor</strong> — battery state of charge in % (optional, Live Power only)</li>
@@ -137,7 +137,7 @@
       </ul>
     </div>
     <div>
-      <p><strong>EV / Heat Pump sub-meter sensors</strong></p>
+      <p><strong>EV / Heat Pump sensors</strong></p>
       <ul>
         <li><strong>Read sensor</strong> — cumulative kWh consumed (required)</li>
         <li><strong>Charger / Heat Pump power sensor</strong> — live power in W or kW (optional, Live Power only)</li>
@@ -172,7 +172,7 @@
       </ul>
     </div>
     <div>
-      <p><strong>Sub-meter — Read sensors</strong></p>
+      <p><strong>Device — Read sensors</strong></p>
       <ul>
         <li>Must be <strong>cumulative kWh consumed (import only)</strong> — not net, not export, not watts</li>
         <li>Can update less frequently (60s+)</li>
@@ -200,9 +200,9 @@
   </p>
   <ul>
     <li><strong>Live Power gauge</strong> — net grid power (negative = exporting). Status pill shows Importing/Exporting/Net Zero with current kW.</li>
-    <li><strong>🔋 Battery card</strong> — appears when a battery sub-meter has SoC or inverter power sensors configured. Shows charge level (colour-coded green/amber/red) and a bidirectional inverter gauge (teal = discharging, purple = charging).</li>
-    <li><strong>🚗 EV Charger card</strong> — appears when an EV sub-meter has a charger power sensor configured. Shows a unidirectional charge gauge (0 on left, max on right). Gauge scale is derived from the 48-hour history.</li>
-    <li><strong>♨️ Heat Pump card</strong> — appears when a heat pump sub-meter has a power sensor configured. Same unidirectional gauge as the EV charger.</li>
+    <li><strong>🔋 Battery card</strong> — appears when a battery device has SoC or inverter power sensors configured. Shows charge level (colour-coded green/amber/red) and a bidirectional inverter gauge (teal = discharging, purple = charging).</li>
+    <li><strong>🚗 EV Charger card</strong> — appears when an EV device has a charger power sensor configured. Shows a unidirectional charge gauge (0 on left, max on right). Gauge scale is derived from the 48-hour history.</li>
+    <li><strong>♨️ Heat Pump card</strong> — appears when a heat pump device has a power sensor configured. Same unidirectional gauge as the EV charger.</li>
     <li><strong>🌿 Carbon Intensity card</strong> — appears when a postcode prefix is configured. Shows current gCO₂/kWh and 48-hour forecast.</li>
   </ul>
   <div class="note-box">
@@ -222,10 +222,10 @@
     are not interpolated — the blocks are left as zero to avoid misleading data.
   </p>
   <div class="note-box">
-    ⓘ <strong>Sub-meter gap attribution:</strong> The main meter uses boundary interpolation to
-    correctly allocate energy to each block window. Sub-meters use raw cumulative deltas — if no
+    ⓘ <strong>Device gap attribution:</strong> The main meter uses boundary interpolation to
+    correctly allocate energy to each block window. Devices use raw cumulative deltas — if no
     intermediate reads arrived during a gap, the full delta may be attributed to a single block
-    even if it spans multiple windows. This can cause a sub-meter to appear to exceed the parent
+    even if it spans multiple windows. This can cause a device to appear to exceed the parent
     grid import for that block. The engine logs a WARNING and preserves the raw value. This is a
     known limitation and will be improved in a future release.
   </div>

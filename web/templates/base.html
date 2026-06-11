@@ -446,9 +446,9 @@
       <a href="{{ url_for('insights_page') }}" class="{{ 'active' if active == 'insights' }}">
         <span class="nav-icon">💡</span> Insights
       </a>
-      {% if has_power_sensor %}
+      {% if has_power_sensor or has_postcode %}
       <a href="{{ url_for('live_power_page') }}" class="{{ 'active' if active == 'live_power' }}">
-        <span class="nav-icon">⚡</span> Live Power
+        <span class="nav-icon">⚡</span> Overview
       </a>
       {% endif %}
       <a href="{{ url_for('data_management_page') }}"  class="{{ 'active' if active == 'data_management' }}">
