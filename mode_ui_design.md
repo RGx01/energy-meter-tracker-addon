@@ -157,21 +157,23 @@ For re-running:
 
 ---
 
-## 7. Open questions (resolve before building)
+## 7. Open questions — RESOLVED (release decisions)
 
-1. **Does `api+mini` show the billing-source toggle?** Mini is provisional-local;
-   DCC is settled. Is "trust Mini vs settle to DCC" a user choice, or always
-   "DCC wins when settled, Mini provisional until then" (current behaviour)?
-   *Recommendation: no toggle — the DCC-wins-when-settled rule is the design;
-   document it rather than expose it.*
-2. **Per-meter vs global billing source.** Today it's global. With sub-meters,
-   could a user want DCC for the main and CAD-derived for a sub? Probably not
-   worth it — sub-meters have no DCC. *Recommendation: keep global, but site it
-   in Meter Config under the main meter.*
-3. **Mid-period switch semantics** — confirm mixed-source billing is correct
-   (§4.4) before exposing easy switching.
-4. **Should "Change data source" be gated behind a confirmation / "advanced"
-   disclosure?** It's consequential; casual users shouldn't flip it by accident.
+1. **`api+mini` billing-source toggle?** RESOLVED (B1): no separate Mini-vs-DCC
+   toggle. The rule is **"Mini is provisional; DCC wins once settled"** and is
+   documented, not exposed. The DCC/CAD billing-source choice IS surfaced (wizard +
+   Data Management) but that's a different axis (settlement source, not Mini trust).
+2. **Per-meter vs global billing source.** RESOLVED: kept global. Sub-meters have
+   no DCC; "use overlay" (INTELLIGENT-RATES §4.12) handles device pricing instead.
+3. **Mid-period switch semantics.** RESOLVED (B3): a billing-source change calls
+   `flag_all_for_pass2_rerun` → a FULL history recompute under the new source, so
+   the period is coherent (never half-and-half). Reversible (flip back = another
+   full recompute). Spot-check on dev; not an open design risk.
+4. **Gate "Change data source" behind confirmation?** RESOLVED + BUILT (B2). A
+   confirmation warns it runs a large recalculation that can't be stopped but is
+   reversible — in Data Management (billing-source Apply) and the wizard's Change
+   Setup finish (only when mode/billing-source actually changed over an existing
+   config). Fresh setups skip it (no history to recompute).
 
 ---
 
@@ -272,3 +274,11 @@ rate) is still going to be rewritten.
 - Precedence: manual wins — show DCC divergence in the review card rather than
   auto-overwriting.
 - Solve rate, kWh, and standing under one "manually corrected / locked" concept.
+
+**Release status (3.0):** CONFIRMED DEFERRED (decision D1 / backlog 1; cross-ref
+INTELLIGENT-RATES §7 F5). Not a 3.0 blocker — the gating rule covers the routine
+path. Note that the limbo-finalisation work (block_store `finalise_past_horizon_
+blocks` + `finalised_from_cad`, cleared by a real settlement in `upsert_kraken_
+block`) already demonstrates the reversible-flag pattern this lock would extend:
+a per-block marker that the settlement path respects/clears. The lock would add a
+*user-set* equivalent that settlement must NOT clear.

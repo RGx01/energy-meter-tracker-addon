@@ -815,6 +815,9 @@ class BlockStore:
             ("supplier",              "config_periods",  "TEXT",              _cp_cols),
             ("mpan",             "meter_channels",  "TEXT",              _mc_cols),
             ("tariff",           "meter_channels",  "TEXT",              _mc_cols),
+            # ── 3.0.0 per-channel rate/standing-charge source (API vs sensor) ─
+            ("rate_source",            "meter_channels",  "TEXT",        _mc_cols),
+            ("standing_charge_source", "meter_channels",  "TEXT",        _mc_cols),
             ("carbon_g",         "blocks",          "REAL",              _b_cols),
             ("imp_provisional",  "blocks",          "INTEGER NOT NULL DEFAULT 0", _b_cols),
             # ── 3.0.0 Kraken API integration columns (upgrade path) ──────────
@@ -834,6 +837,60 @@ class BlockStore:
                     self._conn.commit()
                 except Exception:
                     pass  # already exists or table missing — migrate will handle it
+
+        # ── 3.0.0: backfill per-channel rate / standing-charge source ─────────
+        # Pre-3.0.0 (v2) configs predate the explicit "API vs sensor" toggles.
+        # Default every existing channel to the source it was ALREADY using, so an
+        # upgrade does not change a single price until the user opts in:
+        #   • sub-meter (device) channel → derived from the meter's legacy
+        #     rate_source AND its own sensor: an explicit own-sensor choice
+        #     ('own'/'base'/'sensor') OR a device that has its own rate sensor
+        #     mapped becomes 'sensor'; anything else (incl. 'overlay'/'inherit'/
+        #     NULL with no own sensor) becomes 'main' — i.e. inherit the main
+        #     meter's effective rate, as v2 sub-meters did via parent_rates.
+        #   • main-meter channel → 'sensor' when a rate sensor is actually mapped,
+        #     otherwise 'api' (the rate must have been coming from the supplier
+        #     API). We never silently flip a sensor-fed meter onto the API.
+        #   • standing charge → 'sensor' when a standing-charge sensor is mapped,
+        #     otherwise 'api'.
+        # Only NULL rows are touched, so explicit UI/wizard choices are preserved.
+        try:
+            _mc_now = [r[1] for r in self._conn.execute("PRAGMA table_info(meter_channels)").fetchall()]
+            if "rate_source" in _mc_now:
+                n1 = self._conn.execute(
+                    """UPDATE meter_channels SET rate_source = (
+                           SELECT CASE
+                               WHEN m.is_sub_meter = 1 THEN
+                                   CASE WHEN m.rate_source IN ('own','base','sensor')
+                                        THEN 'sensor'
+                                        WHEN meter_channels.rate_sensor IS NOT NULL
+                                             AND TRIM(meter_channels.rate_sensor) <> ''
+                                        THEN 'sensor'
+                                        ELSE 'main' END
+                               ELSE
+                                   CASE WHEN meter_channels.rate_sensor IS NOT NULL
+                                             AND TRIM(meter_channels.rate_sensor) <> ''
+                                        THEN 'sensor' ELSE 'api' END
+                           END
+                           FROM meters m WHERE m.id = meter_channels.meter_id)
+                       WHERE rate_source IS NULL"""
+                ).rowcount
+                n2 = self._conn.execute(
+                    """UPDATE meter_channels SET standing_charge_source =
+                           CASE WHEN standing_charge_sensor IS NOT NULL
+                                     AND TRIM(standing_charge_sensor) <> ''
+                                THEN 'sensor' ELSE 'api' END
+                       WHERE standing_charge_source IS NULL"""
+                ).rowcount
+                if n1 or n2:
+                    self._conn.commit()
+                    logger.info(
+                        "_ensure_schema: backfilled channel sources "
+                        "(rate_source=%d, standing_charge_source=%d) for v2 upgrade",
+                        n1, n2,
+                    )
+        except Exception:
+            logger.debug("_ensure_schema: rate-source backfill skipped", exc_info=True)
 
         # Clear inverter_possible for all existing meters — feature removed in 2.9.0
         # All sub-meters now use the protected queue in PASS 2 regardless of this flag
@@ -2509,14 +2566,17 @@ class BlockStore:
                 self._conn.execute(
                     """INSERT INTO meter_channels
                            (meter_id, channel, read_sensor, rate_sensor,
-                            standing_charge_sensor, mpan, tariff)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                            standing_charge_sensor, mpan, tariff,
+                            rate_source, standing_charge_source)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(meter_id, channel) DO UPDATE SET
                            read_sensor            = excluded.read_sensor,
                            rate_sensor            = excluded.rate_sensor,
                            standing_charge_sensor = excluded.standing_charge_sensor,
                            mpan                   = excluded.mpan,
-                           tariff                 = excluded.tariff""",
+                           tariff                 = excluded.tariff,
+                           rate_source            = excluded.rate_source,
+                           standing_charge_source = excluded.standing_charge_source""",
                     (
                         meter_row_id, channel,
                         ch_cfg.get("read"),
@@ -2524,6 +2584,8 @@ class BlockStore:
                         ch_cfg.get("standing_charge_sensor"),
                         ch_meta.get("mpan"),
                         ch_meta.get("tariff"),
+                        ch_cfg.get("rate_source"),
+                        ch_cfg.get("standing_charge_source"),
                     )
                 )
 
@@ -2607,6 +2669,15 @@ class BlockStore:
                     ch_dict["rate"] = ch["rate_sensor"]
                 if ch["standing_charge_sensor"]:
                     ch_dict["standing_charge_sensor"] = ch["standing_charge_sensor"]
+                # 3.0.0 per-channel source toggles (API vs sensor; 'main' = device
+                # inherits the main meter's effective rate). Guarded for older DBs.
+                try:
+                    if ch["rate_source"]:
+                        ch_dict["rate_source"] = ch["rate_source"]
+                    if ch["standing_charge_source"]:
+                        ch_dict["standing_charge_source"] = ch["standing_charge_source"]
+                except (KeyError, IndexError):
+                    pass
                 # mpan / tariff as channel meta dict (preserves engine-expected shape)
                 ch_meta = {}
                 if ch["mpan"]:
@@ -2616,6 +2687,18 @@ class BlockStore:
                 if ch_meta:
                     ch_dict["meta"] = ch_meta
                 channels[ch["channel"]] = ch_dict
+
+            # Engine compatibility: the overlay path reads meta["rate_source"].
+            # For a device, derive it from the (authoritative) import-channel
+            # source so the existing engine honours the explicit choice:
+            #   'main'   → 'overlay' (price on the main meter's effective rate)
+            #   'sensor' → 'own'     (the device's own rate sensor wins)
+            if meta.get("sub_meter"):
+                _imp_src = (channels.get("import") or {}).get("rate_source")
+                if _imp_src == "main":
+                    meta["rate_source"] = "overlay"
+                elif _imp_src == "sensor":
+                    meta["rate_source"] = "own"
 
             meters_out[mid] = {"meta": meta, "channels": channels}
 

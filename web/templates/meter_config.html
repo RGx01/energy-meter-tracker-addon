@@ -551,6 +551,7 @@ function renderAll() {
   subIds.forEach(function(id) { sc.appendChild(buildSubCard(id, meters[id])); });
 
   attachListeners();
+  applySourceToggles();
 }
 
 // ── Main meter card ───────────────────────────────────────────────────────────
@@ -648,8 +649,10 @@ function buildMainCard(meterId, meter) {
         '<div class="form-group"><label>Read Sensor — cumulative kWh from grid</label>' +
           buildEntityInput(meterId+'__import__read', imp.read||'', meterId, 'import', 'read') + '</div>' +
         '<div class="form-group"><label>Import Rate Sensor' + rateOptNote + '</label>' +
+          (usesApi ? buildSourceToggle(meterId, 'import', 'rate', mainApiChecked(imp, 'rate'), meterId+'__import__rate') : '') +
           buildEntityInput(meterId+'__import__rate', imp.rate||'', meterId, 'import', 'rate') + '</div>' +
         '<div class="form-group"><label>Standing Charge Sensor (per day)' + rateOptNote + '</label>' +
+          (usesApi ? buildSourceToggle(meterId, 'import', 'standing_charge', mainApiChecked(imp, 'standing_charge'), meterId+'__import__sc') : '') +
           buildEntityInput(meterId+'__import__sc', imp.standing_charge_sensor||'', meterId, 'import', 'standing_charge_sensor', true) + '</div>' +
         buildAdvanced(meterId, 'import', imp) +
       '</div>' +
@@ -660,6 +663,7 @@ function buildMainCard(meterId, meter) {
         '<div class="form-group"><label>Read Sensor — cumulative kWh exported to grid</label>' +
           buildEntityInput(meterId+'__export__read', exp.read||'', meterId, 'export', 'read') + '</div>' +
         '<div class="form-group"><label>Export Rate Sensor' + rateOptNote + '</label>' +
+          (usesApi ? buildSourceToggle(meterId, 'export', 'rate', mainApiChecked(exp, 'rate'), meterId+'__export__rate') : '') +
           buildEntityInput(meterId+'__export__rate', exp.rate||'', meterId, 'export', 'rate') + '</div>' +
         buildAdvanced(meterId, 'export', exp) +
       '</div>');
@@ -807,6 +811,7 @@ function buildSubCard(meterId, meter) {
       '<div class="form-group"><label>Read Sensor — cumulative kWh</label>' +
         buildEntityInput(meterId+'__import__read', imp.read||'', meterId, 'import', 'read') + '</div>' +
       '<div class="form-group"><label>Rate Sensor ' + (mainImportRate ? '(default: one-time copy from main meter at setup — update here if your device has a different rate or you retrospectively change rates)' : '') + '</label>' +
+        buildSourceToggle(meterId, 'import', 'device', deviceUsesMain(imp), meterId+'__import__rate') +
         buildEntityInput(meterId+'__import__rate', rateVal, meterId, 'import', 'rate') + '</div>' +
     '</div>' : '');  // end of !meta.retired_at conditional
 
@@ -856,6 +861,72 @@ function buildEntityInput(id, currentVal, meterId, chId, field, allowClear) {
     '</div>' +
     (allowClear ? '<button class="btn btn-secondary btn-sm js-clear-entity" data-target="' + id + '" title="Clear">✕</button>' : '') +
     '</div>';
+}
+
+// ── Rate-source toggles (API vs sensor; "use main meter rate" for devices) ────
+// Whether the supplier-API checkbox for a MAIN-meter quantity is ticked.
+// Falls back to inference (no sensor mapped → API) for un-migrated configs,
+// matching the DB migration's own default.
+function mainApiChecked(ch, kind) {
+  ch = ch || {};
+  if (kind === 'standing_charge') {
+    if (ch.standing_charge_source) return ch.standing_charge_source === 'api';
+    return !((ch.standing_charge_sensor || '').trim());
+  }
+  if (ch.rate_source) return ch.rate_source === 'api';
+  return !((ch.rate || '').trim());
+}
+
+// Whether a DEVICE's "use main meter rate" is ticked (inherit the main meter).
+// Default is inherit unless the device was explicitly pinned to its own sensor.
+function deviceUsesMain(imp) {
+  imp = imp || {};
+  if (imp.rate_source) return imp.rate_source !== 'sensor';
+  return !((imp.rate || '').trim());
+}
+
+// Map a checkbox state to the stored source value.
+function srcFromToggle(checked, onVal) { return checked ? onVal : 'sensor'; }
+
+// kind: 'rate' | 'standing_charge' (main) | 'device'
+function buildSourceToggle(meterId, chId, kind, checked, targetId) {
+  var sourceKey = (kind === 'standing_charge') ? 'standing_charge_source' : 'rate_source';
+  var onVal     = (kind === 'device') ? 'main' : 'api';
+  var label     = (kind === 'device') ? 'Use main meter rate'
+                : (kind === 'standing_charge') ? 'Use supplier API standing charge'
+                : 'Use supplier API rate';
+  var hint      = (kind === 'device')
+        ? ' \u2014 untick to give this device its own rate sensor'
+        : ' \u2014 untick to read this from a Home Assistant sensor';
+  var cbId = 'src-' + meterId + '__' + chId + '__' + kind;
+  return '<div class="checkbox-row" style="margin:2px 0 8px;">' +
+    '<input type="checkbox" class="js-ch-source" id="' + cbId + '"' +
+      ' data-meter="' + meterId + '" data-channel="' + chId + '"' +
+      ' data-source-key="' + sourceKey + '" data-on="' + onVal + '"' +
+      ' data-target="' + targetId + '"' + (checked ? ' checked' : '') + '>' +
+    '<label for="' + cbId + '">' + label +
+      '<span style="color:var(--muted);font-weight:400;">' + hint + '</span></label>' +
+  '</div>';
+}
+
+// Grey out (or restore) the entity input paired with a source toggle.
+function setEntityDisabled(targetId, disabled) {
+  var input = document.getElementById(targetId);
+  if (input) {
+    input.disabled = disabled;
+    input.style.opacity = disabled ? '0.4' : '';
+  }
+  var clr = document.querySelector('.js-clear-entity[data-target="' + targetId + '"]');
+  if (clr) clr.style.display = disabled ? 'none' : '';
+  var drop = document.getElementById(targetId + '_drop');
+  if (drop) { drop.innerHTML = ''; drop.style.display = 'none'; }
+}
+
+// Apply the initial grey-out for every source toggle after a render.
+function applySourceToggles() {
+  document.querySelectorAll('.js-ch-source').forEach(function(cb) {
+    setEntityDisabled(cb.dataset.target, cb.checked);
+  });
 }
 
 // ── Event delegation ──────────────────────────────────────────────────────────
@@ -944,6 +1015,12 @@ function onContainerChange(e) {
     var ch2 = el.dataset.channel;
     if (!config.meters[m].channels[ch2].meta) config.meters[m].channels[ch2].meta = {};
     config.meters[m].channels[ch2].meta[k] = el.value;
+  }
+  else if (el.classList.contains('js-ch-source')) {
+    var chS = el.dataset.channel;
+    if (!config.meters[m].channels[chS]) config.meters[m].channels[chS] = {};
+    config.meters[m].channels[chS][el.dataset.sourceKey] = srcFromToggle(el.checked, el.dataset.on);
+    setEntityDisabled(el.dataset.target, el.checked);
   }
 }
 
@@ -1586,20 +1663,35 @@ function startWizard() {
   Object.keys(meters).forEach(function(id) {
     var m = meters[id];
     if (!m.meta.sub_meter) return;
-    // Match to a device type by ID prefix or inverter_possible flag
-    var devType = null;
-    if (id.indexOf('ev') !== -1 || id.indexOf('charger') !== -1)       devType = 'ev';
-    else if (id.indexOf('battery') !== -1 || id.indexOf('batt') !== -1) devType = 'battery';
-    else if (id.indexOf('solar') !== -1 || id.indexOf('pv') !== -1)     devType = 'solar';
-    else if (id.indexOf('heat') !== -1 || id.indexOf('pump') !== -1)    devType = 'heat';
-    if (!devType) return;
+    // Match to a device type. Prefer the authoritative meta.meter_type — this is
+    // what wizApplyAndClose writes and what findExistingSubId reuses — and fall
+    // back to ID prefix only for legacy sub-meters created before meter_type
+    // existed. Without the meter_type match, wizard-created sub-meters (IDs like
+    // "sub_meter_1718…") aren't detected on Change Setup, so they appear
+    // deselected and their sensors are dropped on the next save.
+    var mtMap = { ev: 'ev', battery: 'battery', heat_pump: 'heat' };
+    var devType = mtMap[m.meta.meter_type] || null;
+    if (!devType) {
+      if (id.indexOf('ev') !== -1 || id.indexOf('charger') !== -1)       devType = 'ev';
+      else if (id.indexOf('battery') !== -1 || id.indexOf('batt') !== -1) devType = 'battery';
+      else if (id.indexOf('heat') !== -1 || id.indexOf('pump') !== -1)    devType = 'heat';
+    }
+    if (!devType) return;  // unmanaged types (e.g. solar) are left untouched
     if (wiz.devices.indexOf(devType) === -1) wiz.devices.push(devType);
     var subCh = (m.channels || {}).import || {};
     subMeters[devType] = {
-      name: m.meta.device || '',
-      read: subCh.read || '',
-      rate: subCh.rate || '',
-      rate_source: m.meta.rate_source || ''
+      name:                  m.meta.device || '',
+      read:                  subCh.read || '',
+      rate:                  subCh.rate || '',
+      // authoritative channel source; fall back to mapping the legacy meta mirror
+      rate_source:           subCh.rate_source ||
+                               (m.meta.rate_source === 'overlay' ? 'main'
+                                : m.meta.rate_source === 'own' ? 'sensor' : ''),
+      soc:                   m.meta.soc_sensor || '',
+      inverter_power:        m.meta.inverter_power_sensor || '',
+      inverter_power_invert: !!m.meta.inverter_power_invert,
+      device_power:          m.meta.device_power_sensor || '',
+      v2x_capable:           !!m.meta.v2x_capable
     };
   });
 
@@ -1626,6 +1718,12 @@ function startWizard() {
     standingCharge: imp.standing_charge_sensor   || '',
     exportRead:    exp.read                      || '',
     exportRate:    exp.rate                      || '',
+    // Per-quantity "use API" choice (cad+api). Seed from the stored source, else
+    // infer (no sensor mapped → API). Only consulted when an API is available.
+    importRateApi:     imp.rate_source ? (imp.rate_source === 'api') : !((imp.rate || '').trim()),
+    standingChargeApi: imp.standing_charge_source ? (imp.standing_charge_source === 'api')
+                                                  : !((imp.standing_charge_sensor || '').trim()),
+    exportRateApi:     exp.rate_source ? (exp.rate_source === 'api') : !((exp.rate || '').trim()),
     powerSensor:   mainMeta.power_sensor         || '',
     postcode:      mainMeta.postcode_prefix       || '',
     billing_source: 'dcc',        // settlement source (API modes); pre-filled below
@@ -1638,6 +1736,22 @@ function startWizard() {
     .then(function(r) { return r.json(); })
     .then(function(d) {
       if (d && d.source) { wiz.data.billing_source = d.source; wiz._origBillingSource = d.source; }
+    })
+    .catch(function() {});
+
+  // Pre-populate stored API credential state so "Change Setup" doesn't force
+  // re-entry. The key itself is never returned by the server (it's write-only),
+  // so we surface a keep-or-replace state and pre-fill the (non-secret) account.
+  wiz.data.hasStoredKey = false;
+  fetch(apiUrl('/api/kraken-config'))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d && d.configured) {
+        wiz.data.hasStoredKey = true;
+        if (d.account_number && !wiz.data.accountNumber)
+          wiz.data.accountNumber = d.account_number;
+        if (document.getElementById('wiz-api-key')) renderWizStep();  // refresh if shown
+      }
     })
     .catch(function() {});
 
@@ -1716,6 +1830,29 @@ function renderWizStep() {
 
   setupWizEntityDropdowns();
   if (step === 'survey') wizBindSurvey();
+  if (step === 'sub_sensors') wizApplyDeviceRateToggles();
+  if (step === 'sensors') wizApplySensorToggles();
+}
+
+// Grey out a main-meter rate field while its "Use API" box is ticked.
+function wizApplySensorToggles() {
+  document.querySelectorAll('.wiz-api-toggle').forEach(function(cb) {
+    var target = cb.dataset.wizTarget;
+    setEntityDisabled(target, cb.checked);
+    cb.addEventListener('change', function() { setEntityDisabled(target, cb.checked); });
+  });
+}
+
+// Grey out a device's rate sensor field while "use main meter rate" is ticked,
+// and keep it in sync as the box is toggled (mirrors the meter-config screen).
+function wizApplyDeviceRateToggles() {
+  (wiz.devices || []).forEach(function(devId) {
+    var cb = document.getElementById('wiz-sub-' + devId + '-overlay');
+    if (!cb) return;
+    var target = 'wiz-sub-' + devId + '-rate';
+    setEntityDisabled(target, cb.checked);
+    cb.addEventListener('change', function() { setEntityDisabled(target, cb.checked); });
+  });
 }
 
 function wizStepSurvey() {
@@ -1861,12 +1998,17 @@ function wizDeriveMode() {
 }
 
 function wizStepCredentials() {
+  var onFile = !!wiz.data.hasStoredKey;
+  var keyHint = onFile
+    ? 'An API key is already saved. Leave this blank to keep it, or enter a new one to replace it.'
+    : 'Enter your Octopus API key. It\'s stored in a private file (never in backups) and never shown again. We\'ll verify the connection when you continue.';
   return '<h3 style="margin:0 0 6px;">Connect your supplier</h3>' +
-    '<p style="color:var(--muted);font-size:13px;margin:0 0 18px;">Enter your ' +
-      'Octopus API key. It\'s stored in a private file (never in backups) and ' +
-      'never shown again. We\'ll verify the connection when you continue.</p>' +
-    '<div class="form-group"><label>API key</label>' +
-      '<input id="wiz-api-key" type="password" autocomplete="off" placeholder="sk_live_…" ' +
+    '<p style="color:var(--muted);font-size:13px;margin:0 0 18px;">' + keyHint + '</p>' +
+    '<div class="form-group"><label>API key' +
+      (onFile ? ' <span style="color:var(--ok,green);font-weight:400;">✓ on file</span>' : '') +
+      '</label>' +
+      '<input id="wiz-api-key" type="password" autocomplete="off" placeholder="' +
+      (onFile ? '•••••••• saved — leave blank to keep' : 'sk_live_…') + '" ' +
       'value="' + esc(wiz.data.apiKey || '') + '"></div>' +
     '<div class="form-group"><label>Account number ' +
       '<span style="color:var(--muted);font-weight:400;">(optional — auto-detected)</span></label>' +
@@ -1905,6 +2047,16 @@ function wizStepMain() {
     '</div>';
 }
 
+// A wizard "Use supplier API rate" checkbox that greys its paired sensor field.
+function wizApiToggle(id, label, checked, targetId) {
+  return '<div class="checkbox-row" style="margin:2px 0 8px;">' +
+    '<input type="checkbox" class="wiz-api-toggle" id="' + id + '"' +
+      ' data-wiz-target="' + targetId + '"' + (checked ? ' checked' : '') + '>' +
+    '<label for="' + id + '">' + label +
+      '<span style="color:var(--muted);font-weight:400;"> \u2014 untick to map a sensor instead</span>' +
+    '</label></div>';
+}
+
 function wizStepSensors() {
   var noLocal = (wiz.data.mode || 'cad').indexOf('api') !== -1 &&
                 (wiz.data.mode || '').indexOf('cad') === -1;
@@ -1928,21 +2080,32 @@ function wizStepSensors() {
         'Positive = importing, negative = exporting. ⓘ Informational only.</small></div>';
   }
 
+  // Full-fields branch runs for cad / cad+api. When an API is configured the
+  // rate, standing-charge and export-rate sensors are optional — the engine
+  // resolves them from the Octopus rate schedules — so a sensor only overrides.
+  var hasApi = (wiz.data.mode || '').indexOf('api') !== -1;
+  var rateApiNote = hasApi
+    ? ' <span style="color:var(--muted);font-weight:400;">— leave blank to use your Octopus API rates, or override with an existing sensor</span>'
+    : '';
+
   return '<h3 style="margin:0 0 6px;">Meter Sensors</h3>' +
     '<p style="color:var(--muted);font-size:13px;margin:0 0 20px;">Map your HA sensors to import, export and rate readings.</p>' +
 
     '<div class="section-divider">Import</div>' +
     '<div class="form-group"><label>Import Read Sensor — cumulative kWh from grid</label>' +
       buildWizEntity('wiz-imp-read', wiz.data.importRead) + '</div>' +
-    '<div class="form-group"><label>Import Rate Sensor</label>' +
+    '<div class="form-group"><label>Import Rate Sensor' + rateApiNote + '</label>' +
+      (hasApi ? wizApiToggle('wiz-imp-rate-api', 'Use supplier API rate', wiz.data.importRateApi, 'wiz-imp-rate') : '') +
       buildWizEntity('wiz-imp-rate', wiz.data.importRate) + '</div>' +
-    '<div class="form-group"><label>Standing Charge Sensor <span style="color:var(--muted);font-weight:400;">(optional, per day)</span></label>' +
+    '<div class="form-group"><label>Standing Charge Sensor <span style="color:var(--muted);font-weight:400;">(optional, per day)</span>' + rateApiNote + '</label>' +
+      (hasApi ? wizApiToggle('wiz-imp-sc-api', 'Use supplier API standing charge', wiz.data.standingChargeApi, 'wiz-imp-sc') : '') +
       buildWizEntity('wiz-imp-sc', wiz.data.standingCharge) + '</div>' +
 
     '<div class="section-divider" style="margin-top:20px;">Export</div>' +
     '<div class="form-group"><label>Export Read Sensor — cumulative kWh to grid</label>' +
       buildWizEntity('wiz-exp-read', wiz.data.exportRead) + '</div>' +
-    '<div class="form-group"><label>Export Rate Sensor <span style="color:var(--muted);font-weight:400;">(optional)</span></label>' +
+    '<div class="form-group"><label>Export Rate Sensor <span style="color:var(--muted);font-weight:400;">(optional)</span>' + rateApiNote + '</label>' +
+      (hasApi ? wizApiToggle('wiz-exp-rate-api', 'Use supplier API rate', wiz.data.exportRateApi, 'wiz-exp-rate') : '') +
       buildWizEntity('wiz-exp-rate', wiz.data.exportRate) + '</div>' +
 
     '<div class="section-divider" style="margin-top:20px;">Live Power</div>' +
@@ -2036,7 +2199,7 @@ function wizStepSubSensors() {
       ((wiz.data.mode || '').indexOf('api') !== -1
         ? '<div class="checkbox-row" style="margin:-4px 0 14px;">' +
             '<input type="checkbox" id="wiz-sub-' + devId + '-overlay" ' +
-              (sd.rate_source !== 'base' ? 'checked' : '') + '>' +
+              (sd.rate_source !== 'sensor' ? 'checked' : '') + '>' +
             '<label for="wiz-sub-' + devId + '-overlay">Use the main meter\u2019s rate, including ' +
               'smart-charge off-peak periods <span style="font-weight:400;color:var(--muted);">\u2014 ' +
               'recommended; prices this device\u2019s charging during cheap dispatch windows correctly. ' +
@@ -2159,6 +2322,12 @@ function wizCollectStep() {
     if (expReadEl) wiz.data.exportRead = expReadEl.value;
     var expRateEl = document.getElementById('wiz-exp-rate');
     if (expRateEl) wiz.data.exportRate = expRateEl.value;
+    var iraEl = document.getElementById('wiz-imp-rate-api');
+    if (iraEl) wiz.data.importRateApi = iraEl.checked;
+    var iscaEl = document.getElementById('wiz-imp-sc-api');
+    if (iscaEl) wiz.data.standingChargeApi = iscaEl.checked;
+    var eraEl = document.getElementById('wiz-exp-rate-api');
+    if (eraEl) wiz.data.exportRateApi = eraEl.checked;
     var pwrEl = document.getElementById('wiz-power');
     if (pwrEl) wiz.data.powerSensor = pwrEl.value;
   } else if (step === 'sub_sensors') {
@@ -2181,7 +2350,7 @@ function wizCollectStep() {
       if (devPwrEl && devPwrEl.value) wiz.data.subMeters[devId].device_power = devPwrEl.value;
       if (v2xEl)    wiz.data.subMeters[devId].v2x_capable = v2xEl.checked;
       var ovEl = document.getElementById('wiz-sub-' + devId + '-overlay');
-      if (ovEl) wiz.data.subMeters[devId].rate_source = ovEl.checked ? 'overlay' : 'base';
+      if (ovEl) wiz.data.subMeters[devId].rate_source = ovEl.checked ? 'main' : 'sensor';
     });
   }
 }
@@ -2189,6 +2358,17 @@ function wizCollectStep() {
 function _wizVerifyCredentialsThenAdvance() {
   var status = document.getElementById('wiz-api-status');
   var nextBtn = document.getElementById('wiz-btn-next');
+  // Keep the saved key: a blank field with a key on file means "don't change it".
+  // POSTing an empty api_key would CLEAR the stored credential, so skip it and
+  // advance — the key was verified when it was first saved.
+  if (!wiz.data.apiKey && wiz.data.hasStoredKey) {
+    if (status) status.innerHTML =
+      '<span style="color:var(--ok,green);">✓ Using your saved API key</span>';
+    WIZ_STEPS = computeWizSteps();
+    wiz.step++;
+    renderWizStep();
+    return;
+  }
   if (status) status.textContent = 'Connecting…';
   if (nextBtn) nextBtn.disabled = true;
   fetch(apiUrl('/api/kraken-config'), {
@@ -2255,7 +2435,7 @@ function wizNext() {
   // Credentials: save + verify the API before advancing. Async, so we return
   // and let the verify callback advance on success.
   if (curStep === 'credentials') {
-    if (!wiz.data.apiKey) {
+    if (!wiz.data.apiKey && !wiz.data.hasStoredKey) {
       alert('Enter your API key, or go back and choose a non-API mode.');
       return;
     }
@@ -2302,6 +2482,27 @@ function wizBack() {
   renderWizStep();
 }
 
+// Per-channel source for the MAIN meter from the explicit "Use API" choice and
+// the mode. Pure-API modes have no sensors → always 'api'; with no API at all
+// the sensor is the only option → 'sensor'; in cad+api the checkbox decides.
+function wizMainSource(useApi, mode) {
+  mode = mode || '';
+  var hasApi  = mode.indexOf('api') !== -1;
+  var noLocal = hasApi && mode.indexOf('cad') === -1;
+  if (noLocal) return 'api';
+  if (!hasApi) return 'sensor';
+  return useApi ? 'api' : 'sensor';
+}
+
+// 'use main meter rate' for a DEVICE: explicit checkbox choice wins; otherwise
+// (cad, no checkbox) a rate that differs from the main's means its own sensor.
+function wizDeviceSource(sd, importRate) {
+  sd = sd || {};
+  if (sd.rate_source) return sd.rate_source;
+  return (sd.rate && String(sd.rate).trim() && sd.rate !== (importRate || ''))
+    ? 'sensor' : 'main';
+}
+
 async function wizApplyAndClose() {
   // B2: warn before a consequential recompute. A Change-Setup re-run that alters
   // the data source or billing source re-calculates the whole history — a large
@@ -2332,6 +2533,17 @@ async function wizApplyAndClose() {
     }
   };
   if (d.standingCharge) mainMeter.channels.import.standing_charge_sensor = d.standingCharge;
+
+  // Per-channel source (API vs sensor). The wizard expresses the choice through
+  // sensor presence: a mapped sensor → 'sensor'; otherwise the supplier API when
+  // it's available (pure-API modes have no sensors at all → always 'api'); with
+  // no API, sensor is the only option. This persists the explicit rate_source the
+  // engine and the meter-config screen read, so they agree from first setup.
+  (function() {
+    mainMeter.channels.import.rate_source            = wizMainSource(d.importRateApi, d.mode);
+    mainMeter.channels.import.standing_charge_source = wizMainSource(d.standingChargeApi, d.mode);
+    mainMeter.channels.export.rate_source            = wizMainSource(d.exportRateApi, d.mode);
+  })();
 
   if (!config.meters[mainId]) {
     config.meters[mainId] = mainMeter;
@@ -2385,11 +2597,17 @@ async function wizApplyAndClose() {
         ...(devId === 'battery' && sd.inverter_power ? { inverter_power_sensor: sd.inverter_power } : {}),
         ...(devId === 'battery' && sd.inverter_power_invert ? { inverter_power_invert: true } : {}),
         ...((devId === 'ev' || devId === 'heat') && sd.device_power ? { device_power_sensor: sd.device_power } : {}),
-        ...(devId === 'ev' && sd.v2x_capable ? { v2x_capable: true } : {}),
-        ...(sd.rate_source ? { rate_source: sd.rate_source } : {})
+        ...(devId === 'ev' && sd.v2x_capable ? { v2x_capable: true } : {})
       },
       channels: {
-        import: { read: sd.read || '', rate: sd.rate || d.importRate || '' }
+        import: {
+          read: sd.read || '',
+          rate: sd.rate || d.importRate || '',
+          // 'use main meter rate' is captured by the checkbox (API modes); with
+          // no checkbox (cad), a device rate that differs from the main's means
+          // its own sensor, otherwise it inherits the main.
+          rate_source: wizDeviceSource(sd, d.importRate)
+        }
       }
     };
   });
