@@ -806,6 +806,86 @@ class TestExtractLastReads(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# build_gap_blocks — sub-meter reset vs unchanged classification (2.10.9 regress)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBuildGapBlocksResetClassification(unittest.TestCase):
+    """A brief HA restart during an active block leaves a sub-meter's cumulative
+    read UNCHANGED across the gap (pre == post). That must yield a ZERO delta —
+    never be mistaken for a register reset and billed the full cumulative value.
+    Regression for 2.10.9 (rogue ~5798 kWh battery / ~19 kWh EV gap blocks).
+    """
+
+    CONFIG = {
+        "meters": {
+            "electricity_main": {
+                "meta": {"sub_meter": False},
+                "channels": {
+                    "import": {"read": "sensor.imp", "rate": "sensor.rate"},
+                    "export": {"read": "sensor.exp", "rate": "sensor.rate"},
+                },
+            },
+            "sub_meter_battery": {
+                "meta": {"sub_meter": True, "parent_meter": "electricity_main"},
+                "channels": {"import": {"read": "sensor.bat_imp", "rate": "sensor.rate"}},
+            },
+        }
+    }
+
+    def _window(self):
+        return [(dt("2026-01-01T09:00:00"), dt("2026-01-01T09:30:00"))]
+
+    def _main_reads(self):
+        pre  = {"import": read(1000.0, "2026-01-01T08:55:00"),
+                "export": read(500.0,  "2026-01-01T08:55:00")}
+        post = {"import": read(1000.5, "2026-01-01T09:35:00"),
+                "export": read(500.0,  "2026-01-01T09:35:00")}
+        return pre, post
+
+    def _rates(self):
+        return {
+            "electricity_main": {"import": {"ts": "2026-01-01T08:30:00", "value": 0.30},
+                                 "export": {"ts": "2026-01-01T08:30:00", "value": 0.10}},
+            "sub_meter_battery": {"import": {"ts": "2026-01-01T08:30:00", "value": 0.30}},
+        }
+
+    def _battery_kwh(self, pre_val, post_val):
+        mpre, mpost = self._main_reads()
+        pre = {"electricity_main": mpre,
+               "sub_meter_battery": {"import": read(pre_val,  "2026-01-01T08:55:00")}}
+        post = {"electricity_main": mpost,
+                "sub_meter_battery": {"import": read(post_val, "2026-01-01T09:35:00")}}
+        blocks = engine.build_gap_blocks(self._window(), pre, post, self._rates(), self.CONFIG)
+        self.assertEqual(len(blocks), 1)
+        bat = blocks[0]["meters"].get("sub_meter_battery")
+        self.assertIsNotNone(bat, "sub_meter_battery must appear in the gap block")
+        return bat["channels"]["import"]["kwh"]
+
+    def test_unchanged_reads_yield_zero_kwh(self):
+        # Battery register identical across the gap — the 2.10.9 bug billed 5798.914.
+        kwh = self._battery_kwh(5798.914, 5798.914)
+        self.assertEqual(kwh, 0.0,
+            msg="unchanged sub-meter reads across a gap must be ZERO kWh, "
+                "not the full cumulative register value")
+
+    def test_genuine_reset_uses_post_value(self):
+        # Register genuinely dropped (e.g. daily-reset sensor) — post value is the
+        # kWh accumulated since the reset.
+        kwh = self._battery_kwh(5800.0, 12.5)
+        self.assertAlmostEqual(kwh, 12.5, places=4,
+            msg="a true reset (post < pre) must use the post read as kWh")
+
+    def test_normal_increase_interpolates_delta(self):
+        # Ordinary consumption — positive delta, interpolated across the window.
+        # Reads bracket the window (08:55→09:35, 40 min) so the 30-min window gets
+        # 30/40 × (102.0−100.0) = 1.5 kWh; the point is it interpolates rather than
+        # zeroing or treating it as a reset.
+        kwh = self._battery_kwh(100.0, 102.0)
+        self.assertAlmostEqual(kwh, 1.5, places=4,
+            msg="a normal increase must interpolate to the window's share of the delta")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # build_gap_blocks — sub-meter rate on restart (2.7.0 sawtooth fix)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2556,6 +2636,126 @@ class TestScheduleResolverPrecedence(unittest.TestCase):
         rate = self._finalise("2026-06-05T01:00:00", "2026-06-05T01:30:00", lkr)
         self.assertAlmostEqual(rate, 0.28, places=5,
             msg="with no schedule, last_known_rates must remain the fallback")
+
+
+class TestMainMeterApiHonouring(unittest.TestCase):
+    """A main-meter channel with an explicit rate_source/standing_charge_source
+    of 'api' must take the Kraken schedule for that block EVEN WHEN a sensor is
+    mapped — the config-screen / wizard "Use supplier API rate" choice wins over
+    the sensor. With the source unset or 'sensor', the sensor value is honoured.
+    """
+
+    def setUp(self):
+        import json, os
+        from kraken_rates import RateSchedule
+        os.makedirs("/data/energy_meter_tracker", exist_ok=True)
+        self.RateSchedule = RateSchedule
+        # Main meter HAS both a rate sensor and a standing-charge sensor mapped.
+        self.cfg = {"meters": {"electricity_main": {
+            "meta": {"timezone": "Europe/London", "billing_day": 1,
+                     "block_minutes": 30, "currency_symbol": "£",
+                     "currency_code": "GBP", "sub_meter": False},
+            "channels": {
+                "import": {"read": "sensor.imp_read", "rate": "sensor.imp_rate",
+                           "standing_charge_sensor": "sensor.sc"},
+                "export": {"read": "", "rate": ""}}}}}
+        self._lj_patch = patch.object(engine, "load_json",
+                                      side_effect=lambda *a, **k: self.cfg)
+        self._lj_patch.start()
+        engine._store = BlockStore(":memory:")
+        engine._store.insert_config_period(self.cfg)
+        engine.set_data_source_mode("cad+api")   # sensor exists AND api available
+        engine._kraken_rate_schedules = {"import": RateSchedule([
+            ("2026-06-05T04:30:00", "2026-06-05T22:30:00", 32.3092),  # peak pence/kWh
+        ])}
+        engine._kraken_standing_schedule = RateSchedule([
+            ("2026-06-01T00:00:00", "2026-07-01T00:00:00", 47.85),    # pence/day
+        ])
+
+    def tearDown(self):
+        import os
+        self._lj_patch.stop()
+        try:
+            os.remove(engine.CONFIG_PATH)
+        except OSError:
+            pass
+        engine._kraken_rate_schedules = {}
+        engine._kraken_standing_schedule = None
+
+    def _set_source(self, rate_source=None, sc_source=None):
+        imp = self.cfg["meters"]["electricity_main"]["channels"]["import"]
+        imp.pop("rate_source", None)
+        imp.pop("standing_charge_source", None)
+        if rate_source is not None:
+            imp["rate_source"] = rate_source
+        if sc_source is not None:
+            imp["standing_charge_source"] = sc_source
+        engine._store = BlockStore(":memory:")
+        engine._store.insert_config_period(self.cfg)
+
+    def _finalise(self, start, end):
+        blk = engine.create_block(
+            datetime.fromisoformat(start), datetime.fromisoformat(end),
+            30, seed_meters=True)
+        ch = blk["meters"]["electricity_main"]["channels"]["import"]
+        ch["reads"] = [{"ts": start, "value": 100.0}, {"ts": end, "value": 101.0}]
+        # A SENSOR-provided unit rate of £0.25/kWh sits in the block's rates.
+        ch["rates"] = [{"ts": start, "value": 0.25}]
+
+        class _HA:
+            def get_state(self, e):
+                # The SC sensor reads £0.99/day; the schedule says £0.4785.
+                return "0.99" if e == "sensor.sc" else None
+        engine.finalise_block(_HA(), block_data=blk)
+        row = engine._store._conn.execute(
+            "SELECT imp_rate, standing_charge FROM blocks WHERE block_start=?",
+            (start,)).fetchone()
+        return (row["imp_rate"], row["standing_charge"]) if row else (None, None)
+
+    # ── rate ────────────────────────────────────────────────────────────────
+    def test_rate_source_api_overrides_sensor(self):
+        self._set_source(rate_source="api")
+        rate, _ = self._finalise("2026-06-05T12:00:00", "2026-06-05T12:30:00")
+        self.assertAlmostEqual(rate, 0.323092, places=5,
+            msg="rate_source='api' must take the schedule peak rate, not the £0.25 sensor")
+
+    def test_rate_source_sensor_keeps_sensor(self):
+        self._set_source(rate_source="sensor")
+        rate, _ = self._finalise("2026-06-05T12:00:00", "2026-06-05T12:30:00")
+        self.assertAlmostEqual(rate, 0.25, places=5,
+            msg="rate_source='sensor' must honour the mapped sensor rate")
+
+    def test_rate_source_unset_keeps_sensor(self):
+        self._set_source()  # no explicit source — sensor present, resolver must not override
+        rate, _ = self._finalise("2026-06-05T12:00:00", "2026-06-05T12:30:00")
+        self.assertAlmostEqual(rate, 0.25, places=5,
+            msg="with no explicit source a mapped sensor rate stays in force")
+
+    def test_rate_source_api_falls_back_to_sensor_when_schedule_empty(self):
+        self._set_source(rate_source="api")
+        engine._kraken_rate_schedules = {}   # schedule can't resolve
+        rate, _ = self._finalise("2026-06-05T12:00:00", "2026-06-05T12:30:00")
+        self.assertAlmostEqual(rate, 0.25, places=5,
+            msg="rate_source='api' with no schedule must leave the sensor value as a graceful fallback")
+
+    # ── standing charge ───────────────────────────────────────────────────────
+    def test_sc_source_api_overrides_sensor(self):
+        self._set_source(sc_source="api")
+        _, sc = self._finalise("2026-06-05T12:00:00", "2026-06-05T12:30:00")
+        self.assertAlmostEqual(sc, 0.4785, places=5,
+            msg="standing_charge_source='api' must take the schedule £0.4785, not the £0.99 sensor")
+
+    def test_sc_source_sensor_keeps_sensor(self):
+        self._set_source(sc_source="sensor")
+        _, sc = self._finalise("2026-06-05T12:00:00", "2026-06-05T12:30:00")
+        self.assertAlmostEqual(sc, 0.99, places=5,
+            msg="standing_charge_source='sensor' must honour the mapped SC sensor")
+
+    def test_sc_source_unset_keeps_sensor(self):
+        self._set_source()  # no explicit source — SC sensor present, stays in force
+        _, sc = self._finalise("2026-06-05T12:00:00", "2026-06-05T12:30:00")
+        self.assertAlmostEqual(sc, 0.99, places=5,
+            msg="with no explicit source a mapped SC sensor stays in force")
 
 
 class TestDccOnlyExportMaterialises(unittest.TestCase):

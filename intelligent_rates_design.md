@@ -400,8 +400,25 @@ DONE, all tested:
     skipped + reported ("re-run after settlement"); pure CAD applies immediately.
     This is the primary protection against reconciliation clobbering a correction
     for the common case (see §5.3 and MODE-UI §10).
+12. **Device "use overlay" rates (release decision E)** — a sub-meter with no own
+    rate sensor is priced on the main meter's EFFECTIVE rate: inherited base tariff
+    (CAD main) or schedule-resolved rate (API main, where parent_rates is empty),
+    then the dispatch overlay against the DEVICE's own draw. So an EV bump-charging
+    midday on IOG is costed off-peak, not the inherited daytime peak. Precedence:
+    own sensor (incl. BCD `current_rate`) → "use overlay" → base; default ON when
+    an API key is configured, opt-out via `meta.rate_source="base"`. Flag persists
+    in a dedicated `meters.rate_source` column. Tested with teeth (precedence +
+    finalise: off-peak-with-flag / peak-without / peak-when-no-draw).
 
-~974 tests green.
+~1024 tests green.
+
+### Attribution principle (documented, no legal framing)
+Per-device costs are **attribution / insight**, not a separate billable rate: EMT
+allocates the single metered bill across devices so users can see what each one
+cost under their real tariff. The meter remains the one source of truth; EMT does
+not split billing by telemetry. "Use overlay" is what makes that allocation
+*accurate* during smart-charge dispatch. (Framed as a principle, not a legal
+posture — the regulatory ground may shift; see Future §F2.)
 
 ---
 
@@ -508,8 +525,10 @@ DONE, all tested:
    opt-in for the billing-source override (rule c).** Cosmetic-path freedom,
    billing-path caution.
 
-   Defensive extra (still worth it): on `KT-CT-1199` from any EMT Kraken call,
-   back off gracefully (skip tick, exponential backoff) rather than hammer.
+   Defensive extra (BUILT, release 4b): on `KT-CT-1199`, HTTP 429/5xx, or transient
+   transport/timeout from any Kraken call, `_graphql` applies bounded exponential
+   backoff with jitter (1→2→4→8s, ≤4 retries) then surfaces the error — centralised,
+   so the Mini poller, ingester, and settlement all inherit it.
 
 ### Resolved during build (no longer open)
 - Started-vs-planned key → smart-charge planned slot, captured forward. CONFIRMED.
@@ -528,3 +547,33 @@ DONE, all tested:
 - `_kraken_rate_resolver` (base) + `_dispatch_overlay_rate` (overlay).
 - DCC PASS-2 re-run machinery (settlement path B).
 - Per-block materialised cost (settle-aware), `dispatch_slots` persistence.
+
+---
+
+## 7. Future overlay extensions (post-3.0, not built)
+
+- **F1 — IOG split rate on cumulative usage (NEW, watch).** Octopus is pushing
+  Intelligent Octopus Go toward a *split rate based on ~6 hours of cumulative
+  usage* — i.e. a rate that changes once a duration threshold is crossed within a
+  period. This is a DIFFERENT overlay mechanism from the current dispatch-window
+  override: it's a **cumulative-duration tier**, not a per-slot off-peak swap. If
+  it lands, extend the overlay to track cumulative qualifying usage and switch the
+  rate at the threshold. Design only — pricing rules not yet firm.
+- **F2 — Attribution principle may need revisiting** if the regulatory ground on
+  per-device telemetry shifts. Documented as a principle (see §4 Attribution), not
+  a legal posture, precisely so it can move.
+- **F3 — BCD `intelligent_dispatching` dispatch-feed offload** (backlog 2). When
+  BCD already computes dispatch slots, consume its feed instead of EMT's own
+  capture. Pending verification that BCD's slot granularity/semantics match
+  `dispatch_slots`. The BCD *live-power* offload already exists.
+- **F4 — Explicit rate-sensor-override as a 3rd detection feature** (backlog 3).
+  The `config-state` line already logs a `rate-sensor-override` slot; wiring it to
+  actually disable the overlay + `get_dispatches` polling (footprint ladder §5.6c)
+  is the remaining build. Confirm whether the slot is wired or a placeholder.
+- **F5 — DCC re-settlement override lock + standing-charge override** (backlog 1;
+  MODE-UI §10). The per-block "manually corrected / locked" flag the rerun path
+  respects, for the narrow second-settlement and standing-charge cases.
+- **F6 — Bright (Hildebrand/Glowmarkt) as a second DCC settlement source.** As a
+  DCC participant it serves settled HH data going back far further than the
+  supplier API; it would feed the same `*_api` settlement columns (which is why
+  those stay strictly "real DCC settlement"). Needs its own auth/connectivity.

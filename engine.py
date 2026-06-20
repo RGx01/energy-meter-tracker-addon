@@ -427,6 +427,67 @@ def _device_uses_overlay(meter_meta: dict, has_own_rates: bool) -> bool:
     return kraken_available()
 
 
+def _device_base_rate(parent_import_cfg: dict, inherited_rate, block_start: str,
+                      resolver=None) -> float:
+    """Resolve the PRE-overlay base rate for a 'use main meter rate' device,
+    honouring the MAIN meter's own rate source.
+
+    A device that inherits the main meter must track whatever the main is on:
+      • main on the API (explicit import rate_source == 'api', or — for an
+        un-migrated config — no rate sensor mapped): resolve the supplier
+        schedule rate at THIS block's start, so the device follows time-of-use
+        correctly. This deliberately bypasses the inherited value, which in API
+        mode can be the whole-day series collapsed to its off-peak floor by the
+        sub-meter tariff reconstruction.
+      • main on a sensor: inherit the main's per-block rate (passed in as
+        `inherited_rate`) — never silently substitute the API, even when an API
+        key is also configured (cad+api).
+
+    The schedule resolver is only consulted as a fallback when the inherited
+    base is empty (e.g. a gap block) for a sensor-fed main.
+    """
+    if resolver is None:
+        resolver = _kraken_rate_resolver
+    cfg = parent_import_cfg or {}
+    src = cfg.get("rate_source")
+    has_sensor = bool((cfg.get("rate") or "").strip())
+    use_api = (src == "api") or (src is None and not has_sensor)
+
+    base = inherited_rate or 0.0
+    if use_api or not base:
+        try:
+            kr = resolver("import", block_start)
+            if kr is not None:
+                base = kr
+        except Exception:
+            pass
+    return base or 0.0
+
+
+def _device_overlay_decision(device_import_cfg: dict, meter_meta: dict,
+                             has_own_rates: bool) -> bool:
+    """Whether a device's import should be priced on the main meter's effective
+    rate, honouring the explicit per-channel "use main meter rate" choice over a
+    mapped sensor (the precedence the config screen makes visible):
+
+      • rate_source == 'main'   → always inherit the main meter, even if a rate
+                                   sensor is also mapped (the toggle wins).
+      • rate_source == 'sensor' → use the device's own rate sensor when it has
+                                   one; with no sensor mapped, fall back to
+                                   inheriting the main meter (an empty sensor
+                                   never leaves the device un-priced).
+      • unset (un-migrated)     → legacy precedence via _device_uses_overlay
+                                   (a mapped sensor wins, else default on when
+                                   the supplier API is configured).
+    """
+    src = (device_import_cfg or {}).get("rate_source")
+    if src == "main":
+        return True
+    if src == "sensor":
+        return not has_own_rates
+    return _device_uses_overlay(meter_meta, has_own_rates)
+
+
 def _snap_to_slot(block_start: str) -> str:
     """Snap a block_start to its 30-min slot boundary ISO (matches capture)."""
     try:
@@ -2483,8 +2544,13 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
 
         import_channel_cfg     = meter_cfg.get("channels", {}).get("import", {})
         standing_charge_sensor = import_channel_cfg.get("standing_charge_sensor")
-        raw_sc                 = read_sensor(ha, standing_charge_sensor) if standing_charge_sensor else 0.0
-        if (raw_sc is None or raw_sc == 0.0) and standing_charge_sensor:
+        # Honour an explicit "use supplier API standing charge" choice on the
+        # main meter: take the schedule value even when a SC sensor is mapped.
+        _sc_force_api          = (import_channel_cfg.get("standing_charge_source") == "api") \
+                                 and not meter_meta.get("sub_meter")
+        raw_sc                 = 0.0 if _sc_force_api else \
+                                 (read_sensor(ha, standing_charge_sensor) if standing_charge_sensor else 0.0)
+        if (raw_sc is None or raw_sc == 0.0) and standing_charge_sensor and not _sc_force_api:
             # Sensor unavailable — fall back to last known value from DB
             try:
                 _sc_row = _store._conn.execute(
@@ -2498,12 +2564,12 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
                     logger.debug("finalise_block: standing charge sensor unavailable, using last known value %.4f", raw_sc)
             except Exception:
                 pass
-        # API mode: no standing-charge SENSOR exists — the standing charge comes
-        # from the Kraken schedule. Apply it at finalise (only the main import
-        # meter; sub-meters inherit) so every block carries its standing charge
-        # immediately, rather than 0-until-DCC-settlement. The settlement rerun
-        # later refines it via the same resolver.
-        if (raw_sc is None or raw_sc == 0.0) and not standing_charge_sensor \
+        # API mode (no SC sensor) OR an explicit "use API standing charge" choice:
+        # the standing charge comes from the Kraken schedule. Apply it at finalise
+        # (main import only; sub-meters inherit) so every block carries its
+        # standing charge immediately, rather than 0-until-DCC-settlement. The
+        # settlement rerun later refines it via the same resolver.
+        if (raw_sc is None or raw_sc == 0.0) and (not standing_charge_sensor or _sc_force_api) \
                 and not meter_meta.get("sub_meter"):
             try:
                 _sc_sched = _kraken_standing_resolver(start)
@@ -2537,6 +2603,20 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
             # bug). The schedule is time-of-use aware and per-block correct, so
             # it wins; last_known_rates is only the gap/restore fallback when the
             # resolver yields nothing (no schedule, or timestamp uncovered).
+            # Honour an explicit "use supplier API rate" choice on the MAIN
+            # meter: resolve the schedule for this block even when a rate sensor
+            # is mapped (the config-screen / wizard toggle wins over the sensor).
+            # If the schedule can't resolve, the sensor value already in
+            # valid_rates is left as a graceful fallback.
+            _ch_cfg = (meter_cfg or {}).get("channels", {}).get(channel_name, {})
+            if (_ch_cfg.get("rate_source") == "api") and not is_sub \
+                    and channel_name in ("import", "export"):
+                try:
+                    _kr = _kraken_rate_resolver(channel_name, start)
+                    if _kr is not None:
+                        valid_rates = [{"ts": start, "value": _kr}]
+                except Exception:
+                    pass
             if not valid_rates and not is_sub and channel_name in ("import", "export"):
                 try:
                     _kr = _kraken_rate_resolver(channel_name, start)
@@ -2616,25 +2696,29 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
                         result["rate"] = _ov
                         result["cost"] = round((result.get("kwh") or 0.0) * _ov, 6)
 
-            # Dispatch overlay for a DEVICE on "use overlay" — price its import on
-            # the main meter's EFFECTIVE rate. The device's base is the inherited
-            # parent tariff (CAD main has a rate sensor) or, when the parent has no
-            # sensor (API mode → empty parent_rates), the schedule-resolved rate the
-            # main meter itself uses. The dispatch overlay then reprices the device's
-            # draw to off-peak if IT drew during a smart-charge slot (so e.g. an EV
-            # bump-charging midday on IOG is costed off-peak, not the daytime peak).
-            # Own-sensor devices keep their sensor; opt-out via meta.rate_source.
+            # Dispatch overlay for a DEVICE on "use main meter rate" — price its
+            # import on the main meter's EFFECTIVE rate. The base follows the
+            # main meter's own source (sensor → inherit its per-block rate; API →
+            # resolve the schedule per-slot, NOT the inherited day which the
+            # sub-meter reconstruction can collapse to off-peak). The dispatch
+            # overlay then reprices the device's own draw to off-peak if IT drew
+            # during a smart-charge slot (so e.g. an EV bump-charging midday on
+            # IOG is costed off-peak, not the daytime peak). Own-sensor devices
+            # keep their sensor; opt-out via meta.rate_source.
             elif is_sub and channel_name == "import" and \
-                    _device_uses_overlay((meter_cfg or {}).get("meta") or meter_meta,
-                                         bool(channel.get("rates"))):
-                _base = result.get("rate", 0.0) or 0.0
-                if not _base:
-                    try:
-                        _kr = _kraken_rate_resolver("import", start)
-                        if _kr is not None:
-                            _base = _kr
-                    except Exception:
-                        pass
+                    _device_overlay_decision(
+                        (meter_cfg or {}).get("channels", {}).get("import", {}),
+                        (meter_cfg or {}).get("meta") or meter_meta,
+                        bool(channel.get("rates"))):
+                _parent_imp_cfg = (
+                    config.get("meters", {})
+                          .get(parent_name, {})
+                          .get("channels", {})
+                          .get("import", {})
+                )
+                _base = _device_base_rate(_parent_imp_cfg,
+                                          result.get("rate", 0.0) or 0.0,
+                                          start)
                 if _base:
                     _ov = _dispatch_overlay_rate("import", start, _base,
                                                  result.get("kwh"))

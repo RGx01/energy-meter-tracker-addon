@@ -17,6 +17,24 @@ move) since changing billing philosophy later is legitimate — that's what the
 recalculation path supports. Surfacing it at setup makes the common choice free
 (no history to recalculate at first run).
 
+## BUILT — Change-Setup confirmation (B2)
+Finishing the wizard intercepts with a confirmation modal when (and only when) it
+will recalculate: a Change-Setup re-run over an EXISTING config where the
+data-source mode or — in API modes — the billing source actually changed
+(`_wizWillRecompute`). Fresh first-time setups skip it (no history). Wording:
+"large recalculation … can't be stopped once it starts, but it's reversible —
+switch back afterwards." Mirrored on the Data Management billing-source Apply.
+
+## BUILT — credential keep-or-replace on Change Setup
+`startWizard` fetches `GET /api/kraken-config` (which returns `configured` +
+`account_number` but NEVER the key — write-only by design). On a re-run the
+credentials step shows the key field as "✓ on file — leave blank to keep, or
+enter a new one to replace," pre-fills the (non-secret) account number, and
+allows advancing on a blank field. `_wizVerifyCredentialsThenAdvance` SKIPS the
+POST when the field is blank and a key is on file — an empty `api_key` would
+CLEAR the stored credential — and advances using the saved key. Secret never
+re-enters the DOM.
+
 ## The mode matrix (from V3 Refinement, authoritative)
 
 Modes collapse by "what job each source does":
@@ -311,19 +329,20 @@ Only if they proactively choose to add the API (e.g. via the future "Change data
 source" config action, MODE-UI §3). At that point they pick a supplier and the
 gating runs forward — opt-in, never forced.
 
-### Open questions (resolve when building the migration path)
-1. Do we backfill `supplier="octopus"` for a migrated user who ALREADY had API
-   credentials configured in a late-2.x/early-3.0 build? (i.e. someone who set up
-   API before supplier existed.) Detect existing creds → infer supplier=octopus?
-2. One-time non-blocking notice on first 3.x load ("EMT now supports supplier
-   selection; your setup is unchanged") vs fully silent? Lean: silent unless they
-   open config.
-3. Does the migrated `cad` user's config page show the supplier as "not set /
-   local only," or hide supplier UI until they engage the API? Lean: show it
-   read-only as "Local metering only" so the concept is discoverable.
-4. Backups/restore across the schema addition: a restored v2-era backup has no
-   supplier — same not-listed default applies. Confirm restore path tolerates the
-   missing field (should, if reads default cleanly).
+### Migration questions — RESOLVED (release decisions C1–C4)
+1. **Backfill `supplier="octopus"` for existing API users?** RESOLVED (C1): NOT
+   NEEDED. No released EMT ever had API access, so no existing user has API creds —
+   there is nothing to backfill. Supplier simply defaults to not-set for everyone
+   on upgrade. (The only half-migrated DB is the author's own prod_dev, reset to a
+   clean 2.x snapshot before the upgrade test.)
+2. **One-time notice vs silent?** RESOLVED (C2): silent. No first-load banner;
+   existing setups carry on untouched and the new options are discovered when the
+   user opens config / Change Setup.
+3. **Show supplier read-only for cad users?** RESOLVED (C3): leave the supplier
+   field AS IS (not shown read-only) until the user actively selects a supplier on
+   Change Setup. Don't surface a "Local metering only" label pre-emptively.
+4. **Restore tolerance.** RESOLVED (C4): confirmed — a restored v2-era backup with
+   no supplier field defaults cleanly to not-listed.
 
 ### Guiding principle
 Migration = "existing setups keep working untouched; new concepts are opt-in."

@@ -3722,9 +3722,14 @@ function _hmGetTotColorscale() {{
 }}
 
 function _hmGetChartTitle() {{
-  if (_hmMetric === 'co2')       return 'Carbon Flow (gCO₂ per slot)';
+  if (_hmMetric === 'co2')       return 'Carbon Emitted (gCO₂)';
   if (_hmMetric === 'intensity') return 'Grid Carbon Intensity (gCO₂/kWh)';
-  return 'Net Energy Flow';
+  return 'Net Energy (kWh)';
+}}
+function _hmGetChartSubtitle() {{
+  if (_hmMetric === 'co2')       return 'The amount of carbon your usage produced — scales with how much you use';
+  if (_hmMetric === 'intensity') return 'The rate — how clean the grid was per unit, regardless of your usage';
+  return 'Energy imported minus exported, each half-hour';
 }}
 
 function _hmApplyMetric() {{
@@ -3800,6 +3805,8 @@ function _hmApplyMetric() {{
   // Update title to match current metric
   _liveLayout.title = _liveLayout.title || {{}};
   _liveLayout.title.text = _hmGetChartTitle();
+  _liveLayout.title.subtitle = {{text: _hmGetChartSubtitle(), font: {{color: _hmTc.axisC, size: 12}}}};
+  _liveLayout.title.automargin = true;
   Plotly.react('heatmap', newData, _liveLayout).then(function() {{
     if (totals && _hmMetric !== 'intensity') {{
       Plotly.relayout('heatmap', {{'xaxis2.title.text': totLabel}});
@@ -3858,7 +3865,7 @@ var data = [
 }}
 ];
 var layout = {{
-  title: {{text: 'Net Energy Flow', x: 0.5, font: {{color: _hmTc.textC}}}},
+  title: {{text: _hmGetChartTitle(), subtitle: {{text: _hmGetChartSubtitle(), font: {{color: _hmTc.axisC, size: 12}}}}, x: 0.5, automargin: true, font: {{color: _hmTc.textC}}}},
   xaxis:  {{tickangle: -45, side: 'top', domain: [0, 0.85], tickmode: 'array', tickvals: {x_tickvals_json}, ticktext: {x_tickvals_json}, tickfont: {{color: _hmTc.axisC}}, fixedrange: true}},
   xaxis2: {{title: {{text: 'Daily Total', standoff: 10, font: {{color: _hmTc.axisC}}}}, side: 'top', domain: [0.86, 1], tickfont: {{color: _hmTc.axisC}}, fixedrange: true}},
   yaxis:  {{type: 'category', tickmode: 'array', tickvals: {y_json}, ticktext: {y_ticktext_json}, fixedrange: true, tickfont: {{color: _hmTc.axisC}}}},

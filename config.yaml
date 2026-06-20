@@ -52,9 +52,8 @@ options:
   # Meter reconciliation period in minutes (5, 15 or 30).
   # Set once before data collection begins — cannot be changed without clearing data.
   block_minutes: 30
-  # DEV ONLY — set false to disable HA sensor publishing when running a dev instance
-  # in parallel with a prod instance on the same HA. Always true on production.
-  publish_ha_sensors: true
+  # Soon to be depricated
+  publish_ha_sensors: false
   # DEV ONLY — set to a different port (e.g. 8100) when running a dev instance
   # in parallel with a prod instance. Always 8099 on production.
   port: 8099
