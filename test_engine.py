@@ -806,6 +806,86 @@ class TestExtractLastReads(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# build_gap_blocks — sub-meter reset vs unchanged classification (2.10.9 regress)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBuildGapBlocksResetClassification(unittest.TestCase):
+    """A brief HA restart during an active block leaves a sub-meter's cumulative
+    read UNCHANGED across the gap (pre == post). That must yield a ZERO delta —
+    never be mistaken for a register reset and billed the full cumulative value.
+    Regression for 2.10.9 (rogue ~5798 kWh battery / ~19 kWh EV gap blocks).
+    """
+
+    CONFIG = {
+        "meters": {
+            "electricity_main": {
+                "meta": {"sub_meter": False},
+                "channels": {
+                    "import": {"read": "sensor.imp", "rate": "sensor.rate"},
+                    "export": {"read": "sensor.exp", "rate": "sensor.rate"},
+                },
+            },
+            "sub_meter_battery": {
+                "meta": {"sub_meter": True, "parent_meter": "electricity_main"},
+                "channels": {"import": {"read": "sensor.bat_imp", "rate": "sensor.rate"}},
+            },
+        }
+    }
+
+    def _window(self):
+        return [(dt("2026-01-01T09:00:00"), dt("2026-01-01T09:30:00"))]
+
+    def _main_reads(self):
+        pre  = {"import": read(1000.0, "2026-01-01T08:55:00"),
+                "export": read(500.0,  "2026-01-01T08:55:00")}
+        post = {"import": read(1000.5, "2026-01-01T09:35:00"),
+                "export": read(500.0,  "2026-01-01T09:35:00")}
+        return pre, post
+
+    def _rates(self):
+        return {
+            "electricity_main": {"import": {"ts": "2026-01-01T08:30:00", "value": 0.30},
+                                 "export": {"ts": "2026-01-01T08:30:00", "value": 0.10}},
+            "sub_meter_battery": {"import": {"ts": "2026-01-01T08:30:00", "value": 0.30}},
+        }
+
+    def _battery_kwh(self, pre_val, post_val):
+        mpre, mpost = self._main_reads()
+        pre = {"electricity_main": mpre,
+               "sub_meter_battery": {"import": read(pre_val,  "2026-01-01T08:55:00")}}
+        post = {"electricity_main": mpost,
+                "sub_meter_battery": {"import": read(post_val, "2026-01-01T09:35:00")}}
+        blocks = engine.build_gap_blocks(self._window(), pre, post, self._rates(), self.CONFIG)
+        self.assertEqual(len(blocks), 1)
+        bat = blocks[0]["meters"].get("sub_meter_battery")
+        self.assertIsNotNone(bat, "sub_meter_battery must appear in the gap block")
+        return bat["channels"]["import"]["kwh"]
+
+    def test_unchanged_reads_yield_zero_kwh(self):
+        # Battery register identical across the gap — the 2.10.9 bug billed 5798.914.
+        kwh = self._battery_kwh(5798.914, 5798.914)
+        self.assertEqual(kwh, 0.0,
+            msg="unchanged sub-meter reads across a gap must be ZERO kWh, "
+                "not the full cumulative register value")
+
+    def test_genuine_reset_uses_post_value(self):
+        # Register genuinely dropped (e.g. daily-reset sensor) — post value is the
+        # kWh accumulated since the reset.
+        kwh = self._battery_kwh(5800.0, 12.5)
+        self.assertAlmostEqual(kwh, 12.5, places=4,
+            msg="a true reset (post < pre) must use the post read as kWh")
+
+    def test_normal_increase_interpolates_delta(self):
+        # Ordinary consumption — positive delta, interpolated across the window.
+        # Reads bracket the window (08:55→09:35, 40 min) so the 30-min window gets
+        # 30/40 × (102.0−100.0) = 1.5 kWh; the point is it interpolates rather than
+        # zeroing or treating it as a reset.
+        kwh = self._battery_kwh(100.0, 102.0)
+        self.assertAlmostEqual(kwh, 1.5, places=4,
+            msg="a normal increase must interpolate to the window's share of the delta")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # build_gap_blocks — sub-meter rate on restart (2.7.0 sawtooth fix)
 # ─────────────────────────────────────────────────────────────────────────────
 
