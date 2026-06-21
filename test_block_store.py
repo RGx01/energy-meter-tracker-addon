@@ -2417,10 +2417,15 @@ class TestBlockDeletion(unittest.TestCase):
         self.assertEqual(r["dates"], 2)
 
     def test_count_preview_single_meter(self):
+        # Counting (or deleting) a MAIN meter now includes its sub-meters, so the
+        # two 2026-03-01 main blocks plus its ev_charger block = 3.
         store = self._make_store()
         r = store.count_blocks_for_date_range("2026-03-01", "2026-03-01", "electricity_main")
-        self.assertEqual(r["blocks"], 2)
+        self.assertEqual(r["blocks"], 3)
         self.assertEqual(r["dates"], 1)
+        # A device on its own counts only itself.
+        rd = store.count_blocks_for_date_range("2026-03-01", "2026-03-01", "ev_charger")
+        self.assertEqual(rd["blocks"], 1)
 
     def test_count_preview_no_match(self):
         store = self._make_store()

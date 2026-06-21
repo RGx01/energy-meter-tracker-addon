@@ -1431,9 +1431,12 @@ def build_gap_blocks(
                         if gap_hours > 12:
                             skip_reason = f"gap too large ({gap_hours:.1f}hrs)"
                         elif post_read["value"] == pre_read["value"]:
-                            # Identical reads — sensor didn't change during the gap
-                            # (e.g. brief HA outage with no actual consumption).
-                            # Delta is zero — do not use the register value as kWh.
+                            # Identical reads — the sub-meter sensor did not change
+                            # during the gap (e.g. a brief HA outage with no actual
+                            # consumption). The delta is ZERO; do NOT mistake this
+                            # for a reset and bill the full cumulative register.
+                            # (Regression: 2.10.9 — rogue full-register kWh, e.g.
+                            # 5798 kWh on a battery, from a momentary restart.)
                             sub_kwh = 0.0
                             logger.info(
                                 "build_gap_blocks: %s/%s unchanged (%.4f → %.4f) "
@@ -1442,9 +1445,10 @@ def build_gap_blocks(
                                 pre_read["value"], post_read["value"]
                             )
                         elif post_read["value"] < pre_read["value"]:
-                            # Genuine reset — register dropped. Use post_read value
-                            # directly as kWh accumulated since reset (handles
-                            # daily-reset sensors and any cumulative sensor reset).
+                            # Genuine reset — the register dropped. Use post_read
+                            # value directly as kWh accumulated since the reset
+                            # (handles daily-reset sensors and any other cumulative
+                            # sensor that resets mid-block).
                             sub_kwh = max(round(post_read["value"], 6), 0.0)
                             logger.info(
                                 "build_gap_blocks: %s/%s reset detected (%.4f → %.4f) "
@@ -2080,6 +2084,105 @@ def _resolve_block_rate(channel: dict, block_start: str, channel_name: str,
     return resolved, True
 
 
+def _recompute_pass3_totals(block: dict) -> None:
+    """PASS 3 — re-derive a block's import/export totals from its (already
+    PASS-2'd) per-meter channels: sub-meters contribute kwh_grid, the main
+    contributes its kwh_remainder. Mirrors finalise_block PASS 3 and is shared
+    by the settlement rerun and the post-delete remainder recompute so the two
+    can never drift."""
+    block.setdefault("totals", {})
+    block["totals"].update({"import_kwh": 0.0, "import_cost": 0.0,
+                            "export_kwh": 0.0, "export_cost": 0.0})
+    for meter_name, meter_block in block["meters"].items():
+        meta = meter_block.get("meta", {}) or {}
+        for channel_name, channel in (meter_block.get("channels") or {}).items():
+            if channel_name == "import":
+                if meta.get("sub_meter"):
+                    ik = channel.get("kwh_grid")
+                    if ik is None:
+                        ik = channel.get("kwh") or 0.0
+                    block["totals"]["import_kwh"]  += ik or 0.0
+                    block["totals"]["import_cost"] += channel.get("cost") or 0.0
+                else:
+                    ik = channel.get("kwh_remainder")
+                    if ik is None:
+                        ik = channel.get("kwh") or 0.0
+                    ic = channel.get("cost_remainder")
+                    if ic is None:
+                        ic = channel.get("cost") or 0.0
+                    block["totals"]["import_kwh"]  += ik or 0.0
+                    block["totals"]["import_cost"] += ic or 0.0
+            elif channel_name == "export":
+                block["totals"]["export_kwh"]  += channel.get("kwh") or 0.0
+                block["totals"]["export_cost"] += channel.get("cost") or 0.0
+
+
+def recompute_remainders_for_window(parent_meter_id: str, utc_start: str,
+                                    utc_end: str) -> int:
+    """Re-derive a main meter's kwh_remainder/cost_remainder after one of its
+    sub-meters' blocks were deleted.
+
+    Deleting a device in isolation leaves the parent's stored remainder having
+    subtracted a device that no longer exists, so the parent line reads low.
+    For each affected parent block in [utc_start, utc_end) this reconstructs the
+    block (the deleted device is already absent), re-runs PASS 2 against the
+    surviving sub-meters — reattributing the deleted device's grid-attributed
+    energy back into the remainder — then re-derives PASS 3 totals and carbon
+    and writes it back. Returns the number of parent blocks recomputed.
+
+    Uses _apply_pass2 directly, NOT _rerun_pass2_for_settled_block: the
+    remainder is a PASS-2 concern only. The settlement rerun would also
+    materialise DCC/CAD kWh, capture kwh_cad, apply the dispatch overlay and
+    clear is_provisional — all of which would be wrong to trigger from a delete.
+    Recomputing a window that was not actually affected is a no-op (the same
+    surviving subs yield the same remainder), so the bounds can be generous.
+    """
+    if not parent_meter_id:
+        return 0
+    store = get_store()
+    starts = [r["block_start"] for r in store._conn.execute(
+        "SELECT DISTINCT block_start FROM blocks "
+        "WHERE meter_id = ? AND block_start >= ? AND block_start < ? "
+        "ORDER BY block_start",
+        (parent_meter_id, utc_start, utc_end),
+    ).fetchall()]
+    done = 0
+    for bs in starts:
+        try:
+            block = store.get_block_dict_by_start(bs)
+            if not block:
+                continue
+            # Reset the parent's remainder to the full main import first, so a
+            # window left with NO surviving sub-meters yields remainder == main
+            # (no phantom subtraction). _apply_pass2 only writes the remainder
+            # for parents that still have sub-meters, so without this a
+            # fully-emptied window would keep its stale remainder.
+            pm = (block.get("meters") or {}).get(parent_meter_id)
+            if pm:
+                pic = (pm.get("channels") or {}).get("import")
+                if pic is not None:
+                    pic["kwh_remainder"]  = pic.get("kwh")
+                    pic["cost_remainder"] = pic.get("cost")
+            _apply_pass2(block)
+            _recompute_pass3_totals(block)
+            _recompute_block_carbon(block)
+            append_block_replace(block)
+            done += 1
+        except Exception as e:
+            logger.error(
+                "recompute_remainders_for_window: block %s failed: %s", bs, e)
+    if done:
+        try:
+            generate_charts(store)
+        except Exception as _ce:
+            logger.warning(
+                "recompute_remainders_for_window: chart regen failed: %s", _ce)
+    logger.info(
+        "recompute_remainders_for_window: recomputed %d block(s) for parent %s",
+        done, parent_meter_id)
+    return done
+
+
 def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricity_main",
                                    rate_resolver=None, billing_source: str = "dcc",
                                    standing_resolver=None) -> dict:
@@ -2185,31 +2288,7 @@ def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricit
     _apply_pass2(block)
 
     # PASS 3 totals re-derivation (mirror finalise_block PASS 3)
-    block.setdefault("totals", {})
-    block["totals"].update({"import_kwh": 0.0, "import_cost": 0.0,
-                            "export_kwh": 0.0, "export_cost": 0.0})
-    for meter_name, meter_block in block["meters"].items():
-        meta = meter_block.get("meta", {}) or {}
-        for channel_name, channel in (meter_block.get("channels") or {}).items():
-            if channel_name == "import":
-                if meta.get("sub_meter"):
-                    ik = channel.get("kwh_grid")
-                    if ik is None:
-                        ik = channel.get("kwh") or 0.0
-                    block["totals"]["import_kwh"]  += ik or 0.0
-                    block["totals"]["import_cost"] += channel.get("cost") or 0.0
-                else:
-                    ik = channel.get("kwh_remainder")
-                    if ik is None:
-                        ik = channel.get("kwh") or 0.0
-                    ic = channel.get("cost_remainder")
-                    if ic is None:
-                        ic = channel.get("cost") or 0.0
-                    block["totals"]["import_kwh"]  += ik or 0.0
-                    block["totals"]["import_cost"] += ic or 0.0
-            elif channel_name == "export":
-                block["totals"]["export_kwh"]  += channel.get("kwh") or 0.0
-                block["totals"]["export_cost"] += channel.get("cost") or 0.0
+    _recompute_pass3_totals(block)
 
     _recompute_block_carbon(block)
 
@@ -5322,9 +5401,12 @@ async def engine_startup(ha: HAClient):
                     # Add CI to gap blocks from the carbon_intensity table
                     _postcode = _get_postcode()
                     for _gb in _startup_gap_blocks:
-                        # Skip if an interpolated block already exists for this window —
-                        # prevents double gap-fill when engine_startup runs twice in rapid
-                        # succession due to consecutive HA disconnects.
+                        # Skip if an interpolated block already exists for this
+                        # window — prevents a double gap-fill when engine_startup
+                        # runs twice in rapid succession (consecutive HA
+                        # disconnects), where the second fill would overwrite the
+                        # first with slightly different interpolated values.
+                        # (Regression: 2.10.9.)
                         _gb_start = _gb.get("start")
                         if _gb_start:
                             _existing = _store._conn.execute(
@@ -5336,8 +5418,8 @@ async def engine_startup(ha: HAClient):
                             ).fetchone()
                             if _existing:
                                 logger.info(
-                                    "engine_startup: gap block %s already exists (interpolated) — skipping",
-                                    _gb_start
+                                    "engine_startup: gap block %s already exists "
+                                    "(interpolated) — skipping", _gb_start
                                 )
                                 continue
                         try:
