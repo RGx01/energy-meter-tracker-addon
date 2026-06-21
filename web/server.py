@@ -780,6 +780,24 @@ def _bcd_demand_sensor():
         return None
 
 
+def _ohme_detection():
+    """OHME charge-mode detection result, surfaced to the EV card so the hint can
+    say whether EMT found an Ohme charge-mode entity (verified off-peak path) or
+    fell back to the optimistic path. None-safe; always returns a plain dict."""
+    try:
+        import engine as _eng
+        ohme = (_eng._detected_integrations or {}).get("ohme") or {}
+        if ohme.get("found"):
+            return {
+                "found": True,
+                "integration": ohme.get("integration"),
+                "charge_mode_entity": ohme.get("charge_mode_entity"),
+            }
+    except Exception:
+        pass
+    return {"found": False, "integration": None, "charge_mode_entity": None}
+
+
 def _effective_power_sensor(main_meta):
     """Resolve the live-power sensor entity: the user's configured power_sensor,
     or — when none is set — BottlecapDave's current_demand (auto-adopted)."""
@@ -2805,7 +2823,8 @@ def settings_page():
         active="settings",
         tz_select_html=tz_select_html,
         has_data=has_data,
-        data_source_mode=_ds_mode
+        data_source_mode=_ds_mode,
+        ohme_detection=_ohme_detection()
     )
 
 
@@ -4340,6 +4359,17 @@ def api_blocks_delete():
         to_time_utc   = _corrections_time_to_utc(to_time,   _tz_name, to_date)
         store = _get_store()
         result = store.delete_blocks_for_date_range(from_date, to_date, meter_id, from_time_utc, to_time_utc, _tz_name)
+        # A device-only delete leaves the parent main meter's remainder stale for
+        # those windows — recompute it (PASS 2) against the surviving sub-meters.
+        if result.get("recompute_parent"):
+            try:
+                import engine as _eng
+                result["remainders_recomputed"] = _eng.recompute_remainders_for_window(
+                    result["recompute_parent"], result["recompute_from"], result["recompute_to"]
+                )
+            except Exception as _re:
+                logger.error("api_blocks_delete: remainder recompute failed: %s", _re)
+                result["remainders_recomputed"] = 0
         logger.info(
             "api_blocks_delete: deleted %d blocks across %d dates (%s\u2192%s meter=%s)",
             result["deleted"], result["dates"], from_date, to_date, meter_id or "all"

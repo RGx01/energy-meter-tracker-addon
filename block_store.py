@@ -1479,14 +1479,72 @@ class BlockStore:
         return {"deleted": True, "blocks_reassigned": block_rows}
 
 
+    def _resolve_delete_meters(self, meter_id):
+        """Normalize the meter sentinel for a block delete/preview.
+
+        Returns None when *all* meters should be affected (meter_id is None,
+        empty, or the UI sentinel "all" — previously this string was passed
+        through as a literal filter, matching no row and silently deleting
+        nothing). Otherwise returns a de-duplicated list of meter_ids: the
+        requested meter plus, when it is a parent (main) meter, all of its
+        sub-meters — so deleting a day for the main meter takes its device
+        blocks with it and cannot leave an orphaned, internally-inconsistent
+        bill line behind.
+        """
+        if meter_id in (None, "", "all"):
+            return None
+        ids = [meter_id]
+        cur = self._conn.execute(
+            "SELECT DISTINCT meter_id FROM meters WHERE parent_meter_id = ?",
+            (meter_id,),
+        )
+        ids.extend(r["meter_id"] for r in cur.fetchall())
+        return list(dict.fromkeys(ids))
+
+    def _block_range_where(self, utc_start, utc_end, from_time, to_time, meter_ids):
+        """Build the shared WHERE clause + params for block date-range
+        delete/preview. `meter_ids` is None (all meters) or a list of ids."""
+        clauses = ["block_start >= ?", "block_start < ?"]
+        params  = [utc_start, utc_end]
+
+        if from_time != "00:00" and to_time != "23:59":
+            if from_time <= to_time:
+                clauses.append("TIME(block_start) >= ?")
+                clauses.append("TIME(block_start) <= ?")
+                params.extend([from_time, to_time])
+            else:
+                clauses.append("(TIME(block_start) >= ? OR TIME(block_start) <= ?)")
+                params.extend([from_time, to_time])
+        elif from_time != "00:00":
+            clauses.append("TIME(block_start) >= ?")
+            params.append(from_time)
+        elif to_time != "23:59":
+            clauses.append("TIME(block_start) <= ?")
+            params.append(to_time)
+
+        if meter_ids is not None:
+            placeholders = ",".join("?" * len(meter_ids))
+            clauses.append(f"meter_id IN ({placeholders})")
+            params.extend(meter_ids)
+
+        return " AND ".join(clauses), params
+
     def delete_blocks_for_date_range(
         self, from_date: str, to_date: str, meter_id: str | None = None,
         from_time: str = "00:00", to_time: str = "23:59", tz_name: str = "UTC"
     ) -> dict:
         """
         Delete all blocks within [from_date, to_date] local date range (inclusive),
-        optionally restricted by time-of-day (UTC HH:MM) within those dates.
-        Uses UTC bounds derived from local dates via local_date_range_to_utc_bounds().
+        optionally restricted by time-of-day (UTC HH:MM) and/or to a single meter
+        (which also pulls in that meter's sub-meters — see _resolve_delete_meters).
+
+        Cascades to the rows that reference the deleted blocks: `reads` (FK
+        block_id, deleted first so foreign_keys=ON can't error) and
+        `generation_mix` (block_id). When the delete removes the most recent
+        finalised block for the targeted meters (a "tail" delete), the engine's
+        live read-state (current_block + current_reads) is cleared in the same
+        transaction so the next block re-anchors from the next live read instead
+        of spanning the deleted window.
         """
         if not from_date or not to_date:
             raise ValueError("from_date and to_date are required")
@@ -1498,85 +1556,109 @@ class BlockStore:
 
         utc_start, utc_end = local_date_range_to_utc_bounds(from_date, to_date, tz_name)
 
-        clauses = ["block_start >= ?", "block_start < ?"]
-        params  = [utc_start, utc_end]
-
-        if from_time != "00:00" and to_time != "23:59":
-            if from_time <= to_time:
-                clauses.append("TIME(block_start) >= ?")
-                clauses.append("TIME(block_start) <= ?")
-                params.extend([from_time, to_time])
-            else:
-                clauses.append("(TIME(block_start) >= ? OR TIME(block_start) <= ?)")
-                params.extend([from_time, to_time])
-        elif from_time != "00:00":
-            clauses.append("TIME(block_start) >= ?")
-            params.append(from_time)
-        elif to_time != "23:59":
-            clauses.append("TIME(block_start) <= ?")
-            params.append(to_time)
-
-        if meter_id:
-            clauses.append("meter_id = ?")
-            params.append(meter_id)
-
-        where = " AND ".join(clauses)
-
-        cur = self._conn.execute(
-            f"SELECT COUNT(*) as n, COUNT(DISTINCT date(block_start)) as d FROM blocks WHERE {where}",
-            params
+        meter_ids = self._resolve_delete_meters(meter_id)
+        where, params = self._block_range_where(
+            utc_start, utc_end, from_time, to_time, meter_ids
         )
-        row = cur.fetchone()
+
+        row = self._conn.execute(
+            f"SELECT COUNT(*) as n, COUNT(DISTINCT date(block_start)) as d "
+            f"FROM blocks WHERE {where}",
+            params,
+        ).fetchone()
         n_blocks = row["n"]
         n_dates  = row["d"]
 
-        with self._conn:
-            self._conn.execute(f"DELETE FROM blocks WHERE {where}", params)
+        # Tail detection: is the newest finalised block within the targeted
+        # meters inside the deleted range? If so the engine anchor must reset.
+        if meter_ids is not None:
+            ph = ",".join("?" * len(meter_ids))
+            latest = self._conn.execute(
+                f"SELECT MAX(block_start) AS m FROM blocks WHERE meter_id IN ({ph})",
+                meter_ids,
+            ).fetchone()["m"]
+        else:
+            latest = self._conn.execute(
+                "SELECT MAX(block_start) AS m FROM blocks"
+            ).fetchone()["m"]
+        is_tail = bool(latest is not None and utc_start <= latest < utc_end)
 
-        return {"deleted": n_blocks, "dates": n_dates}
+        # Device-only delete? If the resolved target is a single sub-meter (its
+        # parent's blocks are untouched and survive), the parent's stored
+        # remainder for these windows is now stale — hand the parent + window
+        # back so the caller can trigger a PASS-2 remainder recompute. A main
+        # or all-meters delete takes the devices with it, so nothing to recompute.
+        recompute_parent = None
+        if meter_ids is not None and len(meter_ids) == 1:
+            pr = self._conn.execute(
+                "SELECT parent_meter_id FROM meters "
+                "WHERE meter_id = ? AND is_sub_meter = 1 AND parent_meter_id IS NOT NULL "
+                "LIMIT 1",
+                (meter_ids[0],),
+            ).fetchone()
+            if pr and pr["parent_meter_id"]:
+                recompute_parent = pr["parent_meter_id"]
+
+        reads_deleted = 0
+        mix_deleted   = 0
+        with self._conn:
+            if n_blocks:
+                # Children first (reads FK -> blocks(id) with foreign_keys=ON).
+                # Match by block id via subquery: no huge IN-list, no param cap.
+                cur_r = self._conn.execute(
+                    f"DELETE FROM reads WHERE block_id IN "
+                    f"(SELECT id FROM blocks WHERE {where})",
+                    params,
+                )
+                reads_deleted = cur_r.rowcount
+                cur_m = self._conn.execute(
+                    f"DELETE FROM generation_mix WHERE block_id IN "
+                    f"(SELECT id FROM blocks WHERE {where})",
+                    params,
+                )
+                mix_deleted = cur_m.rowcount
+                self._conn.execute(f"DELETE FROM blocks WHERE {where}", params)
+            if is_tail and n_blocks:
+                # Reseed live engine state so the next block starts cleanly.
+                self._conn.execute("DELETE FROM current_block")
+                self._conn.execute("DELETE FROM current_reads")
+
+        return {
+            "deleted":                n_blocks,
+            "dates":                  n_dates,
+            "reads_deleted":          reads_deleted,
+            "generation_mix_deleted": mix_deleted,
+            "reseeded":               bool(is_tail and n_blocks),
+            # set only for a device-only delete with surviving parent blocks
+            "recompute_parent":       recompute_parent if n_blocks else None,
+            "recompute_from":         utc_start if recompute_parent and n_blocks else None,
+            "recompute_to":           utc_end if recompute_parent and n_blocks else None,
+        }
 
     def count_blocks_for_date_range(
         self, from_date: str, to_date: str, meter_id: str | None = None,
         from_time: str = "00:00", to_time: str = "23:59", tz_name: str = "UTC"
     ) -> dict:
         """
-        Preview how many blocks would be affected by delete_blocks_for_date_range.
+        Preview how many blocks delete_blocks_for_date_range would remove, using
+        the identical meter resolution (sentinel + sub-meter inclusion) and WHERE
+        clause so the preview can never disagree with the delete.
         Returns {"blocks": N, "dates": N_distinct_dates}.
         """
         from_time = from_time or "00:00"
         to_time   = to_time   or "23:59"
 
         utc_start, utc_end = local_date_range_to_utc_bounds(from_date, to_date, tz_name)
-
-        clauses = ["block_start >= ?", "block_start < ?"]
-        params  = [utc_start, utc_end]
-
-        if from_time != "00:00" and to_time != "23:59":
-            if from_time <= to_time:
-                clauses.append("TIME(block_start) >= ?")
-                clauses.append("TIME(block_start) <= ?")
-                params.extend([from_time, to_time])
-            else:
-                clauses.append("(TIME(block_start) >= ? OR TIME(block_start) <= ?)")
-                params.extend([from_time, to_time])
-        elif from_time != "00:00":
-            clauses.append("TIME(block_start) >= ?")
-            params.append(from_time)
-        elif to_time != "23:59":
-            clauses.append("TIME(block_start) <= ?")
-            params.append(to_time)
-
-        if meter_id:
-            clauses.append("meter_id = ?")
-            params.append(meter_id)
-
-        where = " AND ".join(clauses)
-
-        cur = self._conn.execute(
-            f"SELECT COUNT(*) as n, COUNT(DISTINCT date(block_start)) as d FROM blocks WHERE {where}",
-            params
+        meter_ids = self._resolve_delete_meters(meter_id)
+        where, params = self._block_range_where(
+            utc_start, utc_end, from_time, to_time, meter_ids
         )
-        row = cur.fetchone()
+
+        row = self._conn.execute(
+            f"SELECT COUNT(*) as n, COUNT(DISTINCT date(block_start)) as d "
+            f"FROM blocks WHERE {where}",
+            params,
+        ).fetchone()
         return {"blocks": row["n"], "dates": row["d"]}
 
 
@@ -3261,7 +3343,7 @@ class BlockStore:
                        b.imp_rate, b.imp_cost, b.imp_read_start, b.imp_read_end,
                        b.exp_kwh, b.exp_rate, b.exp_cost,
                        b.exp_read_start, b.exp_read_end,
-                       b.standing_charge, b.carbon_g, b.interpolated,
+                       b.standing_charge, b.carbon_g, b.carbon_intensity_g, b.interpolated,
                        m.is_sub_meter, m.parent_meter_id, m.device_label,
                        m.inverter_possible, m.meter_type,
                        cp.billing_day, cp.block_minutes, cp.timezone,
@@ -3345,6 +3427,7 @@ class BlockStore:
                     "currency_symbol":  row["currency_symbol"],
                 },
                 "carbon_g":      row["carbon_g"],
+                "carbon_intensity_g": row["carbon_intensity_g"],
                 "imp_kwh":       imp,
                 "exp_kwh":       exp,
                 "imp_cost":      float(row["imp_cost"] or 0),

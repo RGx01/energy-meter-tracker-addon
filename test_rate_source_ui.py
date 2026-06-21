@@ -180,5 +180,64 @@ vm.runInContext(`
         self.assertIn("OK", out.stdout)
 
 
+@unittest.skipUnless(shutil.which("node"), "node not available")
+class TestOhmeEvNote(unittest.TestCase):
+    """The EV-card Ohme note: hidden off-API, nudges when no charge-mode entity is
+    detected, confirms the verified path when one is, and always carries the
+    session-sensor read caveat + GitHub feedback ask."""
+
+    HARNESS = r"""
+const fs = require('fs'), vm = require('vm');
+const html = fs.readFileSync(process.argv[2], 'utf8');
+const s = html.indexOf('function ohmeEvNote()');
+const e = html.indexOf('function buildSubCard');
+const fn = html.slice(s, e);
+const ctx = { esc: (x) => String(x === undefined || x === null ? '' : x), console };
+vm.createContext(ctx);
+function run(mode, det) { ctx.DATA_SOURCE_MODE = mode; ctx.OHME_DETECTION = det;
+  return vm.runInContext(fn + '\nohmeEvNote();', ctx); }
+let fails = [];
+const has = (str, sub, m) => { if (str.indexOf(sub) === -1) fails.push(m + ' (missing: ' + sub + ')'); };
+const eq  = (a, b, m) => { if (a !== b) fails.push(m + ' (got ' + JSON.stringify(a).slice(0,40) + ')'); };
+
+// hidden when not an API/IOG account
+eq(run('cad', { found: false }), '', 'cad (no api) → empty');
+eq(run('', { found: true, integration: 'official', charge_mode_entity: 'x' }), '', 'no mode → empty');
+
+// API + undetected → nudge to install, plus caveats
+const nud = run('cad+api', { found: false });
+has(nud, 'Using an Ohme charger', 'nudge head');
+has(nud, 'Install the official Ohme', 'nudge install');
+has(nud, 'optimistically', 'nudge explains optimistic fallback');
+has(nud, 'github.com', 'feedback link');
+
+// API + detected (official) → verified copy + entity + caveats
+const ver = run('api', { found: true, integration: 'official',
+                         charge_mode_entity: 'select.ohme_home_pro_charge_mode' });
+has(ver, 'charge mode detected', 'verified head');
+has(ver, 'verified off-peak', 'verified body');
+has(ver, 'select.ohme_home_pro_charge_mode', 'entity shown');
+has(ver, 'official Ohme integration', 'official name');
+
+// dan-r naming
+const dr = run('api+mini', { found: true, integration: 'danr',
+                            charge_mode_entity: 'binary_sensor.ohme_x_charge_slot_active' });
+has(dr, "dan-r's HomeAssistant-Ohme", 'danr name');
+
+if (fails.length) { console.log('FAIL\n' + fails.join('\n')); process.exit(1); }
+console.log('OK');
+"""
+
+    def test_ohme_ev_note(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        p = os.path.join(d, "h.js")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(self.HARNESS)
+        out = subprocess.run(["node", p, TMPL], capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("OK", out.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -425,6 +425,7 @@ var _serverConfig = JSON.parse(JSON.stringify(config));
 let entities = [];
 var hasData  = {{ has_data | tojson }};
 var DATA_SOURCE_MODE = {{ data_source_mode | tojson }};
+var OHME_DETECTION = {{ ohme_detection | tojson }};
 // Timezone select HTML — rendered server-side to avoid JS string escaping issues
 var TZ_SELECT_HTML = {{ tz_select_html | tojson }};
 function buildTzSelect(id, currentTz) {
@@ -672,6 +673,39 @@ function buildMainCard(meterId, meter) {
 }
 
 // ── Sub-meter card ────────────────────────────────────────────────────────────
+// Ohme guidance for the EV card, shown only on Octopus/IOG (API) accounts.
+// Detection-aware: confirms the verified path when a charge-mode entity was
+// found, otherwise nudges installing an integration. Always flags the
+// session-based energy sensor (read-sensor caveat) and asks for GitHub feedback,
+// since the Ohme path is new and unvalidated on live hardware.
+function ohmeEvNote() {
+  var mode = (typeof DATA_SOURCE_MODE !== 'undefined' && DATA_SOURCE_MODE) ? DATA_SOURCE_MODE : '';
+  if (mode.indexOf('api') === -1) return '';   // Octopus / IOG (API) accounts only
+  var det = (typeof OHME_DETECTION !== 'undefined' && OHME_DETECTION) ? OHME_DETECTION : {};
+  var gh = 'https://github.com/RGx01/energy-meter-tracker-addon/issues';
+  var head, body;
+  if (det && det.found) {
+    var integ = det.integration === 'official' ? 'the official Ohme integration'
+              : det.integration === 'danr'     ? "dan-r's HomeAssistant-Ohme"
+              : 'an Ohme integration';
+    head = 'Ohme charge mode detected';
+    body = 'EMT found ' + integ +
+           (det.charge_mode_entity ? ' (<code>' + esc(det.charge_mode_entity) + '</code>)' : '') +
+           ' and is using verified off-peak detection for this charger — smart charges are priced off-peak and manual boosts stay at peak.';
+  } else {
+    head = 'Using an Ohme charger?';
+    body = "Install the official Ohme integration or dan-r's HomeAssistant-Ohme to give EMT a charge-mode signal. " +
+           'It can then tell a smart (off-peak) charge from a manual boost and price your Intelligent Octopus rates accurately. ' +
+           'Without one, planned charge windows are priced optimistically (still bounded by measured draw).';
+  }
+  var feedback = 'Ohme support is new and not yet validated on live hardware — please share feedback and your add-on log on <a href="' + gh + '" target="_blank" rel="noopener">GitHub</a>.';
+  return '<div class="info-box" style="border-left:3px solid #8b5cf6;">' +
+           '<strong>' + head + '</strong>' +
+           '<div style="margin-top:6px;">' + body + '</div>' +
+           '<div style="margin-top:6px;color:var(--muted);">' + feedback + '</div>' +
+         '</div>';
+}
+
 function buildSubCard(meterId, meter) {
   var meta     = meter.meta || {};
   var channels = meter.channels || {};
@@ -744,6 +778,7 @@ function buildSubCard(meterId, meter) {
       '</ul>' +
       'Rate defaults to main meter rate — change only if this device has a different tariff.' +
     '</div>' +
+    (isEV ? ohmeEvNote() : '') +
 
     '<div class="grid-2">' +
       '<input type="hidden" class="js-meter-id" data-meter="' + meterId + '" value="' + esc(meterId) + '">' +

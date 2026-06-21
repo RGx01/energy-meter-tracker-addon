@@ -3198,8 +3198,15 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None, curren
                     break
                 cg = float(cg)
                 days_carbon[day][hh_index] = cg
-                # Intensity only meaningful when net != 0
-                if net != 0:
+                # Carbon intensity is the grid's gCO2/kWh at this time — a property
+                # of the grid, independent of how much we drew. Prefer the value
+                # stored at write time (3.0.0+), which is defined even for a
+                # zero-net block (so it no longer leaves an empty cell); fall back
+                # to carbon_g/net for pre-3.0.0 blocks that predate the column.
+                ci = md.get("carbon_intensity_g")
+                if ci is not None:
+                    days_intensity[day][hh_index] = round(abs(float(ci)), 1)
+                elif net != 0:
                     days_intensity[day][hh_index] = round(abs(cg / net), 1)
                 break
         except Exception:
