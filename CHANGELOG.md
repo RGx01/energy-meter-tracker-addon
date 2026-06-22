@@ -1,11 +1,52 @@
 # Changelog
 
+## [3.0.0] — 2026-06-21
+
+*The largest release since EMT began. v3 turns a meter-reading recorder into a billing-grade energy ledger: it can reconcile every block against the settled half-hourly data your supplier actually bills from (Octopus / Kraken DCC), understands Intelligent Octopus Go smart-charge slots, and accounts for grid carbon intensity across the whole app. This is a **major-additive release — nothing breaks**. Existing 2.x installs upgrade in place, keep behaving exactly as before, and switch the new capabilities on when they're ready. Everything new is opt-in through the Setup Wizard. See **Upgrading** at the foot of this entry.*
+
+### Added
+
+- **Octopus / Kraken DCC settlement** — EMT can now reconcile each block against the settled half-hourly consumption your supplier bills from, fetched directly from the Kraken platform. It pulls settled import (and export), unit rates and standing charges on a schedule, runs an automatic settlement sweep with a horizon back-stop so older blocks get reconciled as the data lands, and retries transient failures. A **billing-source toggle** (Meter sensor vs Supplier API) chooses which figures drive your bill. Credentials are entered in-app with a keep-or-replace flow and a disconnect/clear action — no YAML. Rate corrections are gated until a block is DCC-settled, so a manual edit can't fight the authoritative figure.
+
+- **Data-source modes & supplier-first setup** — the Setup Wizard now leads with your supplier and meter situation, then configures the right data path: **`cad`** (local CAD/sensor only — exactly how 2.x works) or **`cad+api`** (local readings plus supplier-API settlement and telemetry). A **Change Setup** launcher lets you move between modes later, behind a confirmation because a switch can trigger a full recalculation. Configuration is mode-aware — options that don't apply to your setup are hidden.
+
+- **Octopus Home Mini live power** — if you have an Octopus Home Mini, EMT can use its real-time demand feed as a live-power source for the gauges and 48-hour history without a separate CAD sensor, with exponential backoff and rate-limit-aware polling. (Mini figures are treated as provisional; DCC wins once a block settles.)
+
+- **Intelligent Octopus Go dispatch overlay** — for IOG users, EMT captures smart-charge dispatch slots and reprices the affected blocks at the off-peak rate they were actually charged at, applied at both finalise and DCC settlement. Per-device **"use dispatch overlay" rates** let an EV charger bill at the dispatch rate while the rest of the house stays on the standard tariff. A 0.1 kWh validation floor ignores meter jitter.
+
+- **Grid carbon intensity** — EMT records gCO₂/kWh for every block (🇬🇧 UK, postcode-based) and surfaces it throughout: a **Carbon Insights** page (house / solar / EV / battery / heat-pump breakdown, gCO₂/mile, generation mix), CO₂ columns and charts in Usage Stats, and a gCO₂/kWh **heatmap** mode. A one-time historical backfill fills carbon data for your existing 2.x blocks in the background after first start.
+
+- **Per-channel rate source (API rates vs sensor)** — each channel can independently take its unit rate from the supplier API or from a sensor, so mixed setups work (e.g. API import rates alongside a sensor-supplied export rate).
+
+- **Power-sensor invert & unit override** — any power sensor (main, EV, heat pump, battery) can now have its sign inverted and its unit forced to W or kW. This fixes live-power and 48-hour charts that read reversed (sensor sign convention opposite EMT's) or 1000× wrong (a sensor that emits watt-scale numbers while declaring its unit as kW, which no auto-heuristic can catch).
+
+- **Ohme EV charger support** — detection-aware handling for Ohme chargers, preferring the charger's own session sensor where available. Ships conservatively, with a feedback path in the config UI for Ohme users to report behaviour.
+
+### Improved
+
+*Lighter-touch refinements to things 2.x users already rely on:*
+
+- **"Devices" replaces "sub-meters"** — your EV charger, battery and heat pump are now called **Devices** throughout the UI. No data or configuration change.
+- **Overview page (formerly Live Power)** — the Live Power page is now **Overview** and renders even without a live-power sensor, so postcode-only installs still get generation mix and carbon context.
+- **EV grid attribution (issue #212)** — when an EV and a battery draw at the same time and grid import only covers part of it (solar filling the rest), the EV now claims grid import **first** instead of the largest load winning. An EV on a cheap smart-charge slot no longer vanishes from the grid view behind a simultaneously-charging battery. Bill totals are unchanged — only the per-device attribution is corrected.
+- **Block delete redesign** — deleting blocks now cascades device rows, reseeds the following block's opening reads and recomputes the remainder, so a delete no longer leaves orphaned device data or a gap.
+- **BottlecapDave (BCD) awareness** — if you run the BCD Octopus integration, EMT detects it and adjusts so the two don't double up on live-power polling.
+- **Billing consistency & restart robustness** — many reconciliation, gap-fill, restart-recovery and cost-rounding refinements across the api+mini path, so totals stay self-consistent across restarts and configuration changes.
+
+### Upgrading
+
+- **Nothing breaks.** Your blocks, configuration and history are preserved. Schema migrations run automatically on first start, and a one-time carbon-intensity backfill runs in the background (UK postcode installs).
+- **You don't have to change anything.** Leaving the data-source mode at `cad` keeps EMT behaving exactly as 2.x did. DCC settlement, Mini live power and the dispatch overlay are all opt-in via the Setup Wizard / Change Setup.
+- If you configured the Octopus API before the supplier field existed, EMT infers Octopus from your existing credentials. A restored v2-era backup with no supplier field defaults cleanly to local-metering-only.
+- See **Upgrading from 2.x** in the README for the full walk-through.
+
+---
+
 ## [2.10.9] — 2026-06-03
 
 ### Fixed
 
 - **Rogue sub-meter kWh from identical pre/post reads** — when HA restarted briefly during an active block, the gap-fill logic detected identical pre and post reads on sub-meters (sensor value unchanged during the outage) and incorrectly treated this as a daily sensor reset. The reset handler used the full cumulative register value as the block's kWh (e.g. 5798.914 kWh for a battery, 19.38 kWh for an EV charger) instead of a delta of zero. Fixed by splitting the `post_read <= pre_read` condition into two cases: `==` (unchanged sensor, delta is zero) and `<` (genuine register reset, use post_read value).
-
 - **Double gap fill on rapid HA reconnects** — if HA disconnected and reconnected twice in quick succession, `engine_startup` ran twice and both runs detected and filled the same gap. The second fill overwrote the first with slightly different interpolated values. Fixed by checking for an existing interpolated block before writing a gap block — if one already exists for that window, the gap fill is skipped.
 
 ---

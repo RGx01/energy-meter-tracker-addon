@@ -104,8 +104,12 @@
   <div id="backup-list" style="font-size:13px;color:var(--muted);">Loading...</div>
 </div>
 
-<!-- ── Settlement Source ────────────────────────────────────────────────────── -->
-<div class="card">
+<!-- ── Settlement Source (supplier-API only) ───────────────────────────────────
+     Hidden by default; loadBillingSource() reveals it only when a supplier API
+     is configured (valid key + verified account). Without one, DCC settlement
+     can never arrive, so the DCC/CAD toggle and the "awaiting DCC settlement"
+     count would be meaningless. -->
+<div class="card" id="settlement-source-card" style="display:none;">
   <div class="card-title">⚖️ Billing Settlement Source</div>
   <p style="color:var(--muted);font-size:13px;margin-bottom:16px;line-height:1.7;">
     Choose which figures drive your billing. <strong>DCC</strong> uses Octopus's
@@ -757,11 +761,16 @@ function loadBillingSource() {
           ? 'DCC settlement' : 'CAD readings') + '. '
           + (d.unsettled || 0) + ' block(s) awaiting DCC settlement.';
       }
-      // Show the unsettled-review card only in DCC mode.
-      var uc = document.getElementById('unsettled-card');
-      if (uc) uc.style.display = (d.source === 'dcc') ? '' : 'none';
-      // Retry settlement only makes sense when a supplier API is configured.
+      // The settlement-source control only makes sense with a supplier API
+      // configured (valid key + verified account). Without one, DCC settlement
+      // can never arrive — hide the whole card rather than offer a meaningless
+      // DCC/CAD toggle and a misleading "awaiting DCC settlement" count.
       window._apiAvailable = !!d.api_available;
+      var sc = document.getElementById('settlement-source-card');
+      if (sc) sc.style.display = d.api_available ? '' : 'none';
+      // Show the unsettled-review card only in DCC mode AND with an API present.
+      var uc = document.getElementById('unsettled-card');
+      if (uc) uc.style.display = (d.source === 'dcc' && d.api_available) ? '' : 'none';
       var rb = document.getElementById('btn-retry-settle');
       if (rb) rb.style.display = (d.source === 'dcc' && d.api_available) ? '' : 'none';
     })
@@ -776,9 +785,8 @@ function applyBillingSource() {
   showConfirm({
     title: 'Change billing source',
     message: 'Switch billing to <strong>' + label + '</strong>?<br><br>'
-      + 'This runs a large recalculation across your whole history. It '
-      + 'can\u2019t be stopped once it starts, but you can switch back to '
-      + (source === 'dcc' ? 'CAD' : 'DCC') + ' afterwards if you change your mind.',
+      + 'This re-calculates your entire history and can take a few minutes '
+      + 'to complete in the background.',
     okLabel: 'Switch to ' + (source === 'dcc' ? 'DCC' : 'CAD'),
     onConfirm: function() { _doApplyBillingSource(source); }
   });

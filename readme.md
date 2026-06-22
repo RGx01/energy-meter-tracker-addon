@@ -73,10 +73,12 @@ A Home Assistant add-on that records your electricity usage in precise configura
 
 - Records import and export meter readings at configurable reconciliation period boundaries — 5, 15 or 30 minutes — matching your supplier's billing resolution
 - Interpolates precisely to the boundary timestamp so block deltas are billing-accurate
-- Tracks sub-meters (EV charger, home battery, heat pump) and distributes grid consumption across them
+- Tracks Devices — EV charger, home battery, heat pump — and distributes grid consumption across them
+- Optionally reconciles every block against your supplier's settled half-hourly data (Octopus / Kraken DCC) for billing-grade accuracy
+- Understands Intelligent Octopus Go smart-charge slots and prices the affected blocks at the off-peak rate you were actually charged
 - Fills gaps automatically if the add-on restarts mid-session
 - Publishes four cumulative sensors back to Home Assistant, compatible with the HA Energy dashboard
-- Serves a local web UI on port 8099 for configuration, charts, insights, live power and data management
+- Serves a local web UI on port 8099 for configuration, charts, insights, Overview and data management
 - Records grid carbon intensity at every block (🇬🇧 UK, postcode required) for per-period carbon accounting
 - **Carbon Insights** — house consumption, solar offset, EV mileage and gCO₂/mile, battery charging behaviour, heat pump vs gas comparison, grid generation mix breakdown
 - **Usage Insights** — cost breakdown by meter, rate period distribution, grid position, peak demand window, per-device costs with period comparison narrative in plain English
@@ -99,6 +101,41 @@ Full documentation is on the **[GitHub Wiki](https://github.com/RGx01/energy-met
 | [Data Management](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Data-Management) | Backups, restore, corrections |
 | [Sensor Requirements](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Sensor-Requirements-and-Known-Limitations) | Sensor types, units, known limitations |
 | [Carbon Intensity](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Carbon-Intensity) | How carbon data is fetched and used |
+
+---
+
+## What's new in 3.0
+
+EMT 3.0 is the largest release so far — and a **major-additive one: nothing breaks**. Existing installs upgrade in place, keep working exactly as before, and switch the new things on when ready. Everything new is opt-in through the Setup Wizard.
+
+### 3.0.0
+- **🔌 Supplier settlement (Octopus / Kraken DCC)** — reconcile every block against the settled half-hourly data your supplier actually bills from. A billing-source toggle chooses whether your bill is driven by your meter sensor or the supplier API; credentials are entered in-app (no YAML), and corrections are gated until a block is settled. Opt-in.
+- **🧙 Supplier-first Setup Wizard & data-source modes** — setup now starts from your supplier and meter situation and configures the right path: **`cad`** (local sensor only, as in 2.x) or **`cad+api`** (local readings plus supplier settlement). A **Change Setup** launcher lets you switch later.
+- **🚗 Intelligent Octopus Go awareness** — EMT captures IOG smart-charge dispatch slots and prices the affected blocks at the off-peak rate you were actually charged, at both finalise and settlement. Per-device "use dispatch overlay" rates let your EV bill at the dispatch rate while the house stays on the standard tariff.
+- **📡 Octopus Home Mini live power** — use a Home Mini's real-time demand feed for the gauges and 48-hour history without a separate CAD sensor.
+- **🌍 Grid carbon intensity everywhere** — gCO₂/kWh recorded on every block, with a Carbon Insights page, CO₂ columns and charts in Usage Stats, and a gCO₂/kWh heatmap mode. A one-time backfill fills carbon data for your existing 2.x history.
+- **🔁 Per-channel rate source** — each channel can take its unit rate from the API or a sensor independently (mix as needed).
+- **🔧 Power-sensor invert & unit override** — fix sensors that read reversed or 1000× wrong (sign convention or a mis-declared W/kW unit) on the main, EV, heat pump or battery.
+- **🔋 Ohme EV charger support** — detection-aware, preferring the charger's own session sensor. Ships conservatively, with an in-app feedback path.
+- **Renamed for clarity** — "sub-meters" are now **Devices**; the **Live Power** page is now **Overview** and works even without a live-power sensor.
+- **EV grid attribution fix (#212)** — when an EV and a battery charge at once and solar covers part of it, the EV now claims grid import first, so a cheap smart-charge no longer disappears behind a charging battery. Bill totals unchanged.
+
+See the [full changelog](CHANGELOG.md) for the complete list.
+
+---
+
+## Upgrading from 2.x
+
+**3.0 is a drop-in upgrade. Nothing you have changes, and nothing new is forced on you.**
+
+- **Your data is preserved.** Blocks, configuration, billing periods and history all carry over. Schema migrations run automatically on first start.
+- **Carbon backfill runs once, in the background.** UK postcode installs get a one-time pass that fills gCO₂/kWh for your existing 2.x blocks. It self-heals if interrupted by a restart — no action needed.
+- **Your setup behaves exactly as before.** The data-source mode defaults to **`cad`** (local metering only), which is precisely how 2.x worked. You'll see the new terminology (Devices, Overview) and the new pages, but your recording and billing are unchanged.
+- **The supplier features are opt-in.** When you're ready, open the **Setup Wizard** (or **Change Setup**) to add Octopus/Kraken DCC settlement, Home Mini live power, or Intelligent Octopus Go dispatch pricing. Switching modes is gated behind a confirmation because it can trigger a full recalculation.
+- **Already had the Octopus API configured?** EMT infers your supplier from the existing credentials — no re-entry needed.
+- **Restoring an old backup?** A v2-era backup with no supplier field restores cleanly as local-metering-only.
+
+If anything looks off after upgrading, your previous data is untouched and you can review it in **Data Management** → backups.
 
 ---
 

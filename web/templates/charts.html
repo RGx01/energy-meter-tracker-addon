@@ -1289,29 +1289,14 @@ function barStandingVal(agg) {
   return agg.standing || 0;
 }
 
-// Full-property CO2 import + export offset for a period, summed across every
-// meter the same way the per-meter table does (main meter contributes its
-// carbon_g_imp; sub-meters contribute their gross carbon_g; only the main meter
-// has carbon_g_exp). This is the basis for the net/Total = total import - export,
-// INCLUDING the EV/battery — not the house-direct carbon_g_net.
-function barCo2ImpExp(agg) {
-  var imp = 0, exp = 0;
-  Object.values(agg.meters || {}).forEach(function(m) {
-    imp += (m.carbon_g_imp != null) ? m.carbon_g_imp : (m.carbon_g || 0);
-    exp += (m.carbon_g_exp || 0);
-  });
-  return { imp: imp, exp: exp };
-}
-
 function barGetDatasets(labels, aggList) {
   if (barView === 'net') {
     return [{
       label: 'Net',
       data: aggList.map(function(agg) {
         if (barMetric === 'co2') {
-          var ie = barCo2ImpExp(agg);
-          var v = ie.imp - ie.exp;
-          return (agg.carbon_g_net != null || ie.imp || ie.exp) ? Math.round(v * 100) / 100 : null;
+          var v = agg.carbon_g_net;
+          return v != null ? Math.round(v * 100) / 100 : null;
         }
         var imp = barMetric === 'kwh' ? agg.imp_kwh  : (agg.imp_cost + barStandingVal(agg));
         var exp = barMetric === 'kwh' ? agg.exp_kwh  :  agg.exp_cost;
@@ -1319,9 +1304,8 @@ function barGetDatasets(labels, aggList) {
       }),
       backgroundColor: aggList.map(function(agg) {
         if (barMetric === 'co2') {
-          var ie = barCo2ImpExp(agg);
-          var v = ie.imp - ie.exp;
-          return (v >= 0) ? (barMeters[0] && barMeters[0].color || '#1f77b4') : barExportColor;
+          var v = agg.carbon_g_net;
+          return (v == null || v >= 0) ? (barMeters[0] && barMeters[0].color || '#1f77b4') : barExportColor;
         }
         var imp = barMetric === 'kwh' ? agg.imp_kwh : (agg.imp_cost + barStandingVal(agg));
         var exp = barMetric === 'kwh' ? agg.exp_kwh : agg.exp_cost;
@@ -1409,19 +1393,12 @@ function barAggRows(filterFn) {
     // carbon_g: NULL-aware — only accumulate when data exists (post-2.3.0 blocks)
     if (row.carbon_g_net != null)   result.carbon_g_net   = (result.carbon_g_net   || 0) + row.carbon_g_net;
     if (row.carbon_g_total != null) result.carbon_g_total = (result.carbon_g_total || 0) + row.carbon_g_total;
-    // avg_intensity: weight the server's per-row intensity (already a correct
-    // per-block weighted average) by the day's energy throughput. The previous
-    // code re-derived intensity as abs(daily_net_carbon)/abs(daily_net_kwh),
-    // which exploded on near-balanced days (tiny net kWh) to thousands of
-    // gCO2/kWh — blowing out the chart axis and burying normal days so they
-    // looked "missing". throughput weight keeps single-day values exact.
-    if (row.avg_intensity != null) {
-      var _aiW = Math.abs(row.imp_kwh || 0) + Math.abs(row.exp_kwh || 0);
-      if (_aiW > 0) {
-        _aiCarbon += row.avg_intensity * _aiW;
-        _aiKwh    += _aiW;
-        _aiHasData = true;
-      }
+    // avg_intensity: weighted average using abs(carbon_g) / abs(net_kwh)
+    if (row.avg_intensity != null && row.carbon_g_net != null) {
+      var absKwh = Math.abs((row.imp_kwh || 0) - (row.exp_kwh || 0));
+      _aiCarbon += Math.abs(row.carbon_g_net);
+      _aiKwh    += absKwh;
+      _aiHasData = true;
     }
     Object.keys(row.meters || {}).forEach(function(mid) {
       if (!result.meters[mid]) result.meters[mid] = {imp_kwh:0,imp_cost:0,exp_kwh:0,exp_cost:0,carbon_g:null,carbon_g_imp:null,carbon_g_exp:null};
@@ -1930,19 +1907,20 @@ function barBuildTable() {
       return imp - exp;
     }
     if (col.key === 'net_imp') {
+      // Net view = gross import vs gross export, netting to Total (carbon_g_net),
+      // identical in shape to the kWh/£ Net columns. For CO2 the gross import
+      // carbon is the main meter's carbon_g_imp (sub-meters draw through it and
+      // carry no carbon_g_imp, so the sum collapses to the main's figure).
+      // Using the net-positive split here was the bug: it forced import to 0 on
+      // any net-offsetting day and to the net (not gross) value otherwise.
       if (barMetric === 'co2') {
-        // Total import carbon across the whole property (house + EV + battery),
-        // matching the per-meter table. Total = net_imp - net_exp = total
-        // import - export. NOT the net's positive part (which hid the export
-        // offset on net-import days) and NOT house-direct only.
-        return barCo2ImpExp(agg).imp;
+        return Object.values(agg.meters||{}).reduce(function(s,m){ return s+(m.carbon_g_imp||0); }, 0);
       }
       return barMetric === 'kwh' ? (agg.imp_kwh || 0) : ((agg.imp_cost || 0) + barStandingVal(agg));
     }
     if (col.key === 'net_exp') {
       if (barMetric === 'co2') {
-        // Real gross export offset (positive magnitude — rowTotal subtracts it).
-        return barCo2ImpExp(agg).exp;
+        return Object.values(agg.meters||{}).reduce(function(s,m){ return s+(m.carbon_g_exp||0); }, 0);
       }
       return barMetric === 'kwh' ? (agg.exp_kwh || 0) : (agg.exp_cost || 0);
     }
@@ -1964,9 +1942,15 @@ function barBuildTable() {
     var m = (agg.meters||{})[col.mid];
     if (!m) return barMetric === 'co2' ? null : 0;
     if (barMetric === 'co2') {
-      // main meter: use carbon_g_imp (import portion only)
-      // sub-meters: use carbon_g (gross import, no export)
-      var cgi = m.carbon_g_imp != null ? m.carbon_g_imp : m.carbon_g;
+      // Each meter's import-side carbon contribution:
+      //   main meter -> carbon_g is the DIRECT remainder (import carbon minus
+      //                 the sub-meters that draw through it)
+      //   sub-meters -> carbon_g is their gross import carbon (no export)
+      // carbon_g_imp is the main's *un-subtracted* gross import and must NOT be
+      // used here — it already contains the sub carbon, so reading it would
+      // double-count the subs against the Direct column (and inflate the row
+      // Total). This matches barVal()'s chart logic and the Insights page.
+      var cgi = m.carbon_g;
       return cgi != null ? cgi : null;
     }
     return barMetric === 'kwh' ? m.imp_kwh : m.imp_cost;
