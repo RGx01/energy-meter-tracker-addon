@@ -691,6 +691,7 @@ def _is_meter_type(meta: dict, meter_id: str, expected_type: str) -> bool:
 
 def _build_soc_response(soc_sensors, ha_client):
     """Safely build SoC sensor readings dict for the live power API response."""
+    import engine as _eng_pc
     result = {}
     for m_id, info in soc_sensors.items():
         soc_val = None
@@ -706,23 +707,16 @@ def _build_soc_response(soc_sensors, ha_client):
             if ha_client and info.get("power_entity"):
                 v = ha_client.get_state(info["power_entity"])
                 if v not in (None, "unknown", "unavailable"):
-                    fv = float(v)
-                    # Use unit_of_measurement to determine W vs kW — don't guess from magnitude
                     unit = ""
                     try:
-                        attrs = ha_client.get_attributes(info["power_entity"])
-                        unit = (attrs or {}).get("unit_of_measurement", "")
+                        unit = (ha_client.get_attributes(info["power_entity"])
+                                or {}).get("unit_of_measurement", "")
                     except Exception:
                         pass
-                    if unit.upper() == "W":
-                        fv = fv / 1000.0
-                    elif unit.upper() not in ("KW", "kW"):
-                        # Unknown unit — fall back to magnitude heuristic
-                        fv = fv / 1000.0 if abs(fv) > 100 else fv
-                    # Invert if sensor convention is positive=charging, negative=discharging
-                    if info.get("power_invert"):
-                        fv = -fv
-                    power_kw = round(fv, 3)
+                    # Shared converter: unit attr → kW (override when the declared
+                    # unit is wrong/absent), then invert (positive = charging).
+                    power_kw = _eng_pc._power_value_to_kw(
+                        v, unit, info.get("power_unit"), info.get("power_invert"))
         except (ValueError, TypeError):
             pass
         result[m_id] = {
@@ -819,6 +813,8 @@ def api_power():
         power_sensor = bat_sensor = ev_sensor = None
         power_source = None  # e.g. "mini" — Octopus Mini opted in as the live source
         postcode_prefix = None
+        _main_power_invert = False
+        _main_power_unit = None
         soc_sensors = {}  # {meter_id: {soc, inverter_power}}
         from datetime import datetime as _dt2
         _today = _dt2.now().strftime("%Y-%m-%d")
@@ -831,6 +827,10 @@ def api_power():
                 power_sensor = meta.get("power_sensor")
                 power_source = meta.get("power_source")
                 postcode_prefix = meta.get("postcode_prefix")
+                # invert / unit-override apply to the user's OWN sensor only.
+                if power_sensor:
+                    _main_power_invert = bool(meta.get("power_invert", False))
+                    _main_power_unit = meta.get("power_unit") or None
             elif _is_meter_type(meta, m_id, "battery"):
                 bat_sensor = ((m_data.get("channels") or {}).get("import") or {}).get("read")
                 if meta.get("soc_sensor") or meta.get("inverter_power_sensor"):
@@ -838,6 +838,7 @@ def api_power():
                         "soc_entity":    meta.get("soc_sensor"),
                         "power_entity":  meta.get("inverter_power_sensor"),
                         "power_invert":  bool(meta.get("inverter_power_invert", False)),
+                        "power_unit":    meta.get("inverter_power_unit") or None,
                         "label":         meta.get("device") or m_id,
                         "type":          "battery",
                     }
@@ -847,6 +848,8 @@ def api_power():
                     soc_sensors[m_id] = {
                         "soc_entity":   None,
                         "power_entity": meta.get("device_power_sensor"),
+                        "power_invert": bool(meta.get("device_power_invert", False)),
+                        "power_unit":   meta.get("device_power_unit") or None,
                         "label":        meta.get("device") or m_id,
                         "type":         "ev",
                         "v2x":          bool(meta.get("v2x_capable")),
@@ -856,35 +859,30 @@ def api_power():
                     soc_sensors[m_id] = {
                         "soc_entity":   None,
                         "power_entity": meta.get("device_power_sensor"),
+                        "power_invert": bool(meta.get("device_power_invert", False)),
+                        "power_unit":   meta.get("device_power_unit") or None,
                         "label":        meta.get("device") or m_id,
                         "type":         "heat_pump",
                     }
 
-        def sensor_kw(entity_id):
+        def sensor_kw(entity_id, invert=False, unit_override=None):
             if not entity_id or not _ha_client:
                 return None
             val = _ha_client.get_state(entity_id)
             if val in (None, "unknown", "unavailable"):
                 return None
-            try:
-                fv = float(val)
-            except (ValueError, TypeError):
-                return None
-            # Respect the sensor's unit rather than assuming kW: BCD's
-            # current_demand (and many power sensors) report in watts.
             unit = ""
             try:
-                attrs = _ha_client.get_attributes(entity_id)
-                unit = ((attrs or {}).get("unit_of_measurement") or "")
+                unit = ((_ha_client.get_attributes(entity_id) or {})
+                        .get("unit_of_measurement") or "")
             except Exception:
                 pass
-            u = unit.upper()
-            if u == "W":
-                fv = fv / 1000.0
-            elif u != "KW":
-                # No/unknown unit — small magnitudes are kW, large are W.
-                fv = fv / 1000.0 if abs(fv) > 100 else fv
-            return round(fv, 3)
+            # Shared converter: unit attr → kW, override when the declared unit is
+            # wrong/absent (a CT sensor labelled kW but emitting W-scale numbers),
+            # then invert for sensors wired import-negative. Falls back to the
+            # magnitude heuristic when the unit is missing.
+            import engine as _eng_pc
+            return _eng_pc._power_value_to_kw(val, unit, unit_override, invert)
 
         def derive_kw(reads):
             if not reads or len(reads) < 2:
@@ -928,7 +926,11 @@ def api_power():
         if effective_ps:
             # Main meter — direct power sensor: the user's own, or BCD's
             # current_demand auto-adopted (kW after sensor_kw's unit handling).
-            net_kw = sensor_kw(effective_ps)
+            # invert / unit-override apply to the user's OWN sensor only.
+            _own = (effective_ps == power_sensor)
+            net_kw = sensor_kw(effective_ps,
+                               invert=(_main_power_invert if _own else False),
+                               unit_override=(_main_power_unit if _own else None))
             imp_kw = max(0.0, net_kw)  if net_kw is not None else None
             exp_kw = max(0.0, -net_kw) if net_kw is not None else None
         elif mini_active:

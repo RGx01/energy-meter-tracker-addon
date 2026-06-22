@@ -1730,7 +1730,20 @@ def _apply_pass2(block: dict) -> None:
             }
             protected.append(entry)  # all sub-meters are protected (inverter_possible removed)
 
-        protected.sort(key=lambda x: x["kwh"], reverse=True)
+        # Grid-attribution priority: the EV claims grid import FIRST, then every
+        # other device (batteries, heat pump) clips to whatever grid remains.
+        # EV charging is grid-charging by design — on IOG/smart-charge the supplier
+        # is deliberately pulling cheap grid for the car — so the car's import must
+        # land on the grid, not get squeezed out. The old order (biggest draw first)
+        # handed the whole grid pool to a simultaneously-charging battery and
+        # labelled the car's grid charge as battery-sourced, so the car vanished
+        # from the grid view until the battery filled (issue #212). Whatever the
+        # battery then can't source from grid is its own non-grid (solar) charge.
+        def _grid_priority(e):
+            is_ev = ((e["meter_block"].get("meta", {}) or {}).get("meter_type")
+                     == "ev")
+            return (0 if is_ev else 1, -e["kwh"])   # EVs first, then desc by kWh
+        protected.sort(key=_grid_priority)
         unprotected.sort(key=lambda x: x["kwh"], reverse=True)
 
         is_interpolated = block.get("interpolated", False)
@@ -1921,6 +1934,30 @@ def _commit_provisional_as_final(ha: HAClient, full_block: dict,
         logger.warning("_amend_provisional: sensor republish failed: %s", _se)
 
 
+def _apply_intensity_to_block(block: dict, intensity: float) -> None:
+    """Attribute carbon_g + carbon_intensity_g to every meter in *block* using a
+    known grid intensity (gCO2/kWh).
+
+    Shared by the live CI-table attribution (_attribute_block_carbon) and the
+    historical backfill (_run_historical_carbon_backfill), so both produce
+    identical per-meter carbon: sub-meters bill their gross import; the main
+    meter nets export against import."""
+    for meter_name, meter_block in block.get("meters", {}).items():
+        meta   = meter_block.get("meta", {}) or {}
+        imp_ch = (meter_block.get("channels") or {}).get("import")
+        exp_ch = (meter_block.get("channels") or {}).get("export")
+        if meta.get("sub_meter", False):
+            imp_kwh  = float((imp_ch or {}).get("kwh", 0.0) or 0.0)
+            carbon_g = round(imp_kwh * intensity, 4)
+        else:
+            imp_kwh  = float((imp_ch or {}).get("kwh_total",
+                       (imp_ch or {}).get("kwh", 0.0)) or 0.0)
+            exp_kwh  = float((exp_ch or {}).get("kwh", 0.0) or 0.0)
+            carbon_g = round((imp_kwh - exp_kwh) * intensity, 4)
+        meter_block["carbon_g"] = carbon_g
+        meter_block["carbon_intensity_g"] = intensity
+
+
 def _attribute_block_carbon(block: dict, start: str) -> bool:
     """Look up the nearest carbon-intensity slot for *start* and attribute
     carbon_g (+ persist carbon_intensity_g) to every meter in *block*.
@@ -1951,21 +1988,7 @@ def _attribute_block_carbon(block: dict, start: str) -> bool:
                 return False
         except Exception:
             pass
-        intensity = ci_row["intensity"]
-        for meter_name, meter_block in block.get("meters", {}).items():
-            meta   = meter_block.get("meta", {}) or {}
-            imp_ch = (meter_block.get("channels") or {}).get("import")
-            exp_ch = (meter_block.get("channels") or {}).get("export")
-            if meta.get("sub_meter", False):
-                imp_kwh  = float((imp_ch or {}).get("kwh", 0.0) or 0.0)
-                carbon_g = round(imp_kwh * intensity, 4)
-            else:
-                imp_kwh  = float((imp_ch or {}).get("kwh_total",
-                           (imp_ch or {}).get("kwh", 0.0)) or 0.0)
-                exp_kwh  = float((exp_ch or {}).get("kwh", 0.0) or 0.0)
-                carbon_g = round((imp_kwh - exp_kwh) * intensity, 4)
-            meter_block["carbon_g"] = carbon_g
-            meter_block["carbon_intensity_g"] = intensity
+        _apply_intensity_to_block(block, ci_row["intensity"])
         return True
     except Exception as e:
         logger.warning("_attribute_block_carbon: failed for %s: %s", start, e)
@@ -3054,20 +3077,30 @@ async def _poll_mini_demand_kw(now) -> float | None:
         return None
 
 
-def _power_value_to_kw(value, unit) -> float | None:
-    """Convert a power sensor reading to kW, respecting its unit_of_measurement:
-    W → ÷1000, kW as-is, unknown/missing → magnitude heuristic (>100 ⇒ watts).
-    Returns None for non-numeric values. Mirrors the server's sensor_kw so BCD's
-    current_demand (watts) is recorded correctly in power_history."""
+def _power_value_to_kw(value, unit, unit_override=None, invert=False) -> float | None:
+    """Convert a power sensor reading to kW.
+
+    `unit_override` ('W'/'kW', case-insensitive) forces the unit when HA's
+    unit_of_measurement is wrong or absent — e.g. a CT integration that declares
+    'kW' but emits W-scale numbers (1400 for 1.4 kW), which no magnitude heuristic
+    can catch because the (wrong) unit IS present. With no override, the sensor's
+    declared unit drives it; an absent/unknown unit falls back to the magnitude
+    heuristic (>100 ⇒ watts). `invert` negates the result for sensors whose sign
+    convention is opposite EMT's (import positive / export negative; or, for a
+    battery inverter, positive = charging). Returns None for non-numeric values.
+    Mirrors the server's sensor_kw so BCD's current_demand is recorded correctly."""
     try:
         fv = float(value)
     except (ValueError, TypeError):
         return None
-    u = (unit or "").upper()
+    ov = (unit_override or "").strip().upper()
+    u = ov if ov in ("W", "KW") else (unit or "").upper()
     if u == "W":
         fv = fv / 1000.0
     elif u != "KW":
         fv = fv / 1000.0 if abs(fv) > 100 else fv
+    if invert:
+        fv = -fv
     return round(fv, 3)
 
 
@@ -3138,6 +3171,293 @@ def _fetch_carbon_intensity(postcode: str) -> list:
     return slots
 
 
+# ── Historical carbon backfill (v2 -> v3 migration) ────────────────────────────
+# The heatmap and Usage Stats now treat the stored carbon_intensity_g as the
+# source of truth. Blocks created before CI first became available (the whole
+# pre-postcode history, including everything carried over from v2) have a NULL
+# intensity. The live recovery sweep (_recover_missing_carbon) can only reach
+# blocks still inside the 4-day CI table, so this one-shot backfill pages the
+# Carbon Intensity API's historical endpoint over the NULL span and writes the
+# intensity straight onto the blocks. Gated on "postcode exists"; runs once
+# (persistent marker); resumable (cursor); throttled to sub-14-day windows.
+_CARBON_BACKFILL_MARKER = "carbon_backfill_state"   # store_meta key
+_carbon_backfill_running = False                    # in-process re-entry guard
+
+
+def _fetch_carbon_intensity_range(postcode: str, from_iso: str, to_iso: str) -> dict:
+    """Fetch settled historical regional intensity for [from_iso, to_iso] and
+    return {slot_from -> intensity_gco2}. The Carbon Intensity API serves at most
+    a 14-day window per request, so callers must page. 'actual' is preferred over
+    'forecast' (actuals settle ~24h after each slot; every backfill target is far
+    older than that, so a real actual is always returned). Raises on HTTP/network
+    error so the caller can persist a resume cursor and stop."""
+    import urllib.request
+    import json as _json
+
+    url = (f"https://api.carbonintensity.org.uk/regional/intensity"
+           f"/{from_iso}/{to_iso}/postcode/{postcode}")
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = _json.loads(resp.read())
+
+    raw = data.get("data", [])
+    if isinstance(raw, dict):
+        entries = raw.get("data", [])
+    elif isinstance(raw, list) and raw:
+        entries = raw[0].get("data", []) if "data" in raw[0] else raw
+    else:
+        entries = []
+
+    out: dict = {}
+    for slot in entries:
+        io = slot.get("intensity", {}) or {}
+        val = io.get("actual")
+        if val is None:
+            val = io.get("forecast")
+        sf = slot.get("from")
+        if sf and val is not None:
+            out[sf.replace("Z", "").replace("+00:00", "")] = float(val)
+    return out
+
+
+def _nearest_intensity_from_map(ci_map: dict, block_start: str):
+    """Nearest slot intensity (<=60 min) for *block_start* from a
+    {slot_iso -> intensity} map. Tries the containing 30-min slot first (a direct
+    hit for 30-min-aligned blocks), then falls back to the nearest within 60 min."""
+    from datetime import datetime as _dt
+    if not ci_map:
+        return None
+    try:
+        bs = _dt.fromisoformat(str(block_start).replace("Z", "").split("+")[0])
+    except Exception:
+        return None
+    floored = bs.replace(minute=(0 if bs.minute < 30 else 30),
+                         second=0, microsecond=0)
+    hit = ci_map.get(floored.strftime("%Y-%m-%dT%H:%M"))
+    if hit is not None:
+        return hit
+    best = best_d = None
+    for k, v in ci_map.items():
+        try:
+            kd = _dt.fromisoformat(k)
+        except Exception:
+            continue
+        d = abs((bs - kd).total_seconds())
+        if d <= 3600 and (best_d is None or d < best_d):
+            best_d, best = d, v
+    return best
+
+
+async def _run_historical_carbon_backfill(window_days: int = 13,
+                                          max_windows: int = 60) -> int:
+    """One-shot historical carbon backfill. Pages the Carbon Intensity API over
+    the span of NULL-intensity blocks in sub-14-day windows, writes carbon_g +
+    carbon_intensity_g straight onto those blocks (NOT via the 4-day-pruned CI
+    table), and records a resume cursor after each window so a restart continues.
+    Idempotent: only touches NULL blocks; sets a done marker when no NULL blocks
+    remain. Returns blocks backfilled this invocation.
+
+    CONCURRENCY (this is why it is a coroutine, not a threaded worker): every
+    BlockStore read/write here runs on the event-loop thread — the same thread
+    that owns the engine's single SQLite connection (opened check_same_thread=
+    False for a *single* thread). Only the blocking CI fetch is offloaded, via
+    run_in_executor. The first cut ran the whole worker on an executor thread; its
+    DB writes then raced the main-loop _drain_pass2_queue on that one shared
+    connection and corrupted both (SQLITE_MISUSE: "bad parameter or other API
+    misuse", "cannot commit - no transaction is active"). Running the DB work on
+    the loop thread serialises it cooperatively with the drain — no shared-
+    connection race, and no second connection / last-write-wins race either.
+
+    window_days defaults to 13, NOT 14: the API's /regional/intensity/{from}/{to}
+    range cap is effectively exclusive — a [00:00..00:00] 14-day request lands one
+    half-hour period past the limit and returns HTTP 400. 13-day windows sit
+    safely under it (one extra request over the whole history; negligible).
+
+    `max_windows` bounds a single invocation; a larger history finishes across
+    successive triggers via the cursor."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    import asyncio as _aio
+    _now = lambda: _dt.now(_tz.utc).replace(tzinfo=None).isoformat()
+    if _store is None:
+        return 0
+    postcode = _get_postcode()
+    if not postcode:
+        return 0
+
+    state = _store.get_meta(_CARBON_BACKFILL_MARKER, {}) or {}
+    if state.get("done"):
+        return 0
+
+    rng = _store.get_missing_carbon_date_range()
+    if not rng:
+        _store.set_meta(_CARBON_BACKFILL_MARKER,
+                        {"done": True, "completed_at": _now()})
+        return 0
+
+    lo_iso, hi_iso = rng
+    cursor = state.get("cursor") or lo_iso
+    try:
+        cur_dt = _dt.fromisoformat(str(cursor).replace("Z", "").split("+")[0])
+    except Exception:
+        cur_dt = _dt.fromisoformat(str(lo_iso).replace("Z", "").split("+")[0])
+    try:
+        hi_dt = (_dt.fromisoformat(str(hi_iso).replace("Z", "").split("+")[0])
+                 + _td(minutes=30))   # inclusive of the last slot
+    except Exception:
+        return 0
+
+    try:
+        loop = _aio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    backfilled = 0
+    windows = 0
+    while cur_dt < hi_dt and windows < max_windows:
+        win_end = min(cur_dt + _td(days=window_days), hi_dt)
+        f_iso = cur_dt.strftime("%Y-%m-%dT%H:%MZ")
+        t_iso = win_end.strftime("%Y-%m-%dT%H:%MZ")
+        try:
+            # Offload ONLY the blocking network fetch; DB stays on this thread.
+            if loop is not None:
+                ci_map = await loop.run_in_executor(
+                    None, _fetch_carbon_intensity_range, postcode, f_iso, t_iso)
+            else:
+                ci_map = _fetch_carbon_intensity_range(postcode, f_iso, t_iso)
+        except Exception as e:
+            logger.warning("_run_historical_carbon_backfill: fetch failed "
+                           "%s..%s: %s — pausing, will resume", f_iso, t_iso, e)
+            _store.set_meta(_CARBON_BACKFILL_MARKER,
+                            {"cursor": cur_dt.isoformat(), "done": False})
+            return backfilled
+
+        for start in _store.get_block_starts_missing_carbon_in_range(
+                cur_dt.isoformat(), win_end.isoformat()):
+            intensity = _nearest_intensity_from_map(ci_map, start)
+            if intensity is None:
+                continue
+            block = _store.get_block_dict_by_start(start)
+            if not block:
+                continue
+            _apply_intensity_to_block(block, intensity)
+            try:
+                append_block_replace(block)
+                backfilled += 1
+            except Exception as e:
+                logger.warning("_run_historical_carbon_backfill: persist failed "
+                               "%s: %s", start, e)
+
+        cur_dt = win_end
+        windows += 1
+        _store.set_meta(_CARBON_BACKFILL_MARKER,
+                        {"cursor": cur_dt.isoformat(), "done": False})
+        if loop is not None:
+            await _aio.sleep(0)   # yield so ticks/reads interleave between windows
+
+    if cur_dt < hi_dt:
+        # Hit the per-invocation window cap; resume next trigger from the cursor.
+        logger.info("_run_historical_carbon_backfill: paused after %d window(s), "
+                    "%d block(s); will resume from cursor", windows, backfilled)
+        return backfilled
+
+    # Full span swept. Decide the marker by what NULL blocks ACTUALLY remain — not
+    # by the cursor. A per-block persist failure leaves a gap the forward cursor
+    # has already moved past; marking done on cursor alone (the original bug) would
+    # strand it. Re-query the truth instead.
+    remaining = _store.get_missing_carbon_date_range()
+    if remaining is None:
+        _store.set_meta(_CARBON_BACKFILL_MARKER,
+                        {"done": True, "completed_at": _now()})
+        if backfilled:
+            try:
+                generate_charts(_store)
+            except Exception as e:
+                logger.warning("_run_historical_carbon_backfill: chart regen "
+                               "failed: %s", e)
+        logger.info("_run_historical_carbon_backfill: complete — %d block(s) "
+                    "backfilled", backfilled)
+    elif backfilled > 0:
+        # Progress made but gaps remain (transient persist failures). Retry next
+        # trigger from the earliest still-NULL block — bounded so a permanently
+        # stuck slot can't loop forever re-hitting the API.
+        attempts = int(state.get("retry_attempts", 0)) + 1
+        if attempts >= 6:
+            _store.set_meta(_CARBON_BACKFILL_MARKER,
+                            {"done": True, "completed_at": _now(),
+                             "unfilled_from": remaining[0]})
+            logger.warning("_run_historical_carbon_backfill: gaps remain from %s "
+                           "after %d retries — marking done", remaining[0], attempts)
+        else:
+            _store.set_meta(_CARBON_BACKFILL_MARKER,
+                            {"cursor": remaining[0], "done": False,
+                             "retry_attempts": attempts})
+            logger.info("_run_historical_carbon_backfill: %d block(s) backfilled; "
+                        "gaps remain from %s — will retry (%d)",
+                        backfilled, remaining[0], attempts)
+    else:
+        # A whole pass filled nothing yet NULL blocks remain → those slots are
+        # genuinely unattributable (no CI data). Stop to avoid an infinite retry.
+        _store.set_meta(_CARBON_BACKFILL_MARKER,
+                        {"done": True, "completed_at": _now(),
+                         "unfilled_from": remaining[0]})
+        logger.warning("_run_historical_carbon_backfill: span swept but NULL "
+                       "blocks remain from %s and none could be attributed — "
+                       "marking done (unfillable)", remaining[0])
+    return backfilled
+
+
+def _maybe_backfill_historical_carbon() -> None:
+    """Schedule the one-shot historical backfill if a postcode exists and it
+    hasn't completed. Safe to call repeatedly (engine startup + every CI tick) —
+    guarded by an in-process flag and the persistent done marker. The CI-tick
+    trigger is what catches a postcode added *after* first boot.
+
+    Dispatches the async worker as a loop TASK (create_task), not an executor
+    thread: all BlockStore access must run on the event-loop thread that owns the
+    engine's single SQLite connection. Self-heals a stale done marker — an earlier
+    (concurrency-broken) run could mark done while transient failures left NULL
+    blocks behind; if gaps remain and we didn't already conclude they're
+    unattributable, re-arm and let the worker fill them."""
+    global _carbon_backfill_running
+    try:
+        if _store is None or not _get_postcode() or _carbon_backfill_running:
+            return
+        state = _store.get_meta(_CARBON_BACKFILL_MARKER, {}) or {}
+        if state.get("done"):
+            if state.get("unfilled_from"):
+                return   # already concluded the remainder is unattributable
+            remaining = _store.get_missing_carbon_date_range()
+            if remaining is None:
+                return   # genuinely complete
+            logger.info("_maybe_backfill_historical_carbon: done marker but NULL "
+                        "carbon blocks remain from %s — re-arming", remaining[0])
+            _store.set_meta(_CARBON_BACKFILL_MARKER,
+                            {"cursor": remaining[0], "done": False})
+        import asyncio as _aio
+        try:
+            loop = _aio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            return   # no running loop to host the task (non-async caller)
+
+        async def _task():
+            global _carbon_backfill_running
+            try:
+                await _run_historical_carbon_backfill()
+            except Exception as e:
+                logger.warning("_maybe_backfill_historical_carbon: worker "
+                               "failed: %s", e)
+            finally:
+                _carbon_backfill_running = False
+
+        _carbon_backfill_running = True
+        loop.create_task(_task())
+    except Exception as e:
+        logger.warning("_maybe_backfill_historical_carbon: schedule failed: %s", e)
+        _carbon_backfill_running = False
+
+
 async def _tick_carbon_intensity() -> float | None:
     """
     Fetch and store carbon intensity if 15 minutes have elapsed since last fetch.
@@ -3180,6 +3500,13 @@ async def _tick_carbon_intensity() -> float | None:
             _recover_missing_carbon()
         except Exception as e:
             logger.warning("_tick_carbon_intensity: carbon recovery failed: %s", e)
+        # Historical backfill (v2->v3 migration). Run-once; this trigger is what
+        # picks it up when a postcode is added after first boot. No-op once done.
+        try:
+            _maybe_backfill_historical_carbon()
+        except Exception as e:
+            logger.warning("_tick_carbon_intensity: historical backfill "
+                           "schedule failed: %s", e)
     except urllib.error.HTTPError as e:
         logger.warning("_tick_carbon_intensity: HTTP %s for postcode %s", e.code, postcode)
     except urllib.error.URLError as e:
@@ -3436,11 +3763,18 @@ async def _engine_tick(ha: HAClient):
         cfg = load_config()
         power_sensor = None
         power_source = None
+        _power_invert = False
+        _power_unit_ov = None
         for m_data in cfg.get("meters", {}).values():
             meta = (m_data or {}).get("meta", {}) or {}
             if not meta.get("sub_meter"):
                 power_sensor = meta.get("power_sensor")
                 power_source = meta.get("power_source")
+                # invert / unit-override apply to the user's OWN sensor only,
+                # never to the BCD fallback (whose convention we don't control).
+                if power_sensor:
+                    _power_invert = bool(meta.get("power_invert", False))
+                    _power_unit_ov = meta.get("power_unit") or None
                 break
         # Auto-adopt BottlecapDave's current_demand when no sensor is configured —
         # it's a free local HA entity, so we can sample it every tick.
@@ -3460,7 +3794,8 @@ async def _engine_tick(ha: HAClient):
                         "unit_of_measurement")
                 except Exception:
                     pass
-                net_kw = _power_value_to_kw(raw_kw, _unit)
+                net_kw = _power_value_to_kw(raw_kw, _unit,
+                                            _power_unit_ov, _power_invert)
         elif (not power_sensor and power_source == "mini"
               and _kraken_mini_reader
               and getattr(_kraken_mini_reader, "device_id", None)):
@@ -3509,25 +3844,29 @@ async def _engine_tick(ha: HAClient):
                         soc_val = round(float(v), 1)
                     except (ValueError, TypeError):
                         pass
-            # Use inverter_power_sensor for batteries, device_power_sensor for EV/heat pump
-            power_s = inv_s or dev_s
+            # Use inverter_power_sensor for batteries, device_power_sensor for EV/heat pump.
+            # Pick the matching invert/unit-override flags for whichever drives it.
+            if inv_s:
+                power_s = inv_s
+                _sub_invert = bool(meta.get("inverter_power_invert", False))
+                _sub_unit_ov = meta.get("inverter_power_unit") or None
+            else:
+                power_s = dev_s
+                _sub_invert = bool(meta.get("device_power_invert", False))
+                _sub_unit_ov = meta.get("device_power_unit") or None
             if power_s and ha:
                 v = ha.get_state(power_s)
                 if v not in (None, "unknown", "unavailable"):
                     try:
-                        fv = float(v)
-                        # Convert to kW using unit_of_measurement from HA attributes.
-                        # The meter config sensor picker only allows power sensors (W or kW),
-                        # so the unit is always known — no magnitude guessing needed.
-                        try:
-                            unit = (ha.get_attributes(power_s) or {}).get("unit_of_measurement", "")
-                        except Exception:
-                            unit = ""
-                        if unit.upper() == "W":
-                            fv = fv / 1000.0
-                        inv_val = round(fv, 3)
-                    except (ValueError, TypeError):
-                        pass
+                        unit = (ha.get_attributes(power_s) or {}).get(
+                            "unit_of_measurement", "")
+                    except Exception:
+                        unit = ""
+                    # Shared converter: unit attr → kW, override when declared
+                    # unit is wrong/absent, then invert. Falls back to the
+                    # magnitude heuristic when the unit is missing (previously this
+                    # path assumed kW on a missing unit — a W sensor read 1000× high).
+                    inv_val = _power_value_to_kw(v, unit, _sub_unit_ov, _sub_invert)
             if soc_val is not None or inv_val is not None:
                 _store.append_sub_meter_history(now.isoformat(), mid, soc_val, inv_val)
                 if not _pruned_sub:
@@ -5032,6 +5371,13 @@ async def engine_startup(ha: HAClient):
                                     "%d block(s)", rec)
                 except Exception as e:
                     logger.warning("engine_startup: carbon recovery failed: %s", e)
+                # Historical backfill (v2->v3 migration) — run-once, resumable,
+                # paged; dispatched to a worker thread so it never blocks startup.
+                try:
+                    _maybe_backfill_historical_carbon()
+                except Exception as e:
+                    logger.warning("engine_startup: historical backfill schedule "
+                                   "failed: %s", e)
         except _aio.TimeoutError:
             logger.warning("engine_startup: CI fetch timed out after %ds — will retry on first tick", _CI_TIMEOUT)
 

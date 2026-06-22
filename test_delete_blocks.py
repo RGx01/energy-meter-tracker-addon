@@ -18,7 +18,7 @@ Plus: preview (count) uses the same resolution, so it can't disagree.
 
 import unittest
 
-from test_block_store import new_store, EXAMPLE_CONFIG_WITH_SUB, make_block_with_sub
+from test_block_store import new_store, EXAMPLE_CONFIG_WITH_SUB, make_block_with_sub, make_block
 
 MAIN = "electricity_main"
 DEV  = "zappi_ev"
@@ -199,6 +199,35 @@ class TestRecomputeScope(DeleteBlocksBase):
         res = self._delete("2030-01-01", "2030-01-01", meter_id=DEV)
         self.assertEqual(res["deleted"], 0)
         self.assertIsNone(res["recompute_parent"])
+
+
+class TestPreviewLocalDateCount(unittest.TestCase):
+    """The day count in delete/preview must be in LOCAL time. A BST local day
+    starts at 23:00 UTC the previous calendar date, so counting distinct UTC
+    date(block_start) reported 2 days for a single local day (the bug seen on
+    the Delete Blocks screen)."""
+
+    def test_bst_local_day_counts_as_one_day(self):
+        store = new_store()
+        store.insert_config_period({"meters": {"electricity_main": {"meta": {
+            "timezone": "Europe/London", "billing_day": 1, "block_minutes": 30,
+            "currency_symbol": "£", "currency_code": "GBP"}}}})
+        # local 2026-06-18 (BST) spans UTC [2026-06-17T23:00, 2026-06-18T23:00):
+        # the first two half-hours carry a UTC date of the 17th.
+        for ts in ("2026-06-17T23:00:00", "2026-06-17T23:30:00",
+                   "2026-06-18T00:00:00", "2026-06-18T12:00:00"):
+            store.append_block(make_block(ts, meter_id="electricity_main"))
+
+        prev = store.count_blocks_for_date_range(
+            "2026-06-18", "2026-06-18", "all", tz_name="Europe/London")
+        self.assertEqual(prev["blocks"], 4)
+        self.assertEqual(prev["dates"], 1)   # one LOCAL day, not two UTC dates
+
+        res = store.delete_blocks_for_date_range(
+            "2026-06-18", "2026-06-18", "all", tz_name="Europe/London")
+        self.assertEqual(res["deleted"], 4)
+        self.assertEqual(res["dates"], 1)
+        store.close()
 
 
 if __name__ == "__main__":

@@ -1050,6 +1050,41 @@ class BlockStore:
         return [r["block_start"]
                 for r in self._conn.execute(sql).fetchall()]
 
+    def get_missing_carbon_date_range(self) -> tuple | None:
+        """(min_block_start, max_block_start) over energy-bearing blocks whose
+        carbon_intensity_g IS NULL. None when there are no such blocks.
+
+        Bounds the historical carbon backfill (the v2->v3 migration): every block
+        before CI first became available carries a NULL intensity, and this is the
+        span the backfill must page the Carbon Intensity API over."""
+        row = self._conn.execute(
+            "SELECT MIN(block_start) AS lo, MAX(block_start) AS hi FROM blocks "
+            "WHERE carbon_intensity_g IS NULL "
+            "  AND (imp_kwh IS NOT NULL OR exp_kwh IS NOT NULL)"
+        ).fetchone()
+        if row and row["lo"] and row["hi"]:
+            return (row["lo"], row["hi"])
+        return None
+
+    def get_block_starts_missing_carbon_in_range(
+        self, from_iso: str, to_iso: str, limit: Optional[int] = None
+    ) -> list:
+        """Distinct NULL-carbon block_start values within [from_iso, to_iso),
+        oldest-first. Used per fetched window by the historical backfill."""
+        sql = (
+            "SELECT DISTINCT block_start FROM blocks "
+            "WHERE carbon_intensity_g IS NULL "
+            "  AND (imp_kwh IS NOT NULL OR exp_kwh IS NOT NULL) "
+            "  AND block_start >= ? AND block_start < ? "
+            "ORDER BY block_start"
+        )
+        params: list = [from_iso, to_iso]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return [r["block_start"]
+                for r in self._conn.execute(sql, params).fetchall()]
+
     def prune_carbon_intensity(self, days: int = 4) -> int:
         """Delete carbon_intensity rows older than `days` days. Returns rows deleted."""
         cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
@@ -1320,6 +1355,31 @@ class BlockStore:
         """Return a single setting value by key."""
         return self.get_settings().get(key, default)
 
+    def get_meta(self, key: str, default=None):
+        """Generic KV read from store_meta. Values are JSON-encoded; the raw
+        string is returned if it isn't valid JSON (e.g. legacy schema_version)."""
+        import json as _json
+        row = self._conn.execute(
+            "SELECT value FROM store_meta WHERE key = ?", (key,)
+        ).fetchone()
+        if row and row["value"] is not None:
+            try:
+                return _json.loads(row["value"])
+            except Exception:
+                return row["value"]
+        return default
+
+    def set_meta(self, key: str, value) -> None:
+        """Generic KV write to store_meta (value JSON-encoded). Used for the
+        run-once historical-carbon-backfill marker / resume cursor."""
+        import json as _json
+        self._conn.execute(
+            "INSERT INTO store_meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, _json.dumps(value))
+        )
+        self._conn.commit()
+
     def prune_power_history(self, hours: int = 48) -> int:
         """Delete power_history rows older than `hours` hours. Returns rows deleted."""
         cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
@@ -1529,6 +1589,28 @@ class BlockStore:
 
         return " AND ".join(clauses), params
 
+    def _count_blocks_and_local_dates(self, where, params, tz_name):
+        """Return (block_count, distinct_local_date_count) for a delete/preview
+        WHERE clause. The day count is in the *local* timezone, not UTC: a BST
+        local day starts at 23:00 UTC the previous day, so counting distinct
+        date(block_start) on the stored UTC timestamps would report two calendar
+        days for a single local day. Convert each block_start to local first."""
+        n = self._conn.execute(
+            f"SELECT COUNT(*) FROM blocks WHERE {where}", params).fetchone()[0]
+        if not n:
+            return 0, 0
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo("UTC")
+        starts = self._conn.execute(
+            f"SELECT DISTINCT block_start FROM blocks WHERE {where}", params).fetchall()
+        dates = {
+            datetime.fromisoformat(r[0]).replace(tzinfo=timezone.utc).astimezone(tz).date()
+            for r in starts
+        }
+        return n, len(dates)
+
     def delete_blocks_for_date_range(
         self, from_date: str, to_date: str, meter_id: str | None = None,
         from_time: str = "00:00", to_time: str = "23:59", tz_name: str = "UTC"
@@ -1561,13 +1643,7 @@ class BlockStore:
             utc_start, utc_end, from_time, to_time, meter_ids
         )
 
-        row = self._conn.execute(
-            f"SELECT COUNT(*) as n, COUNT(DISTINCT date(block_start)) as d "
-            f"FROM blocks WHERE {where}",
-            params,
-        ).fetchone()
-        n_blocks = row["n"]
-        n_dates  = row["d"]
+        n_blocks, n_dates = self._count_blocks_and_local_dates(where, params, tz_name)
 
         # Tail detection: is the newest finalised block within the targeted
         # meters inside the deleted range? If so the engine anchor must reset.
@@ -1654,12 +1730,8 @@ class BlockStore:
             utc_start, utc_end, from_time, to_time, meter_ids
         )
 
-        row = self._conn.execute(
-            f"SELECT COUNT(*) as n, COUNT(DISTINCT date(block_start)) as d "
-            f"FROM blocks WHERE {where}",
-            params,
-        ).fetchone()
-        return {"blocks": row["n"], "dates": row["d"]}
+        n_blocks, n_dates = self._count_blocks_and_local_dates(where, params, tz_name)
+        return {"blocks": n_blocks, "dates": n_dates}
 
 
     def backup(self, dst_path: str) -> None:

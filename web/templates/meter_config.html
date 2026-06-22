@@ -635,7 +635,17 @@ function buildMainCard(meterId, meter) {
 
       '<div class="form-group" style="grid-column:1/-1;"><label>Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — enables Live Summary page)</span></label>' +
         buildEntityInput(meterId + '__power__power_sensor', meta.power_sensor||'', meterId, 'power', 'power_sensor', true) +
-        '<small style="color:var(--muted);">Live power in watts (W) — enables the live power gauge on the Summary page.</small></div>' +
+        '<div class="checkbox-row" style="margin-top:8px;">' +
+          '<input type="checkbox" id="pwr-invert-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="power_invert" ' + (meta.power_invert ? 'checked' : '') + '>' +
+          '<label for="pwr-invert-' + meterId + '">Invert sensor value <span style="color:var(--muted);font-weight:400;">— tick if it reads negative when importing</span></label>' +
+        '</div>' +
+        '<div style="margin-top:8px;"><label style="font-size:12px;font-weight:600;">Unit override <span style="color:var(--muted);font-weight:400;">(only if the gauge reads ~1000× wrong)</span></label><br>' +
+          '<select class="js-meta" data-meter="' + meterId + '" data-key="power_unit" style="max-width:220px;margin-top:4px;">' +
+            '<option value=""'   + (!meta.power_unit      ? ' selected' : '') + '>Auto (use sensor unit)</option>' +
+            '<option value="W"'  + (meta.power_unit==='W'  ? ' selected' : '') + '>Force watts (W)</option>' +
+            '<option value="kW"' + (meta.power_unit==='kW' ? ' selected' : '') + '>Force kilowatts (kW)</option>' +
+          '</select></div>' +
+        '<small style="color:var(--muted);">Live power in watts (W) or kW — enables the live power gauge on the Summary page.</small></div>' +
       '<div class="form-group" style="grid-column:1/-1;"><label>Postcode Prefix <span style="color:var(--muted);font-weight:400;">(optional — enables Carbon Intensity forecast)</span></label>' +
         '<input type="text" class="js-meta" data-meter="' + meterId + '" data-key="postcode_prefix" value="' + esc(meta.postcode_prefix||'') + '" placeholder="e.g. DE, SW1, M" style="max-width:200px;">' +
         '<small style="color:var(--muted);">🇬🇧 UK only — first part of your postcode (e.g. DE1, not just DE). Enables the 48-hour carbon intensity forecast on the Summary page via the National Grid API.</small></div>' +
@@ -826,6 +836,12 @@ function buildSubCard(meterId, meter) {
             '<input type="checkbox" id="inv-invert-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="inverter_power_invert" ' + (meta.inverter_power_invert ? 'checked' : '') + '>' +
             '<label for="inv-invert-' + meterId + '">Invert sensor value <span style="color:var(--muted);font-weight:400;">— tick if positive = charging, negative = discharging</span></label>' +
           '</div>' +
+          '<div style="margin-top:8px;"><label style="font-size:12px;font-weight:600;">Unit override <span style="color:var(--muted);font-weight:400;">(only if the gauge reads ~1000× wrong)</span></label><br>' +
+            '<select class="js-meta" data-meter="' + meterId + '" data-key="inverter_power_unit" style="max-width:220px;margin-top:4px;">' +
+              '<option value=""'   + (!meta.inverter_power_unit      ? ' selected' : '') + '>Auto (use sensor unit)</option>' +
+              '<option value="W"'  + (meta.inverter_power_unit==='W'  ? ' selected' : '') + '>Force watts (W)</option>' +
+              '<option value="kW"' + (meta.inverter_power_unit==='kW' ? ' selected' : '') + '>Force kilowatts (kW)</option>' +
+            '</select></div>' +
           '<small style="color:var(--muted);">Live inverter power in W or kW. ⓘ Informational only — not recorded in blocks or used in calculations.</small>' +
         '</div>'
       : '') +
@@ -835,6 +851,16 @@ function buildSubCard(meterId, meter) {
       ? '<div class="form-group" style="grid-column:1/-1;margin-bottom:16px;">' +
           '<label>' + (isEV ? 'Charger' : 'Heat Pump') + ' Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — shows live kW on Live Power page)</span></label>' +
           buildEntityInput(meterId + '__device_power__device_power_sensor', meta.device_power_sensor||'', meterId, 'device_power', 'device_power_sensor', true) +
+          '<div class="checkbox-row" style="margin-top:8px;">' +
+            '<input type="checkbox" id="dev-invert-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="device_power_invert" ' + (meta.device_power_invert ? 'checked' : '') + '>' +
+            '<label for="dev-invert-' + meterId + '">Invert sensor value <span style="color:var(--muted);font-weight:400;">— tick if it reads negative when consuming</span></label>' +
+          '</div>' +
+          '<div style="margin-top:8px;"><label style="font-size:12px;font-weight:600;">Unit override <span style="color:var(--muted);font-weight:400;">(only if the gauge reads ~1000× wrong)</span></label><br>' +
+            '<select class="js-meta" data-meter="' + meterId + '" data-key="device_power_unit" style="max-width:220px;margin-top:4px;">' +
+              '<option value=""'   + (!meta.device_power_unit      ? ' selected' : '') + '>Auto (use sensor unit)</option>' +
+              '<option value="W"'  + (meta.device_power_unit==='W'  ? ' selected' : '') + '>Force watts (W)</option>' +
+              '<option value="kW"' + (meta.device_power_unit==='kW' ? ' selected' : '') + '>Force kilowatts (kW)</option>' +
+            '</select></div>' +
           '<small style="color:var(--muted);">Live power in W or kW. ⓘ Informational only — not recorded in blocks or used in calculations.</small>' +
         '</div>'
       : '') +
