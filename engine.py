@@ -2822,8 +2822,25 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
                                           result.get("rate", 0.0) or 0.0,
                                           start)
                 if _base:
-                    _ov = _dispatch_overlay_rate("import", start, _base,
-                                                 result.get("kwh"))
+                    # Follow the MAIN meter's overlay DECISION, not the device's
+                    # own draw. "Use main meter rate" means inheriting main's
+                    # effective (base + dispatch overlay) rate, so the overlay's
+                    # over-report floor must be evaluated against the MAIN
+                    # meter's import, not the follower's. A device that barely
+                    # draws during a smart-charge slot (e.g. a battery at ~0 kWh)
+                    # must still inherit the off-peak rate main received. The EV
+                    # path is unaffected: if the EV drew, main drew at least as
+                    # much, so it still clears the floor. (parent is finalised
+                    # earlier in PASS 1; fall back to own kWh if not yet present.)
+                    _main_imp_kwh = (
+                        (block["meters"].get(parent_name, {})
+                              .get("channels", {})
+                              .get("import") or {}).get("kwh")
+                    )
+                    _ov = _dispatch_overlay_rate(
+                        "import", start, _base,
+                        _main_imp_kwh if _main_imp_kwh is not None
+                        else result.get("kwh"))
                     result["rate"] = _ov
                     result["cost"] = round((result.get("kwh") or 0.0) * _ov, 6)
 
