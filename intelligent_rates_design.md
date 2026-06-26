@@ -1,4 +1,4 @@
-# EMT — Intelligent Tariff Dispatch-Aware Rates (3.1.0)
+# EMT — Intelligent Tariff Dispatch-Aware Rates (3.0.0)
 
 **Status:** BUILT (compute-and-log), validated live against a real Intelligent
 Octopus Go / myenergi Zappi account. Capture + overlay are deployed and
@@ -77,6 +77,30 @@ Consequence — the overlay applies at **two** call sites (BUILT):
     *preserve*, not an independent decision.
 The overlay is idempotent: a pure function of (base schedule + dispatch_slots +
 meter draw), so repeated passes can't double-apply.
+
+### STANDING PRINCIPLE: never blanket-recompute the overlay over history (it is non-reconstructable)
+The overlay is a function of `dispatch_slots`, and those slots are **captured
+forward while planned** and **cannot be recovered retrospectively**: planned→
+completed drops `source` to `unknown` (proven live), the API serves no historical
+slot data, and captured slots prune at 90 days. So a slot absent from the table
+at recompute time is indistinguishable from "no dispatch" — the resolver returns
+base/peak.
+
+Therefore **PASS 2 / settlement may only be re-run over the recent window where
+the slots still exist.** The ~2-day DCC settlement horizon sits comfortably inside
+the 90-day retention — that is *why* call site (B) is safe. A **blanket recompute
+over arbitrary history is FORBIDDEN**: for any block correctly priced off-peak
+live whose slots have since aged out — or were never captured because the add-on
+was down / had no API connectivity at the time — a re-run would silently re-price
+that energy back to peak, **degrading correct history rather than repairing it**.
+
+Corollary for any per-device rate fix (e.g. the follow-main overlay fix —
+a sub-floor follower must inherit main's overlay decision, not re-qualify the
+over-report floor against its own draw): apply it **at finalise**, where the slots
+are known. Existing blocks are left as-is, not retro-recomputed. A repair pass is
+acceptable only inside the live slot-retention window, never as a full-history
+sweep. (Confirmed in practice: a prod-dev DB held blocks back to February but only
+~hours of dispatch_slots — a history sweep had nothing to reconstruct from.)
 
 ### The key signal is the SMART-CHARGE dispatch, captured while PLANNED
 - **Planned** dispatches carry `meta.source` — and on this account it is
