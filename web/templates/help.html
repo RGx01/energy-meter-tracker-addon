@@ -35,14 +35,18 @@
 <div class="card help-section">
   <div class="card-title">⚡ What is Energy Meter Tracker?</div>
   <div class="warn-box" style="margin-bottom:16px;">
-    ⚠️ <strong>Informational use only.</strong> Energy Meter Tracker provides a close approximation
-    of your consumption based on local sensor readings. It cannot replicate your
-    supplier's authoritative meter reconciliation. Do not use this data for billing disputes
-    or formal energy accounting.
+    ⚠️ <strong>Accuracy depends on your data source.</strong> In local-metering mode (<code>cad</code>),
+    Energy Meter Tracker provides a close approximation of your consumption from local sensor readings —
+    treat it as informational, not as a substitute for your supplier's authoritative reconciliation.
+    In <code>cad+api</code> mode with <strong>Supplier API settlement</strong> enabled, blocks are
+    reconciled against the settled half-hourly data your supplier bills from (see Data Sources &amp;
+    Supplier Integration, below), which is billing-grade once settled.
   </div>
   <p>
-    <strong>Required Hardware</strong> — The addon is intended to be used with an IHD/CAD capable of providing meter readings at reliable
-    regular intervals (0.1Hz).
+    <strong>Required Hardware</strong> — For local metering, the add-on uses an IHD/CAD capable of
+    providing meter readings at reliable regular intervals (0.1&nbsp;Hz). From 3.0 you can instead (or
+    additionally) run in <code>cad+api</code> mode using your supplier's API — and, on Octopus, an
+    Octopus Home Mini as a live-power source — so a local CAD is no longer strictly required.
   </p>
   <p>
     <strong>Energy Meter Tracker</strong> is a Home Assistant add-on that records your electricity usage in
@@ -68,44 +72,45 @@
   </div>
 </div>
 
-<!-- ── Main meter vs sub-meters ──────────────────────────────────────────── -->
+<!-- ── Main meter vs devices ──────────────────────────────────────────── -->
 <div class="card help-section">
-  <div class="card-title">⚖️ Main Meter &amp; Sub-meters</div>
+  <div class="card-title">⚖️ Main Meter &amp; Devices</div>
   <p>
     The <strong>main meter</strong> reads directly from your smart meter via a Consumer Access
     Device (CAD) and is the authoritative source of truth for how much energy crossed the grid boundary.
   </p>
   <p>
-    <strong>Sub-meters</strong> track individual devices — a home battery, EV charger, or heat pump.
-    Each sub-meter has a <strong>Meter Type</strong> which enables additional configuration and
-    drives the Live Power page display:
+    <strong>Devices</strong> let you track individual loads — a home battery, EV charger, or heat pump.
+    Each device has a <strong>Meter Type</strong> which enables additional configuration and
+    drives the Overview page display:
   </p>
   <ul>
-    <li>🔋 <strong>Battery</strong> — enables SoC sensor and inverter power sensor fields. Shows a battery icon with charge level and an inverter gauge on Live Power.</li>
-    <li>🚗 <strong>EV Charger</strong> — enables a charger power sensor field. Shows a unidirectional charge gauge on Live Power. Mark as V2X capable if the vehicle supports vehicle-to-grid.</li>
-    <li>♨️ <strong>Heat Pump</strong> — enables a heat pump power sensor field. Shows a unidirectional power gauge on Live Power.</li>
+    <li>🔋 <strong>Battery</strong> — enables SoC sensor and inverter power sensor fields. Shows a battery icon with charge level and an inverter gauge on Overview.</li>
+    <li>🚗 <strong>EV Charger</strong> — enables a charger power sensor field. Shows a unidirectional charge gauge on Overview. Mark as V2X capable if the vehicle supports vehicle-to-grid.</li>
+    <li>♨️ <strong>Heat Pump</strong> — enables a heat pump power sensor field. Shows a unidirectional power gauge on Overview.</li>
   </ul>
 
   <div class="two-col">
     <div class="note-box">
       <strong>Direct import</strong><br>
-      In each block, sub-meter consumption is subtracted from the main meter's total import.
+      In each block, device consumption is subtracted from the main meter's total import.
       Whatever is left is <em>direct import</em> — the portion of grid import not accounted for
-      by any sub-meter. This is what's used for billing calculations.
+      by any device. This is what's used for billing calculations.
     </div>
     <div class="note-box">
-      <strong>Inverter possible</strong><br>
-      Devices marked <em>inverter possible</em> may show consumption from battery discharge rather
-      than grid. The engine allocates grid energy to protected loads first, then to inverter devices.
-      This flag is set automatically for Battery type meters and can be enabled manually for any
-      sub-meter (e.g. an EV fed by a battery inverter).
+      <strong>Grid vs self-supply attribution</strong><br>
+      When several devices draw at once and grid import covers only part of the total (solar or a
+      battery supplying the rest), the <strong>EV is given grid-import priority</strong> — it's the
+      intended grid load, especially on an Intelligent Octopus Go smart-charge slot — and other devices
+      clip to whatever grid remains. Bill totals are unaffected; only the per-device split is a
+      modelling choice (issue&nbsp;#212).
     </div>
   </div>
 
   <div class="warn-box">
-    ⚠️ <strong>Export sub-metering and solar generation are not yet supported.</strong> Individual
+    ⚠️ <strong>Per-device export tracking and solar generation are not yet supported.</strong> Individual
     device export (e.g. battery discharging to grid, V2G from a V2X-capable EV) is not yet broken
-    down by sub-meter. Solar generation tracking is planned for a future release.
+    down by device. Solar generation tracking is planned for a future release.
   </div>
 </div>
 
@@ -114,12 +119,12 @@
   <div class="card-title">⚙️ Meter Configuration</div>
   <p>
     Meter IDs are assigned automatically and not shown in the UI — the <strong>Device Name</strong>
-    (for sub-meters) and <strong>Site Name</strong> (for the main meter) are the user-facing identifiers
+    (for devices) and <strong>Site Name</strong> (for the main meter) are the user-facing identifiers
     used throughout charts and reports. Names must be unique, 40 characters or fewer, and contain only
     letters, numbers, spaces and <code>' - &amp; ( ) .</code>
   </p>
   <p>
-    <strong>Deleting a sub-meter permanently removes all associated historical data</strong> from the
+    <strong>Deleting a device permanently removes all associated historical data</strong> from the
     database. There is no recovery path — ensure you have a backup before deleting.
   </p>
   <p>
@@ -129,24 +134,24 @@
 
   <div class="two-col">
     <div>
-      <p><strong>Battery sub-meter sensors</strong></p>
+      <p><strong>Battery sensors</strong></p>
       <ul>
         <li><strong>Read sensor</strong> — cumulative kWh consumed (required)</li>
-        <li><strong>SoC sensor</strong> — battery state of charge in % (optional, Live Power only)</li>
-        <li><strong>Inverter power sensor</strong> — live inverter power in W or kW (optional, Live Power only)</li>
+        <li><strong>SoC sensor</strong> — battery state of charge in % (optional, Overview only)</li>
+        <li><strong>Inverter power sensor</strong> — live inverter power in W or kW (optional, Overview only)</li>
       </ul>
     </div>
     <div>
-      <p><strong>EV / Heat Pump sub-meter sensors</strong></p>
+      <p><strong>EV / Heat Pump sensors</strong></p>
       <ul>
         <li><strong>Read sensor</strong> — cumulative kWh consumed (required)</li>
-        <li><strong>Charger / Heat Pump power sensor</strong> — live power in W or kW (optional, Live Power only)</li>
+        <li><strong>Charger / Heat Pump power sensor</strong> — live power in W or kW (optional, Overview only)</li>
       </ul>
     </div>
   </div>
   <div class="note-box">
     ⓘ The SoC, inverter power, charger power and heat pump power sensors are <strong>informational only</strong> —
-    they are displayed on the Live Power page but are not recorded in blocks or used in any billing calculations.
+    they are displayed on the Overview page but are not recorded in blocks or used in any billing calculations.
   </div>
 </div>
 
@@ -172,7 +177,7 @@
       </ul>
     </div>
     <div>
-      <p><strong>Sub-meter — Read sensors</strong></p>
+      <p><strong>Device — Read sensors</strong></p>
       <ul>
         <li>Must be <strong>cumulative kWh consumed (import only)</strong> — not net, not export, not watts</li>
         <li>Can update less frequently (60s+)</li>
@@ -189,24 +194,97 @@
       </ul>
     </div>
   </div>
+  <div class="note-box">
+    ⓘ <strong>Power sensor sign &amp; unit overrides</strong> — any power sensor (main or device) can be
+    sign-<strong>inverted</strong> or have its unit forced to <strong>W</strong> or <strong>kW</strong>
+    in its Edit view, for sensors whose convention is opposite EMT's (importing shown as exporting) or
+    that mis-declare their unit (e.g. emit watt-scale numbers labelled kW, reading 1000× too high).
+    These affect the Overview display only.
+  </div>
 </div>
 
-<!-- ── Live Power ─────────────────────────────────────────────────────────── -->
+<!-- ── Data sources & supplier ──────────────────────────────────────────── -->
 <div class="card help-section">
-  <div class="card-title">⚡ Live Power Page</div>
+  <div class="card-title">🔌 Data Sources &amp; Supplier Integration</div>
   <p>
-    The Live Power page shows your current grid power and billing totals. The summary row at the top
+    From 3.0, the Setup Wizard starts with your <strong>supplier and meter situation</strong>, which
+    sets your <strong>data-source mode</strong>:
+  </p>
+  <ul>
+    <li><strong><code>cad</code></strong> — local CAD/sensor readings only, exactly as before. No supplier account needed.</li>
+    <li><strong><code>cad+api</code></strong> — local readings <em>plus</em> your supplier's API: settled-data reconciliation, API-sourced rates, Octopus Home Mini, and Intelligent Octopus Go pricing.</li>
+  </ul>
+  <p>
+    You can switch modes later via <strong>Change Setup</strong> — behind a confirmation, because a
+    switch can trigger a full recalculation.
+  </p>
+  <div class="two-col">
+    <div class="note-box">
+      <strong>Supplier settlement (Octopus / Kraken DCC)</strong><br>
+      In <code>cad+api</code> mode EMT can reconcile each block against the <strong>settled half-hourly
+      data your supplier bills from</strong>. A <strong>billing source</strong> toggle (Meter sensor vs
+      Supplier API) chooses which figures drive your bill; with the API source a block is provisional
+      until settled, then updates to the settled value. Credentials are entered in-app — no YAML.
+    </div>
+    <div class="note-box">
+      <strong>Rate source — sensor or API</strong><br>
+      Each rate channel can take its unit rate from a sensor or directly from the supplier API,
+      independently — so you can mix (e.g. API import rates with a sensor export rate). The standing
+      charge is fetched from the API too when that source is selected.
+    </div>
+  </div>
+  <div class="note-box">
+    ⓘ <strong>Octopus Home Mini</strong> — if you have one, EMT can use its real-time demand feed as a
+    live-power source for the Overview gauge and 48-hour history without a separate CAD sensor. Mini
+    figures are provisional; DCC settlement corrects the recorded history once available.
+  </div>
+  <p style="font-size:12px;color:var(--muted);">
+    Full detail: see the <a href="https://github.com/RGx01/energy-meter-tracker-addon/wiki/Supplier-Settlement" target="_blank" style="color:var(--accent);">Supplier Settlement</a>
+    and <a href="https://github.com/RGx01/energy-meter-tracker-addon/wiki/Rates-and-Tariffs" target="_blank" style="color:var(--accent);">Rates &amp; Tariffs</a> wiki pages.
+  </p>
+</div>
+
+<!-- ── Intelligent Octopus Go ───────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">🚗 Intelligent Octopus Go</div>
+  <p>
+    On Intelligent Octopus Go (IOG), your EV often smart-charges in <strong>dispatch slots</strong> at
+    the cheap off-peak rate, at times the standard tariff wouldn't predict. EMT captures those slots
+    live and reprices the affected energy with a <strong>dispatch overlay</strong>, applied at both
+    block finalise and DCC settlement.
+  </p>
+  <ul>
+    <li>Enable per device via the <strong>"use dispatch overlay"</strong> rate option in Meter Config, so your EV bills at the dispatch rate while the rest of the house stays on the standard tariff.</li>
+    <li>Dispatch slots are real-time only and can't be reconstructed later — a slot EMT didn't capture (add-on down) may price at the standard rate until corrected.</li>
+    <li>Works wherever Octopus exposes dispatch data (vehicle integrations, Zappi; Ohme conservatively). A <strong>Hypervolt via the charger route</strong> is metered fine but can't get dispatch pricing.</li>
+  </ul>
+  <div class="warn-box">
+    ⚠️ The dispatched-cost figure is a <strong>best estimate</strong>: where EMT can only infer a
+    smart-charge (e.g. Ohme), it optimistically assumes off-peak and marks the block, so it can read
+    slightly cheaper than your real Octopus bill. Settlement corrects the kWh; the dispatch rate stays
+    a best estimate. Correct any that matter with the block correction tool.
+  </div>
+  <p style="font-size:12px;color:var(--muted);">
+    Full detail: see the <a href="https://github.com/RGx01/energy-meter-tracker-addon/wiki/Intelligent-Octopus-Go" target="_blank" style="color:var(--accent);">Intelligent Octopus Go</a> wiki page.
+  </p>
+</div>
+
+<!-- ── Overview ─────────────────────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">⚡ Overview Page</div>
+  <p>
+    The Overview page shows your current grid power and billing totals. The summary row at the top
     adapts to your configuration:
   </p>
   <ul>
-    <li><strong>Live Power gauge</strong> — net grid power (negative = exporting). Status pill shows Importing/Exporting/Net Zero with current kW.</li>
-    <li><strong>🔋 Battery card</strong> — appears when a battery sub-meter has SoC or inverter power sensors configured. Shows charge level (colour-coded green/amber/red) and a bidirectional inverter gauge (teal = discharging, purple = charging).</li>
-    <li><strong>🚗 EV Charger card</strong> — appears when an EV sub-meter has a charger power sensor configured. Shows a unidirectional charge gauge (0 on left, max on right). Gauge scale is derived from the 48-hour history.</li>
-    <li><strong>♨️ Heat Pump card</strong> — appears when a heat pump sub-meter has a power sensor configured. Same unidirectional gauge as the EV charger.</li>
+    <li><strong>Live power gauge</strong> — net grid power (negative = exporting). Status pill shows Importing/Exporting/Net Zero with current kW.</li>
+    <li><strong>🔋 Battery card</strong> — appears when a battery device has SoC or inverter power sensors configured. Shows charge level (colour-coded green/amber/red) and a bidirectional inverter gauge (teal = discharging, purple = charging).</li>
+    <li><strong>🚗 EV Charger card</strong> — appears when an EV device has a charger power sensor configured. Shows a unidirectional charge gauge (0 on left, max on right). Gauge scale is derived from the 48-hour history.</li>
+    <li><strong>♨️ Heat Pump card</strong> — appears when a heat pump device has a power sensor configured. Same unidirectional gauge as the EV charger.</li>
     <li><strong>🌿 Carbon Intensity card</strong> — appears when a postcode prefix is configured. Shows current gCO₂/kWh and 48-hour forecast.</li>
   </ul>
   <div class="note-box">
-    ⓘ Device name detection for Live Power cards uses the <strong>Meter Type</strong> field set in
+    ⓘ Device name detection for Overview cards uses the <strong>Meter Type</strong> field set in
     Meter Config. If no type is set, keywords in the device name or meter ID are used as a fallback
     (e.g. "battery", "charger", "zappi", "heat pump"). Setting the Meter Type explicitly is recommended.
   </div>
@@ -222,10 +300,10 @@
     are not interpolated — the blocks are left as zero to avoid misleading data.
   </p>
   <div class="note-box">
-    ⓘ <strong>Sub-meter gap attribution:</strong> The main meter uses boundary interpolation to
-    correctly allocate energy to each block window. Sub-meters use raw cumulative deltas — if no
+    ⓘ <strong>Device gap attribution:</strong> The main meter uses boundary interpolation to
+    correctly allocate energy to each block window. Devices use raw cumulative deltas — if no
     intermediate reads arrived during a gap, the full delta may be attributed to a single block
-    even if it spans multiple windows. This can cause a sub-meter to appear to exceed the parent
+    even if it spans multiple windows. This can cause a device to appear to exceed the parent
     grid import for that block. The engine logs a WARNING and preserves the raw value. This is a
     known limitation and will be improved in a future release.
   </div>
@@ -333,6 +411,11 @@ http://192.168.1.x:8099/lovelace/heatmap   # Net energy heatmap</pre>
     These sensors use <code>state_class: total_increasing</code> and <code>device_class: energy</code>
     so they are compatible with the HA Energy dashboard and Utility Meter integrations.
   </p>
+  <div class="note-box">
+    ⓘ With the <strong>Supplier API</strong> billing source (<code>cad+api</code>), the cost sensors
+    reflect DCC-settled figures once a block settles (provisional until then). In <code>cad</code> mode
+    they reflect your local rate × kWh as before.
+  </div>
 </div>
 
 <div class="card help-section">

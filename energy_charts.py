@@ -679,7 +679,10 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
                         # Store raw total before sub-meter subtraction
                         main_import_raw[rate]["kwh"]  += kwh
                         main_import_raw[rate]["cost"] += cost
-                        # Use kwh_remainder directly when available
+                        # Use kwh_remainder directly when available. With no
+                        # sub-meters this key is absent (NULL in DB, omitted by
+                        # reconstruction), so the raw kwh is kept unchanged —
+                        # api+mini blocks are identical to CAD here.
                         if "kwh_remainder" in channel:
                             kwh  = float(channel["kwh_remainder"])
                             cost = max(0.0, cost - sub_by_rate[rate]["cost"])
@@ -722,8 +725,10 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
                 continue
             sc = float((meter or {}).get("standing_charge") or 0.0)
             if sc > 0:
-                standing_by_day[day_key] = max(standing_by_day[day_key], sc)
-                # (standing charge accumulated into _main_day_sc below)
+                # Start-of-day: keep the first non-zero charge seen (blocks are
+                # processed in ascending order). Not MAX (over-bills on a drop).
+                if not standing_by_day.get(day_key):
+                    standing_by_day[day_key] = sc
             elif day_key not in charged_days:
                 standing_by_day.setdefault(day_key, 0.0)
         charged_days.add(day_key)
@@ -773,7 +778,8 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
             if _blk_meta.get("sub_meter"):
                 continue  # main meter only
             _blk_sc = float((_blk_meter or {}).get("standing_charge") or 0.0)
-            if _blk_sc > _main_day_sc[_blk_day]:
+            if _blk_sc > 0 and not _main_day_sc.get(_blk_day):
+                # Start-of-day (first non-zero, ascending order); not MAX.
                 _main_day_sc[_blk_day] = _blk_sc
             for _blk_ch_name, _blk_ch in ((_blk_meter or {}).get("channels", {}) or {}).items():
                 if not _blk_ch:
@@ -1046,7 +1052,10 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
             main_export = (main.get("channels", {}) or {}).get("export", {}) or {}
 
             # Use kwh_remainder when available (engine PASS 2 remainder — same field
-            # usage stats uses). Fall back to subtraction for legacy blocks.
+            # usage stats uses). With no sub-meters this key is absent (NULL in DB,
+            # omitted by both block reconstruction paths), so this falls through to
+            # the main meter's kwh — api+mini blocks are structurally identical to
+            # CAD here, so no mode-specific handling is needed.
             if "kwh_remainder" in main_import:
                 main_kwh  = _f(main_import["kwh_remainder"])
                 main_cost = _f(main_import.get("cost"))
@@ -3189,8 +3198,15 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None, curren
                     break
                 cg = float(cg)
                 days_carbon[day][hh_index] = cg
-                # Intensity only meaningful when net != 0
-                if net != 0:
+                # Carbon intensity is the grid's gCO2/kWh at this time — a property
+                # of the grid, independent of how much we drew. Prefer the value
+                # stored at write time (3.0.0+), which is defined even for a
+                # zero-net block (so it no longer leaves an empty cell); fall back
+                # to carbon_g/net for pre-3.0.0 blocks that predate the column.
+                ci = md.get("carbon_intensity_g")
+                if ci is not None:
+                    days_intensity[day][hh_index] = round(abs(float(ci)), 1)
+                elif net != 0:
                     days_intensity[day][hh_index] = round(abs(cg / net), 1)
                 break
         except Exception:
@@ -3713,9 +3729,14 @@ function _hmGetTotColorscale() {{
 }}
 
 function _hmGetChartTitle() {{
-  if (_hmMetric === 'co2')       return 'Carbon Flow (gCO₂ per slot)';
+  if (_hmMetric === 'co2')       return 'Carbon Emitted (gCO₂)';
   if (_hmMetric === 'intensity') return 'Grid Carbon Intensity (gCO₂/kWh)';
-  return 'Net Energy Flow';
+  return 'Net Energy (kWh)';
+}}
+function _hmGetChartSubtitle() {{
+  if (_hmMetric === 'co2')       return 'The amount of carbon your usage produced — scales with how much you use';
+  if (_hmMetric === 'intensity') return 'The rate — how clean the grid was per unit, regardless of your usage';
+  return 'Energy imported minus exported, each half-hour';
 }}
 
 function _hmApplyMetric() {{
@@ -3791,6 +3812,8 @@ function _hmApplyMetric() {{
   // Update title to match current metric
   _liveLayout.title = _liveLayout.title || {{}};
   _liveLayout.title.text = _hmGetChartTitle();
+  _liveLayout.title.subtitle = {{text: _hmGetChartSubtitle(), font: {{color: _hmTc.axisC, size: 12}}}};
+  _liveLayout.title.automargin = true;
   Plotly.react('heatmap', newData, _liveLayout).then(function() {{
     if (totals && _hmMetric !== 'intensity') {{
       Plotly.relayout('heatmap', {{'xaxis2.title.text': totLabel}});
@@ -3849,7 +3872,7 @@ var data = [
 }}
 ];
 var layout = {{
-  title: {{text: 'Net Energy Flow', x: 0.5, font: {{color: _hmTc.textC}}}},
+  title: {{text: _hmGetChartTitle(), subtitle: {{text: _hmGetChartSubtitle(), font: {{color: _hmTc.axisC, size: 12}}}}, x: 0.5, automargin: true, font: {{color: _hmTc.textC}}}},
   xaxis:  {{tickangle: -45, side: 'top', domain: [0, 0.85], tickmode: 'array', tickvals: {x_tickvals_json}, ticktext: {x_tickvals_json}, tickfont: {{color: _hmTc.axisC}}, fixedrange: true}},
   xaxis2: {{title: {{text: 'Daily Total', standoff: 10, font: {{color: _hmTc.axisC}}}}, side: 'top', domain: [0.86, 1], tickfont: {{color: _hmTc.axisC}}, fixedrange: true}},
   yaxis:  {{type: 'category', tickmode: 'array', tickvals: {y_json}, ticktext: {y_ticktext_json}, fixedrange: true, tickfont: {{color: _hmTc.axisC}}}},

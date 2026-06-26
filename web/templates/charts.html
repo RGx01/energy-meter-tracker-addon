@@ -1907,11 +1907,21 @@ function barBuildTable() {
       return imp - exp;
     }
     if (col.key === 'net_imp') {
-      if (barMetric === 'co2') { var v = agg.carbon_g_net; return (v != null && v > 0) ? v : 0; }
+      // Net view = gross import vs gross export, netting to Total (carbon_g_net),
+      // identical in shape to the kWh/£ Net columns. For CO2 the gross import
+      // carbon is the main meter's carbon_g_imp (sub-meters draw through it and
+      // carry no carbon_g_imp, so the sum collapses to the main's figure).
+      // Using the net-positive split here was the bug: it forced import to 0 on
+      // any net-offsetting day and to the net (not gross) value otherwise.
+      if (barMetric === 'co2') {
+        return Object.values(agg.meters||{}).reduce(function(s,m){ return s+(m.carbon_g_imp||0); }, 0);
+      }
       return barMetric === 'kwh' ? (agg.imp_kwh || 0) : ((agg.imp_cost || 0) + barStandingVal(agg));
     }
     if (col.key === 'net_exp') {
-      if (barMetric === 'co2') { var v = agg.carbon_g_net; return (v != null && v < 0) ? Math.abs(v) : 0; }
+      if (barMetric === 'co2') {
+        return Object.values(agg.meters||{}).reduce(function(s,m){ return s+(m.carbon_g_exp||0); }, 0);
+      }
       return barMetric === 'kwh' ? (agg.exp_kwh || 0) : (agg.exp_cost || 0);
     }
     if (col.key === 'co2_total') return agg.carbon_g_total != null ? agg.carbon_g_total : null;
@@ -1932,9 +1942,15 @@ function barBuildTable() {
     var m = (agg.meters||{})[col.mid];
     if (!m) return barMetric === 'co2' ? null : 0;
     if (barMetric === 'co2') {
-      // main meter: use carbon_g_imp (import portion only)
-      // sub-meters: use carbon_g (gross import, no export)
-      var cgi = m.carbon_g_imp != null ? m.carbon_g_imp : m.carbon_g;
+      // Each meter's import-side carbon contribution:
+      //   main meter -> carbon_g is the DIRECT remainder (import carbon minus
+      //                 the sub-meters that draw through it)
+      //   sub-meters -> carbon_g is their gross import carbon (no export)
+      // carbon_g_imp is the main's *un-subtracted* gross import and must NOT be
+      // used here — it already contains the sub carbon, so reading it would
+      // double-count the subs against the Direct column (and inflate the row
+      // Total). This matches barVal()'s chart logic and the Insights page.
+      var cgi = m.carbon_g;
       return cgi != null ? cgi : null;
     }
     return barMetric === 'kwh' ? m.imp_kwh : m.imp_cost;

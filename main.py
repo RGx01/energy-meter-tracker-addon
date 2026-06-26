@@ -15,7 +15,7 @@ import logging
 import sys
 
 from ha_client import HAClient
-from engine import engine_startup, engine_loop_task, setup, DATA_DIR, CHART_DIR
+from engine import engine_startup, engine_loop_task, kraken_poll_task, setup, DATA_DIR, CHART_DIR
 import web.server as server
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -80,7 +80,19 @@ async def main():
 
     # 5 — Run engine loop + WebSocket listener concurrently
     logger.info("Starting engine loop and WebSocket listener")
+    import engine as _eng
     try:
+        # Launch the poll task as an INDEPENDENTLY-MANAGED background task — NOT
+        # awaited in the gather below. engine_startup cancels and relaunches this
+        # handle on every config save (to tear down an in-flight backfill before
+        # reopening the store). If the task were inside the gather, that cancel
+        # would propagate CancelledError to the gather and shut the whole add-on
+        # down — observed when a config save (e.g. completing the setup wizard)
+        # happens on a running instance in an API mode, where the poll task is a
+        # live long-running loop rather than an already-idle no-op. Tracking it
+        # via the handle keeps it alive and lets the engine own its lifecycle.
+        poll_task = asyncio.ensure_future(kraken_poll_task(ha))
+        _eng._kraken_poll_task_handle = poll_task
         await asyncio.gather(
             engine_loop_task(ha),
             ha.listen(),
@@ -88,6 +100,14 @@ async def main():
     except asyncio.CancelledError:
         logger.info("Tasks cancelled — shutting down")
     finally:
+        # Cancel the independently-managed poll task on shutdown (it's not in the
+        # gather above, so it won't be torn down automatically).
+        try:
+            h = _eng._kraken_poll_task_handle
+            if h is not None and not h.done():
+                h.cancel()
+        except Exception:
+            pass
         await ha.close()
         logger.info("Energy Meter Tracker add-on stopped")
 

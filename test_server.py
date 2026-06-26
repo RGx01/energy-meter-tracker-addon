@@ -214,6 +214,59 @@ class TestRouteRegistration(unittest.TestCase):
     def test_api_blocks_summary_registered(self):
         self.assertTrue(self._registered("api_blocks_summary"))
 
+    def test_api_billing_source_get_registered(self):
+        self.assertTrue(self._registered("api_billing_source_get"))
+
+    def test_api_billing_source_post_registered(self):
+        self.assertTrue(self._registered("api_billing_source_post"))
+
+    def test_api_unsettled_blocks_registered(self):
+        self.assertTrue(self._registered("api_unsettled_blocks"))
+
+    def test_api_retry_settlement_registered(self):
+        self.assertTrue(self._registered("api_retry_settlement"))
+
+    def test_api_kraken_config_get_registered(self):
+        self.assertTrue(self._registered("api_kraken_config_get"))
+
+    def test_api_kraken_config_post_registered(self):
+        self.assertTrue(self._registered("api_kraken_config_post"))
+
+    def test_api_data_source_mode_get_registered(self):
+        self.assertTrue(self._registered("api_data_source_mode_get"))
+
+    def test_api_data_source_mode_post_registered(self):
+        self.assertTrue(self._registered("api_data_source_mode_post"))
+
+    def test_api_detect_bcd_registered(self):
+        self.assertTrue(self._registered("api_detect_bcd"))
+
+    def test_api_meter_main_reset_registered(self):
+        self.assertTrue(self._registered("api_meter_main_reset"))
+
+    def test_chart_files_removed_on_reset_logic(self):
+        # The main-reset path removes stale chart HTML from CHART_DIR. Verify the
+        # removal contract over a temp dir (the destructive route itself wipes
+        # the DB + restarts, so we exercise the file-cleanup portion directly).
+        import server, os, tempfile
+        d = tempfile.mkdtemp()
+        orig = server.CHART_DIR
+        server.CHART_DIR = d
+        try:
+            for f in ("net_heatmap.html", "daily_usage.html"):
+                with open(os.path.join(d, f), "w") as fh:
+                    fh.write("<html>stale</html>")
+            # Same logic the reset route runs:
+            for f in ("net_heatmap.html", "daily_usage.html"):
+                p = os.path.join(server.CHART_DIR, f)
+                if os.path.exists(p):
+                    os.remove(p)
+            self.assertFalse(os.path.exists(os.path.join(d, "net_heatmap.html")))
+            self.assertFalse(os.path.exists(os.path.join(d, "daily_usage.html")))
+        finally:
+            server.CHART_DIR = orig
+            import shutil; shutil.rmtree(d, ignore_errors=True)
+
     def test_api_chart_heatmap_registered(self):
         self.assertTrue(self._registered("api_chart_heatmap"))
 
@@ -284,6 +337,42 @@ class TestRouteRegistration(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────────
 # /api/last-page
 # ─────────────────────────────────────────────────────────────────────────────
+
+class TestEngineLoopBridge(unittest.TestCase):
+    """The sync→async bridge must run coroutines on the engine's loop, not a
+    fresh one (fresh-loop run_until_complete breaks aiohttp). Regression guard
+    for the detect-bcd / kraken-config / retry-settlement async bug."""
+
+    def test_raises_when_no_loop(self):
+        import server, asyncio
+        orig = server._event_loop
+        server._event_loop = None
+        async def _c():
+            return 1
+        try:
+            with self.assertRaises(RuntimeError):
+                server._run_on_engine_loop(_c())
+        finally:
+            server._event_loop = orig
+
+    def test_runs_on_running_loop(self):
+        import server, asyncio, threading
+        loop = asyncio.new_event_loop()
+        t = threading.Thread(target=loop.run_forever, daemon=True)
+        t.start()
+        orig = server._event_loop
+        server._event_loop = loop
+        async def _c():
+            await asyncio.sleep(0)
+            return 42
+        try:
+            self.assertEqual(server._run_on_engine_loop(_c(), timeout=5), 42)
+        finally:
+            server._event_loop = orig
+            loop.call_soon_threadsafe(loop.stop)
+            t.join(timeout=2)
+            loop.close()
+
 
 class TestApiLastPage(unittest.TestCase):
 
@@ -942,6 +1031,119 @@ class TestApiCorrections(unittest.TestCase):
             expected_cost = round(row["imp_kwh"] * new_rate, 6)
             self.assertAlmostEqual(row["imp_cost"], expected_cost, places=4,
                                    msg=f"Cost not recalculated: {row['imp_cost']} != {expected_cost}")
+
+
+class TestCorrectionsApiGate(unittest.TestCase):
+    """API+ gate: rate corrections only touch DCC-settled blocks (imp_kwh_api /
+    exp_kwh_api NOT NULL). Pure CAD (no API) applies immediately. Unsettled
+    blocks would be clobbered at settlement, so they're skipped + reported."""
+
+    def test_build_where_rate_import_settled_only(self):
+        where, _, _ = server._corrections_build_where(
+            "rate", "2026-01-01", "2026-12-31", "import", "", "", "all",
+            "UTC", api_settled_only=True)
+        self.assertIn("imp_kwh_api IS NOT NULL", where)
+
+    def test_build_where_rate_export_settled_only(self):
+        where, _, _ = server._corrections_build_where(
+            "rate", "2026-01-01", "2026-12-31", "export", "", "", "all",
+            "UTC", api_settled_only=True)
+        self.assertIn("exp_kwh_api IS NOT NULL", where)
+
+    def test_build_where_no_gate_when_flag_off(self):
+        where, _, _ = server._corrections_build_where(
+            "rate", "2026-01-01", "2026-12-31", "import", "", "", "all",
+            "UTC", api_settled_only=False)
+        self.assertNotIn("kwh_api", where)
+
+    def test_build_where_standing_never_gated(self):
+        where, _, _ = server._corrections_build_where(
+            "standing", "2026-01-01", "2026-12-31", "import", "", "", "all",
+            "UTC", api_settled_only=True)
+        self.assertNotIn("kwh_api", where)
+
+    def _store_settled_and_unsettled(self):
+        cfg = {"meters": {"electricity_main": {"meta": {
+            "billing_day": 1, "block_minutes": 30, "timezone": "Europe/London",
+            "currency_symbol": "£", "currency_code": "GBP", "postcode_prefix": "DE1",
+        }, "channels": {
+            "import": {"read": "sensor.imp", "rate": "sensor.rate"},
+            "export": {"read": "sensor.exp", "rate": "sensor.exp_rate"},
+        }}}}
+        store = BlockStore(":memory:")
+        store.insert_config_period(cfg)
+        cp = store.get_current_config_period_id()
+        def ins(bs, be, kwh_api):
+            store._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, "
+                "config_period_id, interpolated, imp_kwh, imp_rate, imp_cost, "
+                "imp_kwh_api) VALUES (?,?,?,?,0,?,?,?,?)",
+                (bs, be, "electricity_main", cp, 3.5, 0.323092, 1.13, kwh_api))
+        ins("2026-04-14T11:00:00", "2026-04-14T11:30:00", 3.5)   # settled
+        ins("2026-04-14T11:30:00", "2026-04-14T12:00:00", None)  # unsettled
+        store._conn.commit()
+        return store, cfg
+
+    def _apply(self, client, value=0.05493):
+        return client.post("/api/corrections/apply", json={
+            "type": "rate", "channel": "import",
+            "from_date": "2026-04-14", "to_date": "2026-04-14",
+            "value": value, "recalc_cost": True,
+        }, content_type="application/json")
+
+    def test_api_mode_skips_unsettled(self):
+        store, cfg = self._store_settled_and_unsettled()
+        eio.load_json = lambda path, default=None: cfg if "meters_config" in path else default
+        client = make_client(store=store)
+        orig = server._corrections_api_gate_active
+        server._corrections_api_gate_active = lambda: True
+        try:
+            d = json.loads(self._apply(client).data)
+            self.assertTrue(d["api_gated"])
+            self.assertEqual(d["updated_blocks"], 1)        # settled only
+            self.assertEqual(d["skipped_unreconciled"], 1)  # unsettled reported
+            rows = store._conn.execute(
+                "SELECT imp_rate FROM blocks ORDER BY block_start").fetchall()
+            self.assertAlmostEqual(rows[0]["imp_rate"], 0.05493, places=5)
+            self.assertAlmostEqual(rows[1]["imp_rate"], 0.323092, places=5)  # teeth: untouched
+        finally:
+            server._corrections_api_gate_active = orig
+
+    def test_cad_mode_applies_to_all(self):
+        store, cfg = self._store_settled_and_unsettled()
+        eio.load_json = lambda path, default=None: cfg if "meters_config" in path else default
+        client = make_client(store=store)
+        orig = server._corrections_api_gate_active
+        server._corrections_api_gate_active = lambda: False
+        try:
+            d = json.loads(self._apply(client).data)
+            self.assertFalse(d["api_gated"])
+            self.assertEqual(d["updated_blocks"], 2)        # both
+            self.assertEqual(d["skipped_unreconciled"], 0)
+            rows = store._conn.execute(
+                "SELECT imp_rate FROM blocks ORDER BY block_start").fetchall()
+            self.assertAlmostEqual(rows[0]["imp_rate"], 0.05493, places=5)
+            self.assertAlmostEqual(rows[1]["imp_rate"], 0.05493, places=5)
+        finally:
+            server._corrections_api_gate_active = orig
+
+    def test_preview_reports_skip_in_api_mode(self):
+        store, cfg = self._store_settled_and_unsettled()
+        eio.load_json = lambda path, default=None: cfg if "meters_config" in path else default
+        client = make_client(store=store)
+        orig = server._corrections_api_gate_active
+        server._corrections_api_gate_active = lambda: True
+        try:
+            r = client.post("/api/corrections/preview", json={
+                "type": "rate", "channel": "import",
+                "from_date": "2026-04-14", "to_date": "2026-04-14", "value": 0.05493,
+            }, content_type="application/json")
+            d = json.loads(r.data)
+            self.assertTrue(d["api_gated"])
+            self.assertEqual(len(d["blocks"]), 1)            # only settled previewed
+            self.assertEqual(d["skipped_unreconciled"], 1)
+        finally:
+            server._corrections_api_gate_active = orig
 
 
 class TestApiConfigHistoryDelete(unittest.TestCase):
@@ -1734,6 +1936,319 @@ class TestSettingsAndInsightsPages(unittest.TestCase):
             r = self.client.get("/live-power")
         self.assertIn(r.status_code, (200, 500))  # may fail without power sensor
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Overview page gating (power sensor OR postcode)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestOverviewGating(unittest.TestCase):
+    """Overview page (formerly Live Power) reveals on power-sensor OR postcode;
+    cards adapt to the gates; a dismissible hint replaces the old empty state."""
+
+    def _cfg(self, power=False, postcode=False):
+        meta = {"billing_day": 1, "block_minutes": 30, "timezone": "Europe/London",
+                "currency_symbol": "£"}
+        if power:
+            meta["power_sensor"] = "sensor.house_power"
+        if postcode:
+            meta["postcode_prefix"] = "DE1"
+        return {"meters": {"electricity_main": {"meta": meta, "channels": {}}}}
+
+    def _get(self, power, postcode):
+        store = BlockStore(":memory:")
+        client = make_client(store=store)
+        with patch.object(server, "load_config", return_value=self._cfg(power, postcode)):
+            return client.get("/live-power")
+
+    def test_power_only(self):
+        r = self._get(power=True, postcode=False)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b"Overview", r.data)
+        self.assertIn(b'class="power-card"', r.data)        # gauge present
+        self.assertNotIn(b'id="power-hint"', r.data)        # no hint
+        self.assertNotIn(b'id="carbon-card-wrap"', r.data)  # no carbon
+        self.assertIn(b'id="status-text"', r.data)          # status indicator shown
+        self.assertNotIn(b'function loadMix', r.data)       # no standalone donut poller
+
+    def test_postcode_only(self):
+        r = self._get(power=False, postcode=True)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'id="power-hint"', r.data)           # dismissible hint
+        self.assertIn(b'id="carbon-card-wrap"', r.data)     # carbon present
+        self.assertNotIn(b'class="power-card"', r.data)     # teeth: gauge gated out
+        # no power source → no status indicator (was showing a false "Error")
+        self.assertNotIn(b'id="status-text"', r.data)
+        self.assertNotIn(b'id="status-dot"', r.data)
+        # generation-mix donut renders via its own power-independent poller
+        self.assertIn(b'id="mix-donut-canvas"', r.data)
+        self.assertIn(b'function loadMix', r.data)
+        # 48-hour history card renders in Mix mode only (no kW/CO2 without power)
+        self.assertIn(b'id="power-history-card-wrap"', r.data)
+        self.assertIn(b'id="ph-btn-mix"', r.data)
+        self.assertNotIn(b'id="ph-btn-kw"', r.data)
+        self.assertNotIn(b'id="ph-btn-co2"', r.data)
+
+    def test_both_gates(self):
+        r = self._get(power=True, postcode=True)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'class="power-card"', r.data)
+        self.assertIn(b'id="carbon-card-wrap"', r.data)
+        self.assertNotIn(b'id="power-hint"', r.data)
+
+    def test_neither_still_renders(self):
+        # reachable by direct URL though hidden from nav; must not error
+        r = self._get(power=False, postcode=False)
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn(b'class="power-card"', r.data)
+        self.assertNotIn(b'id="carbon-card-wrap"', r.data)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Octopus Mini as the live-power source (power_source == "mini")
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestMiniPowerSource(unittest.TestCase):
+    """Mini opted in as the live source: gate recognition, /api/power demand
+    branch, availability signal, and the engine-polled demand cache."""
+
+    def setUp(self):
+        import engine
+        engine._last_mini_demand = {"kw": None, "ts": 0.0, "wall": 0.0}
+
+    def _cfg(self, power_sensor=None, power_source=None):
+        meta = {"billing_day": 1, "block_minutes": 30, "timezone": "Europe/London",
+                "currency_symbol": "£"}
+        if power_sensor: meta["power_sensor"] = power_sensor
+        if power_source: meta["power_source"] = power_source
+        return {"meters": {"electricity_main": {"meta": meta, "channels": {}}}}
+
+    def _power(self, cfg, **patches):
+        client = make_client(store=BlockStore(":memory:"))
+        import contextlib
+        with contextlib.ExitStack() as es:
+            es.enter_context(patch.object(server, "load_config", return_value=cfg))
+            for tgt, val in patches.items():
+                es.enter_context(patch.object(server, tgt, return_value=val))
+            return json.loads(client.get("/api/power").data)
+
+    def test_overview_reveals_with_mini_source(self):
+        cfg = self._cfg(power_source="mini")
+        client = make_client(store=BlockStore(":memory:"))
+        with patch.object(server, "load_config", return_value=cfg), \
+             patch.object(server, "_mini_device_id", return_value="dev-1"):
+            r = client.get("/live-power")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'class="power-card"', r.data)   # gauge revealed by the marker
+
+    def test_api_power_mini_import(self):
+        d = self._power(self._cfg(power_source="mini"),
+                        _mini_device_id="dev-1", _mini_live_demand_kw=1.25)
+        self.assertTrue(d["mini_active"])
+        self.assertTrue(d["has_power_sensor"])
+        self.assertAlmostEqual(d["import_kw"], 1.25)
+        self.assertEqual(d["export_kw"], 0.0)
+
+    def test_api_power_mini_export(self):
+        d = self._power(self._cfg(power_source="mini"),
+                        _mini_device_id="dev-1", _mini_live_demand_kw=-0.8)
+        self.assertEqual(d["import_kw"], 0.0)
+        self.assertAlmostEqual(d["export_kw"], 0.8)
+
+    def test_mini_inactive_without_device(self):
+        # marker set but no Mini discovered → not active, falls through
+        d = self._power(self._cfg(power_source="mini"), _mini_device_id=None)
+        self.assertFalse(d["mini_active"])
+
+    def test_mini_available_when_no_other_source(self):
+        import engine
+        cfg = self._cfg()
+        client = make_client(store=BlockStore(":memory:"))
+        with patch.object(server, "load_config", return_value=cfg), \
+             patch.object(server, "_mini_device_id", return_value="dev-1"), \
+             patch.object(engine, "_detected_integrations", {"bcd": {"found": False}}, create=True):
+            d = json.loads(client.get("/api/power").data)
+        self.assertTrue(d["mini_available"])
+        self.assertFalse(d["mini_active"])
+
+    def test_mini_not_available_with_bcd(self):
+        import engine
+        cfg = self._cfg()
+        client = make_client(store=BlockStore(":memory:"))
+        with patch.object(server, "load_config", return_value=cfg), \
+             patch.object(server, "_mini_device_id", return_value="dev-1"), \
+             patch.object(engine, "_detected_integrations", {"bcd": {"found": True}}, create=True):
+            d = json.loads(client.get("/api/power").data)
+        self.assertFalse(d["mini_available"])
+
+    def test_mini_not_available_with_sensor(self):
+        d = self._power(self._cfg(power_sensor="sensor.house"),
+                        _mini_device_id="dev-1")
+        self.assertFalse(d["mini_available"])
+
+    def test_gauge_reads_engine_cache(self):
+        import engine, time
+        # fresh engine reading → gauge returns it (no GraphQL here)
+        engine._last_mini_demand = {"kw": 1.5, "ts": 0.0, "wall": time.time()}
+        self.assertAlmostEqual(server._mini_live_demand_kw(), 1.5)
+        # stale reading → None
+        engine._last_mini_demand = {"kw": 1.5, "ts": 0.0, "wall": time.time() - 600}
+        self.assertIsNone(server._mini_live_demand_kw())
+        # no reading → None
+        engine._last_mini_demand = {"kw": None, "ts": 0.0, "wall": 0.0}
+        self.assertIsNone(server._mini_live_demand_kw())
+
+    # ── enable / disable endpoint ──
+    def test_enable_sets_marker(self):
+        cfg = self._cfg()
+        saved = {}
+        client = make_client(store=BlockStore(":memory:"))
+        with patch.object(server, "load_config", return_value=cfg), \
+             patch.object(server, "save_config", side_effect=lambda d: saved.update(cfg=d)):
+            r = client.post("/api/power-source/mini", json={"enabled": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(json.loads(r.data)["enabled"])
+        self.assertEqual(
+            saved["cfg"]["meters"]["electricity_main"]["meta"].get("power_source"), "mini")
+
+    def test_disable_clears_marker(self):
+        cfg = self._cfg(power_source="mini")
+        saved = {}
+        client = make_client(store=BlockStore(":memory:"))
+        with patch.object(server, "load_config", return_value=cfg), \
+             patch.object(server, "save_config", side_effect=lambda d: saved.update(cfg=d)):
+            r = client.post("/api/power-source/mini", json={"enabled": False})
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("power_source",
+                         saved["cfg"]["meters"]["electricity_main"]["meta"])
+
+    def test_enable_blocked_when_sensor_present(self):
+        # never override a real device sensor — 409, no save
+        cfg = self._cfg(power_sensor="sensor.house")
+        client = make_client(store=BlockStore(":memory:"))
+        with patch.object(server, "load_config", return_value=cfg), \
+             patch.object(server, "save_config",
+                          side_effect=AssertionError("must not save")):
+            r = client.post("/api/power-source/mini", json={"enabled": True})
+        self.assertEqual(r.status_code, 409)
+
+    # ── render: enable-card / disable-note / generic-hint ──
+    def test_render_enable_card_when_available(self):
+        import engine
+        client = make_client(store=BlockStore(":memory:"))
+        with patch.object(server, "load_config", return_value=self._cfg()), \
+             patch.object(server, "_mini_device_id", return_value="dev-1"), \
+             patch.object(engine, "_detected_integrations",
+                          {"bcd": {"found": False}}, create=True):
+            r = client.get("/live-power")
+        self.assertIn(b'id="mini-enable"', r.data)
+        self.assertNotIn(b'id="power-hint"', r.data)
+        self.assertNotIn(b'id="mini-active-note"', r.data)
+
+    def test_render_disable_note_when_chosen(self):
+        client = make_client(store=BlockStore(":memory:"))
+        with patch.object(server, "load_config",
+                          return_value=self._cfg(power_source="mini")), \
+             patch.object(server, "_mini_device_id", return_value="dev-1"):
+            r = client.get("/live-power")
+        self.assertIn(b'id="mini-active-note"', r.data)
+        self.assertIn(b'class="power-card"', r.data)   # gauge revealed
+        self.assertNotIn(b'id="mini-enable"', r.data)
+
+    def test_render_generic_hint_when_no_mini(self):
+        import engine
+        client = make_client(store=BlockStore(":memory:"))
+        with patch.object(server, "load_config", return_value=self._cfg()), \
+             patch.object(server, "_mini_device_id", return_value=None), \
+             patch.object(engine, "_detected_integrations",
+                          {"bcd": {"found": False}}, create=True):
+            r = client.get("/live-power")
+        self.assertIn(b'id="power-hint"', r.data)
+        self.assertNotIn(b'id="mini-enable"', r.data)
+        self.assertNotIn(b'id="mini-active-note"', r.data)
+
+    # ── poll cadence + visibility (chunk 3a) ──
+    def test_render_mini_poll_cadence(self):
+        client = make_client(store=BlockStore(":memory:"))
+        with patch.object(server, "load_config",
+                          return_value=self._cfg(power_source="mini")), \
+             patch.object(server, "_mini_device_id", return_value="dev-1"):
+            r = client.get("/live-power")
+        self.assertIn(b"POWER_POLL_MS = 60000", r.data)   # Mini → 60s (reads engine cache)
+        self.assertNotIn(b"visibilitychange", r.data)     # no page-active gating
+
+    def test_render_sensor_poll_cadence(self):
+        ha = MagicMock(); ha.get_state.return_value = None
+        client = make_client(store=BlockStore(":memory:"))
+        with patch.object(server, "load_config",
+                          return_value=self._cfg(power_sensor="sensor.house")), \
+             patch.object(server, "_ha_client", ha):
+            r = client.get("/live-power")
+        self.assertIn(b"POWER_POLL_MS = 5000", r.data)    # local sensor → 5s
+
+    # ── BCD auto-adopt + unit-aware sensor read (chunk 3b) ──
+    def test_bcd_demand_sensor_helper(self):
+        import engine
+        with patch.object(engine, "_detected_integrations",
+                          {"bcd": {"found": True, "demand_sensor": "sensor.bcd"}}, create=True):
+            self.assertEqual(server._bcd_demand_sensor(), "sensor.bcd")
+        with patch.object(engine, "_detected_integrations",
+                          {"bcd": {"found": False, "demand_sensor": "sensor.bcd"}}, create=True):
+            self.assertIsNone(server._bcd_demand_sensor())
+
+    def test_effective_power_sensor_precedence(self):
+        with patch.object(server, "_bcd_demand_sensor", return_value="sensor.bcd"):
+            self.assertEqual(
+                server._effective_power_sensor({"power_sensor": "sensor.mine"}), "sensor.mine")
+            self.assertEqual(server._effective_power_sensor({}), "sensor.bcd")
+        with patch.object(server, "_bcd_demand_sensor", return_value=None):
+            self.assertIsNone(server._effective_power_sensor({}))
+
+    def test_render_bcd_adopted_reveals_gauge(self):
+        import engine
+        client = make_client(store=BlockStore(":memory:"))
+        with patch.object(server, "load_config", return_value=self._cfg()), \
+             patch.object(engine, "_detected_integrations",
+                          {"bcd": {"found": True, "demand_sensor": "sensor.bcd_demand"}}, create=True), \
+             patch.object(server, "_mini_device_id", return_value="dev-1"):
+            r = client.get("/live-power")
+        self.assertIn(b'class="power-card"', r.data)    # gauge revealed via BCD
+        self.assertNotIn(b'id="mini-enable"', r.data)   # Mini NOT offered when BCD present
+        self.assertNotIn(b'id="power-hint"', r.data)
+
+    def test_api_power_bcd_adopted_beats_mini(self):
+        import engine
+        client = make_client(store=BlockStore(":memory:"))
+        with patch.object(server, "load_config",
+                          return_value=self._cfg(power_source="mini")), \
+             patch.object(engine, "_detected_integrations",
+                          {"bcd": {"found": True, "demand_sensor": "sensor.bcd_demand"}}, create=True), \
+             patch.object(server, "_mini_device_id", return_value="dev-1"):
+            d = json.loads(client.get("/api/power").data)
+        self.assertTrue(d["has_power_sensor"])          # BCD adopted
+        self.assertFalse(d["mini_active"])              # configured/BCD beats Mini quota
+
+    def test_sensor_kw_watts_converted(self):
+        ha = MagicMock()
+        ha.get_state.return_value = "1500"
+        ha.get_attributes.return_value = {"unit_of_measurement": "W"}
+        client = make_client(store=BlockStore(":memory:"))
+        with patch.object(server, "load_config",
+                          return_value=self._cfg(power_sensor="sensor.house_w")), \
+             patch.object(server, "_ha_client", ha):
+            d = json.loads(client.get("/api/power").data)
+        self.assertAlmostEqual(d["import_kw"], 1.5)     # 1500 W → 1.5 kW
+
+    def test_sensor_kw_kilowatts_preserved(self):
+        ha = MagicMock()
+        ha.get_state.return_value = "2.5"
+        ha.get_attributes.return_value = {"unit_of_measurement": "kW"}
+        client = make_client(store=BlockStore(":memory:"))
+        with patch.object(server, "load_config",
+                          return_value=self._cfg(power_sensor="sensor.house_kw")), \
+             patch.object(server, "_ha_client", ha):
+            d = json.loads(client.get("/api/power").data)
+        self.assertAlmostEqual(d["import_kw"], 2.5)     # kW preserved
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2833,3 +3348,125 @@ class TestGaugeScaleFromPowerHistory(unittest.TestCase):
             r = self.client.get("/live-power")
         # Should render successfully (200) — gauge scale code runs without error
         self.assertEqual(r.status_code, 200)
+
+class TestDataSourceModeSupplierGating(unittest.TestCase):
+    """Server-side enforcement of supplier gating on POST /api/data-source-mode.
+
+    The route must reject an API-backed mode for a non-API-capable supplier even
+    if the UI would never send it (don't trust the UI alone). Capability
+    correctness itself is unit-tested in test_engine; here we exercise the
+    route's branching with faithful controlled stand-ins on the engine stub.
+    """
+
+    def setUp(self):
+        self.client = make_client()
+        import server as _s
+        self._s = _s
+        self._eng = sys.modules["engine"]
+        self._saved = {k: getattr(self._eng, k, None)
+                       for k in ("mode_uses_api", "supplier_is_api_capable",
+                                 "set_data_source_mode", "has_kraken_credentials")}
+        self._eng.mode_uses_api = lambda m=None: (m or "") in ("cad+api", "api", "api+mini")
+        self._eng.supplier_is_api_capable = lambda s=None: "octopus" in (s or "").strip().lower()
+        self._eng.set_data_source_mode = lambda m: m
+        self._eng.has_kraken_credentials = lambda: True   # creds present by default
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                if hasattr(self._eng, k):
+                    delattr(self._eng, k)
+            else:
+                setattr(self._eng, k, v)
+
+    def _post(self, body):
+        return self.client.post("/api/data-source-mode",
+                                data=json.dumps(body),
+                                content_type="application/json")
+
+    def test_api_mode_with_octopus_accepted(self):
+        r = self._post({"mode": "api", "supplier": "octopus"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json().get("ok"))
+
+    def test_api_mode_with_not_listed_rejected(self):
+        r = self._post({"mode": "api", "supplier": "not-listed"})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json().get("error"), "supplier_not_api_capable")
+
+    def test_cadapi_mode_with_not_listed_rejected(self):
+        r = self._post({"mode": "cad+api", "supplier": "not-listed"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_api_mode_without_credentials_rejected(self):
+        # API mode requires creds — cad→api with no creds must be rejected,
+        # not silently leave the user on a mode with nothing to poll.
+        self._eng.has_kraken_credentials = lambda: False
+        r = self._post({"mode": "api", "supplier": "octopus"})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json().get("error"), "no_credentials")
+
+    def test_cad_mode_not_gated(self):
+        r = self._post({"mode": "cad", "supplier": "not-listed"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json().get("ok"))
+
+    def test_api_mode_falls_back_to_config_octopus_accepted(self):
+        cfg = {"meters": {"electricity_main": {"meta": {"supplier": "octopus"}}}}
+        with patch.object(self._s, "load_config", return_value=cfg):
+            r = self._post({"mode": "api"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_api_mode_config_fallback_local_only_rejected(self):
+        cfg = {"meters": {"electricity_main": {"meta": {"supplier": "not-listed"}}}}
+        with patch.object(self._s, "load_config", return_value=cfg):
+            r = self._post({"mode": "api"})
+        self.assertEqual(r.status_code, 400)
+
+
+class TestDisconnectKrakenRoute(unittest.TestCase):
+    """POST /api/disconnect-kraken delegates to engine.disconnect_kraken via the
+    engine loop and maps the result to the HTTP status. Engine logic itself is
+    unit-tested in test_engine; here we exercise the route's wiring/branching."""
+
+    def setUp(self):
+        self.client = make_client()
+        import server as _s
+        self._s = _s
+        self._eng = sys.modules["engine"]
+        self._saved_dis = getattr(self._eng, "disconnect_kraken", None)
+        self._saved_run = _s._run_on_engine_loop
+        # disconnect_kraken stub returns the dict directly; _run_on_engine_loop
+        # is replaced with a pass-through so no real engine loop is needed.
+        self._s._run_on_engine_loop = lambda coro, timeout=None: coro
+
+    def tearDown(self):
+        if self._saved_dis is None:
+            if hasattr(self._eng, "disconnect_kraken"):
+                delattr(self._eng, "disconnect_kraken")
+        else:
+            self._eng.disconnect_kraken = self._saved_dis
+        self._s._run_on_engine_loop = self._saved_run
+
+    def _post(self):
+        return self.client.post("/api/disconnect-kraken",
+                                data="{}", content_type="application/json")
+
+    def test_disconnect_ok_returns_200(self):
+        self._eng.disconnect_kraken = lambda: {"ok": True, "mode": "cad",
+                                               "had_credentials": True}
+        r = self._post()
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertTrue(j["ok"])
+        self.assertEqual(j["mode"], "cad")
+
+    def test_disconnect_failure_returns_500(self):
+        self._eng.disconnect_kraken = lambda: {"ok": False, "detail": "boom"}
+        r = self._post()
+        self.assertEqual(r.status_code, 500)
+        self.assertFalse(r.get_json()["ok"])
+
+
+if __name__ == "__main__":
+    unittest.main()

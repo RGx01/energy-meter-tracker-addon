@@ -939,25 +939,31 @@ different figures on different pages for the same period.
 `enabled` removed — mode on the meter drives whether Kraken is used.
 `live_poll_interval_seconds` removed — Mini live poll is frontend-driven.
 
-### Open Questions
+### Open Questions — RESOLVED (release decisions A1–A5, D4)
 
-1. **Mini `consumption` field** — import-only, export-inclusive, or net?
-   Test during Chunk 3: static during export while `demand` negative?
+1. **Mini `consumption` field — RESOLVED (A1): import-only.** Confirmed against the
+   real account. Mini-as-billing is import-accurate; there is no export-via-Mini.
 
-2. **Export register via GraphQL** — separate export `consumption` accessible?
-   Determines 3.1.0 export enhancement.
+2. **Export register via GraphQL — RESOLVED (A2): export is DCC-only.** No separate
+   export consumption via Mini/GraphQL. Export figures always come from DCC
+   settlement. Export-via-demand stays a future item (3.1+), not a 3.0 claim.
 
-3. **Export MPAN** — always separate for export tariff users? Verify during
-   auto-discover testing.
+3. **Export MPAN — RESOLVED (A3):** auto-discover picks up the separate export MPAN
+   cleanly when using the API.
 
-4. **`rateLimitInfo` field names** — verify against real account.
+4. **`rateLimitInfo` field names — RESOLVED (A4):** no field exposes queries
+   remaining/used for the period, so there is no live quota counter. This is why
+   the 4b backoff reacts to `KT-CT-1199` rather than budgeting proactively, and why
+   the Mini "intensive" caveat stays qualitative.
 
-5. **BottlecapDave config entry pre-population** — what is readable from HA
-   device/config registry without touching encrypted store?
+5. **BottlecapDave config pre-population — BUILT:** detection reads HA states
+   (`detect_bottlecapdave` → demand/current_rate entities); wizard prefill uses it.
 
-6. **NULL `imp_kwh` at provisional timeout** — `"api"` mode: block finalises
-   with NULL, excluded from billing permanently. `"api+mini"` mode: Mini figure
-   stands as billing value. Confirm this asymmetry is the correct policy.
+6. **NULL `imp_kwh` at provisional timeout — RESOLVED (A5): confirmed.** `"api"`
+   finalises NULL (excluded from billing); `"api+mini"` lets the Mini figure stand.
+   This is the intended asymmetry. (Intersects limbo-finalisation, which marks
+   past-horizon `api`-mode blocks `finalised_from_cad` so the unsettled count
+   drains — reversible if DCC later arrives.)
 
 7. **Mode transition behaviour — resolved:**
    - `"cad+api"`: engine writes `imp_kwh`, ingester writes `imp_kwh_api`.
@@ -970,8 +976,8 @@ different figures on different pages for the same period.
      from new `config_period`. Ingester continues writing `imp_kwh_api`
      as before. No special case needed.
 
-8. **IO dispatch correction, no HA sensor** — future version. Known limitation
-   for pure REST Intelligent Octopus users.
+8. **IO dispatch correction, no HA sensor — RESOLVED (D4): future/deferred.** Known
+   limitation for pure-REST Intelligent Octopus users (no smart-charge sensor).
 
 ### New Files
 

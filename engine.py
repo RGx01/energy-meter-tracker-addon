@@ -38,6 +38,9 @@ logger = logging.getLogger("engine")
 
 DATA_DIR           = "/data/energy_meter_tracker"
 CONFIG_PATH        = f"{DATA_DIR}/meters_config.json"
+# API credentials are stored in their OWN file (not the DB, not config.yaml) so
+# they are never swept into the DB backups. Entered in-app, read at startup.
+KRAKEN_CREDS_PATH  = f"{DATA_DIR}/kraken_credentials.json"
 # current_block.json removed in 2.1.0 — state stored in DB current_block table
 BLOCKS_PATH        = f"{DATA_DIR}/blocks.json"    # read-only: used only for one-time migration on startup
 BLOCKS_DB_PATH     = f"{DATA_DIR}/blocks.db"
@@ -83,8 +86,620 @@ _PUBLISH_HA_SENSORS: bool = os.environ.get("PUBLISH_HA_SENSORS", "true").lower()
 _engine_loop_lock:         asyncio.Lock = None   # initialised in setup()
 _engine_paused:            bool         = False
 _last_ci_fetch:            datetime | None = None   # UTC — last carbon intensity fetch
+_last_dispatch_capture:    datetime | None = None   # UTC — last dispatch-slot capture (5-min cadence)
 _current_slot_mix:         dict            = {}      # captured_at → generationmix list
 _meter_reset_detected:     bool            = False   # set when post-gap read < pre-gap read (possible meter replacement)
+
+# 3.0.0: optional block-boundary callback. The Kraken Mini ingester (Chunk 7)
+# registers here so it can take a Mini register reading at each boundary. None
+# until registered; firing is a guarded no-op otherwise. The full Mini read
+# logic lands in Chunk 7 — this is the hook it plugs into.
+_on_block_boundary_cb = None   # Optional[Callable[[str], None]]
+
+# 3.0.0 Kraken integration runtime state. Populated at startup by
+# _kraken_startup_discovery() when an API key is configured. The ingester
+# task (4b-ii) reads _kraken_discovery for the verified meter identifiers.
+# None/empty until then; the presence of _kraken_client gates all API work.
+_kraken_client = None          # KrakenAPIClient | None
+_kraken_discovery: dict | None = None
+_kraken_account_number: str | None = None
+# Reference to the running HAClient + poll-task handle, captured when the engine
+# loop starts. Lets connect_kraken_now() (the in-app credential-save path)
+# launch the DCC poll task without an addon restart — the task is otherwise
+# started once at boot and exits permanently if the API wasn't yet configured.
+_engine_ha = None              # HAClient | None
+_kraken_poll_task_handle = None  # asyncio.Task | None
+# True once the first (cold) engine_startup has completed in this process. The
+# rogue-total guard (clearing the in-progress block's carried reads) is valid
+# ONLY on a cold start, where those reads are stale leftovers from a previous
+# container. Every later engine_startup in the SAME process — HA reconnect or
+# config-save — is "warm": the process never stopped, the in-progress reads are
+# LIVE, and clearing them would discard real consumption (observed: a Mini block
+# lost ~3.4 kWh during an HA-upgrade reconnect storm). A new process resets this
+# to False, so a genuine container restart is correctly treated as cold.
+_cold_start_complete = False
+# Result of the last third-party HA integration detection (BCD live-power
+# offload source, OHME charge-mode smart-vs-boost signal). Populated by
+# _detect_and_log_integrations() each startup; consulted by the overlay (OHME
+# verified path) and the live-power tile (BCD offload). None until first run.
+_detected_integrations: dict | None = None
+# 4b-ii: ingester + scheduling. dry-run is HARDCODED here (4b choice); the
+# flip to live writes is a deliberate later step. Poll every 6h (DCC settles
+# ~daily, so frequent polling adds nothing). backfill cap is generous; the real
+# window is MIN(block_start)→now via get_oldest_block_start().
+_kraken_ingester = None         # KrakenIngester | None
+_KRAKEN_POLL_INTERVAL_S = 6 * 3600
+# 4b-iii: LIVE. The poll now writes DCC settlement into blocks (imp_kwh_api /
+# exp_kwh_api + needs_pass2_rerun), which the engine drain re-runs into billing.
+# A one-time blocks.db snapshot is taken before the first live write as a
+# rollback point (see _kraken_pre_live_snapshot).
+_KRAKEN_DRY_RUN = False
+_KRAKEN_BACKFILL_CAP_DAYS = 400
+_KRAKEN_SNAPSHOT_DONE_KEY = "pre_live_snapshot_done"
+# Auto settlement sweep: the 6h incremental poll only re-checks a sliding window
+# (last-seen − 6h → now). When DCC settles intervals out of order or later than
+# that overlap (export commonly lags import by days), an earlier interval can age
+# out behind the cursor and never be re-requested by the incremental poll. A
+# daily sweep re-fetches oldest-unsettled → now (advance_cursor=False) so those
+# gaps self-heal. Bounded to a horizon: beyond it, DCC settlement is unlikely and
+# the provisional value stands (also caps the sweep window cost).
+_SETTLEMENT_SWEEP_HORIZON_DAYS = 14
+_SETTLEMENT_SWEEP_MIN_INTERVAL_S = 24 * 3600   # run at most once per day
+_STATE_LAST_SWEEP = "last_settlement_sweep_utc"
+# Chunk 5: cached rate schedules for reconcile-time rate repair. Built once per
+# poll cycle by the (async) poll task; read by the (sync) drain via the resolver
+# below. Rates stored as £/kWh (converted from the API's pence at build time).
+_kraken_rate_schedules: dict = {}   # {"import": RateSchedule, "export": RateSchedule}
+# Standing-charge schedule (single, import-side — the daily standing charge).
+# Stored as £/day after conversion at resolve time, like rates.
+_kraken_standing_schedule = None    # RateSchedule | None
+_kraken_mini_reader = None          # MiniBoundaryReader | None — Chunk 7
+# Latest Mini live demand, polled server-side by the engine tick (page-independent)
+# so the 48h history fills continuously and the gauge reads it without its own
+# GraphQL call. {"kw": float|None, "ts": monotonic seconds, "wall": epoch seconds}
+_last_mini_demand = {"kw": None, "ts": 0.0, "wall": 0.0}
+_MINI_POLL_GAP = 55.0               # seconds between Mini demand polls (~1/min)
+# Start collecting Mini telemetry this many seconds BEFORE the block boundary
+# (per spec: 20s lead), continuing until the post-boundary read is bracketed.
+_MINI_COLLECT_LEAD_S = 20
+
+
+_BILLING_SOURCE_KEY = "billing_source"
+_VALID_BILLING_SOURCES = ("dcc", "cad")
+
+_MODE_KEY = "data_source_mode"
+_VALID_MODES = ("cad", "cad+api", "api", "api+mini")
+
+
+def get_data_source_mode() -> str:
+    """Current data-source mode, stored in kraken_state. One of:
+    'unset'    — no mode chosen yet (fresh/flattened DB, pre-survey). NOTHING
+                 should auto-activate (esp. the API) in this state.
+    'cad'      — local meter reads only, no supplier API
+    'cad+api'  — local reads + DCC settlement/rates
+    'api'      — no local reads; DCC is the import source
+    'api+mini' — no local reads; Mini provisional + DCC settlement
+    Returns 'unset' when nothing is stored — deliberately NOT defaulting to
+    'cad', so a flat DB (which has chosen nothing) is distinguishable from a
+    user who actually chose cad. The survey sets the mode explicitly."""
+    try:
+        val = _store.get_kraken_state(_MODE_KEY)
+    except Exception:
+        val = None
+    return val if val in _VALID_MODES else "unset"
+
+
+def is_mode_configured() -> bool:
+    """True once the survey has explicitly set a data-source mode."""
+    return get_data_source_mode() in _VALID_MODES
+
+
+def set_data_source_mode(mode: str) -> str:
+    """Persist the data-source mode. Returns the stored value. Raises ValueError
+    on an unknown mode. The mode is derived by the setup survey and drives
+    sensor collection, API requirement, and Mini activation."""
+    mode = (mode or "").lower()
+    if mode not in _VALID_MODES:
+        raise ValueError(f"mode must be one of {_VALID_MODES}, got {mode!r}")
+    _store.set_kraken_state(_MODE_KEY, mode)
+    logger.info("set_data_source_mode: %s", mode)
+    return mode
+
+
+def _detect_upgrade_mode(config: dict) -> str | None:
+    """Upgrade bridge: decide the mode for an install that has no stored mode.
+
+    2.x installs predate the data-source-mode concept, so on first 3.0.0 boot
+    get_data_source_mode() returns 'unset'. We must NOT leave an existing,
+    working user in 'unset' (which disables everything pending the survey), and
+    we must NOT infer or auto-activate the API. The conservative rule:
+
+      no stored mode AND a non-sub (main) meter has a configured import read
+      sensor (channels.import.read set)  →  this is an existing CAD user;
+      silently set mode 'cad' and carry on exactly as before.
+
+    A genuinely fresh/flattened install (no import sensor configured) is left
+    'unset' so the setup survey runs. Returns the mode it set, or None if it
+    made no change (already had a mode, or fresh install).
+
+    Because 'cad' makes mode_uses_api() False, this also neutralises any stale
+    credentials file left in /data on upgrade — nothing reads it under cad.
+    """
+    if get_data_source_mode() != "unset":
+        return None  # mode already chosen (survey, or a prior 3.0.0 boot)
+    has_import_sensor = any(
+        ((meter.get("channels") or {}).get("import") or {}).get("read")
+        for meter in (config.get("meters") or {}).values()
+        if not (meter.get("meta") or {}).get("sub_meter")
+    )
+    if not has_import_sensor:
+        return None  # fresh install — leave 'unset' for the survey
+    set_data_source_mode("cad")
+    logger.info(
+        "engine_startup: upgrade detected — existing import sensor present and "
+        "no stored mode; preserving as 'cad' (survey not required, API path off)"
+    )
+    return "cad"
+
+
+def mode_uses_api(mode: str = None) -> bool:
+    """True only if an explicitly-set mode involves the supplier API
+    (cad+api / api / api+mini). 'unset' → False (don't auto-activate API)."""
+    m = mode or get_data_source_mode()
+    return m in _VALID_MODES and "api" in m
+
+
+def mode_uses_mini(mode: str = None) -> bool:
+    """True only for api+mini."""
+    return (mode or get_data_source_mode()) == "api+mini"
+
+
+# ── Supplier capability (server-side gating seam) ────────────────────────────
+# Mirrors the client WIZ_SUPPLIERS registry. The supplier gate decides whether
+# an API-backed mode is permitted at all. Adding a future Kraken-platform
+# supplier = add its key here (+ eventually a profile). This is the authoritative
+# server-side check: the UI gating is convenience, this is enforcement.
+_API_CAPABLE_SUPPLIERS = frozenset({"octopus"})
+
+
+def normalize_supplier(supplier: str) -> str:
+    """Normalise a stored/submitted supplier (possibly legacy free-text like
+    'Octopus Energy', or empty for a v2 user) to a registry key. Empty → ''.
+    Any non-Octopus free-text collapses to 'not-listed' (the local-only
+    migration default), so legacy configs map cleanly onto the gating model."""
+    v = (supplier or "").strip().lower()
+    if not v:
+        return ""
+    if "octopus" in v:
+        return "octopus"
+    if v in _API_CAPABLE_SUPPLIERS or v == "not-listed":
+        return v
+    return "not-listed"
+
+
+def supplier_is_api_capable(supplier: str) -> bool:
+    """True if the (normalised) supplier supports an API-backed mode."""
+    return normalize_supplier(supplier) in _API_CAPABLE_SUPPLIERS
+
+
+def _get_billing_source() -> str:
+    """Current global billing source ('dcc' default, or 'cad').
+
+    Stored in kraken_state so it persists and is readable by the sync drain.
+    Defaults to 'dcc' (the validated default — settle to DCC except where
+    missing).
+    """
+    try:
+        val = _store.get_kraken_state(_BILLING_SOURCE_KEY)
+    except Exception:
+        val = None
+    return val if val in _VALID_BILLING_SOURCES else "dcc"
+
+
+def apply_billing_source_change(new_source: str,
+                                main_meter_id: str = "electricity_main") -> dict:
+    """Set the global billing source and, if it changed, flag all main-meter
+    blocks for PASS 2 re-run so the drain re-materialises billing to the new
+    source.
+
+    Returns {"changed": bool, "source": str, "flagged": int}. The caller (config
+    UI) shows the "recalculation takes time" warning when changed and flagged>0.
+    Idempotent: setting the same source is a no-op (no re-flag, no churn).
+    """
+    new_source = (new_source or "").lower()
+    if new_source not in _VALID_BILLING_SOURCES:
+        raise ValueError(f"billing_source must be one of {_VALID_BILLING_SOURCES}, "
+                         f"got {new_source!r}")
+    current = _get_billing_source()
+    if new_source == current:
+        return {"changed": False, "source": current, "flagged": 0}
+    _store.set_kraken_state(_BILLING_SOURCE_KEY, new_source)
+    flagged = _store.flag_all_for_pass2_rerun(main_meter_id)
+    logger.info("apply_billing_source_change: %s → %s, flagged %d blocks for "
+                "re-run (drain will re-materialise billing)",
+                current, new_source, flagged)
+    return {"changed": True, "source": new_source, "flagged": flagged}
+
+
+_DISPATCH_OVERLAY_APPLY = True    # live: overlay applies off-peak to validated slots
+
+# Meter-validation noise floor (kWh). A smart-charge slot is credited off-peak
+# only if the block drew at least this much import — a PRESENCE check (did real
+# charging happen?), NOT a comparison to the dispatch delta. Block draw is
+# car + household baseload; dispatch delta is car-only, so comparing them is
+# wrong. 0.1 kWh rejects sensor noise / tiny baseload trickle while any genuine
+# EV charge clears it with large margin (live data: charging slots 2–6 kWh,
+# idle slots ~0.0). Confirmed against real slot data.
+_DISPATCH_OVERLAY_MIN_KWH = 0.1
+
+
+def _dispatch_overlay_rate(channel_name: str, block_start: str,
+                           base_rate: float, imp_kwh: float | None):
+    """Dispatch overlay (step 2 piece 2). Given a block's base-resolved import
+    rate, decide whether an Intelligent smart-charge dispatch should override it
+    to the off-peak rate. Returns the rate to use (£/kWh).
+
+    Rules (design §1c):
+      - Import channel only (export is never dispatch-adjusted).
+      - The block's 30-min slot must be a persisted smart-charge dispatch_slot.
+      - METER VALIDATION: the block must have drawn at least _DISPATCH_OVERLAY_MIN_KWH
+        of import (0.1 kWh noise floor). A PRESENCE check — did real charging
+        happen? — NOT a comparison to the dispatch delta. A slot with no real
+        draw is NOT overridden (the over-reporting guard — Zappi/IOG dispatch
+        slots stay 'on' after charging stops).
+      - Only overrides when base_rate is ABOVE the off-peak rate (i.e. the slot
+        is out-of-window / peak). In-window slots are already off-peak — no-op.
+
+    COMPUTE-AND-LOG: when _DISPATCH_OVERLAY_APPLY is False, the override is
+    computed and LOGGED but NOT applied (returns base_rate unchanged), so it can
+    be validated against real data before affecting any bill. Idempotent: the
+    decision is a pure function of (base schedule, dispatch_slots, meter draw).
+    """
+    if channel_name != "import" or _store is None or not block_start:
+        return base_rate
+    try:
+        slot = _store.get_dispatch_slot(_snap_to_slot(block_start))
+    except Exception:
+        return base_rate
+    if not slot or not slot.get("off_peak"):
+        return base_rate
+    # Per-decision config fingerprint (design open-item 2): makes every overlay
+    # decision self-describing in the log, so a user's bug report carries the
+    # config context (mode, mini, provider, source, apply-state) without a
+    # round-trip. NOTE mini=active reports the ACTUAL runtime reader state
+    # (_kraken_mini_reader), not the nominal mode: in plain `api` mode a Mini
+    # device elevates to provisional collection at runtime, so mode=api can
+    # legitimately run with mini=active — and the Mini is what supplies the
+    # provisional kWh this guard validates against.
+    _fp = ("mode=%s mini=%s provider=%s source=%s apply=%s"
+           % (get_data_source_mode(),
+              "active" if _kraken_mini_reader is not None else "off",
+              slot.get("provider"), slot.get("source"),
+              _DISPATCH_OVERLAY_APPLY))
+    # Meter validation: only credit slots that actually drew power. PRESENCE
+    # check against the block's CURRENT kWh (provisional at finalise,
+    # authoritative at settlement) — a 0.1 kWh noise floor, NOT a dispatch-delta
+    # comparison. Below the floor → treat as no real charging (over-report guard).
+    if not imp_kwh or imp_kwh < _DISPATCH_OVERLAY_MIN_KWH:
+        logger.info("dispatch-overlay: slot %s active but draw below floor "
+                    "(%.4f kWh < %.2f) — NOT overriding (over-report guard) [%s]",
+                    block_start, imp_kwh or 0.0, _DISPATCH_OVERLAY_MIN_KWH, _fp)
+        return base_rate
+    sched = _kraken_rate_schedules.get("import")
+    if sched is None or sched.is_empty():
+        return base_rate
+    off_peak_pence = sched.off_peak_rate_near(block_start)
+    if off_peak_pence is None:
+        return base_rate
+    off_peak_rate = round(off_peak_pence / 100.0, 6)
+    # Only override if base is meaningfully above off-peak (out-of-window slot).
+    if base_rate <= off_peak_rate + 1e-9:
+        return base_rate  # already off-peak (in-window) — no-op
+    if _DISPATCH_OVERLAY_APPLY:
+        logger.info("dispatch-overlay: APPLIED %s peak→off-peak %.5f→%.5f "
+                    "(%.4f kWh) [%s]", block_start, base_rate,
+                    off_peak_rate, imp_kwh, _fp)
+        return off_peak_rate
+    logger.info("dispatch-overlay: WOULD apply %s peak→off-peak %.5f→%.5f "
+                "(%.4f kWh) [compute-and-log; not applied] [%s]",
+                block_start, base_rate, off_peak_rate, imp_kwh, _fp)
+    return base_rate
+
+
+def _device_uses_overlay(meter_meta: dict, has_own_rates: bool) -> bool:
+    """Decide whether a sub-meter (device) import should be priced on the main
+    meter's EFFECTIVE rate — base tariff + dispatch overlay — instead of the base
+    tariff alone.
+
+    Precedence (RELEASE-3.0-DECISIONS E2): an own rate sensor always wins (incl.
+    BCD `current_rate`, which already reflects the dispatched rate); an explicit
+    `rate_source` opts in (`"overlay"`) or out (`"base"`/`"own"`/`"inherit"`);
+    otherwise the default is ON when an API key is configured (E3). The overlay is
+    a no-op anyway when there are no dispatch slots, so defaulting ON only changes
+    pricing for devices that actually drew during a smart-charge dispatch."""
+    if has_own_rates:
+        return False
+    rs = (meter_meta or {}).get("rate_source")
+    if rs == "overlay":
+        return True
+    if rs in ("base", "own", "inherit"):
+        return False
+    return kraken_available()
+
+
+def _device_base_rate(parent_import_cfg: dict, inherited_rate, block_start: str,
+                      resolver=None) -> float:
+    """Resolve the PRE-overlay base rate for a 'use main meter rate' device,
+    honouring the MAIN meter's own rate source.
+
+    A device that inherits the main meter must track whatever the main is on:
+      • main on the API (explicit import rate_source == 'api', or — for an
+        un-migrated config — no rate sensor mapped): resolve the supplier
+        schedule rate at THIS block's start, so the device follows time-of-use
+        correctly. This deliberately bypasses the inherited value, which in API
+        mode can be the whole-day series collapsed to its off-peak floor by the
+        sub-meter tariff reconstruction.
+      • main on a sensor: inherit the main's per-block rate (passed in as
+        `inherited_rate`) — never silently substitute the API, even when an API
+        key is also configured (cad+api).
+
+    The schedule resolver is only consulted as a fallback when the inherited
+    base is empty (e.g. a gap block) for a sensor-fed main.
+    """
+    if resolver is None:
+        resolver = _kraken_rate_resolver
+    cfg = parent_import_cfg or {}
+    src = cfg.get("rate_source")
+    has_sensor = bool((cfg.get("rate") or "").strip())
+    use_api = (src == "api") or (src is None and not has_sensor)
+
+    base = inherited_rate or 0.0
+    if use_api or not base:
+        try:
+            kr = resolver("import", block_start)
+            if kr is not None:
+                base = kr
+        except Exception:
+            pass
+    return base or 0.0
+
+
+def _device_overlay_decision(device_import_cfg: dict, meter_meta: dict,
+                             has_own_rates: bool) -> bool:
+    """Whether a device's import should be priced on the main meter's effective
+    rate, honouring the explicit per-channel "use main meter rate" choice over a
+    mapped sensor (the precedence the config screen makes visible):
+
+      • rate_source == 'main'   → always inherit the main meter, even if a rate
+                                   sensor is also mapped (the toggle wins).
+      • rate_source == 'sensor' → use the device's own rate sensor when it has
+                                   one; with no sensor mapped, fall back to
+                                   inheriting the main meter (an empty sensor
+                                   never leaves the device un-priced).
+      • unset (un-migrated)     → legacy precedence via _device_uses_overlay
+                                   (a mapped sensor wins, else default on when
+                                   the supplier API is configured).
+    """
+    src = (device_import_cfg or {}).get("rate_source")
+    if src == "main":
+        return True
+    if src == "sensor":
+        return not has_own_rates
+    return _device_uses_overlay(meter_meta, has_own_rates)
+
+
+def _snap_to_slot(block_start: str) -> str:
+    """Snap a block_start to its 30-min slot boundary ISO (matches capture)."""
+    try:
+        dt = datetime.fromisoformat(str(block_start).replace("Z", "").split("+")[0])
+        dt = dt.replace(minute=(0 if dt.minute < 30 else 30),
+                        second=0, microsecond=0)
+        return dt.isoformat()
+    except Exception:
+        return block_start
+
+
+def _log_config_state(config: dict | None = None) -> None:
+    """Emit a one-shot config-state dump at startup (design open-item 2).
+
+    On a self-hosted add-on the LOG is the only window into a user's setup, so
+    "rely on user reporting" only works if a report carries the config context.
+    This logs the OVERLAY-relevant config that is known synchronously at startup.
+    Tariff/MPAN/account are logged separately by the Kraken discovery step when
+    it completes (async), so they are intentionally not duplicated here.
+
+    Reports only GROUNDED values. Detection features not yet built (BCD-detected
+    live-tile offload, explicit rate-sensor override, OHME charge-mode sensor
+    path) are marked as a seam rather than printed as fabricated values — the log
+    must never claim a state the code can't actually determine.
+    """
+    cfg = config if config is not None else {}
+    mode = get_data_source_mode()
+    # Is a main import/export read sensor configured? (cad-side presence)
+    has_import = has_export = False
+    for mcfg in (cfg.get("meters") or {}).values():
+        if (mcfg.get("meta") or {}).get("sub_meter"):
+            continue
+        ch = mcfg.get("channels") or {}
+        if (ch.get("import") or {}).get("read"):
+            has_import = True
+        if (ch.get("export") or {}).get("read"):
+            has_export = True
+    try:
+        billing_source = _get_billing_source()
+    except Exception:
+        billing_source = "?"
+    # Mini at startup-dump time: the reader is wired LATER in startup (after
+    # device discovery), so we cannot yet report a definitive active/off here.
+    # Report ELIGIBILITY honestly instead — a definitive `mini_provisional=...`
+    # line is emitted once _maybe_setup_mini() resolves. Reporting the nominal
+    # mode (== api+mini) would be WRONG: a plain `api` mode elevates to Mini at
+    # runtime when a device is present, so mode alone can't tell the truth.
+    if not mode_uses_api(mode):
+        mini_note = "off (no API mode)"
+    elif has_import:
+        mini_note = "off (local import sensor authoritative)"
+    else:
+        mini_note = "pending (API mode, no local sensor — will probe for device)"
+    logger.info(
+        "config-state: mode=%s uses_api=%s mini=%s billing_source=%s "
+        "import_sensor=%s export_sensor=%s",
+        mode, mode_uses_api(mode), mini_note, billing_source,
+        has_import, has_export)
+    logger.info(
+        "config-state: dispatch_overlay apply=%s min_kwh=%.2f (overlay %s)",
+        _DISPATCH_OVERLAY_APPLY, _DISPATCH_OVERLAY_MIN_KWH,
+        "ACTIVE — dispatch capture + repricing runs" if mode_uses_api(mode)
+        else "inactive — no API mode, dispatch path off")
+    # BCD + OHME detection are reported by _detect_and_log_integrations() once
+    # HA states have been fetched (a `config-state: detection ...` line, emitted
+    # later in startup like mini_provisional). The remaining unbuilt feature is
+    # the explicit rate-sensor override; mark only that as a seam here.
+    logger.info(
+        "config-state: rate-sensor-override pending — not yet implemented "
+        "(bcd + ohme detection logged after HA state fetch)")
+
+
+async def _detect_and_log_integrations(ha) -> dict:
+    """Detect third-party HA integrations EMT can use and log the result.
+
+    BCD (BottlecapDave Octopus): its `current_demand` sensor lets the live-power
+    tile read off BCD instead of EMT polling the Mini (~60/hr saved). OHME: a
+    charge-mode signal (official `ohme` select or dan-r binary) upgrades the
+    optimistic off-peak default to VERIFIED smart-vs-boost. One REST round-trip,
+    non-fatal; stored in _detected_integrations for the overlay + tile to read.
+    Re-run each startup so a mid-life install is picked up.
+    """
+    global _detected_integrations
+    from kraken_api_client import detect_bottlecapdave, detect_ohme_charge_mode
+    bcd = {"found": False}
+    ohme = {"found": False, "integration": None}
+    try:
+        states = await ha.get_all_states()
+        bcd = detect_bottlecapdave(states or [])
+        ohme = detect_ohme_charge_mode(states or [])
+    except Exception as e:
+        logger.warning("config-state: integration detection failed: %s", e)
+    _detected_integrations = {"bcd": bcd, "ohme": ohme}
+
+    # Preload the OHME charge-mode entity so the capture tick's get_state() has a
+    # value before the entity's first state_changed event. After that, the WS
+    # listener keeps it fresh automatically (it caches every state_changed).
+    if ohme.get("found") and ohme.get("charge_mode_entity"):
+        try:
+            await ha.preload_states([ohme["charge_mode_entity"]])
+        except Exception as e:
+            logger.warning("config-state: ohme entity preload failed: %s", e)
+    logger.info(
+        "config-state: detection bcd=%s bcd_live_power=%s ohme_charge_mode=%s "
+        "(integration=%s) ohme_path=%s",
+        bool(bcd.get("found")),
+        "yes" if bcd.get("demand_sensor") else "no",
+        bool(ohme.get("found")),
+        ohme.get("integration") or "none",
+        "verified" if ohme.get("found") else "optimistic")
+    return _detected_integrations
+
+
+def _reseed_opener_after_short_restart(last_block: dict, current_block: dict) -> list:
+    """Restore the in-progress block's opener after a within-block restart.
+
+    On restart the rogue-total guard clears the in-progress block's reads. The
+    block's channel structure is reconstructed FROM those reads, so once they're
+    gone load_current_block() returns the block with meters={} — no channels at
+    all. We therefore rebuild the opener by iterating LAST_block's channels (each
+    carries the durable read_end = this block's true opening register) and writing
+    a single seed read into current_block, CREATING the meter/channel as needed.
+
+    Without this the block re-seeds from a late post-restart read and UNDER-COUNTS,
+    measuring only the tail (observed live: Mini blocks finalising at ~0.23 kWh
+    when ~3.5 kWh really flowed, because each restart dropped the opener).
+
+    Safe because:
+      - acts only when last_block.end == current_block.start (contiguous — the
+        no-gap case; gap-fill owns seeding when there's a gap, so we return []);
+      - seeds a channel only when current_block has no live reads for it (never
+        clobbers reads that survived a warm restart);
+      - read_end is the durable finalised register, not a volatile in-block read,
+        so it cannot reintroduce a rogue total.
+
+    Mutates current_block in place; returns human-readable seeded descriptors
+    (empty list if nothing seeded). Caller persists + logs.
+    """
+    if not last_block or not current_block:
+        return []
+    # Contiguity gate: only when the current block immediately follows last_block.
+    if (last_block.get("end") or None) != (current_block.get("start") or None):
+        return []
+    seed_ts = current_block.get("start")
+    if not seed_ts:
+        return []
+    reseeded = []
+    cur_meters = current_block.setdefault("meters", {})
+    for mn, lb_m in (last_block.get("meters") or {}).items():
+        for cn, lb_ch in (lb_m.get("channels") or {}).items():
+            read_end = lb_ch.get("read_end")
+            if read_end is None:
+                continue
+            cur_ch = (cur_meters.setdefault(mn, {})
+                                 .setdefault("channels", {})
+                                 .setdefault(cn, {}))
+            if cur_ch.get("reads"):
+                continue  # live reads survived — never clobber
+            cur_ch["reads"] = [{"ts": seed_ts, "value": float(read_end)}]
+            reseeded.append("%s/%s=%.3f" % (mn, cn, float(read_end)))
+    return reseeded
+
+
+def _kraken_rate_resolver(channel_name: str, block_start: str):
+    """Sync resolver the drain passes to the re-run. Returns £/kWh or None.
+
+    Reads the cached schedule for the channel and resolves the rate at
+    block_start, converting the API's pence/kWh to £/kWh. Pure/in-memory — no
+    network. Returns None when no schedule or no covering period exists, so the
+    re-run leaves the block flagged for the tooling rather than guessing.
+    """
+    sched = _kraken_rate_schedules.get(channel_name)
+    if sched is None or sched.is_empty():
+        return None
+    pence = sched.resolve(block_start)
+    if pence is None:
+        return None
+    return round(pence / 100.0, 6)   # pence/kWh → £/kWh
+
+
+def _kraken_standing_resolver(block_start: str):
+    """Resolve the standing charge (£/day) at block_start from the cached
+    schedule, or None. pence/day → £/day. Pure/in-memory."""
+    sched = _kraken_standing_schedule
+    if sched is None or sched.is_empty():
+        return None
+    pence = sched.resolve(block_start)
+    if pence is None:
+        return None
+    return round(pence / 100.0, 6)
+
+
+def register_block_boundary_callback(cb) -> None:
+    """Register a callback fired once per finalised block boundary.
+
+    cb receives the boundary timestamp (the block_end ISO string). Pass None
+    to clear. Exceptions raised by the callback are caught and logged so a
+    failing ingester can never break finalisation.
+    """
+    global _on_block_boundary_cb
+    _on_block_boundary_cb = cb
+
+
+def _fire_block_boundary(boundary_time: str) -> None:
+    """Invoke the registered boundary callback, swallowing any error."""
+    cb = _on_block_boundary_cb
+    if cb is None:
+        return
+    try:
+        cb(boundary_time)
+    except Exception as e:
+        logger.warning("_fire_block_boundary: callback failed: %s", e)
 
 
 def setup():
@@ -278,14 +893,37 @@ def get_block_window(now: datetime, block_minutes: int = BLOCK_MINUTES):
     return start, start + timedelta(minutes=block_minutes)
 
 
-def create_block(start: datetime, end: datetime, block_minutes: int = BLOCK_MINUTES) -> dict:
-    return {
+def create_block(start: datetime, end: datetime, block_minutes: int = BLOCK_MINUTES,
+                 seed_meters: bool = False) -> dict:
+    block = {
         "start":         iso(start),
         "end":           iso(end),
         "block_minutes": block_minutes,
         "meters":        {},
         "interpolated":  False,
     }
+    # In API/Mini mode there are no local read sensors, so capture_samples adds
+    # no reads — but the block still needs a meter SHELL (meter present, meta
+    # set, empty channels) so finalise_block doesn't bail with "nothing to
+    # finalise" and the Mini boundary read / DCC settlement have a block to
+    # attach to. Seed it from config.
+    if seed_meters:
+        try:
+            cfg = load_config()
+            for meter_id, meter_cfg in (cfg.get("meters") or {}).items():
+                meta = meter_cfg.get("meta", {}) or {}
+                # Skip retired sub-meters.
+                if meta.get("sub_meter") and meta.get("retired_at"):
+                    continue
+                channels = {}
+                for channel_id in (meter_cfg.get("channels") or {}):
+                    channels[channel_id] = {"reads": [], "rates": []}
+                block["meters"][meter_id] = {
+                    "meta": meta, "channels": channels, "interpolated": False,
+                }
+        except Exception as e:
+            logger.warning("create_block: seed_meters failed: %s", e)
+    return block
 
 
 def interpolate_value(pre_read: dict, post_read: dict, target_dt: datetime) -> dict:
@@ -470,10 +1108,22 @@ def ensure_correct_block(ha: HAClient, current_block: dict, now: datetime,
             for meter in (cfg.get("meters") or {}).values()
             if not (meter.get("meta") or {}).get("sub_meter")
         )
-        if not has_sensors:
-            return current_block  # return None/empty — no block yet
-        logger.info("Creating first block %s", iso(start))
-        return create_block(start, end, block_minutes=int(get_block_minutes()))
+        # API/Mini mode has no local read sensor by design — blocks are
+        # populated by the Mini boundary reader (provisional) and DCC
+        # settlement. Block formation must still proceed once an API mode is
+        # configured, with a seeded meter shell so the block can finalise and
+        # fire the boundary. (CAD without sensors stays pre-wizard: no block.)
+        api_mode = False
+        try:
+            api_mode = mode_uses_api()
+        except Exception:
+            api_mode = False
+        if not has_sensors and not api_mode:
+            return current_block  # pre-wizard / CAD-without-sensors: no block yet
+        logger.info("Creating first block %s%s", iso(start),
+                    " (API mode — seeded meter shell)" if (api_mode and not has_sensors) else "")
+        return create_block(start, end, block_minutes=int(get_block_minutes()),
+                            seed_meters=(api_mode and not has_sensors))
 
     existing_start = datetime.fromisoformat(current_block["start"])
     if existing_start == start:
@@ -481,7 +1131,12 @@ def ensure_correct_block(ha: HAClient, current_block: dict, now: datetime,
 
     logger.info("Block rollover: %s → %s", current_block["start"], iso(start))
 
-    # Wait for at least one post-boundary read before finalising
+    # Wait for at least one post-boundary read before finalising. This brackets
+    # the boundary so the block's end-register can be interpolated at the exact
+    # boundary instant. It applies to BOTH local-sensor (CAD) reads AND Mini
+    # telemetry reads — the Mini reader feeds its (timestamped, possibly delayed)
+    # readings into the same per-channel reads buffer, so we wait for a read
+    # timestamped at/after the boundary before finalising.
     boundary_iso           = iso(start)
     has_post_boundary_read = False
     for meter_data in current_block.get("meters", {}).values():
@@ -585,13 +1240,43 @@ def capture_samples(ha: HAClient, block: dict, now: datetime):
 # Compute kWh / cost
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_channel(channel: dict, parent_rates=None, is_sub_meter: bool = False) -> dict:
+_zero_rate_warned: dict = {}   # (meter_id, channel_id) -> last warn monotonic ts
+
+
+def _warn_zero_rate(meter_id: str, channel_id: str) -> None:
+    """Warn (throttled to once/hour per meter+channel) that a block with real
+    consumption is being costed at a zero rate — i.e. no rate is configured for
+    this channel. This is the 'rate field left blank' misconfiguration; usage
+    is being billed as free. Throttled so it doesn't spam every 30-min block.
+    """
+    import time as _t
+    key = (meter_id, channel_id)
+    now = _t.monotonic()
+    last = _zero_rate_warned.get(key)
+    if last is not None and (now - last) < 3600:
+        return
+    # In API modes the Kraken rate schedule fills missing rates at settlement,
+    # so a transiently-zero rate is expected, not a misconfiguration. Only warn
+    # in CAD-only mode where a blank rate genuinely means zero-cost blocks.
+    try:
+        if mode_uses_api():
+            return
+    except Exception:
+        pass
+    _zero_rate_warned[key] = now
+    logger.warning(
+        "compute_channel: %s/%s has consumption but NO rate configured — "
+        "blocks are being costed at £0. Set a rate sensor for this channel "
+        "(Configuration → meter), or configure the supplier API.",
+        meter_id, channel_id)
+
+
+def compute_channel(channel: dict, parent_rates=None, is_sub_meter: bool = False,
+                    meter_id: str = "?", channel_id: str = "?") -> dict:
     reads     = channel.get("reads", [])
     rates     = channel.get("rates", [])
     if not rates and parent_rates:
         rates = parent_rates
-    if not rates:
-        logger.warning("compute_channel: no rate data, defaulting to 0.0")
     last_rate = rates[-1]["value"] if rates else 0.0
 
     if len(reads) < 2:
@@ -607,6 +1292,13 @@ def compute_channel(channel: dict, parent_rates=None, is_sub_meter: bool = False
     if not is_sub_meter:
         raw_delta = reads[-1]["value"] - reads[0]["value"]
         total_kwh = max(raw_delta, 0.0)
+        # Runtime backstop: a block that consumed/exported energy but has no
+        # rate is being costed at ZERO silently — i.e. real usage billed as
+        # free. This is the "rate field left blank" hole. Surface it (throttled)
+        # so it's visible; billing isn't changed here, only flagged. (Zero-kwh
+        # blocks with zero rate are harmless and don't warn.)
+        if total_kwh > 0.0001 and (last_rate is None or abs(last_rate) < 1e-9):
+            _warn_zero_rate(meter_id, channel_id)
         return {
             "kwh":        total_kwh,
             "rate":       last_rate,
@@ -739,9 +1431,12 @@ def build_gap_blocks(
                         if gap_hours > 12:
                             skip_reason = f"gap too large ({gap_hours:.1f}hrs)"
                         elif post_read["value"] == pre_read["value"]:
-                            # Identical reads — sensor didn't change during the gap
-                            # (e.g. brief HA outage with no actual consumption).
-                            # Delta is zero — do not use the register value as kWh.
+                            # Identical reads — the sub-meter sensor did not change
+                            # during the gap (e.g. a brief HA outage with no actual
+                            # consumption). The delta is ZERO; do NOT mistake this
+                            # for a reset and bill the full cumulative register.
+                            # (Regression: 2.10.9 — rogue full-register kWh, e.g.
+                            # 5798 kWh on a battery, from a momentary restart.)
                             sub_kwh = 0.0
                             logger.info(
                                 "build_gap_blocks: %s/%s unchanged (%.4f → %.4f) "
@@ -750,9 +1445,10 @@ def build_gap_blocks(
                                 pre_read["value"], post_read["value"]
                             )
                         elif post_read["value"] < pre_read["value"]:
-                            # Genuine reset — register dropped. Use post_read value
-                            # directly as kWh accumulated since reset (handles
-                            # daily-reset sensors and any cumulative sensor reset).
+                            # Genuine reset — the register dropped. Use post_read
+                            # value directly as kWh accumulated since the reset
+                            # (handles daily-reset sensors and any other cumulative
+                            # sensor that resets mid-block).
                             sub_kwh = max(round(post_read["value"], 6), 0.0)
                             logger.info(
                                 "build_gap_blocks: %s/%s reset detected (%.4f → %.4f) "
@@ -852,6 +1548,15 @@ def build_gap_blocks(
 
         # Apply grid-authoritative clipping to gap blocks (same as finalise_block PASS 2)
         _apply_pass2(block)
+
+        # PASS 3b for gap blocks: attribute carbon if a CI slot is available for
+        # this window. Gap blocks previously skipped this, leaving
+        # carbon_intensity_g NULL (the outage-block carbon gap). If CI isn't
+        # available now, the recovery sweep will backfill it later.
+        if not _attribute_block_carbon(block, iso(window_start)):
+            logger.info("build_gap_blocks: %s carbon not attributed "
+                        "(no CI slot yet; recovery sweep will retry)",
+                        iso(window_start))
 
         gap_blocks.append(block)
         logger.info(
@@ -1025,7 +1730,20 @@ def _apply_pass2(block: dict) -> None:
             }
             protected.append(entry)  # all sub-meters are protected (inverter_possible removed)
 
-        protected.sort(key=lambda x: x["kwh"], reverse=True)
+        # Grid-attribution priority: the EV claims grid import FIRST, then every
+        # other device (batteries, heat pump) clips to whatever grid remains.
+        # EV charging is grid-charging by design — on IOG/smart-charge the supplier
+        # is deliberately pulling cheap grid for the car — so the car's import must
+        # land on the grid, not get squeezed out. The old order (biggest draw first)
+        # handed the whole grid pool to a simultaneously-charging battery and
+        # labelled the car's grid charge as battery-sourced, so the car vanished
+        # from the grid view until the battery filled (issue #212). Whatever the
+        # battery then can't source from grid is its own non-grid (solar) charge.
+        def _grid_priority(e):
+            is_ev = ((e["meter_block"].get("meta", {}) or {}).get("meter_type")
+                     == "ev")
+            return (0 if is_ev else 1, -e["kwh"])   # EVs first, then desc by kWh
+        protected.sort(key=_grid_priority)
         unprotected.sort(key=lambda x: x["kwh"], reverse=True)
 
         is_interpolated = block.get("interpolated", False)
@@ -1214,6 +1932,464 @@ def _commit_provisional_as_final(ha: HAClient, full_block: dict,
             loop.create_task(_deferred_sensor_update(ha, engine_totals))
     except Exception as _se:
         logger.warning("_amend_provisional: sensor republish failed: %s", _se)
+
+
+def _apply_intensity_to_block(block: dict, intensity: float) -> None:
+    """Attribute carbon_g + carbon_intensity_g to every meter in *block* using a
+    known grid intensity (gCO2/kWh).
+
+    Shared by the live CI-table attribution (_attribute_block_carbon) and the
+    historical backfill (_run_historical_carbon_backfill), so both produce
+    identical per-meter carbon: sub-meters bill their gross import; the main
+    meter nets export against import."""
+    for meter_name, meter_block in block.get("meters", {}).items():
+        meta   = meter_block.get("meta", {}) or {}
+        imp_ch = (meter_block.get("channels") or {}).get("import")
+        exp_ch = (meter_block.get("channels") or {}).get("export")
+        if meta.get("sub_meter", False):
+            imp_kwh  = float((imp_ch or {}).get("kwh", 0.0) or 0.0)
+            carbon_g = round(imp_kwh * intensity, 4)
+        else:
+            imp_kwh  = float((imp_ch or {}).get("kwh_total",
+                       (imp_ch or {}).get("kwh", 0.0)) or 0.0)
+            exp_kwh  = float((exp_ch or {}).get("kwh", 0.0) or 0.0)
+            carbon_g = round((imp_kwh - exp_kwh) * intensity, 4)
+        meter_block["carbon_g"] = carbon_g
+        meter_block["carbon_intensity_g"] = intensity
+
+
+def _attribute_block_carbon(block: dict, start: str) -> bool:
+    """Look up the nearest carbon-intensity slot for *start* and attribute
+    carbon_g (+ persist carbon_intensity_g) to every meter in *block*.
+
+    This is the PASS 3b logic, extracted so it can run from finalise_block,
+    the gap-fill path (build_gap_blocks — prevention), and the NULL-carbon
+    recovery sweep. Returns True if a CI slot was found and carbon attributed,
+    False otherwise (no postcode, or no CI slot available for that time —
+    e.g. the slot has aged out of the 4-day CI table).
+    """
+    try:
+        postcode = _get_postcode()
+        if not postcode:
+            return False
+        ci_row = _store.get_nearest_carbon_intensity(start, postcode)
+        if not ci_row:
+            return False
+        # Bound the slot distance: get_nearest_carbon_intensity returns the
+        # nearest row with NO distance limit, so a block whose true slot has aged
+        # out of the 4-day table would otherwise be attributed a wrong, distant
+        # CI value. Only attribute when the slot is genuinely near (≤60 min; CI
+        # slots are 30 min, so a correct match is ≤30 min away).
+        try:
+            from datetime import datetime as _dt
+            _bs = _dt.fromisoformat(str(start).replace("Z", "").split("+")[0])
+            _cs = _dt.fromisoformat(str(ci_row["captured_at"]).replace("Z", "").split("+")[0])
+            if abs((_bs - _cs).total_seconds()) > 3600:
+                return False
+        except Exception:
+            pass
+        _apply_intensity_to_block(block, ci_row["intensity"])
+        return True
+    except Exception as e:
+        logger.warning("_attribute_block_carbon: failed for %s: %s", start, e)
+        return False
+
+
+def _recover_missing_carbon(limit: int = 200) -> int:
+    """Backfill carbon for blocks whose carbon_intensity_g is NULL.
+
+    These are typically outage gap-fill blocks that were built before a CI slot
+    was available (the energy was recovered by interpolation, but carbon wasn't
+    attributed). Now that the CI tick has populated the table, re-attribute from
+    the nearest CI slot and persist. Blocks whose slot has aged out of the 4-day
+    CI table can't be recovered and are left for a future manual tool.
+
+    Returns the number of blocks recovered. Safe to call on startup and after a
+    CI tick; a no-op when nothing is missing.
+    """
+    if _store is None:
+        return 0
+    try:
+        starts = _store.get_block_starts_missing_carbon(limit=limit)
+    except Exception as e:
+        logger.warning("_recover_missing_carbon: query failed: %s", e)
+        return 0
+    if not starts:
+        return 0
+    recovered = 0
+    for start in starts:
+        block = _store.get_block_dict_by_start(start)
+        if not block:
+            continue
+        if _attribute_block_carbon(block, start):
+            try:
+                append_block_replace(block)
+                recovered += 1
+                logger.info("_recover_missing_carbon: backfilled carbon for %s",
+                            start)
+            except Exception as e:
+                logger.warning("_recover_missing_carbon: persist failed for "
+                               "%s: %s", start, e)
+        # If not attributed, the CI slot isn't available (aged out) — skip.
+    if recovered:
+        try:
+            generate_charts(_store)
+        except Exception as e:
+            logger.warning("_recover_missing_carbon: chart regen failed: %s", e)
+        logger.info("_recover_missing_carbon: recovered %d block(s)", recovered)
+    return recovered
+
+
+def _recompute_block_carbon(block: dict) -> None:
+    """Recompute carbon_g for every meter in *block* using the intensity
+    persisted on the block (carbon_intensity_g), NOT a fresh CI-table lookup.
+
+    Mirrors finalise_block PASS 3b exactly, but sources intensity from the
+    stored value so a DCC re-run weeks later (after the 4-day CI prune) still
+    produces the correct figure. If a meter has no stored intensity, carbon_g
+    is left unchanged (we cannot recompute without it, and reverse-deriving
+    from the old carbon_g would be circular).
+    """
+    for meter_name, meter_block in block.get("meters", {}).items():
+        intensity = meter_block.get("carbon_intensity_g")
+        if intensity is None:
+            continue
+        meta   = meter_block.get("meta", {}) or {}
+        imp_ch = (meter_block.get("channels") or {}).get("import")
+        exp_ch = (meter_block.get("channels") or {}).get("export")
+        if meta.get("sub_meter"):
+            imp_kwh  = float((imp_ch or {}).get("kwh", 0.0) or 0.0)
+            meter_block["carbon_g"] = round(imp_kwh * intensity, 4)
+        else:
+            imp_kwh = float((imp_ch or {}).get("kwh_total",
+                       (imp_ch or {}).get("kwh", 0.0)) or 0.0)
+            exp_kwh = float((exp_ch or {}).get("kwh", 0.0) or 0.0)
+            meter_block["carbon_g"] = round((imp_kwh - exp_kwh) * intensity, 4)
+
+
+def _resolve_block_rate(channel: dict, block_start: str, channel_name: str,
+                        rate_resolver=None) -> tuple[float, bool]:
+    """Return (rate, repaired) for a channel at reconcile time.
+
+    Uses the channel's stored rate when it is a sane non-zero value. When the
+    stored rate is zero/missing AND a rate_resolver is supplied, asks the
+    resolver for the historical rate at block_start (the Kraken fallback,
+    Chunk 5). The resolver returns rate in £/kWh already (caller converts from
+    the API's pence). A resolved rate outside a plausible band is rejected
+    (logged) rather than applied, guarding against a units surprise.
+
+    repaired=True when the resolver supplied the rate, so the caller can flag
+    the block. Never returns a silent zero when a resolver could help: if the
+    resolver yields nothing, the original (possibly zero) rate is returned and
+    the block stays flagged for the tooling.
+    """
+    stored = channel.get("rate", 0.0) or 0.0
+    if stored and abs(stored) >= 1e-6:
+        return stored, False
+    if rate_resolver is None:
+        return stored, False
+    try:
+        resolved = rate_resolver(channel_name, block_start)
+    except Exception as e:
+        logger.warning("_resolve_block_rate: resolver error %s/%s: %s",
+                       channel_name, block_start, e)
+        return stored, False
+    if resolved is None:
+        return stored, False
+    # Sanity band for a UK £/kWh rate (import or export). Reject wild values
+    # (e.g. pence not converted → 24.5) rather than corrupt a block.
+    if not (-2.0 <= resolved <= 2.0):
+        logger.warning("_resolve_block_rate: rejected implausible rate %.4f "
+                       "for %s/%s (units?)", resolved, channel_name, block_start)
+        return stored, False
+    logger.info("_resolve_block_rate: repaired %s rate at %s → %.4f £/kWh",
+                channel_name, block_start, resolved)
+    return resolved, True
+
+
+def _recompute_pass3_totals(block: dict) -> None:
+    """PASS 3 — re-derive a block's import/export totals from its (already
+    PASS-2'd) per-meter channels: sub-meters contribute kwh_grid, the main
+    contributes its kwh_remainder. Mirrors finalise_block PASS 3 and is shared
+    by the settlement rerun and the post-delete remainder recompute so the two
+    can never drift."""
+    block.setdefault("totals", {})
+    block["totals"].update({"import_kwh": 0.0, "import_cost": 0.0,
+                            "export_kwh": 0.0, "export_cost": 0.0})
+    for meter_name, meter_block in block["meters"].items():
+        meta = meter_block.get("meta", {}) or {}
+        for channel_name, channel in (meter_block.get("channels") or {}).items():
+            if channel_name == "import":
+                if meta.get("sub_meter"):
+                    ik = channel.get("kwh_grid")
+                    if ik is None:
+                        ik = channel.get("kwh") or 0.0
+                    block["totals"]["import_kwh"]  += ik or 0.0
+                    block["totals"]["import_cost"] += channel.get("cost") or 0.0
+                else:
+                    ik = channel.get("kwh_remainder")
+                    if ik is None:
+                        ik = channel.get("kwh") or 0.0
+                    ic = channel.get("cost_remainder")
+                    if ic is None:
+                        ic = channel.get("cost") or 0.0
+                    block["totals"]["import_kwh"]  += ik or 0.0
+                    block["totals"]["import_cost"] += ic or 0.0
+            elif channel_name == "export":
+                block["totals"]["export_kwh"]  += channel.get("kwh") or 0.0
+                block["totals"]["export_cost"] += channel.get("cost") or 0.0
+
+
+def recompute_remainders_for_window(parent_meter_id: str, utc_start: str,
+                                    utc_end: str) -> int:
+    """Re-derive a main meter's kwh_remainder/cost_remainder after one of its
+    sub-meters' blocks were deleted.
+
+    Deleting a device in isolation leaves the parent's stored remainder having
+    subtracted a device that no longer exists, so the parent line reads low.
+    For each affected parent block in [utc_start, utc_end) this reconstructs the
+    block (the deleted device is already absent), re-runs PASS 2 against the
+    surviving sub-meters — reattributing the deleted device's grid-attributed
+    energy back into the remainder — then re-derives PASS 3 totals and carbon
+    and writes it back. Returns the number of parent blocks recomputed.
+
+    Uses _apply_pass2 directly, NOT _rerun_pass2_for_settled_block: the
+    remainder is a PASS-2 concern only. The settlement rerun would also
+    materialise DCC/CAD kWh, capture kwh_cad, apply the dispatch overlay and
+    clear is_provisional — all of which would be wrong to trigger from a delete.
+    Recomputing a window that was not actually affected is a no-op (the same
+    surviving subs yield the same remainder), so the bounds can be generous.
+    """
+    if not parent_meter_id:
+        return 0
+    store = get_store()
+    starts = [r["block_start"] for r in store._conn.execute(
+        "SELECT DISTINCT block_start FROM blocks "
+        "WHERE meter_id = ? AND block_start >= ? AND block_start < ? "
+        "ORDER BY block_start",
+        (parent_meter_id, utc_start, utc_end),
+    ).fetchall()]
+    done = 0
+    for bs in starts:
+        try:
+            block = store.get_block_dict_by_start(bs)
+            if not block:
+                continue
+            # Reset the parent's remainder to the full main import first, so a
+            # window left with NO surviving sub-meters yields remainder == main
+            # (no phantom subtraction). _apply_pass2 only writes the remainder
+            # for parents that still have sub-meters, so without this a
+            # fully-emptied window would keep its stale remainder.
+            pm = (block.get("meters") or {}).get(parent_meter_id)
+            if pm:
+                pic = (pm.get("channels") or {}).get("import")
+                if pic is not None:
+                    pic["kwh_remainder"]  = pic.get("kwh")
+                    pic["cost_remainder"] = pic.get("cost")
+            _apply_pass2(block)
+            _recompute_pass3_totals(block)
+            _recompute_block_carbon(block)
+            append_block_replace(block)
+            done += 1
+        except Exception as e:
+            logger.error(
+                "recompute_remainders_for_window: block %s failed: %s", bs, e)
+    if done:
+        try:
+            generate_charts(store)
+        except Exception as _ce:
+            logger.warning(
+                "recompute_remainders_for_window: chart regen failed: %s", _ce)
+    logger.info(
+        "recompute_remainders_for_window: recomputed %d block(s) for parent %s",
+        done, parent_meter_id)
+    return done
+
+
+def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricity_main",
+                                   rate_resolver=None, billing_source: str = "dcc",
+                                   standing_resolver=None) -> dict:
+    """Re-run PASS 2 + PASS 3b for a single block, materialising billing
+    figures from the chosen source.
+
+    billing_source (global toggle):
+      - 'dcc' (default): billing kWh is the DCC settlement (imp_kwh_api /
+        exp_kwh_api) where present, falling back to the CAD figure where DCC is
+        absent — "settle to DCC except where missing".
+      - 'cad': billing kWh is always the CAD figure, ignoring DCC. DCC values
+        stay stored for drift/diagnostics, just unused for billing.
+
+    Switching the toggle flags every block for re-run, so this re-materialises
+    each block to the new source. The mechanism is identical both ways; only
+    the kWh selection differs. The original CAD figure is preserved in kwh_cad
+    on first settlement so a switch back to CAD can restore it exactly.
+
+    rate_resolver (Chunk 5): consulted only when the chosen kWh has no rate.
+    Returns the mutated block dict.
+    """
+    main = block.get("meters", {}).get(main_meter_id)
+    if not main:
+        return block
+    _rate_repaired = False
+    use_dcc = (billing_source != "cad")
+
+    imp_ch = (main.get("channels") or {}).get("import")
+    if imp_ch is not None:
+        cad_kwh = imp_ch.get("kwh_cad")
+        if cad_kwh is None:
+            # First settlement: current kwh IS the CAD figure; preserve it so a
+            # later switch back to CAD restores the original exactly.
+            cad_kwh = imp_ch.get("kwh")
+            imp_ch["kwh_cad"] = cad_kwh
+        dcc_kwh = main.get("imp_kwh_api")
+        chosen = dcc_kwh if (use_dcc and dcc_kwh is not None) else cad_kwh
+        if chosen is not None:
+            rate, rep = _resolve_block_rate(imp_ch, block.get("start", ""),
+                                            "import", rate_resolver)
+            _rate_repaired = _rate_repaired or rep
+            if rep:
+                imp_ch["rate"] = rate
+            # Dispatch overlay: an out-of-window smart-charge slot with real draw
+            # is repriced to off-peak (compute-and-log until validated). Gated by
+            # the materialised import kWh (meter validation).
+            rate = _dispatch_overlay_rate("import", block.get("start", ""),
+                                          rate, chosen)
+            imp_ch["kwh"] = chosen
+            imp_ch["kwh_total"] = chosen
+            imp_ch["cost"] = round(chosen * rate, 6)
+
+    exp_ch = (main.get("channels") or {}).get("export")
+    if exp_ch is None and main.get("exp_kwh_api") is not None:
+        # DCC-only export (no export sensor, no Mini export layer): exp_kwh was
+        # never materialised at finalise, so the reconstructed block has no
+        # export channel — but the settled figure is present in exp_kwh_api.
+        # Create the channel so the settlement below can materialise it.
+        # Without this, settled export stays stuck in exp_kwh_api forever and
+        # the export bill reads zero (the DCC-only-export persistence bug).
+        exp_ch = {}
+        main.setdefault("channels", {})["export"] = exp_ch
+    if exp_ch is not None:
+        cad_exp = exp_ch.get("kwh_cad")
+        if cad_exp is None:
+            cad_exp = exp_ch.get("kwh")
+            exp_ch["kwh_cad"] = cad_exp
+        dcc_exp = main.get("exp_kwh_api")
+        chosen_exp = dcc_exp if (use_dcc and dcc_exp is not None) else cad_exp
+        if chosen_exp is not None:
+            exp_rate, rep = _resolve_block_rate(exp_ch, block.get("start", ""),
+                                                "export", rate_resolver)
+            _rate_repaired = _rate_repaired or rep
+            if rep:
+                exp_ch["rate"] = exp_rate
+            exp_ch["kwh"] = chosen_exp
+            exp_ch["cost"] = round(chosen_exp * exp_rate, 6)
+
+    if _rate_repaired:
+        main["rate_repaired"] = True
+
+    # Standing charge: repair zeros AND re-verify non-zero against Kraken
+    # (Kraken wins for now). Resolved value is £/day; reject implausible
+    # (units guard) and only correct when materially different to avoid churn.
+    if standing_resolver is not None:
+        try:
+            sc_new = standing_resolver(block.get("start", ""))
+        except Exception as e:
+            logger.warning("_rerun: standing resolver error at %s: %s",
+                           block.get("start", ""), e)
+            sc_new = None
+        if sc_new is not None and (0.0 <= sc_new <= 2.0):
+            sc_old = main.get("standing_charge", 0.0) or 0.0
+            if abs(sc_new - sc_old) > 1e-6:
+                main["standing_charge"] = sc_new
+                main["standing_charge_repaired"] = True
+                logger.info("_rerun: standing_charge %s %.4f → %.4f £/day",
+                            block.get("start", ""), sc_old, sc_new)
+        elif sc_new is not None:
+            logger.warning("_rerun: rejected implausible standing charge %.4f "
+                           "at %s (units?)", sc_new, block.get("start", ""))
+
+    _apply_pass2(block)
+
+    # PASS 3 totals re-derivation (mirror finalise_block PASS 3)
+    _recompute_pass3_totals(block)
+
+    _recompute_block_carbon(block)
+
+    # Clear provisional markers — block is DCC-final now.
+    for meter_block in block["meters"].values():
+        meter_block.pop("is_provisional", None)
+        meter_block.pop("provisional", None)
+    return block
+
+
+def _drain_pass2_queue(ha: HAClient, limit: int = 50, rate_resolver=None) -> int:
+    """Process blocks flagged needs_pass2_rerun=1 (DCC settlement arrived).
+
+    For each: reload the full block, re-run PASS 2+3b against imp_kwh_api,
+    write back (clearing is_provisional), clear the re-run flag. Returns the
+    number of blocks successfully re-run.
+
+    Bounded per call (limit) so a large settlement batch is spread across
+    ticks rather than blocking one. Each block is independent — a failure on
+    one is logged and skipped, leaving its flag set for a later retry.
+
+    rate_resolver (Chunk 5, optional): callable(channel_name, block_start) ->
+    £/kWh or None, used to repair zero/missing rates from Kraken history at
+    reconcile time. Built once per poll cycle and cached; the drain only reads
+    it, never fetches.
+    """
+    queued = _store.get_blocks_needing_pass2_rerun(limit=limit)
+    if not queued:
+        return 0
+
+    resolver = rate_resolver if rate_resolver is not None else _kraken_rate_resolver
+    source = _get_billing_source()
+
+    done = 0
+    for row in queued:
+        block_start = row["block_start"]
+        block_id    = row["id"]
+        try:
+            block = _store.get_block_dict_by_start(block_start)
+            if not block:
+                logger.warning(
+                    "_drain_pass2_queue: block %s vanished; clearing flag",
+                    block_start)
+                _store.clear_pass2_rerun_flag(block_id)
+                continue
+
+            _rerun_pass2_for_settled_block(block, rate_resolver=resolver,
+                                           billing_source=source,
+                                           standing_resolver=_kraken_standing_resolver)
+            append_block_replace(block)
+            _store.clear_pass2_rerun_flag(block_id)
+            done += 1
+            logger.info(
+                "_drain_pass2_queue: re-ran PASS 2+3b for %s against DCC figure",
+                block_start)
+        except Exception as e:
+            logger.error(
+                "_drain_pass2_queue: re-run failed for %s (flag left set "
+                "for retry): %s", block_start, e)
+
+    if done:
+        # Re-priced blocks change the billing/daily charts — regenerate them now
+        # so the UI reflects the reconciled figures immediately. Without this the
+        # charts stay stale until the next block rollover happens to trigger a
+        # chart write, so a user viewing right after a reconcile sees old numbers.
+        try:
+            generate_charts(_store)
+        except Exception as _ce:
+            logger.warning("_drain_pass2_queue: chart regen failed: %s", _ce)
+        try:
+            engine_totals = _store.get_cumulative_totals()
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(_deferred_sensor_update(ha, engine_totals))
+        except Exception as _se:
+            logger.warning("_drain_pass2_queue: sensor republish failed: %s", _se)
+
+    return done
 
 
 def _amend_provisional_sub_meter_blocks(ha: HAClient, current_block: dict) -> None:
@@ -1470,8 +2646,13 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
 
         import_channel_cfg     = meter_cfg.get("channels", {}).get("import", {})
         standing_charge_sensor = import_channel_cfg.get("standing_charge_sensor")
-        raw_sc                 = read_sensor(ha, standing_charge_sensor) if standing_charge_sensor else 0.0
-        if (raw_sc is None or raw_sc == 0.0) and standing_charge_sensor:
+        # Honour an explicit "use supplier API standing charge" choice on the
+        # main meter: take the schedule value even when a SC sensor is mapped.
+        _sc_force_api          = (import_channel_cfg.get("standing_charge_source") == "api") \
+                                 and not meter_meta.get("sub_meter")
+        raw_sc                 = 0.0 if _sc_force_api else \
+                                 (read_sensor(ha, standing_charge_sensor) if standing_charge_sensor else 0.0)
+        if (raw_sc is None or raw_sc == 0.0) and standing_charge_sensor and not _sc_force_api:
             # Sensor unavailable — fall back to last known value from DB
             try:
                 _sc_row = _store._conn.execute(
@@ -1483,6 +2664,19 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
                 if _sc_row:
                     raw_sc = float(_sc_row["standing_charge"])
                     logger.debug("finalise_block: standing charge sensor unavailable, using last known value %.4f", raw_sc)
+            except Exception:
+                pass
+        # API mode (no SC sensor) OR an explicit "use API standing charge" choice:
+        # the standing charge comes from the Kraken schedule. Apply it at finalise
+        # (main import only; sub-meters inherit) so every block carries its
+        # standing charge immediately, rather than 0-until-DCC-settlement. The
+        # settlement rerun later refines it via the same resolver.
+        if (raw_sc is None or raw_sc == 0.0) and (not standing_charge_sensor or _sc_force_api) \
+                and not meter_meta.get("sub_meter"):
+            try:
+                _sc_sched = _kraken_standing_resolver(start)
+                if _sc_sched:
+                    raw_sc = float(_sc_sched)
             except Exception:
                 pass
         meter_block["standing_charge"] = raw_sc if raw_sc is not None else 0.0
@@ -1497,8 +2691,44 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
             valid_rates = [r for r in rates if r["ts"] < boundary_iso]
             if not valid_rates and rates:
                 valid_rates = [rates[0]]
-            # Fallback to last_known_rates when no live rates are available
-            # (e.g. after a restore where stale reads were cleared)
+            # API/Mini mode: no rate SENSOR exists — the unit rate comes from the
+            # Kraken rate schedule, which knows the correct PER-BLOCK time-of-use
+            # rate (e.g. IOG off-peak overnight vs peak by day). Resolve it at the
+            # block start (main meter import/export only; sub-meters inherit the
+            # parent rate via compute_channel).
+            #
+            # This MUST be tried BEFORE the last_known_rates fallback below.
+            # last_known_rates carries the PREVIOUS block's rate forward as a
+            # single value; if it ran first it would mask the schedule resolver
+            # and every block would inherit the first block's rate uniformly
+            # (the IOG "every block billed at peak, incl. overnight off-peak"
+            # bug). The schedule is time-of-use aware and per-block correct, so
+            # it wins; last_known_rates is only the gap/restore fallback when the
+            # resolver yields nothing (no schedule, or timestamp uncovered).
+            # Honour an explicit "use supplier API rate" choice on the MAIN
+            # meter: resolve the schedule for this block even when a rate sensor
+            # is mapped (the config-screen / wizard toggle wins over the sensor).
+            # If the schedule can't resolve, the sensor value already in
+            # valid_rates is left as a graceful fallback.
+            _ch_cfg = (meter_cfg or {}).get("channels", {}).get(channel_name, {})
+            if (_ch_cfg.get("rate_source") == "api") and not is_sub \
+                    and channel_name in ("import", "export"):
+                try:
+                    _kr = _kraken_rate_resolver(channel_name, start)
+                    if _kr is not None:
+                        valid_rates = [{"ts": start, "value": _kr}]
+                except Exception:
+                    pass
+            if not valid_rates and not is_sub and channel_name in ("import", "export"):
+                try:
+                    _kr = _kraken_rate_resolver(channel_name, start)
+                    if _kr is not None:
+                        valid_rates = [{"ts": start, "value": _kr}]
+                except Exception:
+                    pass
+            # Fallback to last_known_rates when no live rates AND the schedule
+            # resolver could not resolve (e.g. CAD sensor gap after a restore
+            # where stale reads were cleared, or an uncovered schedule window).
             if not valid_rates and last_known_rates:
                 _fallback = last_known_rates.get(meter_name, {}).get(channel_name)
                 if _fallback:
@@ -1542,13 +2772,77 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
                 channel_for_compute          = dict(channel)
                 channel_for_compute["rates"] = valid_rates
 
-            result = compute_channel(channel_for_compute, parent_rates, is_sub_meter=is_sub)
+            result = compute_channel(channel_for_compute, parent_rates, is_sub_meter=is_sub,
+                                     meter_id=meter_name, channel_id=channel_name)
 
             channel_cfg_meta = meter_cfg.get("channels", {}).get(channel_name, {}).get("meta")
             if channel_cfg_meta:
                 result["meta"] = channel_cfg_meta
 
             meter_block["channels"][channel_name] = result
+
+            # Dispatch overlay (A) — at FINALISE, for the main import channel.
+            # This is the finalise-time rate adjustment that BCD's rate sensor
+            # would supply if installed; EMT computes the equivalent itself for
+            # users without BCD. An out-of-window smart-charge slot with real
+            # draw is repriced to off-peak here, the moment the block forms —
+            # consistent with how CAD/BCD rates are applied at finalise. Gated by
+            # the computed import kWh (meter validation). Settlement re-applies it
+            # when the DCC kWh re-materialises (so it isn't clobbered).
+            if not is_sub and channel_name == "import":
+                _base = result.get("rate", 0.0) or 0.0
+                if _base:
+                    _ov = _dispatch_overlay_rate("import", start, _base,
+                                                 result.get("kwh"))
+                    if _ov != _base:
+                        result["rate"] = _ov
+                        result["cost"] = round((result.get("kwh") or 0.0) * _ov, 6)
+
+            # Dispatch overlay for a DEVICE on "use main meter rate" — price its
+            # import on the main meter's EFFECTIVE rate. The base follows the
+            # main meter's own source (sensor → inherit its per-block rate; API →
+            # resolve the schedule per-slot, NOT the inherited day which the
+            # sub-meter reconstruction can collapse to off-peak). The dispatch
+            # overlay then reprices the device's own draw to off-peak if IT drew
+            # during a smart-charge slot (so e.g. an EV bump-charging midday on
+            # IOG is costed off-peak, not the daytime peak). Own-sensor devices
+            # keep their sensor; opt-out via meta.rate_source.
+            elif is_sub and channel_name == "import" and \
+                    _device_overlay_decision(
+                        (meter_cfg or {}).get("channels", {}).get("import", {}),
+                        (meter_cfg or {}).get("meta") or meter_meta,
+                        bool(channel.get("rates"))):
+                _parent_imp_cfg = (
+                    config.get("meters", {})
+                          .get(parent_name, {})
+                          .get("channels", {})
+                          .get("import", {})
+                )
+                _base = _device_base_rate(_parent_imp_cfg,
+                                          result.get("rate", 0.0) or 0.0,
+                                          start)
+                if _base:
+                    # Follow the MAIN meter's overlay DECISION, not the device's
+                    # own draw. "Use main meter rate" means inheriting main's
+                    # effective (base + dispatch overlay) rate, so the overlay's
+                    # over-report floor must be evaluated against the MAIN
+                    # meter's import, not the follower's. A device that barely
+                    # draws during a smart-charge slot (e.g. a battery at ~0 kWh)
+                    # must still inherit the off-peak rate main received. The EV
+                    # path is unaffected: if the EV drew, main drew at least as
+                    # much, so it still clears the floor. (parent is finalised
+                    # earlier in PASS 1; fall back to own kWh if not yet present.)
+                    _main_imp_kwh = (
+                        (block["meters"].get(parent_name, {})
+                              .get("channels", {})
+                              .get("import") or {}).get("kwh")
+                    )
+                    _ov = _dispatch_overlay_rate(
+                        "import", start, _base,
+                        _main_imp_kwh if _main_imp_kwh is not None
+                        else result.get("kwh"))
+                    result["rate"] = _ov
+                    result["cost"] = round((result.get("kwh") or 0.0) * _ov, 6)
 
             # ── 2.10.0: provisional detection for sub-meter import ──────────
             # A sub-meter block is provisional when it was closed without a
@@ -1616,6 +2910,10 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
                         exp_kwh  = float((exp_ch or {}).get("kwh", 0.0) or 0.0)
                         carbon_g = round((imp_kwh - exp_kwh) * intensity, 4)
                     meter_block["carbon_g"] = carbon_g
+                    # 3.0.0: persist the intensity used, so a later PASS 2+3b
+                    # re-run (DCC settlement) can recompute carbon_g without
+                    # re-querying the carbon_intensity table (pruned to 4 days).
+                    meter_block["carbon_intensity_g"] = intensity
                     logger.debug(
                         "finalise_block: %s carbon_g=%.2f gCO2 (intensity=%.1f gCO2/kWh)",
                         meter_name, carbon_g, intensity
@@ -1659,6 +2957,10 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
         logger.warning("finalise_block: no running event loop for sensor update")
 
     logger.info("finalise_block: %s → %s complete", start, end)
+
+    # 3.0.0: notify any registered boundary listener (Kraken Mini ingester).
+    # No-op until Chunk 7 registers a callback.
+    _fire_block_boundary(end)
 
     # ── Prune rolling buffer ───────────────────────────────────────────────
     pruned_block = {
@@ -1758,6 +3060,67 @@ async def on_export_meter_update(entity_id: str, new_val: str, full_state: dict)
 # Engine loop  (replaces @time_trigger("period(now, 10s)"))
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def _poll_mini_demand_kw(now) -> float | None:
+    """Fetch the Mini's latest smartMeterTelemetry demand (kW), throttled to one
+    call per _MINI_POLL_GAP. Updates _last_mini_demand (read by the gauge) and
+    returns the kW for this tick's power_history row, or None when throttled /
+    unavailable. Runs on the engine loop, so the GraphQL call is awaited directly."""
+    global _last_mini_demand
+    import time as _time
+    t = _time.monotonic()
+    if (t - _last_mini_demand["ts"]) < _MINI_POLL_GAP:
+        return None  # throttled — no new row until the next poll window
+    reader = _kraken_mini_reader
+    device_id = getattr(reader, "device_id", None) if reader else None
+    if not device_id or not _kraken_client:
+        return None
+    try:
+        from datetime import timedelta
+        start = now - timedelta(minutes=3)
+        pts = await _kraken_client.get_telemetry(
+            device_id, start.isoformat(), now.isoformat()) or []
+        demand_w = None
+        for p in reversed(pts):
+            if p.get("demand") is not None:
+                demand_w = float(p["demand"])
+                break
+        if demand_w is None:
+            return None
+        kw = round(demand_w / 1000.0, 3)  # telemetry demand is in watts
+        _last_mini_demand = {"kw": kw, "ts": t, "wall": _time.time()}
+        return kw
+    except Exception as e:
+        logger.warning("_poll_mini_demand_kw: %s", e)
+        return None
+
+
+def _power_value_to_kw(value, unit, unit_override=None, invert=False) -> float | None:
+    """Convert a power sensor reading to kW.
+
+    `unit_override` ('W'/'kW', case-insensitive) forces the unit when HA's
+    unit_of_measurement is wrong or absent — e.g. a CT integration that declares
+    'kW' but emits W-scale numbers (1400 for 1.4 kW), which no magnitude heuristic
+    can catch because the (wrong) unit IS present. With no override, the sensor's
+    declared unit drives it; an absent/unknown unit falls back to the magnitude
+    heuristic (>100 ⇒ watts). `invert` negates the result for sensors whose sign
+    convention is opposite EMT's (import positive / export negative; or, for a
+    battery inverter, positive = charging). Returns None for non-numeric values.
+    Mirrors the server's sensor_kw so BCD's current_demand is recorded correctly."""
+    try:
+        fv = float(value)
+    except (ValueError, TypeError):
+        return None
+    ov = (unit_override or "").strip().upper()
+    u = ov if ov in ("W", "KW") else (unit or "").upper()
+    if u == "W":
+        fv = fv / 1000.0
+    elif u != "KW":
+        fv = fv / 1000.0 if abs(fv) > 100 else fv
+    if invert:
+        fv = -fv
+    return round(fv, 3)
+
+
 def _get_postcode() -> str | None:
     """Return the postcode_prefix from the main meter config, or None."""
     try:
@@ -1825,6 +3188,293 @@ def _fetch_carbon_intensity(postcode: str) -> list:
     return slots
 
 
+# ── Historical carbon backfill (v2 -> v3 migration) ────────────────────────────
+# The heatmap and Usage Stats now treat the stored carbon_intensity_g as the
+# source of truth. Blocks created before CI first became available (the whole
+# pre-postcode history, including everything carried over from v2) have a NULL
+# intensity. The live recovery sweep (_recover_missing_carbon) can only reach
+# blocks still inside the 4-day CI table, so this one-shot backfill pages the
+# Carbon Intensity API's historical endpoint over the NULL span and writes the
+# intensity straight onto the blocks. Gated on "postcode exists"; runs once
+# (persistent marker); resumable (cursor); throttled to sub-14-day windows.
+_CARBON_BACKFILL_MARKER = "carbon_backfill_state"   # store_meta key
+_carbon_backfill_running = False                    # in-process re-entry guard
+
+
+def _fetch_carbon_intensity_range(postcode: str, from_iso: str, to_iso: str) -> dict:
+    """Fetch settled historical regional intensity for [from_iso, to_iso] and
+    return {slot_from -> intensity_gco2}. The Carbon Intensity API serves at most
+    a 14-day window per request, so callers must page. 'actual' is preferred over
+    'forecast' (actuals settle ~24h after each slot; every backfill target is far
+    older than that, so a real actual is always returned). Raises on HTTP/network
+    error so the caller can persist a resume cursor and stop."""
+    import urllib.request
+    import json as _json
+
+    url = (f"https://api.carbonintensity.org.uk/regional/intensity"
+           f"/{from_iso}/{to_iso}/postcode/{postcode}")
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = _json.loads(resp.read())
+
+    raw = data.get("data", [])
+    if isinstance(raw, dict):
+        entries = raw.get("data", [])
+    elif isinstance(raw, list) and raw:
+        entries = raw[0].get("data", []) if "data" in raw[0] else raw
+    else:
+        entries = []
+
+    out: dict = {}
+    for slot in entries:
+        io = slot.get("intensity", {}) or {}
+        val = io.get("actual")
+        if val is None:
+            val = io.get("forecast")
+        sf = slot.get("from")
+        if sf and val is not None:
+            out[sf.replace("Z", "").replace("+00:00", "")] = float(val)
+    return out
+
+
+def _nearest_intensity_from_map(ci_map: dict, block_start: str):
+    """Nearest slot intensity (<=60 min) for *block_start* from a
+    {slot_iso -> intensity} map. Tries the containing 30-min slot first (a direct
+    hit for 30-min-aligned blocks), then falls back to the nearest within 60 min."""
+    from datetime import datetime as _dt
+    if not ci_map:
+        return None
+    try:
+        bs = _dt.fromisoformat(str(block_start).replace("Z", "").split("+")[0])
+    except Exception:
+        return None
+    floored = bs.replace(minute=(0 if bs.minute < 30 else 30),
+                         second=0, microsecond=0)
+    hit = ci_map.get(floored.strftime("%Y-%m-%dT%H:%M"))
+    if hit is not None:
+        return hit
+    best = best_d = None
+    for k, v in ci_map.items():
+        try:
+            kd = _dt.fromisoformat(k)
+        except Exception:
+            continue
+        d = abs((bs - kd).total_seconds())
+        if d <= 3600 and (best_d is None or d < best_d):
+            best_d, best = d, v
+    return best
+
+
+async def _run_historical_carbon_backfill(window_days: int = 13,
+                                          max_windows: int = 60) -> int:
+    """One-shot historical carbon backfill. Pages the Carbon Intensity API over
+    the span of NULL-intensity blocks in sub-14-day windows, writes carbon_g +
+    carbon_intensity_g straight onto those blocks (NOT via the 4-day-pruned CI
+    table), and records a resume cursor after each window so a restart continues.
+    Idempotent: only touches NULL blocks; sets a done marker when no NULL blocks
+    remain. Returns blocks backfilled this invocation.
+
+    CONCURRENCY (this is why it is a coroutine, not a threaded worker): every
+    BlockStore read/write here runs on the event-loop thread — the same thread
+    that owns the engine's single SQLite connection (opened check_same_thread=
+    False for a *single* thread). Only the blocking CI fetch is offloaded, via
+    run_in_executor. The first cut ran the whole worker on an executor thread; its
+    DB writes then raced the main-loop _drain_pass2_queue on that one shared
+    connection and corrupted both (SQLITE_MISUSE: "bad parameter or other API
+    misuse", "cannot commit - no transaction is active"). Running the DB work on
+    the loop thread serialises it cooperatively with the drain — no shared-
+    connection race, and no second connection / last-write-wins race either.
+
+    window_days defaults to 13, NOT 14: the API's /regional/intensity/{from}/{to}
+    range cap is effectively exclusive — a [00:00..00:00] 14-day request lands one
+    half-hour period past the limit and returns HTTP 400. 13-day windows sit
+    safely under it (one extra request over the whole history; negligible).
+
+    `max_windows` bounds a single invocation; a larger history finishes across
+    successive triggers via the cursor."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    import asyncio as _aio
+    _now = lambda: _dt.now(_tz.utc).replace(tzinfo=None).isoformat()
+    if _store is None:
+        return 0
+    postcode = _get_postcode()
+    if not postcode:
+        return 0
+
+    state = _store.get_meta(_CARBON_BACKFILL_MARKER, {}) or {}
+    if state.get("done"):
+        return 0
+
+    rng = _store.get_missing_carbon_date_range()
+    if not rng:
+        _store.set_meta(_CARBON_BACKFILL_MARKER,
+                        {"done": True, "completed_at": _now()})
+        return 0
+
+    lo_iso, hi_iso = rng
+    cursor = state.get("cursor") or lo_iso
+    try:
+        cur_dt = _dt.fromisoformat(str(cursor).replace("Z", "").split("+")[0])
+    except Exception:
+        cur_dt = _dt.fromisoformat(str(lo_iso).replace("Z", "").split("+")[0])
+    try:
+        hi_dt = (_dt.fromisoformat(str(hi_iso).replace("Z", "").split("+")[0])
+                 + _td(minutes=30))   # inclusive of the last slot
+    except Exception:
+        return 0
+
+    try:
+        loop = _aio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    backfilled = 0
+    windows = 0
+    while cur_dt < hi_dt and windows < max_windows:
+        win_end = min(cur_dt + _td(days=window_days), hi_dt)
+        f_iso = cur_dt.strftime("%Y-%m-%dT%H:%MZ")
+        t_iso = win_end.strftime("%Y-%m-%dT%H:%MZ")
+        try:
+            # Offload ONLY the blocking network fetch; DB stays on this thread.
+            if loop is not None:
+                ci_map = await loop.run_in_executor(
+                    None, _fetch_carbon_intensity_range, postcode, f_iso, t_iso)
+            else:
+                ci_map = _fetch_carbon_intensity_range(postcode, f_iso, t_iso)
+        except Exception as e:
+            logger.warning("_run_historical_carbon_backfill: fetch failed "
+                           "%s..%s: %s — pausing, will resume", f_iso, t_iso, e)
+            _store.set_meta(_CARBON_BACKFILL_MARKER,
+                            {"cursor": cur_dt.isoformat(), "done": False})
+            return backfilled
+
+        for start in _store.get_block_starts_missing_carbon_in_range(
+                cur_dt.isoformat(), win_end.isoformat()):
+            intensity = _nearest_intensity_from_map(ci_map, start)
+            if intensity is None:
+                continue
+            block = _store.get_block_dict_by_start(start)
+            if not block:
+                continue
+            _apply_intensity_to_block(block, intensity)
+            try:
+                append_block_replace(block)
+                backfilled += 1
+            except Exception as e:
+                logger.warning("_run_historical_carbon_backfill: persist failed "
+                               "%s: %s", start, e)
+
+        cur_dt = win_end
+        windows += 1
+        _store.set_meta(_CARBON_BACKFILL_MARKER,
+                        {"cursor": cur_dt.isoformat(), "done": False})
+        if loop is not None:
+            await _aio.sleep(0)   # yield so ticks/reads interleave between windows
+
+    if cur_dt < hi_dt:
+        # Hit the per-invocation window cap; resume next trigger from the cursor.
+        logger.info("_run_historical_carbon_backfill: paused after %d window(s), "
+                    "%d block(s); will resume from cursor", windows, backfilled)
+        return backfilled
+
+    # Full span swept. Decide the marker by what NULL blocks ACTUALLY remain — not
+    # by the cursor. A per-block persist failure leaves a gap the forward cursor
+    # has already moved past; marking done on cursor alone (the original bug) would
+    # strand it. Re-query the truth instead.
+    remaining = _store.get_missing_carbon_date_range()
+    if remaining is None:
+        _store.set_meta(_CARBON_BACKFILL_MARKER,
+                        {"done": True, "completed_at": _now()})
+        if backfilled:
+            try:
+                generate_charts(_store)
+            except Exception as e:
+                logger.warning("_run_historical_carbon_backfill: chart regen "
+                               "failed: %s", e)
+        logger.info("_run_historical_carbon_backfill: complete — %d block(s) "
+                    "backfilled", backfilled)
+    elif backfilled > 0:
+        # Progress made but gaps remain (transient persist failures). Retry next
+        # trigger from the earliest still-NULL block — bounded so a permanently
+        # stuck slot can't loop forever re-hitting the API.
+        attempts = int(state.get("retry_attempts", 0)) + 1
+        if attempts >= 6:
+            _store.set_meta(_CARBON_BACKFILL_MARKER,
+                            {"done": True, "completed_at": _now(),
+                             "unfilled_from": remaining[0]})
+            logger.warning("_run_historical_carbon_backfill: gaps remain from %s "
+                           "after %d retries — marking done", remaining[0], attempts)
+        else:
+            _store.set_meta(_CARBON_BACKFILL_MARKER,
+                            {"cursor": remaining[0], "done": False,
+                             "retry_attempts": attempts})
+            logger.info("_run_historical_carbon_backfill: %d block(s) backfilled; "
+                        "gaps remain from %s — will retry (%d)",
+                        backfilled, remaining[0], attempts)
+    else:
+        # A whole pass filled nothing yet NULL blocks remain → those slots are
+        # genuinely unattributable (no CI data). Stop to avoid an infinite retry.
+        _store.set_meta(_CARBON_BACKFILL_MARKER,
+                        {"done": True, "completed_at": _now(),
+                         "unfilled_from": remaining[0]})
+        logger.warning("_run_historical_carbon_backfill: span swept but NULL "
+                       "blocks remain from %s and none could be attributed — "
+                       "marking done (unfillable)", remaining[0])
+    return backfilled
+
+
+def _maybe_backfill_historical_carbon() -> None:
+    """Schedule the one-shot historical backfill if a postcode exists and it
+    hasn't completed. Safe to call repeatedly (engine startup + every CI tick) —
+    guarded by an in-process flag and the persistent done marker. The CI-tick
+    trigger is what catches a postcode added *after* first boot.
+
+    Dispatches the async worker as a loop TASK (create_task), not an executor
+    thread: all BlockStore access must run on the event-loop thread that owns the
+    engine's single SQLite connection. Self-heals a stale done marker — an earlier
+    (concurrency-broken) run could mark done while transient failures left NULL
+    blocks behind; if gaps remain and we didn't already conclude they're
+    unattributable, re-arm and let the worker fill them."""
+    global _carbon_backfill_running
+    try:
+        if _store is None or not _get_postcode() or _carbon_backfill_running:
+            return
+        state = _store.get_meta(_CARBON_BACKFILL_MARKER, {}) or {}
+        if state.get("done"):
+            if state.get("unfilled_from"):
+                return   # already concluded the remainder is unattributable
+            remaining = _store.get_missing_carbon_date_range()
+            if remaining is None:
+                return   # genuinely complete
+            logger.info("_maybe_backfill_historical_carbon: done marker but NULL "
+                        "carbon blocks remain from %s — re-arming", remaining[0])
+            _store.set_meta(_CARBON_BACKFILL_MARKER,
+                            {"cursor": remaining[0], "done": False})
+        import asyncio as _aio
+        try:
+            loop = _aio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            return   # no running loop to host the task (non-async caller)
+
+        async def _task():
+            global _carbon_backfill_running
+            try:
+                await _run_historical_carbon_backfill()
+            except Exception as e:
+                logger.warning("_maybe_backfill_historical_carbon: worker "
+                               "failed: %s", e)
+            finally:
+                _carbon_backfill_running = False
+
+        _carbon_backfill_running = True
+        loop.create_task(_task())
+    except Exception as e:
+        logger.warning("_maybe_backfill_historical_carbon: schedule failed: %s", e)
+        _carbon_backfill_running = False
+
+
 async def _tick_carbon_intensity() -> float | None:
     """
     Fetch and store carbon intensity if 15 minutes have elapsed since last fetch.
@@ -1861,6 +3511,19 @@ async def _tick_carbon_intensity() -> float | None:
         _store.prune_mix_history(hours=48)
         _last_ci_fetch = now
         logger.info("_tick_carbon_intensity: stored %d slots for %s", len(slots), postcode)
+        # CI is freshly populated — backfill any blocks left NULL by an outage
+        # gap-fill (recovers without waiting for a restart).
+        try:
+            _recover_missing_carbon()
+        except Exception as e:
+            logger.warning("_tick_carbon_intensity: carbon recovery failed: %s", e)
+        # Historical backfill (v2->v3 migration). Run-once; this trigger is what
+        # picks it up when a postcode is added after first boot. No-op once done.
+        try:
+            _maybe_backfill_historical_carbon()
+        except Exception as e:
+            logger.warning("_tick_carbon_intensity: historical backfill "
+                           "schedule failed: %s", e)
     except urllib.error.HTTPError as e:
         logger.warning("_tick_carbon_intensity: HTTP %s for postcode %s", e.code, postcode)
     except urllib.error.URLError as e:
@@ -1880,6 +3543,8 @@ async def engine_loop_task(ha: HAClient):
     The asyncio.Lock prevents overlapping executions.
     """
     logger.info("engine_loop_task: started")
+    global _engine_ha
+    _engine_ha = ha
 
     while True:
         try:
@@ -1924,6 +3589,19 @@ async def _engine_tick(ha: HAClient):
     if not _read_queue and (periodic_checkpoint or near_boundary):
         capture_samples(ha, current_block, now)
 
+    # ── 3.0.0: Mini telemetry collection (CAD-like) ───────────────────────
+    # When the Mini provisional layer is active (api+mini, no local sensor),
+    # collect smart-meter telemetry into the CURRENT block's import reads buffer
+    # around each boundary — starting ~20s before and continuing until a read
+    # timestamped past the boundary lands. The existing post-boundary-read wait
+    # + finalise interpolation then bracket the boundary and compute the closing
+    # register uniformly with CAD. Mini reads carry their OWN readAt timestamps.
+    if _kraken_mini_reader is not None and current_block.get("start"):
+        try:
+            await _collect_mini_into_block(current_block, now, block_minutes)
+        except Exception as _mc_e:
+            logger.warning("_engine_tick: mini collection failed: %s", _mc_e)
+
     # ── 2.10.0: amend provisional sub-meter blocks ────────────────────────
     # Skip entirely when a gap marker is active — gap-seed reads in the
     # rolling buffer look identical to real reads and must never be used
@@ -1933,6 +3611,15 @@ async def _engine_tick(ha: HAClient):
             _amend_provisional_sub_meter_blocks(ha, current_block)
         except Exception as _amp_e:
             logger.warning("_engine_tick: provisional amendment failed: %s", _amp_e)
+
+        # ── 3.0.0: drain the DCC PASS 2 re-run queue ──────────────────────
+        # Blocks whose Kraken DCC settlement has arrived (needs_pass2_rerun=1)
+        # are re-run against imp_kwh_api here. No-op until the ingester sets
+        # the flag (Chunk 3+). Gap-guarded for the same reason as amendment.
+        try:
+            _drain_pass2_queue(ha)
+        except Exception as _dpq_e:
+            logger.warning("_engine_tick: PASS 2 re-run drain failed: %s", _dpq_e)
 
     # Deferred gap filling
     # Pre-populate with rates from the last finalised block so finalise_block
@@ -2073,6 +3760,13 @@ async def _engine_tick(ha: HAClient):
         logger.warning("_engine_tick: CI fetch raised: %s", _cie)
         current_intensity = None
 
+    # Dispatch-slot capture (5-min throttled) — catch smart-charge slots while
+    # still 'planned', before they convert to completed/unknown.
+    try:
+        await _tick_dispatch_capture()
+    except Exception as _dce:
+        logger.warning("_engine_tick: dispatch capture raised: %s", _dce)
+
     # Block lifecycle
     updated_block = ensure_correct_block(ha, current_block, now, last_known_rates=_post_gap_rates)
     block_changed = updated_block.get("start") != current_block.get("start")
@@ -2081,35 +3775,67 @@ async def _engine_tick(ha: HAClient):
         updated_block["_last_checkpoint"] = now.isoformat()
         _store.save_current_block(updated_block)
 
-    # Write power history row every tick if a power sensor is configured
+    # Write power history row every tick if a live power source is available
     try:
         cfg = load_config()
         power_sensor = None
+        power_source = None
+        _power_invert = False
+        _power_unit_ov = None
         for m_data in cfg.get("meters", {}).values():
             meta = (m_data or {}).get("meta", {}) or {}
             if not meta.get("sub_meter"):
                 power_sensor = meta.get("power_sensor")
+                power_source = meta.get("power_source")
+                # invert / unit-override apply to the user's OWN sensor only,
+                # never to the BCD fallback (whose convention we don't control).
+                if power_sensor:
+                    _power_invert = bool(meta.get("power_invert", False))
+                    _power_unit_ov = meta.get("power_unit") or None
                 break
+        # Auto-adopt BottlecapDave's current_demand when no sensor is configured —
+        # it's a free local HA entity, so we can sample it every tick.
+        if not power_sensor:
+            bcd = (_detected_integrations or {}).get("bcd") or {}
+            if bcd.get("found"):
+                power_sensor = bcd.get("demand_sensor")
+
+        net_kw = None
         if power_sensor and ha:
             raw_kw = ha.get_state(power_sensor)
             if raw_kw not in (None, "unknown", "unavailable"):
-                net_kw = round(float(raw_kw), 3)
+                # Respect the sensor's unit (BCD current_demand is in watts).
+                _unit = None
+                try:
+                    _unit = (ha.get_attributes(power_sensor) or {}).get(
+                        "unit_of_measurement")
+                except Exception:
+                    pass
+                net_kw = _power_value_to_kw(raw_kw, _unit,
+                                            _power_unit_ov, _power_invert)
+        elif (not power_sensor and power_source == "mini"
+              and _kraken_mini_reader
+              and getattr(_kraken_mini_reader, "device_id", None)):
+            # Octopus Mini source — poll it here (throttled) so the 48h history
+            # fills continuously, independent of whether the page is open.
+            net_kw = await _poll_mini_demand_kw(now)
 
-                # Carbon rate: net_kw (kW) × intensity (gCO2/kWh) ÷ 60 = gCO2/min.
-                # Derived directly from the power sensor — the kWh sensor only updates
-                # every ~60s while the engine ticks every ~10s, so the read-delta approach
-                # produced zeros (sensor unchanged) and spikes (full 60s of kWh over a
-                # ~10s dt_min). The power sensor is already the correct instantaneous value.
-                carbon_gco2_min = None
-                if current_intensity is not None:
-                    try:
-                        carbon_gco2_min = round(net_kw * current_intensity / 60.0, 4)
-                    except Exception as _ce:
-                        logger.debug("_engine_tick: carbon_gco2_min skipped: %s", _ce)
+        if net_kw is not None:
+            # Carbon rate: net_kw (kW) × intensity (gCO2/kWh) ÷ 60 = gCO2/min.
+            # Derived directly from the power sensor — the kWh sensor only updates
+            # every ~60s while the engine ticks every ~10s, so the read-delta approach
+            # produced zeros (sensor unchanged) and spikes (full 60s of kWh over a
+            # ~10s dt_min). The power sensor is already the correct instantaneous value.
+            carbon_gco2_min = None
+            if current_intensity is not None:
+                try:
+                    carbon_gco2_min = round(net_kw * current_intensity / 60.0, 4)
+                except Exception as _ce:
+                    logger.debug("_engine_tick: carbon_gco2_min skipped: %s", _ce)
 
-                _store.append_power_history(now.isoformat(), net_kw,
-                                            current_intensity, carbon_gco2_min)
-                _store.prune_power_history(hours=48)
+            _store.append_power_history(now.isoformat(), net_kw,
+                                        current_intensity, carbon_gco2_min)
+            _store.prune_power_history(hours=48)
     except Exception as e:
         logger.warning("_engine_tick: power_history write skipped: %s", e)
 
@@ -2135,25 +3861,29 @@ async def _engine_tick(ha: HAClient):
                         soc_val = round(float(v), 1)
                     except (ValueError, TypeError):
                         pass
-            # Use inverter_power_sensor for batteries, device_power_sensor for EV/heat pump
-            power_s = inv_s or dev_s
+            # Use inverter_power_sensor for batteries, device_power_sensor for EV/heat pump.
+            # Pick the matching invert/unit-override flags for whichever drives it.
+            if inv_s:
+                power_s = inv_s
+                _sub_invert = bool(meta.get("inverter_power_invert", False))
+                _sub_unit_ov = meta.get("inverter_power_unit") or None
+            else:
+                power_s = dev_s
+                _sub_invert = bool(meta.get("device_power_invert", False))
+                _sub_unit_ov = meta.get("device_power_unit") or None
             if power_s and ha:
                 v = ha.get_state(power_s)
                 if v not in (None, "unknown", "unavailable"):
                     try:
-                        fv = float(v)
-                        # Convert to kW using unit_of_measurement from HA attributes.
-                        # The meter config sensor picker only allows power sensors (W or kW),
-                        # so the unit is always known — no magnitude guessing needed.
-                        try:
-                            unit = (ha.get_attributes(power_s) or {}).get("unit_of_measurement", "")
-                        except Exception:
-                            unit = ""
-                        if unit.upper() == "W":
-                            fv = fv / 1000.0
-                        inv_val = round(fv, 3)
-                    except (ValueError, TypeError):
-                        pass
+                        unit = (ha.get_attributes(power_s) or {}).get(
+                            "unit_of_measurement", "")
+                    except Exception:
+                        unit = ""
+                    # Shared converter: unit attr → kW, override when declared
+                    # unit is wrong/absent, then invert. Falls back to the
+                    # magnitude heuristic when the unit is missing (previously this
+                    # path assumed kW on a missing unit — a W sensor read 1000× high).
+                    inv_val = _power_value_to_kw(v, unit, _sub_unit_ov, _sub_invert)
             if soc_val is not None or inv_val is not None:
                 _store.append_sub_meter_history(now.isoformat(), mid, soc_val, inv_val)
                 if not _pruned_sub:
@@ -2168,6 +3898,1239 @@ async def _engine_tick(ha: HAClient):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _read_kraken_creds_file() -> dict:
+    """Read credentials from KRAKEN_CREDS_PATH, or {} if absent/unreadable."""
+    try:
+        with open(KRAKEN_CREDS_PATH, "r") as f:
+            import json as _json
+            data = _json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+def save_kraken_credentials(api_key, account_number, base_url=None) -> None:
+    """Persist API credentials to their own file (0600), outside the DB so they
+    are never included in backups. Passing None/'' for api_key clears the file
+    (disconnect). Account/base_url are stored alongside."""
+    import json as _json
+    ensure_dir(DATA_DIR)
+    key = (api_key or "").strip()
+    if not key:
+        # Disconnect: remove the file entirely.
+        try:
+            os.remove(KRAKEN_CREDS_PATH)
+        except FileNotFoundError:
+            pass
+        return
+    payload = {"api_key": key,
+               "account_number": (account_number or "").strip() or None,
+               "base_url": (base_url or "").strip() or None}
+    tmp = KRAKEN_CREDS_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        _json.dump(payload, f)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, KRAKEN_CREDS_PATH)
+
+
+def _kraken_env() -> dict:
+    """Resolve Kraken credentials. Prefers the in-app credentials file
+    (KRAKEN_CREDS_PATH); falls back to environment variables for backward
+    compatibility (the 2.x add-on-config path). Normalises empties to None.
+    Returns {api_key, account_number, base_url}."""
+    def _clean(v):
+        v = (v or "").strip()
+        return None if v in ("", "null", "None") else v
+    creds = _read_kraken_creds_file()
+    if creds.get("api_key"):
+        return {
+            "api_key": _clean(creds.get("api_key")),
+            "account_number": _clean(creds.get("account_number")),
+            "base_url": _clean(creds.get("base_url")),
+        }
+    return {
+        "api_key": _clean(os.environ.get("KRAKEN_API_KEY")),
+        "account_number": _clean(os.environ.get("KRAKEN_ACCOUNT_NUMBER")),
+        "base_url": _clean(os.environ.get("KRAKEN_BASE_URL")),
+    }
+
+
+def has_kraken_credentials() -> bool:
+    """True if a Kraken API key is configured (creds file or env). Used to guard
+    against activating an API mode with no credentials (Change Setup cad→api)."""
+    try:
+        return bool(_kraken_env().get("api_key"))
+    except Exception:
+        return False
+
+
+async def connect_kraken_now() -> dict:
+    """(Re)build the Kraken client from current credentials and run discovery
+    immediately — used after the user enters credentials in-app, so they get a
+    live connection result without restarting. Returns a status dict:
+      {ok, connected, account_number?, import_mpan?, export_mpan?, mini?, detail?}
+    Never raises."""
+    env = _kraken_env()
+    if not env["api_key"]:
+        return {"ok": False, "connected": False, "detail": "no_api_key"}
+    try:
+        await _kraken_startup_discovery(force=True)
+    except Exception as e:
+        return {"ok": False, "connected": False, "detail": str(e)}
+    if _kraken_client is None or not _kraken_discovery:
+        return {"ok": False, "connected": False, "detail": "discovery_failed"}
+    imp = _kraken_discovery.get("import") or {}
+    exp = _kraken_discovery.get("export") or {}
+    # Also (re)build rate schedules so reconcile has them without waiting a poll.
+    try:
+        await _refresh_kraken_rate_schedules()
+    except Exception:
+        pass
+    # NB: the DCC poll task is launched at the END of engine_startup (after the
+    # store + client are rebuilt), NOT here — launching it mid-connect raced the
+    # config-save's engine_startup teardown of those shared resources.
+    return {
+        "ok": True, "connected": True,
+        "account_number": _kraken_discovery.get("account_number"),
+        "import_mpan": imp.get("mpan"),
+        "export_mpan": exp.get("mpan") or None,
+        "mini": _kraken_mini_reader is not None,
+    }
+
+
+async def disconnect_kraken() -> dict:
+    """Destructive 'disconnect Octopus' action (MODE-UI §5): clear stored API
+    credentials and API-derived runtime state, stop polling immediately, tear
+    down the live client + Mini reader, and land the install on local-sensor
+    mode ('cad').
+
+    Kept on purpose: historical DCC-settled billing data (per-block imp_kwh_api /
+    exp_kwh_api + materialised cost) — that's billing history, not a credential —
+    and the billing source, so existing settled blocks keep their materialisation
+    and future local blocks bill off local figures exactly as a cad-only install
+    does. NOT re-priced.
+
+    Lands on 'cad' because api / api+mini with no credentials is non-functional;
+    'cad' makes mode_uses_api() False and surfaces the local meter-sensor fields
+    in the config UI, so the user can add a sensor (or reconnect) to resume. Runs
+    on the engine loop (touches the asyncio poll-task handle). Returns
+    {ok, mode, had_credentials}. Never raises.
+    """
+    global _kraken_client, _kraken_mini_reader, _kraken_discovery
+    global _kraken_rate_schedules, _kraken_standing_schedule
+    had = has_kraken_credentials()
+    try:
+        # 1. Stop the live poll loop and drop all in-memory API state, so polling
+        #    stops NOW (not just on the next restart) — the existing 'send empty
+        #    api_key' path only deleted the file and left the in-memory client
+        #    polling.
+        _cancel_kraken_poll_task()
+        _kraken_client = None
+        _kraken_mini_reader = None
+        _kraken_discovery = None
+        _kraken_rate_schedules = {}
+        _kraken_standing_schedule = None
+        # 2. Remove the credentials file (the actual disconnect).
+        save_kraken_credentials(None, None)
+        # 3. Wipe API-derived progress markers so a future reconnect starts clean
+        #    (fresh backfill, re-takes the pre-live rollback snapshot). Mode and
+        #    billing source also live in kraken_state but are NOT progress markers
+        #    — they are set / preserved explicitly, never blanket-deleted.
+        try:
+            from kraken_ingester import _STATE_LAST_POLL as _LAST_POLL_KEY
+        except Exception:
+            _LAST_POLL_KEY = "last_poll_utc"
+        for k in (_LAST_POLL_KEY, _STATE_LAST_SWEEP, _KRAKEN_SNAPSHOT_DONE_KEY):
+            try:
+                _store.delete_kraken_state(k)
+            except Exception:
+                pass
+        # 4. Land on local-sensor mode (api-without-creds is invalid).
+        set_data_source_mode("cad")
+        logger.info("disconnect_kraken: credentials cleared (had=%s), API client/"
+                    "Mini/discovery torn down, progress state wiped, mode→cad", had)
+        return {"ok": True, "mode": "cad", "had_credentials": had}
+    except Exception as e:
+        logger.error("disconnect_kraken: failed: %s", e)
+        return {"ok": False, "detail": str(e), "had_credentials": had}
+
+
+def _cancel_kraken_poll_task() -> None:
+    """Cancel the running DCC poll task, if any. Called before engine_startup
+    tears down the store/client so an in-flight backfill can't operate on closed
+    resources. Best-effort; the task is relaunched at the end of startup."""
+    global _kraken_poll_task_handle
+    h = _kraken_poll_task_handle
+    if h is not None and not h.done():
+        h.cancel()
+        logger.info("_cancel_kraken_poll_task: cancelled in-flight poll")
+    _kraken_poll_task_handle = None
+
+
+def _ensure_kraken_poll_task_running() -> bool:
+    """Launch kraken_poll_task on the engine loop if it isn't already running.
+    Idempotent and safe to call repeatedly (e.g. on every credential save).
+    Returns True if a task is running afterwards.
+
+    If the engine loop isn't up yet (_engine_ha is None), we're still in boot —
+    main() launches the poll task via its gather() a moment later, so this is
+    expected and NOT a problem. We log it at INFO (not WARNING) to avoid a
+    misleading 'engine loop not up' alarm on a normal pre-configured startup."""
+    global _kraken_poll_task_handle
+    if _engine_ha is None:
+        logger.info("_ensure_kraken_poll_task_running: engine loop not up yet "
+                    "— poll task will be launched by startup")
+        return False
+    h = _kraken_poll_task_handle
+    if h is not None and not h.done():
+        # Already running — nothing to do.
+        return True
+    try:
+        loop = asyncio.get_event_loop()
+        _kraken_poll_task_handle = loop.create_task(kraken_poll_task(_engine_ha))
+        logger.info("_ensure_kraken_poll_task_running: poll task launched")
+        return True
+    except Exception as e:
+        logger.warning("_ensure_kraken_poll_task_running: could not launch: %s", e)
+        return False
+
+
+async def _kraken_startup_discovery(force: bool = False) -> None:
+    """If a Kraken API key is configured, construct the client and run
+    auto_discover ONCE at startup, logging what was found.
+
+    force=True bypasses the fresh-setup guard — used by connect_kraken_now()
+    when the user explicitly enters credentials in the wizard (the DB may still
+    be empty mid-setup, but the connect is intentional).
+
+    This is the 4b-i gate: it performs only the single read-only account fetch
+    that discovery needs, and does NOT poll consumption or write anything. The
+    operator verifies the logged MPANs/serials/account/tariff before the
+    scheduled (dry-run) polling is enabled in a later step. Any failure is
+    logged and swallowed — API misconfiguration must never break engine
+    startup or the CAD pipeline.
+    """
+    global _kraken_client, _kraken_discovery, _kraken_account_number
+    env = _kraken_env()
+    if not env["api_key"]:
+        logger.info("kraken_discovery: no API key configured — API integration off")
+        return
+    # API-activation gate: only auto-activate the supplier API when a mode has
+    # been EXPLICITLY chosen (by the survey) AND that mode uses the API. A flat/
+    # pre-survey DB reports mode 'unset' → no auto-activation, even though an
+    # orphaned credentials file may still exist (it lives outside the DB, so a
+    # flatten doesn't clear it). The wizard re-establishes the mode + creds.
+    # force=True (the wizard's own connect) bypasses this.
+    if not force and not mode_uses_api():
+        logger.info("kraken_discovery: data-source mode is '%s' — API not "
+                    "auto-activated (awaiting survey / not an API mode)",
+                    get_data_source_mode())
+        return
+    try:
+        from kraken_api_client import KrakenAPIClient
+    except Exception as e:
+        logger.warning("kraken_discovery: client import failed: %s", e)
+        return
+    try:
+        kwargs = {"account_number": env["account_number"]}
+        if env["base_url"]:
+            kwargs["base_url"] = env["base_url"]
+        # Close any previous client first — connect_kraken_now() re-runs this on
+        # every in-app credential save, and leaking the old aiohttp session
+        # ("Unclosed client session") accumulates connections.
+        if _kraken_client is not None:
+            try:
+                await _kraken_client.close()
+            except Exception:
+                pass
+            _kraken_client = None
+        _kraken_client = KrakenAPIClient(env["api_key"], **kwargs)
+        # test_connection first — clean credential check, never raises.
+        conn = await _kraken_client.test_connection()
+        if not conn.get("ok"):
+            logger.warning("kraken_discovery: connection check failed: %s",
+                           conn.get("detail"))
+            return
+        acct = env["account_number"] or conn.get("account_number")
+        _kraken_account_number = acct
+        disc = await _kraken_client.auto_discover(acct)
+        _kraken_discovery = disc
+
+        imp = disc.get("import") or {}
+        exp = disc.get("export") or {}
+        from kraken_api_client import _mask as _m
+        logger.info("=" * 60)
+        logger.info("kraken_discovery: account verified — REVIEW BEFORE ENABLING POLLING")
+        logger.info("  account_number : %s", _m(disc.get("account_number")))
+        logger.info("  properties     : %s", disc.get("properties"))
+        logger.info("  IMPORT mpan=%s serial=%s tariff=%s product=%s",
+                    _m(imp.get("mpan")), _m(imp.get("serial")),
+                    imp.get("tariff_code"), imp.get("product_code"))
+        if exp:
+            logger.info("  EXPORT mpan=%s serial=%s tariff=%s product=%s",
+                        _m(exp.get("mpan")), _m(exp.get("serial")),
+                        exp.get("tariff_code"), exp.get("product_code"))
+        else:
+            logger.info("  EXPORT : none detected")
+        for w in disc.get("warnings", []):
+            logger.warning("  ⚠ %s", w)
+        logger.info("kraken_discovery: NO polling scheduled yet (4b-i). Verify the "
+                    "above, then enable scheduled dry-run in the next step.")
+        logger.info("=" * 60)
+        # Chunk 7: discover an Octopus Mini and, if present, wire the
+        # near-real-time provisional import layer (api+mini). Best-effort:
+        # any failure leaves the Mini layer off and DCC still reconciles.
+        await _maybe_setup_mini()
+        # Point-of-truth config-state line: now the reader is resolved, report
+        # the ACTUAL Mini provisional state (the startup dump could only report
+        # eligibility, as this runs later in startup).
+        logger.info("config-state: mini_provisional=%s",
+                    "active" if _kraken_mini_reader is not None else "off")
+    except Exception as e:
+        logger.warning("kraken_discovery: discovery failed (non-fatal): %s", e)
+
+
+def _teardown_mini_if_no_api() -> bool:
+    """Tear down a stale Mini reader when the mode no longer uses the API.
+
+    On a Change Setup api→cad transition the engine restarts (engine_startup),
+    but _kraken_startup_discovery returns early in a non-API mode and never calls
+    _maybe_setup_mini — so a Mini reader wired in a prior api+mini session would
+    PERSIST (same process) and keep collecting into cad blocks. This clears it.
+    Idempotent; returns True if it tore a reader down. Safe to call any time.
+    """
+    global _kraken_mini_reader
+    if not mode_uses_api() and _kraken_mini_reader is not None:
+        _kraken_mini_reader = None
+        logger.info("teardown_mini: mode=%s — tore down stale Mini reader "
+                    "(API path off)", get_data_source_mode())
+        return True
+    return False
+
+
+async def _maybe_setup_mini() -> None:
+    """If a Mini smart device exists AND there is no local meter read source,
+    build the boundary reader and register it on the block-boundary hook.
+
+    Gating rule (per design): Mini is a FALLBACK for when EMT has no local
+    import feed. If a CAD / main-meter import read sensor is configured, that is
+    the authoritative source and Mini must NEVER be used — even if a Mini device
+    exists and even if mode were set to api+mini. Local sensors always win, so
+    Mini and CAD can never contend for the same block's import. Best-effort;
+    never raises."""
+    global _kraken_mini_reader
+    if _kraken_client is None:
+        return
+    if _has_local_import_sensor():
+        logger.info("mini_setup: local meter import sensor present — Mini not "
+                    "used (CAD/local is authoritative)")
+        return
+    # Mini is AUTOMATIC, not a survey choice: the survey derives cad/cad+api/api
+    # only. In a no-local API mode, if a Mini device is actually present it
+    # elevates behaviour to api+mini at runtime. So the gate is "mode uses API
+    # and there's no local feed" — then we try to discover a device. (A cad/
+    # cad+api setup has a local feed and is already excluded above.)
+    if not mode_uses_api():
+        logger.info("mini_setup: mode is %s (no API) — Mini layer off",
+                    get_data_source_mode())
+        return
+    try:
+        device_id = await _kraken_client.get_device_id(_kraken_account_number)
+    except Exception as e:
+        logger.warning("mini_setup: device discovery failed: %s", e)
+        return
+    if not device_id:
+        logger.info("mini_setup: no Octopus Mini on account — staying plain API "
+                    "(DCC settlement only)")
+        return
+    try:
+        from kraken_mini import MiniBoundaryReader
+        _kraken_mini_reader = MiniBoundaryReader(_kraken_client, device_id)
+        # 3.0.0: Mini reads are now collected per-tick into the current block's
+        # import buffer (CAD-like) and bracketed/interpolated by finalise — see
+        # _collect_mini_into_block. We deliberately do NOT register the old
+        # post-finalise boundary callback here: that path is kept defined as a
+        # dormant fallback, but registering it too would double-write the block.
+        logger.info("mini_setup: Mini provisional import layer ACTIVE "
+                    "(no local sensor; per-tick boundary collection → "
+                    "provisional, DCC reconciles)")
+    except Exception as e:
+        logger.warning("mini_setup: failed to wire Mini reader: %s", e)
+        _kraken_mini_reader = None
+
+
+def _has_local_import_sensor() -> bool:
+    """True if any non-sub main meter has a local import 'read' sensor
+    configured — i.e. a CAD/local feed exists and Mini must stand down."""
+    try:
+        cfg = load_config()
+        return any(
+            (meter.get("channels") or {}).get("import", {}).get("read")
+            for meter in (cfg.get("meters") or {}).values()
+            if not (meter.get("meta") or {}).get("sub_meter")
+        )
+    except Exception:
+        # If config can't be read, assume a local sensor MIGHT exist and keep
+        # Mini off — the safe default (never contend with a possible CAD feed).
+        return True
+
+
+def _main_meter_id() -> "str | None":
+    """Return the id of the main (non-sub) meter from config, or None."""
+    try:
+        cfg = load_config()
+        for mid, meter in (cfg.get("meters") or {}).items():
+            if not (meter.get("meta") or {}).get("sub_meter"):
+                return mid
+    except Exception:
+        pass
+    return None
+
+
+def _mini_collection_window_open(current_block: dict, now: datetime,
+                                 block_minutes: int) -> bool:
+    """True when we should be collecting Mini telemetry for the CURRENT block's
+    upcoming boundary: from ~20s BEFORE the block end until a read timestamped
+    at/after the boundary has landed (bracketing complete). The reader itself
+    enforces the per-boundary call cap and drift pacing."""
+    try:
+        start = datetime.fromisoformat(current_block["start"])
+    except (ValueError, KeyError, TypeError):
+        return False
+    boundary = start + timedelta(minutes=block_minutes)
+    seconds_to_boundary = (boundary - now).total_seconds()
+    # Open from 20s before the boundary onward (and remain open past it — the
+    # reader stops itself once the post-boundary point is collected).
+    return seconds_to_boundary <= _MINI_COLLECT_LEAD_S
+
+
+async def _collect_mini_into_block(current_block: dict, now: datetime,
+                                   block_minutes: int) -> None:
+    """Drive Mini telemetry collection into the current block's main-import
+    reads buffer around its boundary. No-op outside the collection window or if
+    a local import sensor exists (CAD authoritative)."""
+    reader = _kraken_mini_reader
+    if reader is None:
+        return
+    if _has_local_import_sensor():
+        return
+    if not _mini_collection_window_open(current_block, now, block_minutes):
+        return
+
+    try:
+        start = datetime.fromisoformat(current_block["start"])
+    except (ValueError, KeyError, TypeError):
+        return
+    boundary_iso = iso(start + timedelta(minutes=block_minutes))
+
+    main_id = _main_meter_id()
+    if not main_id:
+        return
+    meters = current_block.setdefault("meters", {})
+    meter_block = meters.setdefault(
+        main_id, {"meta": {}, "channels": {}, "interpolated": False})
+    channel = meter_block["channels"].setdefault(
+        "import", {"reads": [], "rates": []})
+
+    await reader.collect_into(channel["reads"], boundary_iso, now)
+    # Persist the in-progress reads so a restart mid-collection isn't lost.
+    try:
+        _store.save_current_block(current_block)
+    except Exception:
+        pass
+
+
+def _mini_boundary_callback(boundary_iso: str) -> None:
+    """Fired (sync) at each block boundary. Schedules the async Mini read so the
+    engine isn't blocked on GraphQL. Best-effort; never raises into the engine."""
+    reader = _kraken_mini_reader
+    if reader is None:
+        return
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(_mini_read_and_apply(reader, boundary_iso))
+    except Exception as e:
+        logger.warning("mini: could not schedule boundary read: %s", e)
+
+
+async def _mini_read_and_apply(reader, boundary_iso: str) -> None:
+    """Acquire the interpolated boundary import register read and apply it to
+    the just-closed block as its closing import read, then re-finalise. All
+    best-effort; on any miss, the block stays as-is and DCC reconciles later."""
+    try:
+        read = await reader.read_at_boundary(boundary_iso)
+    except Exception as e:
+        logger.warning("mini: boundary read failed for %s: %s", boundary_iso, e)
+        return
+    if not read:
+        return
+    try:
+        _apply_mini_boundary_read(boundary_iso, read)
+    except Exception as e:
+        logger.warning("mini: apply failed for %s: %s", boundary_iso, e)
+
+
+def _apply_mini_boundary_read(boundary_iso: str, read: dict) -> None:
+    """Apply an interpolated Mini import-register reading at a block boundary.
+
+    The boundary is the END of the block that just finalised; `read` is the
+    interpolated cumulative import register at that instant. The block's import
+    kWh = this boundary's register − the PREVIOUS boundary's register (cumulative
+    register deltas, exactly as CAD computes from boundary reads).
+
+    We persist the boundary register as the block's Mini reading and store the
+    derived provisional import kWh via the store's Mini path, flagged
+    provisional + sourced 'kraken_mini'. DCC settlement later overwrites it.
+
+    Conservative + best-effort: if we don't yet have a previous boundary
+    register (cold start, or a prior gap), we record THIS boundary's register as
+    the anchor for the next block and store no kWh this time — the next boundary
+    will have its pair. Never raises.
+    """
+    global _kraken_mini_last_register
+    reg = read.get("value")
+    if reg is None:
+        return
+    # Defence in depth: never let Mini write onto a block if a local import
+    # sensor exists (CAD is authoritative). Mirrors the setup-time gate.
+    if _has_local_import_sensor():
+        return
+    prev = _kraken_mini_last_register
+    # Always advance the anchor so the next boundary can delta against this one.
+    _kraken_mini_last_register = {"ts": boundary_iso, "value": reg}
+
+    if prev is None:
+        logger.info("mini: anchored first boundary register at %s (%.3f); kWh "
+                    "from next boundary", boundary_iso, reg)
+        return
+
+    # The just-closed block starts at the previous boundary and ends at this one.
+    block_start = prev["ts"]
+    imp_kwh = round(reg - prev["value"], 6)
+    if imp_kwh < 0:
+        # Register went backwards (meter reset / bad point) — don't store a
+        # negative; re-anchor and defer to DCC for this block.
+        logger.warning("mini: register decreased %.3f→%.3f at %s — skipping, "
+                       "DCC will reconcile", prev["value"], reg, boundary_iso)
+        return
+    try:
+        res = _store.store_mini_import(block_start, "electricity_main", imp_kwh)
+        if res.get("status") == "stored":
+            logger.info("mini: provisional import %.3f kWh for block %s "
+                        "(boundary %s)", imp_kwh, block_start, boundary_iso)
+        elif res.get("status") == "missing_block":
+            logger.info("mini: no block at %s for provisional import — skipped",
+                        block_start)
+    except Exception as e:
+        logger.warning("mini: store_mini_import failed for %s: %s",
+                       block_start, e)
+
+
+_kraken_mini_last_register = None   # {"ts": boundary_iso, "value": register}
+
+
+def _kraken_backfill_days() -> int:
+    """Compute the first-run backfill window: from the oldest block to now,
+    capped. Beyond the oldest block, DCC rows have no block to attach to.
+
+    Fresh DB (no blocks): return 0 — do NOT backfill. There are no blocks to
+    reconcile, so pulling ~400 days (~19k half-hourly rows) is wasted work and
+    needless API load. The first poll then starts the cursor at 'now' and only
+    tracks forward. A deliberate historical-import action can be added later."""
+    oldest = None
+    try:
+        oldest = _store.get_oldest_block_start()
+    except Exception:
+        pass
+    if not oldest:
+        return 0
+    try:
+        oldest_dt = datetime.fromisoformat(oldest)
+        if oldest_dt.tzinfo is None:
+            oldest_dt = oldest_dt.replace(tzinfo=timezone.utc)
+        days = (datetime.now(timezone.utc) - oldest_dt).days + 1
+        return max(1, min(days, _KRAKEN_BACKFILL_CAP_DAYS))
+    except Exception:
+        return _KRAKEN_BACKFILL_CAP_DAYS
+
+
+def _build_kraken_ingester():
+    """Construct the KrakenIngester from verified discovery, or return None.
+
+    Requires _kraken_client and a discovery result with an import meter. Export
+    is wired only if discovery found an export MPAN. Returns None (logging why)
+    if prerequisites are absent, so the poll task can no-op cleanly.
+    """
+    global _kraken_ingester
+    if _kraken_client is None or not _kraken_discovery:
+        return None
+    imp = _kraken_discovery.get("import")
+    if not imp or not imp.get("mpan") or not imp.get("serial"):
+        logger.warning("kraken_ingester: no import meter in discovery — not built")
+        return None
+    try:
+        from kraken_ingester import KrakenIngester
+    except Exception as e:
+        logger.warning("kraken_ingester: import failed: %s", e)
+        return None
+    exp = _kraken_discovery.get("export") or {}
+    _kraken_ingester = KrakenIngester(
+        _kraken_client, _store,
+        import_mpan=imp["mpan"], import_serial=imp["serial"],
+        export_mpan=exp.get("mpan"), export_serial=exp.get("serial"),
+        main_meter_id="electricity_main",
+        billing_source="api",
+        backfill_days=_kraken_backfill_days(),
+    )
+    return _kraken_ingester
+
+
+def kraken_available() -> bool:
+    """True when a Kraken API client and verified discovery exist — i.e. there
+    IS an API to settle/retry against. The UI uses this to gate the unsettled
+    'retry settlement' action (no API ⇒ nothing to retry)."""
+    return _kraken_client is not None and bool(_kraken_discovery)
+
+
+def _clamp_sweep_start(oldest_iso: str, now: datetime,
+                       max_lookback_days=None) -> datetime:
+    """Earliest sweep start = oldest-unsettled block, floored at the horizon.
+
+    Pure. Bounds how far back settlement is chased: an unsettled block older than
+    `max_lookback_days` keeps its provisional value (DCC won't settle it now), and
+    the floor caps the sweep window cost. None ⇒ unbounded (user-triggered retry).
+    """
+    odt = datetime.fromisoformat(oldest_iso)
+    if odt.tzinfo is None:
+        odt = odt.replace(tzinfo=timezone.utc)
+    if max_lookback_days is not None:
+        floor_dt = now - timedelta(days=max_lookback_days)
+        if odt < floor_dt:
+            odt = floor_dt
+    return odt
+
+
+def _sweep_is_due(last_iso, now: datetime, min_interval_s: int) -> bool:
+    """Pure cadence gate: True if at least `min_interval_s` has elapsed since the
+    last sweep (or there was none). Unparseable/missing state ⇒ due."""
+    if not last_iso:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(last_iso)
+    except (ValueError, TypeError):
+        return True
+    if last_dt.tzinfo is None:
+        last_dt = last_dt.replace(tzinfo=timezone.utc)
+    return (now - last_dt).total_seconds() >= min_interval_s
+
+
+async def retry_settlement_for_unsettled(now=None, max_lookback_days=None) -> dict:
+    """User-triggered: re-fetch DCC over the span oldest-unsettled → now and
+    settle whatever is now available, WITHOUT advancing the incremental cursor.
+
+    A cheaper, on-demand alternative to having every poll chase old gaps: the
+    Data Management report shows unsettled blocks and the user clicks retry.
+    Returns {ok, reason?, settled_import, settled_export, unsettled_before,
+    unsettled_after, window}.
+    """
+    if not kraken_available():
+        return {"ok": False, "reason": "no_api"}
+    ingester = _build_kraken_ingester()
+    if ingester is None:
+        return {"ok": False, "reason": "no_ingester"}
+
+    before = _store.count_unsettled_blocks()
+    if before == 0:
+        return {"ok": True, "settled_import": 0, "settled_export": 0,
+                "unsettled_before": 0, "unsettled_after": 0, "window": None}
+
+    oldest = _store.get_oldest_unsettled_block_start()
+    if not oldest:
+        return {"ok": True, "settled_import": 0, "settled_export": 0,
+                "unsettled_before": before, "unsettled_after": before,
+                "window": None}
+
+    _now = now or datetime.now(timezone.utc)
+    # Build a Z-suffixed UTC window from oldest unsettled block → now, floored at
+    # the look-back horizon when one is given (the daily auto-sweep passes one;
+    # the user-triggered retry leaves it None = reach as far back as needed).
+    try:
+        odt = _clamp_sweep_start(oldest, _now, max_lookback_days)
+    except ValueError:
+        return {"ok": False, "reason": "bad_oldest"}
+    period_from = odt.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds") + "Z"
+    period_to = _now.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds") + "Z"
+
+    summary = await ingester.poll(window=(period_from, period_to),
+                                  advance_cursor=False)
+    after = _store.count_unsettled_blocks()
+    logger.info("retry_settlement: window=%s..%s settled_import=%d "
+                "settled_export=%d unsettled %d→%d",
+                period_from, period_to, summary.get("stored", 0),
+                summary.get("export_stored", 0), before, after)
+    return {"ok": True,
+            "settled_import": summary.get("stored", 0),
+            "settled_export": summary.get("export_stored", 0),
+            "unsettled_before": before, "unsettled_after": after,
+            "window": [period_from, period_to],
+            "errors": summary.get("errors", [])}
+
+
+async def _maybe_run_settlement_sweep() -> None:
+    """Daily-cadenced sweep of unsettled gaps that aged out of the incremental
+    poll's sliding window (late/out-of-order DCC settlement, e.g. export lagging
+    import by days). Re-fetches oldest-unsettled → now bounded to the horizon, so
+    such gaps self-heal without the user clicking 'Retry settlement'. Gated to run
+    at most once per _SETTLEMENT_SWEEP_MIN_INTERVAL_S and non-fatal — a failure
+    must never break the poll loop."""
+    try:
+        now = datetime.now(timezone.utc)
+        last = _store.get_kraken_state(_STATE_LAST_SWEEP)
+        if not _sweep_is_due(last, now, _SETTLEMENT_SWEEP_MIN_INTERVAL_S):
+            return
+        if _store.count_unsettled_blocks() == 0:
+            _store.set_kraken_state(_STATE_LAST_SWEEP, now.isoformat())
+            return
+        res = await retry_settlement_for_unsettled(
+            now=now, max_lookback_days=_SETTLEMENT_SWEEP_HORIZON_DAYS)
+        _store.set_kraken_state(_STATE_LAST_SWEEP, now.isoformat())
+        if res.get("ok"):
+            logger.info("settlement_sweep: settled_import=%d settled_export=%d "
+                        "unsettled %s→%s (horizon=%dd)",
+                        res.get("settled_import", 0), res.get("settled_export", 0),
+                        res.get("unsettled_before"), res.get("unsettled_after"),
+                        _SETTLEMENT_SWEEP_HORIZON_DAYS)
+        else:
+            logger.info("settlement_sweep: skipped (%s)", res.get("reason"))
+        # Finalise blocks that aged past the horizon still unsettled — DCC isn't
+        # coming, so mark them finalised-from-CAD (distinct from a real
+        # settlement; imp_kwh_api stays NULL) so the unsettled count can reach
+        # zero. Reversible: a later settlement clears the flag in the store.
+        cutoff = (now.replace(tzinfo=None)
+                  - timedelta(days=_SETTLEMENT_SWEEP_HORIZON_DAYS)).isoformat()
+        finalised = _store.finalise_past_horizon_blocks(cutoff)
+        if finalised:
+            logger.info("settlement_sweep: finalised %d past-horizon block(s) "
+                        "from CAD (>%dd unsettled, DCC not expected)",
+                        finalised, _SETTLEMENT_SWEEP_HORIZON_DAYS)
+    except Exception as e:
+        logger.warning("settlement_sweep: failed (non-fatal): %s", e)
+
+
+def _kraken_pre_live_snapshot() -> bool:
+    """Take a one-time blocks.db snapshot before the first live DCC write.
+
+    Idempotent: gated on the kraken_state marker _KRAKEN_SNAPSHOT_DONE_KEY, so
+    it fires once ever (across restarts) and is a no-op thereafter. Mirrors the
+    upgrade-backup mechanism: an online SQLite backup zipped into the share
+    backups dir. Returns True if it is safe to proceed with live writes (either
+    the snapshot was taken now, already taken before, or there are no blocks to
+    risk); returns False only if the snapshot was attempted and failed, in
+    which case the caller must NOT write.
+    """
+    try:
+        if _store.get_kraken_state(_KRAKEN_SNAPSHOT_DONE_KEY):
+            return True  # already snapshotted on a prior run
+    except Exception:
+        pass
+    try:
+        if _store.count_blocks() == 0:
+            # Nothing to protect; mark done so we don't re-check forever.
+            _store.set_kraken_state(_KRAKEN_SNAPSHOT_DONE_KEY,
+                                    _dt_now_iso_safe())
+            return True
+        import zipfile as _zf, glob as _gl
+        bk_dir = f"{SHARE_BACKUP_DIR}/backups"
+        ensure_dir(bk_dir)
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+        bk_path = f"{bk_dir}/{ts}_pre_kraken_live.zip"
+        try:
+            _store._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except Exception:
+            pass
+        with _zf.ZipFile(bk_path, "w", _zf.ZIP_DEFLATED) as bkz:
+            _store.backup(BLOCKS_DB_PATH + ".kraken_bak")
+            bkz.write(BLOCKS_DB_PATH + ".kraken_bak", "blocks.db")
+            os.remove(BLOCKS_DB_PATH + ".kraken_bak")
+        _store.set_kraken_state(_KRAKEN_SNAPSHOT_DONE_KEY, ts)
+        logger.info("=" * 60)
+        logger.info("kraken_pre_live_snapshot: blocks.db snapshotted before "
+                    "first live DCC write → %s", os.path.basename(bk_path))
+        logger.info("  Rollback: stop add-on, unzip this over "
+                    "%s, restart.", BLOCKS_DB_PATH)
+        logger.info("=" * 60)
+        return True
+    except Exception as e:
+        logger.error("kraken_pre_live_snapshot: FAILED (%s) — refusing to write "
+                     "live until a snapshot succeeds", e)
+        return False
+
+
+def _dt_now_iso_safe() -> str:
+    try:
+        return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    except Exception:
+        return ""
+
+
+async def _refresh_kraken_rate_schedules() -> None:
+    """Build/refresh the cached rate schedules for import and export from the
+    discovered tariffs. Cheap (fixed tariffs ≈ 1 record). Failures leave the
+    previous cache intact; an empty cache simply means the resolver returns
+    None and zero-rate blocks stay flagged for the tooling.
+    """
+    global _kraken_rate_schedules, _kraken_standing_schedule
+    if _kraken_client is None or not _kraken_discovery:
+        return
+    try:
+        from kraken_rates import build_rate_schedule, build_standing_charge_schedule
+    except Exception as e:
+        logger.warning("_refresh_kraken_rate_schedules: import failed: %s", e)
+        return
+    new_cache: dict = {}
+    for ch in ("import", "export"):
+        info = _kraken_discovery.get(ch) or {}
+        product = info.get("product_code")
+        tariff = info.get("tariff_code")
+        if not product or not tariff:
+            continue
+        try:
+            sched = await build_rate_schedule(_kraken_client, product, tariff)
+            if not sched.is_empty():
+                new_cache[ch] = sched
+        except Exception as e:
+            logger.warning("_refresh_kraken_rate_schedules: %s build failed: %s",
+                           ch, e)
+    if new_cache:
+        _kraken_rate_schedules = new_cache
+        logger.info("_refresh_kraken_rate_schedules: import=%d export=%d periods",
+                    len(_kraken_rate_schedules.get("import", []) or []),
+                    len(_kraken_rate_schedules.get("export", []) or []))
+
+    # Standing charge comes from the import tariff.
+    imp = _kraken_discovery.get("import") or {}
+    if imp.get("product_code") and imp.get("tariff_code"):
+        try:
+            sc = await build_standing_charge_schedule(
+                _kraken_client, imp["product_code"], imp["tariff_code"])
+            if not sc.is_empty():
+                _kraken_standing_schedule = sc
+                logger.info("_refresh_kraken_rate_schedules: standing_charge=%d periods",
+                            len(sc))
+        except Exception as e:
+            logger.warning("_refresh_kraken_rate_schedules: standing build failed: %s", e)
+
+
+def _smart_charge_slots(planned: list) -> set:
+    """30-min slots (naive-UTC ISO) covered by planned dispatches whose
+    meta.source is 'smart-charge'. This is the started/smart gate: bump-charge
+    (boost) and unknown/null sources are EXCLUDED — only genuine smart-charge
+    dispatches are off-peak candidates. 'Any active minute → whole slot.'
+    """
+    smart = [d for d in (planned or [])
+             if str(d.get("source") or "").lower() == "smart-charge"]
+    return _planned_dispatch_slots_preview(smart)
+
+
+# ── OHME charge-mode interpretation + capture (verified-gating path) ──────────
+# OHME is structurally unlike Zappi: Octopus does not control the charge, so its
+# planned-dispatch `source` labels are unreliable (the planned set is a superset
+# wiped ~17:00, present even when unplugged; completed dispatches report
+# source=null). The Zappi gate `source=='smart-charge'` would therefore capture
+# almost nothing for OHME and badly under-bill. OHME gets its OWN capture-feeding
+# rule — the overlay, meter-draw validation and storage stay the shared path.
+# Three ways:
+#   • no charge-mode sensor → OPTIMISTIC: treat every planned-superset slot as an
+#     off-peak candidate (source ohme_assumed_unverified); the overlay's meter
+#     validation narrows it to slots that actually drew. Bounded to
+#     under-application (a boost in a drawn slot is the accepted residual).
+#   • charge-mode sensor    → VERIFIED: the sensor is real-time charge STATE,
+#     independent of Octopus's planned data, so it both vetoes boosts (Max charge
+#     stays peak) AND catches smart charges the superset missed. Sensor-driven,
+#     per-tick: snap NOW to its 30-min slot and capture it iff the sensor reports
+#     a smart slot active. 5-min ticks sample each 30-min slot ~6× so a running
+#     smart charge is caught.
+_OHME_PROVIDER_TOKEN = "OHME"
+
+
+def _is_ohme_provider(provider) -> bool:
+    return _OHME_PROVIDER_TOKEN in str(provider or "").upper()
+
+
+def _ohme_interpret_mode(integration, state) -> str:
+    """Map a live OHME charge-mode entity state to 'smart' | 'boost' | 'idle'.
+
+    official select: 'Smart charge'→smart, 'Max charge'→boost, else idle.
+    dan-r binary:    'on'→smart, else idle. dan-r cannot report boost directly,
+                     so boost is left to inference-by-absence (an out-of-window
+                     drawn slot with the binary off is never captured → stays
+                     peak), per the agreed dan-r asymmetry.
+    """
+    sl = str(state or "").strip().lower()
+    if integration == "official":
+        if sl == "max charge":
+            return "boost"
+        if sl == "smart charge":
+            return "smart"
+        return "idle"
+    if integration == "danr":
+        return "smart" if sl in ("on", "true", "active") else "idle"
+    return "idle"
+
+
+def _ohme_slot_for_now(now) -> str:
+    """Snap a naive-UTC datetime to its 30-min slot start (naive-UTC ISO),
+    matching _planned_dispatch_slots_preview's slot keys."""
+    slot = now.replace(minute=(0 if now.minute < 30 else 30),
+                       second=0, microsecond=0)
+    return slot.isoformat()
+
+
+def _ohme_capture_slots(provider, planned, sensor_present, mode, now):
+    """Decide which dispatch slots OHME should persist this tick. PURE — all I/O
+    (sensor read, persistence, logging) stays in the caller.
+
+    Returns a list of (slot_start_iso, source) pairs, or None when the provider
+    is NOT OHME (signalling the caller to use the default smart-charge path).
+    """
+    if not _is_ohme_provider(provider):
+        return None
+    if not sensor_present:
+        # Optimistic: every planned-superset slot is an off-peak candidate.
+        return [(s, "ohme_assumed_unverified")
+                for s in sorted(_planned_dispatch_slots_preview(planned))]
+    # Verified: the sensor is authoritative for the current slot.
+    if mode == "smart":
+        return [(_ohme_slot_for_now(now), "ohme_verified")]
+    # boost → veto (slot stays peak); idle/unknown → capture nothing.
+    return []
+
+
+def _capture_ohme_slots(provider, planned) -> int:
+    """OHME branch of _capture_dispatch_slots (the I/O side). Reads the detected
+    charge-mode sensor (if any), decides slots via the pure _ohme_capture_slots
+    helper, persists them, and logs richly — including the planned-source
+    distribution — so an OHME user's log fully explains every decision. That log
+    is the diagnostic backstop for a path we cannot validate on a Zappi account.
+    """
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    ohme = (_detected_integrations or {}).get("ohme") or {}
+    entity = ohme.get("charge_mode_entity") if ohme.get("found") else None
+    sensor_present = bool(entity)
+    mode = None
+    raw = None
+    if sensor_present and _engine_ha is not None:
+        try:
+            raw = _engine_ha.get_state(entity)
+        except Exception as e:
+            logger.warning("_capture_ohme_slots: sensor read failed (%s): %s",
+                           entity, e)
+            raw = None
+        mode = _ohme_interpret_mode(ohme.get("integration"), raw)
+
+    pairs = _ohme_capture_slots(provider, planned, sensor_present, mode, now)
+    if pairs is None:        # not OHME — caller already gated; defensive
+        return 0
+
+    # Diagnostic backstop: the ACTUAL planned-source distribution OHME reports,
+    # logged every capture so the first OHME log reveals what their dispatches
+    # really carry (smart-charge / bump-charge / unknown / null).
+    try:
+        from collections import Counter
+        dist = dict(Counter(str(d.get("source")).lower() for d in (planned or [])))
+    except Exception:
+        dist = {}
+
+    if not sensor_present:
+        decision = "optimistic (no charge-mode sensor; all planned slots)"
+    elif mode == "smart":
+        decision = "verified-smart (capture current slot)"
+    elif mode == "boost":
+        decision = "verified-boost (veto — stays peak)"
+    else:
+        decision = "verified-idle (nothing active)"
+
+    captured = 0
+    for slot_start, source in pairs:
+        try:
+            _store.upsert_dispatch_slot(
+                slot_start, off_peak=True, provider=provider, source=source)
+            captured += 1
+        except Exception as e:
+            logger.warning("_capture_ohme_slots: persist %s failed: %s",
+                           slot_start, e)
+    logger.info(
+        "_capture_ohme_slots: provider=%s integration=%s mode=%s %s — "
+        "captured %d slot(s) planned=%d source_dist=%s",
+        provider, ohme.get("integration") or "none", mode or "n/a",
+        decision, captured, len(planned or []), dist)
+    try:
+        _store.prune_dispatch_slots(days=90)
+    except Exception:
+        pass
+    return captured
+
+
+async def _capture_dispatch_slots() -> int:
+    """STEP 2 (piece 1): persist smart-charge dispatch slots to dispatch_slots.
+
+    Captures forward each poll. NON-BILLING: this only records which slots had a
+    smart-charge dispatch; it does NOT change any rate. The overlay resolver +
+    meter-draw validation (next piece) decides whether a recorded slot actually
+    gets the off-peak rate. Returns the number of slots captured this poll.
+
+    Provider handling: the DEFAULT path is capability-based (design §1c) — we
+    persist smart-charge slots for ANY provider (incl. MYENERGI_V2) gated by the
+    source filter, not a provider allowlist. OHME is the one exception: its
+    source labels are unreliable, so it branches to _capture_ohme_slots (which
+    captures optimistically, or sensor-verified when a charge-mode signal is
+    present). See that function for the rationale.
+    """
+    if _kraken_client is None or not _kraken_discovery or _store is None:
+        return 0
+    try:
+        disp = await _kraken_client.get_dispatches(_kraken_account_number)
+    except Exception as e:
+        logger.warning("_capture_dispatch_slots: fetch failed: %s", e)
+        return 0
+    if not disp:
+        return 0
+    provider = disp.get("provider")
+    planned = disp.get("planned") or []
+
+    # OHME has its own capture-feeding rule (see _capture_ohme_slots): the Zappi
+    # source=='smart-charge' gate would under-capture OHME badly.
+    if _is_ohme_provider(provider):
+        return _capture_ohme_slots(provider, planned)
+
+    slots = _smart_charge_slots(planned)
+    if not slots:
+        return 0
+    captured = 0
+    for slot_start in sorted(slots):
+        try:
+            _store.upsert_dispatch_slot(
+                slot_start, off_peak=True, provider=provider,
+                source="smart-charge")
+            captured += 1
+        except Exception as e:
+            logger.warning("_capture_dispatch_slots: persist %s failed: %s",
+                           slot_start, e)
+    if captured:
+        logger.info("_capture_dispatch_slots: persisted %d smart-charge slot(s) "
+                    "(provider=%s)", captured, provider)
+    try:
+        _store.prune_dispatch_slots(days=90)
+    except Exception:
+        pass
+    return captured
+
+
+async def _tick_dispatch_capture() -> None:
+    """5-minute-throttled dispatch-slot capture. Called from _engine_tick (every
+    ~10s) but only fetches every 5 minutes.
+
+    Rationale (confirmed against live data + BCD): a smart-charge dispatch only
+    carries source='smart-charge' while it is PLANNED/upcoming; once actioned it
+    moves to completed with source='unknown', losing the smart signal. The
+    6-hour DCC poll is far too coarse to catch a short daytime dispatch while
+    still planned. BCD refreshes ~every 60s; we use 5 min — frequent enough to
+    catch the planned state with margin (Octopus schedules ahead), light enough
+    for an add-on also doing DCC polls + CI ticks. Captured slots persist in
+    dispatch_slots for the overlay to price later (gated by meter draw).
+    """
+    global _last_dispatch_capture
+    if _kraken_client is None or not _kraken_discovery:
+        return
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    elapsed = ((now - _last_dispatch_capture).total_seconds()
+               if _last_dispatch_capture else None)
+    if elapsed is not None and elapsed < 300:  # 5 minutes
+        return
+    _last_dispatch_capture = now
+    try:
+        await _capture_dispatch_slots()
+    except Exception as e:
+        logger.warning("_tick_dispatch_capture: failed: %s", e)
+
+
+async def _log_dispatches_observe_only() -> None:
+    """STEP 1 of the dispatch overlay: fetch dispatches and LOG them only.
+
+    No rate changes, no persistence — pure observation. Lets us confirm the
+    live dispatch shape (provider, planned/completed slots, meta.source) against
+    the real account before building the started-dispatch overlay (step 2+).
+
+    Logs: provider; counts; the first few planned and completed slots; and which
+    30-min slots the planned dispatches would map to (the started-slot preview).
+    """
+    if _kraken_client is None or not _kraken_discovery:
+        return
+    disp = await _kraken_client.get_dispatches(_kraken_account_number)
+    if disp is None:
+        logger.info("dispatch-observe: no dispatch data available")
+        return
+    provider = disp.get("provider")
+    planned = disp.get("planned") or []
+    completed = disp.get("completed") or []
+    logger.info("dispatch-observe: provider=%s planned=%d completed=%d",
+                provider, len(planned), len(completed))
+    for d in planned[:5]:
+        logger.info("dispatch-observe:   planned   start=%s end=%s source=%s",
+                    d.get("start"), d.get("end"), d.get("source"))
+    for d in completed[:5]:
+        logger.info("dispatch-observe:   completed start=%s end=%s delta=%s source=%s",
+                    d.get("start"), d.get("end"), d.get("delta"), d.get("source"))
+    # Preview the 30-min slots the PLANNED dispatches would map to (started-slot
+    # snap). This is observation only — nothing is persisted or priced.
+    try:
+        slots = _planned_dispatch_slots_preview(planned)
+        if slots:
+            logger.info("dispatch-observe:   would-snap to %d off-peak 30-min "
+                        "slot(s): %s", len(slots), sorted(slots)[:8])
+    except Exception as e:
+        logger.warning("dispatch-observe: slot preview failed: %s", e)
+
+
+def _planned_dispatch_slots_preview(planned: list) -> set:
+    """Map planned dispatches to the 30-min slots they cover (naive-UTC ISO).
+
+    Pure helper, no side effects. A dispatch covering any part of a 30-min slot
+    maps the whole slot (matches BCD's 'any active minute counts' rule). Used by
+    the observe-only step now; the real overlay (step 2+) will gate these on the
+    intelligent state being active and validate against meter draw.
+    """
+    slots: set = set()
+    for d in planned or []:
+        start = d.get("start")
+        end = d.get("end")
+        if not start or not end:
+            continue
+        try:
+            s = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+            e = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        # Normalise to naive UTC
+        if s.tzinfo is not None:
+            s = s.astimezone(timezone.utc).replace(tzinfo=None)
+        if e.tzinfo is not None:
+            e = e.astimezone(timezone.utc).replace(tzinfo=None)
+        # Snap start down to the 30-min slot, then step in 30-min increments
+        slot = s.replace(minute=(0 if s.minute < 30 else 30),
+                         second=0, microsecond=0)
+        while slot < e:
+            slots.add(slot.isoformat())
+            slot = slot + timedelta(minutes=30)
+    return slots
+
+
+async def kraken_poll_task(ha: HAClient):
+    """Periodic DCC ingest loop. Runs poll() every 6h.
+
+    4b-iii: LIVE — poll() now writes settlement. Before the FIRST live write
+    (once, ever, gated on a kraken_state marker), a full blocks.db snapshot is
+    taken as a rollback point. dry_run is False; the flip was a deliberate step.
+
+    No-op (returns immediately) when no API key / discovery / ingester — so it
+    is always safe to schedule.
+    """
+    if _kraken_client is None or not _kraken_discovery:
+        logger.info("kraken_poll_task: API not configured — task idle")
+        return
+    ingester = _build_kraken_ingester()
+    if ingester is None:
+        logger.info("kraken_poll_task: ingester unavailable — task idle")
+        return
+
+    logger.info("kraken_poll_task: started (interval=%ds, dry_run=%s, "
+                "backfill_days=%d)", _KRAKEN_POLL_INTERVAL_S, _KRAKEN_DRY_RUN,
+                ingester.backfill_days)
+    while True:
+        try:
+            # Chunk 5: refresh rate schedules once per cycle (cheap — fixed
+            # tariffs return ~1 record). The sync drain reads these via
+            # _kraken_rate_resolver to repair zero/missing rates at reconcile.
+            await _refresh_kraken_rate_schedules()
+            # Before the first LIVE write, ensure the rollback snapshot exists.
+            # If it can't be taken, downgrade THIS cycle to dry-run rather than
+            # mutate blocks without a backup.
+            effective_dry_run = _KRAKEN_DRY_RUN
+            if not _KRAKEN_DRY_RUN:
+                if not _kraken_pre_live_snapshot():
+                    logger.warning("kraken_poll_task: snapshot unavailable — "
+                                   "running this cycle as dry-run (no writes)")
+                    effective_dry_run = True
+            summary = await ingester.poll(dry_run=effective_dry_run)
+            logger.info(
+                "kraken_poll_task: %s window=%s..%s import_rows=%d "
+                "store_import=%d export_rows=%d store_export=%d "
+                "skip=%d flag_review=%d (interpolated=%d) errors=%d",
+                "DRY-RUN" if effective_dry_run else "LIVE",
+                summary["window"][0], summary["window"][1],
+                summary["import_rows"], summary["stored"],
+                summary["export_rows"], summary["export_stored"],
+                summary["skipped_no_block"], summary["flagged_review"],
+                summary.get("flagged_interpolated", 0),
+                len(summary["errors"]))
+            for err in summary["errors"][:5]:
+                logger.warning("kraken_poll_task: %s", err)
+            for smp in summary.get("review_samples", []):
+                logger.info(
+                    "kraken_poll_task:   review-sample [%s]%s %s CAD=%s DCC=%s drift=%s%%",
+                    smp["channel"], " INTERP" if smp.get("interpolated") else "",
+                    smp["block_start"], smp["cad_kwh"], smp["dcc_kwh"],
+                    ("%.1f" % smp["drift_pct"]) if smp["drift_pct"] is not None
+                    else "n/a")
+            # Dispatch overlay — STEP 1: OBSERVE-ONLY. Fetch and log Intelligent
+            # dispatches; make NO rate changes. This surfaces the real dispatch
+            # shape (provider, planned vs completed, meta) against the live
+            # account so the overlay (step 2+) can be built on confirmed data.
+            # Wrapped independently so a dispatch-fetch failure never breaks the
+            # DCC poll.
+            try:
+                await _log_dispatches_observe_only()
+            except Exception as de:
+                logger.warning("kraken_poll_task: dispatch observe failed: %s", de)
+            # Daily sweep for unsettled gaps that aged out of the sliding window
+            # (late/out-of-order DCC settlement). Runs on the first poll after
+            # startup too, so downtime gaps catch up. Self-gated + non-fatal.
+            await _maybe_run_settlement_sweep()
+        except Exception as e:
+            logger.error("kraken_poll_task: poll failed: %s", e)
+        await asyncio.sleep(_KRAKEN_POLL_INTERVAL_S)
+
+
+def _clear_stale_inprogress_reads(cb_for_gap, cold_start: bool) -> bool:
+    """Rogue-total guard: on a COLD start, clear the in-progress block's carried
+    reads/rates so a stale prior-process register isn't taken as the block opener
+    (reads[0] becomes the opener and the block's kWh = reads[-1] - reads[0] off a
+    previous-session value — a "rogue total").
+
+    Cold-start ONLY. On a warm re-run (HA reconnect / config-save within the same
+    process) the in-progress reads are LIVE, not stale, so clearing them discards
+    real consumption — e.g. a Mini block losing its ~3.4 kWh opener when an HA
+    upgrade triggered repeated engine_startup re-runs. Returns True if it cleared
+    anything (caller persists + logs). Mutates cb_for_gap in place.
+    """
+    if not cold_start:
+        return False
+    if not (cb_for_gap and cb_for_gap.get("start")):
+        return False
+    cleared = False
+    for _md in (cb_for_gap.get("meters") or {}).values():
+        for _ch in (_md.get("channels") or {}).values():
+            if _ch.get("reads") or _ch.get("rates"):
+                _ch["reads"] = []
+                _ch["rates"] = []
+                cleared = True
+    return cleared
+
+
 async def engine_startup(ha: HAClient):
     """
     Run once when the add-on starts.
@@ -2179,7 +5142,23 @@ async def engine_startup(ha: HAClient):
     # exists, load_config() deliberately returns {} to avoid stale JSON reads.
     # Opening the store here ensures config is always read from the DB on startup,
     # including after a restore where the DB file has been replaced.
-    global _store
+    global _store, _cold_start_complete
+    # Cancel any in-flight DCC poll BEFORE we tear down the store and Kraken
+    # client below. A long backfill reading the DB / HTTP session while we close
+    # them throws "Cannot operate on a closed database" / "Connector is closed".
+    # The poll is relaunched at the end of startup once resources are rebuilt.
+    _cancel_kraken_poll_task()
+    # CRITICAL: engine_startup runs again on every config save. Reopening the
+    # store without closing the previous connection leaves an orphaned WAL
+    # connection that holds locks indefinitely — the engine loop's writes then
+    # fail every tick with "database is locked" (busy_timeout can't help: the
+    # orphaned connection never releases). Close it first.
+    if _store is not None:
+        try:
+            _store.close()
+        except Exception as _se:
+            logger.warning("engine_startup: closing prior store failed: %s", _se)
+        _store = None
     _store = open_block_store(BLOCKS_DB_PATH)
 
     # ── Checkpoint WAL immediately after opening ──────────────────────────
@@ -2224,6 +5203,24 @@ async def engine_startup(ha: HAClient):
                 config = load_config()
             except Exception as _cre:
                 logger.warning("engine_startup: config repair failed: %s", _cre)
+
+    # ── Upgrade bridge: preserve existing CAD users on first 3.0.0 boot ───
+    # If no mode is stored but a main import sensor is configured, this is an
+    # existing 2.x user — set 'cad' silently so nothing is disrupted and the
+    # API path stays off (also neutralises any stale creds file in /data).
+    # A fresh install (no import sensor) is left 'unset' for the setup survey.
+    try:
+        _detect_upgrade_mode(config)
+    except Exception as _ude:
+        logger.warning("engine_startup: upgrade mode detection failed: %s", _ude)
+
+    # ── Config-state diagnostic dump (open-item 2) ───────────────────────
+    # One-shot, after mode is settled. The log is the only window into a
+    # self-hosted user's config, so a bug report can be diagnosed from it.
+    try:
+        _log_config_state(config)
+    except Exception as _lce:
+        logger.warning("engine_startup: config-state dump failed: %s", _lce)
 
     # ── Register state triggers from config ─────────────────────────────
     main_import_sensor = None
@@ -2382,6 +5379,22 @@ async def engine_startup(ha: HAClient):
                 global _last_ci_fetch
                 _last_ci_fetch = datetime.now(timezone.utc).replace(tzinfo=None)
                 logger.info("engine_startup: CI fetch complete — %d slots for %s", n, postcode)
+                # Now that CI is populated, backfill carbon for any blocks left
+                # NULL by an outage gap-fill (the carbon-gap recovery).
+                try:
+                    rec = await loop.run_in_executor(None, _recover_missing_carbon)
+                    if rec:
+                        logger.info("engine_startup: carbon recovery backfilled "
+                                    "%d block(s)", rec)
+                except Exception as e:
+                    logger.warning("engine_startup: carbon recovery failed: %s", e)
+                # Historical backfill (v2->v3 migration) — run-once, resumable,
+                # paged; dispatched to a worker thread so it never blocks startup.
+                try:
+                    _maybe_backfill_historical_carbon()
+                except Exception as e:
+                    logger.warning("engine_startup: historical backfill schedule "
+                                   "failed: %s", e)
         except _aio.TimeoutError:
             logger.warning("engine_startup: CI fetch timed out after %ds — will retry on first tick", _CI_TIMEOUT)
 
@@ -2391,6 +5404,14 @@ async def engine_startup(ha: HAClient):
         _startup_ci_fetch(),
         return_exceptions=True
     )
+
+    # ── Detect third-party HA integrations (BCD live-power, OHME charge-mode) ──
+    # Non-fatal; logs the config-state detection line and stores the result for
+    # the overlay (OHME verified path) and live-power tile (BCD offload).
+    try:
+        await _detect_and_log_integrations(ha)
+    except Exception as _de:
+        logger.warning("engine_startup: integration detection step failed: %s", _de)
 
     # ── Detect and store currency symbol ────────────────────────────────
     for mid, mcfg in config.get("meters", {}).items():
@@ -2566,6 +5587,29 @@ async def engine_startup(ha: HAClient):
     _cb_start   = _cb_for_gap.get("start") if _cb_for_gap else None
     last_block  = _store.get_last_block_before(_cb_start) if _cb_start else _store.get_last_block()
     logger.info("engine_startup: gap detection — current_block.start=%s", _cb_start)
+
+    # ── Clear stale pre-restart reads from the in-progress block ──────────
+    # The process has only just started and has captured nothing yet, so any
+    # reads already in current_block are from BEFORE the restart. If left in,
+    # the first one becomes reads[0] (the block opener) and the block's kWh is
+    # computed as reads[-1] - reads[0] using a stale prior-session register —
+    # a "rogue total" taken as a block value (e.g. read_start carried from the
+    # previous session). The gap-detected path below also clears these, but a
+    # SHORT restart (< one block) yields no missing windows and would otherwise
+    # skip the clear entirely. Clearing unconditionally here covers both cases;
+    # the correct opener is then supplied by boundary interpolation against
+    # fresh post-restart reads (and the carry-seed written at finalise).
+    # ── Clear stale pre-restart reads from the in-progress block ──────────
+    # COLD START ONLY (see _clear_stale_inprogress_reads). On a warm re-run (HA
+    # reconnect / config-save) the in-progress reads are live and must be kept;
+    # an HA upgrade on the dev box was triggering reconnect-storm re-runs that
+    # otherwise wiped the live Mini block opener.
+    if _clear_stale_inprogress_reads(_cb_for_gap, not _cold_start_complete):
+        _store.save_current_block(_cb_for_gap)
+        logger.info("engine_startup: cleared stale pre-restart reads from "
+                    "in-progress block %s (rogue-total guard, cold start)",
+                    _cb_start)
+
     if last_block:
         logger.info("engine_startup: gap detection — last_block start=%s end=%s",
                     last_block.get("start"), last_block.get("end"))
@@ -2720,9 +5764,12 @@ async def engine_startup(ha: HAClient):
                     # Add CI to gap blocks from the carbon_intensity table
                     _postcode = _get_postcode()
                     for _gb in _startup_gap_blocks:
-                        # Skip if an interpolated block already exists for this window —
-                        # prevents double gap-fill when engine_startup runs twice in rapid
-                        # succession due to consecutive HA disconnects.
+                        # Skip if an interpolated block already exists for this
+                        # window — prevents a double gap-fill when engine_startup
+                        # runs twice in rapid succession (consecutive HA
+                        # disconnects), where the second fill would overwrite the
+                        # first with slightly different interpolated values.
+                        # (Regression: 2.10.9.)
                         _gb_start = _gb.get("start")
                         if _gb_start:
                             _existing = _store._conn.execute(
@@ -2734,8 +5781,8 @@ async def engine_startup(ha: HAClient):
                             ).fetchone()
                             if _existing:
                                 logger.info(
-                                    "engine_startup: gap block %s already exists (interpolated) — skipping",
-                                    _gb_start
+                                    "engine_startup: gap block %s already exists "
+                                    "(interpolated) — skipping", _gb_start
                                 )
                                 continue
                         try:
@@ -2757,6 +5804,7 @@ async def engine_startup(ha: HAClient):
                                                        (_imp_ch or {}).get("kwh", 0.0)) or 0.0)
                                             _exp_kwh = float((_exp_ch or {}).get("kwh", 0.0) or 0.0)
                                             _mb["carbon_g"] = round((_imp_kwh - _exp_kwh) * _intensity, 4)
+                                        _mb["carbon_intensity_g"] = _intensity
                         except Exception:
                             pass
                         append_block_replace(_gb)
@@ -2771,6 +5819,25 @@ async def engine_startup(ha: HAClient):
                     logger.info("engine_startup: gap marker set, will fill on first sensor capture")
             else:
                 logger.info("engine_startup: no session gap detected")
+                # ── Re-seed opener after a within-block (no-gap) restart ──────
+                # The rogue-total guard above cleared the in-progress block's
+                # reads, including the carry-seed opener. With no gap, gap-fill
+                # does not run to restore it, so the block would under-count
+                # (measure only the tail). Restore the opener from last_block's
+                # read_end. Self-heals at DCC settlement anyway, but this fixes
+                # the provisional kWh (and is the only fix for mini-only setups).
+                try:
+                    _rs_cb = _store.load_current_block()
+                    if _rs_cb and last_block:
+                        _seeded = _reseed_opener_after_short_restart(last_block, _rs_cb)
+                        if _seeded:
+                            _store.save_current_block(_rs_cb)
+                            logger.info(
+                                "engine_startup: re-seeded in-progress block opener "
+                                "from last_block read_end after within-block restart "
+                                "(%s)", ", ".join(_seeded))
+                except Exception as _rse:
+                    logger.warning("engine_startup: opener re-seed failed: %s", _rse)
 
     # ── Seed _current_slot_mix from recent DB data ───────────────────────
     # _current_slot_mix is in-memory and lost on restart. Re-seed from
@@ -2824,4 +5891,33 @@ async def engine_startup(ha: HAClient):
 
     # ── Startup charts ───────────────────────────────────────────────────
     generate_charts(_store)
+
+    # ── 3.0.0 Kraken discovery (read-only; no polling yet) ────────────────
+    try:
+        await _kraken_startup_discovery()
+    except Exception as _kd_e:
+        logger.warning("engine_startup: kraken discovery skipped: %s", _kd_e)
+
+    # Teardown guard for a Change Setup api→cad transition. When the mode no
+    # longer uses the API, _kraken_startup_discovery returns early and never
+    # calls _maybe_setup_mini, so a Mini reader wired in a prior api+mini session
+    # would otherwise PERSIST (same process) and keep collecting into cad blocks.
+    # Clear it explicitly. (The poll task is already cancelled at startup top and
+    # not relaunched below — gated on mode_uses_api — so no poll leak.)
+    _teardown_mini_if_no_api()
+
+    # If an API mode is configured and discovery succeeded, ensure the DCC poll
+    # task is running. Only relevant when the engine loop is ALREADY up — i.e. a
+    # mid-session engine_startup re-run (config save). At first boot _engine_ha
+    # is still None and main()'s gather() launches the poll task itself, so we
+    # skip here to avoid a redundant (and previously misleading) call. Launching
+    # HERE rather than from connect_kraken_now ensures the store + client are
+    # rebuilt first (avoids the "Connector is closed" teardown race).
+    if (_engine_ha is not None and _kraken_client is not None
+            and _kraken_discovery and mode_uses_api()):
+        _ensure_kraken_poll_task_running()
+
+    # Mark cold start done: any later engine_startup in this process (HA
+    # reconnect / config-save) is warm and must not run the rogue-total guard.
+    _cold_start_complete = True
     logger.info("engine_startup: complete")

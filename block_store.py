@@ -132,6 +132,14 @@ CREATE TABLE IF NOT EXISTS blocks (
     standing_charge  REAL    NOT NULL DEFAULT 0,
     carbon_g         REAL,               -- net gCO2 for this block (NULL if no CI data)
     imp_provisional  INTEGER NOT NULL DEFAULT 0,  -- 1 = sub-meter kWh written without post-boundary read; 0 = final
+    -- ── 3.0.0 Kraken API integration columns ──────────────────────────────
+    source              TEXT,                       -- 'ha_sensor' | 'kraken_api' | 'kraken_mini' (NULL = legacy/ha_sensor)
+    is_provisional      INTEGER NOT NULL DEFAULT 0, -- 1 = main meter not yet DCC-settled (api / api+mini modes)
+    needs_pass2_rerun   INTEGER NOT NULL DEFAULT 0, -- 1 = DCC arrived, PASS 2+3b re-run pending
+    imp_kwh_api         REAL,                       -- DCC-settled import kWh from Kraken REST (NULL until settlement)
+    exp_kwh_api         REAL,                       -- DCC-settled export kWh from Kraken REST (NULL until settlement)
+    needs_review        INTEGER NOT NULL DEFAULT 0, -- 1 = CAD/Mini vs DCC drift exceeded threshold
+    carbon_intensity_g  REAL,                       -- gCO2/kWh at block_start, stored at write time (survives CI table pruning)
     FOREIGN KEY (config_period_id) REFERENCES config_periods(id),
     UNIQUE (block_start, meter_id)
 );
@@ -246,6 +254,35 @@ CREATE TABLE IF NOT EXISTS sub_meter_history (
 
 CREATE INDEX IF NOT EXISTS idx_sub_meter_history_time ON sub_meter_history (captured_at);
 CREATE INDEX IF NOT EXISTS idx_sub_meter_history_meter ON sub_meter_history (meter_id, captured_at);
+
+-- ── 3.0.0 Kraken API integration ─────────────────────────────────────────────
+-- Persists ingester progress so a restart resumes from the last successful poll
+-- rather than re-running a full backfill (quota protection). Single-row-per-key.
+-- The blocks unique index idx_blocks_start_meter and the partial sweep indexes
+-- are created in _ensure_schema AFTER the column ALTERs and duplicate detection,
+-- because on an upgrade DB those columns do not exist when this DDL first runs.
+CREATE TABLE IF NOT EXISTS kraken_state (
+    key        TEXT PRIMARY KEY,   -- e.g. 'last_poll_utc', 'last_backfill_utc'
+    value      TEXT,               -- ISO UTC timestamp or opaque string
+    updated_at TEXT                -- ISO UTC of last write
+);
+
+-- ── 3.1.0 Intelligent dispatch overlay ───────────────────────────────────────
+-- Durable record of which 30-min slots had an Intelligent smart-charge dispatch.
+-- Dispatches are ephemeral in the Kraken API (planned dispatches churn and
+-- disappear), so we capture them forward each poll and persist here. The overlay
+-- resolver reads THIS table (not a live re-fetch) to decide whether a block's
+-- slot should get the off-peak dispatch rate — gated by actual meter draw at
+-- pricing time. One row per slot; re-capture upserts (last-write-wins).
+CREATE TABLE IF NOT EXISTS dispatch_slots (
+    slot_start  TEXT NOT NULL,      -- naive-UTC ISO, 30-min slot boundary
+    off_peak    INTEGER NOT NULL DEFAULT 1,  -- 1 = smart-charge (off-peak candidate)
+    provider    TEXT,               -- e.g. 'MYENERGI_V2', 'OHME', 'TESLA'
+    source      TEXT,               -- meta.source: smart-charge/bump-charge/unknown
+    captured_at TEXT NOT NULL,      -- UTC ISO when we recorded this slot
+    PRIMARY KEY (slot_start)
+);
+CREATE INDEX IF NOT EXISTS idx_dispatch_slots_start ON dispatch_slots (slot_start);
 """
 
 
@@ -371,6 +408,18 @@ def _block_rows(block: dict, config_period_id: int, tz_name: str) -> list[dict]:
             "standing_charge":   float(meter_block.get("standing_charge") or 0),
             # carbon footprint (NULL if no CI data available)
             "carbon_g":          meter_block.get("carbon_g"),
+            # gCO2/kWh at block_start, stored at write time (3.0.0) — survives
+            # carbon_intensity table pruning so PASS 3b re-run never re-queries it
+            "carbon_intensity_g": meter_block.get("carbon_intensity_g"),
+            # 3.0.0 Kraken state — preserved across append_block_replace so a
+            # PASS 2 re-run (INSERT OR REPLACE) does not reset them. Defaults
+            # keep pre-3.0.0 / CAD-mode blocks at 0/NULL.
+            "imp_kwh_api":       meter_block.get("imp_kwh_api"),
+            "exp_kwh_api":       meter_block.get("exp_kwh_api"),
+            "is_provisional":    1 if meter_block.get("is_provisional") else 0,
+            "needs_pass2_rerun": 1 if meter_block.get("needs_pass2_rerun") else 0,
+            "needs_review":      1 if meter_block.get("needs_review") else 0,
+            "source":            meter_block.get("source"),
             # provisional: 1 if sub-meter was written without a post-boundary read
             "imp_provisional":   1 if meter_block.get("provisional") else 0,
         })
@@ -440,6 +489,10 @@ def _row_to_block(rows: list[sqlite3.Row]) -> dict:
             if row["v2x_capable"]:
                 meta["v2x_capable"] = True
             try:
+                if row["power_source"]:
+                    meta["power_source"] = row["power_source"]
+                if row["rate_source"]:
+                    meta["rate_source"] = row["rate_source"]
                 if row["soc_sensor"]:
                     meta["soc_sensor"] = row["soc_sensor"]
                 if row["meter_type"]:
@@ -466,6 +519,27 @@ def _row_to_block(rows: list[sqlite3.Row]) -> dict:
             "carbon_g":        row["carbon_g"],  # None when no CI data (pre-2.3.0)
             "channels":       {},
         }
+        # 3.0.0 columns — surfaced so the DCC re-run can read them. Guarded
+        # with try/except for older rows / pre-join fetches lacking the columns.
+        try:
+            meter_block["carbon_intensity_g"] = row["carbon_intensity_g"]
+        except (IndexError, KeyError):
+            pass
+        try:
+            if row["imp_kwh_api"] is not None:
+                meter_block["imp_kwh_api"] = row["imp_kwh_api"]
+        except (IndexError, KeyError):
+            pass
+        try:
+            if row["exp_kwh_api"] is not None:
+                meter_block["exp_kwh_api"] = row["exp_kwh_api"]
+        except (IndexError, KeyError):
+            pass
+        try:
+            if row["is_provisional"]:
+                meter_block["is_provisional"] = True
+        except (IndexError, KeyError):
+            pass
 
         if row["imp_kwh"] is not None:
             imp_ch = {
@@ -678,12 +752,30 @@ class BlockStore:
                 """)
         except Exception:
             pass
+        # CRITICAL (fresh-DB lock): the blocks above (schema executescript, the
+        # mix_history CREATE/INSERT) can leave an open transaction on the
+        # connection. A lingering transaction makes the engine's startup
+        # wal_checkpoint(TRUNCATE) fail with "database table is locked" (same
+        # root cause as the 2.x 'fresh install hang' — executescript leaving an
+        # open read txn on a fresh WAL DB). Commit now so the connection is in a
+        # clean autocommit state before any checkpoint/backup runs.
+        try:
+            self._conn.commit()
+        except Exception:
+            pass
         logger.debug("BlockStore opened: %s", db_path)
 
     # ── Connection management ─────────────────────────────────────────────
 
     def _apply_pragmas(self) -> None:
+        # busy_timeout is critical: EMT runs TWO connections (engine loop + web
+        # server) against one WAL database. Without it, any momentary write
+        # contention (a config save, a checkpoint, a block finalise) makes the
+        # other connection fail INSTANTLY with "database is locked" instead of
+        # waiting. 5s lets brief contention resolve transparently. This was the
+        # cause of the every-tick "database is locked" loop errors on fresh DBs.
         self._conn.executescript("""
+            PRAGMA busy_timeout = 5000;
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous  = NORMAL;
             PRAGMA cache_size   = -8000;
@@ -709,6 +801,8 @@ class BlockStore:
             ("protected",            "meters",         "INTEGER DEFAULT 0",  _m_cols),
             ("inverter_possible",    "meters",         "INTEGER DEFAULT 0",  _m_cols),
             ("power_sensor",         "meters",         "TEXT",               _m_cols),
+            ("power_source",         "meters",         "TEXT",               _m_cols),
+            ("rate_source",          "meters",         "TEXT",               _m_cols),
             ("postcode_prefix",      "meters",         "TEXT",               _m_cols),
             ("v2x_capable",          "meters",         "INTEGER DEFAULT 0",  _m_cols),
             ("inverter_power_invert","meters",         "INTEGER DEFAULT 0",  _m_cols),
@@ -721,8 +815,20 @@ class BlockStore:
             ("supplier",              "config_periods",  "TEXT",              _cp_cols),
             ("mpan",             "meter_channels",  "TEXT",              _mc_cols),
             ("tariff",           "meter_channels",  "TEXT",              _mc_cols),
+            # ── 3.0.0 per-channel rate/standing-charge source (API vs sensor) ─
+            ("rate_source",            "meter_channels",  "TEXT",        _mc_cols),
+            ("standing_charge_source", "meter_channels",  "TEXT",        _mc_cols),
             ("carbon_g",         "blocks",          "REAL",              _b_cols),
             ("imp_provisional",  "blocks",          "INTEGER NOT NULL DEFAULT 0", _b_cols),
+            # ── 3.0.0 Kraken API integration columns (upgrade path) ──────────
+            ("source",             "blocks",        "TEXT",                       _b_cols),
+            ("is_provisional",     "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
+            ("needs_pass2_rerun",  "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
+            ("imp_kwh_api",        "blocks",        "REAL",                       _b_cols),
+            ("exp_kwh_api",        "blocks",        "REAL",                       _b_cols),
+            ("finalised_from_cad", "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
+            ("needs_review",       "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
+            ("carbon_intensity_g", "blocks",        "REAL",                       _b_cols),
             ("carbon_gco2_min",  "power_history",   "REAL",              _ph_cols),
         ]:
             if _col not in _col_set:
@@ -731,6 +837,60 @@ class BlockStore:
                     self._conn.commit()
                 except Exception:
                     pass  # already exists or table missing — migrate will handle it
+
+        # ── 3.0.0: backfill per-channel rate / standing-charge source ─────────
+        # Pre-3.0.0 (v2) configs predate the explicit "API vs sensor" toggles.
+        # Default every existing channel to the source it was ALREADY using, so an
+        # upgrade does not change a single price until the user opts in:
+        #   • sub-meter (device) channel → derived from the meter's legacy
+        #     rate_source AND its own sensor: an explicit own-sensor choice
+        #     ('own'/'base'/'sensor') OR a device that has its own rate sensor
+        #     mapped becomes 'sensor'; anything else (incl. 'overlay'/'inherit'/
+        #     NULL with no own sensor) becomes 'main' — i.e. inherit the main
+        #     meter's effective rate, as v2 sub-meters did via parent_rates.
+        #   • main-meter channel → 'sensor' when a rate sensor is actually mapped,
+        #     otherwise 'api' (the rate must have been coming from the supplier
+        #     API). We never silently flip a sensor-fed meter onto the API.
+        #   • standing charge → 'sensor' when a standing-charge sensor is mapped,
+        #     otherwise 'api'.
+        # Only NULL rows are touched, so explicit UI/wizard choices are preserved.
+        try:
+            _mc_now = [r[1] for r in self._conn.execute("PRAGMA table_info(meter_channels)").fetchall()]
+            if "rate_source" in _mc_now:
+                n1 = self._conn.execute(
+                    """UPDATE meter_channels SET rate_source = (
+                           SELECT CASE
+                               WHEN m.is_sub_meter = 1 THEN
+                                   CASE WHEN m.rate_source IN ('own','base','sensor')
+                                        THEN 'sensor'
+                                        WHEN meter_channels.rate_sensor IS NOT NULL
+                                             AND TRIM(meter_channels.rate_sensor) <> ''
+                                        THEN 'sensor'
+                                        ELSE 'main' END
+                               ELSE
+                                   CASE WHEN meter_channels.rate_sensor IS NOT NULL
+                                             AND TRIM(meter_channels.rate_sensor) <> ''
+                                        THEN 'sensor' ELSE 'api' END
+                           END
+                           FROM meters m WHERE m.id = meter_channels.meter_id)
+                       WHERE rate_source IS NULL"""
+                ).rowcount
+                n2 = self._conn.execute(
+                    """UPDATE meter_channels SET standing_charge_source =
+                           CASE WHEN standing_charge_sensor IS NOT NULL
+                                     AND TRIM(standing_charge_sensor) <> ''
+                                THEN 'sensor' ELSE 'api' END
+                       WHERE standing_charge_source IS NULL"""
+                ).rowcount
+                if n1 or n2:
+                    self._conn.commit()
+                    logger.info(
+                        "_ensure_schema: backfilled channel sources "
+                        "(rate_source=%d, standing_charge_source=%d) for v2 upgrade",
+                        n1, n2,
+                    )
+        except Exception:
+            logger.debug("_ensure_schema: rate-source backfill skipped", exc_info=True)
 
         # Clear inverter_possible for all existing meters — feature removed in 2.9.0
         # All sub-meters now use the protected queue in PASS 2 regardless of this flag
@@ -756,6 +916,56 @@ class BlockStore:
                 "CREATE INDEX IF NOT EXISTS idx_current_reads_gap "
                 "ON current_reads (is_gap_seed)"
             )
+
+        # ── 3.0.0 Kraken integration: duplicate detection + partial indexes ───
+        # The blocks table has carried a table-level UNIQUE(block_start, meter_id)
+        # constraint since its inception, so genuine duplicates should not exist.
+        # We still check defensively before relying on the named unique index,
+        # and deduplicate (keeping the highest id) if any are somehow present —
+        # e.g. a DB hand-restored from a pre-constraint export.
+        try:
+            dupes = self._conn.execute(
+                """SELECT block_start, meter_id, COUNT(*) AS n
+                   FROM blocks
+                   GROUP BY block_start, meter_id
+                   HAVING n > 1"""
+            ).fetchall()
+            if dupes:
+                for d in dupes:
+                    self._conn.execute(
+                        """DELETE FROM blocks
+                           WHERE block_start = ? AND meter_id = ?
+                             AND id < (SELECT MAX(id) FROM blocks
+                                       WHERE block_start = ? AND meter_id = ?)""",
+                        (d["block_start"], d["meter_id"],
+                         d["block_start"], d["meter_id"]),
+                    )
+                    logger.warning(
+                        "_ensure_schema: deduplicated block_start=%s meter_id=%s "
+                        "(%d duplicate row(s) removed, kept highest id)",
+                        d["block_start"], d["meter_id"], d["n"] - 1,
+                    )
+                self._conn.commit()
+        except Exception:
+            logger.exception("_ensure_schema: duplicate detection failed (non-fatal)")
+
+        # Partial indexes for the Kraken sweeps. Created here (not in _DDL) because
+        # they reference columns that only exist after the ALTER loop above on an
+        # upgrade DB. IF NOT EXISTS makes this idempotent on fresh installs too.
+        _b_cols_now = {r[1] for r in self._conn.execute("PRAGMA table_info(blocks)").fetchall()}
+        if {"is_provisional", "needs_pass2_rerun", "needs_review"} <= _b_cols_now:
+            self._conn.executescript(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_blocks_start_meter "
+                "    ON blocks (block_start, meter_id);"
+                "CREATE INDEX IF NOT EXISTS idx_blocks_provisional "
+                "    ON blocks (is_provisional)    WHERE is_provisional = 1;"
+                "CREATE INDEX IF NOT EXISTS idx_blocks_pass2_rerun "
+                "    ON blocks (needs_pass2_rerun) WHERE needs_pass2_rerun = 1;"
+                "CREATE INDEX IF NOT EXISTS idx_blocks_needs_review "
+                "    ON blocks (needs_review)      WHERE needs_review = 1;"
+            )
+            self._conn.commit()
+
         cur = self._conn.execute(
             "SELECT value FROM store_meta WHERE key = 'schema_version'"
         )
@@ -819,6 +1029,62 @@ class BlockStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def get_block_starts_missing_carbon(self, limit: Optional[int] = None) -> list:
+        """Distinct block_start values for main-meter blocks whose carbon was
+        never attributed (carbon_intensity_g IS NULL but the block has energy).
+
+        Used by the carbon recovery sweep: blocks left NULL by an outage gap-fill
+        that ran before a CI slot was available. Ordered oldest-first so the most
+        recently-recoverable (still within the 4-day CI window) are handled.
+        """
+        sql = (
+            "SELECT DISTINCT block_start FROM blocks "
+            "WHERE carbon_intensity_g IS NULL "
+            "  AND (imp_kwh IS NOT NULL OR exp_kwh IS NOT NULL) "
+            "ORDER BY block_start"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            return [r["block_start"]
+                    for r in self._conn.execute(sql, (limit,)).fetchall()]
+        return [r["block_start"]
+                for r in self._conn.execute(sql).fetchall()]
+
+    def get_missing_carbon_date_range(self) -> tuple | None:
+        """(min_block_start, max_block_start) over energy-bearing blocks whose
+        carbon_intensity_g IS NULL. None when there are no such blocks.
+
+        Bounds the historical carbon backfill (the v2->v3 migration): every block
+        before CI first became available carries a NULL intensity, and this is the
+        span the backfill must page the Carbon Intensity API over."""
+        row = self._conn.execute(
+            "SELECT MIN(block_start) AS lo, MAX(block_start) AS hi FROM blocks "
+            "WHERE carbon_intensity_g IS NULL "
+            "  AND (imp_kwh IS NOT NULL OR exp_kwh IS NOT NULL)"
+        ).fetchone()
+        if row and row["lo"] and row["hi"]:
+            return (row["lo"], row["hi"])
+        return None
+
+    def get_block_starts_missing_carbon_in_range(
+        self, from_iso: str, to_iso: str, limit: Optional[int] = None
+    ) -> list:
+        """Distinct NULL-carbon block_start values within [from_iso, to_iso),
+        oldest-first. Used per fetched window by the historical backfill."""
+        sql = (
+            "SELECT DISTINCT block_start FROM blocks "
+            "WHERE carbon_intensity_g IS NULL "
+            "  AND (imp_kwh IS NOT NULL OR exp_kwh IS NOT NULL) "
+            "  AND block_start >= ? AND block_start < ? "
+            "ORDER BY block_start"
+        )
+        params: list = [from_iso, to_iso]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return [r["block_start"]
+                for r in self._conn.execute(sql, params).fetchall()]
+
     def prune_carbon_intensity(self, days: int = 4) -> int:
         """Delete carbon_intensity rows older than `days` days. Returns rows deleted."""
         cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
@@ -826,6 +1092,64 @@ class BlockStore:
         with self._conn:
             cur = self._conn.execute(
                 "DELETE FROM carbon_intensity WHERE captured_at < ?", (cutoff,)
+            )
+        return cur.rowcount
+
+    # ── 3.1.0 Intelligent dispatch slots ────────────────────────────────────────
+
+    def upsert_dispatch_slot(self, slot_start: str, *, off_peak: bool = True,
+                             provider: Optional[str] = None,
+                             source: Optional[str] = None,
+                             captured_at: Optional[str] = None) -> None:
+        """Record (or refresh) a 30-min slot that had an Intelligent smart-charge
+        dispatch. Last-write-wins on slot_start. Captured forward each poll; the
+        overlay reads these to decide off-peak candidacy (gated by meter draw at
+        pricing time, NOT here).
+        """
+        if captured_at is None:
+            captured_at = (datetime.now(timezone.utc)
+                           .replace(tzinfo=None).isoformat())
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO dispatch_slots
+                       (slot_start, off_peak, provider, source, captured_at)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(slot_start) DO UPDATE SET
+                       off_peak    = excluded.off_peak,
+                       provider    = excluded.provider,
+                       source      = excluded.source,
+                       captured_at = excluded.captured_at""",
+                (slot_start, 1 if off_peak else 0, provider, source, captured_at),
+            )
+
+    def get_dispatch_slot(self, slot_start: str) -> dict | None:
+        """Return the dispatch_slots row for a slot, or None. Used by the overlay
+        resolver to check whether a block's slot is an off-peak candidate.
+        """
+        row = self._conn.execute(
+            "SELECT slot_start, off_peak, provider, source, captured_at "
+            "FROM dispatch_slots WHERE slot_start = ?", (slot_start,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_dispatch_slots_in_range(self, start_iso: str, end_iso: str) -> list:
+        """All dispatch_slots with slot_start in [start_iso, end_iso). Ordered."""
+        return [dict(r) for r in self._conn.execute(
+            "SELECT slot_start, off_peak, provider, source, captured_at "
+            "FROM dispatch_slots WHERE slot_start >= ? AND slot_start < ? "
+            "ORDER BY slot_start", (start_iso, end_iso)
+        ).fetchall()]
+
+    def prune_dispatch_slots(self, days: int = 90) -> int:
+        """Delete dispatch_slots older than `days` days. Generous retention (90d)
+        — these are small and the overlay may reprice historical blocks during a
+        billing-period review. Returns rows deleted.
+        """
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                  - timedelta(days=days)).isoformat()
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM dispatch_slots WHERE slot_start < ?", (cutoff,)
             )
         return cur.rowcount
 
@@ -1031,6 +1355,31 @@ class BlockStore:
         """Return a single setting value by key."""
         return self.get_settings().get(key, default)
 
+    def get_meta(self, key: str, default=None):
+        """Generic KV read from store_meta. Values are JSON-encoded; the raw
+        string is returned if it isn't valid JSON (e.g. legacy schema_version)."""
+        import json as _json
+        row = self._conn.execute(
+            "SELECT value FROM store_meta WHERE key = ?", (key,)
+        ).fetchone()
+        if row and row["value"] is not None:
+            try:
+                return _json.loads(row["value"])
+            except Exception:
+                return row["value"]
+        return default
+
+    def set_meta(self, key: str, value) -> None:
+        """Generic KV write to store_meta (value JSON-encoded). Used for the
+        run-once historical-carbon-backfill marker / resume cursor."""
+        import json as _json
+        self._conn.execute(
+            "INSERT INTO store_meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, _json.dumps(value))
+        )
+        self._conn.commit()
+
     def prune_power_history(self, hours: int = 48) -> int:
         """Delete power_history rows older than `hours` hours. Returns rows deleted."""
         cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
@@ -1190,14 +1539,94 @@ class BlockStore:
         return {"deleted": True, "blocks_reassigned": block_rows}
 
 
+    def _resolve_delete_meters(self, meter_id):
+        """Normalize the meter sentinel for a block delete/preview.
+
+        Returns None when *all* meters should be affected (meter_id is None,
+        empty, or the UI sentinel "all" — previously this string was passed
+        through as a literal filter, matching no row and silently deleting
+        nothing). Otherwise returns a de-duplicated list of meter_ids: the
+        requested meter plus, when it is a parent (main) meter, all of its
+        sub-meters — so deleting a day for the main meter takes its device
+        blocks with it and cannot leave an orphaned, internally-inconsistent
+        bill line behind.
+        """
+        if meter_id in (None, "", "all"):
+            return None
+        ids = [meter_id]
+        cur = self._conn.execute(
+            "SELECT DISTINCT meter_id FROM meters WHERE parent_meter_id = ?",
+            (meter_id,),
+        )
+        ids.extend(r["meter_id"] for r in cur.fetchall())
+        return list(dict.fromkeys(ids))
+
+    def _block_range_where(self, utc_start, utc_end, from_time, to_time, meter_ids):
+        """Build the shared WHERE clause + params for block date-range
+        delete/preview. `meter_ids` is None (all meters) or a list of ids."""
+        clauses = ["block_start >= ?", "block_start < ?"]
+        params  = [utc_start, utc_end]
+
+        if from_time != "00:00" and to_time != "23:59":
+            if from_time <= to_time:
+                clauses.append("TIME(block_start) >= ?")
+                clauses.append("TIME(block_start) <= ?")
+                params.extend([from_time, to_time])
+            else:
+                clauses.append("(TIME(block_start) >= ? OR TIME(block_start) <= ?)")
+                params.extend([from_time, to_time])
+        elif from_time != "00:00":
+            clauses.append("TIME(block_start) >= ?")
+            params.append(from_time)
+        elif to_time != "23:59":
+            clauses.append("TIME(block_start) <= ?")
+            params.append(to_time)
+
+        if meter_ids is not None:
+            placeholders = ",".join("?" * len(meter_ids))
+            clauses.append(f"meter_id IN ({placeholders})")
+            params.extend(meter_ids)
+
+        return " AND ".join(clauses), params
+
+    def _count_blocks_and_local_dates(self, where, params, tz_name):
+        """Return (block_count, distinct_local_date_count) for a delete/preview
+        WHERE clause. The day count is in the *local* timezone, not UTC: a BST
+        local day starts at 23:00 UTC the previous day, so counting distinct
+        date(block_start) on the stored UTC timestamps would report two calendar
+        days for a single local day. Convert each block_start to local first."""
+        n = self._conn.execute(
+            f"SELECT COUNT(*) FROM blocks WHERE {where}", params).fetchone()[0]
+        if not n:
+            return 0, 0
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo("UTC")
+        starts = self._conn.execute(
+            f"SELECT DISTINCT block_start FROM blocks WHERE {where}", params).fetchall()
+        dates = {
+            datetime.fromisoformat(r[0]).replace(tzinfo=timezone.utc).astimezone(tz).date()
+            for r in starts
+        }
+        return n, len(dates)
+
     def delete_blocks_for_date_range(
         self, from_date: str, to_date: str, meter_id: str | None = None,
         from_time: str = "00:00", to_time: str = "23:59", tz_name: str = "UTC"
     ) -> dict:
         """
         Delete all blocks within [from_date, to_date] local date range (inclusive),
-        optionally restricted by time-of-day (UTC HH:MM) within those dates.
-        Uses UTC bounds derived from local dates via local_date_range_to_utc_bounds().
+        optionally restricted by time-of-day (UTC HH:MM) and/or to a single meter
+        (which also pulls in that meter's sub-meters — see _resolve_delete_meters).
+
+        Cascades to the rows that reference the deleted blocks: `reads` (FK
+        block_id, deleted first so foreign_keys=ON can't error) and
+        `generation_mix` (block_id). When the delete removes the most recent
+        finalised block for the targeted meters (a "tail" delete), the engine's
+        live read-state (current_block + current_reads) is cleared in the same
+        transaction so the next block re-anchors from the next live read instead
+        of spanning the deleted window.
         """
         if not from_date or not to_date:
             raise ValueError("from_date and to_date are required")
@@ -1209,86 +1638,100 @@ class BlockStore:
 
         utc_start, utc_end = local_date_range_to_utc_bounds(from_date, to_date, tz_name)
 
-        clauses = ["block_start >= ?", "block_start < ?"]
-        params  = [utc_start, utc_end]
-
-        if from_time != "00:00" and to_time != "23:59":
-            if from_time <= to_time:
-                clauses.append("TIME(block_start) >= ?")
-                clauses.append("TIME(block_start) <= ?")
-                params.extend([from_time, to_time])
-            else:
-                clauses.append("(TIME(block_start) >= ? OR TIME(block_start) <= ?)")
-                params.extend([from_time, to_time])
-        elif from_time != "00:00":
-            clauses.append("TIME(block_start) >= ?")
-            params.append(from_time)
-        elif to_time != "23:59":
-            clauses.append("TIME(block_start) <= ?")
-            params.append(to_time)
-
-        if meter_id:
-            clauses.append("meter_id = ?")
-            params.append(meter_id)
-
-        where = " AND ".join(clauses)
-
-        cur = self._conn.execute(
-            f"SELECT COUNT(*) as n, COUNT(DISTINCT date(block_start)) as d FROM blocks WHERE {where}",
-            params
+        meter_ids = self._resolve_delete_meters(meter_id)
+        where, params = self._block_range_where(
+            utc_start, utc_end, from_time, to_time, meter_ids
         )
-        row = cur.fetchone()
-        n_blocks = row["n"]
-        n_dates  = row["d"]
 
+        n_blocks, n_dates = self._count_blocks_and_local_dates(where, params, tz_name)
+
+        # Tail detection: is the newest finalised block within the targeted
+        # meters inside the deleted range? If so the engine anchor must reset.
+        if meter_ids is not None:
+            ph = ",".join("?" * len(meter_ids))
+            latest = self._conn.execute(
+                f"SELECT MAX(block_start) AS m FROM blocks WHERE meter_id IN ({ph})",
+                meter_ids,
+            ).fetchone()["m"]
+        else:
+            latest = self._conn.execute(
+                "SELECT MAX(block_start) AS m FROM blocks"
+            ).fetchone()["m"]
+        is_tail = bool(latest is not None and utc_start <= latest < utc_end)
+
+        # Device-only delete? If the resolved target is a single sub-meter (its
+        # parent's blocks are untouched and survive), the parent's stored
+        # remainder for these windows is now stale — hand the parent + window
+        # back so the caller can trigger a PASS-2 remainder recompute. A main
+        # or all-meters delete takes the devices with it, so nothing to recompute.
+        recompute_parent = None
+        if meter_ids is not None and len(meter_ids) == 1:
+            pr = self._conn.execute(
+                "SELECT parent_meter_id FROM meters "
+                "WHERE meter_id = ? AND is_sub_meter = 1 AND parent_meter_id IS NOT NULL "
+                "LIMIT 1",
+                (meter_ids[0],),
+            ).fetchone()
+            if pr and pr["parent_meter_id"]:
+                recompute_parent = pr["parent_meter_id"]
+
+        reads_deleted = 0
+        mix_deleted   = 0
         with self._conn:
-            self._conn.execute(f"DELETE FROM blocks WHERE {where}", params)
+            if n_blocks:
+                # Children first (reads FK -> blocks(id) with foreign_keys=ON).
+                # Match by block id via subquery: no huge IN-list, no param cap.
+                cur_r = self._conn.execute(
+                    f"DELETE FROM reads WHERE block_id IN "
+                    f"(SELECT id FROM blocks WHERE {where})",
+                    params,
+                )
+                reads_deleted = cur_r.rowcount
+                cur_m = self._conn.execute(
+                    f"DELETE FROM generation_mix WHERE block_id IN "
+                    f"(SELECT id FROM blocks WHERE {where})",
+                    params,
+                )
+                mix_deleted = cur_m.rowcount
+                self._conn.execute(f"DELETE FROM blocks WHERE {where}", params)
+            if is_tail and n_blocks:
+                # Reseed live engine state so the next block starts cleanly.
+                self._conn.execute("DELETE FROM current_block")
+                self._conn.execute("DELETE FROM current_reads")
 
-        return {"deleted": n_blocks, "dates": n_dates}
+        return {
+            "deleted":                n_blocks,
+            "dates":                  n_dates,
+            "reads_deleted":          reads_deleted,
+            "generation_mix_deleted": mix_deleted,
+            "reseeded":               bool(is_tail and n_blocks),
+            # set only for a device-only delete with surviving parent blocks
+            "recompute_parent":       recompute_parent if n_blocks else None,
+            "recompute_from":         utc_start if recompute_parent and n_blocks else None,
+            "recompute_to":           utc_end if recompute_parent and n_blocks else None,
+        }
 
     def count_blocks_for_date_range(
         self, from_date: str, to_date: str, meter_id: str | None = None,
         from_time: str = "00:00", to_time: str = "23:59", tz_name: str = "UTC"
     ) -> dict:
         """
-        Preview how many blocks would be affected by delete_blocks_for_date_range.
+        Preview how many blocks delete_blocks_for_date_range would remove, using
+        the identical meter resolution (sentinel + sub-meter inclusion) and WHERE
+        clause so the preview can never disagree with the delete.
         Returns {"blocks": N, "dates": N_distinct_dates}.
         """
         from_time = from_time or "00:00"
         to_time   = to_time   or "23:59"
 
         utc_start, utc_end = local_date_range_to_utc_bounds(from_date, to_date, tz_name)
-
-        clauses = ["block_start >= ?", "block_start < ?"]
-        params  = [utc_start, utc_end]
-
-        if from_time != "00:00" and to_time != "23:59":
-            if from_time <= to_time:
-                clauses.append("TIME(block_start) >= ?")
-                clauses.append("TIME(block_start) <= ?")
-                params.extend([from_time, to_time])
-            else:
-                clauses.append("(TIME(block_start) >= ? OR TIME(block_start) <= ?)")
-                params.extend([from_time, to_time])
-        elif from_time != "00:00":
-            clauses.append("TIME(block_start) >= ?")
-            params.append(from_time)
-        elif to_time != "23:59":
-            clauses.append("TIME(block_start) <= ?")
-            params.append(to_time)
-
-        if meter_id:
-            clauses.append("meter_id = ?")
-            params.append(meter_id)
-
-        where = " AND ".join(clauses)
-
-        cur = self._conn.execute(
-            f"SELECT COUNT(*) as n, COUNT(DISTINCT date(block_start)) as d FROM blocks WHERE {where}",
-            params
+        meter_ids = self._resolve_delete_meters(meter_id)
+        where, params = self._block_range_where(
+            utc_start, utc_end, from_time, to_time, meter_ids
         )
-        row = cur.fetchone()
-        return {"blocks": row["n"], "dates": row["d"]}
+
+        n_blocks, n_dates = self._count_blocks_and_local_dates(where, params, tz_name)
+        return {"blocks": n_blocks, "dates": n_dates}
 
 
     def backup(self, dst_path: str) -> None:
@@ -1341,7 +1784,20 @@ class BlockStore:
 
 
 
-    def compute_period_net(self, utc_s: str, utc_e: str, tz_name: str) -> float:
+    @staticmethod
+    def _finalised_clause(finalised_only: bool, alias: str = "b") -> str:
+        """SQL fragment to exclude provisional (not-yet-DCC-settled) blocks.
+
+        Returns ' AND <alias>.is_provisional = 0' when finalised_only is True,
+        else ''. Tier 1 (accuracy-critical) surfaces in 'api'/'api+mini' modes
+        pass finalised_only=True. The default False preserves all pre-3.0.0
+        behaviour: 'cad'/'cad+api' blocks are finalised at write time
+        (is_provisional always 0), so the clause is a no-op for them anyway.
+        """
+        return f" AND {alias}.is_provisional = 0" if finalised_only else ""
+
+    def compute_period_net(self, utc_s: str, utc_e: str, tz_name: str,
+                           finalised_only: bool = False) -> float:
         """Compute net cost for a UTC period — single source of truth used by
         both Live Power (_fmt_total in server.py) and the billing chart
         (calculate_billing_summary_for_period in energy_charts.py).
@@ -1361,12 +1817,17 @@ class BlockStore:
             """SELECT b.block_start, b.imp_cost, b.exp_cost, b.standing_charge,
                       m.is_sub_meter, m.meter_id
                FROM blocks b JOIN meters m ON m.meter_id = b.meter_id
-               WHERE b.block_start >= ? AND b.block_start < ?""",
+               WHERE b.block_start >= ? AND b.block_start < ?"""
+            + self._finalised_clause(finalised_only),
             (utc_s, utc_e)
         ).fetchall()
 
         by_d     = defaultdict(lambda: {"main_imp": 0.0, "exp": 0.0, "sc": 0.0})
         sub_by_d = defaultdict(lambda: defaultdict(float))
+        # Track the earliest block_start seen per day so the standing charge is
+        # the start-of-day value (supplier convention), not MAX (which
+        # over-bills on a decrease).
+        _sc_earliest: dict = {}
 
         for r in rows:
             d = datetime.fromisoformat(r["block_start"]).replace(
@@ -1375,8 +1836,14 @@ class BlockStore:
             if not bool(r["is_sub_meter"]):
                 by_d[d]["main_imp"] += cost
                 by_d[d]["exp"] += float(r["exp_cost"] or 0)
-                sc = float(r["standing_charge"] or 0)
-                if sc > by_d[d]["sc"]: by_d[d]["sc"] = sc
+                bs = r["block_start"]
+                _sc = float(r["standing_charge"] or 0)
+                # Start-of-day standing charge: take the earliest block that has
+                # a non-zero charge, so a leading zero (early gap-fill) doesn't
+                # shadow the real value. Not MAX (over-bills on a decrease).
+                if _sc > 0 and (d not in _sc_earliest or bs < _sc_earliest[d]):
+                    _sc_earliest[d] = bs
+                    by_d[d]["sc"] = _sc
             else:
                 sub_by_d[d][r["meter_id"]] += cost
 
@@ -1392,8 +1859,441 @@ class BlockStore:
 
         return round(sum(daily_nets), 2)
 
+    # ── 3.0.0 Kraken API integration — storage layer ─────────────────────────
+    # All methods below operate only on the 3.0.0 columns/tables. They never
+    # modify imp_kwh, imp_kwh_grid, imp_kwh_remainder or any pre-3.0.0 column,
+    # so existing billing behaviour is unaffected.
+
+    def set_kraken_state(self, key: str, value: Optional[str]) -> None:
+        """Persist an ingester progress marker (e.g. 'last_poll_utc')."""
+        self._conn.execute(
+            """INSERT INTO kraken_state (key, value, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET
+                   value = excluded.value,
+                   updated_at = excluded.updated_at""",
+            (key, value, _utc_now_iso()),
+        )
+        self._conn.commit()
+
+    def get_kraken_state(self, key: str) -> Optional[str]:
+        """Read an ingester progress marker. None if never set."""
+        row = self._conn.execute(
+            "SELECT value FROM kraken_state WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+
+    def delete_kraken_state(self, key: str) -> None:
+        """Remove a kraken_state marker entirely (used by the disconnect action to
+        wipe API-derived progress state — poll watermark, sweep cadence, pre-live
+        snapshot flag — so a later reconnect starts clean). No-op if absent."""
+        self._conn.execute("DELETE FROM kraken_state WHERE key = ?", (key,))
+        self._conn.commit()
+
+    def get_block_by_start(self, block_start: str, meter_id: str):
+        """Return the block row for (block_start, meter_id), or None."""
+        return self._conn.execute(
+            "SELECT * FROM blocks WHERE block_start = ? AND meter_id = ?",
+            (block_start, meter_id),
+        ).fetchone()
+
+    def get_block_by_id(self, block_id: int):
+        """Return the block row for a given id, or None."""
+        return self._conn.execute(
+            "SELECT * FROM blocks WHERE id = ?", (block_id,)
+        ).fetchone()
+
+    def get_oldest_block_start(self, meter_id: Optional[str] = None) -> Optional[str]:
+        """Return the earliest block_start in the store, or None if empty.
+
+        Drives the data-driven backfill window: the ingester fetches DCC from
+        this point to now (capped). Backfilling earlier than the oldest block
+        is pointless — upsert_kraken_block would only return missing_block.
+        """
+        if meter_id:
+            row = self._conn.execute(
+                "SELECT MIN(block_start) AS m FROM blocks WHERE meter_id = ?",
+                (meter_id,)).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT MIN(block_start) AS m FROM blocks").fetchone()
+        return row["m"] if row and row["m"] else None
+
+    def classify_kraken_block(
+        self,
+        block_start: str,
+        meter_id: str,
+        settled_kwh: Optional[float],
+        *,
+        channel: str = "import",
+        billing_source: str = "api",
+        drift_block_percent: float = 2.0,
+        drift_min_kwh: float = 0.05,
+    ) -> dict:
+        """Read-only: determine what upsert_kraken_block WOULD do, without
+        writing. Returns the same verdict dict (status / drift_pct /
+        needs_review / needs_pass2_rerun / cad_kwh / settled_kwh / channel /
+        block_id) so a dry-run preview is identical to a live run minus the
+        UPDATE. Performs one SELECT (the block lookup) and no writes.
+
+        Drift flags review only when BOTH thresholds are exceeded: the absolute
+        delta > drift_min_kwh (default 50 Wh) AND |drift| > drift_block_percent.
+        The absolute floor stops percentage-on-tiny-numbers noise (e.g. 131% of
+        16 Wh) dominating the count on a solar profile, while keeping real
+        divergence on substantial blocks.
+        """
+        if channel not in ("import", "export"):
+            raise ValueError(f"channel must be 'import' or 'export', got {channel!r}")
+        cad_col = "imp_kwh" if channel == "import" else "exp_kwh"
+
+        existing = self.get_block_by_start(block_start, meter_id)
+        if existing is None:
+            return {"status": "missing_block", "block_start": block_start,
+                    "meter_id": meter_id, "channel": channel}
+        if settled_kwh is None:
+            return {"status": "no_value", "block_id": existing["id"],
+                    "channel": channel}
+
+        cad_kwh = existing[cad_col]
+        drift_pct: Optional[float] = None
+        review = 0
+        # Materiality epsilon: kWh below this is treated as zero, so float dust
+        # and sub-watt noise don't count as a real figure. 0.005 kWh = 5 Wh.
+        _EPS = 0.005
+        cad_material = cad_kwh is not None and abs(cad_kwh) >= _EPS
+        dcc_material = settled_kwh is not None and abs(settled_kwh) >= _EPS
+
+        if not cad_material and not dcc_material:
+            # zero-vs-zero → agreement (e.g. night export, solar-covered import).
+            review = 0
+        elif cad_material and dcc_material:
+            # both substantive → flag only if BOTH thresholds exceeded.
+            abs_delta = abs(settled_kwh - cad_kwh)
+            drift_pct = (settled_kwh - cad_kwh) / cad_kwh * 100.0
+            if abs_delta > drift_min_kwh and abs(drift_pct) > drift_block_percent:
+                review = 1
+        else:
+            # one side material, the other ~zero → genuine discrepancy, but only
+            # worth flagging if the material side exceeds the absolute floor
+            # (a lone 20 Wh blip is not actionable).
+            material_val = settled_kwh if dcc_material else cad_kwh
+            if abs(material_val) > drift_min_kwh:
+                review = 1
+
+        # Only queue a PASS 2 re-run when the DCC figure is NEW or CHANGED.
+        # The poll re-upserts a rolling backfill window every cycle, so without
+        # this guard an already-settled block would be re-flagged and re-run on
+        # EVERY poll forever (rerun=1 unconditionally when billing_source=='api').
+        # Compare the incoming settled_kwh against what's already materialised in
+        # the api column: if unchanged, there's nothing new to re-run.
+        api_col = "imp_kwh_api" if channel == "import" else "exp_kwh_api"
+        try:
+            prev_api = existing[api_col]
+        except (IndexError, KeyError):
+            prev_api = None
+        _figure_changed = (prev_api is None) or (
+            abs((settled_kwh or 0.0) - (prev_api or 0.0)) > 1e-6)
+        rerun = 1 if (billing_source == "api" and _figure_changed) else 0
+        new_review = 1 if (review or (existing["needs_review"] or 0)) else 0
+        new_rerun = 1 if (rerun or (existing["needs_pass2_rerun"] or 0)) else 0
+        try:
+            interpolated = bool(existing["interpolated"])
+        except (IndexError, KeyError):
+            interpolated = False
+        return {
+            "status": "stored",   # i.e. WOULD store
+            "block_id": existing["id"],
+            "channel": channel,
+            "settled_kwh": settled_kwh,
+            "cad_kwh": cad_kwh,
+            "drift_pct": drift_pct,
+            "interpolated": interpolated,
+            "needs_review": new_review,
+            "needs_pass2_rerun": new_rerun,
+        }
+
+    def store_mini_import(self, block_start: str, meter_id: str,
+                          imp_kwh: float) -> dict:
+        """Store a provisional Mini-derived import kWh on an existing block.
+
+        api+mini near-real-time layer: writes imp_kwh, marks the block
+        provisional + sourced 'kraken_mini', and queues it for PASS 2 re-run so
+        DCC settlement (when it arrives) overwrites it. Returns
+        {"status": "stored"|"missing_block"}.
+
+        Mini is treated like CAD: imp_kwh is the working import figure until DCC
+        reconciles. Export is never Mini-sourced (no Mini export register).
+        """
+        row = self.get_block_by_start(block_start, meter_id)
+        if row is None:
+            return {"status": "missing_block", "block_start": block_start}
+        self._conn.execute(
+            """UPDATE blocks
+               SET imp_kwh = ?, is_provisional = 1, source = 'kraken_mini',
+                   needs_pass2_rerun = 1
+               WHERE block_start = ? AND meter_id = ?""",
+            (imp_kwh, block_start, meter_id))
+        self._conn.commit()
+        return {"status": "stored", "imp_kwh": imp_kwh}
+
+    def upsert_kraken_block(
+        self,
+        block_start: str,
+        meter_id: str,
+        settled_kwh: Optional[float],
+        *,
+        channel: str = "import",
+        source: str = "kraken_api",
+        billing_source: str = "api",
+        drift_block_percent: float = 2.0,
+        drift_min_kwh: float = 0.05,
+    ) -> dict:
+        """Store a DCC-settled figure on an existing block, for one channel.
+
+        channel='import' writes imp_kwh_api and compares against imp_kwh;
+        channel='export' writes exp_kwh_api and compares against exp_kwh. The
+        two channels are symmetric and independent: a block may receive both
+        (separate ingester calls), and the second call must not clear the
+        first's flags, so needs_review and needs_pass2_rerun are OR-ed with the
+        existing row values rather than overwritten.
+
+        Classification is delegated to classify_kraken_block (shared with the
+        dry-run preview); this method adds the UPDATE for a 'stored' verdict.
+
+        Returns a dict describing what happened; status == "missing_block"
+        when no matching block exists, "no_value" when settled_kwh is None.
+        """
+        verdict = self.classify_kraken_block(
+            block_start, meter_id, settled_kwh, channel=channel,
+            billing_source=billing_source, drift_block_percent=drift_block_percent,
+            drift_min_kwh=drift_min_kwh)
+        if verdict["status"] != "stored":
+            return verdict
+
+        api_col = "imp_kwh_api" if channel == "import" else "exp_kwh_api"
+        self._conn.execute(
+            f"""UPDATE blocks
+                SET {api_col} = ?,
+                    source = COALESCE(?, source),
+                    needs_review = ?,
+                    needs_pass2_rerun = ?,
+                    finalised_from_cad = 0
+                WHERE id = ?""",
+            (settled_kwh, source, verdict["needs_review"],
+             verdict["needs_pass2_rerun"], verdict["block_id"]),
+        )
+        self._conn.commit()
+        return verdict
+
+    def get_blocks_needing_pass2_rerun(self, limit: Optional[int] = None) -> list:
+        """Blocks where DCC has arrived and PASS 2+3b re-run is pending.
+
+        The engine drains this queue: re-runs attribution + carbon using the
+        stored carbon_intensity_g, then calls clear_pass2_rerun_flag().
+        """
+        sql = ("SELECT * FROM blocks WHERE needs_pass2_rerun = 1 "
+               "ORDER BY block_start")
+        if limit is not None:
+            sql += " LIMIT ?"
+            return self._conn.execute(sql, (limit,)).fetchall()
+        return self._conn.execute(sql).fetchall()
+
+    def clear_pass2_rerun_flag(self, block_id: int) -> None:
+        """Mark a block's PASS 2+3b re-run as complete."""
+        self._conn.execute(
+            "UPDATE blocks SET needs_pass2_rerun = 0 WHERE id = ?", (block_id,)
+        )
+        self._conn.commit()
+
+    def flag_all_for_pass2_rerun(self, main_meter_id: Optional[str] = None) -> int:
+        """Flag every (main-meter) block for PASS 2 re-run.
+
+        Used when the global billing_source toggle changes (cad<->dcc): the
+        drain then reprocesses each block, rewriting billing figures to the
+        chosen source. Returns the number of blocks flagged. Bounded only by
+        the table size; the drain spreads the actual work across ticks.
+
+        Only main-meter blocks carry the settlement columns, so sub-meter
+        blocks don't need flagging — but flagging all is harmless (their re-run
+        is a no-op) and simpler, so we scope to main meter when given.
+        """
+        if main_meter_id:
+            cur = self._conn.execute(
+                "UPDATE blocks SET needs_pass2_rerun = 1 WHERE meter_id = ?",
+                (main_meter_id,))
+        else:
+            cur = self._conn.execute("UPDATE blocks SET needs_pass2_rerun = 1")
+        self._conn.commit()
+        return cur.rowcount
+
+    def get_unsettled_blocks(self, main_meter_id: str = "electricity_main",
+                             limit: Optional[int] = None) -> list:
+        """Main-meter blocks that never received DCC import settlement.
+
+        For the view-only 'review unsettled blocks' report (relevant only when
+        billing_source='dcc'): these are blocks running on the CAD fallback
+        because DCC import never arrived (imp_kwh_api IS NULL). Ordered newest
+        first so the most recent gaps surface at the top.
+        """
+        sql = ("SELECT block_start, block_end, imp_kwh, imp_kwh_api, "
+               "       exp_kwh, exp_kwh_api, is_provisional "
+               "FROM blocks WHERE meter_id = ? AND imp_kwh_api IS NULL "
+               "AND finalised_from_cad = 0 "
+               "ORDER BY block_start DESC")
+        params: tuple = (main_meter_id,)
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (main_meter_id, limit)
+        return self._conn.execute(sql, params).fetchall()
+
+    def count_unsettled_blocks(self, main_meter_id: str = "electricity_main") -> int:
+        """Count of main-meter blocks with no DCC import settlement, excluding
+        those finalised-from-CAD (past the horizon — DCC isn't coming)."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM blocks "
+            "WHERE meter_id = ? AND imp_kwh_api IS NULL "
+            "AND finalised_from_cad = 0",
+            (main_meter_id,)).fetchone()
+        return int(row["n"]) if row else 0
+
+    def finalise_past_horizon_blocks(self, cutoff_block_start: str,
+                                     main_meter_id: str = "electricity_main") -> int:
+        """Mark main-meter blocks older than cutoff_block_start that never got DCC
+        import settlement as finalised-from-CAD, so the unsettled count can reach
+        zero once DCC is no longer expected. This is DISTINCT from a real
+        settlement — imp_kwh_api stays NULL — and reversible: a later DCC
+        settlement clears the flag (see upsert_kraken_block). Returns the
+        number of blocks newly flagged."""
+        cur = self._conn.execute(
+            "UPDATE blocks SET finalised_from_cad = 1 "
+            "WHERE meter_id = ? AND imp_kwh_api IS NULL "
+            "AND finalised_from_cad = 0 AND block_start < ?",
+            (main_meter_id, cutoff_block_start))
+        self._conn.commit()
+        return cur.rowcount
+
+    def get_oldest_unsettled_block_start(
+            self, main_meter_id: str = "electricity_main") -> Optional[str]:
+        """Earliest block_start with no DCC import settlement, or None.
+
+        Used by the user-triggered retry to bound the re-fetch window
+        (oldest-unsettled → now)."""
+        row = self._conn.execute(
+            "SELECT MIN(block_start) AS m FROM blocks "
+            "WHERE meter_id = ? AND imp_kwh_api IS NULL",
+            (main_meter_id,)).fetchone()
+        return row["m"] if row and row["m"] else None
+
+    def get_timed_out_provisionals(
+        self, cutoff_utc: str,
+        sources: tuple = ("kraken_api", "kraken_mini"),
+    ) -> list:
+        """Provisional blocks older than cutoff whose DCC never arrived."""
+        placeholders = ",".join("?" for _ in sources)
+        return self._conn.execute(
+            f"""SELECT * FROM blocks
+                WHERE is_provisional = 1
+                  AND block_start < ?
+                  AND source IN ({placeholders})
+                ORDER BY block_start""",
+            (cutoff_utc, *sources),
+        ).fetchall()
+
+    def finalise_timed_out_provisionals(
+        self, cutoff_utc: str,
+        sources: tuple = ("kraken_api", "kraken_mini"),
+    ) -> int:
+        """Clear is_provisional on timed-out blocks. Returns rows affected.
+
+        In 'api+mini' the Mini imp_kwh becomes the permanent billing value via
+        COALESCE. In 'api' a block whose imp_kwh is still NULL finalises with
+        NULL and is excluded from billing aggregations permanently — safer than
+        writing a zero. The caller logs a WARNING per block (it has the list
+        from get_timed_out_provisionals); this method only flips the flag.
+        """
+        placeholders = ",".join("?" for _ in sources)
+        cur = self._conn.execute(
+            f"""UPDATE blocks SET is_provisional = 0
+                WHERE is_provisional = 1
+                  AND block_start < ?
+                  AND source IN ({placeholders})""",
+            (cutoff_utc, *sources),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def get_drift_alerts(self) -> list:
+        """Blocks flagged needs_review = 1, for the Settings drift list.
+
+        Returns dicts with the CAD/Mini figure, the DCC figure and the delta %
+        so the UI table can render directly. Informational only — billing_source
+        already determines which figure drives the numbers.
+        """
+        rows = self._conn.execute(
+            """SELECT id, block_start, meter_id, imp_kwh, imp_kwh_api
+               FROM blocks
+               WHERE needs_review = 1
+               ORDER BY block_start"""
+        ).fetchall()
+        alerts = []
+        for r in rows:
+            cad = r["imp_kwh"]
+            dcc = r["imp_kwh_api"]
+            if cad is not None and cad != 0 and dcc is not None:
+                delta_pct = (dcc - cad) / cad * 100.0
+            elif dcc == 0.0:
+                delta_pct = -100.0 if (cad or 0) > 0 else 0.0
+            else:
+                delta_pct = None
+            alerts.append({
+                "block_id": r["id"],
+                "block_start": r["block_start"],
+                "meter_id": r["meter_id"],
+                "cad_kwh": cad,
+                "dcc_kwh": dcc,
+                "delta_pct": delta_pct,
+            })
+        return alerts
+
+    def dismiss_drift_alerts(self, block_ids: Optional[list] = None) -> int:
+        """Clear needs_review. All flagged blocks, or a specific subset.
+
+        Returns rows affected. Dismissing does not change any billing figure —
+        it only removes the investigate flag.
+        """
+        if block_ids is None:
+            cur = self._conn.execute(
+                "UPDATE blocks SET needs_review = 0 WHERE needs_review = 1"
+            )
+        elif not block_ids:
+            return 0
+        else:
+            placeholders = ",".join("?" for _ in block_ids)
+            cur = self._conn.execute(
+                f"UPDATE blocks SET needs_review = 0 WHERE id IN ({placeholders})",
+                tuple(block_ids),
+            )
+        self._conn.commit()
+        return cur.rowcount
+
+    def get_settled_to(self, main_meter_id: str) -> Optional[str]:
+        """Latest block_start that is fully DCC-settled for the main meter.
+
+        Powers the Overview "As of HH:MM" timestamp in 'api'/'api+mini' modes.
+        Returns None when nothing is settled yet.
+        """
+        row = self._conn.execute(
+            """SELECT MAX(block_start) AS settled_to FROM blocks
+               WHERE is_provisional = 0
+                 AND imp_cost IS NOT NULL
+                 AND meter_id = ?""",
+            (main_meter_id,),
+        ).fetchone()
+        return row["settled_to"] if row and row["settled_to"] else None
+
     def get_billing_totals_for_utc_range(self, utc_start: str, utc_end: str,
-                                          tz_name: str = "UTC") -> dict:
+                                          tz_name: str = "UTC",
+                                          finalised_only: bool = False) -> dict:
         """
         UTC-based replacement for get_billing_totals_for_local_date_range.
         Filters on block_start >= utc_start AND block_start < utc_end.
@@ -1429,7 +2329,8 @@ class BlockStore:
                JOIN meters m
                  ON m.meter_id = b.meter_id
                 AND m.config_period_id = ({active_period_sq})
-               WHERE b.block_start >= ? AND b.block_start < ?""",
+               WHERE b.block_start >= ? AND b.block_start < ?"""
+            + self._finalised_clause(finalised_only),
             (utc_start, utc_end)
         )
         row = cur.fetchone()
@@ -1449,12 +2350,20 @@ class BlockStore:
                JOIN meters m ON m.meter_id = b.meter_id
                  AND m.config_period_id = ({active_period_sq})
                WHERE b.block_start >= ? AND b.block_start < ?
-                 AND m.is_sub_meter = 0
-               ORDER BY b.block_start""",
+                 AND m.is_sub_meter = 0"""
+            + self._finalised_clause(finalised_only)
+            + " ORDER BY b.block_start",
             (utc_start, utc_end)
         ).fetchall()
 
-        # Group by local date, take MAX standing_charge per day
+        # Standing charge is a fixed DAILY fee. Bill the charge effective at the
+        # START of each local day (the supplier convention), not the max — MAX
+        # over-bills on any day the charge decreases. Rows are ORDER BY
+        # block_start ascending, so the first row seen for a local date is that
+        # day's earliest block = the start-of-day value. After DCC settlement
+        # every block in a day carries the same schedule value anyway, so this
+        # only differs from the old MAX on a genuine mid-day change boundary,
+        # where start-of-day is the correct billing choice.
         daily_sc: dict = {}
         for sc_row in sc_rows:
             local_d = (datetime.fromisoformat(sc_row["block_start"])
@@ -1462,8 +2371,11 @@ class BlockStore:
                        .astimezone(tz)
                        .strftime("%Y-%m-%d"))
             sc_val = float(sc_row["standing_charge"] or 0)
-            if local_d not in daily_sc or sc_val > daily_sc[local_d]:
-                daily_sc[local_d] = sc_val
+            if sc_val > 0:
+                if not daily_sc.get(local_d):       # unset or still 0
+                    daily_sc[local_d] = sc_val
+            elif local_d not in daily_sc:
+                daily_sc[local_d] = 0.0
         standing = round(sum(daily_sc.values()), 4)
 
         return {
@@ -1758,6 +2670,8 @@ class BlockStore:
             protected   = 1 if meta.get("protected") else 0
             inv_poss    = 1 if (meta.get("meter_type") == "battery" or meta.get("inverter_possible")) else 0
             power_s     = meta.get("power_sensor")
+            power_src   = meta.get("power_source")
+            rate_src    = meta.get("rate_source")
             postcode    = meta.get("postcode_prefix")
             v2x         = 1 if meta.get("v2x_capable") else 0
             meter_type  = meta.get("meter_type")
@@ -1770,10 +2684,10 @@ class BlockStore:
                 """INSERT INTO meters
                        (config_period_id, meter_id, is_sub_meter, parent_meter_id,
                         device_label, protected, inverter_possible,
-                        power_sensor, postcode_prefix, v2x_capable,
+                        power_sensor, power_source, postcode_prefix, v2x_capable,
                         meter_type, soc_sensor, inverter_power_sensor, inverter_power_invert,
-                        device_power_sensor)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        device_power_sensor, rate_source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(config_period_id, meter_id) DO UPDATE SET
                        is_sub_meter            = excluded.is_sub_meter,
                        parent_meter_id         = excluded.parent_meter_id,
@@ -1781,6 +2695,8 @@ class BlockStore:
                        protected               = excluded.protected,
                        inverter_possible       = excluded.inverter_possible,
                        power_sensor            = excluded.power_sensor,
+                       power_source            = excluded.power_source,
+                       rate_source             = excluded.rate_source,
                        postcode_prefix         = excluded.postcode_prefix,
                        v2x_capable             = excluded.v2x_capable,
                        meter_type              = excluded.meter_type,
@@ -1791,8 +2707,8 @@ class BlockStore:
                        retired_at              = COALESCE(meters.retired_at, excluded.retired_at),
                        retired_reason          = COALESCE(meters.retired_reason, excluded.retired_reason)""",
                 (period_id, meter_id, is_sub, parent, device,
-                 protected, inv_poss, power_s, postcode, v2x,
-                 meter_type, soc_s, inv_pwr_s, inv_invert, dev_pwr_s)
+                 protected, inv_poss, power_s, power_src, postcode, v2x,
+                 meter_type, soc_s, inv_pwr_s, inv_invert, dev_pwr_s, rate_src)
             )
             meter_row_id = cur.lastrowid or self._conn.execute(
                 "SELECT id FROM meters WHERE config_period_id=? AND meter_id=?",
@@ -1804,14 +2720,17 @@ class BlockStore:
                 self._conn.execute(
                     """INSERT INTO meter_channels
                            (meter_id, channel, read_sensor, rate_sensor,
-                            standing_charge_sensor, mpan, tariff)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                            standing_charge_sensor, mpan, tariff,
+                            rate_source, standing_charge_source)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(meter_id, channel) DO UPDATE SET
                            read_sensor            = excluded.read_sensor,
                            rate_sensor            = excluded.rate_sensor,
                            standing_charge_sensor = excluded.standing_charge_sensor,
                            mpan                   = excluded.mpan,
-                           tariff                 = excluded.tariff""",
+                           tariff                 = excluded.tariff,
+                           rate_source            = excluded.rate_source,
+                           standing_charge_source = excluded.standing_charge_source""",
                     (
                         meter_row_id, channel,
                         ch_cfg.get("read"),
@@ -1819,6 +2738,8 @@ class BlockStore:
                         ch_cfg.get("standing_charge_sensor"),
                         ch_meta.get("mpan"),
                         ch_meta.get("tariff"),
+                        ch_cfg.get("rate_source"),
+                        ch_cfg.get("standing_charge_source"),
                     )
                 )
 
@@ -1861,6 +2782,13 @@ class BlockStore:
                 meta["inverter_possible"] = True
             if m["power_sensor"]:
                 meta["power_sensor"] = m["power_sensor"]
+            try:
+                if m["power_source"]:
+                    meta["power_source"] = m["power_source"]
+                if m["rate_source"]:
+                    meta["rate_source"] = m["rate_source"]
+            except (KeyError, IndexError):
+                pass
             if m["postcode_prefix"]:
                 meta["postcode_prefix"] = m["postcode_prefix"]
             if m["v2x_capable"]:
@@ -1895,6 +2823,15 @@ class BlockStore:
                     ch_dict["rate"] = ch["rate_sensor"]
                 if ch["standing_charge_sensor"]:
                     ch_dict["standing_charge_sensor"] = ch["standing_charge_sensor"]
+                # 3.0.0 per-channel source toggles (API vs sensor; 'main' = device
+                # inherits the main meter's effective rate). Guarded for older DBs.
+                try:
+                    if ch["rate_source"]:
+                        ch_dict["rate_source"] = ch["rate_source"]
+                    if ch["standing_charge_source"]:
+                        ch_dict["standing_charge_source"] = ch["standing_charge_source"]
+                except (KeyError, IndexError):
+                    pass
                 # mpan / tariff as channel meta dict (preserves engine-expected shape)
                 ch_meta = {}
                 if ch["mpan"]:
@@ -1904,6 +2841,18 @@ class BlockStore:
                 if ch_meta:
                     ch_dict["meta"] = ch_meta
                 channels[ch["channel"]] = ch_dict
+
+            # Engine compatibility: the overlay path reads meta["rate_source"].
+            # For a device, derive it from the (authoritative) import-channel
+            # source so the existing engine honours the explicit choice:
+            #   'main'   → 'overlay' (price on the main meter's effective rate)
+            #   'sensor' → 'own'     (the device's own rate sensor wins)
+            if meta.get("sub_meter"):
+                _imp_src = (channels.get("import") or {}).get("rate_source")
+                if _imp_src == "main":
+                    meta["rate_source"] = "overlay"
+                elif _imp_src == "sensor":
+                    meta["rate_source"] = "own"
 
             meters_out[mid] = {"meta": meta, "channels": channels}
 
@@ -2302,7 +3251,9 @@ class BlockStore:
                 imp_read_start, imp_read_end,
                 exp_kwh, exp_rate, exp_cost,
                 exp_read_start, exp_read_end,
-                standing_charge, carbon_g, imp_provisional
+                standing_charge, carbon_g, carbon_intensity_g, imp_provisional,
+                source, is_provisional, needs_pass2_rerun, imp_kwh_api, needs_review,
+                exp_kwh_api
             ) VALUES (
                 :block_start, :block_end,
                 :meter_id, :config_period_id, :interpolated,
@@ -2311,7 +3262,9 @@ class BlockStore:
                 :imp_read_start, :imp_read_end,
                 :exp_kwh, :exp_rate, :exp_cost,
                 :exp_read_start, :exp_read_end,
-                :standing_charge, :carbon_g, :imp_provisional
+                :standing_charge, :carbon_g, :carbon_intensity_g, :imp_provisional,
+                :source, :is_provisional, :needs_pass2_rerun, :imp_kwh_api, :needs_review,
+                :exp_kwh_api
             )
         """
         with self._conn:
@@ -2331,7 +3284,9 @@ class BlockStore:
                 imp_read_start, imp_read_end,
                 exp_kwh, exp_rate, exp_cost,
                 exp_read_start, exp_read_end,
-                standing_charge, carbon_g, imp_provisional
+                standing_charge, carbon_g, carbon_intensity_g, imp_provisional,
+                source, is_provisional, needs_pass2_rerun, imp_kwh_api, needs_review,
+                exp_kwh_api
             ) VALUES (
                 :block_start, :block_end,
                 :meter_id, :config_period_id, :interpolated,
@@ -2340,7 +3295,9 @@ class BlockStore:
                 :imp_read_start, :imp_read_end,
                 :exp_kwh, :exp_rate, :exp_cost,
                 :exp_read_start, :exp_read_end,
-                :standing_charge, :carbon_g, :imp_provisional
+                :standing_charge, :carbon_g, :carbon_intensity_g, :imp_provisional,
+                :source, :is_provisional, :needs_pass2_rerun, :imp_kwh_api, :needs_review,
+                :exp_kwh_api
             )
         """
         with self._conn:
@@ -2424,7 +3381,8 @@ class BlockStore:
         return self._select_blocks("", ())
 
     def get_blocks_lightweight(self, utc_start: str | None = None,
-                                utc_end: str | None = None) -> list[dict]:
+                                utc_end: str | None = None,
+                                finalised_only: bool = False) -> list[dict]:
         """
         Lightweight block fetch for chart generation — returns minimal dicts
         without full _rows_to_blocks reconstruction. Significantly faster than
@@ -2447,13 +3405,17 @@ class BlockStore:
             where = "WHERE b.block_start >= ?"
             params = [utc_start]
 
+        if finalised_only:
+            where = (where + " AND b.is_provisional = 0") if where \
+                    else "WHERE b.is_provisional = 0"
+
         rows = self._conn.execute(
             f"""SELECT b.block_start, b.meter_id,
                        b.imp_kwh, b.imp_kwh_grid, b.imp_kwh_remainder,
                        b.imp_rate, b.imp_cost, b.imp_read_start, b.imp_read_end,
                        b.exp_kwh, b.exp_rate, b.exp_cost,
                        b.exp_read_start, b.exp_read_end,
-                       b.standing_charge, b.carbon_g, b.interpolated,
+                       b.standing_charge, b.carbon_g, b.carbon_intensity_g, b.interpolated,
                        m.is_sub_meter, m.parent_meter_id, m.device_label,
                        m.inverter_possible, m.meter_type,
                        cp.billing_day, cp.block_minutes, cp.timezone,
@@ -2496,6 +3458,35 @@ class BlockStore:
             imp = float(row["imp_kwh"] or 0)
             exp = float(row["exp_kwh"] or 0)
 
+            imp_channel = {
+                "kwh":           imp,
+                "cost":          float(row["imp_cost"] or 0),
+                "read_start":    row["imp_read_start"],
+                "read_end":      row["imp_read_end"],
+            }
+            # Only include kwh_grid / kwh_remainder / rate when actually set in
+            # the DB. _row_to_block omits these when NULL; get_blocks_lightweight
+            # must do the same, otherwise a present-but-None key makes downstream
+            # membership tests (`if "kwh_remainder" in channel`) read None as 0,
+            # zeroing a real import on no-sub-meter setups (the "cost but no kWh"
+            # billing bug). kwh_grid/kwh_remainder are only set by PASS 2 when
+            # sub-meters exist; on a sub-less main meter they are legitimately NULL.
+            if row["imp_kwh_grid"] is not None:
+                imp_channel["kwh_grid"] = float(row["imp_kwh_grid"])
+            if row["imp_kwh_remainder"] is not None:
+                imp_channel["kwh_remainder"] = float(row["imp_kwh_remainder"])
+            if row["imp_rate"] is not None:
+                imp_channel["rate"] = float(row["imp_rate"])
+
+            exp_channel = {
+                "kwh":        exp,
+                "cost":       float(row["exp_cost"] or 0),
+                "read_start": row["exp_read_start"],
+                "read_end":   row["exp_read_end"],
+            }
+            if row["exp_rate"] is not None:
+                exp_channel["rate"] = float(row["exp_rate"])
+
             b["meters"][mid] = {
                 "meta": {
                     "sub_meter":        is_sub,
@@ -2508,6 +3499,7 @@ class BlockStore:
                     "currency_symbol":  row["currency_symbol"],
                 },
                 "carbon_g":      row["carbon_g"],
+                "carbon_intensity_g": row["carbon_intensity_g"],
                 "imp_kwh":       imp,
                 "exp_kwh":       exp,
                 "imp_cost":      float(row["imp_cost"] or 0),
@@ -2515,22 +3507,8 @@ class BlockStore:
                 "standing_charge": float(row["standing_charge"] or 0),
                 "interpolated":  bool(row["interpolated"]),
                 "channels": {
-                    "import": {
-                        "kwh":           imp,
-                        "kwh_grid":      float(row["imp_kwh_grid"] or 0) if row["imp_kwh_grid"] is not None else None,
-                        "kwh_remainder": float(row["imp_kwh_remainder"] or 0) if row["imp_kwh_remainder"] is not None else None,
-                        "rate":          float(row["imp_rate"]) if row["imp_rate"] is not None else None,
-                        "cost":          float(row["imp_cost"] or 0),
-                        "read_start":    row["imp_read_start"],
-                        "read_end":      row["imp_read_end"],
-                    },
-                    "export": {
-                        "kwh":        exp,
-                        "rate":       float(row["exp_rate"]) if row["exp_rate"] is not None else None,
-                        "cost":       float(row["exp_cost"] or 0),
-                        "read_start": row["exp_read_start"],
-                        "read_end":   row["exp_read_end"],
-                    },
+                    "import": imp_channel,
+                    "export": exp_channel,
                 },
             }
 
@@ -2594,37 +3572,55 @@ class BlockStore:
     def get_blocks_for_range(self,
                              start: datetime,
                              end: datetime,
-                             meter_id: Optional[str] = None) -> list[dict]:
+                             meter_id: Optional[str] = None,
+                             finalised_only: bool = False) -> list[dict]:
         """Return blocks within [start, end], optionally filtered by meter."""
         start_iso = start.isoformat()
         end_iso   = end.isoformat()
+        fin = self._finalised_clause(finalised_only)
         if meter_id:
             return self._select_blocks(
-                "WHERE b.block_start >= ? AND b.block_start <= ? AND b.meter_id = ?",
+                "WHERE b.block_start >= ? AND b.block_start <= ? AND b.meter_id = ?" + fin,
                 (start_iso, end_iso, meter_id)
             )
         return self._select_blocks(
-            "WHERE b.block_start >= ? AND b.block_start <= ?",
+            "WHERE b.block_start >= ? AND b.block_start <= ?" + fin,
             (start_iso, end_iso)
         )
 
     # ── UTC-based query methods ───────────────────────────────────────────────
 
+    def get_block_dict_by_start(self, block_start: str) -> Optional[dict]:
+        """Return the fully-reconstructed (joined) block dict for a single
+        block_start — all meters, with meta/channels and the 3.0.0 columns
+        (carbon_intensity_g, imp_kwh_api, is_provisional) surfaced.
+
+        Used by the DCC PASS 2+3b re-run, which needs the same dict shape that
+        _apply_pass2 / PASS 3b operate on in finalise_block. Returns None if no
+        block exists at that start.
+        """
+        blocks = self._select_blocks(
+            "WHERE b.block_start = ?", (block_start,)
+        )
+        return blocks[0] if blocks else None
+
     def get_blocks_for_utc_range(self, utc_start: str, utc_end: str,
-                                  meter_id: str | None = None) -> list[dict]:
+                                  meter_id: str | None = None,
+                                  finalised_only: bool = False) -> list[dict]:
         """
         Return all blocks where block_start >= utc_start AND block_start < utc_end.
         utc_start / utc_end are naive ISO strings (no tzinfo) matching DB format.
         Replaces get_blocks_for_local_date_range — use local_date_range_to_utc_bounds()
         to compute the UTC bounds from local date strings.
         """
+        fin = self._finalised_clause(finalised_only)
         if meter_id:
             return self._select_blocks(
-                "WHERE b.block_start >= ? AND b.block_start < ? AND b.meter_id = ?",
+                "WHERE b.block_start >= ? AND b.block_start < ? AND b.meter_id = ?" + fin,
                 (utc_start, utc_end, meter_id)
             )
         return self._select_blocks(
-            "WHERE b.block_start >= ? AND b.block_start < ?",
+            "WHERE b.block_start >= ? AND b.block_start < ?" + fin,
             (utc_start, utc_end)
         )
 

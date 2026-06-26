@@ -223,6 +223,33 @@ class TestSchema(unittest.TestCase):
         self.assertIsNotNone(cur.fetchone())
         store.close()
 
+    def test_busy_timeout_set(self):
+        # Critical for the two-connection (engine + web) WAL setup — without it,
+        # write contention raises "database is locked" instead of waiting.
+        store = new_store()
+        bt = store._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        self.assertEqual(bt, 5000)
+        store.close()
+
+    def test_no_open_transaction_after_init(self):
+        # Fresh-DB lock root cause: __init__ must leave the connection in a clean
+        # autocommit state (no lingering transaction), or the engine's startup
+        # wal_checkpoint(TRUNCATE) fails with "database table is locked".
+        import tempfile, os
+        p = tempfile.mktemp(suffix=".db")
+        try:
+            from block_store import BlockStore
+            store = BlockStore(p)
+            self.assertFalse(store._conn.in_transaction,
+                             "BlockStore.__init__ left an open transaction")
+            # The checkpoint that was failing on fresh DBs must now succeed.
+            store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            store.close()
+        finally:
+            for ext in ("", "-wal", "-shm"):
+                try: os.remove(p + ext)
+                except OSError: pass
+
     def test_foreign_keys_on(self):
         store = new_store()
         cur = store._conn.execute("PRAGMA foreign_keys")
@@ -290,6 +317,44 @@ class TestConfigPeriods(unittest.TestCase):
         self.assertEqual(imp.get("read"), orig_imp.get("read"))
         self.assertEqual(imp.get("rate"), orig_imp.get("rate"))
 
+    def test_power_source_marker_round_trips(self):
+        """The Octopus Mini opt-in marker (meta.power_source) must survive the
+        DB write/read round-trip — it has a dedicated column, not a generic blob."""
+        import copy
+        cfg = copy.deepcopy(EXAMPLE_CONFIG)
+        cfg["meters"]["electricity_main"]["meta"]["power_source"] = "mini"
+        self.store.insert_config_period(cfg)
+        period_id = self.store.get_current_config_period_id()
+        restored = self.store.config_from_db(period_id)
+        self.assertEqual(
+            restored["meters"]["electricity_main"]["meta"].get("power_source"), "mini")
+        # And clearing it round-trips to absent (not stale "mini")
+        cfg2 = copy.deepcopy(EXAMPLE_CONFIG)
+        cfg2["meters"]["electricity_main"]["meta"].pop("power_source", None)
+        self.store.insert_config_period(cfg2)
+        restored2 = self.store.config_from_db(self.store.get_current_config_period_id())
+        self.assertNotIn(
+            "power_source", restored2["meters"]["electricity_main"]["meta"])
+
+    def test_rate_source_marker_round_trips(self):
+        """The per-device 'use overlay' marker (meta.rate_source) must survive the
+        DB write/read round-trip — dedicated column, like power_source."""
+        import copy
+        cfg = copy.deepcopy(EXAMPLE_CONFIG)
+        cfg["meters"]["electricity_main"]["meta"]["rate_source"] = "base"
+        self.store.insert_config_period(cfg)
+        period_id = self.store.get_current_config_period_id()
+        restored = self.store.config_from_db(period_id)
+        self.assertEqual(
+            restored["meters"]["electricity_main"]["meta"].get("rate_source"), "base")
+        # Clearing it round-trips to absent (engine then applies its default).
+        cfg2 = copy.deepcopy(EXAMPLE_CONFIG)
+        cfg2["meters"]["electricity_main"]["meta"].pop("rate_source", None)
+        self.store.insert_config_period(cfg2)
+        restored2 = self.store.config_from_db(self.store.get_current_config_period_id())
+        self.assertNotIn(
+            "rate_source", restored2["meters"]["electricity_main"]["meta"])
+
     def test_second_config_period_closes_first(self):
         self.store.insert_config_period(EXAMPLE_CONFIG,
                                         effective_from="2026-01-01T00:00:00")
@@ -349,6 +414,57 @@ class TestConfigPeriods(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests: append and read blocks
 # ─────────────────────────────────────────────────────────────────────────────
+
+class TestFinaliseHorizon(unittest.TestCase):
+    """Past-horizon limbo-block finalisation (finalised-from-CAD flag): drains the
+    unsettled count without faking DCC settlement, and is reversible."""
+
+    def setUp(self):
+        self.store = BlockStore(":memory:")
+        self.store.insert_config_period(EXAMPLE_CONFIG)
+
+    def _add(self, start_iso, imp_kwh=0.5):
+        self.store.append_block(make_block(start_iso, imp_kwh=imp_kwh))
+
+    def test_finalise_marks_only_old_unsettled(self):
+        old, recent = "2026-05-01T00:00:00", "2026-06-09T00:00:00"
+        self._add(old); self._add(recent)
+        self.assertEqual(self.store.count_unsettled_blocks(), 2)
+        n = self.store.finalise_past_horizon_blocks("2026-05-28T00:00:00")
+        self.assertEqual(n, 1)                                   # only the old one
+        self.assertEqual(self.store.count_unsettled_blocks(), 1)  # recent still counts
+        starts = [r["block_start"] for r in self.store.get_unsettled_blocks()]
+        self.assertIn(recent, starts)
+        self.assertNotIn(old, starts)                            # excluded from the list
+
+    def test_finalise_idempotent(self):
+        self._add("2026-05-01T00:00:00")
+        self.assertEqual(
+            self.store.finalise_past_horizon_blocks("2026-05-28T00:00:00"), 1)
+        self.assertEqual(
+            self.store.finalise_past_horizon_blocks("2026-05-28T00:00:00"), 0)  # re-run: none
+
+    def test_finalise_skips_settled(self):
+        old = "2026-05-01T00:00:00"
+        self._add(old)
+        self.store.upsert_kraken_block(old, "electricity_main", 0.5, billing_source="api")
+        self.assertEqual(
+            self.store.finalise_past_horizon_blocks("2026-05-28T00:00:00"), 0)  # already DCC
+
+    def test_settlement_clears_finalised_flag(self):
+        # Reversibility: a real DCC settlement landing later supersedes the
+        # CAD finalisation (imp_kwh_api set, flag cleared).
+        old = "2026-05-01T00:00:00"
+        self._add(old)
+        self.store.finalise_past_horizon_blocks("2026-05-28T00:00:00")
+        self.assertEqual(self.store.count_unsettled_blocks(), 0)   # finalised → not counted
+        self.store.upsert_kraken_block(old, "electricity_main", 0.5, billing_source="api")
+        row = self.store._conn.execute(
+            "SELECT imp_kwh_api, finalised_from_cad FROM blocks WHERE block_start=?",
+            (old,)).fetchone()
+        self.assertIsNotNone(row["imp_kwh_api"])        # real settlement landed
+        self.assertEqual(row["finalised_from_cad"], 0)  # flag cleared
+
 
 class TestAppendBlock(unittest.TestCase):
 
@@ -1092,6 +1208,39 @@ class TestBillingTotalsVsBlockMethod(unittest.TestCase):
         self.assertAlmostEqual(sql_t["standing"], 1.50, places=3,
                                msg="Standing charge should be summed once per local day")
 
+    def test_standing_charge_decrease_uses_start_of_day(self):
+        """If the standing charge DECREASES mid-day, billing must use the
+        start-of-day value, not MAX (which would over-bill the old higher one)."""
+        # Day with an early block at 0.60 then a later block at 0.40 (a decrease).
+        self._insert_block("2026-03-01T00:00:00", 1.0, 0.245, 0.0, 0.0, 0.60)
+        self._insert_block("2026-03-01T12:00:00", 1.0, 0.245, 0.0, 0.0, 0.40)
+        utc_s, utc_e = local_date_range_to_utc_bounds("2026-03-01", "2026-03-01", "Europe/London")
+        t = self.store.get_billing_totals_for_utc_range(utc_s, utc_e, "Europe/London")
+        # Start-of-day = 0.60 (the earliest block). MAX would also give 0.60 here,
+        # so make the discriminating case explicit below.
+        self.assertAlmostEqual(t["standing"], 0.60, places=3)
+
+    def test_standing_charge_increase_uses_start_of_day_not_max(self):
+        """The discriminating case: charge INCREASES mid-day. MAX would pick the
+        later higher value; start-of-day must pick the earlier lower one."""
+        self._insert_block("2026-03-01T00:00:00", 1.0, 0.245, 0.0, 0.0, 0.40)
+        self._insert_block("2026-03-01T12:00:00", 1.0, 0.245, 0.0, 0.0, 0.60)
+        utc_s, utc_e = local_date_range_to_utc_bounds("2026-03-01", "2026-03-01", "Europe/London")
+        t = self.store.get_billing_totals_for_utc_range(utc_s, utc_e, "Europe/London")
+        # Start-of-day = 0.40 (earliest). Old MAX logic would have given 0.60.
+        self.assertAlmostEqual(t["standing"], 0.40, places=3,
+                               msg="Must use start-of-day (0.40), not MAX (0.60)")
+
+    def test_standing_charge_leading_zero_not_shadowing(self):
+        """A leading zero (e.g. early gap-filled block) must NOT shadow the real
+        charge — first NON-zero of the day wins."""
+        self._insert_block("2026-03-01T00:00:00", 0.0, 0.0, 0.0, 0.0, 0.0)   # gap-fill
+        self._insert_block("2026-03-01T01:00:00", 1.0, 0.245, 0.0, 0.0, 0.50)
+        utc_s, utc_e = local_date_range_to_utc_bounds("2026-03-01", "2026-03-01", "Europe/London")
+        t = self.store.get_billing_totals_for_utc_range(utc_s, utc_e, "Europe/London")
+        self.assertAlmostEqual(t["standing"], 0.50, places=3,
+                               msg="Leading zero must not shadow the real charge")
+
     def test_standing_charge_bst_boundary(self):
         """Block at 23:00 UTC = 00:00 BST next day should count for the BST day."""
         from datetime import datetime
@@ -1126,6 +1275,117 @@ class TestBillingTotalsVsBlockMethod(unittest.TestCase):
         blocks_utc = self.store.get_blocks_for_range(datetime(2026,4,2,0,0,0), datetime(2026,4,2,23,59,59))
         self.assertEqual(len(blocks_utc), 1,
                          "get_blocks_for_range misses the 23:00 UTC block (known limitation)")
+
+
+class TestMixedSourceBilling(unittest.TestCase):
+    """A billing period that spans a data-source-mode change (Change Setup, or
+    DCC settlement catching up) contains a MIX of block origins:
+      - cad blocks  (source='ha_sensor'): kWh in imp_kwh, grid/remainder NULL
+      - DCC blocks  (source='kraken_api', settled): authoritative kWh in
+        imp_kwh_grid, with a DIFFERENT provisional value left in imp_kwh
+      - Mini blocks (source='kraken_mini', provisional): kWh in imp_kwh only
+
+    The billing aggregation is source-agnostic — it must pick the right kWh per
+    block via COALESCE(imp_kwh_remainder, imp_kwh_grid, imp_kwh) and sum the
+    materialised imp_cost, with no double-count, no omission, and standing charge
+    once per local day across the mode boundary. This pins that behaviour (the
+    mixed case was never previously exercised — the reconciliation harness leaves
+    imp_kwh_grid/imp_kwh_remainder NULL on every block).
+    """
+
+    def setUp(self):
+        self.store = BlockStore(":memory:")
+        self.store.insert_config_period({"meters": {"electricity_main": {"meta": {
+            "billing_day": 1, "block_minutes": 30, "timezone": "Europe/London",
+            "currency_symbol": "£", "currency_code": "GBP", "site": "Home",
+        }}}})
+        self.cp = self.store._conn.execute(
+            "SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+
+    def _insert(self, start, *, imp_kwh=None, imp_kwh_grid=None,
+                imp_kwh_remainder=None, imp_cost=0.0, exp_kwh=0.0, exp_cost=0.0,
+                standing=0.50, source=None, is_provisional=0, imp_kwh_api=None):
+        from datetime import datetime, timedelta
+        end = (datetime.fromisoformat(start) + timedelta(minutes=30)).isoformat()
+        self.store._conn.execute(
+            """INSERT INTO blocks
+               (block_start, block_end, meter_id, config_period_id, interpolated,
+                imp_kwh, imp_kwh_grid, imp_kwh_remainder, imp_rate, imp_cost,
+                exp_kwh, exp_rate, exp_cost, standing_charge,
+                source, is_provisional, imp_kwh_api)
+               VALUES (?,?,?,?,0, ?,?,?,NULL,?, ?,NULL,?, ?, ?,?,?)""",
+            (start, end, "electricity_main", self.cp,
+             imp_kwh, imp_kwh_grid, imp_kwh_remainder, imp_cost,
+             exp_kwh, exp_cost, standing, source, is_provisional, imp_kwh_api))
+        self.store._conn.commit()
+
+    def test_mixed_cad_api_mini_period_bills_correctly(self):
+        # A period spanning a mode change contains blocks of different ORIGIN, but
+        # data-source mode is invisible to billing: on a sub-less meter every
+        # origin stores its billable kWh in imp_kwh (DCC settlement writes the
+        # authoritative value into imp_kwh/kwh_total — engine.py reconstruct), so
+        # the aggregation simply sums imp_kwh across origins.
+        # Day 1 — cad (ha_sensor): kWh from local reads.
+        self._insert("2026-03-04T00:00:00", imp_kwh=1.0, imp_cost=0.30,
+                     source="ha_sensor")
+        self._insert("2026-03-04T00:30:00", imp_kwh=1.5, imp_cost=0.45,
+                     source="ha_sensor")
+        # Day 2 — DCC-settled (kraken_api): authoritative kWh normalised into
+        # imp_kwh by settlement (grid/remainder NULL on a sub-less meter).
+        self._insert("2026-03-05T00:00:00", imp_kwh=2.0, imp_cost=0.60,
+                     source="kraken_api", imp_kwh_api=2.0)
+        self._insert("2026-03-05T00:30:00", imp_kwh=2.0, imp_cost=0.60,
+                     source="kraken_api", imp_kwh_api=2.0)
+        # Day 2 — recent Mini provisional block (kraken_mini, not yet settled).
+        self._insert("2026-03-05T01:00:00", imp_kwh=0.5, imp_cost=0.16,
+                     source="kraken_mini", is_provisional=1)
+
+        utc_s, utc_e = local_date_range_to_utc_bounds(
+            "2026-03-04", "2026-03-05", "Europe/London")
+        t = self.store.get_billing_totals_for_utc_range(utc_s, utc_e, "Europe/London")
+
+        self.assertAlmostEqual(t["imp_kwh"], 1.0+1.5+2.0+2.0+0.5, places=4,
+            msg="Mixed-origin period must sum every block's imp_kwh (7.0) — "
+                "data-source mode is invisible to billing")
+        self.assertAlmostEqual(t["imp_cost"], 0.30+0.45+0.60+0.60+0.16, places=4)
+        self.assertAlmostEqual(t["standing"], 1.00, places=4,
+            msg="Standing charge once per local day across the mode boundary")
+
+    def test_source_column_does_not_affect_billing_total(self):
+        # Same kWh/cost, three different source tags → identical billing total.
+        for src in ("ha_sensor", "kraken_api", "kraken_mini"):
+            st = BlockStore(":memory:")
+            st.insert_config_period({"meters": {"electricity_main": {"meta": {
+                "billing_day": 1, "block_minutes": 30, "timezone": "Europe/London",
+                "currency_symbol": "£", "currency_code": "GBP", "site": "Home"}}}})
+            cp = st._conn.execute("SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+            st._conn.execute(
+                """INSERT INTO blocks (block_start, block_end, meter_id,
+                   config_period_id, interpolated, imp_kwh, imp_cost,
+                   standing_charge, source)
+                   VALUES (?,?,?,?,0,?,?,?,?)""",
+                ("2026-03-04T00:00:00", "2026-03-04T00:30:00", "electricity_main",
+                 cp, 2.0, 0.60, 0.50, src))
+            st._conn.commit()
+            utc_s, utc_e = local_date_range_to_utc_bounds(
+                "2026-03-04", "2026-03-04", "Europe/London")
+            t = st.get_billing_totals_for_utc_range(utc_s, utc_e, "Europe/London")
+            self.assertAlmostEqual(t["imp_kwh"], 2.0, places=4,
+                msg=f"source={src} must bill identically (mode-invisible)")
+            self.assertAlmostEqual(t["imp_cost"], 0.60, places=4)
+
+    def test_billing_kwh_coalesce_priority(self):
+        # Contract of the aggregation's kWh selection: remainder > grid > raw.
+        # (On the main meter PASS 2 sets remainder+grid together for sub-meter
+        # periods; this pins the priority so a future change can't silently flip
+        # which column bills.)
+        self._insert("2026-03-04T00:00:00", imp_kwh=3.0, imp_kwh_grid=2.5,
+                     imp_kwh_remainder=2.0, imp_cost=0.55, source="kraken_api")
+        utc_s, utc_e = local_date_range_to_utc_bounds(
+            "2026-03-04", "2026-03-04", "Europe/London")
+        t = self.store.get_billing_totals_for_utc_range(utc_s, utc_e, "Europe/London")
+        self.assertAlmostEqual(t["imp_kwh"], 2.0, places=4,
+            msg="remainder (2.0) must win over grid (2.5) and raw (3.0)")
 
 
 if __name__ == "__main__":
@@ -2157,10 +2417,15 @@ class TestBlockDeletion(unittest.TestCase):
         self.assertEqual(r["dates"], 2)
 
     def test_count_preview_single_meter(self):
+        # Counting (or deleting) a MAIN meter now includes its sub-meters, so the
+        # two 2026-03-01 main blocks plus its ev_charger block = 3.
         store = self._make_store()
         r = store.count_blocks_for_date_range("2026-03-01", "2026-03-01", "electricity_main")
-        self.assertEqual(r["blocks"], 2)
+        self.assertEqual(r["blocks"], 3)
         self.assertEqual(r["dates"], 1)
+        # A device on its own counts only itself.
+        rd = store.count_blocks_for_date_range("2026-03-01", "2026-03-01", "ev_charger")
+        self.assertEqual(rd["blocks"], 1)
 
     def test_count_preview_no_match(self):
         store = self._make_store()
@@ -3893,3 +4158,37 @@ class TestProvisionalBlocks(unittest.TestCase):
         """get_provisional_sub_meter_blocks returns [] on a fresh store."""
         result = self.store.get_provisional_sub_meter_blocks()
         self.assertEqual(result, [])
+
+class TestDeleteKrakenState(unittest.TestCase):
+    """delete_kraken_state removes a marker entirely (used by disconnect to wipe
+    API-derived progress state), without disturbing other keys."""
+
+    def setUp(self):
+        import sys, types
+        eio = types.ModuleType("energy_engine_io"); eio.load_json = lambda *a, **kw: {}
+        sys.modules.setdefault("energy_engine_io", eio)
+        self.store = BlockStore(":memory:")
+
+    def tearDown(self):
+        try:
+            self.store.close()
+        except Exception:
+            pass
+
+    def test_delete_removes_key(self):
+        self.store.set_kraken_state("last_poll_utc", "2026-06-10T06:00:00Z")
+        self.assertEqual(self.store.get_kraken_state("last_poll_utc"), "2026-06-10T06:00:00Z")
+        self.store.delete_kraken_state("last_poll_utc")
+        self.assertIsNone(self.store.get_kraken_state("last_poll_utc"))
+
+    def test_delete_absent_key_is_noop(self):
+        # Must not raise on a key that was never set.
+        self.store.delete_kraken_state("never_set")
+        self.assertIsNone(self.store.get_kraken_state("never_set"))
+
+    def test_delete_leaves_other_keys(self):
+        self.store.set_kraken_state("billing_source", "dcc")
+        self.store.set_kraken_state("last_poll_utc", "x")
+        self.store.delete_kraken_state("last_poll_utc")
+        self.assertIsNone(self.store.get_kraken_state("last_poll_utc"))
+        self.assertEqual(self.store.get_kraken_state("billing_source"), "dcc")
