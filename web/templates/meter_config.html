@@ -2071,8 +2071,7 @@ function wizStepCredentials() {
       '<input id="wiz-api-key" type="password" autocomplete="off" placeholder="' +
       (onFile ? '•••••••• saved — leave blank to keep' : 'sk_live_…') + '" ' +
       'value="' + esc(wiz.data.apiKey || '') + '"></div>' +
-    '<div class="form-group"><label>Account number ' +
-      '<span style="color:var(--muted);font-weight:400;">(optional — auto-detected)</span></label>' +
+    '<div class="form-group"><label>Account number</label>' +
       '<input id="wiz-api-account" type="text" autocomplete="off" placeholder="A-XXXXXXXX" ' +
       'value="' + esc(wiz.data.accountNumber || '') + '"></div>' +
     '<div id="wiz-api-status" style="font-size:13px;color:var(--muted);margin-top:8px;"></div>';
@@ -2251,7 +2250,7 @@ function wizStepSubSensors() {
     html += '<div style="border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:16px;">' +
       '<div style="font-weight:600;margin-bottom:12px;">' + deviceLabels[devId] + '</div>' +
       '<p style="color:var(--muted);font-size:12px;margin:0 0 12px;">' + deviceHints[devId] + '</p>' +
-      '<div class="form-group"><label>Device Name <span style="color:var(--muted);font-weight:400;">(optional)</span></label>' +
+      '<div class="form-group"><label>Device Name</label>' +
         '<input id="wiz-sub-' + devId + '-name" type="text" value="' + esc(sd.name) + '" placeholder="e.g. Tesla Charger"></div>' +
       '<div class="form-group"><label>Read Sensor — cumulative kWh</label>' +
         buildWizEntity('wiz-sub-' + devId + '-read', sd.read) + '</div>' +

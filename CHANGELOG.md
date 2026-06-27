@@ -1,5 +1,18 @@
 # Changelog
 
+## [3.0.1] — 2026-06-27
+
+*Post-release fixes for issues reported after 3.0.0.*
+
+### Fixed
+
+- **Confusing error after entering the Octopus API key (issue #217)** — the Setup Wizard's Account number field was labelled "(optional — auto-detected)", so users left it blank; when auto-detection couldn't resolve the account the result was an unhelpful error. The misleading hint is removed so the field reads plainly as the credential it is.
+- **Device name appeared optional when adding an EV / battery / heat pump (issue #218)** — the wizard's Device Name field was labelled "(optional)" even though a name is required (and was already enforced on submit), producing a confusing "name is optional, apparently" experience. The misleading "(optional)" label is removed; the genuinely-optional Site Name is unchanged.
+- **"This Bill" showed a stale historical date when the current period had no data yet (issue #221)** — on the Overview, when the most recent block predated the current billing period (so no generated period contained today), the "This Bill" card fell back to the last *historical* period and displayed an old date (e.g. an April period). It now synthesises the current billing period from your billing day and shows it — at £0.00 until data lands — instead of a past one. The billing-day arithmetic is also hardened so a billing day of 29–31 no longer breaks in shorter months.
+- **Generation Mix card overlapped its neighbour on the Overview (issue #223)** — with a live-power card plus three or more devices, the Overview switches to a grid layout whose 220 px columns were narrower than the 280 px Generation Mix card, so at some window widths the card overflowed its cell and overlapped the Live Power card instead of wrapping. The grid columns are widened to 280 px so the cards always wrap cleanly. (Live Power with two devices was unaffected and still is.)
+
+---
+
 ## [3.0.0] — 2026-06-21
 
 *The largest release since EMT began. v3 turns a meter-reading recorder into a billing-grade energy ledger: it can reconcile every block against the settled half-hourly data your supplier actually bills from (Octopus / Kraken DCC), understands Intelligent Octopus Go smart-charge slots, and accounts for grid carbon intensity across the whole app. This is a **major-additive release — nothing breaks**. Existing 2.x installs upgrade in place, keep behaving exactly as before, and switch the new capabilities on when they're ready. Everything new is opt-in through the Setup Wizard. See **Upgrading** at the foot of this entry.*
