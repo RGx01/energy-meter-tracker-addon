@@ -1188,16 +1188,28 @@ def api_billing():
                 period_start, period_end_excl = _bps, _bpe
                 break
         if period_start is None:
-            if _bp_periods:
-                period_start, period_end_excl = _bp_periods[-1]
+            # No generated period contains today. This happens when there are no
+            # periods at all, OR — the reported bug — when the most recent data
+            # predates the current billing period ("no current bill" yet, because
+            # the generator stops at the last block). In both cases "This Bill"
+            # must show the CURRENT period, even with £0 of data so far, not the
+            # last historical period (which surfaced as a stale date).
+            import calendar as _cal
+            bd = billing_day
+            _dim = _cal.monthrange(now_local.year, now_local.month)[1]
+            if now_local.day >= min(bd, _dim):
+                _sy, _sm = now_local.year, now_local.month
             else:
-                bd = billing_day
-                if now_local.day >= bd:
-                    period_start = now_local.replace(day=bd, hour=0, minute=0, second=0, microsecond=0)
-                else:
-                    m = now_local.month - 1 or 12
-                    y = now_local.year if now_local.month > 1 else now_local.year - 1
-                    period_start = now_local.replace(year=y, month=m, day=bd, hour=0, minute=0, second=0, microsecond=0)
+                _sm = now_local.month - 1 or 12
+                _sy = now_local.year if now_local.month > 1 else now_local.year - 1
+            _sdim = _cal.monthrange(_sy, _sm)[1]
+            period_start = now_local.replace(
+                year=_sy, month=_sm, day=min(bd, _sdim),
+                hour=0, minute=0, second=0, microsecond=0)
+            _ey, _em = (_sy + 1, 1) if _sm == 12 else (_sy, _sm + 1)
+            _edim = _cal.monthrange(_ey, _em)[1]
+            period_end_excl = period_start.replace(
+                year=_ey, month=_em, day=min(bd, _edim))
 
         # Derive local date strings for period boundaries
         if hasattr(period_start, 'tzinfo') and period_start.tzinfo is not None:
