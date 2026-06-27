@@ -818,6 +818,54 @@ class TestApiBilling(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# /api/billing — "This Bill" current-period selection (issue #221)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApiBillingCurrentPeriod(unittest.TestCase):
+    """Regression for #221: when no generated billing period contains today —
+    e.g. the newest data predates the current billing period, so the period
+    generator (which stops at the last block) never emits a period spanning
+    today — "This Bill" must synthesise the CURRENT period from the billing day,
+    not fall back to the last *historical* period (which previously surfaced as
+    a stale date, e.g. an April period)."""
+
+    def setUp(self):
+        self.client = make_client()
+        eio.load_json = lambda path, default=None: (
+            MINIMAL_CONFIG if "meters_config" in path else default)
+
+    def test_no_period_containing_today_shows_current_not_historical(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("Europe/London"))
+
+        # A billing period wholly in the previous year, in a month guaranteed to
+        # differ from the current month → nothing contains today, forcing the
+        # fallback path. Naive datetimes, matching get_billing_periods_*.
+        hist_month = (now.month % 12) + 1                     # always != now.month
+        h_start = datetime(now.year - 1, hist_month, 1)
+        h_end = (datetime(now.year, 1, 1) if hist_month == 12
+                 else datetime(now.year - 1, hist_month + 1, 1))
+
+        with patch.object(ec, "get_billing_periods_from_config_periods",
+                          lambda *a, **kw: [(h_start, h_end)]):
+            r = self.client.get("/api/billing")
+
+        self.assertEqual(r.status_code, 200)
+        mp = r.get_json()["month_period"]                    # "DD Mon → DD Mon YYYY"
+        current_label = now.replace(day=1).strftime("%d %b")  # billing_day = 1
+        historical_label = h_start.strftime("%d %b")
+
+        self.assertTrue(
+            mp.startswith(current_label),
+            f'"This Bill" should show the current period ({current_label!r}), got {mp!r}')
+        self.assertFalse(
+            mp.startswith(historical_label),
+            f'"This Bill" must not fall back to the historical period '
+            f'({historical_label!r}), got {mp!r}')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # /api/logs
 # ─────────────────────────────────────────────────────────────────────────────
 
