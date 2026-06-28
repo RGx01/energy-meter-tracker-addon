@@ -102,6 +102,22 @@ _EMT_GRAPHQL_FIELDS = {
 # breaks logic (telemetry grouping, live-device test, charging-device match).
 _EMT_GRAPHQL_ENUMS = _CHARGING_DEVICE_TYPES | {"TEN_SECONDS", "LIVE"}
 
+# Known same-NAME collisions: a deprecated field whose name is in the set above
+# but which sits on a (type, position) EMT never selects. Kept at (type, field)
+# granularity — NOT type-wide — so a real future deprecation of another field on
+# the same type (e.g. DeviceStatusType.current, which EMT *does* read) still
+# fires. Seeded from observed introspection; extend as new collisions surface.
+#   - DeviceStatusType.status   : EMT reads status{current} on the DEVICE, not
+#                                 the status field of DeviceStatusType itself.
+#   - HeatPumpDeviceType.deviceType : EMT reads deviceType at the device
+#                                 interface level; it has no heat pump.
+#   - TestCharge.status         : EMT never queries TestCharge.
+_DEPRECATION_IGNORE = {
+    ("DeviceStatusType", "status"),
+    ("HeatPumpDeviceType", "deviceType"),
+    ("TestCharge", "status"),
+}
+
 
 def _pick_device_provider(devices: list) -> Optional[str]:
     """Manufacturer/provider signal for the smart-charging device that drives
@@ -745,15 +761,24 @@ class KrakenAPIClient:
 
         types = ((data or {}).get("__schema") or {}).get("types") or []
         hits = []  # list of {kind, type, name, reason}
+        ignored = 0
         for t in types:
             tname = t.get("name") or "?"
             for f in (t.get("fields") or []):
                 if f.get("isDeprecated") and f.get("name") in _EMT_GRAPHQL_FIELDS:
+                    if (tname, f.get("name")) in _DEPRECATION_IGNORE:
+                        ignored += 1
+                        logger.debug("kraken_deprecation_check: ignoring known "
+                                     "name-collision %s.%s", tname, f.get("name"))
+                        continue
                     hits.append({"kind": "field", "type": tname,
                                  "name": f.get("name"),
                                  "reason": f.get("deprecationReason")})
             for ev in (t.get("enumValues") or []):
                 if ev.get("isDeprecated") and ev.get("name") in _EMT_GRAPHQL_ENUMS:
+                    if (tname, ev.get("name")) in _DEPRECATION_IGNORE:
+                        ignored += 1
+                        continue
                     hits.append({"kind": "enum", "type": tname,
                                  "name": ev.get("name"),
                                  "reason": ev.get("deprecationReason")})
@@ -761,12 +786,15 @@ class KrakenAPIClient:
         # Publish for the engine to surface (HA notification + sensor). None means
         # "never successfully checked"; [] means "checked, all clear".
         self.last_deprecations = hits
+        _ign = f" ({ignored} known name-collision(s) ignored)" if ignored else ""
         if not hits:
             logger.info(
                 "kraken_deprecation_check: no deprecations among the %d fields / "
-                "%d enum values EMT uses",
-                len(_EMT_GRAPHQL_FIELDS), len(_EMT_GRAPHQL_ENUMS))
+                "%d enum values EMT uses%s",
+                len(_EMT_GRAPHQL_FIELDS), len(_EMT_GRAPHQL_ENUMS), _ign)
             return
+        logger.warning("kraken_deprecation_check: %d deprecated field(s) EMT "
+                       "uses%s", len(hits), _ign)
         for h in hits:
             logger.warning(
                 "kraken_field_deprecated: %s %s.%s is deprecated — migrate "

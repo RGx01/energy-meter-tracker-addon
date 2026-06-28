@@ -4890,6 +4890,14 @@ async def _surface_kraken_deprecations(ha, deprecations: list) -> None:
     """
     if ha is None:
         return
+    # Respect dev-mode: publish_ha_sensors=false means this instance does not
+    # write to HA. The per-field kraken_field_deprecated WARNINGs were already
+    # logged (locally) by the client; here we only skip the HA-facing surface.
+    if not _PUBLISH_HA_SENSORS:
+        logger.info(
+            "_surface_kraken_deprecations: HA publishing disabled — %d "
+            "deprecation(s) logged only, not surfaced to HA", len(deprecations))
+        return
     _NOTIF_ID = "emt_api_deprecation"
     _SENSOR   = "sensor.energy_meter_tracker_api_deprecations"
     try:
