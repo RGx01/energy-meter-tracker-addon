@@ -1,5 +1,19 @@
 # Changelog
 
+## [3.0.3] — 2026-06-28
+
+*Resilience to Octopus/Kraken API changes — no functional change for current setups.*
+
+### Changed
+
+- **Future-proofed Intelligent dispatch detection** — moved off Octopus's deprecated `registeredKrakenflexDevice` API (which Octopus has scheduled for removal) to the current `devices` query. Smart-charge / dispatch provider detection keeps working once Octopus withdraws the old field.
+
+### Added
+
+- **API drift self-detection** — if an Octopus/Kraken schema change ever rejects a field the add-on depends on, it now logs a distinct `kraken_schema_drift` error pointing to the Octopus announcements page, instead of a generic "unavailable" message — so a broken query is obvious in the logs and quick to pin down.
+
+---
+
 ## [3.0.2] — 2026-06-28
 
 *Packaging and repository housekeeping — no functional changes. Faster to install and update.*

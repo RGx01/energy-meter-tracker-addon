@@ -42,6 +42,9 @@ _PAGE_SIZE = 1500      # consumption rows per page (API max is large; keep sane)
 # GraphQL rate-limit error code (Kraken). Surfaced in the errors[] array of an
 # otherwise-200 response. Verified against Octopus GraphQL guides.
 _GQL_RATE_LIMIT_CODE = "KT-CT-1199"
+# Kraken returns this code when a requested field has been disabled/removed —
+# the definitive "the schema changed under us" signal (drift canary).
+_GQL_DISABLED_FIELD_CODE = "KT-CT-1113"
 # Bounded exponential backoff for retryable GraphQL failures (rate limit,
 # HTTP 429/5xx, transient transport/timeout). Delays: 1, 2, 4, 8s (+jitter),
 # capped, then give up. Non-retryable errors (auth, other 4xx, logic) raise at once.
@@ -63,6 +66,84 @@ def _mask(value: Optional[str]) -> str:
     if len(s) <= 2:
         return "…"
     return s[0] + "…" + s[-1]
+
+
+# SmartFlex device classification — the IOG-controllable charging devices whose
+# manufacturer/provider drives dispatch behaviour (vs meters, batteries, heat pumps).
+_CHARGING_DEVICE_TYPES = {"ELECTRIC_VEHICLES", "CHARGE_POINTS"}
+_CHARGING_TYPENAMES = {"SmartFlexVehicle", "SmartFlexChargePoint"}
+
+
+def _pick_device_provider(devices: list) -> Optional[str]:
+    """Manufacturer/provider signal for the smart-charging device that drives
+    dispatch behaviour, from the polymorphic `devices` query.
+
+    The `devices` API splits what the deprecated registeredKrakenflexDevice
+    conflated: ``provider`` is the flex/control provider (often 'OCTOPUS_ENERGY'),
+    while the device manufacturer (MYENERGI, OHME, TESLA, …) is in ``make`` on the
+    vehicle/charge-point types. EMT's per-provider logic — notably OHME detection
+    via ``"OHME" in provider`` — keys on the manufacturer, so we surface ``make``
+    first and fall back to ``provider``.
+
+    Ranks candidates so a LIVE charging device (EV / charge point) wins over a
+    non-charging or non-LIVE one; returns None when the account has no device
+    carrying a signal.
+    """
+    best_rank = -1
+    best_signal = None
+    for dev in devices or []:
+        if not dev:
+            continue
+        signal = dev.get("make") or dev.get("provider")
+        if not signal:
+            continue
+        dtype = dev.get("deviceType") or ""
+        typename = dev.get("__typename") or ""
+        is_charging = (dtype in _CHARGING_DEVICE_TYPES
+                       or typename in _CHARGING_TYPENAMES)
+        is_live = ((dev.get("status") or {}).get("current") or "").upper() == "LIVE"
+        rank = (2 if is_charging else 0) + (1 if is_live else 0)
+        if rank > best_rank:
+            best_rank = rank
+            best_signal = signal
+    return best_signal
+
+
+def _operation_name(query: str) -> str:
+    """Best-effort GraphQL operation name (e.g. 'dispatches') for log context."""
+    for kw in ("query ", "mutation "):
+        i = (query or "").find(kw)
+        if i != -1:
+            rest = query[i + len(kw):].lstrip()
+            return (rest[:64].split("(")[0].split("{")[0].strip() or "?")
+    return "?"
+
+
+def _schema_drift_errors(errors: list) -> list:
+    """GraphQL errors that mean the *schema* changed under us — a field EMT
+    requests was renamed, removed, or disabled by Kraken. This is the signal a
+    Kraken API change has broken a query, as distinct from auth, rate-limit, or
+    resolution errors.
+
+    Note: an auth failure (KT-CT-1139) is itself classed VALIDATION, so we do NOT
+    key on the VALIDATION class. We rely on the disabled-field code (KT-CT-1113)
+    and GraphQL's unknown-field validation messages, which are specific to drift.
+    """
+    out = []
+    for e in errors or []:
+        ext = (e or {}).get("extensions") or {}
+        code = ext.get("errorCode") or ext.get("errorType") or ""
+        msg = (e.get("message") or "")
+        if (
+            code == _GQL_DISABLED_FIELD_CODE
+            or "Cannot query field" in msg
+            or "Unknown field" in msg
+            or "Unknown argument" in msg
+            or "Unknown type" in msg
+            or "isn't a defined" in msg
+        ):
+            out.append(e)
+    return out
 
 
 class KrakenAPIError(Exception):
@@ -472,6 +553,19 @@ class KrakenAPIClient:
             if _GQL_RATE_LIMIT_CODE in codes:
                 raise KrakenRateLimitError(
                     "GraphQL rate limit (KT-CT-1199)", status=429)
+            # Schema-drift canary: a renamed/removed/disabled field is how a Kraken
+            # API change first reaches us. Surface it LOUDLY and with a greppable
+            # token so it stands out from generic "unavailable" lines — this turns
+            # every running instance into a passive drift detector, no extra creds.
+            drift = _schema_drift_errors(errors)
+            if drift:
+                logger.error(
+                    "kraken_schema_drift: Octopus/Kraken rejected fields this query "
+                    "depends on — a schema change has likely broken it. Check "
+                    "https://developer.octopus.energy/announcements and migrate. "
+                    "operation=%s errors=%s",
+                    _operation_name(query),
+                    [d.get("message") for d in drift])
             msg = "; ".join(str(e.get("message", e)) for e in errors)
             raise KrakenAPIError(f"GraphQL error: {msg}")
         return payload.get("data", {}) or {}
@@ -611,17 +705,21 @@ class KrakenAPIClient:
         #    meta { location source }. meta.source now returns
         #    smart-charge/test-charge/bump-charge (or null/unknown) on PLANNED
         #    dispatches — the smart-vs-boost signal (incl. for OHME bump).
-        #  - the device carries 'provider'/'status'. NOTE: registeredKrakenflexDevice
-        #    is DEPRECATED by Kraken (moving to a 'devices' query); we request only
-        #    the confirmed scalar fields and tolerate it being absent/empty.
+        #  - provider comes from the `devices` query (polymorphic list; we read
+        #    the interface-level provider/deviceType/status{current}). This
+        #    REPLACES the deprecated registeredKrakenflexDevice, whose removal
+        #    Kraken announced for on/after 2026-03-01. Shape confirmed against the
+        #    Octopus GraphQL reference + the BottlecapDave integration's live query.
         query = (
             "query dispatches($acc: String!) {"
             "  plannedDispatches(accountNumber: $acc) {"
             "    startDt endDt delta meta { source location } }"
             "  completedDispatches(accountNumber: $acc) {"
             "    startDt endDt delta meta { source location } }"
-            "  registeredKrakenflexDevice(accountNumber: $acc) {"
-            "    provider status } }"
+            "  devices(accountNumber: $acc) {"
+            "    provider deviceType status { current } __typename"
+            "    ... on SmartFlexVehicle { make model }"
+            "    ... on SmartFlexChargePoint { make model } } }"
         )
         try:
             data = await self._graphql(query, {"acc": acct})
@@ -631,8 +729,20 @@ class KrakenAPIClient:
 
         planned_raw = data.get("plannedDispatches") or []
         completed_raw = data.get("completedDispatches") or []
-        device = data.get("registeredKrakenflexDevice") or {}
-        provider = device.get("provider")
+        devices = data.get("devices") or []
+        # Diagnostic: log the devices list (categories/brands only — no IDs/PII) so
+        # the chosen charging device + provider signal is verifiable from logs while
+        # this migration beds in. provider is the flex provider (e.g. OCTOPUS_ENERGY);
+        # make is the manufacturer (MYENERGI/OHME/…), which is what we key on.
+        if devices:
+            logger.info("get_dispatches: devices=%s", [
+                {"type": d.get("deviceType"), "make": d.get("make"),
+                 "provider": d.get("provider"), "kind": d.get("__typename"),
+                 "status": (d.get("status") or {}).get("current")}
+                for d in devices if d])
+        # devices replaced the deprecated registeredKrakenflexDevice; pick the
+        # smart-charging device's manufacturer signal (make, then provider).
+        provider = _pick_device_provider(devices)
 
         def _norm(d: dict) -> dict:
             # Normalise to stable keys: the API uses startDt/endDt; meta.source
