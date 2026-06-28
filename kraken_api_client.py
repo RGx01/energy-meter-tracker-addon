@@ -42,6 +42,9 @@ _PAGE_SIZE = 1500      # consumption rows per page (API max is large; keep sane)
 # GraphQL rate-limit error code (Kraken). Surfaced in the errors[] array of an
 # otherwise-200 response. Verified against Octopus GraphQL guides.
 _GQL_RATE_LIMIT_CODE = "KT-CT-1199"
+# Kraken returns this code when a requested field has been disabled/removed —
+# the definitive "the schema changed under us" signal (drift canary).
+_GQL_DISABLED_FIELD_CODE = "KT-CT-1113"
 # Bounded exponential backoff for retryable GraphQL failures (rate limit,
 # HTTP 429/5xx, transient transport/timeout). Delays: 1, 2, 4, 8s (+jitter),
 # capped, then give up. Non-retryable errors (auth, other 4xx, logic) raise at once.
@@ -63,6 +66,113 @@ def _mask(value: Optional[str]) -> str:
     if len(s) <= 2:
         return "…"
     return s[0] + "…" + s[-1]
+
+
+# SmartFlex device classification — the IOG-controllable charging devices whose
+# manufacturer/provider drives dispatch behaviour (vs meters, batteries, heat pumps).
+_CHARGING_DEVICE_TYPES = {"ELECTRIC_VEHICLES", "CHARGE_POINTS"}
+_CHARGING_TYPENAMES = {"SmartFlexVehicle", "SmartFlexChargePoint"}
+
+# Fields EMT actually selects across its GraphQL queries (auth, device
+# discovery, telemetry, dispatches, devices). The deprecation check
+# (check_field_deprecations) introspects the live schema and warns if any of
+# these is flagged isDeprecated — the warning PHASE, before the field is
+# removed. That is distinct from the runtime drift logging in _graphql_once,
+# which catches fields already REMOVED (KT-CT-1113 / "Cannot query field").
+# Together: introspection = early warning, drift = last line.
+# NB the match is by field NAME (introspection is type-keyed, but tracking exact
+# Kraken type names here would rot); the warning log includes the type so a
+# same-named field on a type EMT doesn't use can be adjudicated by the reader.
+_EMT_GRAPHQL_FIELDS = {
+    # auth
+    "obtainKrakenToken", "token",
+    # device discovery (account → agreements → meter point → meters → devices)
+    "account", "electricityAgreements", "meterPoint", "meters",
+    "smartDevices", "deviceId",
+    # telemetry
+    "smartMeterTelemetry", "readAt", "demand", "consumption",
+    "consumptionDelta", "costDelta",
+    # dispatches
+    "plannedDispatches", "completedDispatches",
+    "startDt", "endDt", "delta", "meta", "source", "location",
+    # devices (provider / charge-point discovery)
+    "devices", "provider", "deviceType", "status", "current", "make", "model",
+}
+# Enum VALUES EMT passes or compares literally — a rename/removal silently
+# breaks logic (telemetry grouping, live-device test, charging-device match).
+_EMT_GRAPHQL_ENUMS = _CHARGING_DEVICE_TYPES | {"TEN_SECONDS", "LIVE"}
+
+
+def _pick_device_provider(devices: list) -> Optional[str]:
+    """Manufacturer/provider signal for the smart-charging device that drives
+    dispatch behaviour, from the polymorphic `devices` query.
+
+    The `devices` API splits what the deprecated registeredKrakenflexDevice
+    conflated: ``provider`` is the flex/control provider (often 'OCTOPUS_ENERGY'),
+    while the device manufacturer (MYENERGI, OHME, TESLA, …) is in ``make`` on the
+    vehicle/charge-point types. EMT's per-provider logic — notably OHME detection
+    via ``"OHME" in provider`` — keys on the manufacturer, so we surface ``make``
+    first and fall back to ``provider``.
+
+    Ranks candidates so a LIVE charging device (EV / charge point) wins over a
+    non-charging or non-LIVE one; returns None when the account has no device
+    carrying a signal.
+    """
+    best_rank = -1
+    best_signal = None
+    for dev in devices or []:
+        if not dev:
+            continue
+        signal = dev.get("make") or dev.get("provider")
+        if not signal:
+            continue
+        dtype = dev.get("deviceType") or ""
+        typename = dev.get("__typename") or ""
+        is_charging = (dtype in _CHARGING_DEVICE_TYPES
+                       or typename in _CHARGING_TYPENAMES)
+        is_live = ((dev.get("status") or {}).get("current") or "").upper() == "LIVE"
+        rank = (2 if is_charging else 0) + (1 if is_live else 0)
+        if rank > best_rank:
+            best_rank = rank
+            best_signal = signal
+    return best_signal
+
+
+def _operation_name(query: str) -> str:
+    """Best-effort GraphQL operation name (e.g. 'dispatches') for log context."""
+    for kw in ("query ", "mutation "):
+        i = (query or "").find(kw)
+        if i != -1:
+            rest = query[i + len(kw):].lstrip()
+            return (rest[:64].split("(")[0].split("{")[0].strip() or "?")
+    return "?"
+
+
+def _schema_drift_errors(errors: list) -> list:
+    """GraphQL errors that mean the *schema* changed under us — a field EMT
+    requests was renamed, removed, or disabled by Kraken. This is the signal a
+    Kraken API change has broken a query, as distinct from auth, rate-limit, or
+    resolution errors.
+
+    Note: an auth failure (KT-CT-1139) is itself classed VALIDATION, so we do NOT
+    key on the VALIDATION class. We rely on the disabled-field code (KT-CT-1113)
+    and GraphQL's unknown-field validation messages, which are specific to drift.
+    """
+    out = []
+    for e in errors or []:
+        ext = (e or {}).get("extensions") or {}
+        code = ext.get("errorCode") or ext.get("errorType") or ""
+        msg = (e.get("message") or "")
+        if (
+            code == _GQL_DISABLED_FIELD_CODE
+            or "Cannot query field" in msg
+            or "Unknown field" in msg
+            or "Unknown argument" in msg
+            or "Unknown type" in msg
+            or "isn't a defined" in msg
+        ):
+            out.append(e)
+    return out
 
 
 class KrakenAPIError(Exception):
@@ -114,6 +224,12 @@ class KrakenAPIClient:
         # GraphQL token cache (obtained lazily, refreshed before exp).
         self._gql_token: Optional[str] = None
         self._gql_token_exp: Optional[float] = None
+        # One-shot: deprecation introspection runs once per process (first
+        # get_dispatches). See check_field_deprecations. last_deprecations is
+        # None until the first successful check, then a (possibly empty) list of
+        # {kind,type,name,reason} dicts the engine surfaces to HA.
+        self._deprecation_checked = False
+        self.last_deprecations: Optional[list] = None
 
     # ── session lifecycle ────────────────────────────────────────────────
     async def __aenter__(self) -> "KrakenAPIClient":
@@ -472,6 +588,19 @@ class KrakenAPIClient:
             if _GQL_RATE_LIMIT_CODE in codes:
                 raise KrakenRateLimitError(
                     "GraphQL rate limit (KT-CT-1199)", status=429)
+            # Schema-drift canary: a renamed/removed/disabled field is how a Kraken
+            # API change first reaches us. Surface it LOUDLY and with a greppable
+            # token so it stands out from generic "unavailable" lines — this turns
+            # every running instance into a passive drift detector, no extra creds.
+            drift = _schema_drift_errors(errors)
+            if drift:
+                logger.error(
+                    "kraken_schema_drift: Octopus/Kraken rejected fields this query "
+                    "depends on — a schema change has likely broken it. Check "
+                    "https://developer.octopus.energy/announcements and migrate. "
+                    "operation=%s errors=%s",
+                    _operation_name(query),
+                    [d.get("message") for d in drift])
             msg = "; ".join(str(e.get("message", e)) for e in errors)
             raise KrakenAPIError(f"GraphQL error: {msg}")
         return payload.get("data", {}) or {}
@@ -580,6 +709,70 @@ class KrakenAPIClient:
             "id": device_id, "start": start, "end": end, "grouping": grouping})
         return data.get("smartMeterTelemetry", []) or []
 
+    async def check_field_deprecations(self) -> None:
+        """Introspect the live schema and WARN for any field/enum EMT uses that
+        Kraken has flagged deprecated — the grace-window warning BEFORE removal.
+
+        Pull-not-push: this replaces relying on the (unreliable) developer-portal
+        notification email. A deprecated field still WORKS; the flag is the cue to
+        migrate before its removal date (often in deprecationReason). Complements
+        the runtime drift logging, which only fires once a field is actually gone.
+
+        Fail-safe: introspection is frequently DISABLED on production GraphQL
+        endpoints. On any error (disabled, auth, transport) this logs once at INFO
+        and returns — it must never break the dispatch poll it rides along with.
+        """
+        # Standard introspection: every type's fields + enum values, deprecated
+        # ones included (they are hidden by default).
+        query = (
+            "query introspectDeprecations {"
+            "  __schema { types {"
+            "    name"
+            "    fields(includeDeprecated: true) {"
+            "      name isDeprecated deprecationReason }"
+            "    enumValues(includeDeprecated: true) {"
+            "      name isDeprecated deprecationReason }"
+            "  } } }"
+        )
+        try:
+            data = await self._graphql(query)
+        except Exception as e:  # disabled / auth / transport — all non-fatal
+            logger.info(
+                "kraken_deprecation_check: introspection unavailable (%s: %s) — "
+                "relying on runtime drift detection instead",
+                type(e).__name__, str(e)[:120])
+            return
+
+        types = ((data or {}).get("__schema") or {}).get("types") or []
+        hits = []  # list of {kind, type, name, reason}
+        for t in types:
+            tname = t.get("name") or "?"
+            for f in (t.get("fields") or []):
+                if f.get("isDeprecated") and f.get("name") in _EMT_GRAPHQL_FIELDS:
+                    hits.append({"kind": "field", "type": tname,
+                                 "name": f.get("name"),
+                                 "reason": f.get("deprecationReason")})
+            for ev in (t.get("enumValues") or []):
+                if ev.get("isDeprecated") and ev.get("name") in _EMT_GRAPHQL_ENUMS:
+                    hits.append({"kind": "enum", "type": tname,
+                                 "name": ev.get("name"),
+                                 "reason": ev.get("deprecationReason")})
+
+        # Publish for the engine to surface (HA notification + sensor). None means
+        # "never successfully checked"; [] means "checked, all clear".
+        self.last_deprecations = hits
+        if not hits:
+            logger.info(
+                "kraken_deprecation_check: no deprecations among the %d fields / "
+                "%d enum values EMT uses",
+                len(_EMT_GRAPHQL_FIELDS), len(_EMT_GRAPHQL_ENUMS))
+            return
+        for h in hits:
+            logger.warning(
+                "kraken_field_deprecated: %s %s.%s is deprecated — migrate "
+                "before it is removed. reason=%s",
+                h["kind"], h["type"], h["name"], h["reason"] or "(no reason given)")
+
     async def get_dispatches(self, account_number: Optional[str] = None
                              ) -> Optional[dict]:
         """Fetch Intelligent dispatch data for the account, or None if absent.
@@ -603,6 +796,17 @@ class KrakenAPIClient:
         acct = account_number or self.account_number
         if not acct:
             raise ValueError("account_number required for get_dispatches")
+        # Once per process, ride this first authenticated poll to introspect the
+        # schema for deprecations among the fields EMT uses (no extra key, no CI,
+        # no engine.py wiring). Guarded + fail-safe so it can never affect the
+        # dispatch fetch below.
+        if not self._deprecation_checked:
+            self._deprecation_checked = True
+            try:
+                await self.check_field_deprecations()
+            except Exception as e:
+                logger.info("kraken_deprecation_check: skipped (%s: %s)",
+                            type(e).__name__, str(e)[:120])
         # plannedDispatches / completedDispatches and the registered device
         # (which carries the provider) hang off the account. Field names per the
         # documented Kraken intelligent surface; verify live via the shape log.
@@ -611,17 +815,21 @@ class KrakenAPIClient:
         #    meta { location source }. meta.source now returns
         #    smart-charge/test-charge/bump-charge (or null/unknown) on PLANNED
         #    dispatches — the smart-vs-boost signal (incl. for OHME bump).
-        #  - the device carries 'provider'/'status'. NOTE: registeredKrakenflexDevice
-        #    is DEPRECATED by Kraken (moving to a 'devices' query); we request only
-        #    the confirmed scalar fields and tolerate it being absent/empty.
+        #  - provider comes from the `devices` query (polymorphic list; we read
+        #    the interface-level provider/deviceType/status{current}). This
+        #    REPLACES the deprecated registeredKrakenflexDevice, whose removal
+        #    Kraken announced for on/after 2026-03-01. Shape confirmed against the
+        #    Octopus GraphQL reference + the BottlecapDave integration's live query.
         query = (
             "query dispatches($acc: String!) {"
             "  plannedDispatches(accountNumber: $acc) {"
             "    startDt endDt delta meta { source location } }"
             "  completedDispatches(accountNumber: $acc) {"
             "    startDt endDt delta meta { source location } }"
-            "  registeredKrakenflexDevice(accountNumber: $acc) {"
-            "    provider status } }"
+            "  devices(accountNumber: $acc) {"
+            "    provider deviceType status { current } __typename"
+            "    ... on SmartFlexVehicle { make model }"
+            "    ... on SmartFlexChargePoint { make model } } }"
         )
         try:
             data = await self._graphql(query, {"acc": acct})
@@ -631,8 +839,20 @@ class KrakenAPIClient:
 
         planned_raw = data.get("plannedDispatches") or []
         completed_raw = data.get("completedDispatches") or []
-        device = data.get("registeredKrakenflexDevice") or {}
-        provider = device.get("provider")
+        devices = data.get("devices") or []
+        # Diagnostic: log the devices list (categories/brands only — no IDs/PII) so
+        # the chosen charging device + provider signal is verifiable from logs while
+        # this migration beds in. provider is the flex provider (e.g. OCTOPUS_ENERGY);
+        # make is the manufacturer (MYENERGI/OHME/…), which is what we key on.
+        if devices:
+            logger.info("get_dispatches: devices=%s", [
+                {"type": d.get("deviceType"), "make": d.get("make"),
+                 "provider": d.get("provider"), "kind": d.get("__typename"),
+                 "status": (d.get("status") or {}).get("current")}
+                for d in devices if d])
+        # devices replaced the deprecated registeredKrakenflexDevice; pick the
+        # smart-charging device's manufacturer signal (make, then provider).
+        provider = _pick_device_provider(devices)
 
         def _norm(d: dict) -> dict:
             # Normalise to stable keys: the API uses startDt/endDt; meta.source

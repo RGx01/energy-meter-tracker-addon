@@ -1,5 +1,20 @@
 # Changelog
 
+## [3.0.3] — 2026-06-28
+
+*Resilience to Octopus/Kraken API changes — no functional change for current setups.*
+
+### Changed
+
+- **Future-proofed Intelligent dispatch detection** — moved off Octopus's deprecated `registeredKrakenflexDevice` API (which Octopus has scheduled for removal) to the current `devices` query. Smart-charge / dispatch provider detection keeps working once Octopus withdraws the old field.
+
+### Added
+
+- **API drift self-detection** — if an Octopus/Kraken schema change ever rejects a field the add-on depends on, it now logs a distinct `kraken_schema_drift` error pointing to the Octopus announcements page, instead of a generic "unavailable" message — so a broken query is obvious in the logs and quick to pin down.
+- **Upcoming-deprecation early warning** — on the first poll after startup the add-on introspects the live Octopus/Kraken schema and checks the specific fields and enum values it relies on against those Octopus has flagged *deprecated* (the grace window before a field is actually removed). If any are found it raises a Home Assistant **persistent notification** and publishes a `sensor.energy_meter_tracker_api_deprecations` entity (a count, with the affected fields and Octopus's stated reasons in its attributes), alongside a distinct `kraken_field_deprecated` log line — so the alert reaches you outside the logs and you can migrate *ahead* of the break rather than discovering it via `kraken_schema_drift` after it lands. The notification dismisses itself and the sensor returns to `0` once the schema comes back clean; if the endpoint has introspection disabled the check quietly skips and leaves drift-detection as the safety net.
+
+---
+
 ## [3.0.2] — 2026-06-28
 
 *Packaging and repository housekeeping — no functional changes. Faster to install and update.*
