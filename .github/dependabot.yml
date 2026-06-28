@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Python dependencies in requirements.txt.
+  # Security fixes are raised immediately; routine version bumps weekly,
+  # grouped into a single PR to keep the noise down.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    groups:
+      python-deps:
+        patterns:
+          - "*"

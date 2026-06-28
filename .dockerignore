@@ -1,23 +1,30 @@
-# Python cache — never needed in the image
+
+# VCS / CI / build metadata
+.git/
+.gitignore
+.github/
+.dockerignore
+Dockerfile
+Dockerfile.standalone
+ 
+# Python caches
 __pycache__/
 *.pyc
 *.pyo
-
-# Test files — not needed in production image
+ 
+# Tests (now under tests/ — old "test_*.py" no longer matched these)
+tests/
 test_*.py
 test_harness.log
 test_results.json
-
-# Documentation — not needed in image
-CHANGELOG.md
-CONTRIBUTING.md
-DEVELOPMENT.md
-ROADMAP.md
-SQLITE_MIGRATION_PLAN.md
-
-# Dev/build artifacts
-.DS_Store
-.git/
-.gitignore
-Dockerfile.standalone
+ 
+# Docs & design notes — HA reads README/CHANGELOG from the repo, not the image
+*.md
+LICENSE
+ 
+# Store screenshots (~4 MB) — referenced by the README, never served at runtime
+screenshots/
+ 
+# Misc
 *.zip
+.DS_Store

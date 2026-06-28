@@ -102,23 +102,51 @@ Usage PDF showing carbon comparison narrative fix.
 - **`imp_provisional` DB column** — flags provisional sub-meter rows; cleared on amendment. Auto-migrated on first start.
 - 122 tests passing.
 
+### 3.0.0 — DCC Settlement, Carbon & Intelligent Octopus Go ✅
+**The largest release since EMT began.** Reconciles every block against settled half-hourly data from the Kraken platform (Octopus / DCC): settled import/export, unit rates and standing charges on a schedule, an automatic settlement sweep with a horizon back-stop, and a Meter-sensor-vs-Supplier-API billing toggle. Adds data-source modes (`cad`, `cad+api`) with supplier-first wizard setup; Octopus Home Mini live power; the **Intelligent Octopus Go dispatch overlay** (captures smart-charge slots and reprices affected blocks off-peak, with per-device overlay rates and a 0.1 kWh validation floor); whole-app **grid carbon intensity** (Carbon Insights, CO₂ columns and charts, gCO₂/kWh heatmap, one-time backfill); per-channel rate source (API vs sensor); power-sensor invert & unit override; and Ohme EV charger support. Major-additive — nothing breaks; everything new is opt-in.
+
+### 3.0.1 ✅
+Post-release fixes: #217 (account-number hint that led to an unhelpful API-key error), #218 (misleading device-name "(optional)" label), #221 ("This Bill" defaulting to a stale historical date when the current period has no data yet), #223 (Generation Mix card overlapping a neighbour with three or more devices on the Overview).
+
 ---
 
 ## Planned
 
-### 2.11.0 — Gas Meters
-**Theme: Whole-home energy tracking**
+### 3.x — Migration shim removal & API polish
+**Theme: Clean break from legacy** — *carried forward; these were pencilled in as "3.0.0" before 3.0.0 shipped as the DCC / carbon release.*
+
+- Migration shim removal (`migrate_json_to_sqlite` and related code)
+- Meter colour customisation per meter (bidirectional aware)
+- API versioning
+
+---
+
+### 3.x — Bright (Hildebrand / Glow) API as a DCC consumption source
+**Theme: DCC data beyond Octopus**
+
+Use the Hildebrand **Bright / Glow** API (`api.glowmarkt.com`) as an additional source of DCC half-hourly smart-meter consumption data. EMT currently obtains settled DCC figures only via Kraken (Octopus); Bright would give owners of GB smart meters on other suppliers access to the same block-resolution usage data, broadening settlement and gap-backfill coverage beyond Octopus. Pluggable alongside the existing Kraken source and feeding the same `imp_kwh_api` / `exp_kwh_api` settlement path.
+
+---
+
+### 3.x — Gas meters
+**Theme: Whole-home energy tracking** — *deferred from 2.11.0.*
 
 Extend the engine to support gas meter recording alongside electricity. Requires a design spike — gas uses m³/ft³ with calorific value conversion, different billing periods, and slower sensor updates.
 
 ---
 
-### 3.0.0 — Migration Shim Removal & Polish
-**Theme: Clean break from legacy**
+## Engineering backlog — post-3.0 fixes
 
-- Migration shim removal (`migrate_json_to_sqlite` and related code)
-- Meter colour customisation per meter (bidirectional aware)
-- API versioning
+*Surfaced while diagnosing the dev system on the `api` + Mini path. Full forensic detail in `POST-3.0-BACKLOG.md`; all are candidates for a 3.0.x point release and none block anything.*
+
+### BL-1 — Gap marker globally freezes DCC settlement application
+*Medium — the only correctness item.* An outage longer than the 12-hour gap-fill limit leaves the gap marker set, which globally gates the PASS-2 drain — so DCC-settled figures are ingested but never **applied** to billing (across the whole history) until the source returns or the add-on restarts. Fix: make the drain gap-window-aware so blocks outside the gap window still settle, rather than gating globally.
+
+### BL-2 — Phantom export channel from the gap-seed
+*Low — cosmetic, never affects billing (kWh = 0).* In a no-export `api` setup the gap-seed carries a 0-kWh export channel forward, so the daily billing chart draws a 12p export-rate line despite zero actual export. Root fix: don't carry forward an export channel that has no configured source and never carried real export.
+
+### BL-3 — Carry billing-chart rate lines forward as a step
+*Low — the agreed near-term fix for BL-2's visible symptom.* Build the import/export rate series by forward-filling the last-known rate (a tariff is in force all day) instead of zero-filling per slot; back-fill leading slots and use a None sentinel so a genuine 0 rate stays distinct from "no data". Exact for a flat tariff; the per-slot schedule-resolve variant is the upgrade path for a varying Agile Outgoing export tariff.
 
 ---
 
