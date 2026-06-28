@@ -109,6 +109,9 @@ _kraken_account_number: str | None = None
 # started once at boot and exits permanently if the API wasn't yet configured.
 _engine_ha = None              # HAClient | None
 _kraken_poll_task_handle = None  # asyncio.Task | None
+# One-shot: True once the first poll has surfaced any Kraken field deprecations
+# to HA (notification + sensor). See _surface_kraken_deprecations.
+_deprecations_surfaced = False
 # True once the first (cold) engine_startup has completed in this process. The
 # rogue-total guard (clearing the in-progress block's carried reads) is valid
 # ONLY on a cold start, where those reads are stale leftovers from a previous
@@ -4875,6 +4878,61 @@ def _capture_ohme_slots(provider, planned) -> int:
     return captured
 
 
+async def _surface_kraken_deprecations(ha, deprecations: list) -> None:
+    """Surface Kraken API field deprecations to HA so they reach the user OUTSIDE
+    the logs: a durable sensor (automatable) plus a persistent notification (the
+    sidebar bell — loud, stays until dismissed).
+
+    Idempotent: the notification uses a fixed id, so re-runs update rather than
+    duplicate, and an empty list dismisses any stale notification + zeroes the
+    sensor (i.e. once you've migrated, the alert clears itself). Best-effort —
+    never raises into the poll.
+    """
+    if ha is None:
+        return
+    # Respect dev-mode: publish_ha_sensors=false means this instance does not
+    # write to HA. The per-field kraken_field_deprecated WARNINGs were already
+    # logged (locally) by the client; here we only skip the HA-facing surface.
+    if not _PUBLISH_HA_SENSORS:
+        logger.info(
+            "_surface_kraken_deprecations: HA publishing disabled — %d "
+            "deprecation(s) logged only, not surfaced to HA", len(deprecations))
+        return
+    _NOTIF_ID = "emt_api_deprecation"
+    _SENSOR   = "sensor.energy_meter_tracker_api_deprecations"
+    try:
+        count = len(deprecations)
+        await ha.set_state(_SENSOR, count, {
+            "friendly_name": "EMT Octopus API deprecations",
+            "icon": "mdi:alert-decagram" if count else "mdi:check-decagram",
+            "deprecated_fields": [f'{h["type"]}.{h["name"]}' for h in deprecations],
+            "details": deprecations,
+        })
+        if count:
+            lines = "\n".join(
+                f'- `{h["type"]}.{h["name"]}` — {h["reason"] or "no reason given"}'
+                for h in deprecations)
+            await ha.call_service("persistent_notification", "create", {
+                "notification_id": _NOTIF_ID,
+                "title": "⚠️ Energy Meter Tracker: Octopus API change ahead",
+                "message": (
+                    "Octopus has flagged GraphQL field(s) the Energy Meter "
+                    "Tracker add-on relies on as **deprecated**. They still work "
+                    "for now but will be removed — migrate before then.\n\n"
+                    f"{lines}\n\n"
+                    "See the Octopus developer announcements page and the add-on "
+                    "logs (`kraken_field_deprecated`) for details."),
+            })
+            logger.warning(
+                "_surface_kraken_deprecations: raised HA notification for %d "
+                "deprecated field(s)", count)
+        else:
+            await ha.call_service("persistent_notification", "dismiss",
+                                  {"notification_id": _NOTIF_ID})
+    except Exception as e:
+        logger.warning("_surface_kraken_deprecations: failed: %s", e)
+
+
 async def _capture_dispatch_slots() -> int:
     """STEP 2 (piece 1): persist smart-charge dispatch slots to dispatch_slots.
 
@@ -4897,6 +4955,14 @@ async def _capture_dispatch_slots() -> int:
     except Exception as e:
         logger.warning("_capture_dispatch_slots: fetch failed: %s", e)
         return 0
+    # One-shot: the first get_dispatches also ran the deprecation introspection;
+    # surface any results to HA (notification + sensor) once per process. None =
+    # introspection unavailable (disabled) → nothing to surface.
+    global _deprecations_surfaced
+    if not _deprecations_surfaced and _kraken_client.last_deprecations is not None:
+        _deprecations_surfaced = True
+        await _surface_kraken_deprecations(
+            _engine_ha, _kraken_client.last_deprecations)
     if not disp:
         return 0
     provider = disp.get("provider")

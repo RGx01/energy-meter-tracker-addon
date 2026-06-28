@@ -73,6 +73,51 @@ def _mask(value: Optional[str]) -> str:
 _CHARGING_DEVICE_TYPES = {"ELECTRIC_VEHICLES", "CHARGE_POINTS"}
 _CHARGING_TYPENAMES = {"SmartFlexVehicle", "SmartFlexChargePoint"}
 
+# Fields EMT actually selects across its GraphQL queries (auth, device
+# discovery, telemetry, dispatches, devices). The deprecation check
+# (check_field_deprecations) introspects the live schema and warns if any of
+# these is flagged isDeprecated — the warning PHASE, before the field is
+# removed. That is distinct from the runtime drift logging in _graphql_once,
+# which catches fields already REMOVED (KT-CT-1113 / "Cannot query field").
+# Together: introspection = early warning, drift = last line.
+# NB the match is by field NAME (introspection is type-keyed, but tracking exact
+# Kraken type names here would rot); the warning log includes the type so a
+# same-named field on a type EMT doesn't use can be adjudicated by the reader.
+_EMT_GRAPHQL_FIELDS = {
+    # auth
+    "obtainKrakenToken", "token",
+    # device discovery (account → agreements → meter point → meters → devices)
+    "account", "electricityAgreements", "meterPoint", "meters",
+    "smartDevices", "deviceId",
+    # telemetry
+    "smartMeterTelemetry", "readAt", "demand", "consumption",
+    "consumptionDelta", "costDelta",
+    # dispatches
+    "plannedDispatches", "completedDispatches",
+    "startDt", "endDt", "delta", "meta", "source", "location",
+    # devices (provider / charge-point discovery)
+    "devices", "provider", "deviceType", "status", "current", "make", "model",
+}
+# Enum VALUES EMT passes or compares literally — a rename/removal silently
+# breaks logic (telemetry grouping, live-device test, charging-device match).
+_EMT_GRAPHQL_ENUMS = _CHARGING_DEVICE_TYPES | {"TEN_SECONDS", "LIVE"}
+
+# Known same-NAME collisions: a deprecated field whose name is in the set above
+# but which sits on a (type, position) EMT never selects. Kept at (type, field)
+# granularity — NOT type-wide — so a real future deprecation of another field on
+# the same type (e.g. DeviceStatusType.current, which EMT *does* read) still
+# fires. Seeded from observed introspection; extend as new collisions surface.
+#   - DeviceStatusType.status   : EMT reads status{current} on the DEVICE, not
+#                                 the status field of DeviceStatusType itself.
+#   - HeatPumpDeviceType.deviceType : EMT reads deviceType at the device
+#                                 interface level; it has no heat pump.
+#   - TestCharge.status         : EMT never queries TestCharge.
+_DEPRECATION_IGNORE = {
+    ("DeviceStatusType", "status"),
+    ("HeatPumpDeviceType", "deviceType"),
+    ("TestCharge", "status"),
+}
+
 
 def _pick_device_provider(devices: list) -> Optional[str]:
     """Manufacturer/provider signal for the smart-charging device that drives
@@ -195,6 +240,12 @@ class KrakenAPIClient:
         # GraphQL token cache (obtained lazily, refreshed before exp).
         self._gql_token: Optional[str] = None
         self._gql_token_exp: Optional[float] = None
+        # One-shot: deprecation introspection runs once per process (first
+        # get_dispatches). See check_field_deprecations. last_deprecations is
+        # None until the first successful check, then a (possibly empty) list of
+        # {kind,type,name,reason} dicts the engine surfaces to HA.
+        self._deprecation_checked = False
+        self.last_deprecations: Optional[list] = None
 
     # ── session lifecycle ────────────────────────────────────────────────
     async def __aenter__(self) -> "KrakenAPIClient":
@@ -674,6 +725,82 @@ class KrakenAPIClient:
             "id": device_id, "start": start, "end": end, "grouping": grouping})
         return data.get("smartMeterTelemetry", []) or []
 
+    async def check_field_deprecations(self) -> None:
+        """Introspect the live schema and WARN for any field/enum EMT uses that
+        Kraken has flagged deprecated — the grace-window warning BEFORE removal.
+
+        Pull-not-push: this replaces relying on the (unreliable) developer-portal
+        notification email. A deprecated field still WORKS; the flag is the cue to
+        migrate before its removal date (often in deprecationReason). Complements
+        the runtime drift logging, which only fires once a field is actually gone.
+
+        Fail-safe: introspection is frequently DISABLED on production GraphQL
+        endpoints. On any error (disabled, auth, transport) this logs once at INFO
+        and returns — it must never break the dispatch poll it rides along with.
+        """
+        # Standard introspection: every type's fields + enum values, deprecated
+        # ones included (they are hidden by default).
+        query = (
+            "query introspectDeprecations {"
+            "  __schema { types {"
+            "    name"
+            "    fields(includeDeprecated: true) {"
+            "      name isDeprecated deprecationReason }"
+            "    enumValues(includeDeprecated: true) {"
+            "      name isDeprecated deprecationReason }"
+            "  } } }"
+        )
+        try:
+            data = await self._graphql(query)
+        except Exception as e:  # disabled / auth / transport — all non-fatal
+            logger.info(
+                "kraken_deprecation_check: introspection unavailable (%s: %s) — "
+                "relying on runtime drift detection instead",
+                type(e).__name__, str(e)[:120])
+            return
+
+        types = ((data or {}).get("__schema") or {}).get("types") or []
+        hits = []  # list of {kind, type, name, reason}
+        ignored = 0
+        for t in types:
+            tname = t.get("name") or "?"
+            for f in (t.get("fields") or []):
+                if f.get("isDeprecated") and f.get("name") in _EMT_GRAPHQL_FIELDS:
+                    if (tname, f.get("name")) in _DEPRECATION_IGNORE:
+                        ignored += 1
+                        logger.debug("kraken_deprecation_check: ignoring known "
+                                     "name-collision %s.%s", tname, f.get("name"))
+                        continue
+                    hits.append({"kind": "field", "type": tname,
+                                 "name": f.get("name"),
+                                 "reason": f.get("deprecationReason")})
+            for ev in (t.get("enumValues") or []):
+                if ev.get("isDeprecated") and ev.get("name") in _EMT_GRAPHQL_ENUMS:
+                    if (tname, ev.get("name")) in _DEPRECATION_IGNORE:
+                        ignored += 1
+                        continue
+                    hits.append({"kind": "enum", "type": tname,
+                                 "name": ev.get("name"),
+                                 "reason": ev.get("deprecationReason")})
+
+        # Publish for the engine to surface (HA notification + sensor). None means
+        # "never successfully checked"; [] means "checked, all clear".
+        self.last_deprecations = hits
+        _ign = f" ({ignored} known name-collision(s) ignored)" if ignored else ""
+        if not hits:
+            logger.info(
+                "kraken_deprecation_check: no deprecations among the %d fields / "
+                "%d enum values EMT uses%s",
+                len(_EMT_GRAPHQL_FIELDS), len(_EMT_GRAPHQL_ENUMS), _ign)
+            return
+        logger.warning("kraken_deprecation_check: %d deprecated field(s) EMT "
+                       "uses%s", len(hits), _ign)
+        for h in hits:
+            logger.warning(
+                "kraken_field_deprecated: %s %s.%s is deprecated — migrate "
+                "before it is removed. reason=%s",
+                h["kind"], h["type"], h["name"], h["reason"] or "(no reason given)")
+
     async def get_dispatches(self, account_number: Optional[str] = None
                              ) -> Optional[dict]:
         """Fetch Intelligent dispatch data for the account, or None if absent.
@@ -697,6 +824,17 @@ class KrakenAPIClient:
         acct = account_number or self.account_number
         if not acct:
             raise ValueError("account_number required for get_dispatches")
+        # Once per process, ride this first authenticated poll to introspect the
+        # schema for deprecations among the fields EMT uses (no extra key, no CI,
+        # no engine.py wiring). Guarded + fail-safe so it can never affect the
+        # dispatch fetch below.
+        if not self._deprecation_checked:
+            self._deprecation_checked = True
+            try:
+                await self.check_field_deprecations()
+            except Exception as e:
+                logger.info("kraken_deprecation_check: skipped (%s: %s)",
+                            type(e).__name__, str(e)[:120])
         # plannedDispatches / completedDispatches and the registered device
         # (which carries the provider) hang off the account. Field names per the
         # documented Kraken intelligent surface; verify live via the shape log.

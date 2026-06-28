@@ -331,6 +331,35 @@ class HAClient:
         except Exception as e:
             logger.error("ha_client: set_state exception for %s: %s", entity_id, e)
 
+    async def call_service(
+        self,
+        domain:  str,
+        service: str,
+        data:    dict | None = None,
+    ) -> bool:
+        """Call a Home Assistant service via REST (e.g. persistent_notification
+        create/dismiss). Returns True on success. Best-effort: logs and returns
+        False on failure rather than raising, so callers can fire-and-forget.
+        """
+        url = f"{HA_REST_URL}/services/{domain}/{service}"
+        try:
+            async with self._session.post(url, json=data or {}) as resp:
+                if resp.status not in (200, 201):
+                    body = await resp.text()
+                    logger.error(
+                        "ha_client: call_service %s.%s failed (%d): %s",
+                        domain, service, resp.status, body
+                    )
+                    return False
+                logger.debug("ha_client: call_service %s.%s ok", domain, service)
+                return True
+        except Exception as e:
+            logger.error(
+                "ha_client: call_service exception for %s.%s: %s",
+                domain, service, e
+            )
+            return False
+
     # ──────────────────────────────────────────────────────────────────────
     # Subscriptions — replaces @state_trigger
     # ──────────────────────────────────────────────────────────────────────
