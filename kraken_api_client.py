@@ -72,6 +72,10 @@ def _mask(value: Optional[str]) -> str:
 # manufacturer/provider drives dispatch behaviour (vs meters, batteries, heat pumps).
 _CHARGING_DEVICE_TYPES = {"ELECTRIC_VEHICLES", "CHARGE_POINTS"}
 _CHARGING_TYPENAMES = {"SmartFlexVehicle", "SmartFlexChargePoint"}
+# Smart-charge source/type vocabulary across API versions (legacy meta.source =
+# 'smart-charge'; flex type = 'smart'). Used only for the flex-vs-legacy parity
+# diagnostic; the engine owns the authoritative capture filter.
+_SMART_SOURCES = {"smart-charge", "smart"}
 
 # Fields EMT actually selects across its GraphQL queries (auth, device
 # discovery, telemetry, dispatches, devices). The deprecation check
@@ -92,15 +96,70 @@ _EMT_GRAPHQL_FIELDS = {
     # telemetry
     "smartMeterTelemetry", "readAt", "demand", "consumption",
     "consumptionDelta", "costDelta",
-    # dispatches
-    "plannedDispatches", "completedDispatches",
-    "startDt", "endDt", "delta", "meta", "source", "location",
+    # dispatches (flexPlannedDispatches keyed by charge-point id;
+    # completedDispatches account-keyed — neither is deprecated)
+    "flexPlannedDispatches", "completedDispatches",
+    "start", "end", "delta", "energyAddedKwh", "type",
+    "meta", "source", "location",
     # devices (provider / charge-point discovery)
     "devices", "provider", "deviceType", "status", "current", "make", "model",
+}
+# Fields too GENERIC to match by bare name (e.g. `id` exists on nearly every
+# type and is deprecated on many EMT never touches — ledgers, payments, …). We
+# match these only on the specific type EMT reads them from. EMT reads `id` only
+# on the charge-point device (for flexPlannedDispatches(deviceId:)).
+_EMT_GRAPHQL_TYPED_FIELDS = {
+    ("SmartFlexDevice", "id"),
+    ("SmartFlexChargePoint", "id"),
+    ("SmartFlexVehicle", "id"),
 }
 # Enum VALUES EMT passes or compares literally — a rename/removal silently
 # breaks logic (telemetry grouping, live-device test, charging-device match).
 _EMT_GRAPHQL_ENUMS = _CHARGING_DEVICE_TYPES | {"TEN_SECONDS", "LIVE"}
+
+# Known same-NAME collisions: a deprecated field whose name is in the set above
+# but which sits on a (type, position) EMT never selects. Kept at (type, field)
+# granularity — NOT type-wide — so a real future deprecation of another field on
+# the same type (e.g. DeviceStatusType.current, which EMT *does* read) still
+# fires. Seeded from observed introspection; extend as new collisions surface.
+#   - DeviceStatusType.status   : EMT reads status{current} on the DEVICE, not
+#                                 the status field of DeviceStatusType itself.
+#   - HeatPumpDeviceType.deviceType : EMT reads deviceType at the device
+#                                 interface level; it has no heat pump.
+#   - TestCharge.status         : EMT never queries TestCharge.
+_DEPRECATION_IGNORE = {
+    ("DeviceStatusType", "status"),
+    ("HeatPumpDeviceType", "deviceType"),
+    ("TestCharge", "status"),
+}
+
+
+def _pick_charging_device(devices: list) -> Optional[dict]:
+    """Return the device dict best representing the IOG-controllable charging
+    device — a LIVE EV / charge point wins over non-charging or non-LIVE ones.
+
+    Shared selection used by _pick_device_provider (reads make/provider) and
+    _pick_device_id (reads id for flexPlannedDispatches), so both always agree on
+    WHICH device they describe. Returns None if no device carries a usable signal.
+    """
+    best_rank = -1
+    best = None
+    for dev in devices or []:
+        if not dev:
+            continue
+        signal = dev.get("make") or dev.get("provider")
+        if not signal:
+            continue
+        dtype = dev.get("deviceType") or ""
+        typename = dev.get("__typename") or ""
+        is_charging = (dtype in _CHARGING_DEVICE_TYPES
+                       or typename in _CHARGING_TYPENAMES)
+        is_live = ((dev.get("status") or {}).get("current") or "").upper() == "LIVE"
+        rank = (2 if is_charging else 0) + (1 if is_live else 0)
+        if rank > best_rank:
+            best_rank = rank
+            best = dev
+    return best
 
 
 def _pick_device_provider(devices: list) -> Optional[str]:
@@ -118,24 +177,27 @@ def _pick_device_provider(devices: list) -> Optional[str]:
     non-charging or non-LIVE one; returns None when the account has no device
     carrying a signal.
     """
-    best_rank = -1
-    best_signal = None
-    for dev in devices or []:
-        if not dev:
-            continue
-        signal = dev.get("make") or dev.get("provider")
-        if not signal:
-            continue
-        dtype = dev.get("deviceType") or ""
-        typename = dev.get("__typename") or ""
-        is_charging = (dtype in _CHARGING_DEVICE_TYPES
-                       or typename in _CHARGING_TYPENAMES)
-        is_live = ((dev.get("status") or {}).get("current") or "").upper() == "LIVE"
-        rank = (2 if is_charging else 0) + (1 if is_live else 0)
-        if rank > best_rank:
-            best_rank = rank
-            best_signal = signal
-    return best_signal
+    dev = _pick_charging_device(devices)
+    if not dev:
+        return None
+    return dev.get("make") or dev.get("provider")
+
+
+def _pick_device_id(devices: list) -> Optional[str]:
+    """The charge-point device id for flexPlannedDispatches(deviceId:), taken from
+    the SAME device _pick_device_provider describes — but ONLY when that device is
+    a genuine charging device (EV / charge point). Returns None otherwise (e.g. an
+    account with only a meter), in which case there are no planned dispatches to
+    fetch and the caller skips the flex query entirely.
+    """
+    dev = _pick_charging_device(devices)
+    if not dev:
+        return None
+    dtype = dev.get("deviceType") or ""
+    typename = dev.get("__typename") or ""
+    if not (dtype in _CHARGING_DEVICE_TYPES or typename in _CHARGING_TYPENAMES):
+        return None
+    return dev.get("id")
 
 
 def _operation_name(query: str) -> str:
@@ -745,15 +807,27 @@ class KrakenAPIClient:
 
         types = ((data or {}).get("__schema") or {}).get("types") or []
         hits = []  # list of {kind, type, name, reason}
+        ignored = 0
         for t in types:
             tname = t.get("name") or "?"
             for f in (t.get("fields") or []):
-                if f.get("isDeprecated") and f.get("name") in _EMT_GRAPHQL_FIELDS:
+                fname = f.get("name")
+                if f.get("isDeprecated") and (
+                        fname in _EMT_GRAPHQL_FIELDS
+                        or (tname, fname) in _EMT_GRAPHQL_TYPED_FIELDS):
+                    if (tname, fname) in _DEPRECATION_IGNORE:
+                        ignored += 1
+                        logger.debug("kraken_deprecation_check: ignoring known "
+                                     "name-collision %s.%s", tname, fname)
+                        continue
                     hits.append({"kind": "field", "type": tname,
-                                 "name": f.get("name"),
+                                 "name": fname,
                                  "reason": f.get("deprecationReason")})
             for ev in (t.get("enumValues") or []):
                 if ev.get("isDeprecated") and ev.get("name") in _EMT_GRAPHQL_ENUMS:
+                    if (tname, ev.get("name")) in _DEPRECATION_IGNORE:
+                        ignored += 1
+                        continue
                     hits.append({"kind": "enum", "type": tname,
                                  "name": ev.get("name"),
                                  "reason": ev.get("deprecationReason")})
@@ -761,12 +835,15 @@ class KrakenAPIClient:
         # Publish for the engine to surface (HA notification + sensor). None means
         # "never successfully checked"; [] means "checked, all clear".
         self.last_deprecations = hits
+        _ign = f" ({ignored} known name-collision(s) ignored)" if ignored else ""
         if not hits:
             logger.info(
                 "kraken_deprecation_check: no deprecations among the %d fields / "
-                "%d enum values EMT uses",
-                len(_EMT_GRAPHQL_FIELDS), len(_EMT_GRAPHQL_ENUMS))
+                "%d enum values EMT uses%s",
+                len(_EMT_GRAPHQL_FIELDS), len(_EMT_GRAPHQL_ENUMS), _ign)
             return
+        logger.warning("kraken_deprecation_check: %d deprecated field(s) EMT "
+                       "uses%s", len(hits), _ign)
         for h in hits:
             logger.warning(
                 "kraken_field_deprecated: %s %s.%s is deprecated — migrate "
@@ -807,27 +884,23 @@ class KrakenAPIClient:
             except Exception as e:
                 logger.info("kraken_deprecation_check: skipped (%s: %s)",
                             type(e).__name__, str(e)[:120])
-        # plannedDispatches / completedDispatches and the registered device
-        # (which carries the provider) hang off the account. Field names per the
-        # documented Kraken intelligent surface; verify live via the shape log.
-        # Field names confirmed against the live Octopus app query + API docs:
-        #  - dispatch slots use startDt/endDt (not start/end), plus delta and
-        #    meta { location source }. meta.source now returns
-        #    smart-charge/test-charge/bump-charge (or null/unknown) on PLANNED
-        #    dispatches — the smart-vs-boost signal (incl. for OHME bump).
-        #  - provider comes from the `devices` query (polymorphic list; we read
-        #    the interface-level provider/deviceType/status{current}). This
-        #    REPLACES the deprecated registeredKrakenflexDevice, whose removal
-        #    Kraken announced for on/after 2026-03-01. Shape confirmed against the
-        #    Octopus GraphQL reference + the BottlecapDave integration's live query.
+        # completedDispatches + the registered device (which carries the provider)
+        # hang off the account; PLANNED dispatches come from flexPlannedDispatches,
+        # keyed by the charge-point device id (see below).
+        #  - completed slots use start/end + delta + meta{source location};
+        #    flexPlannedDispatches uses start/end + type + energyAddedKwh
+        #    (normalised in _norm). meta.source / type carry the smart-vs-bump
+        #    signal (smart-charge/smart vs bump-charge/boost).
+        #  - provider comes from the `devices` query (polymorphic list; we read the
+        #    interface-level provider/deviceType/status{current}). This REPLACES the
+        #    deprecated registeredKrakenflexDevice. Shape confirmed against the
+        #    Octopus GraphQL reference + the BottlecapDave integration.
         query = (
             "query dispatches($acc: String!) {"
-            "  plannedDispatches(accountNumber: $acc) {"
-            "    startDt endDt delta meta { source location } }"
             "  completedDispatches(accountNumber: $acc) {"
-            "    startDt endDt delta meta { source location } }"
+            "    start end delta meta { source location } }"
             "  devices(accountNumber: $acc) {"
-            "    provider deviceType status { current } __typename"
+            "    id provider deviceType status { current } __typename"
             "    ... on SmartFlexVehicle { make model }"
             "    ... on SmartFlexChargePoint { make model } } }"
         )
@@ -837,37 +910,62 @@ class KrakenAPIClient:
             logger.warning("get_dispatches: unavailable (%s)", e)
             return None
 
-        planned_raw = data.get("plannedDispatches") or []
         completed_raw = data.get("completedDispatches") or []
         devices = data.get("devices") or []
         # Diagnostic: log the devices list (categories/brands only — no IDs/PII) so
-        # the chosen charging device + provider signal is verifiable from logs while
-        # this migration beds in. provider is the flex provider (e.g. OCTOPUS_ENERGY);
-        # make is the manufacturer (MYENERGI/OHME/…), which is what we key on.
+        # the chosen charging device + provider signal is verifiable from logs.
         if devices:
             logger.info("get_dispatches: devices=%s", [
                 {"type": d.get("deviceType"), "make": d.get("make"),
                  "provider": d.get("provider"), "kind": d.get("__typename"),
                  "status": (d.get("status") or {}).get("current")}
                 for d in devices if d])
-        # devices replaced the deprecated registeredKrakenflexDevice; pick the
-        # smart-charging device's manufacturer signal (make, then provider).
         provider = _pick_device_provider(devices)
+        device_id = _pick_device_id(devices)
 
         def _norm(d: dict) -> dict:
-            # Normalise to stable keys: the API uses startDt/endDt; meta.source
-            # carries smart-charge/test-charge/bump-charge (or null/unknown).
+            # Normalise both dispatch shapes to stable keys:
+            #   completedDispatches   : start/end, delta, meta{source location}
+            #   flexPlannedDispatches : start/end, energyAddedKwh (→delta),
+            #                           type (→source); no location.
             meta = d.get("meta") or {}
+            delta = d.get("delta")
+            if delta is None:
+                delta = d.get("energyAddedKwh")
             return {
-                "start":  d.get("startDt") or d.get("start"),
-                "end":    d.get("endDt") or d.get("end"),
-                "delta":  d.get("delta"),
-                "source": meta.get("source"),
+                "start":  d.get("start"),
+                "end":    d.get("end"),
+                "delta":  delta,
+                "source": meta.get("source") or d.get("type"),
                 "location": meta.get("location"),
             }
 
+        # PLANNED dispatches come from flexPlannedDispatches, keyed by the
+        # charge-point device id. With no charging device, or if the flex query
+        # errors, there are simply no planned slots this poll — it recovers on the
+        # next poll, and a persistent failure surfaces via kraken_schema_drift.
+        planned_raw = []
+        if device_id:
+            try:
+                flex_data = await self._graphql(
+                    "query flexPlanned($devId: String!) {"
+                    "  flexPlannedDispatches(deviceId: $devId) {"
+                    "    start end type energyAddedKwh } }",
+                    {"devId": device_id})
+                planned_raw = (flex_data or {}).get("flexPlannedDispatches") or []
+            except KrakenAPIError as e:
+                logger.warning("get_dispatches: flexPlannedDispatches failed (%s) "
+                               "— no planned slots this poll", e)
+
         planned = [_norm(d) for d in planned_raw]
         completed = [_norm(d) for d in completed_raw]
+
+        def _smart(items):
+            return sum(1 for d in items
+                       if str(d.get("source") or "").lower() in _SMART_SOURCES)
+        logger.info(
+            "get_dispatches: planned via flex (device=%s) planned=%d (smart=%d)",
+            _mask(device_id) if device_id else "none", len(planned), _smart(planned))
 
         if not planned and not completed and not provider:
             # Nothing came back — log the shape (keys only) for schema diagnosis.

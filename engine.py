@@ -4728,14 +4728,24 @@ async def _refresh_kraken_rate_schedules() -> None:
             logger.warning("_refresh_kraken_rate_schedules: standing build failed: %s", e)
 
 
+# Smart-charge source vocabulary across API versions: legacy meta.source =
+# 'smart-charge', flex type = 'smart'. (Bump/boost are excluded — see filter.)
+_SMART_CHARGE_SOURCES = {"smart-charge", "smart"}
+
+
 def _smart_charge_slots(planned: list) -> set:
     """30-min slots (naive-UTC ISO) covered by planned dispatches whose
-    meta.source is 'smart-charge'. This is the started/smart gate: bump-charge
+    source is a smart-charge dispatch. This is the started/smart gate: bump-charge
     (boost) and unknown/null sources are EXCLUDED — only genuine smart-charge
     dispatches are off-peak candidates. 'Any active minute → whole slot.'
+
+    Vocabulary: the legacy `plannedDispatches.meta.source` says 'smart-charge';
+    the newer `flexPlannedDispatches.type` says 'smart'. Match BOTH so detection
+    is correct whichever the API returns (mirrors BottlecapDave's
+    INTELLIGENT_SOURCE_SMART_CHARGE_OPTIONS).
     """
     smart = [d for d in (planned or [])
-             if str(d.get("source") or "").lower() == "smart-charge"]
+             if str(d.get("source") or "").lower() in _SMART_CHARGE_SOURCES]
     return _planned_dispatch_slots_preview(smart)
 
 
@@ -4889,6 +4899,14 @@ async def _surface_kraken_deprecations(ha, deprecations: list) -> None:
     never raises into the poll.
     """
     if ha is None:
+        return
+    # Respect dev-mode: publish_ha_sensors=false means this instance does not
+    # write to HA. The per-field kraken_field_deprecated WARNINGs were already
+    # logged (locally) by the client; here we only skip the HA-facing surface.
+    if not _PUBLISH_HA_SENSORS:
+        logger.info(
+            "_surface_kraken_deprecations: HA publishing disabled — %d "
+            "deprecation(s) logged only, not surfaced to HA", len(deprecations))
         return
     _NOTIF_ID = "emt_api_deprecation"
     _SENSOR   = "sensor.energy_meter_tracker_api_deprecations"

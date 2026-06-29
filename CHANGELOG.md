@@ -1,5 +1,19 @@
 # Changelog
 
+## [3.0.4] — 2026-06-29
+
+*Completes the Intelligent dispatch API migration begun in 3.0.3. No change to how charges are priced for current setups — the same smart-charge slots are detected, now via Octopus's current API.*
+
+### Changed
+
+- **Migrated Intelligent planned dispatches to `flexPlannedDispatches`** — Octopus deprecated the `plannedDispatches` field (scheduled for removal) in favour of `flexPlannedDispatches`, which is keyed by the charge-point device rather than the account and reports `type`/`energyAddedKwh` in place of `meta.source`/`delta`. EMT now discovers the charge-point device id and queries the new field, mapping it back to the same internal shape. Verified against live data (planned-slot and smart-slot counts matched the old field exactly through a real charging schedule) before the old field was removed.
+- **Smart-charge detection now recognises both API vocabularies** — the dispatch source is matched against `smart-charge` (legacy) and `smart` (flex), so detection is correct regardless of which spelling Octopus returns. Boost/bump dispatches (`bump-charge`/`boost`) remain excluded from off-peak, as before.
+- **Dispatch slot times moved to `start`/`end`** — off the deprecated `startDt`/`endDt` fields (same values, current field names).
+
+### Fixed
+
+- **Deprecation self-check no longer over-reports on generic field names** — fields like `id` exist on nearly every schema type, so name-only matching flagged unrelated deprecations (ledgers, payments) EMT never uses. Generic names are now matched only on the specific types EMT actually reads them from, so the count reflects fields EMT genuinely depends on. With this migration complete, EMT uses no deprecated API fields, so the deprecation notification clears itself.
+
 ## [3.0.3] — 2026-06-28
 
 *Resilience to Octopus/Kraken API changes — no functional change for current setups.*
