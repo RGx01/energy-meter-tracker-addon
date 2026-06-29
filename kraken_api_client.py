@@ -134,7 +134,6 @@ _DEPRECATION_IGNORE = {
 }
 
 
-
 def _pick_charging_device(devices: list) -> Optional[dict]:
     """Return the device dict best representing the IOG-controllable charging
     device — a LIVE EV / charge point wins over non-charging or non-LIVE ones.
@@ -812,11 +811,14 @@ class KrakenAPIClient:
         for t in types:
             tname = t.get("name") or "?"
             for f in (t.get("fields") or []):
-                if f.get("isDeprecated") and f.get("name") in _EMT_GRAPHQL_FIELDS:
-                    if (tname, f.get("name")) in _DEPRECATION_IGNORE:
+                fname = f.get("name")
+                if f.get("isDeprecated") and (
+                        fname in _EMT_GRAPHQL_FIELDS
+                        or (tname, fname) in _EMT_GRAPHQL_TYPED_FIELDS):
+                    if (tname, fname) in _DEPRECATION_IGNORE:
                         ignored += 1
                         logger.debug("kraken_deprecation_check: ignoring known "
-                                     "name-collision %s.%s", tname, f.get("name"))
+                                     "name-collision %s.%s", tname, fname)
                         continue
                     hits.append({"kind": "field", "type": tname,
                                  "name": fname,
