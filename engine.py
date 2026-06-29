@@ -4728,14 +4728,24 @@ async def _refresh_kraken_rate_schedules() -> None:
             logger.warning("_refresh_kraken_rate_schedules: standing build failed: %s", e)
 
 
+# Smart-charge source vocabulary across API versions: legacy meta.source =
+# 'smart-charge', flex type = 'smart'. (Bump/boost are excluded — see filter.)
+_SMART_CHARGE_SOURCES = {"smart-charge", "smart"}
+
+
 def _smart_charge_slots(planned: list) -> set:
     """30-min slots (naive-UTC ISO) covered by planned dispatches whose
-    meta.source is 'smart-charge'. This is the started/smart gate: bump-charge
+    source is a smart-charge dispatch. This is the started/smart gate: bump-charge
     (boost) and unknown/null sources are EXCLUDED — only genuine smart-charge
     dispatches are off-peak candidates. 'Any active minute → whole slot.'
+
+    Vocabulary: the legacy `plannedDispatches.meta.source` says 'smart-charge';
+    the newer `flexPlannedDispatches.type` says 'smart'. Match BOTH so detection
+    is correct whichever the API returns (mirrors BottlecapDave's
+    INTELLIGENT_SOURCE_SMART_CHARGE_OPTIONS).
     """
     smart = [d for d in (planned or [])
-             if str(d.get("source") or "").lower() == "smart-charge"]
+             if str(d.get("source") or "").lower() in _SMART_CHARGE_SOURCES]
     return _planned_dispatch_slots_preview(smart)
 
 
