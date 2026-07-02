@@ -1274,6 +1274,14 @@ def _warn_zero_rate(meter_id: str, channel_id: str) -> None:
         meter_id, channel_id)
 
 
+# A single block's import/export delta can never plausibly reach this. Domestic
+# supply tops out well under 100 kW, so a per-block delta in the hundreds of kWh
+# is always a lost-opener artifact — the whole cumulative register booked as one
+# interval — not real usage. Used as the rogue-total backstop in compute_channel;
+# 15×+ margin over the most extreme domestic block so it never trips on real use.
+_ROGUE_BLOCK_KWH_CEILING = 500.0
+
+
 def compute_channel(channel: dict, parent_rates=None, is_sub_meter: bool = False,
                     meter_id: str = "?", channel_id: str = "?") -> dict:
     reads     = channel.get("reads", [])
@@ -1295,6 +1303,31 @@ def compute_channel(channel: dict, parent_rates=None, is_sub_meter: bool = False
     if not is_sub_meter:
         raw_delta = reads[-1]["value"] - reads[0]["value"]
         total_kwh = max(raw_delta, 0.0)
+        # Rogue-total backstop (source-agnostic — sensor, Mini, or DCC reads).
+        # A single block cannot import a physically impossible amount. This
+        # occurs when the opening register is lost or zeroed — e.g. a read
+        # dropout during a restart leaves the opener at 0 while the closer still
+        # holds the true cumulative register, so the block books the ENTIRE
+        # lifetime register as one interval's delta. Clamp to zero and collapse
+        # read_start onto read_end so (a) the total is not inflated and (b) the
+        # next block still opens at the correct register. Logged (not silent) and
+        # flagged for review. (Incident 2026-07: 30961 kWh booked in one 30-min
+        # block from a zeroed opener during device config churn — a £10k bill.)
+        if total_kwh > _ROGUE_BLOCK_KWH_CEILING:
+            logger.warning(
+                "compute_channel: %s/%s rogue block delta %.1f kWh "
+                "(opener=%.3f closer=%.3f) exceeds %.0f kWh ceiling — clamping to "
+                "0 (lost/zeroed opener); register continuity preserved via read_end.",
+                meter_id, channel_id, total_kwh, reads[0]["value"],
+                reads[-1]["value"], _ROGUE_BLOCK_KWH_CEILING)
+            return {
+                "kwh":          0.0,
+                "rate":         last_rate,
+                "cost":         0.0,
+                "read_start":   reads[-1]["value"],
+                "read_end":     reads[-1]["value"],
+                "needs_review": True,
+            }
         # Runtime backstop: a block that consumed/exported energy but has no
         # rate is being costed at ZERO silently — i.e. real usage billed as
         # free. This is the "rate field left blank" hole. Surface it (throttled)
