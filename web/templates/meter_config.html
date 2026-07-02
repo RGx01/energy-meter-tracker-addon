@@ -101,6 +101,14 @@
           </div>
           <small style="color:var(--muted);">Live inverter power in W or kW. Enables the inverter gauge on Live Power.</small>
         </div>
+        <div class="form-group" style="margin-bottom:20px;">
+          <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Solar / PV Power Sensor <span style="font-weight:400;">(optional)</span></label>
+          <div style="margin-top:6px;position:relative;">
+            <input type="text" id="ad-pv-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="ad-entity" data-field="pv">
+            <div id="ad-pv-sensor_drop" class="entity-drop"></div>
+          </div>
+          <small style="color:var(--muted);">Live PV generation in W or kW. Adds a small PV dial to the battery card.</small>
+        </div>
       </div>
 
       <!-- EV fields -->
@@ -496,6 +504,7 @@ var FIELD_FILTERS = {
   standing_charge_sensor:  { units: [], unitSuffixes: ['/day'], device_class: ['monetary', 'currency'] },
   soc_sensor:              { units: ['%'], unitSuffixes: [], device_class: ['battery'] },
   inverter_power_sensor:   { units: ['W', 'w', 'kW'], unitSuffixes: [], device_class: ['power'] },
+  pv_power_sensor:         { units: ['W', 'w', 'kW'], unitSuffixes: [], device_class: ['power'] },
   device_power_sensor:     { units: ['W', 'w', 'kW'], unitSuffixes: [], device_class: ['power'] },
 };
 
@@ -843,6 +852,11 @@ function buildSubCard(meterId, meter) {
               '<option value="kW"' + (meta.inverter_power_unit==='kW' ? ' selected' : '') + '>Force kilowatts (kW)</option>' +
             '</select></div>' +
           '<small style="color:var(--muted);">Live inverter power in W or kW. ⓘ Informational only — not recorded in blocks or used in calculations.</small>' +
+        '</div>' +
+        '<div class="form-group" style="grid-column:1/-1;margin-bottom:16px;">' +
+          '<label>Solar / PV Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — adds a small PV dial to the battery card)</span></label>' +
+          buildEntityInput(meterId + '__pv_power__pv_power_sensor', meta.pv_power_sensor||'', meterId, 'pv_power', 'pv_power_sensor', true) +
+          '<small style="color:var(--muted);">Live PV generation in W or kW. ⓘ Informational only — not recorded in blocks or used in calculations.</small>' +
         '</div>'
       : '') +
 
@@ -1066,6 +1080,10 @@ function onContainerChange(e) {
       // device_power_sensor stored in meter meta (EV charger, heat pump)
       if (el.value) config.meters[m].meta['device_power_sensor'] = el.value;
       else delete config.meters[m].meta['device_power_sensor'];
+    } else if (ch === 'pv_power') {
+      // pv_power_sensor stored in meter meta (battery PV/solar dial)
+      if (el.value) config.meters[m].meta['pv_power_sensor'] = el.value;
+      else delete config.meters[m].meta['pv_power_sensor'];
     } else {
       if (!config.meters[m].channels[ch]) config.meters[m].channels[ch] = {};
       if (el.value) config.meters[m].channels[ch][f] = el.value;
@@ -1366,6 +1384,8 @@ function confirmAddDevice() {
     if (soc) meta.soc_sensor = soc;
     if (inv) meta.inverter_power_sensor = inv;
     if (document.getElementById('ad-invert').checked) meta.inverter_power_invert = true;
+    var pv = document.getElementById('ad-pv-sensor').value.trim();
+    if (pv) meta.pv_power_sensor = pv;
   } else if (type === 'ev') {
     var evp = document.getElementById('ad-ev-sensor').value.trim();
     if (evp) meta.device_power_sensor = evp;
@@ -1411,6 +1431,7 @@ function setupAdEntityDropdowns() {
       var fieldMap = {
         soc:      'soc_sensor',
         inverter: 'inverter_power_sensor',
+        pv:       'pv_power_sensor',
         ev:       'device_power_sensor',
         hp:       'device_power_sensor',
         read:     'read',
@@ -1751,6 +1772,7 @@ function startWizard() {
       soc:                   m.meta.soc_sensor || '',
       inverter_power:        m.meta.inverter_power_sensor || '',
       inverter_power_invert: !!m.meta.inverter_power_invert,
+      pv_power:              m.meta.pv_power_sensor || '',
       device_power:          m.meta.device_power_sensor || '',
       v2x_capable:           !!m.meta.v2x_capable
     };
@@ -2276,7 +2298,10 @@ function wizStepSubSensors() {
           '<div class="checkbox-row" style="margin-bottom:16px;">' +
             '<input type="checkbox" id="wiz-sub-' + devId + '-invert" ' + (sd.inverter_power_invert ? 'checked' : '') + '>' +
             '<label for="wiz-sub-' + devId + '-invert">Invert sensor value — <span style="font-weight:400;color:var(--muted);">tick if positive = charging, negative = discharging</span></label>' +
-          '</div>'
+          '</div>' +
+          '<div class="form-group"><label>Solar / PV Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — adds a small PV dial to the battery card)</span></label>' +
+            buildWizEntity('wiz-sub-' + devId + '-pv-power', sd.pv_power||'') +
+            '<small style="color:var(--muted);">Live PV generation in W or kW. ⓘ Informational only.</small></div>'
         : devId === 'ev'
         ? '<div class="form-group"><label>Charger Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — shows live kW on Live Power page)</span></label>' +
             buildWizEntity('wiz-sub-' + devId + '-device-power', sd.device_power||'') +
@@ -2331,6 +2356,7 @@ function showDropById(id, inp) {
   else if (id.indexOf('-sc') !== -1)      field = 'standing_charge_sensor';
   else if (id.indexOf('-soc') !== -1)     field = 'soc_sensor';
   else if (id === 'wiz-power')            field = 'power_sensor';
+  else if (id.indexOf('-pv-power') !== -1)  field = 'pv_power_sensor';
   else if (id.indexOf('-inverter-power') !== -1 || id.indexOf('-device-power') !== -1) field = 'inverter_power_sensor';
   var matches = filterEntities(field, inp.value);
   if (matches.length === 0) { drop.style.display = 'none'; return; }
@@ -2656,6 +2682,7 @@ async function wizApplyAndClose() {
         ...(devId === 'battery' && sd.soc ? { soc_sensor: sd.soc } : {}),
         ...(devId === 'battery' && sd.inverter_power ? { inverter_power_sensor: sd.inverter_power } : {}),
         ...(devId === 'battery' && sd.inverter_power_invert ? { inverter_power_invert: true } : {}),
+        ...(devId === 'battery' && sd.pv_power ? { pv_power_sensor: sd.pv_power } : {}),
         ...((devId === 'ev' || devId === 'heat') && sd.device_power ? { device_power_sensor: sd.device_power } : {}),
         ...(devId === 'ev' && sd.v2x_capable ? { v2x_capable: true } : {})
       },

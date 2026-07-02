@@ -649,6 +649,27 @@ def live_power_page():
     mini_chosen = main_meta.get("power_source") == "mini"
     has_power_sensor = bool(_effective_power_sensor(main_meta)) or mini_chosen
 
+    # Sub-meter device cards (battery SoC / EV / heat-pump power) render
+    # independently of the main gauge — each needs only its own sensor. Without
+    # this flag the cards were gated on has_power_sensor and vanished on
+    # API-only / DCC setups that have no main live-power source.
+    has_sub_devices = False
+    try:
+        from datetime import datetime as _dt_sd
+        _today_sd = _dt_sd.now().strftime("%Y-%m-%d")
+        for _m in (cfg.get("meters") or {}).values():
+            _mm = (_m or {}).get("meta") or {}
+            if not _mm.get("sub_meter"):
+                continue
+            if _mm.get("retired_at") and _mm["retired_at"] <= _today_sd:
+                continue
+            if (_mm.get("soc_sensor") or _mm.get("inverter_power_sensor")
+                    or _mm.get("device_power_sensor") or _mm.get("pv_power_sensor")):
+                has_sub_devices = True
+                break
+    except Exception:
+        has_sub_devices = False
+
     # Mini opt-in offer: a Mini is present AND there's no cheaper live source
     # (no power_sensor entity, no BCD demand sensor). Cheap — no GraphQL here.
     mini_device = bool(_mini_device_id())
@@ -674,6 +695,7 @@ def live_power_page():
         year_rows=year_rows,
         year_period=year_period,
         has_power_sensor=has_power_sensor,
+        has_sub_devices=has_sub_devices,
         mini_available=mini_available,
         mini_chosen=mini_chosen,
         gauge_max_imp=gauge_max_imp,
@@ -696,6 +718,7 @@ def _build_soc_response(soc_sensors, ha_client):
     for m_id, info in soc_sensors.items():
         soc_val = None
         power_kw = None
+        pv_kw = None
         try:
             if ha_client and info.get("soc_entity"):
                 v = ha_client.get_state(info["soc_entity"])
@@ -719,14 +742,30 @@ def _build_soc_response(soc_sensors, ha_client):
                         v, unit, info.get("power_unit"), info.get("power_invert"))
         except (ValueError, TypeError):
             pass
+        # PV / solar generation — always positive, auto unit, no invert.
+        try:
+            if ha_client and info.get("pv_entity"):
+                v = ha_client.get_state(info["pv_entity"])
+                if v not in (None, "unknown", "unavailable"):
+                    unit = ""
+                    try:
+                        unit = (ha_client.get_attributes(info["pv_entity"])
+                                or {}).get("unit_of_measurement", "")
+                    except Exception:
+                        pass
+                    pv_kw = _eng_pc._power_value_to_kw(v, unit, None, False)
+        except (ValueError, TypeError):
+            pass
         result[m_id] = {
             "label":        info.get("label", m_id),
             "type":         info.get("type", "battery"),
             "v2x":          info.get("v2x", False),
             "soc_entity":   info.get("soc_entity"),
             "power_entity": info.get("power_entity"),
+            "pv_entity":    info.get("pv_entity"),
             "soc":          soc_val,
             "power_kw":     power_kw,
+            "pv_kw":        pv_kw,
         }
     return result
 
@@ -833,12 +872,13 @@ def api_power():
                     _main_power_unit = meta.get("power_unit") or None
             elif _is_meter_type(meta, m_id, "battery"):
                 bat_sensor = ((m_data.get("channels") or {}).get("import") or {}).get("read")
-                if meta.get("soc_sensor") or meta.get("inverter_power_sensor"):
+                if meta.get("soc_sensor") or meta.get("inverter_power_sensor") or meta.get("pv_power_sensor"):
                     soc_sensors[m_id] = {
                         "soc_entity":    meta.get("soc_sensor"),
                         "power_entity":  meta.get("inverter_power_sensor"),
                         "power_invert":  bool(meta.get("inverter_power_invert", False)),
                         "power_unit":    meta.get("inverter_power_unit") or None,
+                        "pv_entity":     meta.get("pv_power_sensor"),
                         "label":         meta.get("device") or m_id,
                         "type":          "battery",
                     }

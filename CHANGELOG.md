@@ -1,5 +1,20 @@
 # Changelog
 
+## [3.0.5] — 2026-07-01
+
+*Adds an optional solar/PV dial to the House Battery card, fixes device cards (battery / EV / heat pump) not appearing on the Overview for setups with no main live-power source, and tidies the Overview layout. No change to tracking or billing.*
+
+### Added
+
+- **Solar / PV dial on the House Battery card.** Set a new **Solar / PV Power Sensor** on a battery — on an existing battery in Meter Config, or when adding one via the device wizard — and the battery card shows a small live PV generation dial (kW) beside the inverter gauge. It's display-only — not recorded in blocks or used in any calculation — and the card is unchanged if you don't set one. This release adds a `pv_power_sensor` column to the meters table; existing databases are migrated automatically on upgrade.
+
+### Fixed
+
+- **Device cards now appear on the Overview without a main power sensor.** Battery, EV, and heat-pump cards were only shown when the main meter had a live-power source — your own power sensor, a BottlecapDave demand sensor, or an opted-in Octopus Mini. On API / DCC-only setups with none of those, the cards were never placed on the page even though the underlying data was correct, so configured devices looked missing. They now render whenever the devices exist, independently of the main power gauge.
+- **Overview no longer stretches its cards when four gauges are shown.** A page with four gauges (for example live power plus a battery, an EV, and a heat pump) now keeps the compact, uniform card width instead of switching to a wider, stretched layout. A related miscount could also flip a page with no live-power gauge into the wide layout one card too early; both are corrected. Cards on a full top row now grow to share the width, so a four-card row fills tidily instead of leaving a trailing gap.
+- **Info banners line up with the cards.** The Octopus Mini enable/disable notices and the "add a power sensor" hint are now constrained to the same width as the card grid instead of spanning the full window.
+- **The gauge row fills the full width with four gauges.** When four gauges push the carbon card onto its own line, the top gauge row now stretches to the same width as the rows beneath it (rather than stopping short), and shrinks with the browser window.
+
 ## [3.0.4] — 2026-06-29
 
 *Completes the Intelligent dispatch API migration begun in 3.0.3. No change to how charges are priced for current setups — the same smart-charge slots are detected, now via Octopus's current API.*
