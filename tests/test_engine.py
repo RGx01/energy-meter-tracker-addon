@@ -2805,6 +2805,10 @@ class TestDispatchSlotCapture(unittest.TestCase):
                                                "tariff_code": "Y"}}
 
         class _FakeClient:
+            # last_deprecations is a None sentinel = "introspection unavailable",
+            # so _capture_dispatch_slots skips the one-shot HA surfacing path.
+            # The real KrakenApiClient grew this attribute in 3.0.3.
+            last_deprecations = None
             async def get_dispatches(self, acct):
                 return {"provider": "MYENERGI_V2",
                         "planned": [
