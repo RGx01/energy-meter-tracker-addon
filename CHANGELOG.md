@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.0.6] — 2026-07-02
+
+*Safeguards the running import total against a rare lost-register glitch that could book an impossible one-block figure. No change to normal tracking or billing.*
+
+### Fixed
+
+- **Guard against a rogue full-register import block.** If the main meter's *opening* register reading is momentarily lost — for example a read dropout during a restart, which can happen while adding or removing devices — a single half-hour block could book the entire cumulative meter register as one interval's import, massively inflating the running total (and bill) until settlement caught up. The engine now clamps any single block whose import exceeds a physically impossible ceiling, logs it, and keeps the register continuous so the next block opens correctly. On API / Octopus Mini / DCC setups the true half-hourly figure still replaces the placeholder when DCC settlement arrives (no action needed); on CAD-only setups with no reconciliation source the affected half-hour is treated as zero — a negligible loss versus a phantom total.
+
 ## [3.0.5] — 2026-07-01
 
 *Adds an optional solar/PV dial to the House Battery card, fixes device cards (battery / EV / heat pump) not appearing on the Overview for setups with no main live-power source, and tidies the Overview layout. No change to tracking or billing.*
@@ -14,6 +22,8 @@
 - **Overview no longer stretches its cards when four gauges are shown.** A page with four gauges (for example live power plus a battery, an EV, and a heat pump) now keeps the compact, uniform card width instead of switching to a wider, stretched layout. A related miscount could also flip a page with no live-power gauge into the wide layout one card too early; both are corrected. Cards on a full top row now grow to share the width, so a four-card row fills tidily instead of leaving a trailing gap.
 - **Info banners line up with the cards.** The Octopus Mini enable/disable notices and the "add a power sensor" hint are now constrained to the same width as the card grid instead of spanning the full window.
 - **The gauge row fills the full width with four gauges.** When four gauges push the carbon card onto its own line, the top gauge row now stretches to the same width as the rows beneath it (rather than stopping short), and shrinks with the browser window.
+- **Power-card heights stay consistent.** The gauge cards no longer shrink slightly when the carbon card moves onto its own row as the window narrows.
+- **Cleaner power gauges.** Removed the small min/max scale numbers under each gauge arc — they were hard to read and duplicated the value already shown in the gauge.
 
 ## [3.0.4] — 2026-06-29
 
