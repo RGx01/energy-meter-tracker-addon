@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+<!-- EMT layout variant: WRAP-FILL (ACTIVE) — Cards wrap-and-fill: one filled row when wide; wraps left-aligned filling each row when narrow. -->
 
 {% block head %}
 <style>
@@ -372,6 +373,7 @@
   height: auto;
   overflow: visible;
 }
+.pv-gauge-value { fill: #00d4aa; }
 
 .soc-power-row {
   width: 100%;
@@ -1151,10 +1153,13 @@ function _setInvMax(mid, kw) { _invMaxKw[mid] = Math.max(_getInvMax(mid), kw); }
 
 var _pvMaxKw = {};  // per-meter PV gauge scale, keyed by meter_id
 function setPvGauge(meterId, pkw) {
-  var PV_ARC_LEN = 113.1;  // half-circle, r=36
   var arc  = document.getElementById('pv-arc-' + meterId);
   var kwEl = document.getElementById('pv-kw-' + meterId);
   if (!arc) return;
+  // Measure the real path length rather than trusting a constant (an off-by-a-
+  // few-px path would otherwise scale the fill wrongly). Fall back if unmeasurable.
+  var PV_ARC_LEN = 113.1;  // half-circle, r=36 (fallback)
+  try { var _l = arc.getTotalLength(); if (_l && _l > 1) PV_ARC_LEN = _l; } catch (e) {}
   if (pkw === null || pkw === undefined) {
     arc.style.strokeDasharray = '0 ' + PV_ARC_LEN;
     if (kwEl) kwEl.textContent = '—';
@@ -1282,9 +1287,9 @@ function buildSocCard(meterId, info) {
       '<div class="pv-gauge" id="pv-gauge-' + meterId + '">' +
         '<div class="pv-gauge-label">☀️ PV</div>' +
         '<svg viewBox="0 0 90 54" xmlns="http://www.w3.org/2000/svg">' +
-          '<path d="M 8 48 A 36 36 0 0 1 82 48" fill="none" stroke="#2a2d3a" stroke-width="8" stroke-linecap="round"/>' +
-          '<path id="pv-arc-' + meterId + '" d="M 8 48 A 36 36 0 0 1 82 48" fill="none" stroke="#ef4444" stroke-width="8" stroke-linecap="round" stroke-dasharray="0 113" stroke-dashoffset="0"/>' +
-          '<text x="45" y="42" font-size="15" font-weight="700" fill="#ef4444" text-anchor="middle" id="pv-kw-' + meterId + '">—</text>' +
+          '<path d="M 9 48 A 36 36 0 0 1 81 48" class="gauge-arc-bg" fill="none" stroke="#2a2d3a" stroke-width="8" stroke-linecap="round"/>' +
+          '<path id="pv-arc-' + meterId + '" d="M 9 48 A 36 36 0 0 1 81 48" fill="none" stroke="#00d4aa" stroke-width="8" stroke-linecap="round" stroke-dasharray="0 113" stroke-dashoffset="0"/>' +
+          '<text x="45" y="42" font-size="15" font-weight="700" class="pv-gauge-value" fill="#00d4aa" text-anchor="middle" id="pv-kw-' + meterId + '">—</text>' +
         '</svg>' +
       '</div>';
   }
