@@ -30,7 +30,7 @@ import zipfile
 from unittest.mock import patch
 
 from block_store import BlockStore
-from engine import compute_channel, _device_base_rate
+from engine import compute_channel
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -267,10 +267,10 @@ class TestInheritReproducesV2Pricing(unittest.TestCase):
         """Characterisation: compute_channel's sub-meter reconstruction keeps a
         running minimum, so a FULL multi-rate day collapses to its off-peak
         floor. This latent property is unchanged — but the engine device path no
-        longer feeds it the whole-day series: `_device_base_rate` resolves the
-        base per-slot for an API-fed main (see TestDeviceBaseRate), so the device
-        no longer inherits the collapsed day. This test pins the boundary so a
-        future change to the reconstruction is a conscious one.
+        longer feeds it the whole-day series at all: devices are priced in PASS 2
+        at the main meter's per-block effective rate, so this collapse never
+        reaches a device's cost. This test pins the boundary so a future change
+        to the reconstruction is a conscious one.
         """
         channel = {
             "reads": [
@@ -287,88 +287,6 @@ class TestInheritReproducesV2Pricing(unittest.TestCase):
         r = compute_channel(channel, full_day, is_sub_meter=True,
                             meter_id="ev_charger", channel_id="import")
         self.assertAlmostEqual(r["rate"], self.OFFPEAK, places=6)  # collapses (isolated)
-
-
-# ── engine: device base follows the MAIN meter's source (the fix) ────────────
-
-class TestDeviceBaseRate(unittest.TestCase):
-    """_device_base_rate resolves a 'use main meter rate' device's pre-overlay
-    base, honouring the main meter's own source and never inheriting the
-    collapsed whole-day series in API mode."""
-
-    PEAK = 0.323092
-    OFFPEAK = 0.05493
-
-    def _resolver(self, peak=True):
-        # schedule resolver: peak by day, off-peak overnight (per block_start)
-        def r(channel, ts):
-            hh = int(ts[11:13])
-            return self.PEAK if 6 <= hh < 23 else self.OFFPEAK
-        return r
-
-    def test_api_main_resolves_per_slot_not_collapsed_inherit(self):
-        # main on API (no rate sensor); inherited value is the COLLAPSED off-peak
-        # floor — the resolver's midday peak must win.
-        base = _device_base_rate(
-            {"rate": "", "rate_source": "api"},
-            inherited_rate=self.OFFPEAK,            # collapsed
-            block_start="2026-06-13T13:00:00",
-            resolver=self._resolver(),
-        )
-        self.assertAlmostEqual(base, self.PEAK, places=6)
-
-    def test_api_main_inferred_from_absent_sensor(self):
-        # un-migrated config: no rate_source, no rate sensor → treat as API
-        base = _device_base_rate(
-            {"rate": ""},
-            inherited_rate=self.OFFPEAK,
-            block_start="2026-06-13T13:00:00",
-            resolver=self._resolver(),
-        )
-        self.assertAlmostEqual(base, self.PEAK, places=6)
-
-    def test_sensor_main_inherits_even_when_api_key_present(self):
-        # main explicitly on a sensor: inherit its per-block rate, do NOT
-        # substitute the resolver (the cad+api pitfall).
-        base = _device_base_rate(
-            {"rate": "sensor.octopus_rate", "rate_source": "sensor"},
-            inherited_rate=self.PEAK,               # main's sensor peak
-            block_start="2026-06-13T13:00:00",
-            resolver=lambda c, t: self.OFFPEAK,     # would be wrong if used
-        )
-        self.assertAlmostEqual(base, self.PEAK, places=6)
-
-    def test_sensor_main_inferred_from_present_sensor(self):
-        base = _device_base_rate(
-            {"rate": "sensor.octopus_rate"},        # no explicit source
-            inherited_rate=self.PEAK,
-            block_start="2026-06-13T13:00:00",
-            resolver=lambda c, t: self.OFFPEAK,
-        )
-        self.assertAlmostEqual(base, self.PEAK, places=6)
-
-    def test_sensor_main_gap_falls_back_to_resolver(self):
-        # sensor main but inherited base empty (gap block) → resolver fallback
-        base = _device_base_rate(
-            {"rate": "sensor.octopus_rate", "rate_source": "sensor"},
-            inherited_rate=0.0,
-            block_start="2026-06-13T13:00:00",
-            resolver=self._resolver(),
-        )
-        self.assertAlmostEqual(base, self.PEAK, places=6)
-
-    def test_no_schedule_keeps_inherited(self):
-        base = _device_base_rate(
-            {"rate": "", "rate_source": "api"},
-            inherited_rate=self.OFFPEAK,
-            block_start="2026-06-13T13:00:00",
-            resolver=lambda c, t: None,             # no schedule
-        )
-        self.assertAlmostEqual(base, self.OFFPEAK, places=6)
-
-
-# ── optional: against the real prod_dev v2 database ──────────────────────────
-
 def _find_v2_upload():
     for z in sorted(glob.glob("/mnt/user-data/uploads/*manual.zip")):
         try:
@@ -451,9 +369,11 @@ class TestRealV2DbReproduction(unittest.TestCase):
 
 class TestDeviceOverlayFinaliseWiring(unittest.TestCase):
     """End-to-end: a main on API whose import channel carries a full-day
-    schedule (which collapses under inheritance) plus an overlay device — the
-    finalised device block must be PEAK at midday, proving finalise_block uses
-    _device_base_rate (resolver per-slot) rather than the collapsed inherit."""
+    schedule (which would collapse under the old inheritance) plus a device —
+    the finalised device block must be PEAK at midday. Under the current model
+    the device is priced in PASS 2 at the main meter's per-block effective rate
+    (peak at midday, no dispatch slot), so it never inherits the collapsed
+    whole-day floor."""
 
     PEAK = 0.323092
     OFFPEAK = 0.05493
@@ -563,39 +483,6 @@ class TestDeviceOverlayFinaliseWiring(unittest.TestCase):
         self.assertAlmostEqual(ev_imp["rate"], self.PEAK, places=6)
         self.assertAlmostEqual(ev_imp["cost"], 2.0 * self.PEAK, places=4)
 
-
-# ── engine: explicit choice wins over a mapped sensor (honour the toggle) ─────
-
-class TestDeviceOverlayDecision(unittest.TestCase):
-    def test_main_wins_even_with_own_sensor(self):
-        from engine import _device_overlay_decision
-        # 'use main meter rate' ticked must inherit the main even if a sensor
-        # is also mapped (has_own_rates True).
-        self.assertTrue(_device_overlay_decision({"rate_source": "main"}, {}, True))
-        self.assertTrue(_device_overlay_decision({"rate_source": "main"}, {}, False))
-
-    def test_sensor_uses_own_when_present(self):
-        from engine import _device_overlay_decision
-        self.assertFalse(_device_overlay_decision({"rate_source": "sensor"}, {}, True))
-
-    def test_sensor_but_empty_falls_back_to_main(self):
-        from engine import _device_overlay_decision
-        # 'sensor' chosen but none mapped (no own rates) → inherit the main,
-        # so the device is never left un-priced.
-        self.assertTrue(_device_overlay_decision({"rate_source": "sensor"}, {}, False))
-
-    def test_unset_defers_to_legacy(self):
-        import engine
-        from engine import _device_overlay_decision
-        # no explicit channel choice → legacy _device_uses_overlay precedence
-        self.assertFalse(_device_overlay_decision({}, {}, True))          # sensor wins
-        self.assertTrue(_device_overlay_decision({}, {"rate_source": "overlay"}, False))
-        with patch.object(engine, "kraken_available", return_value=True):
-            self.assertTrue(_device_overlay_decision({}, {}, False))      # API default
-
-
-# ── migration: a device with its OWN rate sensor keeps it ────────────────────
-
 class TestBackfillDeviceWithOwnSensor(unittest.TestCase):
     def test_device_with_rate_sensor_maps_to_sensor(self):
         tmp = tempfile.mkdtemp()
@@ -660,16 +547,6 @@ class TestWizardConfigShape(unittest.TestCase):
         # device compat mirror: 'main' → overlay, 'sensor' → own
         self.assertEqual(cfg["meters"]["ev_charger"]["meta"].get("rate_source"), "overlay")
         self.assertEqual(cfg["meters"]["house_battery"]["meta"].get("rate_source"), "own")
-
-    def test_engine_decision_from_wizard_shape(self):
-        from engine import _device_overlay_decision
-        cfg = self._wizard_config()
-        ev = cfg["meters"]["ev_charger"]["channels"]["import"]
-        batt = cfg["meters"]["house_battery"]["channels"]["import"]
-        # EV ('main') inherits main even though a read sensor exists
-        self.assertTrue(_device_overlay_decision(ev, {}, True))
-        # battery ('sensor') with its own rate sensor uses it
-        self.assertFalse(_device_overlay_decision(batt, {}, True))
 
 
 if __name__ == "__main__":

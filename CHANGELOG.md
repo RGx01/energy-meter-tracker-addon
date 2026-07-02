@@ -2,11 +2,13 @@
 
 ## [3.0.6] — 2026-07-02
 
-*Safeguards the running import total against a rare lost-register glitch that could book an impossible one-block figure. No change to normal tracking or billing.*
+*Safeguards the running import total against a rare lost-register glitch, and makes devices always bill at the main meter's effective rate — fixing an Intelligent Octopus dispatch overcharge that could hit device costs on reconciled smart-charge blocks.*
 
 ### Fixed
 
 - **Guard against a rogue full-register import block.** If the main meter's *opening* register reading is momentarily lost — for example a read dropout during a restart, which can happen while adding or removing devices — a single half-hour block could book the entire cumulative meter register as one interval's import, massively inflating the running total (and bill) until settlement caught up. The engine now clamps any single block whose import exceeds a physically impossible ceiling, logs it, and keeps the register continuous so the next block opens correctly. On API / Octopus Mini / DCC setups the true half-hourly figure still replaces the placeholder when DCC settlement arrives (no action needed); on CAD-only setups with no reconciliation source the affected half-hour is treated as zero — a negligible loss versus a phantom total.
+
+- **Devices are always priced at the main meter's effective rate — fixing an Intelligent Octopus dispatch overcharge at reconciliation.** A device's grid import (a home battery or EV) is a portion of the main meter's supply, so it's billed at the main meter's rate — base tariff plus any Intelligent Octopus Go off-peak dispatch. Two faults broke that during smart-charge slots: at recording time a device whose own draw fell below the 0.1 kWh over-report floor (typical when solar or another device took most of the grid import) was stranded on the standard peak rate; and at DCC reconciliation the main's off-peak rate was applied to its own cost but not carried onto its devices, so a device's grid import was re-billed at **peak** on every settled smart-charge block — a material overcharge (a 3 kWh grid charge billed at ~£0.97 instead of ~£0.16). Device pricing is now resolved in one place, after every meter is finalised, and always follows the main meter's effective rate for both cost and the displayed rate — at recording time and at settlement. The per-device breakdown continues to sum exactly to the metered bill. Single-tariff installs (the common case) see identical bills; the only visible change is a device's shown rate now always matching what it was costed at.
 
 ## [3.0.5] — 2026-07-01
 
