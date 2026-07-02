@@ -23,6 +23,12 @@
   min-width: 0;
 }
 
+/* Info banners (Mini enable / disable / add-sensor hint) align to the card
+   grid's max width instead of running full-bleed edge-to-edge. */
+#mini-enable, #power-hint, #mini-active-note {
+  max-width: 1400px;
+}
+
 /* In layout-b gauges get own full row */
 .layout-b .gauge-ci-row {
   display: block;
@@ -44,6 +50,34 @@
 .layout-a #carbon-card-wrap .carbon-card {
   height: 100%;
   margin-bottom: 0;
+}
+
+/* ── Gauge row (layout-a): fill the row, wrap tidily when forced ──
+   The gauge cards sit in a wrapping flex row where every card flex-grows, so:
+   • while they all fit, they share one row and stretch to fill its full width
+     (no trailing gap on the right);
+   • when the window is too narrow, they wrap LEFT-ALIGNED and the cards on each
+     wrapped row grow to fill that row — so a wrapped card is never stranded at a
+     fixed width with dead space beside it.
+   Mix flexes too (cap lifted) and keeps a wider 280px basis so it stays the
+   roomy card. Carbon lives in the outer .gauge-ci-row (which wraps), so Carbon
+   drops to its own row. Scoped above the 600px mobile breakpoint so the
+   single-column mobile rules below are left completely untouched. */
+@media (min-width: 601px) {
+  .layout-a .summary-grid {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    flex: 1 1 auto;
+  }
+  .layout-a #mix-card {
+    flex: 1 1 280px;
+    max-width: none;
+  }
+  .layout-a .power-card,
+  .layout-a .soc-card {
+    flex: 1 1 220px;
+    max-width: none;
+  }
 }
 
 /* CI card in layout-b — fixed width beside history */
@@ -299,6 +333,44 @@
   font-size: 10px;
   color: var(--muted);
   margin-top: 1px;
+}
+
+/* Wrapper used ONLY when a PV dial is present, so the inverter gauge keeps its
+   exact place. Replicates the card's own flex column (align/gap) and grows to
+   fill remaining height so the gauge's margin-top:auto still pins it to the
+   card bottom. Absent PV, the card doesn't use this wrapper (byte-identical). */
+.soc-gauge-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 auto;
+  width: 100%;
+  align-self: stretch;
+  position: relative;
+  min-width: 0;
+}
+
+/* Small red PV / solar dial, tucked top-right beside the INVERTER label. */
+.pv-gauge {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 84px;
+  text-align: center;
+  pointer-events: none;
+}
+.pv-gauge-label {
+  font-size: 10px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 1px;
+}
+.pv-gauge svg {
+  width: 100%;
+  height: auto;
+  overflow: visible;
 }
 
 .soc-power-row {
@@ -767,7 +839,7 @@ function setMiniSource(enabled){
 
   <!-- Generation Mix card — first card, only shown when postcode configured -->
   {% if has_postcode %}
-  <div class="soc-card" id="mix-card" style="min-width:280px;max-width:420px;align-items:flex-start;">
+  <div class="soc-card" id="mix-card" style="min-width:280px;align-items:flex-start;">
     <div class="card-title" style="font-size:12px;align-self:flex-start;">🌐 Current Grid Generation Mix</div>
     <div style="display:flex;gap:12px;align-items:center;width:100%;">
       <div id="mix-donut-wrap" style="position:relative;width:120px;height:120px;flex-shrink:0;">
@@ -808,9 +880,7 @@ function setMiniSource(enabled){
         <circle cx="110" cy="110" r="5" fill="#e8eaf0"/>
         <!-- Labels -->
         <text x="18" y="125" font-size="10" fill="#6b7080" text-anchor="middle">Export</text>
-        <text x="18" y="136" font-size="9" fill="#6b7080" text-anchor="middle" id="gauge-exp-max"></text>
         <text x="202" y="125" font-size="10" fill="#6b7080" text-anchor="middle">Import</text>
-        <text x="202" y="136" font-size="9" fill="#6b7080" text-anchor="middle" id="gauge-imp-max"></text>
         <text x="110" y="18" font-size="10" fill="#6b7080" text-anchor="middle">Net</text>
       </svg>
       <div class="gauge-value">
@@ -823,8 +893,12 @@ function setMiniSource(enabled){
     <span id="import-kw" style="display:none;"></span>
     <span id="export-kw" style="display:none;"></span>
   </div>
+  {% endif %}
 
-  <!-- Battery SoC cards — rendered dynamically by updatePower() -->
+  <!-- Battery/EV/heat-pump device cards — render whenever sub-devices exist,
+       independent of the main gauge. updateSocCards() no-ops when the container
+       is absent; setGauge() is null-safe when the gauge isn't rendered. -->
+  {% if has_power_sensor or has_sub_devices %}
   <div id="soc-cards-container" style="display:contents;"></div>
   {% endif %}
 
@@ -1075,6 +1149,26 @@ var _invMaxKw = {};  // per-meter inverter gauge scale, keyed by meter_id
 function _getInvMax(mid) { return _invMaxKw[mid] || 5.0; }
 function _setInvMax(mid, kw) { _invMaxKw[mid] = Math.max(_getInvMax(mid), kw); }
 
+var _pvMaxKw = {};  // per-meter PV gauge scale, keyed by meter_id
+function setPvGauge(meterId, pkw) {
+  var PV_ARC_LEN = 113.1;  // half-circle, r=36
+  var arc  = document.getElementById('pv-arc-' + meterId);
+  var kwEl = document.getElementById('pv-kw-' + meterId);
+  if (!arc) return;
+  if (pkw === null || pkw === undefined) {
+    arc.style.strokeDasharray = '0 ' + PV_ARC_LEN;
+    if (kwEl) kwEl.textContent = '—';
+    return;
+  }
+  var absKw = Math.abs(pkw);
+  var cur = _pvMaxKw[meterId] || 4;          // sensible default scale
+  if (absKw > cur) { cur = Math.ceil(absKw); _pvMaxKw[meterId] = cur; }
+  var frac = Math.max(0, Math.min(1, absKw / cur));
+  var arcLen = frac * PV_ARC_LEN;
+  arc.style.strokeDasharray = arcLen + ' ' + (PV_ARC_LEN - arcLen);
+  if (kwEl) kwEl.textContent = fmtKw(absKw);
+}
+
 function setInvGauge(meterId, pkw) {
   var INV_ARC_LEN = 283;  // same as main gauge r=90
   var centre = INV_ARC_LEN / 2;  // 141.5
@@ -1181,8 +1275,23 @@ function buildSocCard(meterId, info) {
       '</div>';
   }
 
+  // Small PV / solar dial — battery only, shown when a PV sensor is configured.
+  var pvGauge = '';
+  if (isBatt && info.pv_entity) {
+    pvGauge =
+      '<div class="pv-gauge" id="pv-gauge-' + meterId + '">' +
+        '<div class="pv-gauge-label">☀️ PV</div>' +
+        '<svg viewBox="0 0 90 54" xmlns="http://www.w3.org/2000/svg">' +
+          '<path d="M 8 48 A 36 36 0 0 1 82 48" fill="none" stroke="#2a2d3a" stroke-width="8" stroke-linecap="round"/>' +
+          '<path id="pv-arc-' + meterId + '" d="M 8 48 A 36 36 0 0 1 82 48" fill="none" stroke="#ef4444" stroke-width="8" stroke-linecap="round" stroke-dasharray="0 113" stroke-dashoffset="0"/>' +
+          '<text x="45" y="42" font-size="15" font-weight="700" fill="#ef4444" text-anchor="middle" id="pv-kw-' + meterId + '">—</text>' +
+        '</svg>' +
+      '</div>';
+  }
+
   // Power gauge — shown when power_entity configured
   var gaugeSection = '';
+  var _invHtml = '';
   if (info.power_entity) {
     var gaugeLabel = isBatt ? '⚡ Inverter' : (isEV ? '⚡ Charger' : '⚡ Heat Pump');
     var bidir = isBatt || v2x;
@@ -1193,7 +1302,7 @@ function buildSocCard(meterId, info) {
     var zeroMarkerY1 = bidir ? '24' : '110';
     var zeroMarkerY2 = bidir ? '36' : '98';
     var zeroLabel = bidir ? '0' : '';
-    gaugeSection =
+    _invHtml =
       '<div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;align-self:flex-start;margin-top:4px;">' + gaugeLabel + '</div>' +
       '<div class="inv-gauge-wrap">' +
         '<svg viewBox="0 0 220 120" xmlns="http://www.w3.org/2000/svg">' +
@@ -1207,14 +1316,22 @@ function buildSocCard(meterId, info) {
           '<text x="18" y="125" font-size="10" fill="#6b7080" text-anchor="middle">' + leftLabel + '</text>' +
           '<text x="202" y="125" font-size="10" fill="#6b7080" text-anchor="middle">' + rightLabel + '</text>' +
           '<text x="110" y="18" font-size="10" fill="#6b7080" text-anchor="middle">' + zeroLabel + '</text>' +
-          '<text x="18" y="136" font-size="9" fill="#6b7080" text-anchor="middle" id="inv-max-l-' + meterId + '"></text>' +
-          '<text x="202" y="136" font-size="9" fill="#6b7080" text-anchor="middle" id="inv-max-r-' + meterId + '"></text>' +
         '</svg>' +
         '<div class="inv-gauge-value">' +
           '<div class="inv-gauge-kw" id="inv-kw-' + meterId + '">—</div>' +
           '<div class="inv-gauge-unit" id="inv-dir-' + meterId + '">kW</div>' +
         '</div>' +
       '</div>';
+  }
+
+  // Assemble the gauge section. Wrap in a relative container only when the PV
+  // dial is present, so a battery card WITHOUT a PV sensor stays byte-identical.
+  if (_invHtml && pvGauge) {
+    gaugeSection = '<div class="soc-gauge-section" style="position:relative;min-height:190px;">' + _invHtml + pvGauge + '</div>';
+  } else if (_invHtml) {
+    gaugeSection = _invHtml;
+  } else if (pvGauge) {
+    gaugeSection = '<div class="soc-gauge-section" style="position:relative;min-height:64px;">' + pvGauge + '</div>';
   }
 
   return '<div class="soc-card" id="soc-card-' + meterId + '" data-type="' + type + '" data-v2x="' + v2x + '">' +
@@ -1380,6 +1497,9 @@ function updateSocCards(socSensors) {
           })
           .catch(function() {});
       }
+      if (info.pv_entity) {
+        setTimeout(function() { setPvGauge(mid, info.pv_kw); }, 0);
+      }
     } else {
       // Update battery fill — only for battery type cards
       var cardEl = document.getElementById('soc-card-' + mid);
@@ -1397,6 +1517,9 @@ function updateSocCards(socSensors) {
       // Update power gauge
       if (info.power_entity) {
         setInvGauge(mid, info.power_kw);
+      }
+      if (info.pv_entity) {
+        setPvGauge(mid, info.pv_kw);
       }
     }
   });
@@ -1422,7 +1545,7 @@ function updateSocCards(socSensors) {
 // Poll the live gauge. A local sensor is cheap → 5s. The Mini reads the engine's
 // server-side polled value (the engine is the single Mini poller, page-independent),
 // so 60s is plenty and there's no per-page GraphQL cost to bound.
-{% if has_power_sensor %}
+{% if has_power_sensor or has_sub_devices %}
 var POWER_POLL_MS = {% if mini_chosen %}60000{% else %}5000{% endif %};
 updatePower();
 pollTimer = setInterval(updatePower, POWER_POLL_MS);
@@ -1652,7 +1775,11 @@ setTimeout(function() { loadCarbonAndSchedule(); }, 600);
 // ── Layout switcher ──────────────────────────────────────────────────────
 function _applyLayout() {
   var container = document.getElementById('soc-cards-container');
-  var gaugeCount = (container ? container.children.length : 0) + 1; // +1 for live power
+  // Count the live-power gauge only when it's actually rendered — on API-only
+  // setups (no main power source) there is no .power-card, so assuming +1 here
+  // over-counted and flipped a 3-device page into the wide layout-b prematurely.
+  var hasLivePower = !!document.querySelector('.power-card');
+  var gaugeCount = (container ? container.children.length : 0) + (hasLivePower ? 1 : 0);
   var page = document.querySelector('.live-power-page');
   if (!page) return;
 
@@ -1660,7 +1787,7 @@ function _applyLayout() {
   var wideRow    = document.querySelector('.wide-row');
   var carbonWrap = document.getElementById('carbon-card-wrap');
 
-  if (gaugeCount <= 3) {
+  if (gaugeCount <= 8) {
     page.classList.add('layout-a');
     page.classList.remove('layout-b');
     // Move CI card into gauge-ci-row so it sits beside gauges, expanding to fill
@@ -1676,6 +1803,7 @@ function _applyLayout() {
     }
   }
 }
+
 
 // Run on load and whenever soc cards update
 document.addEventListener('DOMContentLoaded', function() {
@@ -2490,10 +2618,10 @@ setTimeout(function() { _phLoad(); }, 900);
 setInterval(_phLoad, 30000);
 {% endif %}
 
-{% if has_postcode and not has_power_sensor %}
+{% if has_postcode and not has_power_sensor and not has_sub_devices %}
 // Postcode-only Overview: the power poll that normally feeds the generation-mix
-// donut doesn't run (no power sensor), so drive the donut directly from the
-// current grid mix. Power-independent; helpers are defined above.
+// donut doesn't run (no power sensor and no sub-device cards), so drive the
+// donut directly from the current grid mix. Power-independent; helpers above.
 (function() {
   function loadMix() {
     fetch(apiUrl('/api/power'))
