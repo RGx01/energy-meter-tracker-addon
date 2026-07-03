@@ -149,14 +149,6 @@
         <small style="color:var(--muted);">Cumulative import kWh from your device integration or CT clamp via PowerCalc.</small>
       </div>
 
-      <div class="form-group" style="margin-bottom:28px;">
-        <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Rate Sensor <span style="font-weight:400;">(defaults to main meter rate — change only if this device has a different tariff)</span></label>
-        <div style="margin-top:6px;position:relative;">
-          <input type="text" id="ad-rate-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="ad-entity" data-field="rate">
-          <div id="ad-rate-sensor_drop" class="entity-drop"></div>
-        </div>
-      </div>
-
       <div style="display:flex;gap:12px;justify-content:flex-end;">
         <button class="btn btn-secondary" onclick="closeAddDevice()">Cancel</button>
         <button class="btn btn-primary" id="ad-confirm-btn" onclick="confirmAddDevice()">Add Device</button>
@@ -795,7 +787,7 @@ function buildSubCard(meterId, meter) {
           : '<li><strong>CT clamp via PowerCalc</strong> — aggregated kWh, updates every 60s minimum</li>' +
             '<li><strong>Device integration</strong> — if your device reports kWh directly</li>') +
       '</ul>' +
-      'Rate defaults to main meter rate — change only if this device has a different tariff.' +
+      'Rate follows the main meter automatically.' +
     '</div>' +
     (isEV ? ohmeEvNote() : '') +
 
@@ -885,9 +877,6 @@ function buildSubCard(meterId, meter) {
       '<span class="channel-label label-import">Import</span>' +
       '<div class="form-group"><label>Read Sensor — cumulative kWh</label>' +
         buildEntityInput(meterId+'__import__read', imp.read||'', meterId, 'import', 'read') + '</div>' +
-      '<div class="form-group"><label>Rate Sensor ' + (mainImportRate ? '(default: one-time copy from main meter at setup — update here if your device has a different rate or you retrospectively change rates)' : '') + '</label>' +
-        buildSourceToggle(meterId, 'import', 'device', deviceUsesMain(imp), meterId+'__import__rate') +
-        buildEntityInput(meterId+'__import__rate', rateVal, meterId, 'import', 'rate') + '</div>' +
     '</div>' : '');  // end of !meta.retired_at conditional
 
   return div;
@@ -950,14 +939,6 @@ function mainApiChecked(ch, kind) {
   }
   if (ch.rate_source) return ch.rate_source === 'api';
   return !((ch.rate || '').trim());
-}
-
-// Whether a DEVICE's "use main meter rate" is ticked (inherit the main meter).
-// Default is inherit unless the device was explicitly pinned to its own sensor.
-function deviceUsesMain(imp) {
-  imp = imp || {};
-  if (imp.rate_source) return imp.rate_source !== 'sensor';
-  return !((imp.rate || '').trim());
 }
 
 // Map a checkbox state to the stored source value.
@@ -1324,19 +1305,14 @@ function addDevice(type) {
   document.getElementById('ad-confirm-btn').textContent      = 'Add ' + defaults[type];
 
   // Clear all sensor fields
-  ['ad-soc-sensor','ad-inverter-sensor','ad-ev-sensor','ad-hp-sensor','ad-read-sensor','ad-rate-sensor'].forEach(function(id) {
+  ['ad-soc-sensor','ad-inverter-sensor','ad-ev-sensor','ad-hp-sensor','ad-read-sensor'].forEach(function(id) {
     document.getElementById(id).value = '';
   });
   document.getElementById('ad-invert').checked = false;
   document.getElementById('ad-v2x').checked    = false;
   // ad-ev-inverter-possible and ad-hp-inverter-possible removed in 2.9.0
 
-  // Pre-fill rate from main meter
-  var mainMeters = Object.keys(config.meters||{}).filter(function(k) { return !config.meters[k].meta.sub_meter; });
-  if (mainMeters.length > 0) {
-    var mainRate = ((config.meters[mainMeters[0]].channels||{}).import||{}).rate || '';
-    document.getElementById('ad-rate-sensor').value = mainRate;
-  }
+  // (device rate removed in 3.1.0 — devices always follow the main meter's rate)
 
   // Show/hide type-specific fields
   document.getElementById('ad-battery-fields').style.display = type === 'battery'   ? '' : 'none';
@@ -1402,7 +1378,7 @@ function confirmAddDevice() {
     channels: {
       import: {
         read:  document.getElementById('ad-read-sensor').value.trim(),
-        rate:  document.getElementById('ad-rate-sensor').value.trim(),
+        rate:  '',
         rates: [], reads: []
       }
     }
@@ -1913,7 +1889,6 @@ function renderWizStep() {
 
   setupWizEntityDropdowns();
   if (step === 'survey') wizBindSurvey();
-  if (step === 'sub_sensors') wizApplyDeviceRateToggles();
   if (step === 'sensors') wizApplySensorToggles();
 }
 
@@ -1926,17 +1901,6 @@ function wizApplySensorToggles() {
   });
 }
 
-// Grey out a device's rate sensor field while "use main meter rate" is ticked,
-// and keep it in sync as the box is toggled (mirrors the meter-config screen).
-function wizApplyDeviceRateToggles() {
-  (wiz.devices || []).forEach(function(devId) {
-    var cb = document.getElementById('wiz-sub-' + devId + '-overlay');
-    if (!cb) return;
-    var target = 'wiz-sub-' + devId + '-rate';
-    setEntityDisabled(target, cb.checked);
-    cb.addEventListener('change', function() { setEntityDisabled(target, cb.checked); });
-  });
-}
 
 function wizStepSurvey() {
   function opt(field, val, label, hint) {
@@ -2266,7 +2230,7 @@ function wizStepSubSensors() {
     '<p style="color:var(--muted);font-size:13px;margin:0 0 20px;">Map sensors for each device. Rate defaults to your main meter rate — only change if this device is on a different tariff.</p>';
 
   wiz.devices.forEach(function(devId) {
-    if (!wiz.data.subMeters[devId]) wiz.data.subMeters[devId] = { read: '', rate: impRate, name: '' };
+    if (!wiz.data.subMeters[devId]) wiz.data.subMeters[devId] = { read: '', rate: '', name: '' };
     var sd = wiz.data.subMeters[devId];
 
     html += '<div style="border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:16px;">' +
@@ -2276,18 +2240,6 @@ function wizStepSubSensors() {
         '<input id="wiz-sub-' + devId + '-name" type="text" value="' + esc(sd.name) + '" placeholder="e.g. Tesla Charger"></div>' +
       '<div class="form-group"><label>Read Sensor — cumulative kWh</label>' +
         buildWizEntity('wiz-sub-' + devId + '-read', sd.read) + '</div>' +
-      '<div class="form-group"><label>Rate Sensor ' + (impRate ? '(default: one-time copy from main meter at setup — update here if your device has a different rate or you retrospectively change rates)' : '') + '</label>' +
-        buildWizEntity('wiz-sub-' + devId + '-rate', sd.rate || impRate) + '</div>' +
-      ((wiz.data.mode || '').indexOf('api') !== -1
-        ? '<div class="checkbox-row" style="margin:-4px 0 14px;">' +
-            '<input type="checkbox" id="wiz-sub-' + devId + '-overlay" ' +
-              (sd.rate_source !== 'sensor' ? 'checked' : '') + '>' +
-            '<label for="wiz-sub-' + devId + '-overlay">Use the main meter\u2019s rate, including ' +
-              'smart-charge off-peak periods <span style="font-weight:400;color:var(--muted);">\u2014 ' +
-              'recommended; prices this device\u2019s charging during cheap dispatch windows correctly. ' +
-              'Add a rate sensor above to use your own instead.</span></label>' +
-          '</div>'
-        : '') +
       (devId === 'battery'
         ? '<div class="form-group"><label>State of Charge Sensor <span style="color:var(--muted);font-weight:400;">(optional — enables SoC dial on Live Power page)</span></label>' +
             buildWizEntity('wiz-sub-' + devId + '-soc', sd.soc||'') +
@@ -2421,7 +2373,6 @@ function wizCollectStep() {
       if (!wiz.data.subMeters[devId]) wiz.data.subMeters[devId] = {};
       var nameEl = document.getElementById('wiz-sub-' + devId + '-name');
       var readEl = document.getElementById('wiz-sub-' + devId + '-read');
-      var rateEl = document.getElementById('wiz-sub-' + devId + '-rate');
       var socEl  = document.getElementById('wiz-sub-' + devId + '-soc');
       var invEl  = document.getElementById('wiz-sub-' + devId + '-inverter-power');
       var invertEl   = document.getElementById('wiz-sub-' + devId + '-invert');
@@ -2429,14 +2380,11 @@ function wizCollectStep() {
       var v2xEl      = document.getElementById('wiz-sub-' + devId + '-v2x');
       if (nameEl)   wiz.data.subMeters[devId].name = nameEl.value;
       if (readEl)   wiz.data.subMeters[devId].read = readEl.value;
-      if (rateEl)   wiz.data.subMeters[devId].rate = rateEl.value;
       if (socEl && socEl.value) wiz.data.subMeters[devId].soc = socEl.value;
       if (invEl && invEl.value) wiz.data.subMeters[devId].inverter_power = invEl.value;
       if (invertEl) wiz.data.subMeters[devId].inverter_power_invert = invertEl.checked;
       if (devPwrEl && devPwrEl.value) wiz.data.subMeters[devId].device_power = devPwrEl.value;
       if (v2xEl)    wiz.data.subMeters[devId].v2x_capable = v2xEl.checked;
-      var ovEl = document.getElementById('wiz-sub-' + devId + '-overlay');
-      if (ovEl) wiz.data.subMeters[devId].rate_source = ovEl.checked ? 'main' : 'sensor';
     });
   }
 }

@@ -200,6 +200,46 @@ def _pick_device_id(devices: list) -> Optional[str]:
     return dev.get("id")
 
 
+def _pick_active_meter(meters: list) -> Optional[dict]:
+    """Choose the CURRENT meter for an MPAN that may list several — e.g. after a
+    meter exchange, where the endpoint lists the old and new meters together.
+
+    Issue #244: EMT took ``meters[0]`` unconditionally, which is the OLDEST meter.
+    On an exchanged supply that is the swapped-out meter, so DCC consumption
+    queries for its serial return nothing and import never settles (while a
+    single-meter export point settled fine).
+
+    Selection, in order of trust:
+      1. Honour an explicit active / removal signal if the payload carries one
+         (field names vary, so we check a small set defensively).
+      2. Otherwise fall back to the LAST meter — Kraken lists meters oldest-first,
+         so the current meter is normally last after an exchange.
+    Never returns the first meter of a multi-meter point by position alone.
+    """
+    if not meters:
+        return None
+    if len(meters) == 1:
+        return meters[0]
+
+    def _removed(m: dict) -> bool:
+        for k in ("removed_at", "removedAt", "deactivation_date",
+                  "deactivationDate", "retirement_date", "retiredAt", "end_date"):
+            if m.get(k):
+                return True
+        return False
+
+    def _flagged_active(m: dict) -> bool:
+        for k in ("is_active", "isActive", "active"):
+            if m.get(k) is True:
+                return True
+        return False
+
+    live = [m for m in meters if not _removed(m)] or meters
+    active = [m for m in live if _flagged_active(m)]
+    pool = active or live
+    return pool[-1]  # newest by list order
+
+
 def _operation_name(query: str) -> str:
     """Best-effort GraphQL operation name (e.g. 'dispatches') for log context."""
     for kw in ("query ", "mutation "):
@@ -512,7 +552,8 @@ class KrakenAPIClient:
         for emp in prop.get("electricity_meter_points", []) or []:
             mpan = emp.get("mpan")
             meters = emp.get("meters", []) or []
-            serial = meters[0].get("serial_number") if meters else None
+            _active_meter = _pick_active_meter(meters)
+            serial = _active_meter.get("serial_number") if _active_meter else None
             agreement = self._current_agreement(emp.get("agreements", []) or [])
             tariff_code = agreement.get("tariff_code") if agreement else None
             product_code = (self._tariff_to_product_code(tariff_code)
@@ -538,7 +579,9 @@ class KrakenAPIClient:
                 if len(emp.get("meters", []) or []) > 1]) > 0:
             warnings.append(
                 "a meter point has multiple meters (e.g. after an exchange); "
-                "using the first serial. Verify against your latest meter.")
+                "selected the current (newest) meter for settlement. If DCC "
+                "import settlement stays stuck, your active serial may differ — "
+                "verify against your latest meter.")
 
         logger.info(
             "auto_discover: account=%s import_mpan=%s export_mpan=%s props=%d",

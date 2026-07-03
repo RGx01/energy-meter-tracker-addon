@@ -5093,11 +5093,15 @@ async def kraken_poll_task(ha: HAClient):
                 len(summary["errors"]))
             for err in summary["errors"][:5]:
                 logger.warning("kraken_poll_task: %s", err)
+            # Label the provisional figure by its actual source: the Mini
+            # supplies it whenever the runtime Mini reader is active (mode=api /
+            # api+mini with no local sensor); otherwise it's the local CAD read.
+            _prov_label = "Mini" if _kraken_mini_reader is not None else "CAD"
             for smp in summary.get("review_samples", []):
                 logger.info(
-                    "kraken_poll_task:   review-sample [%s]%s %s CAD=%s DCC=%s drift=%s%%",
+                    "kraken_poll_task:   review-sample [%s]%s %s %s=%s DCC=%s drift=%s%%",
                     smp["channel"], " INTERP" if smp.get("interpolated") else "",
-                    smp["block_start"], smp["cad_kwh"], smp["dcc_kwh"],
+                    smp["block_start"], _prov_label, smp["cad_kwh"], smp["dcc_kwh"],
                     ("%.1f" % smp["drift_pct"]) if smp["drift_pct"] is not None
                     else "n/a")
             # Dispatch overlay — STEP 1: OBSERVE-ONLY. Fetch and log Intelligent

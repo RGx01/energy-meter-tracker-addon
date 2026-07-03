@@ -724,5 +724,36 @@ class TestDetectOhmeChargeMode(unittest.TestCase):
         self.assertFalse(d["found"])
 
 
+class TestPickActiveMeter(unittest.TestCase):
+    """Issue #244: an MPAN with several meters (after an exchange) must resolve to
+    the CURRENT meter, not meters[0] (the swapped-out one), or DCC import
+    settlement queries the wrong serial and never settles."""
+
+    def test_empty(self):
+        self.assertIsNone(kc._pick_active_meter([]))
+        self.assertIsNone(kc._pick_active_meter(None))
+
+    def test_single_meter(self):
+        m = {"serial_number": "Z9990001"}
+        self.assertEqual(kc._pick_active_meter([m]), m)
+
+    def test_multi_meter_picks_last_not_first(self):
+        # reporter's shape: three meters "0","1","2" with the last being current
+        ms = [{"serial_number": "OLD-0"}, {"serial_number": "OLD-1"},
+              {"serial_number": "CUR-2"}]
+        self.assertEqual(kc._pick_active_meter(ms)["serial_number"], "CUR-2")
+
+    def test_removal_signal_excludes_old_meter(self):
+        ms = [{"serial_number": "NEW", "removed_at": None},
+              {"serial_number": "GONE", "removed_at": "2025-01-01"}]
+        # GONE is last but flagged removed -> pick the live NEW
+        self.assertEqual(kc._pick_active_meter(ms)["serial_number"], "NEW")
+
+    def test_active_flag_preferred(self):
+        ms = [{"serial_number": "A", "is_active": True},
+              {"serial_number": "B", "is_active": False}]
+        self.assertEqual(kc._pick_active_meter(ms)["serial_number"], "A")
+
+
 if __name__ == "__main__":
     unittest.main()
