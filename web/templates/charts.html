@@ -92,6 +92,7 @@
   }
   .chart-tab:hover { background: rgba(255,255,255,0.05); color: var(--text); }
   .chart-tab.active { background: rgba(0,212,170,0.1); color: var(--accent); border-color: var(--accent); }
+  .dcc-settle-note { display:inline-flex; align-items:center; gap:5px; margin-left:10px; padding:5px 10px; border-radius:14px; font-size:12px; font-weight:600; background:rgba(230,160,30,0.14); color:#e0a020; border:1px solid rgba(230,160,30,0.35); white-space:nowrap; cursor:default; }
 
   /* Usage Stats floating toolbar — matches billing chart period-nav style */
   /* position:sticky works because .content is the scroll container */
@@ -273,8 +274,10 @@
   <div class="chart-tabs" style="margin-bottom:0;">
     <button class="chart-tab active" data-chart="daily"   onclick="showChart('daily', this)" title="Billing">📊<span class="tab-label"> Billing</span></button>
     <button class="chart-tab"        data-chart="heatmap" onclick="showChart('heatmap', this)" title="Heatmaps">🔥<span class="tab-label"> Heatmaps</span></button>
+    <button class="chart-tab"        data-chart="spiral"  onclick="showChart('spiral', this)" title="Spiral">🌀<span class="tab-label"> Spiral</span></button>
     <button class="chart-tab"        data-chart="bar"     onclick="showChart('bar', this)" title="Usage Stats">📈<span class="tab-label"> Usage Stats</span></button>
   </div>
+  <span id="dcc-settle-note" class="dcc-settle-note" style="display:none;"></span>
   <button class="btn btn-secondary" onclick="chartsPdfExport()" title="Export current view as PDF" id="charts-pdf-btn">⬇ PDF</button>
 </div>
 {% endblock %}
@@ -327,6 +330,229 @@
     </div>
   {% endif %}
 </div>
+
+<!-- Cumulative spiral chart -->
+<div id="chart-spiral" class="chart-frame-wrap" style="display:none;">
+  <style>
+    #chart-spiral{background:var(--surface)}
+    #chart-spiral .sp-board{display:grid;grid-template-columns:1fr 260px;gap:18px;padding:16px}
+    @media (max-width:820px){ #chart-spiral .sp-board{grid-template-columns:1fr}}
+    #chart-spiral .sp-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)}
+    #chart-spiral .sp-chart{padding:12px;position:relative;min-height:480px;display:flex;justify-content:center}
+    #chart-spiral .sp-side{padding:16px;display:flex;flex-direction:column;gap:18px}
+    #chart-spiral .sp-gl{font-family:var(--mono);font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);opacity:.8;margin:0 0 9px}
+    #chart-spiral .sp-seg{display:flex;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:3px}
+    #chart-spiral .sp-seg button{flex:1;border:0;background:transparent;color:var(--muted);font:inherit;font-size:12.5px;padding:7px 6px;border-radius:6px;cursor:pointer}
+    #chart-spiral .sp-seg button.on{background:var(--accent);color:var(--surface);font-weight:600}
+    #chart-spiral .sp-items{display:flex;flex-direction:column;gap:2px;margin-top:10px}
+    #chart-spiral .sp-metric{display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:7px;cursor:pointer;border:1px solid transparent}
+    #chart-spiral .sp-metric:hover{background:var(--bg)}
+    #chart-spiral .sp-metric.on{background:var(--accent);border-color:var(--accent)}
+    #chart-spiral .sp-metric .sp-nm{font-size:13.5px;flex:1;color:var(--text)}
+    #chart-spiral .sp-metric.hd .sp-nm{font-weight:600}
+    #chart-spiral .sp-metric .sp-kd{font-family:var(--mono);font-size:9.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+    #chart-spiral .sp-metric.on .sp-nm{color:var(--surface)}
+    #chart-spiral .sp-metric.on .sp-kd{color:var(--surface);opacity:.8}
+    #chart-spiral .sp-years{display:flex;flex-direction:column;gap:2px}
+    #chart-spiral .sp-yr{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:7px;cursor:pointer}
+    #chart-spiral .sp-yr:not(.off){background:rgba(0,212,170,.12)}
+    #chart-spiral .sp-yr:hover{background:var(--bg)} #chart-spiral .sp-yr.off{opacity:.32;background:transparent}
+    #chart-spiral .sp-sw{width:22px;height:3px;border-radius:2px;flex:none}
+    #chart-spiral .sp-yl{font-family:var(--mono);font-size:12px} #chart-spiral .sp-yt{margin-left:auto;font-variant-numeric:tabular-nums;font-size:12.5px;color:var(--muted)}
+    #chart-spiral svg{display:block;width:100%;max-width:min(100%,70vh);height:auto;margin:0 auto;touch-action:none}
+    #chart-spiral .sp-mo{font-family:var(--mono);font-size:15px;letter-spacing:.06em;fill:var(--text);opacity:.72;font-weight:600}
+    #chart-spiral .sp-rl{font-family:var(--mono);font-size:15px;fill:var(--text);opacity:.6;font-weight:500}
+    #chart-spiral .sp-cm{font-family:var(--mono);font-size:11px;letter-spacing:.13em;text-transform:uppercase;fill:var(--muted)}
+    #chart-spiral .sp-cv{font-size:29px;font-weight:650;fill:var(--text)} #chart-spiral .sp-cu{font-size:12px;fill:var(--muted)}
+    #chart-spiral .sp-tip{position:absolute;pointer-events:none;opacity:0;transform:translate(-50%,-115%);background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 11px;font-size:12px;line-height:1.45;white-space:nowrap;box-shadow:0 8px 26px rgba(0,0,0,.4);transition:opacity .09s}
+    #chart-spiral .sp-tip .sp-d{font-family:var(--mono);color:var(--muted);font-size:10.5px;margin-bottom:3px}
+    #chart-spiral .sp-tip .sp-b{font-weight:650;font-variant-numeric:tabular-nums} #chart-spiral .sp-tip .sp-i{color:var(--muted);font-variant-numeric:tabular-nums}
+    #chart-spiral .sp-hint{min-height:28px;color:var(--muted);opacity:.75;font-size:11.5px;line-height:1.5;margin-top:11px}
+    #chart-spiral .sp-status{color:var(--muted);font-size:13px;text-align:center;padding:60px 20px}
+  </style>
+  <div class="sp-board">
+    <div class="sp-card sp-chart">
+      <div class="sp-status" id="sp-status">Loading&#8230;</div>
+      <svg id="sp-svg" viewBox="0 0 640 620" style="display:none"></svg>
+      <div class="sp-tip" id="sp-tip"></div>
+    </div>
+    <div class="sp-side">
+      <div><p class="sp-gl">Metric</p><div class="sp-seg" id="sp-groups"></div><div class="sp-items" id="sp-items"></div></div>
+      <div><p class="sp-gl">Winding</p><div class="sp-seg" id="sp-mode">
+        <button data-mode="lifetime" class="on">Lifetime</button><button data-mode="year">Year&#8209;aligned</button>
+      </div><div class="sp-hint" id="sp-hint"></div></div>
+      <div><p class="sp-gl">Years</p><div class="sp-years" id="sp-years"></div></div>
+    </div>
+  </div>
+</div>
+<script>
+window.EMTSpiral=(function(){
+  var ENDPOINT="api/charts/blocks-summary";
+  var ROWS=[],YEARS=[],GROUPS={},DEVICE_IDS=[],LABELS={},inited=false,mounted=false;
+  var state={group:"cost",item:"cost_total",mode:"lifetime",hidden:new Set()};
+  var YC=["#00d4aa","#7c6af7","#f9a825","#38bdf8","#ef4444","#fb7185"];
+  var NS="http://www.w3.org/2000/svg",CX=320,CY=300,R_IN=54,R_OUT=250,A0=-Math.PI/2;
+  var SVG,TIP,hoverDot=null;
+
+  function buildGroupsFrom(meters,rows){
+    LABELS={};(meters||[]).forEach(function(m){var id=m.meter_id||m.id;if(id)LABELS[id]=m.label||id;});
+    var seen=new Set();rows.forEach(function(r){Object.keys(r.meters||{}).forEach(function(k){if(k!=="electricity_main")seen.add(k);});});
+    DEVICE_IDS=Array.from(seen);
+    var dev=DEVICE_IDS.map(function(id){return{key:id,name:LABELS[id]||id,kind:"device"};});
+    GROUPS={
+      cost:{label:"Cost",unit:"\u00a3",items:[{key:"cost_total",name:"Total cost",kind:"net"},{key:"cost_import",name:"Import",kind:"+"},{key:"cost_export",name:"Export credit",kind:"\u2212"},{key:"cost_stand",name:"Standing charge",kind:"+"},{key:"cost_direct",name:"Direct import",kind:"of import"}].concat(dev)},
+      usage:{label:"Usage",unit:"kWh",items:[{key:"import",name:"Import",kind:"total"},{key:"export",name:"Export",kind:""},{key:"direct",name:"Direct import",kind:"of import"}].concat(dev)},
+      carbon:{label:"Carbon",unit:"kg",items:[{key:"carb_total",name:"Net carbon",kind:"net"},{key:"carb_import",name:"Import",kind:"+"},{key:"carb_offset",name:"Offset",kind:"\u2212"}].concat(dev)},
+    };
+  }
+  function incFor(row,g,it){
+    var M=row.meters||{},main=M.electricity_main||{},dev=M[it]||{};
+    if(g==="usage"){if(it==="import")return row.imp_kwh||0;if(it==="export")return row.exp_kwh||0;if(it==="direct")return main.imp_kwh||0;return dev.imp_kwh||0;}
+    if(g==="cost"){if(it==="cost_total")return row.net_cost||0;if(it==="cost_import")return row.imp_cost||0;if(it==="cost_export")return row.exp_cost||0;if(it==="cost_stand")return row.standing||0;if(it==="cost_direct")return main.imp_cost||0;return dev.imp_cost||0;}
+    if(it==="carb_total")return (row.carbon_g_net||0)/1000;if(it==="carb_import")return (main.carbon_g_imp||0)/1000;if(it==="carb_offset")return (main.carbon_g_exp||0)/1000;return (dev.carbon_g||0)/1000;
+  }
+  function curUnit(){return GROUPS[state.group].unit;}
+  function curItem(){return GROUPS[state.group].items.find(function(i){return i.key===state.item;})||GROUPS[state.group].items[0];}
+  function fmtS(v){var a=Math.abs(v);if(a>=1000){var t=(v/1000).toFixed(a>=10000?0:1);return (t.indexOf(".")<0?t:t.replace(/\.?0+$/,""))+"k";}if(a>=100)return v.toFixed(0);return v.toFixed(a>=10?0:1);}
+  // Auto-scale a base unit up its ladder once a magnitude crosses 1000:
+  // kWh -> MWh -> GWh, kg(CO2) -> t -> kt. Other units (e.g. £) unchanged.
+  function scaleUnit(u,mag){mag=Math.abs(mag);
+    if(u==="kWh"){if(mag>=1e6)return{u:"GWh",d:1e6};if(mag>=1e3)return{u:"MWh",d:1e3};return{u:"kWh",d:1};}
+    if(u==="kg"){if(mag>=1e6)return{u:"kt",d:1e6};if(mag>=1e3)return{u:"t",d:1e3};return{u:"kg",d:1};}
+    return{u:u,d:1};}
+  // Compact number, trailing zeros trimmed (e.g. 1.0->1, 4.598->4.6, 0.42->0.42).
+  function fmtC(x){var a=Math.abs(x),d=a>=100?0:a>=1?1:2,s=x.toFixed(d);return s.indexOf(".")<0?s:s.replace(/\.?0+$/,"");}
+  // Ring/centre value in the chart-wide scale sc, no unit suffix (£ keeps k-abbrev).
+  function lblV(v,u,sc){return u==="\u00a3"?"\u00a3"+fmtS(v):fmtC(v/sc.d);}
+  // Year-row value WITH unit, in the chart-wide scale sc.
+  function lblU(v,u,sc){return u==="\u00a3"?fmt(v,"\u00a3"):fmtC(v/sc.d)+" "+sc.u;}
+  // Full value with unit; for tooltips it auto-scales by the value's own magnitude.
+  function fmt(v,u){
+    if(u==="\u00a3")return "\u00a3"+v.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+    var sc=scaleUnit(u,v),x=v/sc.d,a=Math.abs(x),d=a>=100?0:a>=10?1:2;
+    return x.toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:d})+" "+sc.u;}
+  function dayFrac(row){var y=row.year,d=new Date(Date.UTC(y,(row.month||1)-1,row.day||1));var diy=(y%4===0&&(y%100!==0||y%400===0))?366:365;var doy=Math.floor((d-Date.UTC(y,0,1))/86400000);return doy/diy;}
+  function el(t,a){var e=document.createElementNS(NS,t);for(var k in a)e.setAttribute(k,a[k]);return e;}
+  // Round a range to a "nice" number (1/2/5 x 10^n) so axis ticks land on clean
+  // values (0,50,100,150,200) instead of raw quarter-fractions (41,82,123,164).
+  function niceNum(range,round){
+    if(!(range>0))return 1;
+    var exp=Math.floor(Math.log(range)/Math.LN10),f=range/Math.pow(10,exp),nf;
+    if(round){nf=f<1.5?1:f<3?2:f<7?5:10;}else{nf=f<=1?1:f<=2?2:f<=5?5:10;}
+    return nf*Math.pow(10,exp);
+  }
+
+  function computeSeries(){
+    var life=0,perYear={};YEARS.forEach(function(y){perYear[y]=0;});
+    var pts=[];
+    ROWS.forEach(function(r){var inc=incFor(r,state.group,state.item);life+=inc;perYear[r.year]+=inc;pts.push({r:r,inc:inc,life:life,yearCum:perYear[r.year],frac:dayFrac(r)});});
+    var yearTotals={};YEARS.forEach(function(y){yearTotals[y]=perYear[y];});
+    // Radial scale spans the cumulative range and always includes 0, so net
+    // metrics that go negative map inward toward the centre instead of producing
+    // a negative radius (which would flip the point 180deg to the wrong month).
+    var vals=pts.map(function(p){return state.mode==="lifetime"?p.life:p.yearCum;});
+    var lo=Math.min.apply(null,vals),hi=Math.max.apply(null,vals);
+    lo=Math.min(lo,0);hi=Math.max(hi,0);if(hi-lo<1e-9)hi=lo+1;
+    // Snap the scale to nice round bounds so the ring labels read cleanly and the
+    // outer ring is a round ceiling the cumulative spiral climbs toward.
+    var step=niceNum((hi-lo)/4,true);
+    lo=Math.floor(lo/step)*step;hi=Math.ceil(hi/step)*step;if(hi-lo<1e-9)hi=lo+step;
+    var span=hi-lo;
+    pts.forEach(function(p){
+      var v=state.mode==="lifetime"?p.life:p.yearCum;
+      var radius=R_IN+((v-lo)/span)*(R_OUT-R_IN);
+      var a=A0+p.frac*2*Math.PI;p.x=CX+radius*Math.cos(a);p.y=CY+radius*Math.sin(a);p.val=v;
+    });
+    return {pts:pts,yearTotals:yearTotals,lo:lo,hi:hi,step:step};
+  }
+  function render(){
+    var unit=curUnit(),item=curItem(),cs=computeSeries(),sc=scaleUnit(unit,cs.hi);
+    SVG.textContent="";
+    var grid=el("g",{});
+    var nring=Math.max(1,Math.round((cs.hi-cs.lo)/cs.step));
+    for(var i=1;i<=nring;i++){var rr=R_IN+(R_OUT-R_IN)*i/nring;
+      grid.appendChild(el("circle",{cx:CX,cy:CY,r:rr,fill:"none","stroke-width":1,opacity:.5,style:"stroke:var(--muted)"}));
+      var lab=el("text",{x:CX+6,y:CY-rr+15,class:"sp-rl"});lab.textContent=lblV(cs.lo+cs.step*i,unit,sc);grid.appendChild(lab);}
+    var MO=["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
+    for(var m=0;m<12;m++){var a=A0+(m/12)*2*Math.PI;
+      grid.appendChild(el("line",{x1:CX+(R_IN-6)*Math.cos(a),y1:CY+(R_IN-6)*Math.sin(a),x2:CX+(R_OUT+10)*Math.cos(a),y2:CY+(R_OUT+10)*Math.sin(a),"stroke-width":1,opacity:.3,style:"stroke:var(--muted)"}));
+      var t=el("text",{x:CX+(R_OUT+28)*Math.cos(a),y:CY+(R_OUT+28)*Math.sin(a),"text-anchor":"middle","dominant-baseline":"middle",class:"sp-mo"});t.textContent=MO[m];grid.appendChild(t);}
+    SVG.appendChild(grid);
+    var visible=[];
+    YEARS.forEach(function(y,yi){
+      if(state.hidden.has(y))return;
+      var seg=cs.pts.filter(function(p){return p.r.year===y;});if(seg.length<2)return;
+      var d="M "+seg[0].x.toFixed(2)+" "+seg[0].y.toFixed(2);
+      for(var i=1;i<seg.length;i++)d+=" L "+seg[i].x.toFixed(2)+" "+seg[i].y.toFixed(2);
+      var c=YC[yi%YC.length];
+      SVG.appendChild(el("path",{d:d,fill:"none",stroke:c,"stroke-width":3,"stroke-linecap":"round","stroke-linejoin":"round",opacity:.95,style:"filter:drop-shadow(0 0 3px "+c+"55)"}));
+      var L=seg[seg.length-1];SVG.appendChild(el("circle",{cx:L.x,cy:L.y,r:3.4,fill:c}));
+      seg.forEach(function(p){visible.push(p);});
+    });
+    var latest=cs.pts[cs.pts.length-1];
+    var cv=state.mode==="lifetime"?latest.life:cs.yearTotals[YEARS[YEARS.length-1]];
+    var cg=el("g",{});
+    var q1=el("text",{x:CX,y:CY-20,"text-anchor":"middle",class:"sp-cm"});q1.textContent=item.name;
+    var q2=el("text",{x:CX,y:CY+10,"text-anchor":"middle",class:"sp-cv"});q2.textContent=lblV(cv,unit,sc);
+    var q3=el("text",{x:CX,y:CY+30,"text-anchor":"middle",class:"sp-cu"});q3.textContent=(state.mode==="lifetime"?"total to date":"latest year")+(unit==="\u00a3"?"":" \u00b7 "+sc.u);
+    cg.appendChild(q1);cg.appendChild(q2);cg.appendChild(q3);SVG.appendChild(cg);
+    attachHover(visible,unit);buildYears(cs.yearTotals,unit,sc);
+  }
+  function attachHover(points,unit){
+    hoverDot=el("circle",{r:5,opacity:0,"pointer-events":"none",style:"fill:var(--text)"});SVG.appendChild(hoverDot);
+    SVG.onpointermove=function(ev){
+      var r=SVG.getBoundingClientRect(),pt={x:(ev.clientX-r.left)/r.width*640,y:(ev.clientY-r.top)/r.height*620};
+      var best=null,bd=1e9;points.forEach(function(p){var dx=p.x-pt.x,dy=p.y-pt.y,dd=dx*dx+dy*dy;if(dd<bd){bd=dd;best=p;}});
+      if(!best||bd>26*26){hideTip();return;}
+      hoverDot.setAttribute("cx",best.x);hoverDot.setAttribute("cy",best.y);hoverDot.setAttribute("opacity",1);hoverDot.setAttribute("fill",YC[YEARS.indexOf(best.r.year)%YC.length]);
+      var card=SVG.parentElement.getBoundingClientRect();var sx=r.left+(best.x/640)*r.width,sy=r.top+(best.y/620)*r.height;
+      var dstr=new Date(Date.UTC(best.r.year,(best.r.month||1)-1,best.r.day||1)).toLocaleDateString(undefined,{day:"numeric",month:"short",year:"numeric"});
+      TIP.innerHTML='<div class="sp-d">'+dstr+'</div><div class="sp-b">'+fmt(best.val,unit)+'</div><div class="sp-i">that day: '+fmt(best.inc,unit)+'</div>';
+      TIP.style.left=(sx-card.left)+"px";TIP.style.top=(sy-card.top)+"px";TIP.style.opacity=1;
+    };
+    SVG.onpointerleave=hideTip;
+  }
+  function hideTip(){TIP.style.opacity=0;if(hoverDot)hoverDot.setAttribute("opacity",0);}
+  function buildGroups(){var h=document.getElementById("sp-groups");h.textContent="";
+    Object.keys(GROUPS).forEach(function(g){var b=document.createElement("button");b.textContent=GROUPS[g].label;if(g===state.group)b.className="on";
+      b.onclick=function(){state.group=g;state.item=GROUPS[g].items[0].key;buildGroups();buildItems();render();};h.appendChild(b);});}
+  function buildItems(){var h=document.getElementById("sp-items");h.textContent="";
+    GROUPS[state.group].items.forEach(function(it,i){var row=document.createElement("div");row.className="sp-metric"+(it.key===state.item?" on":"")+(i===0?" hd":"");
+      row.innerHTML='<span class="sp-nm"></span><span class="sp-kd"></span>';row.children[0].textContent=it.name;row.children[1].textContent=it.kind||"";
+      row.onclick=function(){state.item=it.key;buildItems();render();};h.appendChild(row);});}
+  function buildYears(totals,unit,sc){var h=document.getElementById("sp-years");h.textContent="";
+    YEARS.forEach(function(y,i){var row=document.createElement("div");row.className="sp-yr"+(state.hidden.has(y)?" off":"");var partial=(y===YEARS[YEARS.length-1]);
+      row.innerHTML='<span class="sp-sw"></span><span class="sp-yl"></span><span class="sp-yt"></span>';
+      row.children[0].style.background=YC[i%YC.length];row.children[1].textContent=y+(partial?" \u00b7":"");row.children[2].textContent=lblU(totals[y],unit,sc);
+      row.onclick=function(){state.hidden.has(y)?state.hidden.delete(y):state.hidden.add(y);render();};h.appendChild(row);});}
+  function wireMode(){
+    Array.prototype.forEach.call(document.querySelectorAll("#sp-mode button"),function(b){b.onclick=function(){
+      Array.prototype.forEach.call(document.querySelectorAll("#sp-mode button"),function(x){x.classList.remove("on");});b.classList.add("on");state.mode=b.dataset.mode;
+      document.getElementById("sp-hint").textContent=state.mode==="lifetime"?"Radius = running total. One continuous coil; a fatter gap between loops = a heavier year.":"Every year starts from the centre on the same scale, so loops overlay \u2014 an outer loop at any angle used more by that date. Where loops cross, one year overtook another.";
+      render();
+    };});
+  }
+  function fail(msg){var s=document.getElementById("sp-status");if(s){s.style.display="block";s.textContent=msg;}if(SVG)SVG.style.display="none";}
+
+  async function init(){
+    if(inited)return; inited=true;
+    SVG=document.getElementById("sp-svg");TIP=document.getElementById("sp-tip");
+    try{
+      var res=await fetch(ENDPOINT,{headers:{Accept:"application/json"}});
+      if(!res.ok)throw new Error("HTTP "+res.status);
+      var j=await res.json();
+      if(!j.rows||!j.rows.length){fail("No data yet \u2014 the spiral fills in once blocks are recorded.");inited=false;return;}
+      ROWS=j.rows.slice().sort(function(a,b){return (a.year-b.year)||(a.month-b.month)||(a.day-b.day);});
+      YEARS=Array.from(new Set(ROWS.map(function(r){return r.year;}))).sort();
+      buildGroupsFrom(j.meters||[],ROWS);
+      document.getElementById("sp-status").style.display="none";SVG.style.display="block";
+      document.getElementById("sp-hint").textContent="Radius = running total. One continuous coil; a fatter gap between loops = a heavier year.";
+      buildGroups();buildItems();wireMode();render();
+    }catch(e){inited=false;fail("Couldn't load chart data \u2014 "+(e&&e.message?e.message:e));}
+  }
+  return { init: init };
+})();
+</script>
 
 <!-- Import / Export bar chart -->
 <div id="chart-bar" class="chart-frame-wrap" style="display:none; flex-direction:column; height:calc(100vh - 56px); overflow:hidden;">
@@ -648,7 +874,7 @@ function toggleTopbar() {
 }
 
 function updateToggleLabel(name) {
-  var labels = { daily: 'Billing', heatmap: 'Heatmaps', bar: 'Usage Stats' };
+  var labels = { daily: 'Billing', heatmap: 'Heatmaps', spiral: 'Spiral', bar: 'Usage Stats' };
   var el = document.getElementById('topbar-toggle-label');
   if (el) el.textContent = labels[name] || name;
 }
@@ -661,11 +887,14 @@ function showChart(name, btn) {
   document.getElementById('chart-daily').style.display   = name === 'daily'   ? 'block' : 'none';
   document.getElementById('chart-heatmap').style.display = name === 'heatmap' ? 'block' : 'none';
   document.getElementById('chart-bar').style.display     = name === 'bar'     ? 'flex' : 'none';
+  var _spEl = document.getElementById('chart-spiral'); if (_spEl) _spEl.style.display = name === 'spiral' ? 'block' : 'none';
   _activeChart = name;
   // Hide regenerate button on Usage Stats — it auto-refreshes via setInterval
 
   if (name === 'bar') {
     barInit();
+  } else if (name === 'spiral') {
+    if (window.EMTSpiral) EMTSpiral.init();
   } else {
     // Flush any pending html that was deferred because container was hidden
     if (_pendingHtml[name]) {
@@ -697,6 +926,7 @@ function showChart(name, btn) {
 
 // ── PDF Export ────────────────────────────────────────────────────────────────
 function chartsPdfExport() {
+  if (_activeChart === 'spiral') { showError('PDF export for the spiral view is coming soon.'); return; }
   // Open popup SYNCHRONOUSLY (required for Safari's popup whitelist)
   var win = window.open('', '_blank');
   if (!win) { alert('Please allow pop-ups for this page to export PDF.'); return; }
@@ -1381,8 +1611,8 @@ function barAggRows(filterFn) {
   var filtered = barData.filter(filterFn);
   var result = { standing:0, imp_kwh:0, exp_kwh:0, imp_cost:0, exp_cost:0, net_cost:0,
                  carbon_g_net: null, carbon_g_total: null, avg_intensity: null, meters:{} };
-  // For avg_intensity: accumulate numerator/denominator for weighted average
-  var _aiCarbon = 0, _aiKwh = 0, _aiHasData = false;
+  // For avg_intensity: throughput-weighted mean of the server's per-day value
+  var _aiNum = 0, _aiTp = 0, _aiHasData = false;
   filtered.forEach(function(row) {
     result.standing  += row.standing  || 0;
     result.imp_kwh   += row.imp_kwh   || 0;
@@ -1393,12 +1623,12 @@ function barAggRows(filterFn) {
     // carbon_g: NULL-aware — only accumulate when data exists (post-2.3.0 blocks)
     if (row.carbon_g_net != null)   result.carbon_g_net   = (result.carbon_g_net   || 0) + row.carbon_g_net;
     if (row.carbon_g_total != null) result.carbon_g_total = (result.carbon_g_total || 0) + row.carbon_g_total;
-    // avg_intensity: weighted average using abs(carbon_g) / abs(net_kwh)
-    if (row.avg_intensity != null && row.carbon_g_net != null) {
-      var absKwh = Math.abs((row.imp_kwh || 0) - (row.exp_kwh || 0));
-      _aiCarbon += Math.abs(row.carbon_g_net);
-      _aiKwh    += absKwh;
-      _aiHasData = true;
+    // avg_intensity: use the server's per-day figure, weighted by throughput
+    // (import + export kWh). Re-deriving abs(carbon)/abs(net_kwh) blows up on
+    // near-balanced days where net kWh collapses toward zero.
+    if (row.avg_intensity != null) {
+      var _tp = (row.imp_kwh || 0) + (row.exp_kwh || 0);
+      if (_tp > 0) { _aiNum += row.avg_intensity * _tp; _aiTp += _tp; _aiHasData = true; }
     }
     Object.keys(row.meters || {}).forEach(function(mid) {
       if (!result.meters[mid]) result.meters[mid] = {imp_kwh:0,imp_cost:0,exp_kwh:0,exp_cost:0,carbon_g:null,carbon_g_imp:null,carbon_g_exp:null};
@@ -1417,7 +1647,7 @@ function barAggRows(filterFn) {
   result.exp_kwh  = Math.round(result.exp_kwh  * 10000) / 10000;
   if (result.carbon_g_net   != null) result.carbon_g_net   = Math.round(result.carbon_g_net   * 100) / 100;
   if (result.carbon_g_total != null) result.carbon_g_total = Math.round(result.carbon_g_total * 100) / 100;
-  if (_aiHasData && _aiKwh > 0) result.avg_intensity = Math.round((_aiCarbon / _aiKwh) * 10) / 10;
+  if (_aiHasData && _aiTp > 0) result.avg_intensity = Math.round((_aiNum / _aiTp) * 10) / 10;
 
   // Round period totals from accumulated daily values.
   // One method everywhere: sum daily rows, round at period level.
@@ -2152,6 +2382,26 @@ if (!window.Chart) {
 }
 
 document.addEventListener('DOMContentLoaded', function() {
+  // DCC settlement indicator — shown only when billing runs on the DCC path
+  // and blocks are still awaiting the supplier's settled figure (issue #244:
+  // makes "N blocks awaiting DCC settlement" visible without opening Data
+  // Management, so a stuck import channel is obvious at a glance).
+  (function loadSettleNote(){
+    try {
+      fetch(apiUrl('/api/billing-source')).then(function(r){return r.json();}).then(function(d){
+        var el = document.getElementById('dcc-settle-note');
+        if (!el || !d) return;
+        if (d.source === 'dcc' && d.unsettled > 0) {
+          el.textContent = '\u23f3 ' + d.unsettled + ' block' + (d.unsettled === 1 ? '' : 's') + ' awaiting DCC settlement';
+          el.title = 'These blocks are billed on EMT\u2019s provisional figure and haven\u2019t yet been reconciled to your supplier\u2019s settled DCC figure. See Data Management for detail.';
+          el.style.display = 'inline-flex';
+        } else {
+          el.style.display = 'none';
+        }
+      }).catch(function(){});
+    } catch(e) {}
+  })();
+
   // Sync theme toggle icon immediately
   var theme = document.documentElement.getAttribute('data-theme') || 'dark';
   var btn = document.getElementById('bar-theme-btn');
@@ -2178,7 +2428,8 @@ document.addEventListener('DOMContentLoaded', function() {
     try { saved = localStorage.getItem('emt_chart_tab'); } catch(e) {}
     var tabs = document.querySelectorAll('.chart-tab');
     if (saved === 'heatmap') { showChart('heatmap', tabs[1]); }
-    else if (saved === 'bar') { showChart('bar', tabs[2]); }
+    else if (saved === 'spiral') { showChart('spiral', tabs[2]); }
+    else if (saved === 'bar') { showChart('bar', tabs[3]); }
     else { loadChartContent('daily'); updateToggleLabel('daily'); }
   }, 350);
 });
@@ -2189,6 +2440,7 @@ document.addEventListener('visibilitychange', function() {
   if (document.visibilityState === 'visible') {
     chartsLoaded = {};
     if (_activeChart === 'bar') { barInit(); }
+    else if (_activeChart === 'spiral') { if (window.EMTSpiral) EMTSpiral.init(); }
     else { loadChartContent(_activeChart || 'daily'); }
   }
 });
