@@ -32,9 +32,11 @@ def _extract(name_sig, end_marker):
 
 
 def _extract_funcs():
-    helper = _extract("function barCo2ImpExp(agg) {", "function barGetDatasets")
-    cellval = _extract("function cellVal(agg, col) {", "// Build HTML")
-    return helper + "\n" + cellval
+    # The CO2 import/export split now lives entirely in cellVal()'s net_imp /
+    # net_exp branches (the old barCo2ImpExp helper was inlined away). cellVal
+    # only needs barMetric + barStandingVal on the CO2 path, both provided by the
+    # harness below.
+    return _extract("function cellVal(agg, col) {", "// Build HTML")
 
 
 HARNESS_TMPL = r"""
@@ -43,17 +45,21 @@ var barCurrency = '';
 function barStandingVal(){ return 0; }
 __FUNCS__
 
-// Day that NET-IMPORTED but also exported, WITH an EV sub-meter:
-//   main: import 5.0, export 3.0; ev (sub): gross import 4.0
-// Total import = 5.0 + 4.0 = 9.0 (must include the device), export = 3.0,
-// net = 6.0. The original bug reported import=net=6.0 and export=0; an earlier
-// over-correction excluded the device (import=5.0).
-var impDay = { carbon_g_net: 2.0, imp_kwh: 10, exp_kwh: 4,
-               meters: { main: { carbon_g_imp: 5.0, carbon_g_exp: 3.0 },
+// Contract: the server sends the MAIN meter's carbon_g_imp as the GROSS import
+// carbon — it already includes the sub-meters that draw through the main. Devices
+// carry carbon_g only (no carbon_g_imp). So the CO2 net_imp column sums
+// carbon_g_imp across meters and collapses to the main's gross figure.
+//
+// Net-importer day that also exported, with an EV device drawing through main:
+//   main gross import carbon 9.0 (incl. the EV's 4.0), gross export offset 3.0.
+//   Total import = 9.0, export = 3.0, net = 6.0. The 3.0-era bug reported
+//   import = net = 6.0 and export = 0; use of the gross columns fixes both.
+var impDay = { carbon_g_net: 6.0, imp_kwh: 10, exp_kwh: 4,
+               meters: { main: { carbon_g_imp: 9.0, carbon_g_exp: 3.0, carbon_g: 5.0 },
                          ev:   { carbon_g: 4.0 } } };
-// Day that NET-EXPORTED: main import 2.0, export 3.5; ev gross 1.0.
-var expDay = { carbon_g_net: -1.5, imp_kwh: 4, exp_kwh: 9,
-               meters: { main: { carbon_g_imp: 2.0, carbon_g_exp: 3.5 },
+// Net-exporter day: main gross import 3.0 (incl. the EV's 1.0), gross export 3.5.
+var expDay = { carbon_g_net: -0.5, imp_kwh: 4, exp_kwh: 9,
+               meters: { main: { carbon_g_imp: 3.0, carbon_g_exp: 3.5, carbon_g: 2.0 },
                          ev:   { carbon_g: 1.0 } } };
 
 function near(a,b){ return Math.abs(a-b) < 1e-9; }

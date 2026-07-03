@@ -409,88 +409,6 @@ def _dispatch_overlay_rate(channel_name: str, block_start: str,
     return base_rate
 
 
-def _device_uses_overlay(meter_meta: dict, has_own_rates: bool) -> bool:
-    """Decide whether a sub-meter (device) import should be priced on the main
-    meter's EFFECTIVE rate — base tariff + dispatch overlay — instead of the base
-    tariff alone.
-
-    Precedence (RELEASE-3.0-DECISIONS E2): an own rate sensor always wins (incl.
-    BCD `current_rate`, which already reflects the dispatched rate); an explicit
-    `rate_source` opts in (`"overlay"`) or out (`"base"`/`"own"`/`"inherit"`);
-    otherwise the default is ON when an API key is configured (E3). The overlay is
-    a no-op anyway when there are no dispatch slots, so defaulting ON only changes
-    pricing for devices that actually drew during a smart-charge dispatch."""
-    if has_own_rates:
-        return False
-    rs = (meter_meta or {}).get("rate_source")
-    if rs == "overlay":
-        return True
-    if rs in ("base", "own", "inherit"):
-        return False
-    return kraken_available()
-
-
-def _device_base_rate(parent_import_cfg: dict, inherited_rate, block_start: str,
-                      resolver=None) -> float:
-    """Resolve the PRE-overlay base rate for a 'use main meter rate' device,
-    honouring the MAIN meter's own rate source.
-
-    A device that inherits the main meter must track whatever the main is on:
-      • main on the API (explicit import rate_source == 'api', or — for an
-        un-migrated config — no rate sensor mapped): resolve the supplier
-        schedule rate at THIS block's start, so the device follows time-of-use
-        correctly. This deliberately bypasses the inherited value, which in API
-        mode can be the whole-day series collapsed to its off-peak floor by the
-        sub-meter tariff reconstruction.
-      • main on a sensor: inherit the main's per-block rate (passed in as
-        `inherited_rate`) — never silently substitute the API, even when an API
-        key is also configured (cad+api).
-
-    The schedule resolver is only consulted as a fallback when the inherited
-    base is empty (e.g. a gap block) for a sensor-fed main.
-    """
-    if resolver is None:
-        resolver = _kraken_rate_resolver
-    cfg = parent_import_cfg or {}
-    src = cfg.get("rate_source")
-    has_sensor = bool((cfg.get("rate") or "").strip())
-    use_api = (src == "api") or (src is None and not has_sensor)
-
-    base = inherited_rate or 0.0
-    if use_api or not base:
-        try:
-            kr = resolver("import", block_start)
-            if kr is not None:
-                base = kr
-        except Exception:
-            pass
-    return base or 0.0
-
-
-def _device_overlay_decision(device_import_cfg: dict, meter_meta: dict,
-                             has_own_rates: bool) -> bool:
-    """Whether a device's import should be priced on the main meter's effective
-    rate, honouring the explicit per-channel "use main meter rate" choice over a
-    mapped sensor (the precedence the config screen makes visible):
-
-      • rate_source == 'main'   → always inherit the main meter, even if a rate
-                                   sensor is also mapped (the toggle wins).
-      • rate_source == 'sensor' → use the device's own rate sensor when it has
-                                   one; with no sensor mapped, fall back to
-                                   inheriting the main meter (an empty sensor
-                                   never leaves the device un-priced).
-      • unset (un-migrated)     → legacy precedence via _device_uses_overlay
-                                   (a mapped sensor wins, else default on when
-                                   the supplier API is configured).
-    """
-    src = (device_import_cfg or {}).get("rate_source")
-    if src == "main":
-        return True
-    if src == "sensor":
-        return not has_own_rates
-    return _device_uses_overlay(meter_meta, has_own_rates)
-
-
 def _snap_to_slot(block_start: str) -> str:
     """Snap a block_start to its 30-min slot boundary ISO (matches capture)."""
     try:
@@ -1274,6 +1192,14 @@ def _warn_zero_rate(meter_id: str, channel_id: str) -> None:
         meter_id, channel_id)
 
 
+# A single block's import/export delta can never plausibly reach this. Domestic
+# supply tops out well under 100 kW, so a per-block delta in the hundreds of kWh
+# is always a lost-opener artifact — the whole cumulative register booked as one
+# interval — not real usage. Used as the rogue-total backstop in compute_channel;
+# 15×+ margin over the most extreme domestic block so it never trips on real use.
+_ROGUE_BLOCK_KWH_CEILING = 500.0
+
+
 def compute_channel(channel: dict, parent_rates=None, is_sub_meter: bool = False,
                     meter_id: str = "?", channel_id: str = "?") -> dict:
     reads     = channel.get("reads", [])
@@ -1295,6 +1221,31 @@ def compute_channel(channel: dict, parent_rates=None, is_sub_meter: bool = False
     if not is_sub_meter:
         raw_delta = reads[-1]["value"] - reads[0]["value"]
         total_kwh = max(raw_delta, 0.0)
+        # Rogue-total backstop (source-agnostic — sensor, Mini, or DCC reads).
+        # A single block cannot import a physically impossible amount. This
+        # occurs when the opening register is lost or zeroed — e.g. a read
+        # dropout during a restart leaves the opener at 0 while the closer still
+        # holds the true cumulative register, so the block books the ENTIRE
+        # lifetime register as one interval's delta. Clamp to zero and collapse
+        # read_start onto read_end so (a) the total is not inflated and (b) the
+        # next block still opens at the correct register. Logged (not silent) and
+        # flagged for review. (Incident 2026-07: 30961 kWh booked in one 30-min
+        # block from a zeroed opener during device config churn — a £10k bill.)
+        if total_kwh > _ROGUE_BLOCK_KWH_CEILING:
+            logger.warning(
+                "compute_channel: %s/%s rogue block delta %.1f kWh "
+                "(opener=%.3f closer=%.3f) exceeds %.0f kWh ceiling — clamping to "
+                "0 (lost/zeroed opener); register continuity preserved via read_end.",
+                meter_id, channel_id, total_kwh, reads[0]["value"],
+                reads[-1]["value"], _ROGUE_BLOCK_KWH_CEILING)
+            return {
+                "kwh":          0.0,
+                "rate":         last_rate,
+                "cost":         0.0,
+                "read_start":   reads[-1]["value"],
+                "read_end":     reads[-1]["value"],
+                "needs_review": True,
+            }
         # Runtime backstop: a block that consumed/exported energy but has no
         # rate is being costed at ZERO silently — i.e. real usage billed as
         # free. This is the "rate field left blank" hole. Surface it (throttled)
@@ -1726,6 +1677,16 @@ def _apply_pass2(block: dict) -> None:
                     continue
                 sub_import["kwh"] = delta
             if delta == 0.0:
+                # A device that drew nothing this block still FOLLOWS the main
+                # meter's effective rate for its displayed rate (cost is 0). Skip
+                # was leaving the sub-meter on whatever compute_channel produced,
+                # and a sub-meter's running-minimum reconstruction collapses to the
+                # adjacent off-peak rate at an off-peak→peak boundary block — so a
+                # zero-draw device diverged from a peak main. Pin it to the parent.
+                sub_import["rate"]        = parent_rate
+                sub_import["cost"]        = 0.0
+                sub_import["kwh_grid"]    = 0.0
+                sub_import["kwh_battery"] = 0.0
                 continue
             entry = {
                 "meter_name": meter_name, "meter_block": meter_block,
@@ -1778,6 +1739,14 @@ def _apply_pass2(block: dict) -> None:
             grid_remaining = max(grid_remaining - claimed, 0.0)
             entry["sub_import"]["kwh_grid"]    = claimed
             entry["sub_import"]["kwh_battery"] = entry["kwh"] - claimed
+            # Devices always follow the main meter's EFFECTIVE import rate (base
+            # tariff + dispatch overlay): grid import is a portion of the main's
+            # metered supply, billed at the main's rate, so per-device costs sum
+            # to the metered bill. Set BOTH rate and cost here — this is the single
+            # costing point (runs at finalise and settlement), so rate always
+            # equals cost/kWh with no dependency on meter order or a per-device
+            # rate source.
+            entry["sub_import"]["rate"]        = parent_rate
             entry["sub_import"]["cost"]        = round(claimed * parent_rate, 6)
             logger.info(
                 "PASS 2: %s protected  grid=%.4f  battery=%.4f",
@@ -1807,6 +1776,7 @@ def _apply_pass2(block: dict) -> None:
             grid_remaining = max(grid_remaining - claimed, 0.0)
             entry["sub_import"]["kwh_grid"]    = claimed
             entry["sub_import"]["kwh_battery"] = battery
+            entry["sub_import"]["rate"]        = parent_rate
             entry["sub_import"]["cost"]        = round(claimed * parent_rate, 6)
             logger.info(
                 "PASS 2: %s unprotected  grid=%.4f  battery=%.4f",
@@ -2257,6 +2227,13 @@ def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricit
             # the materialised import kWh (meter validation).
             rate = _dispatch_overlay_rate("import", block.get("start", ""),
                                           rate, chosen)
+            # Persist the EFFECTIVE (post-overlay) rate, not just the cost. PASS 2
+            # (below) prices every device's grid import at the parent's imp_ch
+            # ["rate"]; if we left the pre-overlay base here, a settled block would
+            # bill the main off-peak but charge its devices' grid draw at PEAK —
+            # a real overcharge on every reconciled smart-charge block. Mirrors
+            # finalise_block, where the main overlay writes result["rate"] = _ov.
+            imp_ch["rate"] = rate
             imp_ch["kwh"] = chosen
             imp_ch["kwh_total"] = chosen
             imp_ch["cost"] = round(chosen * rate, 6)
@@ -2801,51 +2778,12 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
                         result["rate"] = _ov
                         result["cost"] = round((result.get("kwh") or 0.0) * _ov, 6)
 
-            # Dispatch overlay for a DEVICE on "use main meter rate" — price its
-            # import on the main meter's EFFECTIVE rate. The base follows the
-            # main meter's own source (sensor → inherit its per-block rate; API →
-            # resolve the schedule per-slot, NOT the inherited day which the
-            # sub-meter reconstruction can collapse to off-peak). The dispatch
-            # overlay then reprices the device's own draw to off-peak if IT drew
-            # during a smart-charge slot (so e.g. an EV bump-charging midday on
-            # IOG is costed off-peak, not the daytime peak). Own-sensor devices
-            # keep their sensor; opt-out via meta.rate_source.
-            elif is_sub and channel_name == "import" and \
-                    _device_overlay_decision(
-                        (meter_cfg or {}).get("channels", {}).get("import", {}),
-                        (meter_cfg or {}).get("meta") or meter_meta,
-                        bool(channel.get("rates"))):
-                _parent_imp_cfg = (
-                    config.get("meters", {})
-                          .get(parent_name, {})
-                          .get("channels", {})
-                          .get("import", {})
-                )
-                _base = _device_base_rate(_parent_imp_cfg,
-                                          result.get("rate", 0.0) or 0.0,
-                                          start)
-                if _base:
-                    # Follow the MAIN meter's overlay DECISION, not the device's
-                    # own draw. "Use main meter rate" means inheriting main's
-                    # effective (base + dispatch overlay) rate, so the overlay's
-                    # over-report floor must be evaluated against the MAIN
-                    # meter's import, not the follower's. A device that barely
-                    # draws during a smart-charge slot (e.g. a battery at ~0 kWh)
-                    # must still inherit the off-peak rate main received. The EV
-                    # path is unaffected: if the EV drew, main drew at least as
-                    # much, so it still clears the floor. (parent is finalised
-                    # earlier in PASS 1; fall back to own kWh if not yet present.)
-                    _main_imp_kwh = (
-                        (block["meters"].get(parent_name, {})
-                              .get("channels", {})
-                              .get("import") or {}).get("kwh")
-                    )
-                    _ov = _dispatch_overlay_rate(
-                        "import", start, _base,
-                        _main_imp_kwh if _main_imp_kwh is not None
-                        else result.get("kwh"))
-                    result["rate"] = _ov
-                    result["cost"] = round((result.get("kwh") or 0.0) * _ov, 6)
+            # NOTE: sub-meter (device) import is NOT priced here. Devices always
+            # follow the main meter's effective import rate, applied uniformly in
+            # PASS 2 (_apply_pass2), which runs after every meter is finalised and
+            # sets both the device's rate and cost from the parent's rate. This is
+            # the single device-costing point; keeping it out of PASS 1 removes any
+            # dependency on meter order and the old per-device over-report floor.
 
             # ── 2.10.0: provisional detection for sub-meter import ──────────
             # A sub-meter block is provisional when it was closed without a

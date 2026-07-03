@@ -100,11 +100,33 @@ bs_mod.local_date_to_utc_bounds        = _ldtub
 bs_mod.local_date_range_to_utc_bounds  = _ldrtub
 sys.modules["block_store"] = bs_mod
 
-# Stub engine (pause/resume only)
+# Stub engine (pause/resume only) — plus the pure power converter that the
+# /api/power route delegates to (server.sensor_kw → engine._power_value_to_kw,
+# added when the W/kW unit handling was unified into engine). engine.py isn't
+# imported here (it pulls in HA/filesystem), so we lift just that one pure,
+# builtins-only function straight from source — no duplicated literal to drift,
+# and its behaviour is independently guarded by test_power_conversion.py.
 eng = types.ModuleType("engine")
 eng.pause_engine  = lambda: None
 eng.resume_engine = lambda: None
 eng.engine_startup = MagicMock()
+
+def _load_power_converter_into(mod):
+    import re as _re
+    _here = os.path.dirname(os.path.abspath(__file__))
+    for _cand in (os.path.join(_here, "engine.py"),
+                  os.path.join(os.path.dirname(_here), "engine.py")):
+        if os.path.exists(_cand):
+            _src = open(_cand, encoding="utf-8").read()
+            _m = _re.search(
+                r"\ndef _power_value_to_kw\(.*?\n    return round\(fv, 3\)\n",
+                _src, _re.S)
+            if _m:
+                exec(_m.group(0), mod.__dict__)
+                return
+    raise RuntimeError("could not locate _power_value_to_kw in engine.py source")
+
+_load_power_converter_into(eng)
 sys.modules["engine"] = eng
 
 # Stub waitress (not needed for test client)

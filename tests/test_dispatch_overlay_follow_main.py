@@ -1,18 +1,18 @@
 """
-Regression: a "use main meter rate" device must follow the MAIN meter's dispatch
-overlay, not re-qualify the overlay against its OWN draw.
+Regression: every device is priced on the MAIN meter's EFFECTIVE import rate
+(base tariff + dispatch overlay), for both cost and the displayed rate.
 
-Bug (caught pre-3.0-release on a prod-dev DB): the dispatch overlay's 0.1 kWh
-over-report floor was evaluated against the device's own import. A follower that
-barely draws during a smart-charge slot — e.g. a battery idling at ~0 kWh while
-the EV charges — fell below the floor and was left on the main meter's PEAK base
-rate, while the main meter and the EV (both above the floor) were repriced
-off-peak. A rate_source == 'main' device is supposed to inherit main's EFFECTIVE
-rate, so the floor must be evaluated against the MAIN meter's draw.
+Devices no longer make any per-device rate decision. All device grid import is
+costed in PASS 2 (_apply_pass2), which runs after every meter is finalised and
+sets each device's rate and cost from the parent's finalised rate. So a device
+follows the main's off-peak dispatch rate whether or not it drew much itself,
+with no dependency on meter order, and there is no per-device over-report floor
+to re-qualify — only the MAIN meter qualifies the overlay, on grid draw.
 
-Fixed by sourcing the overlay floor from the parent's finalised import kWh in the
-device-overlay branch of finalise_block. EV behaviour is unchanged (its own draw
-already clears the floor, and main's draw is always >= the EV's).
+These guards originally caught a prod-dev bug where a sub-floor follower (a
+battery idling at ~0 kWh while the EV charged) was stranded on the main's PEAK
+base rate. Under the PASS 2 model that cannot happen: the device inherits the
+main's effective rate directly.
 
 Style mirrors test_pass2_ev_priority.py; the finalise harness mirrors
 TestDispatchOverlayAtFinalise in test_engine.py.
@@ -138,6 +138,20 @@ class TestFollowMainDeviceOverlay(unittest.TestCase):
             (start, meter)).fetchone()
         return row["imp_rate"] if row else None
 
+    def _cost(self, start, meter):
+        row = engine._store._conn.execute(
+            "SELECT imp_cost FROM blocks WHERE block_start=? AND meter_id=?",
+            (start, meter)).fetchone()
+        return row["imp_cost"] if row else None
+
+    def _settle(self, start, dcc_main_kwh):
+        """Reconcile a finalised block against a DCC main-import figure."""
+        blk = engine._store.get_block_dict_by_start(start)
+        blk["meters"]["electricity_main"]["imp_kwh_api"] = dcc_main_kwh
+        engine._rerun_pass2_for_settled_block(
+            blk, billing_source="api", standing_resolver=None)
+        engine.append_block_replace(blk)
+
     def test_subfloor_battery_follows_main_overlay(self):
         # main 4.0 kWh (>floor), EV 3.4 kWh (>floor), battery 0.05 kWh (<floor).
         self._finalise(SLOT, SLOT_END, main=4.0, batt=0.05, ev=3.4)
@@ -164,6 +178,128 @@ class TestFollowMainDeviceOverlay(unittest.TestCase):
         self.assertAlmostEqual(
             self._rate(NO_SLOT, "electricity_main"), PEAK, places=5,
             msg="no slot -> main itself stays peak")
+
+    def _finalise_ordered(self, start, end, order, main, batt, ev):
+        """Finalise one block whose meters dict is in an EXPLICIT order.
+
+        Reproduces the live prod-dev ordering, where the current block presents
+        the sub-meters BEFORE the main meter. The follow-main overlay reads the
+        parent's just-finalised import kWh for its floor check, so it must not
+        depend on dict insertion order.
+        """
+        blk = engine.create_block(datetime.fromisoformat(start),
+                                  datetime.fromisoformat(end), 30,
+                                  seed_meters=True)
+        # Re-key the meters dict into the requested order (same channel objects).
+        blk["meters"] = {name: blk["meters"][name] for name in order}
+
+        def _reads(meter, lo, delta):
+            blk["meters"][meter]["channels"]["import"]["reads"] = [
+                {"ts": start, "value": lo},
+                {"ts": end, "value": round(lo + delta, 6)}]
+        _reads("electricity_main", 100.0, main)
+        _reads("house_battery", 10.0, batt)
+        _reads("ev_charger", 20.0, ev)
+        engine.finalise_block(_HA(), block_data=blk)
+
+    def test_subfloor_battery_follows_main_when_submeters_first(self):
+        # The block presents sub-meters BEFORE the main meter — the live ordering
+        # behind the original prod-dev report. Because devices are priced in PASS 2
+        # (after every meter is finalised), block-meter order cannot affect a
+        # device's rate: the sub-floor battery still inherits the main's off-peak
+        # rate. Guards against any future change that reintroduces per-PASS-1
+        # device pricing (which was order-sensitive).
+        self._finalise_ordered(
+            SLOT, SLOT_END,
+            order=("house_battery", "ev_charger", "electricity_main"),
+            main=4.0, batt=0.05, ev=3.4)
+        self.assertAlmostEqual(
+            self._rate(SLOT, "house_battery"), OFF_PEAK, places=5,
+            msg="follow-main battery must inherit main's off-peak overlay even "
+                "when sub-meters are finalised before the main (ordering fix)")
+        self.assertAlmostEqual(
+            self._rate(SLOT, "electricity_main"), OFF_PEAK, places=5,
+            msg="main is above the floor -> off-peak regardless of order")
+        self.assertAlmostEqual(
+            self._rate(SLOT, "ev_charger"), OFF_PEAK, places=5,
+            msg="EV is above the floor -> off-peak regardless of order")
+
+
+    def test_settlement_prices_device_grid_on_main_offpeak_not_peak(self):
+        # The COST path at reconcile: a block finalises with the main sub-floor
+        # (over-report guard leaves it on PEAK), then DCC settlement raises the
+        # main import above the floor. The main is re-overlaid to off-peak, and
+        # the device's grid import must be re-costed at that off-peak rate.
+        #
+        # Regression: settlement applied the overlay to the main's COST but left
+        # its stored rate on the pre-overlay PEAK base, so PASS 2 re-priced every
+        # device's grid import at peak while the main billed off-peak — a real
+        # overcharge on every reconciled smart-charge block.
+        self._finalise(SLOT, SLOT_END, main=0.05, batt=0.0, ev=0.05)
+        # sub-floor at finalise -> main (and its follower EV) on peak, correctly
+        self.assertAlmostEqual(self._rate(SLOT, "electricity_main"), PEAK, places=5)
+        self._settle(SLOT, dcc_main_kwh=3.0)
+        # main re-overlaid to off-peak, and its stored rate now reflects that
+        self.assertAlmostEqual(
+            self._rate(SLOT, "electricity_main"), OFF_PEAK, places=5,
+            msg="settled main effective rate must be off-peak")
+        self.assertAlmostEqual(
+            self._cost(SLOT, "electricity_main"), round(3.0 * OFF_PEAK, 6), places=5)
+        # THE COST REGRESSION: the EV's grid import settles at the main's off-peak
+        # rate, not the stale peak base.
+        self.assertAlmostEqual(
+            self._cost(SLOT, "ev_charger"), round(0.05 * OFF_PEAK, 6), places=5,
+            msg="device grid import must settle at the main's off-peak rate "
+                "(regression: PASS 2 read the main's stale pre-overlay peak rate)")
+
+
+    def test_own_rate_on_device_is_ignored_priced_at_main(self):
+        # A device carrying its OWN rate (a rate sensor / explicit per-slot rates)
+        # is still priced at the main meter's effective rate — the per-device
+        # own-rate path was removed. Pins the "devices always follow the main
+        # meter" contract for both rate and cost.
+        blk = engine.create_block(datetime.fromisoformat(SLOT),
+                                  datetime.fromisoformat(SLOT_END), 30,
+                                  seed_meters=True)
+
+        def _reads(meter, lo, delta):
+            blk["meters"][meter]["channels"]["import"]["reads"] = [
+                {"ts": SLOT, "value": lo},
+                {"ts": SLOT_END, "value": round(lo + delta, 6)}]
+        _reads("electricity_main", 100.0, 4.0)
+        _reads("house_battery", 10.0, 0.0)
+        _reads("ev_charger", 20.0, 1.5)
+        # Give the EV its OWN rate (0.20) — must be ignored in favour of main's.
+        blk["meters"]["ev_charger"]["channels"]["import"]["rates"] = [
+            {"ts": SLOT, "value": 0.20}, {"ts": SLOT_END, "value": 0.20}]
+        engine.finalise_block(_HA(), block_data=blk)
+        # main is above the floor in a smart-charge slot -> off-peak
+        self.assertAlmostEqual(self._rate(SLOT, "electricity_main"), OFF_PEAK, places=5)
+        # EV priced at the MAIN's off-peak rate, NOT its own 0.20
+        self.assertAlmostEqual(
+            self._rate(SLOT, "ev_charger"), OFF_PEAK, places=5,
+            msg="device own rate must be ignored; priced at main's effective rate")
+        self.assertAlmostEqual(
+            self._cost(SLOT, "ev_charger"), round(1.5 * OFF_PEAK, 6), places=5)
+
+
+    def test_zero_draw_devices_follow_main_rate(self):
+        # A device that drew NOTHING in a block must still show the main meter's
+        # effective rate (cost 0), not a stale/collapsed compute_channel rate.
+        # Regression (found on a live 04:30 off-peak->peak boundary block): PASS 2
+        # skips zero-draw devices, so they kept the sub-meter reconstruction's
+        # running-minimum rate, which collapses to the adjacent off-peak rate at a
+        # boundary block — leaving the battery/EV off-peak while the main was peak.
+        self._finalise(NO_SLOT, NO_SLOT_END, main=1.0, batt=0.0, ev=0.0)
+        main_rate = self._rate(NO_SLOT, "electricity_main")
+        self.assertAlmostEqual(main_rate, PEAK, places=5,
+                               msg="main resolves to peak in a no-slot peak block")
+        self.assertAlmostEqual(
+            self._rate(NO_SLOT, "house_battery"), main_rate, places=5,
+            msg="zero-draw battery must follow the main's rate, not collapse off-peak")
+        self.assertAlmostEqual(
+            self._rate(NO_SLOT, "ev_charger"), main_rate, places=5,
+            msg="zero-draw EV must follow the main's rate")
 
 
 if __name__ == "__main__":

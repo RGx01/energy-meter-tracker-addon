@@ -440,25 +440,41 @@ class TestGraphQLQueries(unittest.TestCase):
         self.assertIsNone(run(c.get_rate_limit()))
 
     def test_get_dispatches_normalises_fields(self):
-        # API returns startDt/endDt + meta.source; we normalise to start/end/source.
-        data = {
-            "plannedDispatches": [
-                {"startDt": "2026-06-06T10:00:00Z", "endDt": "2026-06-06T10:30:00Z",
-                 "delta": "-1.5", "meta": {"source": "smart-charge",
-                                           "location": "AT_HOME"}}],
+        # Current API surface (post-3.0.3/3.0.4 migration):
+        #   • provider comes from the polymorphic `devices` query (make first,
+        #     then provider) for a LIVE charging device — replaces the deprecated
+        #     registeredKrakenflexDevice.provider.
+        #   • planned dispatches come from a SECOND query, flexPlannedDispatches,
+        #     keyed by that device's id, carrying start/end + type + energyAddedKwh
+        #     (normalised: type→source, energyAddedKwh→delta).
+        #   • completedDispatches still hang off the first query with meta.source.
+        dispatches_resp = {
             "completedDispatches": [
-                {"startDt": "2026-06-06T02:00:00Z", "endDt": "2026-06-06T02:30:00Z",
+                {"start": "2026-06-06T02:00:00Z", "end": "2026-06-06T02:30:00Z",
                  "delta": "-2.9", "meta": {"source": None, "location": "AT_HOME"}}],
-            "registeredKrakenflexDevice": {"provider": "MYENERGI", "status": "Live"},
+            "devices": [
+                {"id": "cp-1", "make": "MYENERGI", "provider": "OCTOPUS_ENERGY",
+                 "deviceType": "ELECTRIC_VEHICLES", "__typename": "SmartFlexVehicle",
+                 "status": {"current": "LIVE"}}],
         }
-        c = self._client([_gql_data(data)])
+        flex_resp = {
+            "flexPlannedDispatches": [
+                {"start": "2026-06-06T10:00:00Z", "end": "2026-06-06T10:30:00Z",
+                 "type": "smart", "energyAddedKwh": "1.5"}],
+        }
+        c = self._client([_gql_data(dispatches_resp), _gql_data(flex_resp)])
+        # Skip the one-shot schema-deprecation introspection (covered by its own
+        # tests) so it doesn't consume a canned response before the two we queue.
+        c._deprecation_checked = True
         res = run(c.get_dispatches("A-123"))
+        # provider = device manufacturer (make), not the flex provider
         self.assertEqual(res["provider"], "MYENERGI")
         self.assertEqual(len(res["planned"]), 1)
         p = res["planned"][0]
         self.assertEqual(p["start"], "2026-06-06T10:00:00Z")
         self.assertEqual(p["end"], "2026-06-06T10:30:00Z")
-        self.assertEqual(p["source"], "smart-charge")
+        self.assertEqual(p["source"], "smart")     # normalised from `type`
+        self.assertEqual(p["delta"], "1.5")        # normalised from energyAddedKwh
         self.assertEqual(res["completed"][0]["source"], None)
 
     def test_get_dispatches_empty(self):

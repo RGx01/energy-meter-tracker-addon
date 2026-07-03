@@ -63,10 +63,13 @@ pessimism — there is no readable truth to substitute for it.
 ### RATE IS A FINALISE-TIME CONCERN (the key architectural decision)
 kWh is provisional-at-finalise → authoritative-at-DCC-settlement. RATE is NOT:
 it is determined at finalise from whatever rate source exists, exactly as EMT has
-always done (CAD rate sensor in v2; a BCD rate sensor in v3 if installed). **If
-BCD is installed, EMT consumes BCD's already-dispatch-adjusted rate at finalise
-and runs NO overlay at all.** Our overlay is the no-BCD substitute, so it applies
-where BCD's rate would have entered: at finalise.
+always done (CAD rate sensor in v2). EMT ALWAYS self-derives its rate — schedule
+base + dispatch overlay — and NEVER consumes a BCD rate/cost sensor or defers its
+rate decision to BCD (see §4.10 point 6, the decision that stuck; an earlier idea
+of "consume BCD's rate and skip the overlay when BCD is installed" was dropped).
+The overlay therefore ALWAYS runs at finalise. (BCD is still used elsewhere — its
+`current_demand` for the live-power offload, and detection — but never for the
+rate.)
 
 Consequence — the overlay applies at **two** call sites (BUILT):
   - **(A) At finalise** (`finalise_block`, after `compute_channel`): a fresh
@@ -151,9 +154,10 @@ new persisted state.
   integrations), BCD absent:** derive smart-charge slots forward from Kraken
   planned dispatches with `source=smart-charge`. CONFIRMED live for
   `MYENERGI_V2`. This is the primary, cleanest branch.
-- **Same, BCD installed:** prefer BCD's `intelligent_dispatching` sensor
-  (already provider-correct, excludes bump). FUTURE — not built; EMT currently
-  always self-derives.
+- **BCD installed:** no change to the rate path. EMT ALWAYS self-derives the
+  dispatch feed from Kraken and never defers to BCD's `intelligent_dispatching`
+  sensor (§4.10 — EMT never defers its rate decision to BCD). BCD is used only
+  for the live-power offload (`current_demand`), never for the rate.
 - **OHME (BUILT — capture branches on `provider==OHME`; overlay, meter
   validation and storage stay the shared path).** OHME differs from Zappi:
   completed dispatches are boost-contaminated and `meta.source` is unreliable for
@@ -337,22 +341,47 @@ charge clears it with huge margin (live data: charging slots show 2–6 kWh, idl
 slots ~0.0 — clean separation, 0.1 splits them safely both ways). Confirmed
 against real slot data, not picked blind.
 
-**Validation fidelity is provisional-at-finalise, authoritative-at-settlement**
-(mirrors how kWh itself behaves). The guard checks the block's CURRENT kWh figure
-at whatever fidelity exists at that pass — never a hardcoded assumption that
-authoritative data is present:
+**Validation fidelity at settlement is ASYMMETRIC — and rate is finalise-time
+(reconciled with §1c).** The guard checks the block's CURRENT kWh figure at
+whatever fidelity exists at that pass:
   - API-only / api+mini at FINALISE (A): validates against the PROVISIONAL Mini
     kWh (a real register delta, not a guess). Provisional draw ≥ 0.1 → apply
     off-peak provisionally.
-  - At SETTLEMENT (B): DCC reconciles kWh to authoritative; the re-flag fires,
-    the block re-runs, and the guard RE-VALIDATES against the authoritative draw.
-    If DCC confirms draw → off-peak stands; if DCC shows ~0 despite a provisional
-    reading → reverts to peak. The validation self-corrects when fidelity firms.
-This makes the overlay behave identically across api / api+mini / cad modes —
-each just has a different fidelity of "current kWh" at finalise, and all get the
-authoritative re-check at settlement via path B. It would be inconsistent for the
-kWh to be provisional→settled while the rate-validation demanded authoritative
-data the kWh layer doesn't yet have; instead, both firm up together.
+  - At SETTLEMENT (B): DCC reconciles kWh to authoritative and the block re-runs.
+    The overlay is re-applied so an off-peak rate isn't clobbered when the kWh
+    re-materialises, AND — because the settlement re-run passes the settled kWh
+    through the same floor — a block that finalised at PEAK because its
+    provisional draw was sub-floor CAN be promoted to off-peak once DCC clears
+    the floor (the solar / low-provisional case; verified). This promotion is the
+    useful, safe direction.
+
+**What settlement does NOT do: revert off-peak → peak.** A block that finalised
+OFF-PEAK (provisional draw ≥ floor) whose DCC figure later comes in BELOW the
+floor is NOT reverted to peak. Mechanically this is because `_resolve_block_rate`
+reuses the block's stored (already-off-peak) rate as the overlay base, and the
+below-floor guard returns that base unchanged — there is no original peak tariff
+left to fall back to. Conceptually it is CONSISTENT with §1c ("RATE IS A
+FINALISE-TIME CONCERN"): the rate is decided at finalise; kWh firms up at
+settlement, the rate does not. The residual over-credit is bounded by the floor
+(the settled kWh is by definition sub-floor, so < ~3p/block) and is the accepted
+cost of the finalise-time decision. NOTE this means the guard's failure mode is
+NOT purely under-application in the settlement-revert direction — a small,
+bounded over-credit is possible here; the finalise-time guard still cannot
+over-credit at finalise.
+
+> **Open for future reconsideration — symmetric settlement re-validation.**
+> If we ever decide the rate SHOULD firm up with the kWh in both directions
+> (revert off-peak → peak when DCC lands sub-floor, not just promote), the fix
+> is to RE-DERIVE the base tariff from the schedule resolver at settlement for a
+> block sitting in a dispatch slot — rather than reusing the stored overlaid
+> rate — so the below-floor guard reverts to the real peak. Feasibility caveat:
+> this needs the block's dispatch slot to still exist (inside the ~90-day slot
+> retention, which the ~2-day DCC horizon comfortably sits within) — outside
+> that window the slot has aged out and a blanket recompute is FORBIDDEN (§ "A
+> blanket recompute over arbitrary history is FORBIDDEN"), so any such revert is
+> horizon-bounded only. The floor stays either way (it is load-bearing for the
+> OHME optimistic path — see OHME §; removing it would over-credit OHME). Left
+> deliberately unbuilt: current decision is finalise-time rate per §1c.
 
 ### 3.3 Kraken dispatch query (BUILT, field names confirmed)
 `get_dispatches(account)` queries `plannedDispatches`/`completedDispatches` with
@@ -389,14 +418,13 @@ values: `ohme_verified` / `ohme_assumed_unverified`. See the per-provider matrix
 above for the mechanism. Ships dormant on a Zappi account (validated by tests +
 first OHME log).
 
-**BCD-installed consumption — FUTURE, not built.** When BCD is installed EMT
-could prefer its `intelligent_dispatching` sensor over self-derivation (already
-provider-correct, excludes bump). NOTE the BCD *live-power* offload is largely
-already in place — `detect_bottlecapdave` finds the `current_demand` sensor and
-the wizard pre-fills the Live Power field with it — but the dispatch-feed offload
-(`intelligent_dispatching`) is the unbuilt piece. Low priority: EMT self-derives
-correctly for the planned-dispatch providers; this is an API-footprint
-optimisation, not a correctness gap.
+**BCD live-power offload — the only BCD consumption EMT does.** `detect_bottlecapdave`
+finds the `current_demand` sensor and the wizard pre-fills the Live Power field
+with it. That's the extent of it: EMT consumes BCD's live-power sensor for the
+gauge, and nothing else. It never consumes BCD's rate, cost, or
+`intelligent_dispatching` sensors — the rate is always EMT's own self-derived
+schedule + overlay (§4.10). The old "prefer BCD's dispatch feed when installed"
+idea is dropped, not deferred: it conflicts with the never-defer-to-BCD decision.
 
 ---
 
