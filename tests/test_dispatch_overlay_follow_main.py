@@ -283,5 +283,24 @@ class TestFollowMainDeviceOverlay(unittest.TestCase):
             self._cost(SLOT, "ev_charger"), round(1.5 * OFF_PEAK, 6), places=5)
 
 
+    def test_zero_draw_devices_follow_main_rate(self):
+        # A device that drew NOTHING in a block must still show the main meter's
+        # effective rate (cost 0), not a stale/collapsed compute_channel rate.
+        # Regression (found on a live 04:30 off-peak->peak boundary block): PASS 2
+        # skips zero-draw devices, so they kept the sub-meter reconstruction's
+        # running-minimum rate, which collapses to the adjacent off-peak rate at a
+        # boundary block — leaving the battery/EV off-peak while the main was peak.
+        self._finalise(NO_SLOT, NO_SLOT_END, main=1.0, batt=0.0, ev=0.0)
+        main_rate = self._rate(NO_SLOT, "electricity_main")
+        self.assertAlmostEqual(main_rate, PEAK, places=5,
+                               msg="main resolves to peak in a no-slot peak block")
+        self.assertAlmostEqual(
+            self._rate(NO_SLOT, "house_battery"), main_rate, places=5,
+            msg="zero-draw battery must follow the main's rate, not collapse off-peak")
+        self.assertAlmostEqual(
+            self._rate(NO_SLOT, "ev_charger"), main_rate, places=5,
+            msg="zero-draw EV must follow the main's rate")
+
+
 if __name__ == "__main__":
     unittest.main()
