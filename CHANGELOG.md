@@ -1,5 +1,25 @@
 # Changelog
 
+## [3.1.0] — 2026-07-03
+
+*Adds a Spiral chart for seeing a year — or a lifetime — of energy at a glance, corrects carbon-intensity averaging on near-balanced solar days, and simplifies device setup now that devices always follow the main meter's rate.*
+
+### Added
+
+- **Spiral chart.** A new chart (Charts → Spiral) that winds your running total — cost, usage, or carbon — outward as a single continuous coil, one loop per year, so a fatter gap between loops is a heavier year and the centre always shows the total to date. Switch between Cost / Usage / Carbon, pick any device or the whole meter, and toggle **Lifetime** (one endless coil) or **Year-aligned** (every year starts at January, at the top) winding. Axis rings land on round numbers, and the unit scales automatically as totals grow — kWh → MWh → GWh, and kg → t for carbon — so a 4,598 kWh year reads as "4.6 MWh" rather than "4.6k". Works in both light and dark themes.
+
+- **Unsettled-blocks indicator in the Charts header.** When billing runs on the DCC settlement path, the Charts header shows a count of blocks still awaiting the supplier's settled figure (e.g. "174 blocks awaiting DCC settlement"), so a stalled settlement is visible at a glance rather than only in Data Management. Hidden on the local/CAD path, where it doesn't apply.
+
+### Changed
+
+- **Devices always follow the main meter's rate — device rate fields removed from setup.** A device's grid import is part of the main meter's metered supply, so it's billed at the main meter's rate; this became the engine's behaviour in 3.0.6. The now-redundant per-device "Rate Sensor" field and "Use the main meter's rate" toggle have been removed from the Add Device dialog, the device editor, and the first-run setup wizard. Existing device rate settings are left untouched in your configuration and simply ignored — nothing to migrate, and no change to any bill. (If per-device tariffs return in a future release — for example Octopus's mooted 6-hour EV-charging cap — the field comes back.)
+
+### Fixed
+
+- **DCC import settlement no longer stalls after a meter exchange ([#244](https://github.com/RGx01/energy-meter-tracker-addon/issues/244)).** On a supply whose meter has been swapped, the meter point lists both the old and the new meter. EMT was always taking the *first*-listed meter — the retired one — so DCC consumption queries for its serial returned nothing and import blocks never settled (while a single-meter export point settled normally, which is the tell). EMT now selects the *current* meter: it honours an active/removal flag when the account provides one, and otherwise takes the newest meter in the list. If your import settlement was stuck at a fixed number of unsettled blocks, it should clear on the next settlement pass. Single-meter supplies are unaffected.
+
+- **Carbon average intensity no longer blows up on near-balanced days.** In the usage-stats table, the average carbon intensity was being re-derived from net figures (total carbon ÷ net kWh), which collapses toward a divide-by-near-zero on days where import and export almost cancel out — sending the figure to absurd values (~3,800 gCO₂/kWh against a grid that peaks around 500). It now uses the server's per-day intensity (computed from half-hourly *absolute* throughput, which doesn't collapse), averaged across the selected range weighted by each day's import + export. Purely a display fix; no stored data changes.
+
 ## [3.0.6] — 2026-07-02
 
 *Safeguards the running import total against a rare lost-register glitch, and makes devices always bill at the main meter's effective rate — fixing an Intelligent Octopus dispatch overcharge that could hit device costs on reconciled smart-charge blocks.*

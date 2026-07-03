@@ -53,12 +53,7 @@ eq(mainApiChecked({rate_source: 'sensor', rate: ''}, 'rate'), false,
 eq(mainApiChecked({standing_charge_source: 'api'}, 'standing_charge'), true,
    'explicit api standing charge');
 
-// ── deviceUsesMain ───────────────────────────────────────────────────────────
-eq(deviceUsesMain({}), true, 'no own sensor → inherit main');
-eq(deviceUsesMain({rate: 'sensor.ev'}), false, 'own sensor (no explicit) → use sensor');
-eq(deviceUsesMain({rate_source: 'main', rate: 'sensor.ev'}), true,
-   'explicit main beats a mapped sensor');
-eq(deviceUsesMain({rate_source: 'sensor'}), false, 'explicit sensor → not main');
+// (deviceUsesMain removed in 3.1.0 — devices always follow the main meter's rate)
 
 // ── srcFromToggle ────────────────────────────────────────────────────────────
 eq(srcFromToggle(true, 'api'), 'api', 'checked api');
