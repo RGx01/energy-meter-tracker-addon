@@ -1677,6 +1677,16 @@ def _apply_pass2(block: dict) -> None:
                     continue
                 sub_import["kwh"] = delta
             if delta == 0.0:
+                # A device that drew nothing this block still FOLLOWS the main
+                # meter's effective rate for its displayed rate (cost is 0). Skip
+                # was leaving the sub-meter on whatever compute_channel produced,
+                # and a sub-meter's running-minimum reconstruction collapses to the
+                # adjacent off-peak rate at an off-peak→peak boundary block — so a
+                # zero-draw device diverged from a peak main. Pin it to the parent.
+                sub_import["rate"]        = parent_rate
+                sub_import["cost"]        = 0.0
+                sub_import["kwh_grid"]    = 0.0
+                sub_import["kwh_battery"] = 0.0
                 continue
             entry = {
                 "meter_name": meter_name, "meter_block": meter_block,
