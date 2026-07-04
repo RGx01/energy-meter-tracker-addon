@@ -269,19 +269,13 @@ docker-compose up -d --build energy-meter-tracker
 
 > ℹ️ Logs are written to `/data/energy_meter_tracker/addon.log` in standalone mode and are viewable from the **Logs** page in the UI.
 
-**Optional — add to HA sidebar**
+**Optional — add to the HA sidebar**
 
-You can embed the UI in your HA sidebar using `panel_iframe` in your `configuration.yaml`:
+You can add the standalone UI to your Home Assistant sidebar as a **Webpage dashboard** (via the UI):
 
-```yaml
-panel_iframe:
-  energy_meter:
-    title: "Energy Meter"
-    icon: mdi:speedometer
-    url: "http://192.168.1.x:8099"
-```
-
-Replace `192.168.1.x` with your Docker host IP. Restart HA after adding this.
+1. Go to **Settings → Dashboards** (or [open dashboard settings](https://my.home-assistant.io/redirect/lovelace_dashboards/)).
+2. Click **Add dashboard → Webpage**.
+3. Set the **URL** to `http://<host>:8099` (your Docker host IP and port), give it a **Title** (e.g. "Energy Meter") and an **Icon** (e.g. `mdi:speedometer`), and choose whether to show it in the sidebar.
 
 ---
 
