@@ -463,6 +463,17 @@ def serve_icon():
     return "", 404
 
 
+@app.route("/favicon.ico")
+def serve_favicon():
+    # Belt-and-braces for the browser's default /favicon.ico request (helps
+    # standalone; under ingress the <link> in base.html carries the correct path).
+    import os
+    p = "/app/icon.png"
+    if os.path.exists(p):
+        return send_file(p, mimetype="image/png")
+    return "", 404
+
+
 @app.route("/help")
 def help_page():
     return render_template("help.html", active="help")
@@ -4559,8 +4570,12 @@ def _corrections_unreconciled_count(store, from_date, to_date, channel,
     where, params, _ = _corrections_build_where(
         "rate", from_date, to_date, channel,
         from_time_utc, to_time_utc, meter_id, tz_name, api_settled_only=False)
+    # Only MAIN-meter blocks settle via DCC (imp_kwh_api). Device rows never get
+    # imp_kwh_api — they follow the main — so counting them here produced a
+    # spurious "N blocks await settlement" warning (issue #254c).
     row = store._conn.execute(
-        f"SELECT COUNT(*) AS n FROM blocks WHERE {where} AND {settled_col} IS NULL",
+        f"SELECT COUNT(*) AS n FROM blocks WHERE {where} AND {settled_col} IS NULL "
+        f"AND meter_id IN (SELECT meter_id FROM meters WHERE is_sub_meter = 0)",
         params).fetchone()
     return int((row["n"] if row else 0) or 0)
 
@@ -4664,47 +4679,57 @@ def api_corrections_preview():
                 "current_max": round(float(row["cur_max"] or 0), 6),
             })
 
-        else:  # rate — return per-block detail
-            kwh_col  = "imp_kwh"  if channel == "import" else "exp_kwh"
-            cost_col = "imp_cost" if channel == "import" else "exp_cost"
-            cur = store._conn.execute(
-                f"""SELECT block_start, meter_id, {col} as current_rate,
-                           {kwh_col} as kwh, {cost_col} as current_cost
-                    FROM blocks WHERE {where}
-                    ORDER BY block_start, meter_id""",
-                params
-            )
-            rows = cur.fetchall()
-
-            # Convert block_start UTC → local for display
+        else:  # rate — per-block detail; device rows follow the main (issue #254b)
             from zoneinfo import ZoneInfo
             from datetime import datetime, timezone as _tz
             tz = ZoneInfo(tz_name)
+            kwh_col  = "imp_kwh"  if channel == "import" else "exp_kwh"
+            cost_col = "imp_cost" if channel == "import" else "exp_cost"
+
+            def _display(bs):
+                try:
+                    return (datetime.fromisoformat(bs).replace(tzinfo=_tz.utc)
+                            .astimezone(tz).strftime("%d/%m %H:%M"))
+                except Exception:
+                    return bs
+
+            def _row(bs, mid, cur_rate, kwh, cur_cost):
+                nc = round(float(kwh or 0) * float(value), 6) if value is not None else None
+                return {"block_start": bs, "display": _display(bs), "meter_id": mid,
+                        "current_rate": round(float(cur_rate or 0), 6),
+                        "new_rate": float(value) if value is not None else None,
+                        "kwh": round(float(kwh or 0), 6),
+                        "current_cost": round(float(cur_cost or 0), 6), "new_cost": nc}
 
             blocks_out = []
-            for r in rows:
-                cur_rate = float(r["current_rate"] or 0)
-                kwh      = float(r["kwh"] or 0)
-                cur_cost = float(r["current_cost"] or 0)
-                try:
-                    utc_dt   = datetime.fromisoformat(r["block_start"]).replace(tzinfo=_tz.utc)
-                    local_dt = utc_dt.astimezone(tz)
-                    display  = local_dt.strftime("%d/%m %H:%M")
-                except Exception:
-                    display = r["block_start"]
+            # MAIN blocks (settled gate applied in `where`) — cost basis = imp_kwh
+            main_rows = store._conn.execute(
+                f"""SELECT block_start, meter_id, {col} as current_rate,
+                           {kwh_col} as kwh, {cost_col} as current_cost
+                    FROM blocks WHERE {where} ORDER BY block_start, meter_id""",
+                params).fetchall()
+            for r in main_rows:
+                blocks_out.append(_row(r["block_start"], r["meter_id"],
+                                       r["current_rate"], r["kwh"], r["current_cost"]))
 
-                new_cost = round(kwh * float(value), 6) if value is not None else None
-                blocks_out.append({
-                    "block_start":   r["block_start"],
-                    "display":       display,
-                    "meter_id":      r["meter_id"],
-                    "current_rate":  round(cur_rate, 6),
-                    "new_rate":      float(value) if value is not None else None,
-                    "kwh":           round(kwh, 6),
-                    "current_cost":  round(cur_cost, 6),
-                    "new_cost":      new_cost,
-                })
+            # DEVICE rows that will follow the correction (import only). Cost basis
+            # is the grid-attributed kWh (imp_kwh_grid), exactly what PASS 2 uses,
+            # so the preview matches what apply writes.
+            if channel == "import" and main_rows:
+                bs_list = [r["block_start"] for r in main_rows]
+                ph = ",".join("?" * len(bs_list))
+                dev_rows = store._conn.execute(
+                    f"""SELECT block_start, meter_id, imp_rate as current_rate,
+                               COALESCE(imp_kwh_grid, imp_kwh) as kwh, imp_cost as current_cost
+                        FROM blocks
+                        WHERE block_start IN ({ph}) AND imp_rate IS NOT NULL
+                          AND meter_id IN (SELECT meter_id FROM meters WHERE is_sub_meter = 1)
+                        ORDER BY block_start, meter_id""", bs_list).fetchall()
+                for r in dev_rows:
+                    blocks_out.append(_row(r["block_start"], r["meter_id"],
+                                           r["current_rate"], r["kwh"], r["current_cost"]))
 
+            blocks_out.sort(key=lambda b: (b["block_start"], b["meter_id"]))
             return jsonify({"blocks": blocks_out,
                             "skipped_unreconciled": skipped,
                             "api_gated": gate})
@@ -4817,19 +4842,48 @@ def api_corrections_apply():
                 )
             store._conn.commit()
             updated = cur.rowcount
+
+            # Devices follow the main meter's rate, so propagate the corrected
+            # IMPORT rate onto device rows for the same blocks (issue #254b). The
+            # settled gate above only matches the main meter — device rows never
+            # carry imp_kwh_api — so without this the correction silently skipped
+            # them. Device cost = grid-attributed kWh × rate, exactly what PASS 2
+            # computes at finalise.
+            if channel == "import" and updated:
+                bs_list = [r["block_start"] for r in store._conn.execute(
+                    f"SELECT DISTINCT block_start FROM blocks WHERE {where}", params)]
+                if bs_list:
+                    ph = ",".join("?" * len(bs_list))
+                    dev = (f"block_start IN ({ph}) AND meter_id IN "
+                           "(SELECT meter_id FROM meters WHERE is_sub_meter = 1)")
+                    if recalc_cost:
+                        store._conn.execute(
+                            f"UPDATE blocks SET imp_rate = ?, "
+                            f"imp_cost = ROUND(COALESCE(imp_kwh_grid, imp_kwh, 0) * ?, 6) "
+                            f"WHERE {dev}", [value, value] + bs_list)
+                    else:
+                        store._conn.execute(
+                            f"UPDATE blocks SET imp_rate = ? WHERE {dev}",
+                            [value] + bs_list)
+                    store._conn.commit()
+
             logger.info(
-                "api_corrections_apply: %s %s_rate=%.6f recalc=%s %d blocks (%s %s→%s %s→%s)",
+                "api_corrections_apply: %s %s_rate=%.6f recalc=%s %d main block(s) "
+                "(%s→%s %s→%s); devices follow",
                 meter_id, channel, value, recalc_cost, updated,
-                meter_id, from_date, to_date,
-                from_time or "00:00", to_time or "24:00"
+                from_date, to_date, from_time or "00:00", to_time or "24:00"
             )
-            store._conn.commit()
-            updated = cur.rowcount
-            logger.info(
-                "api_corrections_apply: %s rate set to %.6f "
-                "(recalc_cost=%s) for %d blocks (%s → %s)",
-                channel, value, recalc_cost, updated, from_date, to_date
-            )
+
+        # Regenerate the pre-built billing/heatmap charts so the correction is
+        # visible immediately, rather than only after the next block finalises
+        # (issue #254a). Client-rendered charts (usage stats, spiral) re-fetch.
+        if updated:
+            try:
+                import engine as _eng
+                _eng.generate_charts(store)
+            except Exception as _ce:
+                logger.warning(
+                    "api_corrections_apply: chart regen after correction failed: %s", _ce)
 
         return jsonify({"ok": True, "updated_blocks": updated,
                         "skipped_unreconciled": skipped, "api_gated": gate})

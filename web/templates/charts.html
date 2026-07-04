@@ -336,7 +336,14 @@
   <style>
     #chart-spiral{background:var(--surface)}
     #chart-spiral .sp-board{display:grid;grid-template-columns:1fr 260px;gap:18px;padding:16px}
-    @media (max-width:820px){ #chart-spiral .sp-board{grid-template-columns:1fr}}
+    @media (max-width:820px){
+      /* Single-column: chart on top, options below. Let the panel grow and the
+         page scroll to the options (was clipped by chart-frame-wrap overflow). */
+      #chart-spiral{overflow:visible; height:auto;}
+      #chart-spiral .sp-board{grid-template-columns:1fr}
+      #chart-spiral .sp-chart{min-height:340px}
+      #chart-spiral .sp-side{max-width:none}
+    }
     #chart-spiral .sp-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)}
     #chart-spiral .sp-chart{padding:12px;position:relative;min-height:480px;display:flex;justify-content:center}
     #chart-spiral .sp-side{padding:16px;display:flex;flex-direction:column;gap:18px}

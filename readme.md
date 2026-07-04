@@ -254,6 +254,17 @@ docker-compose up -d --build energy-meter-tracker
 
 Access the UI at `http://<host>:8099`.
 
+**Updating to a new version**
+
+Standalone builds don't auto-update. To pull a new release, from your clone of the repo:
+
+```bash
+git pull
+docker-compose up -d --build energy-meter-tracker
+```
+
+`--build` rebuilds the image from the updated source; `-d` keeps it detached. Your data (`/data/energy_meter_tracker`) is preserved across rebuilds as long as the volume mapping in your `docker-compose.yml` is unchanged.
+
 > ⚠️ Ingress (sidebar embedding) is only available in HA OS/Supervised. In standalone mode access the UI directly at `http://<host>:8099`.
 
 > ℹ️ Logs are written to `/data/energy_meter_tracker/addon.log` in standalone mode and are viewable from the **Logs** page in the UI.

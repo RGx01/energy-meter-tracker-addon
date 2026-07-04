@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS meters (
     postcode_prefix    TEXT,               -- UK carbon intensity (main meter only)
     v2x_capable             INTEGER DEFAULT 0,  -- V2G / bidirectional charging capable
     inverter_power_invert   INTEGER DEFAULT 0,  -- negate inverter power sensor value
+    power_invert            INTEGER DEFAULT 0,  -- negate MAIN power sensor value (Live Power)
     soc_sensor         TEXT,               -- HA entity_id for battery SoC % (informational)
     inverter_power_sensor TEXT,            -- HA entity_id for inverter power W/kW (informational)
     device_power_sensor TEXT,              -- HA entity_id for EV/heat pump power W/kW (informational)
@@ -281,6 +282,12 @@ CREATE TABLE IF NOT EXISTS dispatch_slots (
     provider    TEXT,               -- e.g. 'MYENERGI_V2', 'OHME', 'TESLA'
     source      TEXT,               -- meta.source: smart-charge/bump-charge/unknown
     captured_at TEXT NOT NULL,      -- UTC ISO when we recorded this slot
+    -- Dispatch lifecycle capture (see dispatch_validation_design.md). OBSERVE-ONLY:
+    -- recorded but NOT yet used for billing. Lets us validate a planned slot
+    -- against what actually charged, instead of the meter-draw floor alone.
+    state            TEXT,          -- 'planned' | 'started' | 'completed'
+    energy_planned   REAL,          -- forecast energyAddedKwh for this slot (kWh)
+    energy_completed REAL,          -- delivered energy for this slot at settlement (kWh)
     PRIMARY KEY (slot_start)
 );
 CREATE INDEX IF NOT EXISTS idx_dispatch_slots_start ON dispatch_slots (slot_start);
@@ -502,6 +509,8 @@ def _row_to_block(rows: list[sqlite3.Row]) -> dict:
                     meta["inverter_power_sensor"] = row["inverter_power_sensor"]
                 if row["inverter_power_invert"]:
                     meta["inverter_power_invert"] = True
+                if "power_invert" in row.keys() and row["power_invert"]:
+                    meta["power_invert"] = True
                 if row["device_power_sensor"]:
                     meta["device_power_sensor"] = row["device_power_sensor"]
                 if row["retired_at"]:
@@ -796,6 +805,7 @@ class BlockStore:
         _mc_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(meter_channels)").fetchall()}
 
         _b_cols  = {r[1] for r in self._conn.execute("PRAGMA table_info(blocks)").fetchall()}
+        _ds_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(dispatch_slots)").fetchall()} if self._conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='dispatch_slots'").fetchone() else set()
         _ph_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(power_history)").fetchall()} if self._conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='power_history'").fetchone() else set()
 
         for _col, _tbl, _defn, _col_set in [
@@ -807,6 +817,7 @@ class BlockStore:
             ("postcode_prefix",      "meters",         "TEXT",               _m_cols),
             ("v2x_capable",          "meters",         "INTEGER DEFAULT 0",  _m_cols),
             ("inverter_power_invert","meters",         "INTEGER DEFAULT 0",  _m_cols),
+            ("power_invert",          "meters",         "INTEGER DEFAULT 0",  _m_cols),
             ("meter_type",           "meters",         "TEXT",               _m_cols),
             ("soc_sensor",           "meters",         "TEXT",               _m_cols),
             ("inverter_power_sensor","meters",         "TEXT",               _m_cols),
@@ -832,6 +843,10 @@ class BlockStore:
             ("needs_review",       "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
             ("carbon_intensity_g", "blocks",        "REAL",                       _b_cols),
             ("carbon_gco2_min",  "power_history",   "REAL",              _ph_cols),
+            # ── 3.1.x dispatch lifecycle capture (observe-only, no billing effect)
+            ("state",            "dispatch_slots", "TEXT",  _ds_cols),
+            ("energy_planned",   "dispatch_slots", "REAL",  _ds_cols),
+            ("energy_completed", "dispatch_slots", "REAL",  _ds_cols),
         ]:
             if _col not in _col_set:
                 try:
@@ -1102,11 +1117,20 @@ class BlockStore:
     def upsert_dispatch_slot(self, slot_start: str, *, off_peak: bool = True,
                              provider: Optional[str] = None,
                              source: Optional[str] = None,
+                             state: Optional[str] = "planned",
+                             energy_planned: Optional[float] = None,
+                             energy_completed: Optional[float] = None,
                              captured_at: Optional[str] = None) -> None:
         """Record (or refresh) a 30-min slot that had an Intelligent smart-charge
         dispatch. Last-write-wins on slot_start. Captured forward each poll; the
         overlay reads these to decide off-peak candidacy (gated by meter draw at
         pricing time, NOT here).
+
+        state / energy_planned / energy_completed are OBSERVE-ONLY lifecycle
+        capture (see dispatch_validation_design.md) — recorded but not yet used
+        for billing. energy_completed is preserved across refreshes if a later
+        upsert doesn't supply it (a planned re-capture shouldn't wipe a settled
+        figure), and likewise energy_planned once known.
         """
         if captured_at is None:
             captured_at = (datetime.now(timezone.utc)
@@ -1114,14 +1138,21 @@ class BlockStore:
         with self._conn:
             self._conn.execute(
                 """INSERT INTO dispatch_slots
-                       (slot_start, off_peak, provider, source, captured_at)
-                   VALUES (?,?,?,?,?)
+                       (slot_start, off_peak, provider, source, captured_at,
+                        state, energy_planned, energy_completed)
+                   VALUES (?,?,?,?,?,?,?,?)
                    ON CONFLICT(slot_start) DO UPDATE SET
                        off_peak    = excluded.off_peak,
                        provider    = excluded.provider,
                        source      = excluded.source,
-                       captured_at = excluded.captured_at""",
-                (slot_start, 1 if off_peak else 0, provider, source, captured_at),
+                       captured_at = excluded.captured_at,
+                       state       = COALESCE(excluded.state, dispatch_slots.state),
+                       energy_planned =
+                           COALESCE(excluded.energy_planned, dispatch_slots.energy_planned),
+                       energy_completed =
+                           COALESCE(excluded.energy_completed, dispatch_slots.energy_completed)""",
+                (slot_start, 1 if off_peak else 0, provider, source, captured_at,
+                 state, energy_planned, energy_completed),
             )
 
     def get_dispatch_slot(self, slot_start: str) -> dict | None:
@@ -1129,7 +1160,8 @@ class BlockStore:
         resolver to check whether a block's slot is an off-peak candidate.
         """
         row = self._conn.execute(
-            "SELECT slot_start, off_peak, provider, source, captured_at "
+            "SELECT slot_start, off_peak, provider, source, captured_at, "
+            "state, energy_planned, energy_completed "
             "FROM dispatch_slots WHERE slot_start = ?", (slot_start,)
         ).fetchone()
         return dict(row) if row else None
@@ -1137,7 +1169,8 @@ class BlockStore:
     def get_dispatch_slots_in_range(self, start_iso: str, end_iso: str) -> list:
         """All dispatch_slots with slot_start in [start_iso, end_iso). Ordered."""
         return [dict(r) for r in self._conn.execute(
-            "SELECT slot_start, off_peak, provider, source, captured_at "
+            "SELECT slot_start, off_peak, provider, source, captured_at, "
+            "state, energy_planned, energy_completed "
             "FROM dispatch_slots WHERE slot_start >= ? AND slot_start < ? "
             "ORDER BY slot_start", (start_iso, end_iso)
         ).fetchall()]
@@ -2680,6 +2713,7 @@ class BlockStore:
             soc_s       = meta.get("soc_sensor")
             inv_pwr_s    = meta.get("inverter_power_sensor")
             inv_invert   = 1 if meta.get("inverter_power_invert") else 0
+            pwr_invert   = 1 if meta.get("power_invert") else 0
             dev_pwr_s   = meta.get("device_power_sensor")
             pv_pwr_s    = meta.get("pv_power_sensor")
 
@@ -2689,8 +2723,8 @@ class BlockStore:
                         device_label, protected, inverter_possible,
                         power_sensor, power_source, postcode_prefix, v2x_capable,
                         meter_type, soc_sensor, inverter_power_sensor, inverter_power_invert,
-                        device_power_sensor, pv_power_sensor, rate_source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        device_power_sensor, pv_power_sensor, rate_source, power_invert)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(config_period_id, meter_id) DO UPDATE SET
                        is_sub_meter            = excluded.is_sub_meter,
                        parent_meter_id         = excluded.parent_meter_id,
@@ -2706,13 +2740,14 @@ class BlockStore:
                        soc_sensor              = excluded.soc_sensor,
                        inverter_power_sensor   = excluded.inverter_power_sensor,
                        inverter_power_invert   = excluded.inverter_power_invert,
+                       power_invert            = excluded.power_invert,
                        device_power_sensor     = excluded.device_power_sensor,
                        pv_power_sensor         = excluded.pv_power_sensor,
                        retired_at              = COALESCE(meters.retired_at, excluded.retired_at),
                        retired_reason          = COALESCE(meters.retired_reason, excluded.retired_reason)""",
                 (period_id, meter_id, is_sub, parent, device,
                  protected, inv_poss, power_s, power_src, postcode, v2x,
-                 meter_type, soc_s, inv_pwr_s, inv_invert, dev_pwr_s, pv_pwr_s, rate_src)
+                 meter_type, soc_s, inv_pwr_s, inv_invert, dev_pwr_s, pv_pwr_s, rate_src, pwr_invert)
             )
             meter_row_id = cur.lastrowid or self._conn.execute(
                 "SELECT id FROM meters WHERE config_period_id=? AND meter_id=?",
@@ -2806,6 +2841,8 @@ class BlockStore:
                     meta["inverter_power_sensor"] = m["inverter_power_sensor"]
                 if m["inverter_power_invert"]:
                     meta["inverter_power_invert"] = True
+                if "power_invert" in m.keys() and m["power_invert"]:
+                    meta["power_invert"] = True
                 if m["device_power_sensor"]:
                     meta["device_power_sensor"] = m["device_power_sensor"]
                 if m["pv_power_sensor"]:

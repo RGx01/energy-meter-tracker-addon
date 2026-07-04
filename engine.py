@@ -4809,7 +4809,8 @@ def _capture_ohme_slots(provider, planned) -> int:
     for slot_start, source in pairs:
         try:
             _store.upsert_dispatch_slot(
-                slot_start, off_peak=True, provider=provider, source=source)
+                slot_start, off_peak=True, provider=provider, source=source,
+                state="planned")
             captured += 1
         except Exception as e:
             logger.warning("_capture_ohme_slots: persist %s failed: %s",
@@ -4924,12 +4925,14 @@ async def _capture_dispatch_slots() -> int:
     slots = _smart_charge_slots(planned)
     if not slots:
         return 0
+    slot_energy = _planned_dispatch_slot_energy(planned)
     captured = 0
     for slot_start in sorted(slots):
         try:
             _store.upsert_dispatch_slot(
                 slot_start, off_peak=True, provider=provider,
-                source="smart-charge")
+                source="smart-charge", state="planned",
+                energy_planned=slot_energy.get(slot_start))
             captured += 1
         except Exception as e:
             logger.warning("_capture_dispatch_slots: persist %s failed: %s",
@@ -5041,6 +5044,52 @@ def _planned_dispatch_slots_preview(planned: list) -> set:
             slots.add(slot.isoformat())
             slot = slot + timedelta(minutes=30)
     return slots
+
+
+def _planned_dispatch_slot_energy(planned: list) -> dict:
+    """Map smart-charge planned dispatches to per-slot FORECAST energy (kWh).
+
+    Companion to _planned_dispatch_slots_preview: distributes each dispatch's
+    energyAddedKwh (normalised to `delta`) evenly across the 30-min slots it
+    covers, so we can persist energy_planned per slot. OBSERVE-ONLY — recorded
+    for diagnostics / future validation, NOT used for billing (see
+    dispatch_validation_design.md). Slots whose dispatch has no delta map to None.
+    """
+    out: dict = {}
+    for d in planned or []:
+        if str(d.get("source") or "").lower() not in _SMART_CHARGE_SOURCES:
+            continue
+        start = d.get("start"); end = d.get("end")
+        if not start or not end:
+            continue
+        try:
+            s = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+            e = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if s.tzinfo is not None:
+            s = s.astimezone(timezone.utc).replace(tzinfo=None)
+        if e.tzinfo is not None:
+            e = e.astimezone(timezone.utc).replace(tzinfo=None)
+        covered = []
+        slot = s.replace(minute=(0 if s.minute < 30 else 30),
+                         second=0, microsecond=0)
+        while slot < e:
+            covered.append(slot.isoformat())
+            slot = slot + timedelta(minutes=30)
+        if not covered:
+            continue
+        try:
+            per = (float(d.get("delta")) / len(covered)) \
+                if d.get("delta") is not None else None
+        except (TypeError, ValueError):
+            per = None
+        for k in covered:
+            if per is None:
+                out.setdefault(k, None)
+            else:
+                out[k] = round((out.get(k) or 0.0) + per, 4)
+    return out
 
 
 async def kraken_poll_task(ha: HAClient):
