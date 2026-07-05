@@ -1533,6 +1533,21 @@ class TestPowerInvertPersistence(_StoreBase):
         meta = self.store.config_from_db(pid)["meters"]["electricity_main"]["meta"]
         self.assertTrue(meta.get("power_invert"))
 
+    def test_device_power_invert_roundtrips(self):
+        # Device power sensor invert (#251, device coverage) must also persist
+        cfg = {"schema_version": "1.0", "meters": {
+            "electricity_main": {"meta": {"timezone": "Europe/London", "billing_day": 1,
+                     "sub_meter": False}, "channels": {"import": {"read": "m", "rate": ""},
+                     "export": {"read": "", "rate": ""}}},
+            "ev_charger": {"meta": {"sub_meter": True, "parent_meter": "electricity_main",
+                     "meter_type": "ev", "device_power_sensor": "sensor.z",
+                     "device_power_invert": True},
+                     "channels": {"import": {"read": "e", "rate_source": "main"}}}}}
+        self.store.insert_config_period(cfg)
+        pid = self.store.get_current_config_period_id()
+        meta = self.store.config_from_db(pid)["meters"]["ev_charger"]["meta"]
+        self.assertTrue(meta.get("device_power_invert"))
+
     def test_power_invert_absent_stays_falsey(self):
         cfg = {"schema_version": "1.0", "meters": {"electricity_main": {
             "meta": {"timezone": "Europe/London", "billing_day": 1,
