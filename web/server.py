@@ -2848,6 +2848,17 @@ def api_backup_restore():
             _asyncio_r.run_coroutine_threadsafe(_engine_startup_r(_ha_client), _event_loop)
             logger.info("api_backup_restore: engine_startup scheduled for gap detection")
 
+        # Regenerate the pre-built charts against the restored DB now (issue #257),
+        # before engine_startup's async gap detection — so the UI reflects the
+        # restore immediately rather than after the next block finalises.
+        if "blocks.db" in restored or "blocks.json" in restored:
+            try:
+                from engine import get_store as _get_store_r, generate_charts as _gc_r
+                _gc_r(_get_store_r())
+                logger.info("api_backup_restore: charts regenerated after restore")
+            except Exception as _gce:
+                logger.warning("api_backup_restore: chart regen after restore failed: %s", _gce)
+
         return jsonify({"ok": True, "restored": restored})
     except Exception as e:
         logger.error("api_backup_restore: %s", e)
@@ -4198,6 +4209,15 @@ def api_import_from_zip():
                 logger.info("api_import_from_zip: engine store reset OK")
             except Exception as _re:
                 logger.warning("api_import_from_zip: engine reset_store failed: %s", _re)
+
+        # Regenerate the pre-built charts against the restored DB now, rather than
+        # waiting for the next block to finalise (issue #257).
+        if _eng and hasattr(_eng, "generate_charts"):
+            try:
+                _eng.generate_charts(_eng.get_store())
+                logger.info("api_import_from_zip: charts regenerated after restore")
+            except Exception as _gce:
+                logger.warning("api_import_from_zip: chart regen after restore failed: %s", _gce)
 
         return jsonify({"ok": True, "imported": imported})
 
