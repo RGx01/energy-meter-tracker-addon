@@ -336,7 +336,14 @@
   <style>
     #chart-spiral{background:var(--surface)}
     #chart-spiral .sp-board{display:grid;grid-template-columns:1fr 260px;gap:18px;padding:16px}
-    @media (max-width:820px){ #chart-spiral .sp-board{grid-template-columns:1fr}}
+    @media (max-width:820px){
+      /* Single-column: chart on top, options below. Let the panel grow and the
+         page scroll to the options (was clipped by chart-frame-wrap overflow). */
+      #chart-spiral{overflow:visible; height:auto;}
+      #chart-spiral .sp-board{grid-template-columns:1fr}
+      #chart-spiral .sp-chart{min-height:340px}
+      #chart-spiral .sp-side{max-width:none}
+    }
     #chart-spiral .sp-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)}
     #chart-spiral .sp-chart{padding:12px;position:relative;min-height:480px;display:flex;justify-content:center}
     #chart-spiral .sp-side{padding:16px;display:flex;flex-direction:column;gap:18px}
@@ -926,7 +933,6 @@ function showChart(name, btn) {
 
 // ── PDF Export ────────────────────────────────────────────────────────────────
 function chartsPdfExport() {
-  if (_activeChart === 'spiral') { showError('PDF export for the spiral view is coming soon.'); return; }
   // Open popup SYNCHRONOUSLY (required for Safari's popup whitelist)
   var win = window.open('', '_blank');
   if (!win) { alert('Please allow pop-ups for this page to export PDF.'); return; }
@@ -1355,6 +1361,54 @@ function _doPdfExport(win, iconSrc) {
       '</head><body>' +
       header + toolbarHtml + chartSection +
       '<div style="margin-top:16px;">' + tblHtml + '</div>' +
+      '</body></html>');
+    win.document.close();
+  } else if (_activeChart === 'spiral') {
+    // Spiral is an inline SVG using CSS-var colours; inject a light-theme
+    // stylesheet so it renders on white in the PDF (issue #250).
+    var spSvg = document.getElementById('sp-svg');
+    var svgHtml = '<p style="color:#888;">Spiral chart not available.</p>';
+    if (spSvg) {
+      var sclone = spSvg.cloneNode(true);
+      sclone.setAttribute('style', 'display:block;width:100%;max-width:560px;height:auto;');
+      svgHtml = sclone.outerHTML;
+    }
+    // Year totals (the SVG centre already shows the selected metric + running total)
+    var yearsEl = document.getElementById('sp-years');
+    var yearsHtml = '';
+    if (yearsEl && yearsEl.querySelectorAll('.sp-yr').length) {
+      yearsHtml = '<h3 class="sp-h">Years</h3><table class="sp-yt-tbl">';
+      Array.prototype.forEach.call(yearsEl.querySelectorAll('.sp-yr'), function(row) {
+        var yl = row.querySelector('.sp-yl'), yt = row.querySelector('.sp-yt'),
+            sw = row.querySelector('.sp-sw');
+        var col = sw ? getComputedStyle(sw).backgroundColor : '#00a080';
+        var off = row.classList.contains('off');
+        yearsHtml += '<tr style="' + (off ? 'opacity:.4;' : '') + '">' +
+          '<td><span style="display:inline-block;width:14px;height:3px;border-radius:2px;background:' +
+            col + ';vertical-align:middle;"></span></td>' +
+          '<td style="padding:0 14px 0 6px;">' + (yl ? yl.textContent : '') + '</td>' +
+          '<td style="text-align:right;">' + (yt ? yt.textContent : '') + '</td></tr>';
+      });
+      yearsHtml += '</table>';
+    }
+    var spiralStyles =
+      ':root{--text:#1a1a1a;--muted:#8a8f98;--accent:#00a080;--mono:ui-monospace,monospace;}' +
+      '.sp-mo{font-family:var(--mono);font-size:15px;letter-spacing:.06em;fill:var(--text);opacity:.72;font-weight:600;}' +
+      '.sp-rl{font-family:var(--mono);font-size:15px;fill:var(--text);opacity:.6;font-weight:500;}' +
+      '.sp-cm{font-family:var(--mono);font-size:11px;fill:var(--muted);letter-spacing:.08em;}' +
+      '.sp-cv{font-size:29px;font-weight:650;fill:var(--text);} .sp-cu{font-size:12px;fill:var(--muted);}' +
+      '#pdf-sp{display:flex;gap:28px;align-items:flex-start;flex-wrap:wrap;}' +
+      '.sp-h{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#888;margin:0 0 8px;}' +
+      '.sp-yt-tbl{font-family:var(--mono);font-size:12px;border-collapse:collapse;} .sp-yt-tbl td{padding:2px 0;}';
+    win.document.open();
+    win.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8">' +
+      '<title>EMT \u2014 ' + tabLabel + '</title>' +
+      // Swap the shared landscape @page for portrait — the spiral is square-ish.
+      // Replacing (not adding) avoids Chrome honouring the first @page it sees.
+      '<style>' + commonStyles.replace('size:A4 landscape', 'size:A4 portrait') + spiralStyles + '</style></head><body>' +
+      header +
+      '<div id="pdf-sp"><div style="flex:1 1 520px;min-width:320px;">' + svgHtml + '</div>' +
+      '<div style="flex:0 0 auto;">' + yearsHtml + '</div></div>' +
       '</body></html>');
     win.document.close();
   }
@@ -2237,8 +2291,12 @@ function barBuildTable() {
     // In cost mode use agg.net_cost directly — it is pre-rounded per day and
     // summed consistently. Re-deriving from column vr values gives a different
     // result because column values are rounded independently then summed.
+    // net_cost bakes in the standing charge (server: imp + standing − exp), so
+    // when "Inc. standing charge" is unchecked we subtract it back out — otherwise
+    // the Total/grand-total ignored the toggle (issue #255).
+    var _sc = barMetric === 'cost' && !barIncStanding() ? (agg.standing || 0) : 0;
     var rowTotalFmt = barMetric === 'cost'
-      ? (agg.net_cost != null ? Math.round(agg.net_cost * 100) / 100 : Math.round(rowTotal * 100) / 100)
+      ? (agg.net_cost != null ? Math.round((agg.net_cost - _sc) * 100) / 100 : Math.round(rowTotal * 100) / 100)
       : barMetric === 'kwh' ? (Math.round(rowTotal * 1000) / 1000)
       : rowTotal;
     if (_rowHasVal) grandTotal += rowTotalFmt;
@@ -2285,7 +2343,10 @@ function barBuildTable() {
   // This ensures: parts sum to daily total, daily totals sum to period total.
   if (barMetric === 'cost') {
     var _netSum = 0;
-    aggList.forEach(function(agg) { _netSum += agg.net_cost || 0; });
+    var _incSc = barIncStanding();
+    aggList.forEach(function(agg) {
+      _netSum += (agg.net_cost || 0) - (_incSc ? 0 : (agg.standing || 0));
+    });
     grandTotalFmt = Math.round(_netSum * 100) / 100;
   }
   _totalsHtml += '<td class="col-total">' + barFmt(grandTotalFmt) + '</td>';

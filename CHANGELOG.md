@@ -1,5 +1,30 @@
 # Changelog
 
+## [3.1.1] — 2026-07-04
+
+*A bug-fix release. The headline is diagnostic groundwork for a critical Intelligent Octopus pricing bug ([#253](https://github.com/RGx01/energy-meter-tracker-addon/issues/253)); the rest are fixes to the corrections tool, Usage Stats, power-sensor config, and the Spiral chart on mobile.*
+
+### Critical — Intelligent Octopus off-peak mispricing, groundwork laid ([#253](https://github.com/RGx01/energy-meter-tracker-addon/issues/253))
+
+On Intelligent Octopus, a **peak** slot can be priced **off-peak** when a smart-charge dispatch was *planned* but the vehicle didn't actually charge — for example it paused mid-session. EMT applied the off-peak overlay on the planned slot, but the supplier billed peak, so the block is under-billed. The over-report floor doesn't catch it, because ordinary household baseload alone can clear the floor during the pause.
+
+**3.1.1 does not fix the pricing yet — it lays the groundwork to.** Each captured smart-charge slot now records its dispatch **lifecycle state** and the dispatch's **planned / completed energy** (kWh), retained in the database. This is **observe-only, with no billing effect**; it exists because, without the dispatch energy on record, there was no way after the fact to tell a genuine off-peak charge from a planned slot that never charged. The pricing fix — validating a slot against the energy actually dispatched — is targeted for **3.1.2**.
+
+### Fixed
+
+- **Corrections tool now follows the devices-follow-main model** ([#254](https://github.com/RGx01/energy-meter-tracker-addon/issues/254)). Three bugs shared one root — the DCC-settled gate keys on `imp_kwh_api`, which only the main meter carries: (a) charts weren't regenerated after a correction until the next block; (b) corrections only touched the main meter, never the device rate lines; and (c) a spurious "N blocks awaiting settlement" warning counted device rows that never settle independently. All fixed: a rate correction now applies to the main meter and the device rate lines follow it (as they do in the 3.0.6 engine), the preview shows the devices following, and charts regenerate immediately. The now-redundant meter/device selector has been removed from the tool.
+- **Charts not regenerated after a database restore/import** ([#257](https://github.com/RGx01/energy-meter-tracker-addon/issues/257)). Same shape as the corrections case above: restoring or importing a backup reopened the database but left the pre-built billing/heatmap charts showing the old data until the next block finalised. Both restore paths now regenerate the charts against the restored database immediately.
+- **Usage Stats — "Inc. standing charge" toggle had no effect on Totals or Net** ([#255](https://github.com/RGx01/energy-meter-tracker-addon/issues/255)). The table's Total column and grand total used the server's `net_cost`, which bakes in the standing charge, so unchecking the box changed nothing. Unchecking now correctly removes the standing charge from both.
+- **Power sensor "invert" setting not persisting** ([#251](https://github.com/RGx01/energy-meter-tracker-addon/issues/251)). The main power sensor's invert flag was applied at runtime but had no database column, so it was dropped on save and the checkbox reverted. It now persists like the battery inverter's flag. The device power sensor's invert flag (`device_power_invert`, used by the Live Power gauge) had the same missing-column problem and is fixed alongside it.
+- **Spiral options unreachable on mobile** ([#248](https://github.com/RGx01/energy-meter-tracker-addon/issues/248)). The options panel stacked below the chart on mobile but was clipped by the chart container; it now scrolls into view.
+- **Browser tab icon intermittent** ([#249](https://github.com/RGx01/energy-meter-tracker-addon/issues/249)). The favicon is now an inline data URI — no separate request or path to resolve — so it renders consistently across ingress/standalone and every environment, working around Safari's URL-keyed favicon cache.
+- **Review-sample log mislabelled the provisional figure.** On the `api` + Mini path the drift-review log printed `CAD=…` even though there's no CAD; it now reflects the actual source (`Mini=…` when the Mini supplies the provisional figure).
+
+### Also in this release
+
+- **Spiral chart PDF export** ([#250](https://github.com/RGx01/energy-meter-tracker-addon/issues/250)) — a small feature addition: the Spiral view now exports to PDF, in portrait, instead of showing a "coming soon" banner.
+- **Docs** ([#252](https://github.com/RGx01/energy-meter-tracker-addon/issues/252)) — documented how to update a standalone Docker build (`git pull` + `docker-compose up -d --build`).
+
 ## [3.1.0] — 2026-07-03
 
 *Adds a Spiral chart for seeing a year — or a lifetime — of energy at a glance, corrects carbon-intensity averaging on near-balanced solar days, and simplifies device setup now that devices always follow the main meter's rate.*

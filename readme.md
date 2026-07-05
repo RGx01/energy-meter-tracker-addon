@@ -254,23 +254,28 @@ docker-compose up -d --build energy-meter-tracker
 
 Access the UI at `http://<host>:8099`.
 
+**Updating to a new version**
+
+Standalone builds don't auto-update. To pull a new release, from your clone of the repo:
+
+```bash
+git pull
+docker-compose up -d --build energy-meter-tracker
+```
+
+`--build` rebuilds the image from the updated source; `-d` keeps it detached. Your data (`/data/energy_meter_tracker`) is preserved across rebuilds as long as the volume mapping in your `docker-compose.yml` is unchanged.
+
 > ⚠️ Ingress (sidebar embedding) is only available in HA OS/Supervised. In standalone mode access the UI directly at `http://<host>:8099`.
 
 > ℹ️ Logs are written to `/data/energy_meter_tracker/addon.log` in standalone mode and are viewable from the **Logs** page in the UI.
 
-**Optional — add to HA sidebar**
+**Optional — add to the HA sidebar**
 
-You can embed the UI in your HA sidebar using `panel_iframe` in your `configuration.yaml`:
+You can add the standalone UI to your Home Assistant sidebar as a **Webpage dashboard** (via the UI):
 
-```yaml
-panel_iframe:
-  energy_meter:
-    title: "Energy Meter"
-    icon: mdi:speedometer
-    url: "http://192.168.1.x:8099"
-```
-
-Replace `192.168.1.x` with your Docker host IP. Restart HA after adding this.
+1. Go to **Settings → Dashboards** (or [open dashboard settings](https://my.home-assistant.io/redirect/lovelace_dashboards/)).
+2. Click **Add dashboard → Webpage**.
+3. Set the **URL** to `http://<host>:8099` (your Docker host IP and port), give it a **Title** (e.g. "Energy Meter") and an **Icon** (e.g. `mdi:speedometer`), and choose whether to show it in the sidebar.
 
 ---
 

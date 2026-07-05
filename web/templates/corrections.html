@@ -68,13 +68,9 @@
     </div>
   </div>
 
-  <!-- Meter selector (rate only) -->
-  <div id="corr-meter-row" style="display:none;margin-bottom:14px;">
-    <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">Meter</label>
-    <select id="corr-meter"
-      style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;font-family:inherit;min-width:200px;">
-      <option value="all">All meters</option>
-    </select>
+  <!-- Rate corrections apply to the main meter; device rate lines follow it. -->
+  <div id="corr-meter-row" style="display:none;margin-bottom:14px;font-size:12px;color:var(--muted);">
+    Applies to the main meter — device rate lines follow the main automatically.
   </div>
 
   <!-- Value -->
@@ -133,21 +129,6 @@ function escHtml(s) {
 }
 
 document.addEventListener('DOMContentLoaded', function() {
-  // Load meters
-  fetch(apiUrl('/api/corrections/meters'))
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      var sel = document.getElementById('corr-meter');
-      var existing = Array.from(sel.options).map(function(o) { return o.value; });
-      (d.meters || []).forEach(function(m) {
-        if (!existing.includes(m)) {
-          var opt = document.createElement('option');
-          opt.value = m; opt.textContent = m;
-          sel.appendChild(opt);
-        }
-      });
-    })
-    .catch(function() {});
   // Load currency symbol
   fetch(apiUrl('/api/config'))
     .then(function(r) { return r.json(); })
@@ -192,7 +173,7 @@ function corrPreview() {
   var value    = document.getElementById('corr-value').value;
   var fromTime = _corrType !== 'standing' ? document.getElementById('corr-from-time').value : '';
   var toTime   = _corrType !== 'standing' ? document.getElementById('corr-to-time').value   : '';
-  var meterId  = _corrType !== 'standing' ? document.getElementById('corr-meter').value      : 'all';
+  var meterId  = 'all';  // rate corrections always target the main; devices follow
   var prev     = document.getElementById('corr-preview');
   var applyBtn = document.getElementById('corr-apply-btn');
 
@@ -293,7 +274,7 @@ function corrApply() {
   var recalc    = _corrType !== 'standing' ? document.getElementById('corr-recalc').checked : false;
   var fromTime  = _corrType !== 'standing' ? document.getElementById('corr-from-time').value : '';
   var toTime    = _corrType !== 'standing' ? document.getElementById('corr-to-time').value   : '';
-  var meterId   = _corrType !== 'standing' ? document.getElementById('corr-meter').value      : 'all';
+  var meterId   = 'all';  // rate corrections always target the main; devices follow
   var result    = document.getElementById('corr-result');
   var applyBtn  = document.getElementById('corr-apply-btn');
   var typeLabel = _corrType === 'standing' ? 'standing charge' : (_corrType === 'rate-export' ? 'export rate' : 'import rate');

@@ -1472,3 +1472,89 @@ class TestDispatchSlots(_StoreBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestDispatchLifecycleColumns(_StoreBase):
+    """3.1.x observe-only dispatch lifecycle capture (dispatch_validation_design.md):
+    state + planned/completed energy persisted per slot, no billing effect."""
+
+    def test_lifecycle_columns_present(self):
+        cols = {r[1] for r in self.store._conn.execute(
+            "PRAGMA table_info(dispatch_slots)")}
+        self.assertTrue({"state", "energy_planned", "energy_completed"} <= cols)
+
+    def test_upsert_and_read_roundtrip(self):
+        self.store.upsert_dispatch_slot(
+            "2026-06-27T19:00:00", provider="MYENERGI_V2", source="smart-charge",
+            state="planned", energy_planned=1.71)
+        r = self.store.get_dispatch_slot("2026-06-27T19:00:00")
+        self.assertEqual(r["state"], "planned")
+        self.assertAlmostEqual(r["energy_planned"], 1.71)
+        self.assertIsNone(r["energy_completed"])
+
+    def test_completed_energy_preserved_across_replan(self):
+        s = "2026-06-27T20:00:00"
+        self.store.upsert_dispatch_slot(s, source="smart-charge",
+                                        state="completed", energy_completed=0.02)
+        # a later planned re-capture (no completed energy) must NOT wipe it
+        self.store.upsert_dispatch_slot(s, source="smart-charge", state="planned",
+                                        energy_planned=1.5)
+        r = self.store.get_dispatch_slot(s)
+        self.assertAlmostEqual(r["energy_completed"], 0.02)
+        self.assertAlmostEqual(r["energy_planned"], 1.5)
+
+    def test_legacy_row_reads_null_lifecycle(self):
+        # a row written the old way (no lifecycle fields) reads back None, not error
+        self.store._conn.execute(
+            "INSERT INTO dispatch_slots (slot_start, off_peak, captured_at) "
+            "VALUES ('2026-06-27T18:00:00', 1, '2026-06-27T18:00:00')")
+        r = self.store.get_dispatch_slot("2026-06-27T18:00:00")
+        self.assertIsNone(r["state"])
+        self.assertIsNone(r["energy_planned"])
+
+
+class TestPowerInvertPersistence(_StoreBase):
+    """Issue #251: the main Power Sensor 'invert' flag (power_invert) must survive
+    a config save/load — previously it had no column and was dropped on save, so
+    the checkbox reverted."""
+
+    def test_power_invert_column_present(self):
+        cols = {r[1] for r in self.store._conn.execute("PRAGMA table_info(meters)")}
+        self.assertIn("power_invert", cols)
+
+    def test_power_invert_roundtrips(self):
+        cfg = {"schema_version": "1.0", "meters": {"electricity_main": {
+            "meta": {"timezone": "Europe/London", "billing_day": 1,
+                     "sub_meter": False, "power_sensor": "sensor.pwr",
+                     "power_invert": True},
+            "channels": {"import": {"read": "s", "rate": ""},
+                         "export": {"read": "", "rate": ""}}}}}
+        self.store.insert_config_period(cfg)
+        pid = self.store.get_current_config_period_id()
+        meta = self.store.config_from_db(pid)["meters"]["electricity_main"]["meta"]
+        self.assertTrue(meta.get("power_invert"))
+
+    def test_device_power_invert_roundtrips(self):
+        # Device power sensor invert (#251, device coverage) must also persist
+        cfg = {"schema_version": "1.0", "meters": {
+            "electricity_main": {"meta": {"timezone": "Europe/London", "billing_day": 1,
+                     "sub_meter": False}, "channels": {"import": {"read": "m", "rate": ""},
+                     "export": {"read": "", "rate": ""}}},
+            "ev_charger": {"meta": {"sub_meter": True, "parent_meter": "electricity_main",
+                     "meter_type": "ev", "device_power_sensor": "sensor.z",
+                     "device_power_invert": True},
+                     "channels": {"import": {"read": "e", "rate_source": "main"}}}}}
+        self.store.insert_config_period(cfg)
+        pid = self.store.get_current_config_period_id()
+        meta = self.store.config_from_db(pid)["meters"]["ev_charger"]["meta"]
+        self.assertTrue(meta.get("device_power_invert"))
+
+    def test_power_invert_absent_stays_falsey(self):
+        cfg = {"schema_version": "1.0", "meters": {"electricity_main": {
+            "meta": {"timezone": "Europe/London", "billing_day": 1,
+                     "sub_meter": False, "power_sensor": "sensor.pwr"},
+            "channels": {"import": {"read": "s", "rate": ""},
+                         "export": {"read": "", "rate": ""}}}}}
+        self.store.insert_config_period(cfg)
+        pid = self.store.get_current_config_period_id()
+        meta = self.store.config_from_db(pid)["meters"]["electricity_main"]["meta"]
+        self.assertFalse(meta.get("power_invert"))
