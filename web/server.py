@@ -1669,6 +1669,16 @@ def api_meter_delete_data(meter_id: str):
         except Exception:
             pass
 
+        # Regenerate the pre-built charts so the removed meter's data disappears
+        # immediately, rather than after the next block finalises (same regen gap
+        # as the corrections and restore paths).
+        try:
+            from engine import get_store as _gs_d, generate_charts as _gc_d
+            _gc_d(_gs_d())
+            logger.info("api_meter_delete_data: charts regenerated after delete")
+        except Exception as _gce:
+            logger.warning("api_meter_delete_data: chart regen after delete failed: %s", _gce)
+
         return jsonify({"ok": True, "deleted": deleted, "meter_id": meter_id})
     except Exception as e:
         logger.error("api_meter_delete_data: %s", e)
@@ -4455,6 +4465,13 @@ def api_blocks_delete():
             except Exception as _re:
                 logger.error("api_blocks_delete: remainder recompute failed: %s", _re)
                 result["remainders_recomputed"] = 0
+        # Regenerate the pre-built charts so deleted blocks disappear immediately
+        # (also makes Delete blocks usable as the #260 lifetime-dump workaround).
+        try:
+            import engine as _eng_gc
+            _eng_gc.generate_charts(_eng_gc.get_store())
+        except Exception as _gce:
+            logger.warning("api_blocks_delete: chart regen after delete failed: %s", _gce)
         logger.info(
             "api_blocks_delete: deleted %d blocks across %d dates (%s\u2192%s meter=%s)",
             result["deleted"], result["dates"], from_date, to_date, meter_id or "all"

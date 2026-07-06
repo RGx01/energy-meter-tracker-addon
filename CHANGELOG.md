@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.1.2] - 2026-07-06
+
+### Fixed
+
+- **Cumulative sub-meter sensors no longer book their whole lifetime on the first block** ([#260](https://github.com/RGx01/energy-meter-tracker-addon/issues/260)). Adding a cumulative battery/EV import sensor (or a read dropout that lost the opener) could book the sensor's entire lifetime register as one block's usage — one reporter saw ~10 MWh land in a single day. The rogue-block clamp that already protected the main meter was scoped to `is_sub_meter=False`, so device channels had no guard at all. The sub-meter path now applies a physical-plausibility ceiling (60 kWh — impossible for a single domestic device in a block, but well above any real charge), so a lost-opener dump is clamped to 0 and the register baselined, while genuine charges — including session-energy sensors that start each charge at 0 and count up — are booked normally. Recovery for an already-affected day: Data Management → Delete blocks.
+- **Delete Device / Delete Blocks now regenerate the billing charts immediately** ([#261](https://github.com/RGx01/energy-meter-tracker-addon/issues/261)). Both delete paths removed the data but left the pre-built billing/heatmap charts stale until the next half-hourly block finalised — correct eventually, but confusing when it isn't instant. They now call `generate_charts` after the delete, matching the corrections (#254a) and restore (#257) paths. (This also makes Delete Blocks usable as the immediate recovery for #260.)
+
 ## [3.1.1] — 2026-07-04
 
 *A bug-fix release. The headline is diagnostic groundwork for a critical Intelligent Octopus pricing bug ([#253](https://github.com/RGx01/energy-meter-tracker-addon/issues/253)); the rest are fixes to the corrections tool, Usage Stats, power-sensor config, and the Spiral chart on mobile.*
