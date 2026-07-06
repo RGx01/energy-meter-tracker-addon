@@ -117,6 +117,35 @@ def _get_store() -> BlockStore:
     return _store
 
 
+def _regen_charts_safely():
+    """Regenerate the pre-built charts on the engine's event-loop thread — never
+    the Flask request thread.
+
+    The engine's BlockStore (engine.get_store()) is opened check_same_thread=False
+    and is driven by the engine on the asyncio loop thread. Calling
+    generate_charts against it from a request thread is concurrent cross-thread
+    use of one SQLite connection → segfault (observed on delete-device, where
+    engine_startup is running on the loop at the same instant). Scheduling the
+    regen onto the loop serialises it with all other engine store access, exactly
+    as the engine's own finalise-time regen already runs. Fire-and-forget: the
+    chart is ready by the user's next page load. Falls back to inline only when no
+    loop is running (tests / pre-init), where there is no concurrent engine."""
+    try:
+        import asyncio as _a
+        import engine as _eng_r
+        if _event_loop is not None and _event_loop.is_running():
+            async def _run():
+                try:
+                    _eng_r.generate_charts(_eng_r.get_store())
+                except Exception as _e:
+                    logger.warning("_regen_charts_safely: loop regen failed: %s", _e)
+            _a.run_coroutine_threadsafe(_run(), _event_loop)
+        else:
+            _eng_r.generate_charts(_eng_r.get_store())
+    except Exception as e:
+        logger.warning("_regen_charts_safely: %s", e)
+
+
 def init(data_dir: str, chart_dir: str, ha_client):
     global DATA_DIR, CHART_DIR, _ha_client, _event_loop
     import asyncio as _asyncio
@@ -1672,12 +1701,7 @@ def api_meter_delete_data(meter_id: str):
         # Regenerate the pre-built charts so the removed meter's data disappears
         # immediately, rather than after the next block finalises (same regen gap
         # as the corrections and restore paths).
-        try:
-            from engine import get_store as _gs_d, generate_charts as _gc_d
-            _gc_d(_gs_d())
-            logger.info("api_meter_delete_data: charts regenerated after delete")
-        except Exception as _gce:
-            logger.warning("api_meter_delete_data: chart regen after delete failed: %s", _gce)
+        _regen_charts_safely()
 
         return jsonify({"ok": True, "deleted": deleted, "meter_id": meter_id})
     except Exception as e:
@@ -2862,12 +2886,7 @@ def api_backup_restore():
         # before engine_startup's async gap detection — so the UI reflects the
         # restore immediately rather than after the next block finalises.
         if "blocks.db" in restored or "blocks.json" in restored:
-            try:
-                from engine import get_store as _get_store_r, generate_charts as _gc_r
-                _gc_r(_get_store_r())
-                logger.info("api_backup_restore: charts regenerated after restore")
-            except Exception as _gce:
-                logger.warning("api_backup_restore: chart regen after restore failed: %s", _gce)
+            _regen_charts_safely()
 
         return jsonify({"ok": True, "restored": restored})
     except Exception as e:
@@ -4222,12 +4241,7 @@ def api_import_from_zip():
 
         # Regenerate the pre-built charts against the restored DB now, rather than
         # waiting for the next block to finalise (issue #257).
-        if _eng and hasattr(_eng, "generate_charts"):
-            try:
-                _eng.generate_charts(_eng.get_store())
-                logger.info("api_import_from_zip: charts regenerated after restore")
-            except Exception as _gce:
-                logger.warning("api_import_from_zip: chart regen after restore failed: %s", _gce)
+        _regen_charts_safely()
 
         return jsonify({"ok": True, "imported": imported})
 
@@ -4467,11 +4481,7 @@ def api_blocks_delete():
                 result["remainders_recomputed"] = 0
         # Regenerate the pre-built charts so deleted blocks disappear immediately
         # (also makes Delete blocks usable as the #260 lifetime-dump workaround).
-        try:
-            import engine as _eng_gc
-            _eng_gc.generate_charts(_eng_gc.get_store())
-        except Exception as _gce:
-            logger.warning("api_blocks_delete: chart regen after delete failed: %s", _gce)
+        _regen_charts_safely()
         logger.info(
             "api_blocks_delete: deleted %d blocks across %d dates (%s\u2192%s meter=%s)",
             result["deleted"], result["dates"], from_date, to_date, meter_id or "all"
@@ -4915,12 +4925,7 @@ def api_corrections_apply():
         # visible immediately, rather than only after the next block finalises
         # (issue #254a). Client-rendered charts (usage stats, spiral) re-fetch.
         if updated:
-            try:
-                import engine as _eng
-                _eng.generate_charts(store)
-            except Exception as _ce:
-                logger.warning(
-                    "api_corrections_apply: chart regen after correction failed: %s", _ce)
+            _regen_charts_safely()
 
         return jsonify({"ok": True, "updated_blocks": updated,
                         "skipped_unreconciled": skipped, "api_gated": gate})
