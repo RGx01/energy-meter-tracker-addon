@@ -1,6 +1,12 @@
 # Changelog
 
-## [3.1.2] - 2026-07-06
+## [3.1.3] — 2026-07-06
+
+### Fixed
+
+- **Critical — segfault when deleting a device** (regression introduced in 3.1.2). The chart regeneration added in 3.1.2 for [#261](https://github.com/RGx01/energy-meter-tracker-addon/issues/261) ran on the Flask request thread using the *engine's* SQLite connection, while `engine_startup` was simultaneously restarting on the asyncio event-loop thread. The connection is opened `check_same_thread=False`, so SQLite permitted the concurrent cross-thread use rather than raising — and it crashed the add-on with a segmentation fault. Chart regeneration after any mutating action (delete device / blocks, backup restore, zip import, rate corrections) is now scheduled onto the engine's event loop, serialised with all other engine store access, so it can never race. The delete/restore/correction itself always completed; only the follow-up regen crashed.
+
+## [3.1.2] — 2026-07-06
 
 ### Fixed
 
