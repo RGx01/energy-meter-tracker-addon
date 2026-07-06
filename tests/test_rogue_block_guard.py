@@ -85,10 +85,11 @@ class TestRogueBlockGuard(unittest.TestCase):
 
 
 class TestGuardIsMainMeterOnly(unittest.TestCase):
-    """The rogue-total clamp is scoped to the main meter (is_sub_meter=False).
-    Device sub-meters — including session-kWh sensors that reset to 0 after an
-    EV charge — use the separate per-pair sub-meter path and must be unaffected
-    by the guard."""
+    """Session-energy sub-meter sensors (which reset to 0 each EV charge and
+    count up) must be booked normally — the sub-meter guard keys on physical
+    plausibility (the 60 kWh device ceiling), NOT on a zero opener, so a genuine
+    charge counting up from 0 is preserved while a lifetime-register dump above
+    the ceiling is clamped (#260)."""
 
     _TS = ["2026-07-01T21:00:00", "2026-07-01T21:15:00",
            "2026-07-01T21:30:00", "2026-07-01T21:45:00"]
@@ -115,14 +116,74 @@ class TestGuardIsMainMeterOnly(unittest.TestCase):
         self.assertAlmostEqual(r["kwh"], 2.1, places=3)   # not 11.4, not 0
         self.assertNotIn("needs_review", r)
 
-    def test_device_large_value_not_clamped(self):
-        """Proof of scope: even a sub-meter delta above the main-meter ceiling is
-        NOT clamped — the guard is inside the is_sub_meter=False branch only."""
+    def test_device_impossible_value_is_clamped(self):
+        """#260: a sub-meter block above the device physical ceiling (60 kWh) IS
+        now clamped — previously the guard was is_sub_meter=False only, which let
+        a cumulative sensor book its whole lifetime register."""
         r = engine.compute_channel(
-            self._channel([0.0, 600.0]),        # 600 > 500 ceiling
+            self._channel([0.0, 600.0]),        # 600 kWh in a block — impossible
             is_sub_meter=True, meter_id="dev", channel_id="import")
-        self.assertAlmostEqual(r["kwh"], 600.0)   # untouched, not 0
-        self.assertNotIn("needs_review", r)
+        self.assertEqual(r["kwh"], 0.0)          # clamped, not 600
+        self.assertEqual(r["read_start"], r["read_end"])
+        self.assertTrue(r.get("needs_review"))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+class TestSubMeterRogueBlockGuard(unittest.TestCase):
+    """#260: the main-meter clamp was is_sub_meter-gated, leaving device channels
+    unprotected — a cumulative battery/EV sensor with a lost/absent opener booked
+    its whole lifetime register as one block. The sub-meter branch now clamps the
+    lost-opener signature (magnitude-independent) and a physical ceiling."""
+
+    def _sub(self, opener, closer, rate=0.30):
+        return {
+            "reads": [
+                {"value": opener, "ts": "2026-07-01T21:30:00"},
+                {"value": closer, "ts": "2026-07-01T22:00:00"},
+            ],
+            "rates": [{"value": rate, "ts": "2026-07-01T21:30:00"}],
+        }
+
+    def _kwh(self, opener, closer):
+        return engine.compute_channel(
+            self._sub(opener, closer), is_sub_meter=True,
+            meter_id="battery", channel_id="import")
+
+    def test_lifetime_dump_clamped(self):
+        r = self._kwh(0.0, 9977.4)          # the reporter's ~10 MWh
+        self.assertEqual(r["kwh"], 0.0)
+        self.assertEqual(r["read_start"], r["read_end"])
+        self.assertEqual(r["read_end"], 9977.4)
+        self.assertTrue(r.get("needs_review"))
+
+    def test_small_lifetime_dump_clamped(self):
+        # a lifetime well above any real device block but under the main 500
+        # clamp — caught by the sub-meter physical ceiling (60 kWh)
+        self.assertEqual(self._kwh(0.0, 380.0)["kwh"], 0.0)
+
+    def test_large_but_plausible_charge_preserved(self):
+        # a session sensor counting a big-but-physical charge (e.g. 45 kWh over a
+        # long block) starts at 0 and must NOT be clamped — it's under 60 kWh
+        r = self._kwh(0.0, 45.0)
+        self.assertAlmostEqual(r["kwh"], 45.0, places=3)
+        self.assertFalse(r.get("needs_review", False))
+
+    def test_normal_cumulative_block_unaffected(self):
+        r = self._kwh(500.0, 503.2)         # opener not near-zero → real 3.2 kWh
+        self.assertAlmostEqual(r["kwh"], 3.2, places=3)
+        self.assertFalse(r.get("needs_review", False))
+
+    def test_tiny_genuine_draw_from_zero_preserved(self):
+        # a genuinely-new-at-0 sensor drawing < 1 kWh in its first block is real
+        r = self._kwh(0.0, 0.5)
+        self.assertAlmostEqual(r["kwh"], 0.5, places=3)
+
+    def test_single_read_baselines_to_zero(self):
+        ch = {"reads": [{"value": 9977.4, "ts": "2026-07-01T22:00:00"}], "rates": []}
+        self.assertEqual(engine.compute_channel(
+            ch, is_sub_meter=True, meter_id="battery", channel_id="import")["kwh"], 0.0)
 
 
 if __name__ == "__main__":

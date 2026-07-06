@@ -1199,6 +1199,14 @@ def _warn_zero_rate(meter_id: str, channel_id: str) -> None:
 # 15×+ margin over the most extreme domestic block so it never trips on real use.
 _ROGUE_BLOCK_KWH_CEILING = 500.0
 
+# Same idea for a SINGLE sub-meter (device) channel — but the main-meter clamp
+# above is is_sub_meter-gated, which left device channels unprotected (#260: a
+# newly-added cumulative battery/EV sensor booked its whole lifetime register as
+# one block). Physical ceiling for ONE device: even a 48 kW 3-phase charger tops
+# out ~24 kWh in a 30-min block / ~48 kWh in an hour, so 60 kWh is impossible and
+# means a lost opener. Kept well above any real charge so session-energy sensors
+# (which count a genuine 10–50 kWh charge) are never clamped.
+_ROGUE_SUB_BLOCK_KWH_CEILING = 60.0
 
 def compute_channel(channel: dict, parent_rates=None, is_sub_meter: bool = False,
                     meter_id: str = "?", channel_id: str = "?") -> dict:
@@ -1298,6 +1306,32 @@ def compute_channel(channel: dict, parent_rates=None, is_sub_meter: bool = False
     # This captures the rate as close to the end of the block as possible,
     # accounting for any API lag from remote rate providers.
     display_rate = corrected_rates[-1]["value"]
+
+    # Rogue-total backstop for sub-meters (#260). The main-meter clamp above is
+    # is_sub_meter-gated, so device channels had none — a cumulative battery/EV
+    # sensor with a lost/absent opener booked its whole lifetime register as one
+    # block (the reporter's ~10 MWh). Guard on PHYSICAL PLAUSIBILITY only: no
+    # single domestic device (even a 48 kW 3-phase charger) moves 60 kWh in a
+    # block, so a delta this large is a lost opener / lifetime dump. Crucially we
+    # do NOT key on a near-zero opener — a session-energy sensor legitimately
+    # starts each charge at 0 and counts up, and must be booked normally. Clamp
+    # to 0 and baseline read_start onto read_end (register continuity preserved).
+    if total_kwh > _ROGUE_SUB_BLOCK_KWH_CEILING:
+        logger.warning(
+            "compute_channel: %s/%s rogue sub-meter block %.1f kWh "
+            "(opener=%.3f closer=%.3f) exceeds %.0f kWh ceiling — clamping to 0 "
+            "(lost opener / lifetime dump); baseline preserved via read_end.",
+            meter_id, channel_id, total_kwh, reads[0]["value"], reads[-1]["value"],
+            _ROGUE_SUB_BLOCK_KWH_CEILING)
+        return {
+            "kwh":          0.0,
+            "rate":         display_rate,
+            "cost":         0.0,
+            "read_start":   reads[-1]["value"],
+            "read_end":     reads[-1]["value"],
+            "needs_review": True,
+        }
+
     return {
         "kwh":        total_kwh,
         "rate":       display_rate,
