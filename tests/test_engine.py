@@ -3658,3 +3658,53 @@ class TestRecomputeRemaindersForWindow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestReconciledRateSurvivesPass2(unittest.TestCase):
+    """§12/marker: a reconciliation-set rate must survive a PASS 2 re-run — the
+    overlay must NOT re-apply off-peak over a slot the reconciliation deliberately
+    reverted to peak (rate_reconciled). Belt-and-braces for a re-settlement."""
+
+    class _Sched:
+        def is_empty(self): return False
+        def off_peak_rate_near(self, ts): return 5.493      # £0.05493
+        def resolve(self, ts): return 32.3092               # £0.323092
+
+    def setUp(self):
+        self.store = BlockStore(":memory:")
+        self.store.insert_config_period({"meters": {"electricity_main": {
+            "meta": {"timezone": "Europe/London", "billing_day": 1,
+                     "block_minutes": 30, "currency_symbol": "£",
+                     "sub_meter": False}}}})
+        self.cp = self.store._conn.execute(
+            "SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+        self._os, engine._store = engine._store, self.store
+        self._osc, engine._kraken_rate_schedules = \
+            engine._kraken_rate_schedules, {"import": self._Sched()}
+        self._oa, engine._DISPATCH_OVERLAY_APPLY = engine._DISPATCH_OVERLAY_APPLY, True
+
+    def tearDown(self):
+        engine._store = self._os
+        engine._kraken_rate_schedules = self._osc
+        engine._DISPATCH_OVERLAY_APPLY = self._oa
+
+    def test_reconciled_peak_survives_pass2(self):
+        bs = "2026-06-04T20:00:00"   # peak-time slot
+        # an off_peak dispatch slot + real draw exists, so the overlay WOULD
+        # reprice to off-peak — but this block was reconciled to PEAK.
+        self.store.upsert_dispatch_slot(bs, off_peak=True, provider="Myenergi",
+                                        source="smart-charge", state="planned")
+        self.store._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id,"
+            " interpolated, imp_kwh, imp_rate, imp_cost, imp_kwh_api, standing_charge,"
+            " needs_pass2_rerun, rate_reconciled) VALUES (?,?,?,?,0,?,?,?,?,?,1,1)",
+            (bs, bs, "electricity_main", self.cp, 3.0, 0.323092,
+             round(3.0 * 0.323092, 6), 3.0, 0.5))
+        self.store._conn.commit()
+        block = self.store.get_block_dict_by_start(bs)
+        engine._rerun_pass2_for_settled_block(
+            block, rate_resolver=engine._kraken_rate_resolver, billing_source="dcc")
+        engine.append_block_replace(block)
+        rate = self.store._conn.execute(
+            "SELECT imp_rate FROM blocks WHERE block_start=?", (bs,)).fetchone()["imp_rate"]
+        self.assertAlmostEqual(rate, 0.323092, places=5,
+            msg="reconciled peak rate must survive PASS 2 (overlay not re-applied)")

@@ -420,3 +420,131 @@ class TestDeriveStartedSlots(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReconcileDecision(unittest.TestCase):
+    """§12 settlement reconciliation: started → off-peak (restores solar slots),
+    neither started nor completed → peak (reverts over-credit), completed-without-
+    started → review (never auto-changed)."""
+
+    def test_started_restores_off_peak(self):
+        # solar slot: started but floored to peak -> restore
+        self.assertEqual(engine._reconcile_decision(True, True, False)[0], "off_peak")
+
+    def test_started_already_off_peak_is_ok(self):
+        self.assertEqual(engine._reconcile_decision(True, True, True)[0], "ok")
+
+    def test_neither_reverts_to_peak(self):
+        # planned, baseload pushed it off-peak, but no charge -> revert
+        self.assertEqual(engine._reconcile_decision(False, False, True)[0], "peak")
+
+    def test_neither_already_peak_is_ok(self):
+        self.assertEqual(engine._reconcile_decision(False, False, False)[0], "ok")
+
+    def test_completed_without_started_is_review(self):
+        # ambiguous: missed-poll smart OR bump — never auto-changed either way
+        self.assertEqual(engine._reconcile_decision(False, True, True)[0], "review")
+        self.assertEqual(engine._reconcile_decision(False, True, False)[0], "review")
+
+    def test_started_overrides_missing_completed(self):
+        # started with no completed yet (completed lands later) still → off-peak
+        self.assertEqual(engine._reconcile_decision(True, False, False)[0], "off_peak")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestReconcilePass(unittest.IsolatedAsyncioTestCase):
+    """§12 settlement reconciliation pass: bidirectional, accumulation-gated,
+    correction-safe. Restores solar slots, reverts non-charging slots, and never
+    touches historical (pre-accumulation) or user-corrected blocks."""
+
+    def _sched(self):
+        class S:
+            def is_empty(self): return False
+            def off_peak_rate_near(self, ts): return 5.493   # £0.05493
+            def resolve(self, ts): return 32.3092            # £0.323092
+        return S()
+
+    def _seed(self, store, slot, imp_rate, kinds, off_peak_slot=True, corrected=0):
+        store._conn.execute(
+            "INSERT OR IGNORE INTO config_periods (id, effective_from, billing_day, "
+            "block_minutes, timezone) VALUES (1, '2020-01-01T00:00:00', 1, 30, 'UTC')")
+        store._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+            "imp_kwh, imp_rate, rate_corrected) VALUES (?,?,?,?,?,?,?)",
+            (slot, slot, "electricity_main", 1, 1.0, imp_rate, corrected))
+        if off_peak_slot:
+            store.upsert_dispatch_slot(slot, off_peak=True, provider="Myenergi",
+                                       source="smart-charge", state="planned")
+        for k in kinds:
+            store.record_dispatch_history(slot, k, provider="Myenergi")
+        store._conn.commit()
+
+    async def _run(self, store):
+        import engine
+        engine._store = store
+        engine._RECONCILE_SETTLE_HOURS = 0.0
+        engine._kraken_rate_schedules = {"import": self._sched()}
+        try:
+            return await engine.reconcile_dispatch_overlay()
+        finally:
+            engine._store = None
+
+    async def test_restore_solar_slot(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # solar: started but floored to PEAK -> should restore to off-peak
+        self._seed(st, "2020-01-01T13:30:00", 0.323092,
+                   ["planned", "started", "completed"])
+        res = await self._run(st)
+        self.assertEqual(res["restored"], 1)
+        r = st._conn.execute("SELECT imp_rate FROM blocks WHERE block_start=?",
+                             ("2020-01-01T13:30:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)
+
+    async def test_revert_non_charging_slot(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # planned, off-peaked, but never started/completed -> revert to peak
+        self._seed(st, "2020-01-01T20:00:00", 0.05493, ["planned"])
+        res = await self._run(st)
+        self.assertEqual(res["reverted"], 1)
+        r = st._conn.execute("SELECT imp_rate FROM blocks WHERE block_start=?",
+                             ("2020-01-01T20:00:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.323092, places=5)
+
+    async def test_skip_user_corrected(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        self._seed(st, "2020-01-01T20:00:00", 0.05493, ["planned"], corrected=1)
+        res = await self._run(st)
+        self.assertEqual(res["reverted"], 0)  # skipped
+        r = st._conn.execute("SELECT imp_rate FROM blocks WHERE block_start=?",
+                             ("2020-01-01T20:00:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)  # untouched
+
+    async def test_skip_pre_accumulation_slot(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # off_peak dispatch_slot but NO dispatch_history (pre-3.1.4) -> not a candidate
+        self._seed(st, "2020-01-01T20:00:00", 0.05493, [])  # no history kinds
+        res = await self._run(st)
+        self.assertEqual(res, {"restored": 0, "reverted": 0, "review": 0})
+        r = st._conn.execute("SELECT imp_rate FROM blocks WHERE block_start=?",
+                             ("2020-01-01T20:00:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)  # untouched
+
+    async def test_review_left_untouched(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # completed but no started -> review, no change
+        self._seed(st, "2020-01-01T20:00:00", 0.05493, ["planned", "completed"])
+        res = await self._run(st)
+        self.assertEqual((res["restored"], res["reverted"], res["review"]),
+                         (0, 0, 1))
+
+
+if __name__ == "__main__":
+    unittest.main()

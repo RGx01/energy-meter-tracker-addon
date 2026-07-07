@@ -372,3 +372,82 @@ cannot trust "absence" for any veto until we accumulate like BCD.**
 The bump case (a charge that never becomes started) still wants one real example
 to confirm the guarded logic behaves — best obtained by a **deliberate evening
 boost** during an observe-only window, not by waiting for one to occur naturally.
+
+---
+
+## 12. VALIDATED against a live solar-supplemented smart charge (2026-07-07)
+
+A full Zappi smart charge was captured on 3.1.4 with the `started` derivation
+live. It validates the model end-to-end, including the confound that defeated the
+meter.
+
+Three-way `dispatch_history` vs grid import (UTC):
+
+| slot  | planned | started | completed | grid_import |
+|-------|---------|---------|-----------|-------------|
+| 11:00 | −3.24   | YES     | −3.18     | 3.387       |
+| 11:30..12:30 | −3.35 | YES | ≈−3.46 | ≈3.67   |
+| 13:00 | −3.35   | YES     | −2.45     | 1.458  (solar ramping) |
+| **13:30** | **−0.95** | **YES** | **−0.81** | **0.002  ← solar-supplied** |
+| 14:00 | −3.35   | –       | 0.000     | 0.000  (planned, never charged) |
+
+Findings:
+1. **Field path confirmed.** `get_intelligent_state` returns real values
+   (`SMART_CONTROL_OFF` → `SMART_CONTROL_IN_PROGRESS`; also a new `SMART_CONTROL_OFF`
+   — treat only `IN_PROGRESS` as started, which we do). `_derive_started_slots`
+   fired for every in-progress slot.
+2. **Solar immunity proven (13:30).** Grid import 0.002 kWh, yet started=YES and
+   completed=−0.81. A meter/floor check would have wrongly stripped off-peak here;
+   started+completed (energy-to-car) correctly confirm the charge. This is the
+   §3 confound, resolved.
+3. **Negative case proven (14:00).** Planned but no started, no completed, no draw
+   → charge ended → peak. Unambiguous.
+4. **Hardest case handled.** This account has NO usable EV energy sensor (Zappi CT
+   is power-only) AND solar — the tier-2-only situation — and the lifecycle signal
+   nailed every slot regardless.
+
+**Resulting billing rule (validated):** off-peak **iff the slot `started`**;
+not-started → peak, regardless of planned/completed. One rule covers paused
+(no started), bump (completes but never starts), and solar (grid≈0 but started).
+The meter is not consulted. `completed` remains a flow corroborator; `planned`
+alone is not sufficient (14:00 was planned but not smart-charged).
+
+Open: still no *directly observed* bump (completed-without-started) — the absence
+logic is validated on 14:00, and a deliberate evening boost would confirm the
+bump branch specifically. Missed-poll robustness (a genuine smart slot polled zero
+times) errs to peak (conservative/under-credit) — the settlement pass can use
+`completed` presence to flag such slots for review rather than silently under-credit.
+
+---
+
+## 13. BILLING CHANGE SHIPPED — settlement reconciliation (3.1.4)
+
+The overlay change is built and writing (risk accepted; soaked on prod_dev before
+promotion). Implements the §12 rule.
+
+- **`_reconcile_decision(started, completed, currently_off_peak)`** — pure:
+  started → off_peak; neither → peak; completed-without-started → review; else ok.
+- **`reconcile_dispatch_overlay()`** — settlement pass on the engine loop, hourly
+  (via `_tick_dispatch_capture`), gated `block_start < now − 6h` so started
+  (real-time) and completed (~hrs) have settled. Bidirectional reprice of main +
+  devices-follow.
+- **Safety gates:**
+  1. **Accumulation gate** — only slots with a `dispatch_history` `planned` entry
+     are candidates. Pre-3.1.4 off-peak slots (no history) are NEVER reverted just
+     because they lack started/completed we weren't recording yet. (This was a
+     real bug caught in test: without the gate, 106 historical slots reverted.)
+  2. **Correction gate** — `rate_corrected=1` blocks (set by the corrections tool)
+     are skipped; the pass never stomps a manual override.
+  3. **review** (completed-without-started) is logged, never auto-changed.
+- **Loop-safe:** runs on the engine loop (single store connection); regenerates
+  charts inline on that thread only when something changed.
+- **Config:** `_DISPATCH_RECONCILE_APPLY` (True) and `_RECONCILE_SETTLE_HOURS` (6).
+- **PASS 2 stomp-guard:** reconcile stamps `rate_reconciled=1`; `_rerun_pass2_for_settled_block` preserves any `rate_corrected`/`rate_reconciled` rate (re-costs to settled kWh but does NOT re-resolve the overlay), so a re-settlement can't undo a reconcile or a manual correction. Closes the ordering gap single-threading alone didn't cover.
+
+Validated on the real solar charge: restored 13:30 (grid 0.002, started) to
+off-peak, left 11:00–13:00 (already off-peak) and 14:00 (planned-only, peak)
+unchanged, touched zero historical slots.
+
+**Still to observe on prod_dev:** a genuine bump (completed-without-started) hitting
+the `review` branch, and confirmation the reconciliation log reads correctly
+against the real Octopus bill across several charges before promotion to main.
