@@ -442,6 +442,12 @@ promotion). Implements the §12 rule.
 - **Loop-safe:** runs on the engine loop (single store connection); regenerates
   charts inline on that thread only when something changed.
 - **Config:** `_DISPATCH_RECONCILE_APPLY` (True) and `_RECONCILE_SETTLE_HOURS` (6).
+- **Split gate (restore vs revert):** a RESTORE (started present) fires as soon as
+  the slot has ended (`_RECONCILE_STARTED_GATE_MIN`, 40 min) — `started` is
+  real-time, so no wait is needed. A REVERT/REVIEW (no started) is DEFERRED until
+  the slot clears `_RECONCILE_SETTLE_HOURS` (6h), because distinguishing
+  neither→peak from completed→review needs `completed` to have settled. So the
+  solar-slot under-credit is corrected promptly; only the over-credit revert waits.
 - **PASS 2 stomp-guard:** reconcile stamps `rate_reconciled=1`; `_rerun_pass2_for_settled_block` preserves any `rate_corrected`/`rate_reconciled` rate (re-costs to settled kWh but does NOT re-resolve the overlay), so a re-settlement can't undo a reconcile or a manual correction. Closes the ordering gap single-threading alone didn't cover.
 
 Validated on the real solar charge: restored 13:30 (grid 0.002, started) to

@@ -5358,7 +5358,8 @@ def _reconcile_decision(has_started: bool, has_completed: bool,
             else "no started/completed → peak (revert)")
 
 
-_RECONCILE_SETTLE_HOURS = 6.0     # wait for started (real-time) + completed (~hrs)
+_RECONCILE_SETTLE_HOURS = 6.0     # revert/review: wait for completed (~hrs) to settle
+_RECONCILE_STARTED_GATE_MIN = 40  # restore: slot ended + a poll margin (started is real-time)
 _DISPATCH_RECONCILE_APPLY = True  # write (risk accepted; soaked on prod_dev first)
 
 
@@ -5380,7 +5381,12 @@ async def reconcile_dispatch_overlay() -> dict:
     if sched is None or sched.is_empty():
         return {}
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    cutoff = (now - timedelta(hours=_RECONCILE_SETTLE_HOURS)).isoformat()
+    # Two gates: a RESTORE can happen as soon as the slot has ended (`started` is
+    # captured in real-time, so it's already known); a REVERT/REVIEW must wait for
+    # `completed` (~hrs) to settle, else we can't tell "neither → peak" from
+    # "completed-but-not-started → review".
+    started_cutoff = (now - timedelta(minutes=_RECONCILE_STARTED_GATE_MIN)).isoformat()
+    settle_cutoff = (now - timedelta(hours=_RECONCILE_SETTLE_HOURS)).isoformat()
     try:
         rows = store._conn.execute(
             """SELECT b.block_start, b.imp_kwh, b.imp_rate
@@ -5391,16 +5397,24 @@ async def reconcile_dispatch_overlay() -> dict:
                              WHERE s.slot_start = b.block_start AND s.off_peak = 1)
                  AND EXISTS (SELECT 1 FROM dispatch_history h
                              WHERE h.slot_start = b.block_start AND h.kind = 'planned')
-               ORDER BY b.block_start""", (cutoff,)).fetchall()
+               ORDER BY b.block_start""", (started_cutoff,)).fetchall()
     except Exception as e:
         logger.warning("reconcile_dispatch_overlay: query failed: %s", e)
         return {}
-    n_restore = n_revert = n_review = 0
+    n_restore = n_revert = n_review = n_deferred = 0
     changed = False
+    n_candidates = len(rows)
     for r in rows:
         bs = r["block_start"]
         kinds = {x[0] for x in store._conn.execute(
             "SELECT kind FROM dispatch_history WHERE slot_start = ?", (bs,))}
+        has_started = "started" in kinds
+        # A no-started slot's fate (revert vs review) hinges on completed, which
+        # lands late — defer it until it clears the settle gate. A started slot is
+        # decidable now.
+        if not has_started and bs >= settle_cutoff:
+            n_deferred += 1
+            continue
         op_pence = sched.off_peak_rate_near(bs)
         base_pence = sched.resolve(bs)
         if op_pence is None or base_pence is None:
@@ -5410,7 +5424,7 @@ async def reconcile_dispatch_overlay() -> dict:
         cur_rate = r["imp_rate"] or 0.0
         currently_off_peak = abs(cur_rate - off_peak) < 1e-6
         target, reason = _reconcile_decision(
-            "started" in kinds, "completed" in kinds, currently_off_peak)
+            has_started, "completed" in kinds, currently_off_peak)
         if target == "review":
             n_review += 1
             logger.info("reconcile: %s REVIEW — %s (unchanged)", bs, reason)
@@ -5446,9 +5460,15 @@ async def reconcile_dispatch_overlay() -> dict:
             generate_charts(store)
         except Exception as e:
             logger.warning("reconcile_dispatch_overlay: chart regen failed: %s", e)
-        logger.info("reconcile: %d restored, %d reverted, %d review (settle=%dh)",
-                    n_restore, n_revert, n_review, int(_RECONCILE_SETTLE_HOURS))
-    return {"restored": n_restore, "reverted": n_revert, "review": n_review}
+    # Heartbeat every run (even with no changes) so the pass is observable in the
+    # log — "0 candidates" vs "N candidates, 0 changed" tells very different
+    # stories when a block isn't being corrected.
+    logger.info("reconcile: scanned %d candidate(s) — %d restored, %d reverted, "
+                "%d review, %d deferred (settle=%dh)",
+                n_candidates, n_restore, n_revert, n_review, n_deferred,
+                int(_RECONCILE_SETTLE_HOURS))
+    return {"restored": n_restore, "reverted": n_revert, "review": n_review,
+            "deferred": n_deferred}
 
 
 async def kraken_poll_task(ha: HAClient):
