@@ -4873,18 +4873,21 @@ def api_corrections_apply():
 
         else:  # rate correction
             kwh_col = "imp_kwh" if channel == "import" else "exp_kwh"
+            # Stamp a durable marker on manual RATE corrections so the dispatch
+            # reconciliation pass never overwrites a user's override.
+            _mark = ", rate_corrected = 1" if col in ("imp_rate", "exp_rate") else ""
             if recalc_cost:
                 cost_col = "imp_cost" if channel == "import" else "exp_cost"
                 cur = store._conn.execute(
                     f"""UPDATE blocks
                         SET {col} = ?,
-                            {cost_col} = ROUND({kwh_col} * ?, 6)
+                            {cost_col} = ROUND({kwh_col} * ?, 6){_mark}
                         WHERE {where}""",
                     [value, value] + params
                 )
             else:
                 cur = store._conn.execute(
-                    f"UPDATE blocks SET {col} = ? WHERE {where}",
+                    f"UPDATE blocks SET {col} = ?{_mark} WHERE {where}",
                     [value] + params
                 )
             store._conn.commit()

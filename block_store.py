@@ -143,6 +143,8 @@ CREATE TABLE IF NOT EXISTS blocks (
     exp_kwh_api         REAL,                       -- DCC-settled export kWh from Kraken REST (NULL until settlement)
     needs_review        INTEGER NOT NULL DEFAULT 0, -- 1 = CAD/Mini vs DCC drift exceeded threshold
     carbon_intensity_g  REAL,                       -- gCO2/kWh at block_start, stored at write time (survives CI table pruning)
+    rate_corrected      INTEGER NOT NULL DEFAULT 0, -- 1 = user manually corrected the rate; dispatch reconciliation must not touch it
+    rate_reconciled     INTEGER NOT NULL DEFAULT 0, -- 1 = dispatch reconciliation set the rate; a later PASS 2 re-run must not stomp it
     FOREIGN KEY (config_period_id) REFERENCES config_periods(id),
     UNIQUE (block_start, meter_id)
 );
@@ -864,6 +866,8 @@ class BlockStore:
             ("finalised_from_cad", "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
             ("needs_review",       "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
             ("carbon_intensity_g", "blocks",        "REAL",                       _b_cols),
+            ("rate_corrected",     "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
+            ("rate_reconciled",    "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
             ("carbon_gco2_min",  "power_history",   "REAL",              _ph_cols),
             # ── 3.1.x dispatch lifecycle capture (observe-only, no billing effect)
             ("state",            "dispatch_slots", "TEXT",  _ds_cols),
