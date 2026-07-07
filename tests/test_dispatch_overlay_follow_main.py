@@ -334,5 +334,89 @@ class TestCompletedDispatchEnergy(unittest.TestCase):
         self.assertIsNone(out["2026-07-07T02:00:00"])
 
 
+class TestCompletedCaptureWhenPlannedEmpty(unittest.IsolatedAsyncioTestCase):
+    """Regression: completed dispatches arrive AFTER the charge, when
+    flexPlannedDispatches is already empty (planned=0). An early return on empty
+    planned skipped the completed capture entirely — energy_completed never
+    populated. Completed must still annotate existing slots when planned=0."""
+
+    async def test_completed_captured_with_planned_empty(self):
+        from unittest.mock import AsyncMock
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # a slot captured earlier as planned (off_peak) — the overnight charge
+        st.upsert_dispatch_slot("2026-07-07T04:30:00", off_peak=True,
+                                provider="Myenergi", source="smart-charge",
+                                state="planned", energy_planned=-3.25)
+        client = AsyncMock()
+        client.get_dispatches = AsyncMock(return_value={
+            "provider": "Myenergi", "planned": [],      # post-charge: empty
+            "completed": [{"start": "2026-07-07T04:30:00+00:00",
+                           "end": "2026-07-07T05:00:00+00:00", "delta": -3.21}],
+        })
+        client.last_deprecations = None
+        for attr, val in (("_store", st), ("_kraken_client", client),
+                          ("_kraken_discovery", {"x": 1}),
+                          ("_kraken_account_number", "ACC"),
+                          ("_deprecations_surfaced", True)):
+            setattr(engine, attr, val)
+        try:
+            await engine._capture_dispatch_slots()
+            r = st.get_dispatch_slot("2026-07-07T04:30:00")
+            self.assertEqual(r["state"], "completed")
+            self.assertAlmostEqual(r["energy_completed"], -3.21, places=3)
+            self.assertAlmostEqual(r["energy_planned"], -3.25, places=3)  # preserved
+            self.assertEqual(r["off_peak"], 1)                            # preserved
+        finally:
+            engine._kraken_client = None
+            engine._store = None
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+class TestDeriveStartedSlots(unittest.TestCase):
+    """§11.2: current slot becomes 'started' iff intelligent state is
+    SMART_CONTROL_IN_PROGRESS AND a planned dispatch is active now. A bump never
+    enters that state, so it never starts."""
+
+    def _planned(self, s, e):
+        return [{"start": s, "end": e, "source": "smart-charge"}]
+
+    def test_started_when_in_progress_and_planned_active(self):
+        now = datetime(2026, 7, 7, 2, 15)  # inside 02:00-02:30
+        out = engine._derive_started_slots(
+            now, self._planned("2026-07-07T02:00:00", "2026-07-07T03:00:00"),
+            "SMART_CONTROL_IN_PROGRESS")
+        self.assertEqual(out, ["2026-07-07T02:00:00"])
+
+    def test_not_started_when_state_only_capable(self):
+        now = datetime(2026, 7, 7, 2, 15)
+        out = engine._derive_started_slots(
+            now, self._planned("2026-07-07T02:00:00", "2026-07-07T03:00:00"),
+            "SMART_CONTROL_CAPABLE")
+        self.assertEqual(out, [])
+
+    def test_not_started_when_no_planned_active_now(self):
+        now = datetime(2026, 7, 7, 5, 15)  # after the planned window
+        out = engine._derive_started_slots(
+            now, self._planned("2026-07-07T02:00:00", "2026-07-07T03:00:00"),
+            "SMART_CONTROL_IN_PROGRESS")
+        self.assertEqual(out, [])
+
+    def test_not_started_when_state_none(self):
+        now = datetime(2026, 7, 7, 2, 15)
+        self.assertEqual(engine._derive_started_slots(
+            now, self._planned("2026-07-07T02:00:00", "2026-07-07T03:00:00"),
+            None), [])
+
+    def test_second_half_hour_slot(self):
+        now = datetime(2026, 7, 7, 2, 45)  # inside 02:30-03:00
+        out = engine._derive_started_slots(
+            now, self._planned("2026-07-07T02:00:00", "2026-07-07T03:00:00"),
+            "SMART_CONTROL_IN_PROGRESS")
+        self.assertEqual(out, ["2026-07-07T02:30:00"])
+
+
 if __name__ == "__main__":
     unittest.main()

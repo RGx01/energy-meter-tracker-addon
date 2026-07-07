@@ -294,3 +294,81 @@ completed-based settlement veto covers the same ground; `started` is now a
    whether the overlay is already right on evening dispatches.
 3. **Then** build the settlement-time validation (tier ladder above), magnitude-
    aware, OHME-exempt — the 3.2.0 billing change.
+
+---
+
+## 11. Correction — `started` is the discriminator, not `completed` (2026-07-07, from BCD)
+
+Reading BCD's own approach (docs + FAQ) corrected two assumptions in §10. This
+section supersedes §10's completed-as-validator framing and §10.6's
+deprioritisation of `started`.
+
+### 11.1 `completed` CANNOT distinguish smart from bump
+BCD's FAQ is explicit: completed dispatches carry no source, so **boost (bump)
+charges are mixed in with smart charges**, and *"Completed dispatches cannot be
+used for this [rate adjustment] as OE do not provide information on the cause of
+the completed dispatch."* A bump **charges and completes identically** to a smart
+charge. So §10's "completed present + energy ≈ planned → confirmed smart →
+off-peak" is **wrong**. What completed CAN do is confirm a planned slot actually
+drew — it catches the PAUSED case (the original 27-June #253, EV didn't charge).
+It is a **flow corroborator, not a smart-vs-bump oracle.**
+
+### 11.2 `started` is the real signal — derived, not fetched
+BCD adjusts rates off **started** dispatches. The derivation (to copy verbatim):
+- On each refresh, **if the account/device intelligent state is
+  `SMART_CONTROL_IN_PROGRESS`**, any PLANNED dispatch whose window is *currently
+  active* promotes the **current 30-minute slot** to a *started* dispatch.
+- Done **30 minutes at a time** (not the whole planned window) because Octopus
+  can stop a dispatch early; the **whole 30-min slot is off-peak** even if only a
+  minute charged.
+- The planned dispatch must **still be present** at slot-start (planned can be
+  pulled at the last minute — accepting bare "was planned" over-applies).
+- A **bump never puts that slot into `SMART_CONTROL_IN_PROGRESS`**, so it never
+  becomes started — which is exactly why started discriminates smart from bump
+  and BCD's dispatching sensor *"will not come on during a bump charge."*
+
+So: `started = planned ∩ active-now ∩ SMART_CONTROL_IN_PROGRESS`, accumulated slot
+by slot. Needs a NEW fetch we don't do today — the **intelligent state**. (BCD's
+logic lives in `custom_components/octopus_energy/intelligent/dispatching.py`.)
+
+### 11.3 Local accumulation is a prerequisite (why BCD "had" 17:30)
+BCD **accumulates dispatch history locally** (`intelligent_dispatches_history_*`,
+~48h, "stored locally as it changes") over frequent polls — it never depends on a
+single snapshot. Our capture reads one `completedDispatches` / `flexPlanned`
+response per poll and annotates only what's in it, so a dispatch present only
+transiently (or in a poll window we miss) is lost. That — **accumulation vs
+snapshot**, not latency — is why BCD had 17:30 / 20:00 / 05:00 and we didn't. **We
+cannot trust "absence" for any veto until we accumulate like BCD.**
+
+### 11.4 Revised model
+- **Off-peak eligibility** = **started** (planned that became active under
+  `SMART_CONTROL_IN_PROGRESS`), accumulated. The smart-vs-bump discriminator;
+  replaces "planned + floor" for accuracy.
+- **completed** = corroborates energy flowed (catches paused slots); never used
+  to prove smart. (Capture already shipped, 3.1.4.)
+- **charger CT** where present = corroborates energy-to-car, immune to
+  solar/battery.
+- **OHME** = unchanged carve-out. OHME provides **no planned dispatches at all**
+  (its billing runs off completed "in reverse"), so it can't use `started`
+  either — keeps charge-mode-sensor / optimistic.
+
+### 11.5 Revised build order (supersedes §10.7 / §7 sequencing)
+1. **Local accumulation** of planned + completed (persist as seen; stop relying
+   on per-poll snapshots) — prerequisite for everything, including trusting
+   absence. **[DONE — 3.1.4: `dispatch_history` table, observe-only.]**
+2. **Fetch intelligent state + derive `started`** (planned ∩ active ∩
+   `SMART_CONTROL_IN_PROGRESS`, 30-min increments, planned-still-present),
+   observe-only. **[DONE — 3.1.4: `get_intelligent_state` (isolated fetch,
+   `status{currentState}`) + `_derive_started_slots`, accumulated as
+   `kind='started'`. Field path unverified against a live charge — see below.]**
+3. **completed** stays as the flow corroborator (done).
+4. **Then** the billing change: off-peak driven by **started** (not raw planned),
+   completed / CT as corroboration, settled-gate + Case-B reversion,
+   respect user overrides, OHME-exempt.
+5. `started` is **no longer deprioritised** — it is the core signal. §10.6 is
+   withdrawn.
+
+### 11.6 Still unproven
+The bump case (a charge that never becomes started) still wants one real example
+to confirm the guarded logic behaves — best obtained by a **deliberate evening
+boost** during an observe-only window, not by waiting for one to occur naturally.
