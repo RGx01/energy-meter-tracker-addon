@@ -4957,9 +4957,10 @@ async def _capture_dispatch_slots() -> int:
         return _capture_ohme_slots(provider, planned)
 
     slots = _smart_charge_slots(planned)
-    if not slots:
-        return 0
-    slot_energy = _planned_dispatch_slot_energy(planned)
+    # NB: do NOT early-return when planned is empty. Completed dispatches land
+    # AFTER the charge, by which point flexPlannedDispatches is already empty
+    # (planned=0) — an early return here skipped the completed capture entirely.
+    slot_energy = _planned_dispatch_slot_energy(planned) if slots else {}
     captured = 0
     for slot_start in sorted(slots):
         try:
@@ -5007,8 +5008,47 @@ async def _capture_dispatch_slots() -> int:
         if n_comp:
             logger.info("_capture_dispatch_slots: recorded completed energy for "
                         "%d slot(s) (observe-only)", n_comp)
+
+    # Accumulate ALL planned + completed dispatches into dispatch_history
+    # (observe-only, design §11) — a persistent record across polls, separate
+    # from the billing dispatch_slots. This retains completed dispatches for
+    # slots we never planned (the tail slots the per-poll snapshot loses) and is
+    # what makes a future "never saw this slot" judgement trustworthy. Never read
+    # for billing.
+    try:
+        for slot_start in sorted(slots):
+            _store.record_dispatch_history(
+                slot_start, "planned", provider=provider,
+                source="smart-charge", energy_kwh=slot_energy.get(slot_start))
+        for slot_start, e_comp in _completed_dispatch_slot_energy(completed).items():
+            _store.record_dispatch_history(
+                slot_start, "completed", provider=provider,
+                source="unknown", energy_kwh=e_comp)
+    except Exception as e:
+        logger.warning("_capture_dispatch_slots: history accumulation failed: %s", e)
+
+    # Derive `started` for the current slot (design §11.2) — the smart-vs-bump
+    # discriminator. Only fires when the intelligent state is
+    # SMART_CONTROL_IN_PROGRESS AND a planned dispatch is active now; a bump never
+    # enters that state, so it never starts. Best-effort + observe-only: the
+    # state fetch is isolated (None on any error → no started slot), and started
+    # is recorded only into dispatch_history, never the billing dispatch_slots.
+    try:
+        state = await _kraken_client.get_intelligent_state(_kraken_account_number)
+        if state:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            for slot_start in _derive_started_slots(now, planned, state):
+                _store.record_dispatch_history(
+                    slot_start, "started", provider=provider,
+                    source="smart-charge", energy_kwh=None)
+                logger.info("_capture_dispatch_slots: slot %s STARTED "
+                            "(intelligent_state=%s)", slot_start, state)
+    except Exception as e:
+        logger.warning("_capture_dispatch_slots: started derivation failed: %s", e)
+
     try:
         _store.prune_dispatch_slots(days=90)
+        _store.prune_dispatch_history(days=90)
     except Exception:
         pass
     return captured
@@ -5203,6 +5243,47 @@ def _completed_dispatch_slot_energy(completed: list) -> dict:
             else:
                 out[k] = round((out.get(k) or 0.0) + per, 4)
     return out
+
+
+def _derive_started_slots(now_utc: datetime, planned: list,
+                          intelligent_state: str | None) -> list:
+    """Derive `started` 30-minute slots (design §11.2 — BCD's mechanism).
+
+    The CURRENT slot becomes 'started' ONLY when the intelligent state is
+    `SMART_CONTROL_IN_PROGRESS` AND a planned dispatch is active right now (and
+    therefore still present in the list — planned can be pulled last-minute).
+    Done one 30-min slot at a time; accumulation across polls builds the full
+    set. A bump never enters `SMART_CONTROL_IN_PROGRESS`, so it never becomes
+    started — which is exactly why `started` discriminates smart from bump where
+    `completed` can't. Returns 0 or 1 slot_start ISO strings (naive UTC).
+    """
+    if intelligent_state != "SMART_CONTROL_IN_PROGRESS":
+        return []
+    now = now_utc
+    if now.tzinfo is not None:
+        now = now.astimezone(timezone.utc).replace(tzinfo=None)
+    active = False
+    for d in planned or []:
+        s, e = d.get("start"), d.get("end")
+        if not s or not e:
+            continue
+        try:
+            sd = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+            ed = datetime.fromisoformat(str(e).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if sd.tzinfo is not None:
+            sd = sd.astimezone(timezone.utc).replace(tzinfo=None)
+        if ed.tzinfo is not None:
+            ed = ed.astimezone(timezone.utc).replace(tzinfo=None)
+        if sd <= now < ed:
+            active = True
+            break
+    if not active:
+        return []
+    slot = now.replace(minute=(0 if now.minute < 30 else 30),
+                       second=0, microsecond=0)
+    return [slot.isoformat()]
 
 
 async def kraken_poll_task(ha: HAClient):

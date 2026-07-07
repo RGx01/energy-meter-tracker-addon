@@ -1052,6 +1052,50 @@ class KrakenAPIClient:
                     provider, len(planned), len(completed))
         return {"provider": provider, "planned": planned, "completed": completed}
 
+    async def get_intelligent_state(self, account_number: Optional[str] = None
+                                    ) -> Optional[str]:
+        """Best-effort fetch of the charging device's intelligent control state
+        — SMART_CONTROL_IN_PROGRESS (scheduled/charging), SMART_CONTROL_CAPABLE
+        (plugged, no schedule), or SMART_CONTROL_NOT_AVAILABLE (unplugged/away).
+        Used to derive `started` dispatches (design §11.2), the smart-vs-bump
+        discriminator.
+
+        ISOLATED from get_dispatches on purpose: the exact field path
+        (`status { currentState }`) is our best read of the Kraken schema, and if
+        it's wrong a field error must NOT break planned/completed capture. Any
+        error → None, and `started` derivation simply doesn't fire. If a live
+        charge shows this returning None while dispatches are active, the field
+        path below is the single line to adjust.
+        """
+        acct = account_number or self._account_number
+        if not acct:
+            return None
+        query = (
+            "query intelligentState($acc: String!) {"
+            "  devices(accountNumber: $acc) {"
+            "    deviceType __typename status { currentState } } }"
+        )
+        try:
+            data = await self._graphql(query, {"acc": acct})
+        except Exception as e:
+            logger.info("get_intelligent_state: fetch failed (field path may "
+                        "need adjustment vs live schema): %s", e)
+            return None
+        devices = (data or {}).get("devices") or []
+
+        def _state(d):
+            return (d.get("status") or {}).get("currentState")
+        # prefer the charging device's state, else any device that reports one
+        for d in devices:
+            if d.get("__typename") in _CHARGING_TYPENAMES and _state(d):
+                logger.info("get_intelligent_state: %s (%s)",
+                            _state(d), d.get("__typename"))
+                return _state(d)
+        for d in devices:
+            if _state(d):
+                return _state(d)
+        return None
+
     async def get_rate_limit(self) -> Optional[dict]:
         """rateLimitInfo — points used / limit. Returns None if the field is
         unavailable on this account (field names per spec; verify live).
