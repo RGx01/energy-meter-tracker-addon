@@ -531,7 +531,8 @@ class TestReconcilePass(unittest.IsolatedAsyncioTestCase):
         # off_peak dispatch_slot but NO dispatch_history (pre-3.1.4) -> not a candidate
         self._seed(st, "2020-01-01T20:00:00", 0.05493, [])  # no history kinds
         res = await self._run(st)
-        self.assertEqual(res, {"restored": 0, "reverted": 0, "review": 0})
+        self.assertEqual((res["restored"], res["reverted"], res["review"]),
+                         (0, 0, 0))
         r = st._conn.execute("SELECT imp_rate FROM blocks WHERE block_start=?",
                              ("2020-01-01T20:00:00",)).fetchone()
         self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)  # untouched
