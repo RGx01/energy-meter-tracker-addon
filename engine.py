@@ -4974,6 +4974,39 @@ async def _capture_dispatch_slots() -> int:
     if captured:
         logger.info("_capture_dispatch_slots: persisted %d smart-charge slot(s) "
                     "(provider=%s)", captured, provider)
+
+    # Record COMPLETED dispatch energy per slot (observe-only). Completed
+    # dispatches land hours after the charge, so this is the settlement-time
+    # signal the #253 validation will veto against — NOT used for billing yet.
+    # OHME already returned above (its completed dispatches carry no reliable
+    # smart-vs-boost signal), so this covers only Octopus-controlled providers.
+    # We only ANNOTATE slots that already exist (were captured as planned) — we
+    # never create a new off_peak slot from a completed dispatch, so this can't
+    # change what the overlay prices. off_peak / provider / source are preserved.
+    completed = disp.get("completed") or []
+    if completed:
+        comp = _completed_dispatch_slot_energy(completed)
+        n_comp = 0
+        for slot_start, e_comp in comp.items():
+            if e_comp is None:
+                continue
+            existing = _store.get_dispatch_slot(slot_start)
+            if not existing:
+                continue
+            try:
+                _store.upsert_dispatch_slot(
+                    slot_start,
+                    off_peak=bool(existing.get("off_peak")),
+                    provider=existing.get("provider") or provider,
+                    source=existing.get("source") or "smart-charge",
+                    state="completed", energy_completed=e_comp)
+                n_comp += 1
+            except Exception as e:
+                logger.warning("_capture_dispatch_slots: completed persist %s "
+                               "failed: %s", slot_start, e)
+        if n_comp:
+            logger.info("_capture_dispatch_slots: recorded completed energy for "
+                        "%d slot(s) (observe-only)", n_comp)
     try:
         _store.prune_dispatch_slots(days=90)
     except Exception:
@@ -5093,6 +5126,52 @@ def _planned_dispatch_slot_energy(planned: list) -> dict:
     for d in planned or []:
         if str(d.get("source") or "").lower() not in _SMART_CHARGE_SOURCES:
             continue
+        start = d.get("start"); end = d.get("end")
+        if not start or not end:
+            continue
+        try:
+            s = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+            e = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if s.tzinfo is not None:
+            s = s.astimezone(timezone.utc).replace(tzinfo=None)
+        if e.tzinfo is not None:
+            e = e.astimezone(timezone.utc).replace(tzinfo=None)
+        covered = []
+        slot = s.replace(minute=(0 if s.minute < 30 else 30),
+                         second=0, microsecond=0)
+        while slot < e:
+            covered.append(slot.isoformat())
+            slot = slot + timedelta(minutes=30)
+        if not covered:
+            continue
+        try:
+            per = (float(d.get("delta")) / len(covered)) \
+                if d.get("delta") is not None else None
+        except (TypeError, ValueError):
+            per = None
+        for k in covered:
+            if per is None:
+                out.setdefault(k, None)
+            else:
+                out[k] = round((out.get(k) or 0.0) + per, 4)
+    return out
+
+
+def _completed_dispatch_slot_energy(completed: list) -> dict:
+    """Map COMPLETED dispatches to per-slot delivered energy (kWh).
+
+    Like _planned_dispatch_slot_energy, but for completedDispatches — what
+    Octopus ACTUALLY dispatched, which land hours after the charge. No source
+    filter: completed dispatches come back source='unknown' (the smart-vs-bump
+    label is lost on completion), so we key on the dispatch itself, not a label.
+    Signed like the planned figure (a charge is negative kWh). OBSERVE-ONLY —
+    recorded to energy_completed for the future settlement-time validation
+    (see dispatch_validation_design.md); NOT used for billing yet.
+    """
+    out: dict = {}
+    for d in completed or []:
         start = d.get("start"); end = d.get("end")
         if not start or not end:
             continue

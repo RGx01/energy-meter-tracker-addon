@@ -754,6 +754,35 @@ class TestPickActiveMeter(unittest.TestCase):
               {"serial_number": "B", "is_active": False}]
         self.assertEqual(kc._pick_active_meter(ms)["serial_number"], "A")
 
+    def test_active_to_excludes_retired_meter(self):
+        # Kraken's authoritative signal (per BCD): active_to set == retired.
+        # OLD is listed last but is retired -> pick the live NEW despite order.
+        ms = [{"serial_number": "NEW", "active_to": None,
+               "active_from": "2026-06-01"},
+              {"serial_number": "OLD", "active_to": "2026-06-01",
+               "active_from": "2024-01-01"}]
+        self.assertEqual(kc._pick_active_meter(ms)["serial_number"], "NEW")
+        # camelCase variant too
+        ms2 = [{"serial_number": "NEW", "activeTo": None},
+               {"serial_number": "OLD", "activeTo": "2026-06-01"}]
+        self.assertEqual(kc._pick_active_meter(ms2)["serial_number"], "NEW")
+
+    def test_overlap_both_live_picks_most_recent(self):
+        # Brief exchange overlap: both still active_to=None. The still-reporting /
+        # most-recently-activated meter wins, regardless of list order.
+        ms = [{"serial_number": "NEW", "active_to": None,
+               "active_from": "2026-06-01", "latest_consumption": "2026-06-05"},
+              {"serial_number": "OLD", "active_to": None,
+               "active_from": "2024-01-01", "latest_consumption": "2026-05-30"}]
+        self.assertEqual(kc._pick_active_meter(ms)["serial_number"], "NEW")
+        # even if the newer meter is listed FIRST (order can't be relied on)
+        self.assertEqual(kc._pick_active_meter(list(reversed(ms)))["serial_number"], "NEW")
+
+    def test_no_signals_falls_back_to_last(self):
+        # bare payload with no active_to / consumption / active flags -> list order
+        ms = [{"serial_number": "OLD-0"}, {"serial_number": "CUR-1"}]
+        self.assertEqual(kc._pick_active_meter(ms)["serial_number"], "CUR-1")
+
 
 if __name__ == "__main__":
     unittest.main()

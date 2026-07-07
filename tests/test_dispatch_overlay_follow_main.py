@@ -302,5 +302,37 @@ class TestFollowMainDeviceOverlay(unittest.TestCase):
             msg="zero-draw EV must follow the main's rate")
 
 
+class TestCompletedDispatchEnergy(unittest.TestCase):
+    """#253 groundwork: _completed_dispatch_slot_energy distributes a completed
+    dispatch's delta across the slots it covers, with NO source filter (completed
+    dispatches come back source='unknown'), signed like planned (negative)."""
+
+    def test_single_slot_completed_energy(self):
+        out = engine._completed_dispatch_slot_energy(
+            [{"start": "2026-07-07T02:00:00", "end": "2026-07-07T02:30:00",
+              "delta": -3.2, "meta": {"source": "unknown"}}])
+        self.assertAlmostEqual(out["2026-07-07T02:00:00"], -3.2, places=3)
+
+    def test_multi_slot_distributes_evenly(self):
+        out = engine._completed_dispatch_slot_energy(
+            [{"start": "2026-07-07T02:00:00", "end": "2026-07-07T03:00:00",
+              "delta": -4.0}])
+        self.assertAlmostEqual(out["2026-07-07T02:00:00"], -2.0, places=3)
+        self.assertAlmostEqual(out["2026-07-07T02:30:00"], -2.0, places=3)
+
+    def test_no_source_filter(self):
+        # unlike the planned helper, unknown/absent source is still counted
+        out = engine._completed_dispatch_slot_energy(
+            [{"start": "2026-07-07T02:00:00", "end": "2026-07-07T02:30:00",
+              "delta": -1.5}])
+        self.assertIn("2026-07-07T02:00:00", out)
+
+    def test_null_delta_maps_none(self):
+        out = engine._completed_dispatch_slot_energy(
+            [{"start": "2026-07-07T02:00:00", "end": "2026-07-07T02:30:00",
+              "delta": None}])
+        self.assertIsNone(out["2026-07-07T02:00:00"])
+
+
 if __name__ == "__main__":
     unittest.main()
