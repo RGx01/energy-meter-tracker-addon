@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased] — 3.1.4
+
+### Added
+
+- **Completed-dispatch energy capture (observe-only, groundwork for [#253](https://github.com/RGx01/energy-meter-tracker-addon/issues/253)).** Building on the planned-dispatch capture shipped in 3.1.1, EMT now also records each **completed** Intelligent Octopus dispatch's delivered energy (`energy_completed`) and lifecycle `state` per slot, for Octopus-controlled chargers (Zappi/Myenergi, vehicle integrations). This is **not used for billing** — it only annotates slots that already exist, never creates a priced slot, and the overlay still decides off-peak purely on the existing flag. It's the settlement-time signal the eventual #253 fix will validate against (a planned slot whose charge didn't actually happen reverts to peak). OHME is excluded, as its dispatch records can't distinguish a smart charge from a boost.
+
+### Fixed
+
+- **Meter-exchange selection now uses the authoritative retirement signal** (hardening of [#244](https://github.com/RGx01/energy-meter-tracker-addon/issues/244)). When an MPAN lists several meters after an exchange, the active-meter picker relied on list order ("Kraken lists oldest-first, take the last") as its main heuristic. It now reads the meter's `active_to` field — a swapped-out meter has it set, a live one has it null (the same signal BottleCapDave's integration keys off) — to drop retired meters authoritatively, and among any still-live meters prefers the one still reporting / most recently activated (newest `latest_consumption` / `active_from`). The list-order fallback is kept only for payloads that carry none of those fields. Turns "the current meter warning" from a positional guess into a read of the actual retirement/reporting data.
+
+- **Billing-source indicator wrongly showed "N blocks awaiting DCC settlement" with no API configured.** The header pill gated on the billing source being `dcc`, but that's the default even when no supplier API is set up — so a user with no API saw thousands of blocks "awaiting settlement" that would never settle (their blocks are billed on the local/CAD figure, permanently). The pill now also requires an API to be available before showing the DCC message, and otherwise reports the actual state: **"No API · local billing"** (no API), **"CAD source · API ready"** (API available but billing uses the local CAD figure), or **"⏳ N awaiting DCC settlement"** (DCC path with blocks pending). Info states are neutral-styled; only genuine pending settlement is amber.
+
 ## [3.1.3] — 2026-07-06
 
 ### Fixed
