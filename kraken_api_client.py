@@ -210,10 +210,18 @@ def _pick_active_meter(meters: list) -> Optional[dict]:
     single-meter export point settled fine).
 
     Selection, in order of trust:
-      1. Honour an explicit active / removal signal if the payload carries one
-         (field names vary, so we check a small set defensively).
-      2. Otherwise fall back to the LAST meter — Kraken lists meters oldest-first,
-         so the current meter is normally last after an exchange.
+      1. Drop RETIRED meters. The Kraken meter payload marks a swapped-out meter
+         with a non-null ``active_to`` — a live meter has it null. This is the
+         authoritative signal (BottleCapDave's integration keys off exactly this
+         field). A small set of other removal/active names is also honoured
+         defensively, since the surface varies between REST/GraphQL shapes.
+      2. Among the meters still live, prefer the one most recently ACTIVE — by the
+         newest of ``latest_consumption`` / ``active_from``. An exchanged-out
+         meter stops reporting (that was the #244 symptom: its consumption query
+         came back empty), so the still-reporting / most-recently-activated meter
+         is the current one.
+      3. Only if no meter carries any of those signals, fall back to the LAST
+         meter (Kraken lists oldest-first) — the pre-existing behaviour.
     Never returns the first meter of a multi-meter point by position alone.
     """
     if not meters:
@@ -222,6 +230,10 @@ def _pick_active_meter(meters: list) -> Optional[dict]:
         return meters[0]
 
     def _removed(m: dict) -> bool:
+        # active_to / activeTo set → retired. This is the authoritative signal.
+        for k in ("active_to", "activeTo"):
+            if m.get(k):
+                return True
         for k in ("removed_at", "removedAt", "deactivation_date",
                   "deactivationDate", "retirement_date", "retiredAt", "end_date"):
             if m.get(k):
@@ -234,10 +246,23 @@ def _pick_active_meter(meters: list) -> Optional[dict]:
                 return True
         return False
 
+    def _recency_key(m: dict) -> str:
+        # Most recent activity signal for this meter. latest_consumption and
+        # active_from are ISO dates, so lexical max == most recent. A meter that
+        # is either still reporting OR most recently activated scores highest.
+        vals = [str(m[k]) for k in ("latest_consumption", "latestConsumption",
+                                    "active_from", "activeFrom")
+                if m.get(k)]
+        return max(vals) if vals else ""
+
     live = [m for m in meters if not _removed(m)] or meters
     active = [m for m in live if _flagged_active(m)]
     pool = active or live
-    return pool[-1]  # newest by list order
+    # Prefer the still-reporting / most-recently-activated meter. If no meter in
+    # the pool carries any recency signal, this is a no-op and we keep list order.
+    if any(_recency_key(m) for m in pool):
+        return max(pool, key=_recency_key)
+    return pool[-1]  # fallback: newest by list order (Kraken lists oldest-first)
 
 
 def _operation_name(query: str) -> str:
@@ -1026,6 +1051,50 @@ class KrakenAPIClient:
         logger.info("get_dispatches: provider=%s planned=%d completed=%d",
                     provider, len(planned), len(completed))
         return {"provider": provider, "planned": planned, "completed": completed}
+
+    async def get_intelligent_state(self, account_number: Optional[str] = None
+                                    ) -> Optional[str]:
+        """Best-effort fetch of the charging device's intelligent control state
+        — SMART_CONTROL_IN_PROGRESS (scheduled/charging), SMART_CONTROL_CAPABLE
+        (plugged, no schedule), or SMART_CONTROL_NOT_AVAILABLE (unplugged/away).
+        Used to derive `started` dispatches (design §11.2), the smart-vs-bump
+        discriminator.
+
+        ISOLATED from get_dispatches on purpose: the exact field path
+        (`status { currentState }`) is our best read of the Kraken schema, and if
+        it's wrong a field error must NOT break planned/completed capture. Any
+        error → None, and `started` derivation simply doesn't fire. If a live
+        charge shows this returning None while dispatches are active, the field
+        path below is the single line to adjust.
+        """
+        acct = account_number or self._account_number
+        if not acct:
+            return None
+        query = (
+            "query intelligentState($acc: String!) {"
+            "  devices(accountNumber: $acc) {"
+            "    deviceType __typename status { currentState } } }"
+        )
+        try:
+            data = await self._graphql(query, {"acc": acct})
+        except Exception as e:
+            logger.info("get_intelligent_state: fetch failed (field path may "
+                        "need adjustment vs live schema): %s", e)
+            return None
+        devices = (data or {}).get("devices") or []
+
+        def _state(d):
+            return (d.get("status") or {}).get("currentState")
+        # prefer the charging device's state, else any device that reports one
+        for d in devices:
+            if d.get("__typename") in _CHARGING_TYPENAMES and _state(d):
+                logger.info("get_intelligent_state: %s (%s)",
+                            _state(d), d.get("__typename"))
+                return _state(d)
+        for d in devices:
+            if _state(d):
+                return _state(d)
+        return None
 
     async def get_rate_limit(self) -> Optional[dict]:
         """rateLimitInfo — points used / limit. Returns None if the field is

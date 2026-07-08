@@ -608,6 +608,8 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
 
     sorted_blocks = sorted([b for b in blocks if b and b.get("start")], key=lambda b: b["start"])
 
+    _period_utc_starts = []  # UTC starts of blocks that fall IN this period (for total_cost)
+
     for block in sorted_blocks:
         # block["start"] is a UTC ISO string; parse it and convert to local naive
         # so BST blocks at 23:xx UTC compare correctly against local period boundaries.
@@ -623,6 +625,7 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
             block_start = _block_utc
         if not (period_start <= block_start < period_end):
             continue
+        _period_utc_starts.append(block["start"])
 
         day_key = block_start.date()
         meters = block.get("meters", {}) or {}
@@ -793,15 +796,18 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
     # Compute total_cost via BlockStore.compute_period_net — the single shared
     # implementation used by Live Power, Usage Stats and billing chart.
     # Fall back to local accumulation if store not provided.
-    if store is not None and tz_name:
-        _utc_s = min(b["start"] for b in sorted_blocks if b.get("start"))
-        _utc_e_dt = max(
-            datetime.fromisoformat(b["start"]) for b in sorted_blocks if b.get("start")
-        )
+    if store is not None and tz_name and _period_utc_starts:
+        # Bounds from the blocks IN THIS PERIOD only — using min/max of ALL
+        # sorted_blocks spanned the whole dataset, so every period returned the
+        # same (all-time) net. Now compute_period_net runs over just this period.
+        _utc_s = min(_period_utc_starts)
+        _utc_e_dt = max(datetime.fromisoformat(s) for s in _period_utc_starts)
         # utc_e must be past the last block — add 30 minutes
         from datetime import timedelta as _timedelta
         _utc_e = (_utc_e_dt + _timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S")
         total_cost = store.compute_period_net(_utc_s, _utc_e, tz_name)
+    elif store is not None and tz_name:
+        total_cost = 0.0   # no blocks fall in this period
     else:
         _daily_nets = [
             round(

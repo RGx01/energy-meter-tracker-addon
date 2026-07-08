@@ -302,5 +302,250 @@ class TestFollowMainDeviceOverlay(unittest.TestCase):
             msg="zero-draw EV must follow the main's rate")
 
 
+class TestCompletedDispatchEnergy(unittest.TestCase):
+    """#253 groundwork: _completed_dispatch_slot_energy distributes a completed
+    dispatch's delta across the slots it covers, with NO source filter (completed
+    dispatches come back source='unknown'), signed like planned (negative)."""
+
+    def test_single_slot_completed_energy(self):
+        out = engine._completed_dispatch_slot_energy(
+            [{"start": "2026-07-07T02:00:00", "end": "2026-07-07T02:30:00",
+              "delta": -3.2, "meta": {"source": "unknown"}}])
+        self.assertAlmostEqual(out["2026-07-07T02:00:00"], -3.2, places=3)
+
+    def test_multi_slot_distributes_evenly(self):
+        out = engine._completed_dispatch_slot_energy(
+            [{"start": "2026-07-07T02:00:00", "end": "2026-07-07T03:00:00",
+              "delta": -4.0}])
+        self.assertAlmostEqual(out["2026-07-07T02:00:00"], -2.0, places=3)
+        self.assertAlmostEqual(out["2026-07-07T02:30:00"], -2.0, places=3)
+
+    def test_no_source_filter(self):
+        # unlike the planned helper, unknown/absent source is still counted
+        out = engine._completed_dispatch_slot_energy(
+            [{"start": "2026-07-07T02:00:00", "end": "2026-07-07T02:30:00",
+              "delta": -1.5}])
+        self.assertIn("2026-07-07T02:00:00", out)
+
+    def test_null_delta_maps_none(self):
+        out = engine._completed_dispatch_slot_energy(
+            [{"start": "2026-07-07T02:00:00", "end": "2026-07-07T02:30:00",
+              "delta": None}])
+        self.assertIsNone(out["2026-07-07T02:00:00"])
+
+
+class TestCompletedCaptureWhenPlannedEmpty(unittest.IsolatedAsyncioTestCase):
+    """Regression: completed dispatches arrive AFTER the charge, when
+    flexPlannedDispatches is already empty (planned=0). An early return on empty
+    planned skipped the completed capture entirely — energy_completed never
+    populated. Completed must still annotate existing slots when planned=0."""
+
+    async def test_completed_captured_with_planned_empty(self):
+        from unittest.mock import AsyncMock
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # a slot captured earlier as planned (off_peak) — the overnight charge
+        st.upsert_dispatch_slot("2026-07-07T04:30:00", off_peak=True,
+                                provider="Myenergi", source="smart-charge",
+                                state="planned", energy_planned=-3.25)
+        client = AsyncMock()
+        client.get_dispatches = AsyncMock(return_value={
+            "provider": "Myenergi", "planned": [],      # post-charge: empty
+            "completed": [{"start": "2026-07-07T04:30:00+00:00",
+                           "end": "2026-07-07T05:00:00+00:00", "delta": -3.21}],
+        })
+        client.last_deprecations = None
+        for attr, val in (("_store", st), ("_kraken_client", client),
+                          ("_kraken_discovery", {"x": 1}),
+                          ("_kraken_account_number", "ACC"),
+                          ("_deprecations_surfaced", True)):
+            setattr(engine, attr, val)
+        try:
+            await engine._capture_dispatch_slots()
+            r = st.get_dispatch_slot("2026-07-07T04:30:00")
+            self.assertEqual(r["state"], "completed")
+            self.assertAlmostEqual(r["energy_completed"], -3.21, places=3)
+            self.assertAlmostEqual(r["energy_planned"], -3.25, places=3)  # preserved
+            self.assertEqual(r["off_peak"], 1)                            # preserved
+        finally:
+            engine._kraken_client = None
+            engine._store = None
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+class TestDeriveStartedSlots(unittest.TestCase):
+    """§11.2: current slot becomes 'started' iff intelligent state is
+    SMART_CONTROL_IN_PROGRESS AND a planned dispatch is active now. A bump never
+    enters that state, so it never starts."""
+
+    def _planned(self, s, e):
+        return [{"start": s, "end": e, "source": "smart-charge"}]
+
+    def test_started_when_in_progress_and_planned_active(self):
+        now = datetime(2026, 7, 7, 2, 15)  # inside 02:00-02:30
+        out = engine._derive_started_slots(
+            now, self._planned("2026-07-07T02:00:00", "2026-07-07T03:00:00"),
+            "SMART_CONTROL_IN_PROGRESS")
+        self.assertEqual(out, ["2026-07-07T02:00:00"])
+
+    def test_not_started_when_state_only_capable(self):
+        now = datetime(2026, 7, 7, 2, 15)
+        out = engine._derive_started_slots(
+            now, self._planned("2026-07-07T02:00:00", "2026-07-07T03:00:00"),
+            "SMART_CONTROL_CAPABLE")
+        self.assertEqual(out, [])
+
+    def test_not_started_when_no_planned_active_now(self):
+        now = datetime(2026, 7, 7, 5, 15)  # after the planned window
+        out = engine._derive_started_slots(
+            now, self._planned("2026-07-07T02:00:00", "2026-07-07T03:00:00"),
+            "SMART_CONTROL_IN_PROGRESS")
+        self.assertEqual(out, [])
+
+    def test_not_started_when_state_none(self):
+        now = datetime(2026, 7, 7, 2, 15)
+        self.assertEqual(engine._derive_started_slots(
+            now, self._planned("2026-07-07T02:00:00", "2026-07-07T03:00:00"),
+            None), [])
+
+    def test_second_half_hour_slot(self):
+        now = datetime(2026, 7, 7, 2, 45)  # inside 02:30-03:00
+        out = engine._derive_started_slots(
+            now, self._planned("2026-07-07T02:00:00", "2026-07-07T03:00:00"),
+            "SMART_CONTROL_IN_PROGRESS")
+        self.assertEqual(out, ["2026-07-07T02:30:00"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestReconcileDecision(unittest.TestCase):
+    """§12 settlement reconciliation: started → off-peak (restores solar slots),
+    neither started nor completed → peak (reverts over-credit), completed-without-
+    started → review (never auto-changed)."""
+
+    def test_started_restores_off_peak(self):
+        # solar slot: started but floored to peak -> restore
+        self.assertEqual(engine._reconcile_decision(True, True, False)[0], "off_peak")
+
+    def test_started_already_off_peak_is_ok(self):
+        self.assertEqual(engine._reconcile_decision(True, True, True)[0], "ok")
+
+    def test_neither_reverts_to_peak(self):
+        # planned, baseload pushed it off-peak, but no charge -> revert
+        self.assertEqual(engine._reconcile_decision(False, False, True)[0], "peak")
+
+    def test_neither_already_peak_is_ok(self):
+        self.assertEqual(engine._reconcile_decision(False, False, False)[0], "ok")
+
+    def test_completed_without_started_is_review(self):
+        # ambiguous: missed-poll smart OR bump — never auto-changed either way
+        self.assertEqual(engine._reconcile_decision(False, True, True)[0], "review")
+        self.assertEqual(engine._reconcile_decision(False, True, False)[0], "review")
+
+    def test_started_overrides_missing_completed(self):
+        # started with no completed yet (completed lands later) still → off-peak
+        self.assertEqual(engine._reconcile_decision(True, False, False)[0], "off_peak")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestReconcilePass(unittest.IsolatedAsyncioTestCase):
+    """§12 settlement reconciliation pass: bidirectional, accumulation-gated,
+    correction-safe. Restores solar slots, reverts non-charging slots, and never
+    touches historical (pre-accumulation) or user-corrected blocks."""
+
+    def _sched(self):
+        class S:
+            def is_empty(self): return False
+            def off_peak_rate_near(self, ts): return 5.493   # £0.05493
+            def resolve(self, ts): return 32.3092            # £0.323092
+        return S()
+
+    def _seed(self, store, slot, imp_rate, kinds, off_peak_slot=True, corrected=0):
+        store._conn.execute(
+            "INSERT OR IGNORE INTO config_periods (id, effective_from, billing_day, "
+            "block_minutes, timezone) VALUES (1, '2020-01-01T00:00:00', 1, 30, 'UTC')")
+        store._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+            "imp_kwh, imp_rate, rate_corrected) VALUES (?,?,?,?,?,?,?)",
+            (slot, slot, "electricity_main", 1, 1.0, imp_rate, corrected))
+        if off_peak_slot:
+            store.upsert_dispatch_slot(slot, off_peak=True, provider="Myenergi",
+                                       source="smart-charge", state="planned")
+        for k in kinds:
+            store.record_dispatch_history(slot, k, provider="Myenergi")
+        store._conn.commit()
+
+    async def _run(self, store):
+        import engine
+        engine._store = store
+        engine._RECONCILE_SETTLE_HOURS = 0.0
+        engine._kraken_rate_schedules = {"import": self._sched()}
+        try:
+            return await engine.reconcile_dispatch_overlay()
+        finally:
+            engine._store = None
+
+    async def test_restore_solar_slot(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # solar: started but floored to PEAK -> should restore to off-peak
+        self._seed(st, "2020-01-01T13:30:00", 0.323092,
+                   ["planned", "started", "completed"])
+        res = await self._run(st)
+        self.assertEqual(res["restored"], 1)
+        r = st._conn.execute("SELECT imp_rate FROM blocks WHERE block_start=?",
+                             ("2020-01-01T13:30:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)
+
+    async def test_revert_non_charging_slot(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # planned, off-peaked, but never started/completed -> revert to peak
+        self._seed(st, "2020-01-01T20:00:00", 0.05493, ["planned"])
+        res = await self._run(st)
+        self.assertEqual(res["reverted"], 1)
+        r = st._conn.execute("SELECT imp_rate FROM blocks WHERE block_start=?",
+                             ("2020-01-01T20:00:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.323092, places=5)
+
+    async def test_skip_user_corrected(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        self._seed(st, "2020-01-01T20:00:00", 0.05493, ["planned"], corrected=1)
+        res = await self._run(st)
+        self.assertEqual(res["reverted"], 0)  # skipped
+        r = st._conn.execute("SELECT imp_rate FROM blocks WHERE block_start=?",
+                             ("2020-01-01T20:00:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)  # untouched
+
+    async def test_skip_pre_accumulation_slot(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # off_peak dispatch_slot but NO dispatch_history (pre-3.1.4) -> not a candidate
+        self._seed(st, "2020-01-01T20:00:00", 0.05493, [])  # no history kinds
+        res = await self._run(st)
+        self.assertEqual((res["restored"], res["reverted"], res["review"]),
+                         (0, 0, 0))
+        r = st._conn.execute("SELECT imp_rate FROM blocks WHERE block_start=?",
+                             ("2020-01-01T20:00:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)  # untouched
+
+    async def test_review_left_untouched(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # completed but no started -> review, no change
+        self._seed(st, "2020-01-01T20:00:00", 0.05493, ["planned", "completed"])
+        res = await self._run(st)
+        self.assertEqual((res["restored"], res["reverted"], res["review"]),
+                         (0, 0, 1))
+
+
 if __name__ == "__main__":
     unittest.main()

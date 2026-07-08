@@ -87,6 +87,7 @@ _engine_loop_lock:         asyncio.Lock = None   # initialised in setup()
 _engine_paused:            bool         = False
 _last_ci_fetch:            datetime | None = None   # UTC — last carbon intensity fetch
 _last_dispatch_capture:    datetime | None = None   # UTC — last dispatch-slot capture (5-min cadence)
+_last_reconcile:           datetime | None = None   # UTC — last dispatch reconciliation (hourly cadence)
 _current_slot_mix:         dict            = {}      # captured_at → generationmix list
 _meter_reset_detected:     bool            = False   # set when post-gap read < pre-gap read (possible meter replacement)
 
@@ -2251,23 +2252,46 @@ def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricit
         dcc_kwh = main.get("imp_kwh_api")
         chosen = dcc_kwh if (use_dcc and dcc_kwh is not None) else cad_kwh
         if chosen is not None:
-            rate, rep = _resolve_block_rate(imp_ch, block.get("start", ""),
-                                            "import", rate_resolver)
-            _rate_repaired = _rate_repaired or rep
-            if rep:
+            # Preserve a deliberate rate override — a user correction
+            # (rate_corrected) or a dispatch reconciliation (rate_reconciled). If
+            # PASS 2 re-runs after one of those (e.g. a re-settlement), it must NOT
+            # re-resolve the overlay over the override; keep the stored rate and
+            # only re-cost it against the settled kWh. (Ordering normally puts
+            # reconcile after settlement, so this is belt-and-braces.)
+            _override_rate = None
+            try:
+                if _store is not None:
+                    _mrow = _store._conn.execute(
+                        "SELECT rate_corrected, rate_reconciled, imp_rate "
+                        "FROM blocks WHERE block_start = ? AND meter_id = ?",
+                        (block.get("start", ""), main_meter_id)).fetchone()
+                    if _mrow and (_mrow[0] or _mrow[1]) and _mrow[2] is not None:
+                        _override_rate = _mrow[2]
+            except Exception:
+                _override_rate = None
+            if _override_rate is not None:
+                rate = _override_rate
+                logger.info("_rerun_pass2: %s rate override preserved (%.5f) — "
+                            "re-costed to settled kWh (not re-resolved)",
+                            block.get("start", ""), rate)
                 imp_ch["rate"] = rate
-            # Dispatch overlay: an out-of-window smart-charge slot with real draw
-            # is repriced to off-peak (compute-and-log until validated). Gated by
-            # the materialised import kWh (meter validation).
-            rate = _dispatch_overlay_rate("import", block.get("start", ""),
-                                          rate, chosen)
-            # Persist the EFFECTIVE (post-overlay) rate, not just the cost. PASS 2
-            # (below) prices every device's grid import at the parent's imp_ch
-            # ["rate"]; if we left the pre-overlay base here, a settled block would
-            # bill the main off-peak but charge its devices' grid draw at PEAK —
-            # a real overcharge on every reconciled smart-charge block. Mirrors
-            # finalise_block, where the main overlay writes result["rate"] = _ov.
-            imp_ch["rate"] = rate
+            else:
+                rate, rep = _resolve_block_rate(imp_ch, block.get("start", ""),
+                                                "import", rate_resolver)
+                _rate_repaired = _rate_repaired or rep
+                if rep:
+                    imp_ch["rate"] = rate
+                # Dispatch overlay: an out-of-window smart-charge slot with real
+                # draw is repriced to off-peak. Gated by the materialised import
+                # kWh (meter validation).
+                rate = _dispatch_overlay_rate("import", block.get("start", ""),
+                                              rate, chosen)
+                # Persist the EFFECTIVE (post-overlay) rate, not just the cost.
+                # PASS 2 prices every device's grid import at the parent's
+                # imp_ch["rate"]; leaving the pre-overlay base here would bill the
+                # main off-peak but devices at PEAK — a real overcharge. Mirrors
+                # finalise_block, where the main overlay writes result["rate"].
+                imp_ch["rate"] = rate
             imp_ch["kwh"] = chosen
             imp_ch["kwh_total"] = chosen
             imp_ch["cost"] = round(chosen * rate, 6)
@@ -4957,9 +4981,10 @@ async def _capture_dispatch_slots() -> int:
         return _capture_ohme_slots(provider, planned)
 
     slots = _smart_charge_slots(planned)
-    if not slots:
-        return 0
-    slot_energy = _planned_dispatch_slot_energy(planned)
+    # NB: do NOT early-return when planned is empty. Completed dispatches land
+    # AFTER the charge, by which point flexPlannedDispatches is already empty
+    # (planned=0) — an early return here skipped the completed capture entirely.
+    slot_energy = _planned_dispatch_slot_energy(planned) if slots else {}
     captured = 0
     for slot_start in sorted(slots):
         try:
@@ -4974,8 +4999,80 @@ async def _capture_dispatch_slots() -> int:
     if captured:
         logger.info("_capture_dispatch_slots: persisted %d smart-charge slot(s) "
                     "(provider=%s)", captured, provider)
+
+    # Record COMPLETED dispatch energy per slot (observe-only). Completed
+    # dispatches land hours after the charge, so this is the settlement-time
+    # signal the #253 validation will veto against — NOT used for billing yet.
+    # OHME already returned above (its completed dispatches carry no reliable
+    # smart-vs-boost signal), so this covers only Octopus-controlled providers.
+    # We only ANNOTATE slots that already exist (were captured as planned) — we
+    # never create a new off_peak slot from a completed dispatch, so this can't
+    # change what the overlay prices. off_peak / provider / source are preserved.
+    completed = disp.get("completed") or []
+    if completed:
+        comp = _completed_dispatch_slot_energy(completed)
+        n_comp = 0
+        for slot_start, e_comp in comp.items():
+            if e_comp is None:
+                continue
+            existing = _store.get_dispatch_slot(slot_start)
+            if not existing:
+                continue
+            try:
+                _store.upsert_dispatch_slot(
+                    slot_start,
+                    off_peak=bool(existing.get("off_peak")),
+                    provider=existing.get("provider") or provider,
+                    source=existing.get("source") or "smart-charge",
+                    state="completed", energy_completed=e_comp)
+                n_comp += 1
+            except Exception as e:
+                logger.warning("_capture_dispatch_slots: completed persist %s "
+                               "failed: %s", slot_start, e)
+        if n_comp:
+            logger.info("_capture_dispatch_slots: recorded completed energy for "
+                        "%d slot(s) (observe-only)", n_comp)
+
+    # Accumulate ALL planned + completed dispatches into dispatch_history
+    # (observe-only, design §11) — a persistent record across polls, separate
+    # from the billing dispatch_slots. This retains completed dispatches for
+    # slots we never planned (the tail slots the per-poll snapshot loses) and is
+    # what makes a future "never saw this slot" judgement trustworthy. Never read
+    # for billing.
+    try:
+        for slot_start in sorted(slots):
+            _store.record_dispatch_history(
+                slot_start, "planned", provider=provider,
+                source="smart-charge", energy_kwh=slot_energy.get(slot_start))
+        for slot_start, e_comp in _completed_dispatch_slot_energy(completed).items():
+            _store.record_dispatch_history(
+                slot_start, "completed", provider=provider,
+                source="unknown", energy_kwh=e_comp)
+    except Exception as e:
+        logger.warning("_capture_dispatch_slots: history accumulation failed: %s", e)
+
+    # Derive `started` for the current slot (design §11.2) — the smart-vs-bump
+    # discriminator. Only fires when the intelligent state is
+    # SMART_CONTROL_IN_PROGRESS AND a planned dispatch is active now; a bump never
+    # enters that state, so it never starts. Best-effort + observe-only: the
+    # state fetch is isolated (None on any error → no started slot), and started
+    # is recorded only into dispatch_history, never the billing dispatch_slots.
+    try:
+        state = await _kraken_client.get_intelligent_state(_kraken_account_number)
+        if state:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            for slot_start in _derive_started_slots(now, planned, state):
+                _store.record_dispatch_history(
+                    slot_start, "started", provider=provider,
+                    source="smart-charge", energy_kwh=None)
+                logger.info("_capture_dispatch_slots: slot %s STARTED "
+                            "(intelligent_state=%s)", slot_start, state)
+    except Exception as e:
+        logger.warning("_capture_dispatch_slots: started derivation failed: %s", e)
+
     try:
         _store.prune_dispatch_slots(days=90)
+        _store.prune_dispatch_history(days=90)
     except Exception:
         pass
     return captured
@@ -5007,6 +5104,20 @@ async def _tick_dispatch_capture() -> None:
         await _capture_dispatch_slots()
     except Exception as e:
         logger.warning("_tick_dispatch_capture: failed: %s", e)
+
+    # Settlement-time reconciliation (design §12) — hourly, not every 5 min. By
+    # now `started` (real-time) and `completed` (~hours) have settled for older
+    # slots, so we can reprice off-peak/peak from the lifecycle instead of the
+    # meter. Runs on this loop thread (single store connection).
+    global _last_reconcile
+    r_elapsed = ((now - _last_reconcile).total_seconds()
+                 if _last_reconcile else None)
+    if r_elapsed is None or r_elapsed >= 3600:
+        _last_reconcile = now
+        try:
+            await reconcile_dispatch_overlay()
+        except Exception as e:
+            logger.warning("_tick_dispatch_capture: reconcile failed: %s", e)
 
 
 async def _log_dispatches_observe_only() -> None:
@@ -5124,6 +5235,240 @@ def _planned_dispatch_slot_energy(planned: list) -> dict:
             else:
                 out[k] = round((out.get(k) or 0.0) + per, 4)
     return out
+
+
+def _completed_dispatch_slot_energy(completed: list) -> dict:
+    """Map COMPLETED dispatches to per-slot delivered energy (kWh).
+
+    Like _planned_dispatch_slot_energy, but for completedDispatches — what
+    Octopus ACTUALLY dispatched, which land hours after the charge. No source
+    filter: completed dispatches come back source='unknown' (the smart-vs-bump
+    label is lost on completion), so we key on the dispatch itself, not a label.
+    Signed like the planned figure (a charge is negative kWh). OBSERVE-ONLY —
+    recorded to energy_completed for the future settlement-time validation
+    (see dispatch_validation_design.md); NOT used for billing yet.
+    """
+    out: dict = {}
+    for d in completed or []:
+        start = d.get("start"); end = d.get("end")
+        if not start or not end:
+            continue
+        try:
+            s = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+            e = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if s.tzinfo is not None:
+            s = s.astimezone(timezone.utc).replace(tzinfo=None)
+        if e.tzinfo is not None:
+            e = e.astimezone(timezone.utc).replace(tzinfo=None)
+        covered = []
+        slot = s.replace(minute=(0 if s.minute < 30 else 30),
+                         second=0, microsecond=0)
+        while slot < e:
+            covered.append(slot.isoformat())
+            slot = slot + timedelta(minutes=30)
+        if not covered:
+            continue
+        try:
+            per = (float(d.get("delta")) / len(covered)) \
+                if d.get("delta") is not None else None
+        except (TypeError, ValueError):
+            per = None
+        for k in covered:
+            if per is None:
+                out.setdefault(k, None)
+            else:
+                out[k] = round((out.get(k) or 0.0) + per, 4)
+    return out
+
+
+def _derive_started_slots(now_utc: datetime, planned: list,
+                          intelligent_state: str | None) -> list:
+    """Derive `started` 30-minute slots (design §11.2 — BCD's mechanism).
+
+    The CURRENT slot becomes 'started' ONLY when the intelligent state is
+    `SMART_CONTROL_IN_PROGRESS` AND a planned dispatch is active right now (and
+    therefore still present in the list — planned can be pulled last-minute).
+    Done one 30-min slot at a time; accumulation across polls builds the full
+    set. A bump never enters `SMART_CONTROL_IN_PROGRESS`, so it never becomes
+    started — which is exactly why `started` discriminates smart from bump where
+    `completed` can't. Returns 0 or 1 slot_start ISO strings (naive UTC).
+    """
+    if intelligent_state != "SMART_CONTROL_IN_PROGRESS":
+        return []
+    now = now_utc
+    if now.tzinfo is not None:
+        now = now.astimezone(timezone.utc).replace(tzinfo=None)
+    active = False
+    for d in planned or []:
+        s, e = d.get("start"), d.get("end")
+        if not s or not e:
+            continue
+        try:
+            sd = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+            ed = datetime.fromisoformat(str(e).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if sd.tzinfo is not None:
+            sd = sd.astimezone(timezone.utc).replace(tzinfo=None)
+        if ed.tzinfo is not None:
+            ed = ed.astimezone(timezone.utc).replace(tzinfo=None)
+        if sd <= now < ed:
+            active = True
+            break
+    if not active:
+        return []
+    slot = now.replace(minute=(0 if now.minute < 30 else 30),
+                       second=0, microsecond=0)
+    return [slot.isoformat()]
+
+
+def _reconcile_decision(has_started: bool, has_completed: bool,
+                        currently_off_peak: bool) -> tuple:
+    """Settlement-time reconciliation of the dispatch overlay against the
+    accumulated lifecycle (design §12). Keys purely on whether the slot STARTED
+    (SMART_CONTROL_IN_PROGRESS + planned active) — the validated smart-vs-bump,
+    solar-immune signal — never on the meter.
+
+    Returns (target, reason) where target is one of:
+      - 'off_peak' : started present → genuine smart charge. Restores off-peak,
+                     including solar slots the meter floor wrongly rejected.
+      - 'peak'     : neither started nor completed → planned but never charged
+                     (the over-report / paused case).
+      - 'review'   : completed but NOT started → ambiguous (a missed-poll smart
+                     charge OR a bump). NEVER auto-changed — flagged for the user
+                     to check against the real bill, so we neither under-credit a
+                     missed poll nor over-credit a bump.
+      - 'ok'       : the correct target already matches the current rate.
+    Only 'off_peak' and 'peak' are actionable; 'review' and 'ok' write nothing.
+    """
+    if has_started:
+        target = "off_peak"
+    elif not has_completed:
+        target = "peak"
+    else:
+        return ("review",
+                "completed but not started — ambiguous (missed-poll smart or bump)")
+    if (target == "off_peak" and currently_off_peak) or \
+       (target == "peak" and not currently_off_peak):
+        return ("ok", "already correct")
+    return (target,
+            "started → off-peak (restore)" if target == "off_peak"
+            else "no started/completed → peak (revert)")
+
+
+_RECONCILE_SETTLE_HOURS = 6.0     # revert/review: wait for completed (~hrs) to settle
+_RECONCILE_STARTED_GATE_MIN = 40  # restore: slot ended + a poll margin (started is real-time)
+_DISPATCH_RECONCILE_APPLY = True  # write (risk accepted; soaked on prod_dev first)
+
+
+async def reconcile_dispatch_overlay() -> dict:
+    """Settlement-time reconciliation of the dispatch overlay against the
+    accumulated lifecycle (design §12). For each SETTLED, non-user-corrected main
+    block whose slot was a planned smart-charge candidate, decide off-peak/peak
+    from `started` / `completed` — never the meter — and reprice if it disagrees
+    with the current rate. Bidirectional: RESTORES solar slots the meter floor
+    wrongly peaked, REVERTS planned-but-never-charged slots. 'review'
+    (completed-without-started) is logged and left untouched. Devices follow the
+    main rate; blocks the user manually corrected are skipped. Runs on the engine
+    loop (single store connection); regenerates charts if anything changed.
+    """
+    store = _store
+    if store is None:
+        return {}
+    sched = _kraken_rate_schedules.get("import")
+    if sched is None or sched.is_empty():
+        return {}
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    # Two gates: a RESTORE can happen as soon as the slot has ended (`started` is
+    # captured in real-time, so it's already known); a REVERT/REVIEW must wait for
+    # `completed` (~hrs) to settle, else we can't tell "neither → peak" from
+    # "completed-but-not-started → review".
+    started_cutoff = (now - timedelta(minutes=_RECONCILE_STARTED_GATE_MIN)).isoformat()
+    settle_cutoff = (now - timedelta(hours=_RECONCILE_SETTLE_HOURS)).isoformat()
+    try:
+        rows = store._conn.execute(
+            """SELECT b.block_start, b.imp_kwh, b.imp_rate
+               FROM blocks b
+               WHERE b.meter_id = 'electricity_main' AND b.rate_corrected = 0
+                 AND b.block_start < ?
+                 AND EXISTS (SELECT 1 FROM dispatch_slots s
+                             WHERE s.slot_start = b.block_start AND s.off_peak = 1)
+                 AND EXISTS (SELECT 1 FROM dispatch_history h
+                             WHERE h.slot_start = b.block_start AND h.kind = 'planned')
+               ORDER BY b.block_start""", (started_cutoff,)).fetchall()
+    except Exception as e:
+        logger.warning("reconcile_dispatch_overlay: query failed: %s", e)
+        return {}
+    n_restore = n_revert = n_review = n_deferred = 0
+    changed = False
+    n_candidates = len(rows)
+    for r in rows:
+        bs = r["block_start"]
+        kinds = {x[0] for x in store._conn.execute(
+            "SELECT kind FROM dispatch_history WHERE slot_start = ?", (bs,))}
+        has_started = "started" in kinds
+        # A no-started slot's fate (revert vs review) hinges on completed, which
+        # lands late — defer it until it clears the settle gate. A started slot is
+        # decidable now.
+        if not has_started and bs >= settle_cutoff:
+            n_deferred += 1
+            continue
+        op_pence = sched.off_peak_rate_near(bs)
+        base_pence = sched.resolve(bs)
+        if op_pence is None or base_pence is None:
+            continue
+        off_peak = round(op_pence / 100.0, 6)
+        base = round(base_pence / 100.0, 6)
+        cur_rate = r["imp_rate"] or 0.0
+        currently_off_peak = abs(cur_rate - off_peak) < 1e-6
+        target, reason = _reconcile_decision(
+            has_started, "completed" in kinds, currently_off_peak)
+        if target == "review":
+            n_review += 1
+            logger.info("reconcile: %s REVIEW — %s (unchanged)", bs, reason)
+            continue
+        if target == "ok":
+            continue
+        new_rate = off_peak if target == "off_peak" else base
+        if not _DISPATCH_RECONCILE_APPLY:
+            logger.info("reconcile: WOULD %s %s %.5f→%.5f (%s)",
+                        target, bs, cur_rate, new_rate, reason)
+            continue
+        with store._conn:
+            store._conn.execute(
+                "UPDATE blocks SET imp_rate = ?, rate_reconciled = 1, "
+                "imp_cost = ROUND(COALESCE(imp_kwh, 0) * ?, 6) "
+                "WHERE block_start = ? AND meter_id = 'electricity_main'",
+                (new_rate, new_rate, bs))
+            store._conn.execute(
+                "UPDATE blocks SET imp_rate = ?, rate_reconciled = 1, "
+                "imp_cost = ROUND(COALESCE(imp_kwh_grid, imp_kwh, 0) * ?, 6) "
+                "WHERE block_start = ? AND rate_corrected = 0 AND meter_id IN "
+                "(SELECT meter_id FROM meters WHERE is_sub_meter = 1)",
+                (new_rate, new_rate, bs))
+        changed = True
+        if target == "off_peak":
+            n_restore += 1
+        else:
+            n_revert += 1
+        logger.info("reconcile: %s %s %.5f→%.5f (%s)",
+                    target, bs, cur_rate, new_rate, reason)
+    if changed:
+        try:
+            generate_charts(store)
+        except Exception as e:
+            logger.warning("reconcile_dispatch_overlay: chart regen failed: %s", e)
+    # Heartbeat every run (even with no changes) so the pass is observable in the
+    # log — "0 candidates" vs "N candidates, 0 changed" tells very different
+    # stories when a block isn't being corrected.
+    logger.info("reconcile: scanned %d candidate(s) — %d restored, %d reverted, "
+                "%d review, %d deferred (settle=%dh)",
+                n_candidates, n_restore, n_revert, n_review, n_deferred,
+                int(_RECONCILE_SETTLE_HOURS))
+    return {"restored": n_restore, "reverted": n_revert, "review": n_review,
+            "deferred": n_deferred}
 
 
 async def kraken_poll_task(ha: HAClient):

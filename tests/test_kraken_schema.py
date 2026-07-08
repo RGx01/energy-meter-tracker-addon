@@ -1558,3 +1558,55 @@ class TestPowerInvertPersistence(_StoreBase):
         pid = self.store.get_current_config_period_id()
         meta = self.store.config_from_db(pid)["meters"]["electricity_main"]["meta"]
         self.assertFalse(meta.get("power_invert"))
+
+
+class TestDispatchHistoryAccumulation(_StoreBase):
+    """§11 observe-only accumulation: a persistent record of every dispatch seen,
+    separate from the billing dispatch_slots, so 'absent' is trustworthy and tail
+    dispatches aren't lost to the per-poll snapshot."""
+
+    def test_table_present(self):
+        cols = {r[1] for r in self.store._conn.execute(
+            "PRAGMA table_info(dispatch_history)")}
+        self.assertTrue(
+            {"slot_start", "kind", "provider", "source", "energy_kwh",
+             "first_seen", "last_seen"} <= cols)
+
+    def test_accumulates_first_seen_preserved_last_seen_advances(self):
+        self.store.record_dispatch_history(
+            "2026-07-06T20:00:00", "completed", provider="Myenergi",
+            source="unknown", energy_kwh=-0.27, seen_at="2026-07-07T07:50:00")
+        # re-seen on a later poll
+        self.store.record_dispatch_history(
+            "2026-07-06T20:00:00", "completed", provider="Myenergi",
+            source="unknown", energy_kwh=-0.27, seen_at="2026-07-07T08:33:00")
+        r = self.store.get_dispatch_history(
+            "2026-07-06T00:00:00", "2026-07-08T00:00:00", kind="completed")[0]
+        self.assertEqual(r["first_seen"], "2026-07-07T07:50:00")  # preserved
+        self.assertEqual(r["last_seen"], "2026-07-07T08:33:00")   # advanced
+        self.assertAlmostEqual(r["energy_kwh"], -0.27, places=3)
+
+    def test_records_tail_slot_dispatch_slots_would_skip(self):
+        # a completed dispatch with no matching planned slot — dispatch_slots
+        # skips it, but history must retain it
+        self.store.record_dispatch_history(
+            "2026-07-06T20:00:00", "completed", energy_kwh=-0.27)
+        self.assertIsNone(self.store.get_dispatch_slot("2026-07-06T20:00:00"))
+        hist = self.store.get_dispatch_history(
+            "2026-07-06T00:00:00", "2026-07-08T00:00:00")
+        self.assertEqual(len(hist), 1)
+
+    def test_planned_and_completed_coexist_same_slot(self):
+        self.store.record_dispatch_history(
+            "2026-07-07T02:00:00", "planned", energy_kwh=-3.35)
+        self.store.record_dispatch_history(
+            "2026-07-07T02:00:00", "completed", energy_kwh=-3.18)
+        both = self.store.get_dispatch_history(
+            "2026-07-07T00:00:00", "2026-07-07T03:00:00")
+        self.assertEqual({r["kind"] for r in both}, {"planned", "completed"})
+
+    def test_prune(self):
+        self.store.record_dispatch_history(
+            "2020-01-01T00:00:00", "completed", energy_kwh=-1.0)
+        deleted = self.store.prune_dispatch_history(days=90)
+        self.assertEqual(deleted, 1)

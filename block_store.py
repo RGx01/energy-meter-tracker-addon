@@ -143,6 +143,8 @@ CREATE TABLE IF NOT EXISTS blocks (
     exp_kwh_api         REAL,                       -- DCC-settled export kWh from Kraken REST (NULL until settlement)
     needs_review        INTEGER NOT NULL DEFAULT 0, -- 1 = CAD/Mini vs DCC drift exceeded threshold
     carbon_intensity_g  REAL,                       -- gCO2/kWh at block_start, stored at write time (survives CI table pruning)
+    rate_corrected      INTEGER NOT NULL DEFAULT 0, -- 1 = user manually corrected the rate; dispatch reconciliation must not touch it
+    rate_reconciled     INTEGER NOT NULL DEFAULT 0, -- 1 = dispatch reconciliation set the rate; a later PASS 2 re-run must not stomp it
     FOREIGN KEY (config_period_id) REFERENCES config_periods(id),
     UNIQUE (block_start, meter_id)
 );
@@ -292,6 +294,24 @@ CREATE TABLE IF NOT EXISTS dispatch_slots (
     PRIMARY KEY (slot_start)
 );
 CREATE INDEX IF NOT EXISTS idx_dispatch_slots_start ON dispatch_slots (slot_start);
+
+-- Local dispatch ACCUMULATION (observe-only; see dispatch_validation_design.md §11).
+-- Separate from dispatch_slots (the billing surface) on purpose: this records
+-- EVERY planned/completed dispatch we ever see, accumulated across polls, so
+-- "absent" becomes meaningful and transient/tail dispatches aren't lost to the
+-- per-poll snapshot. NOTHING reads this for billing. Mirrors BCD's local
+-- intelligent_dispatches_history.
+CREATE TABLE IF NOT EXISTS dispatch_history (
+    slot_start  TEXT NOT NULL,      -- naive-UTC ISO, 30-min slot boundary
+    kind        TEXT NOT NULL,      -- 'planned' | 'completed' | 'started'
+    provider    TEXT,
+    source      TEXT,               -- meta.source (smart-charge/bump/unknown)
+    energy_kwh  REAL,               -- signed kWh for this slot (negative = charge)
+    first_seen  TEXT NOT NULL,      -- UTC ISO — first poll that saw this slot/kind
+    last_seen   TEXT NOT NULL,      -- UTC ISO — most recent poll that saw it
+    PRIMARY KEY (slot_start, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_dispatch_history_start ON dispatch_history (slot_start);
 """
 
 
@@ -846,6 +866,8 @@ class BlockStore:
             ("finalised_from_cad", "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
             ("needs_review",       "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
             ("carbon_intensity_g", "blocks",        "REAL",                       _b_cols),
+            ("rate_corrected",     "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
+            ("rate_reconciled",    "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
             ("carbon_gco2_min",  "power_history",   "REAL",              _ph_cols),
             # ── 3.1.x dispatch lifecycle capture (observe-only, no billing effect)
             ("state",            "dispatch_slots", "TEXT",  _ds_cols),
@@ -1190,6 +1212,59 @@ class BlockStore:
             cur = self._conn.execute(
                 "DELETE FROM dispatch_slots WHERE slot_start < ?", (cutoff,)
             )
+        return cur.rowcount
+
+    # ── Dispatch history (observe-only accumulation, design §11) ──────────────
+
+    def record_dispatch_history(self, slot_start: str, kind: str, *,
+                                provider: str | None = None,
+                                source: str | None = None,
+                                energy_kwh: float | None = None,
+                                seen_at: str | None = None) -> None:
+        """Accumulate one (slot_start, kind) dispatch observation. OBSERVE-ONLY —
+        never read for billing. first_seen is set once and preserved; last_seen
+        and the latest energy/provider/source refresh on every poll that sees it.
+        Keeping a persistent record (vs the per-poll snapshot) is what makes a
+        later 'never seen this slot' judgement trustworthy."""
+        seen = seen_at or datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO dispatch_history
+                       (slot_start, kind, provider, source, energy_kwh,
+                        first_seen, last_seen)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(slot_start, kind) DO UPDATE SET
+                       provider   = COALESCE(excluded.provider, dispatch_history.provider),
+                       source     = COALESCE(excluded.source,   dispatch_history.source),
+                       energy_kwh = COALESCE(excluded.energy_kwh, dispatch_history.energy_kwh),
+                       last_seen  = excluded.last_seen""",
+                (slot_start, kind, provider, source, energy_kwh, seen, seen))
+
+    def get_dispatch_history(self, start_iso: str, end_iso: str,
+                             kind: str | None = None) -> list:
+        """Accumulated dispatch observations with slot_start in [start, end).
+        Optionally filter by kind. Ordered by slot_start."""
+        if kind is not None:
+            rows = self._conn.execute(
+                "SELECT slot_start, kind, provider, source, energy_kwh, "
+                "first_seen, last_seen FROM dispatch_history "
+                "WHERE slot_start >= ? AND slot_start < ? AND kind = ? "
+                "ORDER BY slot_start", (start_iso, end_iso, kind)).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT slot_start, kind, provider, source, energy_kwh, "
+                "first_seen, last_seen FROM dispatch_history "
+                "WHERE slot_start >= ? AND slot_start < ? "
+                "ORDER BY slot_start, kind", (start_iso, end_iso)).fetchall()
+        return [dict(r) for r in rows]
+
+    def prune_dispatch_history(self, days: int = 90) -> int:
+        """Delete dispatch_history older than `days`. Returns rows deleted."""
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                  - timedelta(days=days)).isoformat()
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM dispatch_history WHERE slot_start < ?", (cutoff,))
         return cur.rowcount
 
     # ── Generation mix ────────────────────────────────────────────────────────
