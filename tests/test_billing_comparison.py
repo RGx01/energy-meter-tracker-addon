@@ -184,3 +184,46 @@ if __name__ == "__main__":
     tz_name = sys.argv[2] if len(sys.argv) > 2 else "Europe/London"
     ok = run_comparison(db_path, tz_name)
     sys.exit(0 if ok else 1)
+
+class TestPerPeriodTotalIsolation(unittest.TestCase):
+    """Regression: the Billing chart total_cost must be computed over the SELECTED
+    period only. It previously used min/max of ALL blocks, so every month returned
+    the identical all-time net (observed: every month showing the same £ total)."""
+
+    def _seed_month(self, store, cp, month, imp_cost, exp_cost):
+        # one block on the 15th of the month at midday UTC
+        bs = f"2026-{month:02d}-15T12:00:00"
+        store._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id,"
+            " imp_kwh, imp_cost, exp_kwh, exp_cost, standing_charge) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (bs, bs, "electricity_main", cp, 10.0, imp_cost, 5.0, exp_cost, 0.50))
+        store._conn.commit()
+
+    def _total(self, store, month):
+        from datetime import datetime
+        blocks = [dict(r) | {"start": r["block_start"], "_timezone": "Europe/London",
+                             "channels": {}}
+                  for r in store._conn.execute("SELECT * FROM blocks")]
+        s = datetime(2026, month, 1)
+        e = datetime(2026, month + 1, 1)
+        return ec.calculate_billing_summary_for_period(
+            blocks, s, e, store=store, tz_name="Europe/London")["total_cost"]
+
+    def test_months_have_distinct_totals(self):
+        from block_store import BlockStore
+        store = BlockStore(":memory:")
+        store._conn.execute(
+            "INSERT OR IGNORE INTO config_periods (id, effective_from, billing_day, "
+            "block_minutes, timezone) VALUES (1,'2026-01-01T00:00:00',1,30,'Europe/London')")
+        store._conn.execute(
+            "INSERT OR IGNORE INTO meters (config_period_id, meter_id, is_sub_meter) "
+            "VALUES (1,'electricity_main',0)")
+        store._conn.commit()
+        self._seed_month(store, 1, 3, imp_cost=5.00, exp_cost=1.00)   # Mar net ~ +4.50
+        self._seed_month(store, 1, 4, imp_cost=2.00, exp_cost=9.00)   # Apr net ~ -6.50
+        mar = self._total(store, 3)
+        apr = self._total(store, 4)
+        self.assertNotEqual(mar, apr, "each month must have its own total, not the all-time net")
+        self.assertGreater(mar, 0)   # Mar: import > export
+        self.assertLess(apr, 0)      # Apr: export > import
