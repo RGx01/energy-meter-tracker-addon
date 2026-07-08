@@ -161,6 +161,31 @@ async def build_rate_schedule(
         logger.warning("build_rate_schedule: fetch failed for %s/%s: %s",
                        product_code, tariff_code, e)
         return RateSchedule([])
+    if not records:
+        # New IOG time-of-use / 6-hour-cap tariff (IOG-SMB-TOU) drops
+        # `standard-unit-rates` for split `day` + `night` (general usage) and
+        # `ev-device-*` (EV charging) buckets. Reconstruct the base TOU schedule
+        # by merging day + night — each carries its own half-hour periods, so
+        # concatenating them rebuilds the full day/night schedule. The EV-device
+        # rates and the daily 6-hour off-peak cap are deliberately NOT applied
+        # yet (OE hasn't confirmed the cap rules — see docs/iog_6hr_cap_design.md);
+        # dispatched EV charging keeps using the general off-peak (night) rate via
+        # the dispatch overlay in the interim.
+        try:
+            day = await client.get_unit_rates(
+                product_code, tariff_code, rate_type="day-unit-rates",
+                period_from=period_from, period_to=period_to)
+            night = await client.get_unit_rates(
+                product_code, tariff_code, rate_type="night-unit-rates",
+                period_from=period_from, period_to=period_to)
+            records = (day or []) + (night or [])
+            if records:
+                logger.info("build_rate_schedule: %s — no standard rates; built "
+                            "from day(%d)+night(%d) TOU buckets (new IOG structure)",
+                            tariff_code, len(day or []), len(night or []))
+        except Exception as e:
+            logger.warning("build_rate_schedule: day/night fallback failed for "
+                           "%s/%s: %s", product_code, tariff_code, e)
     sched = RateSchedule.from_api_records(records)
     # Diagnostic: surface DISTINCT rate values, plus the FIRST and LAST few
     # periods and the date-span each distinct rate covers. This reveals whether
