@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased] — 3.1.5
+
+### Fixed
+
+- **New Intelligent Octopus 6-hour-cap tariff — general-usage rates now supported** ([#1708](https://github.com/BottlecapDave/HomeAssistant-OctopusEnergy/issues/1708)). Following the fail-loud guard below, EMT now reads the new tariff's split rate buckets: when `standard-unit-rates` is absent it fetches `day-unit-rates` + `night-unit-rates` and merges them into the day/night time-of-use schedule, so a migrated meter is **billed correctly for general usage** instead of flagged unsupported. The EV-device rates and the daily 6-hour off-peak cap are **not** applied yet — Octopus hasn't finalised those rules — so dispatched EV charging keeps using the general off-peak (night) rate in the interim (a bounded approximation, documented in `docs/iog_6hr_cap_design.md`). Full EV-cap support follows once OE confirms the mechanics.
+- **Fail loud on the new Intelligent Octopus 6-hour-cap tariff instead of silently mispricing** ([#1708](https://github.com/BottlecapDave/HomeAssistant-OctopusEnergy/issues/1708)). Octopus is migrating IOG customers to a new time-of-use tariff (`IOG-SMB-TOU-…`) that **drops the `standard-unit-rates` link** in favour of separate `day` / `night` / `ev_device_peak` / `ev_device_off_peak` rates. EMT reads `standard-unit-rates`, so a migrated meter would get an empty rate schedule and be **silently priced at £0**. EMT now detects this — an active import tariff that returns no standard unit rates — logs a prominent error and surfaces a red **"⚠ Tariff not supported — rates unavailable"** indicator, so the gap is visible rather than producing a wrong-but-plausible bill. Full support for the new tariff (the four rate buckets and the daily 6-hour off-peak cap) is separate, upcoming work; this release makes the gap safe, not silent.
+
 ## [3.1.4] — 2026-07-08
 
 ### Fixed
