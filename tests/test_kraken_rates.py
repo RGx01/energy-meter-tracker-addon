@@ -116,5 +116,45 @@ class TestBuildStandingChargeSchedule(unittest.TestCase):
         self.assertEqual(s.resolve("2026-05-01T00:00:00"), 47.85)
 
 
+
+class TestNewIOGTariffFallback(unittest.TestCase):
+    """#1708: the new IOG time-of-use / 6-hour-cap tariff drops standard-unit-rates
+    for day/night/ev buckets. build_rate_schedule must fall back to merging
+    day+night into the base TOU schedule instead of returning empty."""
+
+    def _client(self, standard, day, night):
+        class C:
+            async def get_unit_rates(self, product, tariff, *,
+                                     rate_type="standard-unit-rates",
+                                     period_from=None, period_to=None):
+                return {"standard-unit-rates": standard, "day-unit-rates": day,
+                        "night-unit-rates": night}.get(rate_type, [])
+        return C()
+
+    def test_day_night_merge_when_no_standard(self):
+        day = [{"value_inc_vat": 32.0, "valid_from": "2026-07-01T05:30:00Z",
+                "valid_to": "2026-07-01T23:30:00Z"}]
+        night = [{"value_inc_vat": 7.0, "valid_from": "2026-07-01T23:30:00Z",
+                  "valid_to": "2026-07-02T05:30:00Z"}]
+        sched = asyncio.get_event_loop().run_until_complete(
+            build_rate_schedule(self._client([], day, night), "IOG-SMB-TOU", "E-1R-IOG-SMB-TOU-H"))
+        self.assertFalse(sched.is_empty())
+        self.assertEqual(sched.resolve("2026-07-01T12:00:00"), 32.0)   # day
+        self.assertEqual(sched.resolve("2026-07-02T02:00:00"), 7.0)    # night
+        self.assertEqual(sched.off_peak_rate_near("2026-07-01T23:45:00"), 7.0)
+
+    def test_standard_still_preferred_when_present(self):
+        std = [{"value_inc_vat": 24.5, "valid_from": "2026-07-01T00:00:00Z",
+                "valid_to": None}]
+        sched = asyncio.get_event_loop().run_until_complete(
+            build_rate_schedule(self._client(std, [], []), "INTELLI-FIX", "E-1R-INTELLI-FIX-H"))
+        self.assertEqual(sched.resolve("2026-07-01T12:00:00"), 24.5)
+
+    def test_empty_when_no_buckets_at_all(self):
+        sched = asyncio.get_event_loop().run_until_complete(
+            build_rate_schedule(self._client([], [], []), "X", "E-1R-X-H"))
+        self.assertTrue(sched.is_empty())   # guard territory
+
+
 if __name__ == "__main__":
     unittest.main()

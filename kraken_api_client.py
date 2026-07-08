@@ -471,12 +471,17 @@ class KrakenAPIClient:
     # ── tariff charges ──────────────────────────────────────────────────────
     async def get_unit_rates(
         self, product_code: str, tariff_code: str,
-        *, period_from: Optional[str] = None, period_to: Optional[str] = None,
+        *, rate_type: str = "standard-unit-rates",
+        period_from: Optional[str] = None, period_to: Optional[str] = None,
     ) -> list[dict]:
-        """standard-unit-rates for a tariff. Returns results list of
+        """Unit rates for a tariff. `rate_type` selects the REST rate bucket:
+        the classic `standard-unit-rates`, or — for the new IOG time-of-use /
+        6-hour-cap tariff (IOG-SMB-TOU) which drops `standard-unit-rates` — one
+        of `day-unit-rates`, `night-unit-rates`, `ev-device-peak-unit-rates`,
+        `ev-device-off-peak-unit-rates`. Returns results list of
         {value_exc_vat, value_inc_vat, valid_from, valid_to}."""
         path = (f"/v1/products/{product_code}/electricity-tariffs/"
-                f"{tariff_code}/standard-unit-rates/")
+                f"{tariff_code}/{rate_type}/")
         params: dict[str, Any] = {}
         if period_from:
             params["period_from"] = period_from
