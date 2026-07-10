@@ -99,6 +99,7 @@ class KrakenIngester:
         backfill_days: int = 7,
         drift_block_percent: float = 2.0,
         drift_min_kwh: float = 0.05,
+        backfill_missing: bool = True,
     ):
         self.client = client
         self.store = store
@@ -108,6 +109,8 @@ class KrakenIngester:
         self.export_serial = export_serial
         self.main_meter_id = main_meter_id
         self.billing_source = billing_source
+        # BL-8: materialise blocks that don't exist (outage backfill).
+        self.backfill_missing = backfill_missing
         self.backfill_days = backfill_days
         self.drift_block_percent = drift_block_percent
         self.drift_min_kwh = drift_min_kwh
@@ -174,6 +177,7 @@ class KrakenIngester:
             "stored": 0, "export_stored": 0,
             "skipped_no_block": 0, "flagged_review": 0,
             "flagged_interpolated": 0,
+            "backfilled": 0,
             "latest_interval": None, "dry_run": dry_run, "errors": [],
             # Diagnostic: first few flagged blocks per channel, with both
             # figures, so a dry-run reveals WHY review fired (units / zeros /
@@ -249,7 +253,19 @@ class KrakenIngester:
                                 "interpolated": res.get("interpolated"),
                             })
                 elif status == "missing_block":
-                    summary["skipped_no_block"] += 1
+                    # BL-8: no block exists for this settled interval — an outage
+                    # longer than the gap-fill limit. Materialise it from the
+                    # authoritative DCC figure; PASS 2 then prices it.
+                    if self.backfill_missing and not dry_run and kwh is not None:
+                        new_id = self.store.create_backfill_block(
+                            block_start, self.main_meter_id, kwh,
+                            channel="import", source="kraken_api")
+                        if new_id:
+                            summary["backfilled"] += 1
+                        else:
+                            summary["skipped_no_block"] += 1
+                    else:
+                        summary["skipped_no_block"] += 1
             except ValueError as ve:
                 summary["errors"].append(f"row parse: {ve}")
             except Exception as e:
@@ -306,7 +322,18 @@ class KrakenIngester:
                                         "interpolated": res.get("interpolated"),
                                     })
                         elif status == "missing_block":
-                            summary["skipped_no_block"] += 1
+                            # BL-8: backfill the export channel likewise.
+                            if (self.backfill_missing and not dry_run
+                                    and kwh is not None):
+                                new_id = self.store.create_backfill_block(
+                                    block_start, self.main_meter_id, kwh,
+                                    channel="export", source="kraken_api")
+                                if new_id:
+                                    summary["backfilled"] += 1
+                                else:
+                                    summary["skipped_no_block"] += 1
+                            else:
+                                summary["skipped_no_block"] += 1
                     except ValueError as ve:
                         summary["errors"].append(f"export row parse: {ve}")
                     except Exception as e:
@@ -323,10 +350,16 @@ class KrakenIngester:
 
         logger.info(
             "poll%s: window=%s..%s import_rows=%d stored=%d export_rows=%d "
-            "export_stored=%d skipped=%d review=%d errors=%d",
+            "export_stored=%d skipped=%d backfilled=%d review=%d errors=%d",
             " (dry-run)" if dry_run else "",
             period_from, period_to, summary["import_rows"], summary["stored"],
             summary["export_rows"], summary["export_stored"],
-            summary["skipped_no_block"], summary["flagged_review"],
-            len(summary["errors"]))
+            summary["skipped_no_block"], summary["backfilled"],
+            summary["flagged_review"], len(summary["errors"]))
+        if summary["backfilled"]:
+            logger.info(
+                "poll: BL-8 backfill — created %d block(s) from settled data for "
+                "period(s) with no local block (outage recovery). PASS 2 will "
+                "price them; they carry no sub-meter split.",
+                summary["backfilled"])
         return summary

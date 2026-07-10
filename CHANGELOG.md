@@ -1,5 +1,27 @@
 # Changelog
 
+## [Unreleased] — 3.2.0
+
+### Added
+
+- **"Update available" notice** (BL-6). Supervised installs get update badges from the Home Assistant Supervisor; Docker/standalone installs got nothing and only learned of a release by checking the repository. EMT now checks once a day for a newer release and shows a dismissible notice linking to the release notes. **Dismissal sticks per version** — dismiss it for a given release and you won't be asked again until something newer ships.
+
+- **Backups are now isolated per site** (BL-5). In supervised installs backups are written to `/share`, which Home Assistant shares across **all** add-ons — so two EMT instances would list, and could restore, each other's backups. The backup directory is now namespaced by a slugified site name (taken from your existing configuration; nothing new to set). Renaming your site moves the directory across silently; renaming back re-adopts the original one so old backups reappear; and a directory belonging to another instance is never merged or touched. Docker/standalone installs are unaffected — their backup directory lives inside the container's own volume and is already isolated. These protections key on site identity rather than how EMT was installed, so they hold however a second instance came to exist.
+
+- **Recover missing data after an outage** (BL-8). A new **Missing Data** panel in Data Management finds half-hour blocks that were never recorded — typically because the add-on was offline longer than the 12-hour gap-fill limit — and rebuilds them from your supplier's settled readings. The routine settlement poll only ever looks forward from its last run, so a gap it has already passed was previously permanent. Recovery is a **manual action on purpose**: EMT cannot tell an outage gap from blocks you deleted deliberately, so an automatic sweep would restore those too. Recovered blocks use the authoritative half-hourly figures and are priced at the rates in force at the time, but carry **no per-device breakdown** — EMT was not running, so no device readings exist for that period.
+
+- **Outage recovery: gaps are now backfilled from settled supplier data as settlement arrives** (BL-8). An outage longer than the 12-hour gap-fill limit used to leave a permanent hole — reconciliation only reprices blocks that exist, and the DCC poll only *settled* existing blocks, dropping the settled figure for any period with no block. EMT now **creates** those blocks from the authoritative half-hourly figures as settlement arrives, and the normal PASS-2 pass prices them (fetching historical rates for the period, so any tariff — Agile included — prices correctly). Recovered blocks are marked as externally sourced, and carry **no sub-meter split** — EMT was down, so no device readings exist for that period. Their off-peak status is decided once, at creation, from whatever dispatch data the supplier still returns (~24–48h), so recovery is best-endeavours: a smart charge during a long-past outage may be billed at the standard rate.
+
+### Removed
+
+- **The four synthetic block sensors have been removed**: `sensor.energy_meter_import_kwh`, `sensor.energy_meter_export_kwh`, `sensor.energy_meter_import_cost`, `sensor.energy_meter_export_credit`. They published live per-block figures that DCC settlement retrospectively corrects, so their values disagreed with the billing EMT itself reports — misleading rather than merely unused. **Breaking change** if you referenced them in a dashboard, template or automation; use the Charts and Insights pages, which reflect settled figures. `sensor.energy_meter_tracker_api_deprecations` is unchanged.
+
+### Fixed
+
+- **Saved-configuration messages no longer overlap the page** ([#219](https://github.com/RGx01/energy-meter-tracker-addon/issues/219)). The "Configuration saved" and error messages on Meter Config were pinned to the top of the viewport, painting over whatever sat beneath them — usually the Meter Config / Carbon tabs, leaving both unreadable. Notifications now appear in a shared region between the topbar and the page content: they push the page down instead of covering it, stack rather than overlap, and stay visible while you scroll. Transient messages clear themselves; ones you need to act on stay until dismissed. The unsupported-tariff warning moved here too, since it affects the whole app rather than the Charts page.
+
+- **A long outage no longer freezes DCC settlement across your whole history** (BL-1). When EMT detects a session gap (an outage longer than the 12-hour gap-fill limit) it sets a gap marker on the current block. That marker also — wrongly — gated the DCC PASS-2 drain, the step that applies settled half-hourly figures to billing. So while a gap marker was live, settled data for **every** block, not just the outage, was ingested but never applied: costs stayed on the pre-settlement estimates until the marker cleared. The marker still correctly guards sub-meter boundary amendment (gap-seed reads would corrupt its interpolation), but the drain now runs regardless — it takes its queue from the database and never reads the current block's rolling buffer, so gap-seed reads cannot contaminate it.
+
 ## [3.1.5] — 2026-07-08
 
 ### Fixed

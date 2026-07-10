@@ -47,11 +47,32 @@ BLOCKS_DB_PATH     = f"{DATA_DIR}/blocks.db"
 # cumulative_totals.json removed in 2.1.0 — totals derived from blocks table
 
 import os as _os_engine
+# BL-5: the supervised backup dir is namespaced by site slug once the DB is open
+# (see instance.py). Until then this holds the legacy/standalone default so any
+# pre-startup use is still valid. `resolve_backup_dir_for_site()` rebinds it.
 SHARE_BACKUP_DIR   = (
     _os_engine.path.join(DATA_DIR, "backup")
     if _os_engine.environ.get("EMT_MODE") == "standalone"
     else "/share/energy_meter_tracker_backup"
 )
+
+
+def resolve_backup_dir_for_site(site_name: str | None) -> str:
+    """BL-5: rebind SHARE_BACKUP_DIR for this site, migrating/adopting as needed.
+
+    Called at startup (and after a site rename) once the config period — and
+    therefore the site name — is known. Standalone is unaffected: its backup dir
+    is volume-scoped and site-independent. Silent in all cases.
+    """
+    global SHARE_BACKUP_DIR
+    try:
+        import instance as _inst
+        current = SHARE_BACKUP_DIR if _os_engine.path.isdir(SHARE_BACKUP_DIR) else None
+        SHARE_BACKUP_DIR = _inst.resolve_backup_dir(site_name, current_dir=current)
+    except Exception as e:
+        logger.warning("resolve_backup_dir_for_site: failed (%s); keeping %s",
+                       e, SHARE_BACKUP_DIR)
+    return SHARE_BACKUP_DIR
 
 # Module-level BlockStore instance — opened in engine_startup()
 _store: BlockStore | None = None
@@ -157,6 +178,9 @@ _kraken_rate_schedules: dict = {}   # {"import": RateSchedule, "export": RateSch
 # Standing-charge schedule (single, import-side — the daily standing charge).
 # Stored as £/day after conversion at resolve time, like rates.
 _kraken_standing_schedule = None    # RateSchedule | None
+_rate_schedule_unsupported: dict | None = None  # set when an active tariff returns
+#   NO standard unit rates — the new IOG time-of-use / 6-hour-cap tariff signature.
+#   Surfaced so a migrated user sees a clear "not yet supported" state, not £0 bills.
 _kraken_mini_reader = None          # MiniBoundaryReader | None — Chunk 7
 # Latest Mini live demand, polled server-side by the engine tick (page-independent)
 # so the 48h history fills continuously and the gauge reads it without its own
@@ -1561,56 +1585,14 @@ def build_gap_blocks(
 # HA sensor update helper  (replaces repeated state.set() blocks)
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def update_ha_sensors(ha: HAClient, engine_totals: dict):
-    """Push cumulative totals to four synthetic HA sensors."""
-    await ha.set_state(
-        "sensor.energy_meter_import_kwh",
-        round(engine_totals["import_kwh"], 6),
-        {
-            "unit_of_measurement": "kWh",
-            "device_class":        "energy",
-            "state_class":         "total_increasing",
-            "friendly_name":       "Energy Engine Import",
-        },
-    )
-    await ha.set_state(
-        "sensor.energy_meter_export_kwh",
-        round(engine_totals["export_kwh"], 6),
-        {
-            "unit_of_measurement": "kWh",
-            "device_class":        "energy",
-            "state_class":         "total_increasing",
-            "friendly_name":       "Energy Engine Export",
-        },
-    )
-    config          = load_config()
-    main_meta       = {}
-    for meter_data in config.get("meters", {}).values():
-        if not (meter_data.get("meta") or {}).get("sub_meter"):
-            main_meta = meter_data.get("meta") or {}
-            break
-    currency_code = main_meta.get("currency_code", "GBP")
-
-    await ha.set_state(
-        "sensor.energy_meter_import_cost",
-        round(engine_totals["import_cost"], 6),
-        {
-            "unit_of_measurement": currency_code,
-            "device_class":        "monetary",
-            "state_class":         "total_increasing",
-            "friendly_name":       "Energy Engine Import Cost",
-        },
-    )
-    await ha.set_state(
-        "sensor.energy_meter_export_credit",
-        round(engine_totals["export_cost"], 6),
-        {
-            "unit_of_measurement": currency_code,
-            "device_class":        "monetary",
-            "state_class":         "total_increasing",
-            "friendly_name":       "Energy Engine Export Credit",
-        },
-    )
+# BL-5 (3.2.0): the four synthetic block sensors were REMOVED —
+#   sensor.energy_meter_import_kwh / _export_kwh / _import_cost / _export_credit
+# They were unused and actively misleading: they published live per-block figures
+# that DCC settlement retrospectively corrects, so their values disagreed with the
+# billing EMT itself reports. Removing them also removes the only HA entity-ID
+# collision between two EMT instances. `sensor.energy_meter_tracker_api_deprecations`
+# is deliberately kept un-namespaced: it counts deprecated Kraken API fields — a
+# property of the API, not the site — so two instances write the same value.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1933,13 +1915,6 @@ def _commit_provisional_as_final(ha: HAClient, full_block: dict,
             meter_name, _we,
         )
         return
-    try:
-        engine_totals = _store.get_cumulative_totals()
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            loop.create_task(_deferred_sensor_update(ha, engine_totals))
-    except Exception as _se:
-        logger.warning("_amend_provisional: sensor republish failed: %s", _se)
 
 
 def _apply_intensity_to_block(block: dict, intensity: float) -> None:
@@ -2419,13 +2394,6 @@ def _drain_pass2_queue(ha: HAClient, limit: int = 50, rate_resolver=None) -> int
             generate_charts(_store)
         except Exception as _ce:
             logger.warning("_drain_pass2_queue: chart regen failed: %s", _ce)
-        try:
-            engine_totals = _store.get_cumulative_totals()
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(_deferred_sensor_update(ha, engine_totals))
-        except Exception as _se:
-            logger.warning("_drain_pass2_queue: sensor republish failed: %s", _se)
 
     return done
 
@@ -2632,15 +2600,6 @@ def _amend_provisional_sub_meter_blocks(ha: HAClient, current_block: dict) -> No
                 )
                 continue
 
-            try:
-                engine_totals = _store.get_cumulative_totals()
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(_deferred_sensor_update(ha, engine_totals))
-            except Exception as _se:
-                logger.warning(
-                    "_amend_provisional: sensor republish failed: %s", _se,
-                )
 
 
 def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: bool = False,
@@ -2945,16 +2904,6 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
     except Exception as _gme:
         logger.debug("finalise_block: generation mix storage failed: %s", _gme)
 
-    # ── PASS 4 — update cumulative totals (derived from DB, no JSON file) ───
-    engine_totals = _store.get_cumulative_totals()
-
-    # ── Update HA sensors (schedule on the event loop — finalise_block is sync) ──
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        loop.create_task(_deferred_sensor_update(ha, engine_totals))
-    else:
-        logger.warning("finalise_block: no running event loop for sensor update")
-
     logger.info("finalise_block: %s → %s complete", start, end)
 
     # 3.0.0: notify any registered boundary listener (Kraken Mini ingester).
@@ -3022,13 +2971,6 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
     _backup_to_share()
 
 
-async def _deferred_sensor_update(ha: HAClient, engine_totals: dict):
-    """Awaitable wrapper so finalise_block (sync) can schedule an async sensor push."""
-    try:
-        if _PUBLISH_HA_SENSORS:
-            await update_ha_sensors(ha, engine_totals)
-    except Exception as e:
-        logger.error("_deferred_sensor_update: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3611,14 +3553,24 @@ async def _engine_tick(ha: HAClient):
         except Exception as _amp_e:
             logger.warning("_engine_tick: provisional amendment failed: %s", _amp_e)
 
-        # ── 3.0.0: drain the DCC PASS 2 re-run queue ──────────────────────
-        # Blocks whose Kraken DCC settlement has arrived (needs_pass2_rerun=1)
-        # are re-run against imp_kwh_api here. No-op until the ingester sets
-        # the flag (Chunk 3+). Gap-guarded for the same reason as amendment.
-        try:
-            _drain_pass2_queue(ha)
-        except Exception as _dpq_e:
-            logger.warning("_engine_tick: PASS 2 re-run drain failed: %s", _dpq_e)
+    # ── 3.0.0: drain the DCC PASS 2 re-run queue ──────────────────────────
+    # Blocks whose Kraken DCC settlement has arrived (needs_pass2_rerun=1) are
+    # re-run against imp_kwh_api here. No-op until the ingester sets the flag.
+    #
+    # BL-1: NOT gap-guarded. This was previously inside the `not
+    # has_gap_marker(...)` block above, which globally froze settlement
+    # application for the WHOLE history while any gap marker was live — an
+    # outage on one day stopped every other day's settled figures from being
+    # applied to billing until the marker cleared. Unlike the amendment above,
+    # the drain takes its work queue from the DB and re-costs historical blocks
+    # by block_start; it never reads the current block or the rolling buffer, so
+    # gap-seed reads cannot contaminate it. Settling a gap-filled block is in
+    # fact desirable — the authoritative DCC figure replaces the interpolated
+    # guess (the ingester already counts these as `flagged_interpolated`).
+    try:
+        _drain_pass2_queue(ha)
+    except Exception as _dpq_e:
+        logger.warning("_engine_tick: PASS 2 re-run drain failed: %s", _dpq_e)
 
     # Deferred gap filling
     # Pre-populate with rates from the last finalised block so finalise_block
@@ -3734,9 +3686,6 @@ async def _engine_tick(ha: HAClient):
                 for gb in gap_blocks:
                     append_block_replace(gb)
 
-                engine_totals = _store.get_cumulative_totals()
-                if _PUBLISH_HA_SENSORS:
-                    await update_ha_sensors(ha, engine_totals)
                 logger.info("gap fill: %d interpolated blocks inserted", len(gap_blocks))
             else:
                 logger.warning("gap fill: no missing windows found, clearing marker")
@@ -4682,7 +4631,7 @@ async def _refresh_kraken_rate_schedules() -> None:
     previous cache intact; an empty cache simply means the resolver returns
     None and zero-rate blocks stay flagged for the tooling.
     """
-    global _kraken_rate_schedules, _kraken_standing_schedule
+    global _kraken_rate_schedules, _kraken_standing_schedule, _rate_schedule_unsupported
     if _kraken_client is None or not _kraken_discovery:
         return
     try:
@@ -4691,6 +4640,7 @@ async def _refresh_kraken_rate_schedules() -> None:
         logger.warning("_refresh_kraken_rate_schedules: import failed: %s", e)
         return
     new_cache: dict = {}
+    unsupported: dict | None = None
     for ch in ("import", "export"):
         info = _kraken_discovery.get(ch) or {}
         product = info.get("product_code")
@@ -4701,9 +4651,23 @@ async def _refresh_kraken_rate_schedules() -> None:
             sched = await build_rate_schedule(_kraken_client, product, tariff)
             if not sched.is_empty():
                 new_cache[ch] = sched
+            elif ch == "import":
+                # Active tariff discovered, but standard-unit-rates came back EMPTY.
+                # That's the signature of the new time-of-use Intelligent Octopus
+                # tariff (IOG-SMB-TOU — the 6-hour charge cap), which drops
+                # `standard-unit-rates` for `day/night/ev_device_*` rate links EMT
+                # does not yet read. FAIL LOUD — do not silently price at £0.
+                unsupported = {"tariff": tariff, "product": product}
+                logger.error(
+                    "_refresh_kraken_rate_schedules: import tariff %s returned NO "
+                    "standard unit rates. This is the new IOG time-of-use / 6-hour-"
+                    "cap tariff (day/night/ev_device rates), which EMT does NOT yet "
+                    "support. Rates are unavailable and billing for this meter will "
+                    "be incorrect until support lands. See issue #1708.", tariff)
         except Exception as e:
             logger.warning("_refresh_kraken_rate_schedules: %s build failed: %s",
                            ch, e)
+    _rate_schedule_unsupported = unsupported
     if new_cache:
         _kraken_rate_schedules = new_cache
         logger.info("_refresh_kraken_rate_schedules: import=%d export=%d periods",
@@ -5471,6 +5435,68 @@ async def reconcile_dispatch_overlay() -> dict:
             "deferred": n_deferred}
 
 
+async def resolve_history_gaps(now=None, meter_id: str = "electricity_main",
+                               max_runs: int = 60) -> dict:
+    """User-triggered sweep: find gaps in the block history and backfill them.
+
+    The DCC poll's window is a forward-moving cursor, so an outage the cursor has
+    already passed is never revisited — the hole is permanent. This asks the DB
+    where the holes are, then re-polls each gap window explicitly
+    (`advance_cursor=False`, so the normal cursor is untouched). BL-8's
+    `create_backfill_block` materialises the missing blocks from the settled
+    figures; PASS 2 then prices them.
+
+    Deliberately **explicit, not automatic**: we cannot distinguish an outage gap
+    from blocks the user deleted on purpose (Data Management → Delete Blocks), and
+    an automatic sweep would silently resurrect them.
+    """
+    if not kraken_available():
+        return {"ok": False, "reason": "no_api"}
+    ingester = _build_kraken_ingester()
+    if ingester is None:
+        return {"ok": False, "reason": "no_ingester"}
+    if _store is None:
+        return {"ok": False, "reason": "no_store"}
+
+    gaps = _store.find_block_gaps(meter_id, now=now)
+    if not gaps:
+        return {"ok": True, "gaps": 0, "backfilled": 0, "runs": []}
+
+    total_backfilled = 0
+    runs_done = []
+    step = timedelta(minutes=30)
+    for g in gaps[:max_runs]:
+        # widen by one slot each side so boundary intervals are included
+        pf = (datetime.fromisoformat(g["start"]) - step)
+        pt = (datetime.fromisoformat(g["end"]) + step * 2)
+        window = (pf.isoformat(timespec="seconds") + "Z",
+                  pt.isoformat(timespec="seconds") + "Z")
+        try:
+            summary = await ingester.poll(window=window, advance_cursor=False)
+        except Exception as e:
+            logger.warning("resolve_history_gaps: window %s failed: %s", window, e)
+            continue
+        made = summary.get("backfilled", 0)
+        total_backfilled += made
+        runs_done.append({"start": g["start"], "end": g["end"],
+                          "slots": g["slots"], "backfilled": made})
+        logger.info("resolve_history_gaps: %s..%s (%d slots) -> backfilled %d",
+                    g["start"], g["end"], g["slots"], made)
+
+    if total_backfilled:
+        # We are already on the engine loop (called via _run_on_engine_loop), so
+        # regen inline on this thread — never from the Flask thread, which would
+        # use the engine's SQLite connection cross-thread (the 3.1.3 segfault).
+        try:
+            generate_charts(_store)
+        except Exception as e:
+            logger.warning("resolve_history_gaps: chart regen failed: %s", e)
+    logger.info("resolve_history_gaps: %d gap run(s), %d block(s) backfilled",
+                len(gaps), total_backfilled)
+    return {"ok": True, "gaps": len(gaps), "backfilled": total_backfilled,
+            "runs": runs_done}
+
+
 async def kraken_poll_task(ha: HAClient):
     """Periodic DCC ingest loop. Runs poll() every 6h.
 
@@ -5618,6 +5644,22 @@ async def engine_startup(ha: HAClient):
         logger.info("engine_startup: WAL checkpoint complete")
     except Exception as _wce:
         logger.warning("engine_startup: WAL checkpoint failed: %s", _wce)
+
+    # BL-5: resolve this instance's backup directory from the site name. In
+    # supervised mode /share is shared across add-ons, so the path is namespaced
+    # by site slug; standalone is volume-scoped and unaffected. engine_startup
+    # re-runs on every config save, so a site rename is picked up here and the
+    # directory is migrated/adopted silently (see instance.py).
+    try:
+        _site = None
+        if _store is not None:
+            _pid = _store.get_current_config_period_id()
+            if _pid is not None:
+                _site = (_store.get_config_period(_pid) or {}).get("site_name")
+        _bd = resolve_backup_dir_for_site(_site)
+        logger.info("engine_startup: backup dir = %s (site=%r)", _bd, _site)
+    except Exception as _bde:
+        logger.warning("engine_startup: backup dir resolution failed: %s", _bde)
 
     if not _PUBLISH_HA_SENSORS:
         logger.warning("engine_startup: HA sensor publishing DISABLED (publish_ha_sensors=false)")

@@ -142,6 +142,26 @@
   <div id="unsettled-list" style="font-size:13px;color:var(--muted);margin-top:14px;"></div>
 </div>
 
+<!-- ── Missing data (outage gaps) ──────────────────────────────────────────── -->
+<div class="card">
+  <div class="card-title">🕳️ Missing Data</div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;line-height:1.7;">
+    If the add-on was offline for longer than 12 hours, those half-hour blocks were
+    never recorded and the routine settlement poll will not go back for them. Your
+    supplier still holds the settled readings, so they can be recovered.
+    <br><br>
+    Recovered blocks use the authoritative half-hourly figures and are priced at the
+    rates in force at the time, but they carry <strong>no per-device breakdown</strong>
+    — EMT was not running, so no device readings exist for that period.
+    <br><br>
+    <strong>Blocks you deleted on purpose will also be restored.</strong> This is why
+    recovery is a manual action: EMT cannot tell a deliberate deletion from an outage.
+  </p>
+  <button class="btn btn-secondary" onclick="loadGaps()" id="btn-find-gaps">🔍 Find missing data</button>
+  <button class="btn btn-primary" onclick="resolveGaps()" id="btn-resolve-gaps" style="display:none;margin-left:8px;">🩹 Recover missing data</button>
+  <div id="gaps-list" style="font-size:13px;color:var(--muted);margin-top:14px;"></div>
+</div>
+
 <!-- ── Import ───────────────────────────────────────────────────────────────── -->
 <div class="card">
   <div class="card-title">📥 Import Data Files</div>
@@ -856,6 +876,86 @@ function loadUnsettled() {
       el.innerHTML = html;
     })
     .catch(function(e) { btn.disabled = false; el.textContent = 'Error: ' + e; });
+}
+
+function loadGaps() {
+  var btn  = document.getElementById('btn-find-gaps');
+  var list = document.getElementById('gaps-list');
+  var act  = document.getElementById('btn-resolve-gaps');
+  btn.disabled = true;
+  list.innerHTML = 'Searching\u2026';
+  fetch(apiUrl('/api/history-gaps'))
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      btn.disabled = false;
+      if (!d.ok) { list.textContent = 'Error: ' + (d.error || 'unknown'); return; }
+      if (!d.gaps.length) {
+        list.innerHTML = '\u2713 No missing data found.';
+        act.style.display = 'none';
+        return;
+      }
+      var html = '<strong>' + d.total_slots + ' missing block(s)</strong> across '
+               + d.gaps.length + ' period(s):<ul style="margin:8px 0 0 18px;">';
+      d.gaps.slice(0, 20).forEach(function (g) {
+        var hrs = (g.slots / 2).toFixed(1);
+        html += '<li>' + g.start.replace('T', ' ') + ' \u2192 '
+             + g.end.replace('T', ' ') + ' (' + hrs + ' h)</li>';
+      });
+      if (d.gaps.length > 20) html += '<li>\u2026 and ' + (d.gaps.length - 20) + ' more</li>';
+      html += '</ul>';
+      // Finding gaps is a local database question and always works. RECOVERING
+      // them needs the supplier API — the missing readings can only come from
+      // the supplier. Say so, rather than hiding the button and leaving the user
+      // told they have a problem with no path forward.
+      if (d.api_available) {
+        act.style.display = '';
+      } else {
+        act.style.display = 'none';
+        html += '<p style="margin-top:10px;">\u2139\ufe0f Recovering this data needs a supplier '
+             + 'API connection \u2014 the missing readings can only come from your supplier. '
+             + 'Configure one in the Setup Wizard to enable recovery.</p>';
+      }
+      list.innerHTML = html;
+    })
+    .catch(function (e) { btn.disabled = false; list.textContent = 'Error: ' + e; });
+}
+
+function resolveGaps() {
+  if (!window._apiAvailable) return;
+  showConfirm({
+    title: 'Recover missing data',
+    message: 'Fetch the settled readings for every missing block from your supplier '
+      + 'and rebuild them?<br><br>Recovered blocks carry <strong>no per-device '
+      + 'breakdown</strong>, and any blocks you deleted on purpose <strong>will be '
+      + 'restored</strong>. This may take a moment.',
+    okLabel: '\ud83e\ude79 Recover',
+    onConfirm: _doResolveGaps
+  });
+}
+
+function _doResolveGaps() {
+  var btn = document.getElementById('btn-resolve-gaps');
+  var list = document.getElementById('gaps-list');
+  hideAlerts();
+  btn.disabled = true;
+  var orig = btn.textContent;
+  btn.textContent = 'Recovering\u2026';
+  fetch(apiUrl('/api/resolve-gaps'), { method: 'POST' })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      btn.disabled = false; btn.textContent = orig;
+      if (!d.ok) {
+        list.innerHTML = 'Error: ' + (d.error || d.reason || 'unknown');
+        return;
+      }
+      list.innerHTML = '\u2713 Recovered <strong>' + d.backfilled + '</strong> block(s) across '
+                     + d.gaps + ' period(s). Charts have been regenerated.';
+      btn.style.display = 'none';
+    })
+    .catch(function (e) {
+      btn.disabled = false; btn.textContent = orig;
+      list.textContent = 'Error: ' + e;
+    });
 }
 
 function retrySettlement() {

@@ -1,6 +1,6 @@
 name: "Energy Meter Tracker"
 description: "Electricity metering engine with configurable reconciliation periods, sub-meter support, gap filling, and billing charts"
-version: "3.1.5"
+version: "3.2.0"
 slug: "energy_meter_tracker"
 init: false
 startup: application
@@ -17,7 +17,9 @@ map:
   - share:rw
 
 # ── Network ───────────────────────────────────────────────────────────────────
-# Port 8099 — direct access (optional, can be disabled)
+# KEY = port INSIDE the container (always 8099 — the server binds this).
+# VALUE = port published on the HOST. Change only the VALUE to avoid a clash with
+# another instance; clear it entirely if you only use ingress.
 ports:
   8099/tcp: 8099
 ports_description:
@@ -26,6 +28,8 @@ ports_description:
 # ── Ingress ───────────────────────────────────────────────────────────────────
 # Enables the "Show in sidebar" toggle and embedded UI in HA
 ingress: true
+# Container-side port. Identical across instances — each add-on has its own
+# network namespace, so ingress can never collide. Only the HOST publish above can.
 ingress_port: 8099
 
 # ── HA API access ─────────────────────────────────────────────────────────────
@@ -52,11 +56,12 @@ options:
   # Meter reconciliation period in minutes (5, 15 or 30).
   # Set once before data collection begins — cannot be changed without clearing data.
   block_minutes: 30
-  # Soon to be depricated
+  # Prevents this instance writing to HA entities. Since 3.2.0 the only entity
+  # EMT publishes is sensor.energy_meter_tracker_api_deprecations (the four
+  # per-block sensors were removed), and two instances writing it collide
+  # harmlessly — they compute the same API-derived value. Kept mainly so a dev
+  # instance can stay entirely out of HA's state machine.
   publish_ha_sensors: false
-  # DEV ONLY — set to a different port (e.g. 8100) when running a dev instance
-  # in parallel with a prod instance. Always 8099 on production.
-  port: 8099
 
 schema:
   log_level: "list(debug|info|warning|error)"
@@ -65,4 +70,3 @@ schema:
   timezone: "str?"
   block_minutes: "int?"  # Meter reconciliation period (5, 15 or 30)
   publish_ha_sensors: "bool?"
-  port: "int?"

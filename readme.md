@@ -104,11 +104,24 @@ Full documentation is on the **[GitHub Wiki](https://github.com/RGx01/energy-met
 
 ---
 
+## What's new in 3.2
+
+- **🩹 Outage recovery** — if the add-on was offline longer than the 12-hour gap-fill limit, those blocks were lost for good: the settlement poll only ever looks forward. **Data Management → Missing Data** now finds the holes and rebuilds them from your supplier's settled readings. Manual on purpose — EMT can't tell an outage from blocks you deleted deliberately.
+- **⚡ Settlement no longer freezes after an outage** — a gap marker was wrongly gating the step that applies settled figures to billing, so *every* block's costs stayed on pre-settlement estimates until the marker cleared.
+- **🔔 Global notification region** — messages now appear between the topbar and the page instead of floating over it, so they no longer overlap the page content ([#219](https://github.com/RGx01/energy-meter-tracker-addon/issues/219)). Includes an **update-available** notice for standalone users, who get no Supervisor badge. Dismissal sticks per version.
+- **🗂️ Backups isolated per site** — supervised backups live in `/share`, which HA shares across *all* add-ons, so two EMT instances could list and restore each other's backups. The directory is now namespaced by site name.
+- **🔌 Four unused sensors removed** — `sensor.energy_meter_import_kwh`, `_export_kwh`, `_import_cost`, `_export_credit`. They published live per-block figures that settlement later corrects, so they disagreed with EMT's own billing. **Breaking** if you referenced them.
+
+Earlier 3.x releases added Intelligent Octopus dispatch-lifecycle pricing (smart charges billed from the dispatch data rather than the meter, so solar-supplied charges price correctly), support for the new IOG 6-hour-cap tariff, and the Spiral chart.
+
+See the [full changelog](CHANGELOG.md) for the complete list.
+
+---
+
 ## What's new in 3.0
 
 EMT 3.0 is the largest release so far — and a **major-additive one: nothing breaks**. Existing installs upgrade in place, keep working exactly as before, and switch the new things on when ready. Everything new is opt-in through the Setup Wizard.
 
-### 3.0.0
 - **🔌 Supplier settlement (Octopus / Kraken DCC)** — reconcile every block against the settled half-hourly data your supplier actually bills from. A billing-source toggle chooses whether your bill is driven by your meter sensor or the supplier API; credentials are entered in-app (no YAML), and corrections are gated until a block is settled. Opt-in.
 - **🧙 Supplier-first Setup Wizard & data-source modes** — setup now starts from your supplier and meter situation and configures the right path: **`cad`** (local sensor only, as in 2.x) or **`cad+api`** (local readings plus supplier settlement). A **Change Setup** launcher lets you switch later.
 - **🚗 Intelligent Octopus Go awareness** — EMT captures IOG smart-charge dispatch slots and prices the affected blocks at the off-peak rate you were actually charged, at both finalise and settlement. Per-device "use dispatch overlay" rates let your EV bill at the dispatch rate while the house stays on the standard tariff.
@@ -136,51 +149,6 @@ See the [full changelog](CHANGELOG.md) for the complete list.
 - **Restoring an old backup?** A v2-era backup with no supplier field restores cleanly as local-metering-only.
 
 If anything looks off after upgrading, your previous data is untouched and you can review it in **Data Management** → backups.
-
----
-
-## What's new in 2.10
-
-### 2.10.0
-- **📋 Per-day data table** — expand any day on the Billing chart to see a half-hourly breakdown of import, export, direct import and per-device kWh and cost. Toggle all tables open/closed at once with the **Show Data / Hide Data** button in the floating toolbar. State persists across the 2-minute auto-refresh.
-- **⬇ PDF export** — export any chart tab as a print-ready report. Billing exports capture the current period, view (Bill / vs Prev / vs Last Year), billing summary, daily chart images and any open data tables. Heatmap and Usage Stats tabs export the chart image, toolbar state and data table. Open via the ⬇ PDF button in the topbar.
-- **Sub-meter boundary interpolation** — provisional blocks are retrospectively corrected when the first post-boundary read arrives, eliminating up to ~0.12 kWh per-boundary misalignment at 7.4 kW without affecting period totals.
-- **Rounding fixes** — billing summary period totals, usage stats totals row, and Live Power billing card headlines now always agree exactly with the sum of their displayed line items.
-- **Bug fixes** — Grid Export legend label, daily chart iframe blank on year view (WebKit size limit), Direct Import kWh attribution, device kWh grid-only consistency.
-
----
-
-## What's new in 2.9
-
-### 2.9.0
-- **📦 Device retirement** — archive a sub-meter without deleting its history. Use the new **Archive** button on any sub-meter card in Settings → Meter Config. The device stops recording, disappears from Live Power, and its sensor entity IDs are freed for reuse. All historical blocks are preserved and still appear in charts and insights. Retirement can be reversed via **↩ Unretire**.
-- **⏱ 12-hour gap-fill limit** — gaps longer than 12 hours are no longer gap-filled. Previously EMT would interpolate across any gap length, producing misleading data for extended CAD or HA outages. Short gaps (power cuts, brief restarts) still gap-fill as before.
-- **⚠️ Meter reset advisory** — when a gap exceeds 12 hours and the post-gap import read is significantly lower than before, EMT shows an advisory banner suggesting you create a new billing period. Covers meter replacement and moving to a new property.
-- **PDF fix** — Usage Insights PDF no longer shows the carbon comparison narrative at the top of the report.
-
----
-
-## What's new in 2.8
-
-### 2.8.2
-- **PDF export fixes** — Carbon report no longer duplicates the comparison panel; Usage report correctly excludes hidden cards when no comparison period is selected
-
-### 2.8.1
-- **Favicon** — browser tab now shows the EMT icon
-- **Timezone auto-detect** — Setup Wizard pre-fills timezone from your browser
-- **PDF export** — ⬇ PDF button on Insights toolbar opens a clean printable report in a new tab with logo, period, version and full tab content
-- **Generation mix history** — 48-hour mix chart now updates at CI-tick resolution (~15 min) independently of block size, so it stays current on 30-minute block installations
-- **Usage Stats Net view** — data table now shows Import and Export as separate columns with Total = Import − Export
-- **Gauge arc light theme** — gauge background arcs now correctly render in light theme
-- **Charts period recall** — selected billing period is now restored correctly when returning to the Charts page
-
-### 2.8.0
-- **💡 Usage Insights** — new Usage tab alongside Carbon showing cost breakdown, rate period distribution, grid position, peak demand window and per-device costs. Period comparison narrative explains cost drivers in plain English
-- **🌐 Current Grid Generation Mix** — donut chart on Live Power showing the current half-hour's fuel split. 🇬🇧 UK only
-- **⚡ 48-Hour Generation Mix chart** — third mode (kW / CO₂ / Mix) on the 48-hour power history chart. 🇬🇧 UK only
-- **Generation mix in Carbon Insights** — stacked bar showing the period's imp_kwh-weighted fuel mix with comparison bar and narrative
-- **Billing chart performance** — JavaScript parsing reduced from 5.8 MB → 76 KB (77×). Charts load near-instantly on slow devices
-- **Timezone refactor** — local date columns dropped from the database; all queries compute UTC bounds at query time
 
 ---
 
@@ -276,6 +244,36 @@ You can add the standalone UI to your Home Assistant sidebar as a **Webpage dash
 1. Go to **Settings → Dashboards** (or [open dashboard settings](https://my.home-assistant.io/redirect/lovelace_dashboards/)).
 2. Click **Add dashboard → Webpage**.
 3. Set the **URL** to `http://<host>:8099` (your Docker host IP and port), give it a **Title** (e.g. "Energy Meter") and an **Icon** (e.g. `mdi:speedometer`), and choose whether to show it in the sidebar.
+
+**Multiple properties / accounts**
+
+One EMT instance tracks one property on one supplier account. To track a second — a rental, a second home, or a separate Octopus account — **run a second container**. Docker is the only install type where this works today.
+
+Give each instance its own **data volume** and its own **host port**, and each authenticates with its own supplier credentials:
+
+```yaml
+  energy-meter-tracker-rental:
+    build:
+      context: ./energy-meter-tracker-addon
+      dockerfile: Dockerfile.standalone
+    container_name: energy-meter-tracker-rental
+    restart: unless-stopped
+    ports:
+      - "8100:8099"            # different HOST port; container port stays 8099
+    environment:
+      - EMT_MODE=standalone
+      - HA_URL=http://homeassistant:8123
+      - LOG_LEVEL=info
+      - HA_TOKEN=your_long_lived_access_token
+    volumes:
+      - ~/emt-data-rental:/data/energy_meter_tracker   # SEPARATE volume
+```
+
+The two instances are fully isolated: the database, configuration and backups all live inside each container's own volume. Give each a distinct **site name** in the Setup Wizard so you can tell their pages apart.
+
+> ⚠️ **Do not share a data volume between instances.** Each expects exclusive use of its own database.
+
+> ℹ️ **HA OS / Supervised cannot run a second instance.** Home Assistant permits a given add-on from a given repository to be installed only once, and we don't ship a second add-on for this. HAOS also has no user-accessible Docker daemon, so there is no fallback — multi-property support is Docker-only.
 
 ---
 

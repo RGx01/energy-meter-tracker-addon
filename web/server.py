@@ -91,11 +91,21 @@ app.secret_key = os.urandom(24)
 DATA_DIR         = None
 CHART_DIR        = None
 import os as _os
-SHARE_BACKUP_DIR = (
-    _os.path.join("/data/energy_meter_tracker", "backup")
-    if _os.environ.get("EMT_MODE") == "standalone"
-    else "/share/energy_meter_tracker_backup"
-)
+
+
+def _share_backup_dir() -> str:
+    """BL-5: the backup dir is resolved at startup from the site slug (see
+    instance.py) and lives on `engine`. Read it there rather than keeping a
+    second, stale copy — this module used to duplicate the derivation, which
+    would silently disagree after a site rename."""
+    try:
+        import engine as _eng
+        return _eng.SHARE_BACKUP_DIR
+    except Exception:
+        return (_os.path.join("/data/energy_meter_tracker", "backup")
+                if _os.environ.get("EMT_MODE") == "standalone"
+                else "/share/energy_meter_tracker_backup")
+
 _ha_client = None   # reference to the running HAClient instance
 _event_loop = None  # asyncio event loop — captured at init time
 
@@ -2678,7 +2688,7 @@ def api_backup():
 def api_backup_info():
     """Return backup configuration info."""
     return jsonify({
-        "backup_dir": SHARE_BACKUP_DIR,
+        "backup_dir": _share_backup_dir(),
         "mode": os.environ.get("EMT_MODE", "supervised")
     })
 
@@ -2688,13 +2698,13 @@ def api_backup_list():
     """List available backup zips and last-finalise flat files."""
     import glob
     try:
-        zips = sorted(glob.glob(f"{SHARE_BACKUP_DIR}/backups/*.zip"), reverse=True)
+        zips = sorted(glob.glob(f"{_share_backup_dir()}/backups/*.zip"), reverse=True)
         # Check for flat files from last finalise
         primary = ["blocks.db"]
         legacy  = ["blocks.json"]   # written by 1.x/2.0.x, no longer updated
         flat_files = []
         for fname in primary + legacy:
-            fpath = f"{SHARE_BACKUP_DIR}/{fname}"
+            fpath = f"{_share_backup_dir()}/{fname}"
             if os.path.exists(fpath):
                 mtime = os.path.getmtime(fpath)
                 from datetime import datetime as _dt
@@ -2779,7 +2789,7 @@ def api_backup_restore():
             for fname in (selected or list(known)):
                 if fname not in known:
                     continue
-                src_path = f"{SHARE_BACKUP_DIR}/{fname}"
+                src_path = f"{_share_backup_dir()}/{fname}"
                 dst_path = os.path.join(DATA_DIR, fname)
                 if os.path.exists(src_path):
                     shutil.copy2(src_path, dst_path)
@@ -2788,7 +2798,7 @@ def api_backup_restore():
         else:
             if not zipname or "/" in zipname or "\\" in zipname:
                 return jsonify({"error": "Invalid zip name"}), 400
-            zip_path = f"{SHARE_BACKUP_DIR}/backups/{zipname}"
+            zip_path = f"{_share_backup_dir()}/backups/{zipname}"
             if not os.path.exists(zip_path):
                 return jsonify({"error": "Backup not found"}), 404
             with zipfile.ZipFile(zip_path, "r") as zf:
@@ -3106,6 +3116,65 @@ def api_disconnect_kraken():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+def _parse_version(v: str):
+    """'3.2.0' -> (3, 2, 0). Non-numeric parts sort as 0. Tolerates a 'v' prefix."""
+    v = (v or "").strip().lstrip("vV")
+    parts = []
+    for chunk in v.split(".")[:3]:
+        digits = "".join(c for c in chunk if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+_update_check_cache = {"checked_at": 0.0, "payload": None}
+_UPDATE_CHECK_TTL = 86400.0   # once a day — the release cadence is far slower
+
+
+@app.route("/api/update-check", methods=["GET"])
+def api_update_check():
+    """BL-6: is a newer release available?
+
+    Supervised users get update badges from the Supervisor; unsupervised (Docker
+    / HA Container) users get nothing and only learn of a release by checking the
+    repo manually. Cached for a day — a release lookup is not worth a request per
+    page load, and GitHub rate-limits unauthenticated calls.
+
+    Never fatal: any failure returns update_available=false, so the UI is silent
+    rather than showing an error the user can do nothing about.
+    """
+    import time
+    now = time.time()
+    if (_update_check_cache["payload"] is not None
+            and now - _update_check_cache["checked_at"] < _UPDATE_CHECK_TTL):
+        return jsonify(_update_check_cache["payload"])
+
+    payload = {"current": APP_VERSION, "latest": None, "url": None,
+               "update_available": False}
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.github.com/repos/RGx01/energy-meter-tracker-addon/releases/latest",
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": "energy-meter-tracker"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        latest = (data.get("tag_name") or "").strip()
+        if latest:
+            payload["latest"] = latest.lstrip("vV")
+            payload["url"] = data.get("html_url")
+            # If we cannot determine our OWN version, never claim an update —
+            # (0,0,0) < anything would prompt on every release, wrongly.
+            payload["update_available"] = bool(APP_VERSION) and (
+                _parse_version(latest) > _parse_version(APP_VERSION))
+    except Exception as e:
+        logger.info("api_update_check: lookup failed (non-fatal): %s", e)
+
+    _update_check_cache.update({"checked_at": now, "payload": payload})
+    return jsonify(payload)
+
+
 @app.route("/api/billing-source", methods=["GET"])
 def api_billing_source_get():
     """Return the current global billing source and unsettled-block count."""
@@ -3115,7 +3184,8 @@ def api_billing_source_get():
         source = _eng._get_billing_source()
         unsettled = store.count_unsettled_blocks()
         return jsonify({"source": source, "unsettled": unsettled,
-                        "api_available": _eng.kraken_available()})
+                        "api_available": _eng.kraken_available(),
+                        "unsupported_tariff": _eng._rate_schedule_unsupported})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3156,6 +3226,45 @@ def api_unsettled_blocks():
         return jsonify({"count": count, "limit": limit, "blocks": out})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/history-gaps")
+def api_history_gaps():
+    """Review: missing half-hour slots in the block history (outage holes).
+
+    Read-only, and deliberately NOT gated on the supplier API: finding gaps is a
+    question about our own blocks table, which a CAD-only user can ask and get a
+    true answer to. `api_available` is returned so the UI can explain that
+    *recovering* them does need a supplier (the readings can only come from there)
+    rather than silently hiding the action.
+    """
+    try:
+        import engine as _eng
+        store = _get_store()
+        gaps = store.find_block_gaps()
+        return jsonify({"ok": True, "gaps": gaps,
+                        "total_slots": sum(g["slots"] for g in gaps),
+                        "api_available": _eng.kraken_available()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/resolve-gaps", methods=["POST"])
+def api_resolve_gaps():
+    """Act: backfill history gaps from settled supplier data.
+
+    User-triggered on purpose — an automatic sweep could not tell an outage gap
+    from blocks the user deleted deliberately, and would resurrect them.
+    """
+    try:
+        import engine as _eng
+        if not _eng.kraken_available():
+            return jsonify({"ok": False, "reason": "no_api",
+                            "error": "No supplier API configured"}), 400
+        result = _run_on_engine_loop(_eng.resolve_history_gaps(), timeout=300.0)
+        return jsonify(result), (200 if result.get("ok") else 400)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/retry-settlement", methods=["POST"])
@@ -4016,7 +4125,7 @@ def api_backup_flat_info():
 
     files = {}
     for fname in primary + legacy:
-        fpath = f"{SHARE_BACKUP_DIR}/{fname}"
+        fpath = f"{_share_backup_dir()}/{fname}"
         if fname == "meters_config.json":
             continue  # no longer a restore target — config lives inside blocks.db
         if os.path.exists(fpath):
@@ -4042,7 +4151,7 @@ def api_import_extract_zip_by_name():
         zipname = data.get("zip", "")
         if not zipname or "/" in zipname or "\\" in zipname:
             return jsonify({"error": "Invalid zip name"}), 400
-        zip_path = f"{SHARE_BACKUP_DIR}/backups/{zipname}"
+        zip_path = f"{_share_backup_dir()}/backups/{zipname}"
         if not os.path.exists(zip_path):
             return jsonify({"error": "Backup not found"}), 404
         known = {"blocks.db", "blocks.json"}
@@ -4065,7 +4174,7 @@ def _create_backup_zip(label="backup"):
     import zipfile
     import glob
     from datetime import datetime as _dt
-    backup_dir = f"{SHARE_BACKUP_DIR}/backups"
+    backup_dir = f"{_share_backup_dir()}/backups"
     os.makedirs(backup_dir, exist_ok=True)
     timestamp = _dt.utcnow().strftime("%Y%m%dT%H%M%S")
     zip_path  = f"{backup_dir}/{timestamp}_{label}.zip"

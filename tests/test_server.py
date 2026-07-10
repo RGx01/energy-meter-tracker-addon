@@ -3540,3 +3540,116 @@ class TestDisconnectKrakenRoute(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestUpdateCheck(unittest.TestCase):
+    """BL-6: cached update check. Never fatal; semver-aware; no self-nagging."""
+
+    def setUp(self):
+        self.client = make_client()
+        server._update_check_cache.update({"checked_at": 0.0, "payload": None})
+        self._ver = server.APP_VERSION
+        server.APP_VERSION = "3.2.0"   # tests run outside the add-on layout
+
+    def tearDown(self):
+        server._update_check_cache.update({"checked_at": 0.0, "payload": None})
+        server.APP_VERSION = self._ver
+
+    def test_parse_version_is_semver_not_string(self):
+        self.assertGreater(server._parse_version("3.10.0"),
+                           server._parse_version("3.2.0"))
+        self.assertEqual(server._parse_version("v3.2"), (3, 2, 0))
+        self.assertEqual(server._parse_version(""), (0, 0, 0))
+        self.assertEqual(server._parse_version("3.2.0-beta"), (3, 2, 0))
+
+    def test_newer_release_flags_update(self):
+        payload = json.dumps({"tag_name": "v9.9.9",
+                              "html_url": "https://example/releases/9.9.9"})
+        m = MagicMock()
+        m.read.return_value = payload.encode()
+        m.__enter__ = lambda s: m
+        m.__exit__ = lambda s, *a: False
+        with patch("urllib.request.urlopen", return_value=m):
+            r = self.client.get("/api/update-check")
+        d = r.get_json()
+        self.assertTrue(d["update_available"])
+        self.assertEqual(d["latest"], "9.9.9")
+
+    def test_same_or_older_release_does_not_flag(self):
+        payload = json.dumps({"tag_name": "v0.0.1"})
+        m = MagicMock()
+        m.read.return_value = payload.encode()
+        m.__enter__ = lambda s: m
+        m.__exit__ = lambda s, *a: False
+        with patch("urllib.request.urlopen", return_value=m):
+            d = self.client.get("/api/update-check").get_json()
+        self.assertFalse(d["update_available"])
+
+    def test_network_failure_is_not_fatal(self):
+        with patch("urllib.request.urlopen", side_effect=OSError("no network")):
+            r = self.client.get("/api/update-check")
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.get_json()["update_available"])
+
+    def test_result_is_cached(self):
+        payload = json.dumps({"tag_name": "v9.9.9"})
+        m = MagicMock()
+        m.read.return_value = payload.encode()
+        m.__enter__ = lambda s: m
+        m.__exit__ = lambda s, *a: False
+        with patch("urllib.request.urlopen", return_value=m) as up:
+            self.client.get("/api/update-check")
+            self.client.get("/api/update-check")
+        self.assertEqual(up.call_count, 1)   # second served from cache
+
+    def test_unknown_own_version_never_prompts(self):
+        """If we can't read our own version, (0,0,0) < anything would prompt on
+        every release. Guard against that."""
+        server.APP_VERSION = ""
+        payload = json.dumps({"tag_name": "v9.9.9"})
+        m = MagicMock()
+        m.read.return_value = payload.encode()
+        m.__enter__ = lambda s: m
+        m.__exit__ = lambda s, *a: False
+        with patch("urllib.request.urlopen", return_value=m):
+            d = self.client.get("/api/update-check").get_json()
+        self.assertFalse(d["update_available"])
+
+
+class TestHistoryGaps(unittest.TestCase):
+    """Gap review is a local DB question — never gated on the supplier API.
+    Recovery is, because the readings can only come from the supplier."""
+
+    def setUp(self):
+        import engine as _eng
+        self._eng = _eng
+        self._orig = getattr(_eng, "kraken_available", None)
+
+    def tearDown(self):
+        if self._orig is None:
+            if hasattr(self._eng, "kraken_available"):
+                del self._eng.kraken_available
+        else:
+            self._eng.kraken_available = self._orig
+
+    def test_find_gaps_works_without_api(self):
+        client = make_client()
+        self._eng.kraken_available = lambda: False
+        r = client.get("/api/history-gaps")
+        self.assertEqual(r.status_code, 200)
+        d = r.get_json()
+        self.assertTrue(d["ok"])
+        self.assertFalse(d["api_available"])   # UI uses this to explain itself
+        self.assertIn("gaps", d)
+
+    def test_find_gaps_reports_api_when_present(self):
+        client = make_client()
+        self._eng.kraken_available = lambda: True
+        d = client.get("/api/history-gaps").get_json()
+        self.assertTrue(d["api_available"])
+
+    def test_resolve_gaps_requires_api(self):
+        client = make_client()
+        self._eng.kraken_available = lambda: False
+        r = client.post("/api/resolve-gaps")
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "no_api")

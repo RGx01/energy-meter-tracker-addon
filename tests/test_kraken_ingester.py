@@ -291,3 +291,54 @@ class TestPoll(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestOutageBackfill(_Base):
+    """BL-8: settled rows for periods with NO block (a long outage) must
+    materialise the block rather than be dropped as `skipped_no_block`."""
+
+    def _rows(self, *triples):
+        return [{"consumption": c, "interval_start": s, "interval_end": e}
+                for c, s, e in triples]
+
+    def setUp(self):
+        super().setUp()
+        self.store._conn.execute(
+            "UPDATE config_periods SET effective_from = '2020-01-01T00:00:00'")
+        self.store._conn.commit()
+
+    def test_missing_block_is_backfilled(self):
+        # no blocks exist for these intervals (the outage)
+        client = FakeClient(import_rows=self._rows(
+            (1.5, "2026-05-01T00:00:00Z", "2026-05-01T00:30:00Z"),
+            (1.8, "2026-05-01T00:30:00Z", "2026-05-01T01:00:00Z"),
+        ))
+        ing = KrakenIngester(client, self.store, import_mpan="M",
+                             import_serial="S", billing_source="api")
+        s = run(ing.poll())
+        self.assertEqual(s["backfilled"], 2)
+        self.assertEqual(s["skipped_no_block"], 0)
+        self.assertEqual(self.store.count_backfilled_blocks(), 2)
+        r = self.store._conn.execute(
+            "SELECT imp_kwh, imp_kwh_api, needs_pass2_rerun FROM blocks "
+            "WHERE block_start = '2026-05-01T00:00:00'").fetchone()
+        self.assertAlmostEqual(r["imp_kwh"], 1.5)
+        self.assertEqual(r["needs_pass2_rerun"], 1)   # PASS 2 will price it
+
+    def test_dry_run_never_backfills(self):
+        client = FakeClient(import_rows=self._rows(
+            (1.5, "2026-05-01T00:00:00Z", "2026-05-01T00:30:00Z")))
+        ing = KrakenIngester(client, self.store, import_mpan="M",
+                             import_serial="S", billing_source="api")
+        s = run(ing.poll(dry_run=True))
+        self.assertEqual(s.get("backfilled", 0), 0)
+        self.assertEqual(self.store.count_backfilled_blocks(), 0)
+
+    def test_backfill_can_be_disabled(self):
+        client = FakeClient(import_rows=self._rows(
+            (1.5, "2026-05-01T00:00:00Z", "2026-05-01T00:30:00Z")))
+        ing = KrakenIngester(client, self.store, import_mpan="M",
+                             import_serial="S", billing_source="api",
+                             backfill_missing=False)
+        s = run(ing.poll())
+        self.assertEqual(s.get("backfilled", 0), 0)
+        self.assertEqual(s["skipped_no_block"], 1)   # old behaviour
