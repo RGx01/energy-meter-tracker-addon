@@ -3708,3 +3708,93 @@ class TestReconciledRateSurvivesPass2(unittest.TestCase):
             "SELECT imp_rate FROM blocks WHERE block_start=?", (bs,)).fetchone()["imp_rate"]
         self.assertAlmostEqual(rate, 0.323092, places=5,
             msg="reconciled peak rate must survive PASS 2 (overlay not re-applied)")
+
+
+class TestUnsupportedTariffGuard(unittest.IsolatedAsyncioTestCase):
+    """#1708 fail-loud guard: a discovered import tariff that returns NO standard
+    unit rates (the new IOG 6-hour-cap / time-of-use tariff) must set the
+    unsupported flag so the UI can warn, instead of silently pricing at £0."""
+
+    async def asyncSetUp(self):
+        self._d, self._c, self._u = (engine._kraken_discovery,
+                                     engine._kraken_client,
+                                     engine._rate_schedule_unsupported)
+
+    async def asyncTearDown(self):
+        engine._kraken_discovery = self._d
+        engine._kraken_client = self._c
+        engine._rate_schedule_unsupported = self._u
+
+    async def test_empty_import_rates_sets_flag(self):
+        from unittest.mock import AsyncMock, MagicMock
+        engine._kraken_discovery = {"import": {
+            "product_code": "IOG-SMB-TOU-25-12-12",
+            "tariff_code": "E-1R-IOG-SMB-TOU-25-12-12-H"}}
+        c = MagicMock()
+        c.get_unit_rates = AsyncMock(return_value=[])
+        c.get_standing_charges = AsyncMock(return_value=[])
+        engine._kraken_client = c
+        await engine._refresh_kraken_rate_schedules()
+        self.assertIsNotNone(engine._rate_schedule_unsupported)
+        self.assertEqual(engine._rate_schedule_unsupported["tariff"],
+                         "E-1R-IOG-SMB-TOU-25-12-12-H")
+
+    async def test_normal_tariff_clears_flag(self):
+        from unittest.mock import AsyncMock, MagicMock
+        engine._rate_schedule_unsupported = {"tariff": "stale"}
+        engine._kraken_discovery = {"import": {
+            "product_code": "INTELLI-FIX", "tariff_code": "E-1R-INTELLI-FIX-B"}}
+        c = MagicMock()
+        c.get_unit_rates = AsyncMock(return_value=[
+            {"value_inc_vat": 5.493, "valid_from": "2026-01-01T00:00:00Z",
+             "valid_to": None}])
+        c.get_standing_charges = AsyncMock(return_value=[])
+        engine._kraken_client = c
+        await engine._refresh_kraken_rate_schedules()
+        self.assertIsNone(engine._rate_schedule_unsupported)
+
+
+class TestGapMarkerDoesNotFreezeSettlement(unittest.TestCase):
+    """BL-1: a gap marker must NOT stop the DCC PASS-2 drain.
+
+    The drain was nested inside `if not has_gap_marker(current_block):` alongside
+    the sub-meter amendment. That globally froze settlement APPLICATION for the
+    whole history whenever any gap marker was live — an outage on one day stopped
+    every other day's settled figures reaching billing. The amendment genuinely
+    needs the guard (gap-seed reads would corrupt boundary interpolation); the
+    drain does not — it takes its queue from the DB and never reads the current
+    block or the rolling buffer.
+    """
+
+    def test_drain_is_not_inside_the_gap_guard(self):
+        """Structural: within _engine_tick, _drain_pass2_queue must be at a
+        shallower indent than the amendment (i.e. outside the guard block)."""
+        import inspect, re
+        src = inspect.getsource(engine._engine_tick)
+        amend = drain = guard = None
+        for line in src.splitlines():
+            if "_amend_provisional_sub_meter_blocks(ha" in line:
+                amend = len(line) - len(line.lstrip())
+            elif "_drain_pass2_queue(ha)" in line:
+                drain = len(line) - len(line.lstrip())
+            elif "if not has_gap_marker(current_block)" in line:
+                guard = len(line) - len(line.lstrip())
+        self.assertIsNotNone(amend, "amendment call not found")
+        self.assertIsNotNone(drain, "drain call not found")
+        self.assertIsNotNone(guard, "gap guard not found")
+        # Both sit inside a `try:`. The amendment's try is nested INSIDE the
+        # guard (guard+8); the drain's try is a sibling OF the guard (guard+4).
+        self.assertEqual(amend, guard + 8,
+                         "amendment must stay INSIDE the gap guard")
+        self.assertEqual(drain, guard + 4,
+                         "drain must be OUTSIDE the gap guard (BL-1) — a gap "
+                         "marker must not freeze DCC settlement application")
+
+    def test_drain_reads_queue_from_db_not_current_block(self):
+        """The justification for un-guarding: the drain's inputs are the DB queue
+        and block_start lookups — never the current block / rolling buffer."""
+        import inspect
+        src = inspect.getsource(engine._drain_pass2_queue)
+        self.assertIn("get_blocks_needing_pass2_rerun", src)
+        self.assertNotIn("current_block", src)
+        self.assertNotIn("_gap_marker", src)

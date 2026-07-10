@@ -1610,3 +1610,127 @@ class TestDispatchHistoryAccumulation(_StoreBase):
             "2020-01-01T00:00:00", "completed", energy_kwh=-1.0)
         deleted = self.store.prune_dispatch_history(days=90)
         self.assertEqual(deleted, 1)
+
+
+class TestBackfillBlock(_StoreBase):
+    """BL-8: materialise blocks from DCC-settled data when an outage left none.
+    `upsert_kraken_block` only settles EXISTING blocks (missing_block → skip), so
+    an outage longer than the gap-fill limit was a permanent hole."""
+
+    def setUp(self):
+        super().setUp()
+        # _StoreBase's config period starts "now"; back-date it so historical
+        # backfill timestamps fall inside a covering period.
+        self.store._conn.execute(
+            "UPDATE config_periods SET effective_from = '2020-01-01T00:00:00'")
+        self.store._conn.commit()
+
+    def test_creates_block_with_settled_kwh_queued_for_pass2(self):
+        bid = self.store.create_backfill_block(
+            "2026-07-06T10:00:00", "electricity_main", 1.5, channel="import")
+        self.assertIsNotNone(bid)
+        r = self.store._conn.execute(
+            "SELECT imp_kwh, imp_kwh_api, interpolated, needs_pass2_rerun, block_end "
+            "FROM blocks WHERE id = ?", (bid,)).fetchone()
+        self.assertAlmostEqual(r["imp_kwh"], 1.5)
+        self.assertAlmostEqual(r["imp_kwh_api"], 1.5)      # authoritative
+        self.assertEqual(r["interpolated"], self.store.BACKFILL_INTERPOLATED)
+        self.assertEqual(r["needs_pass2_rerun"], 1)        # PASS 2 prices it
+        self.assertEqual(r["block_end"], "2026-07-06T10:30:00")  # from block_minutes
+
+    def test_export_fills_block_created_by_import(self):
+        """Import is ingested first and creates the block; export must not be lost."""
+        self.store.create_backfill_block(
+            "2026-07-06T10:00:00", "electricity_main", 1.5, channel="import")
+        bid = self.store.create_backfill_block(
+            "2026-07-06T10:00:00", "electricity_main", 0.8, channel="export")
+        self.assertIsNotNone(bid)
+        r = self.store._conn.execute(
+            "SELECT imp_kwh, exp_kwh, exp_kwh_api FROM blocks WHERE id = ?",
+            (bid,)).fetchone()
+        self.assertAlmostEqual(r["imp_kwh"], 1.5)   # preserved
+        self.assertAlmostEqual(r["exp_kwh"], 0.8)   # filled, not lost
+        self.assertAlmostEqual(r["exp_kwh_api"], 0.8)
+
+    def test_never_touches_a_live_metered_block(self):
+        self.store._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id,"
+            " interpolated, imp_kwh) VALUES (?,?,?,1,0,9.99)",
+            ("2026-07-06T11:00:00", "2026-07-06T11:30:00", "electricity_main"))
+        self.store._conn.commit()
+        self.assertIsNone(self.store.create_backfill_block(
+            "2026-07-06T11:00:00", "electricity_main", 0.1, channel="export"))
+        r = self.store._conn.execute(
+            "SELECT imp_kwh, exp_kwh FROM blocks WHERE block_start = ?",
+            ("2026-07-06T11:00:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_kwh"], 9.99)  # untouched
+        self.assertIsNone(r["exp_kwh"])
+
+    def test_no_config_period_returns_none(self):
+        self.assertIsNone(self.store.create_backfill_block(
+            "1999-01-01T00:00:00", "electricity_main", 1.0))
+
+    def test_count_backfilled(self):
+        self.store.create_backfill_block(
+            "2026-07-06T10:00:00", "electricity_main", 1.0)
+        self.store.create_backfill_block(
+            "2026-07-06T10:30:00", "electricity_main", 1.0)
+        self.assertEqual(self.store.count_backfilled_blocks(), 2)
+
+
+class TestFindBlockGaps(_StoreBase):
+    """BL-8 gap sweep: the DCC poll's cursor only moves forward, so gaps it has
+    passed are never revisited. find_block_gaps asks the DB where the holes are."""
+
+    def setUp(self):
+        super().setUp()
+        self.store._conn.execute(
+            "UPDATE config_periods SET effective_from = '2020-01-01T00:00:00'")
+        self.store._conn.commit()
+        self.cp = self.store.get_current_config_period_id()
+
+    def _block(self, start):
+        self.store._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id,"
+            " interpolated, imp_kwh) VALUES (?,?,?,?,0,1.0)",
+            (start, start, "electricity_main", self.cp))
+
+    def _seed(self, starts):
+        for s in starts:
+            self._block(s)
+        self.store._conn.commit()
+
+    def test_no_gaps_when_contiguous(self):
+        self._seed(["2026-05-01T00:00:00", "2026-05-01T00:30:00",
+                    "2026-05-01T01:00:00"])
+        self.assertEqual(self.store.find_block_gaps(now=datetime(2026, 6, 1)), [])
+
+    def test_finds_a_single_run(self):
+        # missing 00:30 and 01:00
+        self._seed(["2026-05-01T00:00:00", "2026-05-01T01:30:00"])
+        gaps = self.store.find_block_gaps(now=datetime(2026, 6, 1))
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["start"], "2026-05-01T00:30:00")
+        self.assertEqual(gaps[0]["end"], "2026-05-01T01:00:00")
+        self.assertEqual(gaps[0]["slots"], 2)
+
+    def test_separate_runs_are_not_merged(self):
+        self._seed(["2026-05-01T00:00:00", "2026-05-01T01:00:00",
+                    "2026-05-01T02:00:00"])
+        gaps = self.store.find_block_gaps(now=datetime(2026, 6, 1))
+        self.assertEqual([g["slots"] for g in gaps], [1, 1])
+
+    def test_recent_gap_is_deferred_until_settled(self):
+        """A gap newer than min_age_hours would return nothing from DCC."""
+        self._seed(["2026-05-01T00:00:00", "2026-05-01T01:30:00"])
+        # 'now' only an hour after the gap → too recent
+        gaps = self.store.find_block_gaps(now=datetime(2026, 5, 1, 2, 30))
+        self.assertEqual(gaps, [])
+
+    def test_trailing_edge_is_not_a_gap(self):
+        """Nothing after the last block counts as missing."""
+        self._seed(["2026-05-01T00:00:00", "2026-05-01T00:30:00"])
+        self.assertEqual(self.store.find_block_gaps(now=datetime(2026, 6, 1)), [])
+
+    def test_empty_history(self):
+        self.assertEqual(self.store.find_block_gaps(now=datetime(2026, 6, 1)), [])

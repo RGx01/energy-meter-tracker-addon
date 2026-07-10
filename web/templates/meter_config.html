@@ -37,8 +37,11 @@
 {% endblock %}
 
 {% block content %}
-<div id="alert-success" class="alert alert-success" style="position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:999;min-width:320px;text-align:center;box-shadow:0 4px 12px rgba(0,0,0,0.3);">✓ Configuration saved. The engine will pick up changes within 10 seconds.</div>
-<div id="alert-error" class="alert alert-danger" style="position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:999;min-width:320px;text-align:center;box-shadow:0 4px 12px rgba(0,0,0,0.3);"></div>
+<!-- BL-6 (#219): these were position:fixed overlays painting over the tab row.
+     They are now hidden text carriers; show() routes their message into the
+     global in-flow notification region, which pushes content down. -->
+<div id="alert-success" hidden>✓ Configuration saved. The engine will pick up changes within 10 seconds.</div>
+<div id="alert-error" hidden></div>
 
 <!-- ── Main Meter ─────────────────────────────────────────────────────────── -->
 <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;">
@@ -2715,11 +2718,23 @@ function esc(str) {
   return String(str).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 function show(id) {
-  document.getElementById(id).classList.add('show');
-  setTimeout(function() { document.getElementById(id).classList.remove('show'); }, 4000);
+  // BL-6 (#219): route through the global notification region instead of a
+  // position:fixed overlay. Success is transient; errors persist until dismissed
+  // or replaced, since the user usually needs to act on them.
+  var el = document.getElementById(id);
+  if (!el || !window.EMT || !EMT.notify) return;
+  var isError = (id === 'alert-error');
+  EMT.notify({
+    id: id,
+    level: isError ? 'critical' : 'success',
+    html: (el.textContent || '').trim(),
+    transient: !isError,
+    transientMs: 6000,
+    dismissible: isError
+  });
 }
 function hideAlerts() {
-  ['alert-success','alert-error'].forEach(function(id) { document.getElementById(id).classList.remove('show'); });
+  if (window.EMT && EMT.dismiss) { EMT.dismiss('alert-success'); EMT.dismiss('alert-error'); }
 }
 function showError(msg) {
   var el = document.getElementById('alert-error');

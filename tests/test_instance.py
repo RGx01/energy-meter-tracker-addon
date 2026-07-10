@@ -1,0 +1,147 @@
+"""BL-5: instance identity + backup-directory isolation.
+
+/data is per-instance however EMT was installed, so blocks.db is already safe.
+/share is shared across add-ons in supervised mode — two instances would list and
+restore each other's backups. These tests pin the namespacing and the three
+silent rename cases.
+"""
+
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import instance as I
+
+
+class TestSlugify(unittest.TestCase):
+    def test_basic(self):
+        self.assertEqual(I.slugify_site("Highgrove"), "highgrove")
+
+    def test_apostrophes_are_dropped_not_separated(self):
+        self.assertEqual(I.slugify_site("Mum's House"), "mums_house")
+        self.assertEqual(I.slugify_site("Mum\u2019s House"), "mums_house")
+
+    def test_spaces_and_punctuation(self):
+        self.assertEqual(I.slugify_site("Flat 2b"), "flat_2b")
+        self.assertEqual(I.slugify_site("  A -- B  "), "a_b")
+
+    def test_empty_falls_back(self):
+        self.assertEqual(I.slugify_site(""), "site")
+        self.assertEqual(I.slugify_site(None), "site")
+        self.assertEqual(I.slugify_site("!!!"), "site")
+
+    def test_length_capped(self):
+        self.assertLessEqual(len(I.slugify_site("A" * 200)), 48)
+
+
+class _SandboxBase(unittest.TestCase):
+    """Redirect /share and /data into a temp dir; run as supervised."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._share, self._legacy = I._SHARE_ROOT, I.LEGACY_SHARE_BACKUP_DIR
+        self._mode = os.environ.pop("EMT_MODE", None)
+        I._SHARE_ROOT = os.path.join(self.tmp, "share")
+        os.makedirs(I._SHARE_ROOT)
+        I.LEGACY_SHARE_BACKUP_DIR = os.path.join(
+            I._SHARE_ROOT, "energy_meter_tracker_backup")
+        self.data = os.path.join(self.tmp, "data")
+        os.makedirs(self.data)
+
+    def tearDown(self):
+        I._SHARE_ROOT, I.LEGACY_SHARE_BACKUP_DIR = self._share, self._legacy
+        if self._mode is not None:
+            os.environ["EMT_MODE"] = self._mode
+        else:
+            os.environ.pop("EMT_MODE", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+class TestInstanceId(_SandboxBase):
+    def test_minted_once_and_stable(self):
+        a = I.get_instance_id(self.data)
+        b = I.get_instance_id(self.data)
+        self.assertEqual(a, b)
+        self.assertTrue(os.path.exists(os.path.join(self.data, "instance_id")))
+
+    def test_distinct_instances_differ(self):
+        other = os.path.join(self.tmp, "data2")
+        os.makedirs(other)
+        self.assertNotEqual(I.get_instance_id(self.data),
+                            I.get_instance_id(other))
+
+
+class TestStandaloneIsUnaffected(_SandboxBase):
+    def test_volume_scoped_and_site_independent(self):
+        os.environ["EMT_MODE"] = "standalone"
+        a = I.resolve_backup_dir("Highgrove", data_dir=self.data)
+        b = I.resolve_backup_dir("Rental", data_dir=self.data)
+        self.assertEqual(a, b)                       # rename changes nothing
+        self.assertEqual(a, os.path.join(self.data, "backup"))
+        self.assertNotIn("/share", a)
+
+
+class TestBackupDirRename(_SandboxBase):
+    """The three silent cases."""
+
+    def test_case1_destination_free_creates_and_marks(self):
+        d = I.resolve_backup_dir("Highgrove", data_dir=self.data)
+        self.assertTrue(d.endswith("energy_meter_tracker_backup_highgrove"))
+        self.assertTrue(I._owned_by_us(d, I.get_instance_id(self.data)))
+
+    def test_case1b_rename_moves_the_directory(self):
+        d1 = I.resolve_backup_dir("Highgrove", data_dir=self.data)
+        with open(os.path.join(d1, "proof.txt"), "w") as f:
+            f.write("backup")
+        d2 = I.resolve_backup_dir("Rental", data_dir=self.data, current_dir=d1)
+        self.assertTrue(d2.endswith("_rental"))
+        self.assertFalse(os.path.exists(d1))                       # moved
+        self.assertTrue(os.path.exists(os.path.join(d2, "proof.txt")))
+
+    def test_case2_rename_back_adopts_our_own_directory(self):
+        iid = I.get_instance_id(self.data)
+        d1 = I.resolve_backup_dir("Highgrove", data_dir=self.data)
+        d2 = I.resolve_backup_dir("Rental", data_dir=self.data, current_dir=d1)
+        # our old highgrove dir exists again (e.g. restored) and is marked ours
+        os.makedirs(d1, exist_ok=True)
+        I._write_marker(d1, iid)
+        with open(os.path.join(d1, "old.txt"), "w") as f:
+            f.write("x")
+        d3 = I.resolve_backup_dir("Highgrove", data_dir=self.data, current_dir=d2)
+        self.assertEqual(d3, d1)                                   # adopted
+        self.assertTrue(os.path.exists(os.path.join(d3, "old.txt")))  # reappear
+
+    def test_case3_foreign_directory_is_never_touched(self):
+        foreign = I.share_backup_dir("Shared")
+        os.makedirs(foreign)
+        I._write_marker(foreign, "another-instance-uuid")
+        with open(os.path.join(foreign, "theirs.txt"), "w") as f:
+            f.write("x")
+        d = I.resolve_backup_dir("Shared", data_dir=self.data)
+        self.assertNotEqual(d, foreign)                 # timestamp-suffixed
+        self.assertTrue(d.startswith(foreign + "_"))
+        self.assertTrue(os.path.exists(os.path.join(foreign, "theirs.txt")))
+        self.assertTrue(I._owned_by_us(d, I.get_instance_id(self.data)))
+
+    def test_unmarked_existing_directory_is_treated_as_foreign(self):
+        target = I.share_backup_dir("Highgrove")
+        os.makedirs(target)                              # no marker
+        d = I.resolve_backup_dir("Highgrove", data_dir=self.data)
+        self.assertNotEqual(d, target)
+
+    def test_legacy_directory_is_migrated_on_first_run(self):
+        os.makedirs(I.LEGACY_SHARE_BACKUP_DIR)
+        with open(os.path.join(I.LEGACY_SHARE_BACKUP_DIR, "old.zip"), "w") as f:
+            f.write("x")
+        d = I.resolve_backup_dir("Highgrove", data_dir=self.data)
+        self.assertTrue(d.endswith("_highgrove"))
+        self.assertTrue(os.path.exists(os.path.join(d, "old.zip")))  # carried over
+        self.assertFalse(os.path.exists(I.LEGACY_SHARE_BACKUP_DIR))
+
+
+if __name__ == "__main__":
+    unittest.main()
