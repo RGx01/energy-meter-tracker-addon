@@ -134,21 +134,27 @@ def resolve_backup_dir(site_name: str | None, *, data_dir: str = DATA_DIR,
     instance_id = get_instance_id(data_dir)
     target = share_backup_dir(site_name)
 
-    # First run on an existing install: adopt the legacy un-suffixed directory by
-    # renaming it across, so nothing is orphaned and the backup list is unchanged.
-    if current_dir is None and not os.path.exists(target) \
-            and os.path.isdir(LEGACY_SHARE_BACKUP_DIR) \
-            and _read_marker(LEGACY_SHARE_BACKUP_DIR) in (None, instance_id):
-        try:
-            os.rename(LEGACY_SHARE_BACKUP_DIR, target)
-            logger.info("resolve_backup_dir: migrated legacy backup dir -> %s",
-                        target)
-            _write_marker(target, instance_id)
-            return target
-        except Exception as e:
-            logger.warning("resolve_backup_dir: legacy migration failed (%s); "
-                           "continuing with %s", e, LEGACY_SHARE_BACKUP_DIR)
-            return LEGACY_SHARE_BACKUP_DIR
+    # Existing install upgrading to the site-namespaced layout. EMT has only ever
+    # supported ONE instance, so an unmarked legacy directory belongs to this
+    # install: migrate it across, carrying the backups with it. The instance then
+    # owns the site-named directory, and the marker protects it from any second
+    # instance that appears later (which will find it marked and take its own).
+    #
+    # A rename is atomic (same filesystem) so the backups cannot be half-moved.
+    if not os.path.exists(target) and os.path.isdir(LEGACY_SHARE_BACKUP_DIR):
+        legacy_owner = _read_marker(LEGACY_SHARE_BACKUP_DIR)
+        if legacy_owner in (None, instance_id):
+            try:
+                os.rename(LEGACY_SHARE_BACKUP_DIR, target)
+                _write_marker(target, instance_id)
+                logger.info("resolve_backup_dir: migrated backups %s -> %s",
+                            LEGACY_SHARE_BACKUP_DIR, target)
+                return target
+            except Exception as e:
+                logger.warning("resolve_backup_dir: migration failed (%s); "
+                               "continuing to use %s", e, LEGACY_SHARE_BACKUP_DIR)
+                return LEGACY_SHARE_BACKUP_DIR
+        # Marked by another instance — never touch it. Fall through to take our own.
 
     if not os.path.exists(target):
         # Case 1 — destination free. Move our existing directory across if we

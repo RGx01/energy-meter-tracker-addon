@@ -67,7 +67,15 @@ def resolve_backup_dir_for_site(site_name: str | None) -> str:
     global SHARE_BACKUP_DIR
     try:
         import instance as _inst
-        current = SHARE_BACKUP_DIR if _os_engine.path.isdir(SHARE_BACKUP_DIR) else None
+        # Only pass `current_dir` when it is a directory THIS instance owns — it
+        # is used to move our backups on a site rename. At startup the constant
+        # still holds the legacy path, which we do not own until adopted; passing
+        # it here made the rename path try to claim another instance's backups.
+        current = None
+        if _os_engine.path.isdir(SHARE_BACKUP_DIR):
+            iid = _inst.get_instance_id()
+            if _inst._owned_by_us(SHARE_BACKUP_DIR, iid):
+                current = SHARE_BACKUP_DIR
         SHARE_BACKUP_DIR = _inst.resolve_backup_dir(site_name, current_dir=current)
     except Exception as e:
         logger.warning("resolve_backup_dir_for_site: failed (%s); keeping %s",

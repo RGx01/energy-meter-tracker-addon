@@ -133,7 +133,9 @@ class TestBackupDirRename(_SandboxBase):
         d = I.resolve_backup_dir("Highgrove", data_dir=self.data)
         self.assertNotEqual(d, target)
 
-    def test_legacy_directory_is_migrated_on_first_run(self):
+    def test_legacy_directory_is_migrated_on_upgrade(self):
+        """EMT has only ever supported one instance, so an unmarked legacy dir
+        belongs to this install: migrate it, carrying the backups across."""
         os.makedirs(I.LEGACY_SHARE_BACKUP_DIR)
         with open(os.path.join(I.LEGACY_SHARE_BACKUP_DIR, "old.zip"), "w") as f:
             f.write("x")
@@ -141,6 +143,39 @@ class TestBackupDirRename(_SandboxBase):
         self.assertTrue(d.endswith("_highgrove"))
         self.assertTrue(os.path.exists(os.path.join(d, "old.zip")))  # carried over
         self.assertFalse(os.path.exists(I.LEGACY_SHARE_BACKUP_DIR))
+        self.assertTrue(I._owned_by_us(d, I.get_instance_id(self.data)))
+
+    def test_migration_is_idempotent_across_restarts(self):
+        os.makedirs(I.LEGACY_SHARE_BACKUP_DIR)
+        with open(os.path.join(I.LEGACY_SHARE_BACKUP_DIR, "old.zip"), "w") as f:
+            f.write("x")
+        d1 = I.resolve_backup_dir("Highgrove", data_dir=self.data)
+        d2 = I.resolve_backup_dir("Highgrove", data_dir=self.data)
+        self.assertEqual(d1, d2)
+        self.assertEqual(len([x for x in os.listdir(d1) if x.endswith(".zip")]), 1)
+
+    def test_migrated_dir_is_protected_from_a_later_second_instance(self):
+        """After migration the marker guards the user's backups: a second
+        instance with the same site name takes its own directory."""
+        os.makedirs(I.LEGACY_SHARE_BACKUP_DIR)
+        with open(os.path.join(I.LEGACY_SHARE_BACKUP_DIR, "user.zip"), "w") as f:
+            f.write("x")
+        mine = I.resolve_backup_dir("Highgrove", data_dir=self.data)
+        other = os.path.join(self.tmp, "data2")
+        os.makedirs(other)
+        theirs = I.resolve_backup_dir("Highgrove", data_dir=other)
+        self.assertNotEqual(theirs, mine)
+        self.assertTrue(os.path.exists(os.path.join(mine, "user.zip")))
+
+    def test_legacy_marked_by_another_instance_is_never_migrated(self):
+        os.makedirs(I.LEGACY_SHARE_BACKUP_DIR)
+        I._write_marker(I.LEGACY_SHARE_BACKUP_DIR, "another-instance-uuid")
+        with open(os.path.join(I.LEGACY_SHARE_BACKUP_DIR, "theirs.zip"), "w") as f:
+            f.write("x")
+        d = I.resolve_backup_dir("Highgrove", data_dir=self.data)
+        self.assertNotEqual(d, I.LEGACY_SHARE_BACKUP_DIR)
+        self.assertTrue(os.path.exists(
+            os.path.join(I.LEGACY_SHARE_BACKUP_DIR, "theirs.zip")))
 
 
 if __name__ == "__main__":
