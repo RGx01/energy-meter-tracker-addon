@@ -82,6 +82,9 @@ class MiniBoundaryReader:
         self.client = client
         self.device_id = device_id
         self._boundary_count = 0
+        # Dedupe repeated telemetry-fetch failures: log the first, suppress the
+        # rest (the boundary loop polls ~every 10s), log again only on recovery.
+        self._fetch_failing = False
 
     async def _maybe_check_rate_limit(self) -> bool:
         """Every Nth boundary, check the shared GraphQL budget. Returns False
@@ -242,8 +245,19 @@ class MiniBoundaryReader:
                 end_dt.isoformat() + "Z",
             )
         except Exception as e:
-            logger.warning("mini: telemetry fetch failed: %s", e)
+            # Quiet during a GraphQL 403 cooldown (the client logged it once);
+            # otherwise log the FIRST failure and suppress the repeats until
+            # telemetry recovers, so a persistent block can't flood the log.
+            if type(e).__name__ == "KrakenCooldownError":
+                logger.debug("mini: telemetry skipped (GraphQL cooldown)")
+            elif not self._fetch_failing:
+                logger.warning("mini: telemetry fetch failed: %s "
+                               "(suppressing repeats until it recovers)", e)
+            self._fetch_failing = True
             return []
+        if self._fetch_failing:
+            logger.info("mini: telemetry recovered")
+            self._fetch_failing = False
         out: list[dict] = []
         for p in raw or []:
             ts = _parse_readat(p.get("readAt"))

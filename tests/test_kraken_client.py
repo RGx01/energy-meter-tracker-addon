@@ -784,5 +784,113 @@ class TestPickActiveMeter(unittest.TestCase):
         self.assertEqual(kc._pick_active_meter(ms)["serial_number"], "CUR-1")
 
 
+class TestGraphQLEdge403Breaker(unittest.TestCase):
+    """A GraphQL edge/WAF 403 opens a circuit breaker that short-circuits further
+    GraphQL calls (so the Mini/dispatch stop hammering) until a success clears it."""
+
+    def _client(self, gql_responses):
+        c = KrakenAPIClient(api_key="k", account_number="A-1")
+        c._session = FakeSession(gql_responses=gql_responses)
+        c._owns_session = False
+        return c
+
+    def test_403_opens_breaker_then_short_circuits(self):
+        from kraken_api_client import KrakenCooldownError
+        c = self._client([FakeResp(403, text='<!DOCTYPE HTML><TITLE>ERROR')])
+        # First call hits the network, gets 403 → KrakenAPIError, breaker opens.
+        with self.assertRaises(KrakenAPIError):
+            run(c._graphql("query { x }", authenticated=False))
+        self.assertGreater(c._gql_cooldown_remaining(), 0)
+        self.assertEqual(c._gql_cooldown_backoff, kc._GQL_BREAKER_BASE)
+        # Second call short-circuits WITHOUT touching the network.
+        posts_before = len(c._session.post_calls)
+        with self.assertRaises(KrakenCooldownError):
+            run(c._graphql("query { x }", authenticated=False))
+        self.assertEqual(len(c._session.post_calls), posts_before)
+
+    def test_success_resets_breaker(self):
+        c = self._client([FakeResp(200, {"data": {"ok": 1}})])
+        # Simulate a prior cooldown that has since expired.
+        c._gql_cooldown_backoff = kc._GQL_BREAKER_BASE
+        c._gql_cooldown_until = 0.0
+        c._gql_cooldown_logged = True
+        data = run(c._graphql("query { x }", authenticated=False))
+        self.assertEqual(data, {"ok": 1})
+        self.assertEqual(c._gql_cooldown_backoff, 0.0)
+        self.assertEqual(c._gql_cooldown_remaining(), 0.0)
+
+    def test_backoff_doubles_on_repeated_403(self):
+        c = self._client([FakeResp(403, text="<HTML>"),
+                          FakeResp(403, text="<HTML>")])
+        with self.assertRaises(KrakenAPIError):
+            run(c._graphql("q", authenticated=False))
+        first = c._gql_cooldown_backoff
+        c._gql_cooldown_until = 0.0            # force expiry so the next call runs
+        with self.assertRaises(KrakenAPIError):
+            run(c._graphql("q", authenticated=False))
+        self.assertEqual(c._gql_cooldown_backoff, first * 2)
+
+    def test_non_403_4xx_does_not_open_breaker(self):
+        c = self._client([FakeResp(400, text="bad request")])
+        with self.assertRaises(KrakenAPIError):
+            run(c._graphql("q", authenticated=False))
+        self.assertEqual(c._gql_cooldown_remaining(), 0.0)   # only 403 trips it
+
+
+class TestRestEdge403VsAuth(unittest.TestCase):
+    """A REST edge/WAF 403 (HTML body) must NOT be reported as an auth failure —
+    otherwise a transient block tells the user to rotate a working API key."""
+
+    def _client(self, resp):
+        c = KrakenAPIClient(api_key="k", account_number="A-1")
+        c._session = FakeSession(routes={"/v1/foo": resp})
+        c._owns_session = False
+        return c
+
+    def test_401_is_auth_error(self):
+        with self.assertRaises(KrakenAuthError):
+            run(self._client(FakeResp(401, text="unauthorized"))._get("/v1/foo"))
+
+    def test_403_html_is_edge_block_not_auth(self):
+        from kraken_api_client import KrakenEdgeBlockError
+        c = self._client(FakeResp(403, text='<!DOCTYPE HTML><TITLE>ERROR'))
+        with self.assertRaises(KrakenEdgeBlockError):
+            run(c._get("/v1/foo"))
+        # Crucially, it is NOT a KrakenAuthError, so no "check API key".
+        c2 = self._client(FakeResp(403, text='<HTML>'))
+        try:
+            run(c2._get("/v1/foo"))
+            self.fail("expected an error")
+        except KrakenAuthError:
+            self.fail("edge 403 must not be a KrakenAuthError")
+        except KrakenEdgeBlockError:
+            pass
+
+    def test_403_json_body_is_auth_error(self):
+        c = self._client(FakeResp(403, text='{"detail":"forbidden"}'))
+        with self.assertRaises(KrakenAuthError):
+            run(c._get("/v1/foo"))
+
+
+class TestConnectionMessageForEdgeBlock(unittest.TestCase):
+    """The Settings 'Test' button distinguishes an edge block from a key problem."""
+
+    def _client(self, resp):
+        c = KrakenAPIClient(api_key="k", account_number="A-1")
+        c._session = FakeSession(routes={"/v1/accounts": resp})
+        c._owns_session = False
+        return c
+
+    def test_edge_block_not_reported_as_key_problem(self):
+        res = run(self._client(FakeResp(403, text="<HTML>ERROR")).test_connection())
+        self.assertFalse(res["ok"])
+        self.assertIn("not an API key problem", res["detail"])
+
+    def test_genuine_401_reports_check_key(self):
+        res = run(self._client(FakeResp(401, text="nope")).test_connection())
+        self.assertFalse(res["ok"])
+        self.assertIn("check API key", res["detail"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -178,5 +178,62 @@ class TestBackupDirRename(_SandboxBase):
             os.path.join(I.LEGACY_SHARE_BACKUP_DIR, "theirs.zip")))
 
 
+class TestScanFirstOwnership(_SandboxBase):
+    """Ownership is resolved by scanning /share for our marker, so an instance
+    keeps its own directory even after a restore whose data reports a different
+    site name (the prod -> prod dev workflow)."""
+
+    def test_restore_with_colliding_site_name_keeps_own_dir(self):
+        # prod owns ..._home; prod dev owns ..._home_dev.
+        prod = os.path.join(self.tmp, "data_prod")
+        proddev = os.path.join(self.tmp, "data_proddev")
+        os.makedirs(prod); os.makedirs(proddev)
+        prod_dir = I.resolve_backup_dir("Home", data_dir=prod)
+        dev_dir = I.resolve_backup_dir("Home Dev", data_dir=proddev)
+        self.assertNotEqual(prod_dir, dev_dir)
+        # Restore prod -> prod dev: prod dev's site name now reads "Home".
+        # It must keep its OWN dir, never adopt prod's, stable across repeats.
+        for _ in range(3):
+            got = I.resolve_backup_dir("Home", data_dir=proddev)
+            self.assertEqual(got, dev_dir)
+            self.assertNotEqual(got, prod_dir)
+        self.assertTrue(I._owned_by_us(prod_dir, I.get_instance_id(prod)))
+        self.assertTrue(I._owned_by_us(dev_dir, I.get_instance_id(proddev)))
+
+    def test_owned_dir_found_wherever_it_sits(self):
+        d = I.resolve_backup_dir("Home", data_dir=self.data)
+        self.assertEqual(I._find_owned_dir(I.get_instance_id(self.data)), d)
+
+
+class TestDataLineage(_SandboxBase):
+    """db_uuid travels with the data; a mismatch against the install id means
+    the DB was restored from another instance. Ownership never keys on it."""
+
+    def test_native_db_uuid_equals_install_id(self):
+        minted = I.ensure_db_uuid(None, data_dir=self.data)
+        self.assertEqual(minted, I.get_instance_id(self.data))
+        self.assertFalse(
+            I.foreign_restore_notice(minted, data_dir=self.data)["foreign"])
+
+    def test_existing_db_uuid_is_immutable(self):
+        self.assertEqual(I.ensure_db_uuid("abc123", data_dir=self.data), "abc123")
+
+    def test_foreign_restore_flagged_and_dismissal_sticks_per_lineage(self):
+        # A DB carrying another install's id is foreign to this one.
+        foreign_id = "f" * 32
+        n = I.foreign_restore_notice(foreign_id, data_dir=self.data)
+        self.assertTrue(n["foreign"])
+        self.assertFalse(n["acknowledged"])
+        # Dismiss once; sticks for that lineage (survives re-read / re-restore).
+        I.acknowledge_db_uuid(foreign_id, data_dir=self.data)
+        n2 = I.foreign_restore_notice(foreign_id, data_dir=self.data)
+        self.assertTrue(n2["foreign"])
+        self.assertTrue(n2["acknowledged"])
+        # A different lineage still surfaces.
+        other = I.foreign_restore_notice("e" * 32, data_dir=self.data)
+        self.assertTrue(other["foreign"])
+        self.assertFalse(other["acknowledged"])
+
+
 if __name__ == "__main__":
     unittest.main()

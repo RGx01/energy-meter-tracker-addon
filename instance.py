@@ -26,6 +26,7 @@ Ownership is decided by **instance identity, not liveness** — a heartbeat woul
 risk adopting a merely-stopped sibling's directory.
 """
 
+import glob
 import json
 import logging
 import os
@@ -38,10 +39,20 @@ logger = logging.getLogger(__name__)
 DATA_DIR = "/data/energy_meter_tracker"
 LEGACY_SHARE_BACKUP_DIR = "/share/energy_meter_tracker_backup"
 _SHARE_ROOT = "/share"
+_SHARE_GLOB = "energy_meter_tracker_backup*"   # scan pattern for owned dirs
 _MARKER_NAME = ".emt_instance"
 _INSTANCE_ID_FILE = "instance_id"
+# Install-scoped (NOT in blocks.db, so it survives a restore): the set of data
+# lineages (db_uuids) whose "restored from another instance" notice the user has
+# dismissed. Keyed by db_uuid so the same source lineage stays quiet across
+# repeated restores. See docs/instance_isolation_design.md.
+_ACK_FILE = "acknowledged_db_uuids"
 _MAX_SLUG_LEN = 48
 _DEFAULT_SLUG = "site"
+
+
+def _utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
 
 
 def is_standalone() -> bool:
@@ -111,6 +122,23 @@ def _owned_by_us(directory: str, instance_id: str) -> bool:
     return _read_marker(directory) == instance_id
 
 
+def _find_owned_dir(instance_id: str, target: str | None = None) -> str | None:
+    """Scan /share for a backup directory whose marker is ours.
+
+    This is the authoritative ownership test — it keys on *instance identity*,
+    which never changes on a restore, so a directory we created stays ours even
+    after our DB has been replaced by a restore that carries a colliding site
+    name (the prod -> prod dev case). Prefers `target` when we own it.
+    """
+    owned = [d for d in glob.glob(os.path.join(_SHARE_ROOT, _SHARE_GLOB))
+             if os.path.isdir(d) and _read_marker(d) == instance_id]
+    if not owned:
+        return None
+    if target and target in owned:
+        return target
+    return sorted(owned)[0]
+
+
 def share_backup_dir(site_name: str | None) -> str:
     """The supervised backup directory for this site (no filesystem effects)."""
     return os.path.join(_SHARE_ROOT,
@@ -122,11 +150,13 @@ def resolve_backup_dir(site_name: str | None, *, data_dir: str = DATA_DIR,
     """Resolve (and if needed migrate) this instance's backup directory.
 
     Standalone: always `<data_dir>/backup` — volume-scoped, site-independent.
-    Supervised: `/share/energy_meter_tracker_backup_<site_slug>`, with the
-    rename handling described in the module docstring. Always silent.
+    Supervised: `/share/energy_meter_tracker_backup_<site_slug>`, resolved by
+    scanning for the directory this instance *owns* (marker == our instance id)
+    before falling back to the site-name path. Always silent. See
+    docs/instance_isolation_design.md.
 
-    `current_dir` is the directory in use before this call (if known), used to
-    move an existing directory across on a site rename.
+    `current_dir` is accepted for backward compatibility but no longer needed —
+    the /share scan finds our directory wherever it is.
     """
     if is_standalone():
         return os.path.join(data_dir, "backup")
@@ -134,56 +164,121 @@ def resolve_backup_dir(site_name: str | None, *, data_dir: str = DATA_DIR,
     instance_id = get_instance_id(data_dir)
     target = share_backup_dir(site_name)
 
-    # Existing install upgrading to the site-namespaced layout. EMT has only ever
-    # supported ONE instance, so an unmarked legacy directory belongs to this
-    # install: migrate it across, carrying the backups with it. The instance then
-    # owns the site-named directory, and the marker protects it from any second
-    # instance that appears later (which will find it marked and take its own).
-    #
-    # A rename is atomic (same filesystem) so the backups cannot be half-moved.
-    if not os.path.exists(target) and os.path.isdir(LEGACY_SHARE_BACKUP_DIR):
-        legacy_owner = _read_marker(LEGACY_SHARE_BACKUP_DIR)
-        if legacy_owner in (None, instance_id):
+    # 1. Do we already own a directory? Scan by marker — authoritative, and the
+    #    reason a restored-in sibling DB with a colliding site name stays put.
+    owned = _find_owned_dir(instance_id, target)
+    if owned:
+        if owned == target:
+            return target
+        if not os.path.exists(target):
+            # Site renamed and the new name is free — move our dir across
+            # (atomic: same filesystem, so backups cannot be half-moved).
             try:
-                os.rename(LEGACY_SHARE_BACKUP_DIR, target)
+                os.rename(owned, target)
                 _write_marker(target, instance_id)
-                logger.info("resolve_backup_dir: migrated backups %s -> %s",
-                            LEGACY_SHARE_BACKUP_DIR, target)
+                logger.info("resolve_backup_dir: site renamed; backups moved "
+                            "%s -> %s", owned, target)
                 return target
             except Exception as e:
-                logger.warning("resolve_backup_dir: migration failed (%s); "
-                               "continuing to use %s", e, LEGACY_SHARE_BACKUP_DIR)
-                return LEGACY_SHARE_BACKUP_DIR
-        # Marked by another instance — never touch it. Fall through to take our own.
+                logger.warning("resolve_backup_dir: rename %s -> %s failed (%s); "
+                               "staying put", owned, target, e)
+                return owned
+        # The ideal name is taken by a sibling but we already own a directory —
+        # keep it. Stable across repeated foreign restores (prod -> prod dev).
+        logger.info("resolve_backup_dir: keeping owned dir %s (ideal %s taken by "
+                    "another instance)", owned, target)
+        return owned
 
+    # 2. We own nothing yet. An UNMARKED legacy directory belongs to this install
+    #    (EMT only ever supported one instance before BL-5): adopt it, carrying
+    #    the backups across. A marked legacy dir is a sibling's — never touched.
+    if os.path.isdir(LEGACY_SHARE_BACKUP_DIR) \
+            and _read_marker(LEGACY_SHARE_BACKUP_DIR) is None:
+        dest = target if not os.path.exists(target) else f"{target}_{_utc_stamp()}"
+        try:
+            os.rename(LEGACY_SHARE_BACKUP_DIR, dest)
+            _write_marker(dest, instance_id)
+            logger.info("resolve_backup_dir: migrated legacy backups %s -> %s",
+                        LEGACY_SHARE_BACKUP_DIR, dest)
+            return dest
+        except Exception as e:
+            logger.warning("resolve_backup_dir: legacy migration failed (%s); "
+                           "using %s", e, LEGACY_SHARE_BACKUP_DIR)
+            return LEGACY_SHARE_BACKUP_DIR
+
+    # 3. Fresh directory. Take the ideal name if free, else a timestamped one so
+    #    we never merge into a sibling's directory.
     if not os.path.exists(target):
-        # Case 1 — destination free. Move our existing directory across if we
-        # have one (atomic: same filesystem), else create it.
-        if current_dir and os.path.isdir(current_dir) \
-                and _owned_by_us(current_dir, instance_id):
-            try:
-                os.rename(current_dir, target)
-                logger.info("resolve_backup_dir: site renamed; backups moved "
-                            "%s -> %s", current_dir, target)
-            except Exception as e:
-                logger.warning("resolve_backup_dir: rename failed (%s); staying "
-                               "on %s", e, current_dir)
-                return current_dir
         _write_marker(target, instance_id)
         return target
-
-    if _owned_by_us(target, instance_id):
-        # Case 2 — our own former directory (renamed away and back). Adopt it:
-        # the old backups reappear and nothing moves.
-        logger.info("resolve_backup_dir: adopting our previous backup dir %s",
-                    target)
-        return target
-
-    # Case 3 — a sibling instance may own it (or it is unmarked). Never merge,
-    # never touch their data: take a timestamped directory of our own.
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    fresh = f"{target}_{stamp}"
-    logger.info("resolve_backup_dir: %s is owned by another instance; using %s",
+    fresh = f"{target}_{_utc_stamp()}"
+    logger.info("resolve_backup_dir: %s owned by another instance; using %s",
                 target, fresh)
     _write_marker(fresh, instance_id)
     return fresh
+
+
+# ── Data lineage (db_uuid) and foreign-restore detection ─────────────────────
+# db_uuid lives INSIDE blocks.db (store_meta) and travels with the data through
+# backup/restore. A native DB carries db_uuid == install_id; a restored DB
+# carries the *source* install's id, so a mismatch means "restored from another
+# instance." Ownership never keys on this — only the user-facing notice does.
+
+def ensure_db_uuid(current: str | None, data_dir: str = DATA_DIR) -> str:
+    """Return the db_uuid to persist in the DB.
+
+    If the DB already carries one, keep it (immutable — it identifies the data
+    lineage). If it has none (fresh install or pre-3.2.0 upgrade), mint one
+    EQUAL to this install's id, marking the DB native (db_uuid == install_id).
+    """
+    if current:
+        return current
+    return get_instance_id(data_dir)
+
+
+def _ack_path(data_dir: str) -> str:
+    return os.path.join(data_dir, _ACK_FILE)
+
+
+def _read_acknowledged(data_dir: str) -> set[str]:
+    try:
+        with open(_ack_path(data_dir)) as f:
+            return set(json.load(f) or [])
+    except FileNotFoundError:
+        return set()
+    except Exception as e:
+        logger.warning("_read_acknowledged: %s", e)
+        return set()
+
+
+def acknowledge_db_uuid(db_uuid: str, data_dir: str = DATA_DIR) -> None:
+    """Persist that the user dismissed the foreign-restore notice for this
+    lineage. Stored in /data (install-scoped) so it survives the next restore."""
+    if not db_uuid:
+        return
+    acks = _read_acknowledged(data_dir)
+    if db_uuid in acks:
+        return
+    acks.add(db_uuid)
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        with open(_ack_path(data_dir), "w") as f:
+            json.dump(sorted(acks), f)
+    except Exception as e:
+        logger.warning("acknowledge_db_uuid: persist failed (%s)", e)
+
+
+def foreign_restore_notice(db_uuid: str | None, data_dir: str = DATA_DIR) -> dict:
+    """Describe whether the open DB is foreign to this install.
+
+    Returns {"foreign": bool, "db_uuid": str|None, "acknowledged": bool}. A DB is
+    foreign when its db_uuid differs from this install's id. Acknowledgement is
+    per db_uuid (see acknowledge_db_uuid), so a routine repeated restore of the
+    same source lineage is dismissed once and stays quiet.
+    """
+    if not db_uuid:
+        return {"foreign": False, "db_uuid": None, "acknowledged": False}
+    install_id = get_instance_id(data_dir)
+    return {"foreign": db_uuid != install_id,
+            "db_uuid": db_uuid,
+            "acknowledged": db_uuid in _read_acknowledged(data_dir)}

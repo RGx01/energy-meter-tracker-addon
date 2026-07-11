@@ -35,6 +35,14 @@ logger = logging.getLogger("kraken_rates")
 _PREFERRED_PAYMENT = "DIRECT_DEBIT"
 
 
+class RateFetchError(Exception):
+    """A rate fetch FAILED (transport error, HTTP 4xx/5xx, edge 403) — as opposed
+    to succeeding and returning no records. The two must not be conflated: a
+    failed fetch is transient and must NOT be reported as an unsupported tariff.
+    Only raised when `build_rate_schedule(..., raise_on_error=True)`.
+    """
+
+
 class RateSchedule:
     """An ordered set of (valid_from, valid_to, value) periods in naive-UTC.
 
@@ -144,12 +152,18 @@ class RateSchedule:
 async def build_rate_schedule(
     client, product_code: str, tariff_code: str,
     *, period_from: Optional[str] = None, period_to: Optional[str] = None,
+    raise_on_error: bool = False,
 ) -> RateSchedule:
     """Fetch a tariff's unit-rate history and build a RateSchedule.
 
-    One network call (paginated internally) per tariff. Returns an empty
-    schedule on any failure, so the caller degrades to 'no rate found' rather
-    than raising into the drain.
+    One network call (paginated internally) per tariff.
+
+    By default returns an empty schedule on ANY failure, so pricing/drain callers
+    degrade to 'no rate found' rather than raising. Callers that must tell a
+    *failed fetch* from a *tariff genuinely lacking rates* (e.g. the schedule
+    refresh, which drives the "tariff unsupported" banner) pass
+    `raise_on_error=True`: a fetch failure then raises RateFetchError, while a
+    successful-but-empty result still returns an empty schedule.
     """
     if not product_code or not tariff_code:
         return RateSchedule([])
@@ -160,6 +174,10 @@ async def build_rate_schedule(
     except Exception as e:
         logger.warning("build_rate_schedule: fetch failed for %s/%s: %s",
                        product_code, tariff_code, e)
+        if raise_on_error:
+            raise RateFetchError(
+                f"unit-rate fetch failed for {product_code}/{tariff_code}: {e}"
+            ) from e
         return RateSchedule([])
     if not records:
         # New IOG time-of-use / 6-hour-cap tariff (IOG-SMB-TOU) drops
@@ -186,6 +204,11 @@ async def build_rate_schedule(
         except Exception as e:
             logger.warning("build_rate_schedule: day/night fallback failed for "
                            "%s/%s: %s", product_code, tariff_code, e)
+            if raise_on_error:
+                raise RateFetchError(
+                    f"day/night rate fetch failed for {product_code}/"
+                    f"{tariff_code}: {e}"
+                ) from e
     sched = RateSchedule.from_api_records(records)
     # Diagnostic: surface DISTINCT rate values, plus the FIRST and LAST few
     # periods and the date-span each distinct rate covers. This reveals whether
