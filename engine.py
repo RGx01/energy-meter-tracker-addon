@@ -56,6 +56,10 @@ SHARE_BACKUP_DIR   = (
     else "/share/energy_meter_tracker_backup"
 )
 
+# BL-5: set at startup from the data lineage check. Read by the server to surface
+# a dismissible "restored from another instance" notice. Never gates anything.
+FOREIGN_RESTORE_NOTICE = {"foreign": False, "db_uuid": None, "acknowledged": False}
+
 
 def resolve_backup_dir_for_site(site_name: str | None) -> str:
     """BL-5: rebind SHARE_BACKUP_DIR for this site, migrating/adopting as needed.
@@ -4643,12 +4647,16 @@ async def _refresh_kraken_rate_schedules() -> None:
     if _kraken_client is None or not _kraken_discovery:
         return
     try:
-        from kraken_rates import build_rate_schedule, build_standing_charge_schedule
+        from kraken_rates import (build_rate_schedule,
+                                  build_standing_charge_schedule, RateFetchError)
     except Exception as e:
         logger.warning("_refresh_kraken_rate_schedules: import failed: %s", e)
         return
     new_cache: dict = {}
     unsupported: dict | None = None
+    # Did we get a DEFINITIVE (non-error) result for the import channel this
+    # cycle? A transient fetch failure must not raise — or clear — the banner.
+    import_determined = False
     for ch in ("import", "export"):
         info = _kraken_discovery.get(ch) or {}
         product = info.get("product_code")
@@ -4656,26 +4664,41 @@ async def _refresh_kraken_rate_schedules() -> None:
         if not product or not tariff:
             continue
         try:
-            sched = await build_rate_schedule(_kraken_client, product, tariff)
-            if not sched.is_empty():
-                new_cache[ch] = sched
-            elif ch == "import":
-                # Active tariff discovered, but standard-unit-rates came back EMPTY.
-                # That's the signature of the new time-of-use Intelligent Octopus
-                # tariff (IOG-SMB-TOU — the 6-hour charge cap), which drops
-                # `standard-unit-rates` for `day/night/ev_device_*` rate links EMT
-                # does not yet read. FAIL LOUD — do not silently price at £0.
-                unsupported = {"tariff": tariff, "product": product}
-                logger.error(
-                    "_refresh_kraken_rate_schedules: import tariff %s returned NO "
-                    "standard unit rates. This is the new IOG time-of-use / 6-hour-"
-                    "cap tariff (day/night/ev_device rates), which EMT does NOT yet "
-                    "support. Rates are unavailable and billing for this meter will "
-                    "be incorrect until support lands. See issue #1708.", tariff)
+            sched = await build_rate_schedule(
+                _kraken_client, product, tariff, raise_on_error=True)
+        except RateFetchError as e:
+            # The fetch FAILED (transport / HTTP / edge 403) — this is NOT an
+            # unsupported tariff. Keep the last-known schedule and the previous
+            # unsupported state untouched, so an API blip can't flip the
+            # "tariff unsupported" banner (or a stale banner can't clear wrongly).
+            logger.warning("_refresh_kraken_rate_schedules: %s rate fetch failed "
+                           "transiently (%s); keeping last-known schedule", ch, e)
+            continue
         except Exception as e:
             logger.warning("_refresh_kraken_rate_schedules: %s build failed: %s",
                            ch, e)
-    _rate_schedule_unsupported = unsupported
+            continue
+        if ch == "import":
+            import_determined = True
+        if not sched.is_empty():
+            new_cache[ch] = sched
+        elif ch == "import":
+            # Fetch SUCCEEDED but the tariff genuinely returns no standard AND no
+            # day/night rates — the signature of the new time-of-use Intelligent
+            # Octopus tariff (IOG-SMB-TOU — the 6-hour charge cap), which drops
+            # `standard-unit-rates` for `day/night/ev_device_*` links EMT does not
+            # yet read. FAIL LOUD — do not silently price at £0.
+            unsupported = {"tariff": tariff, "product": product}
+            logger.error(
+                "_refresh_kraken_rate_schedules: import tariff %s returned NO "
+                "standard unit rates. This is the new IOG time-of-use / 6-hour-"
+                "cap tariff (day/night/ev_device rates), which EMT does NOT yet "
+                "support. Rates are unavailable and billing for this meter will "
+                "be incorrect until support lands. See issue #1708.", tariff)
+    # Only update the banner when we actually determined the import status this
+    # cycle. A transient failure leaves the previous flag exactly as it was.
+    if import_determined:
+        _rate_schedule_unsupported = unsupported
     if new_cache:
         _kraken_rate_schedules = new_cache
         logger.info("_refresh_kraken_rate_schedules: import=%d export=%d periods",
@@ -5668,6 +5691,29 @@ async def engine_startup(ha: HAClient):
         logger.info("engine_startup: backup dir = %s (site=%r)", _bd, _site)
     except Exception as _bde:
         logger.warning("engine_startup: backup dir resolution failed: %s", _bde)
+
+    # BL-5: data lineage (db_uuid) and foreign-restore detection. db_uuid lives
+    # in the DB (store_meta) and travels with the data; a native DB carries
+    # db_uuid == install_id. A mismatch means this DB was restored from another
+    # instance — surface a dismissible notice (dismissed per lineage). This never
+    # affects backup-directory ownership, which keys on the install id alone.
+    try:
+        global FOREIGN_RESTORE_NOTICE
+        import instance as _inst
+        _dbid = _store.get_meta("db_uuid") if _store is not None else None
+        _dbid2 = _inst.ensure_db_uuid(_dbid)
+        if _store is not None and _dbid2 != _dbid:
+            _store.set_meta("db_uuid", _dbid2)
+        FOREIGN_RESTORE_NOTICE = _inst.foreign_restore_notice(_dbid2)
+        if FOREIGN_RESTORE_NOTICE.get("foreign") \
+                and not FOREIGN_RESTORE_NOTICE.get("acknowledged"):
+            logger.warning("engine_startup: DB appears restored from another "
+                           "instance (db_uuid=%s… != this install)",
+                           str(_dbid2)[:8])
+    except Exception as _fre:
+        logger.warning("engine_startup: lineage check failed: %s", _fre)
+        FOREIGN_RESTORE_NOTICE = {"foreign": False, "db_uuid": None,
+                                  "acknowledged": False}
 
     if not _PUBLISH_HA_SENSORS:
         logger.warning("engine_startup: HA sensor publishing DISABLED (publish_ha_sensors=false)")

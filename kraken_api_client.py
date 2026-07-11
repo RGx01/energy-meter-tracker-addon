@@ -28,6 +28,7 @@ import asyncio
 import base64
 import logging
 import random
+import time
 from typing import Any, Optional
 
 import aiohttp
@@ -51,6 +52,13 @@ _GQL_DISABLED_FIELD_CODE = "KT-CT-1113"
 _GQL_MAX_RETRIES = 4
 _GQL_BACKOFF_BASE = 1.0   # seconds
 _GQL_BACKOFF_CAP = 30.0   # seconds
+# Circuit breaker for an edge/WAF 403 on the GraphQL endpoint. Unlike the
+# retryable 429/5xx path, a 403 means an intermediary is *blocking* the endpoint;
+# retrying every poll (the Mini polls ~every 10s) only prolongs the block and
+# floods the log. After a 403 we OPEN the breaker and short-circuit GraphQL for a
+# growing cooldown (first value, doubling, capped), resetting on the next success.
+_GQL_BREAKER_BASE = 60.0    # first cooldown after an edge 403 (s)
+_GQL_BREAKER_CAP = 900.0    # max cooldown — 15 min
 # Refresh the JWT this many seconds before its exp claim, to avoid using a
 # token that expires mid-flight.
 _TOKEN_REFRESH_SKEW = 120
@@ -318,6 +326,26 @@ class KrakenRateLimitError(KrakenAPIError):
     """429 — REST rate limit hit. Caller should back off."""
 
 
+class KrakenCooldownError(KrakenAPIError):
+    """GraphQL is in a post-403 cooldown; the call was short-circuited WITHOUT
+    hitting the network. Transient — callers log quietly (the breaker already
+    logged once) and try again after the cooldown."""
+
+
+class KrakenEdgeBlockError(KrakenAPIError):
+    """An intermediary (edge/WAF/proxy) returned HTTP 403 with an HTML error page
+    — the request never reached Kraken. This is NOT an authentication failure and
+    the API key is unaffected; it is distinguished from a genuine auth 403 by the
+    response body, so EMT never tells the user to 'check API key' for a block."""
+
+
+def _looks_like_edge_block(body: str) -> bool:
+    """True if a 403 body is an HTML error page (edge/WAF) rather than a JSON API
+    error (auth/permission). Octopus's app layer returns JSON; an Akamai-style
+    denial returns '<!DOCTYPE HTML ...>'."""
+    return (body or "").lstrip()[:1] == "<"
+
+
 class KrakenAPIClient:
     """Async REST client for the Octopus/Kraken public API.
 
@@ -357,6 +385,39 @@ class KrakenAPIClient:
         # {kind,type,name,reason} dicts the engine surfaces to HA.
         self._deprecation_checked = False
         self.last_deprecations: Optional[list] = None
+        # GraphQL edge-403 circuit breaker (see _GQL_BREAKER_* and _graphql).
+        self._gql_cooldown_until = 0.0      # time.monotonic() deadline
+        self._gql_cooldown_backoff = 0.0    # current cooldown length (s)
+        self._gql_cooldown_logged = False   # log the block once per episode
+
+    # ── GraphQL edge-403 circuit breaker ─────────────────────────────────
+    def _gql_cooldown_remaining(self) -> float:
+        """Seconds until GraphQL may be tried again (0 if not cooling down)."""
+        return max(0.0, self._gql_cooldown_until - time.monotonic())
+
+    def _open_gql_cooldown(self, body: str = "") -> None:
+        """Enter/extend the GraphQL cooldown after an edge 403 (exponential)."""
+        self._gql_cooldown_backoff = min(
+            _GQL_BREAKER_CAP,
+            self._gql_cooldown_backoff * 2 if self._gql_cooldown_backoff
+            else _GQL_BREAKER_BASE)
+        self._gql_cooldown_until = time.monotonic() + self._gql_cooldown_backoff
+        if not self._gql_cooldown_logged:
+            edge = "edge/WAF " if _looks_like_edge_block(body) else ""
+            logger.warning(
+                "GraphQL %s403 — pausing GraphQL (Mini + dispatch) for %.0fs. "
+                "Retrying every poll only prolongs the block; if this persists, "
+                "this instance's Octopus GraphQL session is likely throttled.",
+                edge, self._gql_cooldown_backoff)
+            self._gql_cooldown_logged = True
+
+    def _reset_gql_cooldown(self) -> None:
+        """Clear the cooldown after a successful GraphQL call."""
+        if self._gql_cooldown_backoff or self._gql_cooldown_until:
+            logger.info("GraphQL recovered — clearing 403 cooldown")
+        self._gql_cooldown_until = 0.0
+        self._gql_cooldown_backoff = 0.0
+        self._gql_cooldown_logged = False
 
     # ── session lifecycle ────────────────────────────────────────────────
     async def __aenter__(self) -> "KrakenAPIClient":
@@ -399,10 +460,22 @@ class KrakenAPIClient:
         try:
             async with session.get(url, params=params,
                                    auth=self._rest_auth) as resp:
-                if resp.status in (401, 403):
+                if resp.status == 401:
                     raise KrakenAuthError(
-                        f"authentication failed ({resp.status}) — check API key",
-                        status=resp.status)
+                        "authentication failed (401) — check API key", status=401)
+                if resp.status == 403:
+                    text = await resp.text()
+                    if _looks_like_edge_block(text):
+                        # HTML 403 = an edge/WAF is blocking us; the request never
+                        # reached Kraken. NOT a key problem — say so, so the user
+                        # doesn't rotate a working key.
+                        raise KrakenEdgeBlockError(
+                            "REST blocked by supplier edge/WAF (HTTP 403) — the "
+                            "endpoint is refusing requests; this is NOT an API key "
+                            "problem", status=403)
+                    raise KrakenAuthError(
+                        "authentication failed (403) — check API key / permissions",
+                        status=403)
                 if resp.status == 429:
                     raise KrakenRateLimitError(
                         "REST rate limit hit (429)", status=resp.status)
@@ -635,6 +708,11 @@ class KrakenAPIClient:
                 "detail": "connected",
                 "account_number": account.get("number"),
             }
+        except KrakenEdgeBlockError:
+            return {"ok": False,
+                    "detail": "temporarily blocked by the supplier (edge/WAF) — "
+                              "not an API key problem; try again shortly",
+                    "account_number": None}
         except KrakenAuthError as e:
             return {"ok": False, "detail": "auth failed — check API key",
                     "account_number": None}
@@ -656,12 +734,23 @@ class KrakenAPIClient:
         transient transport/timeout errors with exponential delays plus jitter,
         up to _GQL_MAX_RETRIES. Non-retryable errors (auth, other 4xx, GraphQL
         logic errors) propagate immediately. Returns the `data` object.
+
+        Circuit breaker: while a post-403 cooldown is active the call is
+        short-circuited with KrakenCooldownError (no network); a successful call
+        clears the cooldown.
         """
+        remaining = self._gql_cooldown_remaining()
+        if remaining > 0:
+            raise KrakenCooldownError(
+                f"GraphQL cooling down after 403 ({remaining:.0f}s remaining)",
+                status=403)
         last_exc: Optional[Exception] = None
         for attempt in range(_GQL_MAX_RETRIES + 1):
             try:
-                return await self._graphql_once(
+                data = await self._graphql_once(
                     query, variables, authenticated=authenticated)
+                self._reset_gql_cooldown()
+                return data
             except KrakenRateLimitError as e:
                 last_exc = e
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -712,6 +801,10 @@ class KrakenAPIClient:
                     status=resp.status)
             if resp.status >= 400:
                 text = await resp.text()
+                if resp.status == 403:
+                    # Edge/WAF block — open the circuit breaker so we stop
+                    # hammering (and flooding the log) until it clears.
+                    self._open_gql_cooldown(text)
                 raise KrakenAPIError(
                     f"GraphQL HTTP {resp.status}: {text[:200]}",
                     status=resp.status)
@@ -979,6 +1072,10 @@ class KrakenAPIClient:
         )
         try:
             data = await self._graphql(query, {"acc": acct})
+        except KrakenCooldownError:
+            # In a 403 cooldown — the breaker already logged once; stay quiet.
+            logger.debug("get_dispatches: skipped (GraphQL cooldown)")
+            return None
         except KrakenAPIError as e:
             logger.warning("get_dispatches: unavailable (%s)", e)
             return None
