@@ -273,7 +273,54 @@ The two instances are fully isolated: the database, configuration and backups al
 
 > ⚠️ **Do not share a data volume between instances.** Each expects exclusive use of its own database.
 
-> ℹ️ **HA OS / Supervised cannot run a second instance.** Home Assistant permits a given add-on from a given repository to be installed only once, and we don't ship a second add-on for this. HAOS also has no user-accessible Docker daemon, so there is no fallback — multi-property support is Docker-only.
+> ℹ️ **On HA OS / Supervised**, a second instance isn't an officially supported path — Home Assistant installs a given add-on from a given repository only once, and we don't ship a second add-on. You can still run one as a self-maintained **local add-on**; see **Multiple instances on HA OS / Supervised** below.
+
+### Multiple instances on HA OS / Supervised (advanced)
+
+> ⚠️ **Advanced and unofficial.** Home Assistant is designed to install a given add-on once, so a second supervised instance is a workaround — treat it as at your own risk. If you'd rather not, the Docker approach above is the supported route.
+
+Reassuringly, everything that must stay separate between instances is isolated automatically — nothing is shared by accident:
+
+- **Database & charts** — each add-on has its own private `/data`, so `blocks.db` and the generated charts can never clash.
+- **Ingress** — each add-on gets its own authenticated ingress route automatically.
+- **Backups** — the `/share` backup directory is namespaced per instance (by site name and a persistent per-install id), so two instances never list or restore each other's backups.
+
+The only things you set per instance are a **host port** and a **label**.
+
+#### Option 1 — install a second copy from the store (no file access needed)
+
+Home Assistant keys add-on repositories by their URL, so adding this repository a **second time under a slightly different (but equivalent) URL** makes HA treat it as a separate repository offering its own installable copy:
+
+1. Settings → Add-ons → Add-on store → ⋮ → **Repositories**.
+2. Add the repo again with a small URL variation HA treats as distinct — for example append `.git`:
+   `https://github.com/RGx01/energy-meter-tracker-addon.git`
+   (If HA says it's already added, it normalised that variation — try another, such as a trailing `/`.)
+3. The store now lists **Energy Meter Tracker** twice. Install the second one — but **don't start it yet**.
+4. Open the new instance → **Configuration → Network** and change its **host port** from 8099 to a free one such as **8100** (or clear it to use ingress only). Both copies declare host port 8099 in the shared manifest, so without this the second one can't start.
+5. Start it. Set an **Instance name** in the Configuration tab so the EMT footer labels it, then run the **Setup Wizard** for the second property or account.
+
+This copy **updates from the store** like any other add-on, and its icon works automatically (it's in the repo). The catch: both copies read the *same* `config.yaml`, so they share the add-on **name and icon** — in HA's add-on list they look identical, and you tell them apart by the footer label, the port, or the repository shown on each add-on's page.
+
+#### Option 2 — a local add-on (if you want them visually distinct in HA)
+
+Install the second copy as a **local add-on** if you want each instance to have its own **name, icon and sidebar entry** in Home Assistant, at the cost of a manual, self-maintained setup:
+
+1. Get access to `/addons` via the [Samba](https://my.home-assistant.io/redirect/supervisor_addon/?addon=core_samba), [SSH / Terminal](https://my.home-assistant.io/redirect/supervisor_addon/?addon=core_ssh), or Studio Code Server add-on.
+2. Copy the **entire** add-on into a new folder, e.g. `/addons/energy_meter_tracker_2/`, **including `icon.png` and `logo.png`** (the tile icon is read from this folder).
+3. Edit that folder's `config.yaml`:
+   ```yaml
+   name: "Energy Meter Tracker (2)"    # add-on list + EMT footer label
+   slug: "energy_meter_tracker_2"      # must be unique
+   panel_title: "Energy Meter (2)"     # sidebar label
+   ports:
+     8099/tcp: 8100                     # a free HOST port (or null for ingress-only)
+   ```
+   Leave `ingress_port: 8099` unchanged — the internal port is the same for every instance and never collides (each container has its own network namespace).
+4. Add-on store → ⋮ → **Check for updates** → it appears under **Local add-ons** → install, start, and run the **Setup Wizard**.
+
+A local add-on doesn't auto-update: on a new release, copy the files in again (keeping your `config.yaml`) and **Rebuild** from the ⋮ menu — your `/data` is preserved.
+
+> ⚠️ Each instance authenticates to your supplier independently. If two point at the same Octopus account, each opens its own API session — mind the supplier's rate limits if one polls heavily (for example via an Octopus Home Mini).
 
 ---
 
