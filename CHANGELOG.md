@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — 3.2.0
+## [3.2.0] — 2026-07-11
 
 ### Added
 
@@ -25,6 +25,8 @@
 - **A long outage no longer freezes DCC settlement across your whole history** (BL-1). When EMT detects a session gap (an outage longer than the 12-hour gap-fill limit) it sets a gap marker on the current block. That marker also — wrongly — gated the DCC PASS-2 drain, the step that applies settled half-hourly figures to billing. So while a gap marker was live, settled data for **every** block, not just the outage, was ingested but never applied: costs stayed on the pre-settlement estimates until the marker cleared. The marker still correctly guards sub-meter boundary amendment (gap-seed reads would corrupt its interpolation), but the drain now runs regardless — it takes its queue from the database and never reads the current block's rolling buffer, so gap-seed reads cannot contaminate it.
 
 - **A supplier-API outage no longer shows a false "Tariff not supported" banner.** The rate-schedule refresh flagged a meter "unsupported — billing will be incorrect" whenever the unit-rate fetch came back empty — but a *failed* fetch (transport error, timeout, or an edge/WAF **HTTP 403** while the supplier's GraphQL is throttled) returned empty too, so a transient block was reported as a permanent tariff problem. The refresh now distinguishes a failed fetch from a successful-but-empty one: on a fetch failure it keeps the last-known schedule and leaves the banner untouched, and only raises the "unsupported" warning when a fetch genuinely succeeds and returns no standard **and** no day/night rates.
+
+- **Footer now identifies the instance, not the port.** The sidebar footer showed `port 8099` — the internal container port, which is identical for every instance under ingress and so distinguished nothing. It now shows a per-instance label, resolved highest-first from: the new **`instance_name` option** (set it per instance in the add-on's Configuration tab — the only distinguisher when two installs share one add-on `name`, e.g. the repo-URL workaround); the **add-on name** via Supervisor (e.g. "Energy Meter Tracker (DEV)"); or the container hostname on standalone. It falls back to the port only if none resolves. Every source is an *install* identity — the manifest or `options.json`, never the database — so the label stays correct after restoring one instance's backup into another (the site name, which lives in the database, would travel with the restore).
 
 - **An edge 403 no longer masquerades as "check API key".** The REST client mapped *every* 403 to "authentication failed — check API key", so an edge/WAF block (which returns an HTML error page, distinct from a genuine JSON auth error) told users to rotate a perfectly good key. A 403 with an HTML body is now reported as an edge block ("temporarily blocked by the supplier — not an API key problem"), while a real 401 — or a 403 with a JSON body — still says "check API key". The Settings "Test connection" button reflects the same distinction.
 

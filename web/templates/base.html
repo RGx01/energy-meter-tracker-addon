@@ -499,7 +499,7 @@
       </a>
     </nav>
     <div class="sidebar-footer">
-      <span>{% if app_version %}v{{ app_version }} &middot; {% endif %}port {{ server_port }}</span>
+      <span>{% if app_version %}v{{ app_version }}{% endif %}{% if instance_label %} &middot; {{ instance_label }}{% elif server_port %} &middot; port {{ server_port }}{% endif %}</span>
     </div>
   </aside>
 
@@ -646,6 +646,36 @@ window.EMT = window.EMT || {};
               d.latest + ' (you have v' + (d.current || '?') + ').' +
               (d.url ? ' <a href="' + d.url + '" target="_blank" rel="noopener">Release notes</a>' : ''),
         onDismiss: function () { localStorage.setItem(DISMISS_KEY, d.latest); }
+      });
+    })
+    .catch(function () {});
+})();
+
+/* ── BL-5: "restored from another instance" notice ───────────────────────────
+   A restored DB carries another install's lineage id (db_uuid != install_id).
+   Dismissal is persisted server-side PER db_uuid (in /data, install-scoped), so
+   a routine repeated restore of the same source — e.g. prod -> prod dev — is
+   acknowledged once and stays quiet; a genuinely new lineage still surfaces. */
+(function () {
+  fetch(apiUrl('/api/instance/notice'))
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (!d || !d.foreign || d.acknowledged) return;
+      EMT.notify({
+        id: 'foreign-restore',
+        level: 'info',
+        dismissible: true,
+        html: 'ℹ️ <strong>Restored from another instance</strong> — ' +
+              'this database was created by a different EMT install. Its backups ' +
+              'are kept separate from that instance’s. Expected if you just ' +
+              'restored a backup from elsewhere.',
+        onDismiss: function () {
+          fetch(apiUrl('/api/instance/notice/dismiss'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ db_uuid: d.db_uuid })
+          }).catch(function () {});
+        }
       });
     })
     .catch(function () {});

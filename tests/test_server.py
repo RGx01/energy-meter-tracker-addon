@@ -3653,3 +3653,47 @@ class TestHistoryGaps(unittest.TestCase):
         r = client.post("/api/resolve-gaps")
         self.assertEqual(r.status_code, 400)
         self.assertEqual(r.get_json()["reason"], "no_api")
+
+
+class TestInstanceLabel(unittest.TestCase):
+    """The footer label distinguishes instances by INSTALL identity, not data —
+    so it survives a restore (unlike the site name). Supervised reads the add-on
+    name; standalone falls back to EMT_INSTANCE_NAME, then the hostname."""
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k)
+                       for k in ("SUPERVISOR_TOKEN", "EMT_INSTANCE_NAME")}
+        server._INSTANCE_LABEL = None
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        server._INSTANCE_LABEL = None
+
+    def test_standalone_uses_env_override(self):
+        os.environ.pop("SUPERVISOR_TOKEN", None)
+        os.environ["EMT_INSTANCE_NAME"] = "Energy Meter Tracker (DEV)"
+        self.assertEqual(server._instance_label(), "Energy Meter Tracker (DEV)")
+
+    def test_falls_back_to_hostname(self):
+        import socket
+        os.environ.pop("SUPERVISOR_TOKEN", None)
+        os.environ.pop("EMT_INSTANCE_NAME", None)
+        self.assertEqual(server._instance_label(), socket.gethostname())
+
+    def test_result_is_memoised(self):
+        os.environ.pop("SUPERVISOR_TOKEN", None)
+        os.environ["EMT_INSTANCE_NAME"] = "First"
+        self.assertEqual(server._instance_label(), "First")
+        os.environ["EMT_INSTANCE_NAME"] = "Second"   # cache must still hold First
+        self.assertEqual(server._instance_label(), "First")
+
+    def test_option_overrides_supervisor_name(self):
+        # The explicit instance_name option wins over the manifest name — and is
+        # taken WITHOUT a network call (the fake token is never used).
+        os.environ["SUPERVISOR_TOKEN"] = "faketoken-never-used"
+        os.environ["EMT_INSTANCE_NAME"] = "Prod"
+        self.assertEqual(server._instance_label(), "Prod")
