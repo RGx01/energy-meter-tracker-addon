@@ -6,6 +6,7 @@
 .dockerignore
 Dockerfile
 Dockerfile.standalone
+run_tests.sh
  
 # Python caches
 __pycache__/

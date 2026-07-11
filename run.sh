@@ -8,13 +8,19 @@ if [ -n "$SUPERVISOR_TOKEN" ]; then
   LOG_LEVEL=$(bashio::config 'log_level' 2>/dev/null || echo "info")
   export LOG_LEVEL="${LOG_LEVEL:-info}"
   export EMT_MODE="supervised"
-  EMT_PORT=$(bashio::config 'port' 2>/dev/null)
-  if [ -z "$EMT_PORT" ] || [ "$EMT_PORT" = "null" ]; then EMT_PORT="8099"; fi
-  export EMT_PORT="${EMT_PORT}"
+  # Internal bind port is always 8099 under Supervisor (ingress_port and the
+  # ports mapping are both 8099); the host publish is set in the Network panel,
+  # not here. The old `port` option was removed in 3.2.0.
+  export EMT_PORT="8099"
   PUBLISH_HA=$(bashio::config 'publish_ha_sensors' 2>/dev/null || echo "true")
   export PUBLISH_HA_SENSORS="${PUBLISH_HA:-true}"
   if [ "$PUBLISH_HA_SENSORS" = "false" ]; then
     bashio::log.warning "publish_ha_sensors=false — HA sensor publishing disabled (dev mode)"
+  fi
+  # Optional per-instance footer label (blank falls back to the add-on name).
+  INSTANCE_NAME=$(bashio::config 'instance_name' 2>/dev/null || echo "")
+  if [ -n "$INSTANCE_NAME" ] && [ "$INSTANCE_NAME" != "null" ]; then
+    export EMT_INSTANCE_NAME="${INSTANCE_NAME}"
   fi
   bashio::log.info "Energy Meter Tracker starting in Supervised mode (log_level=${LOG_LEVEL}, port=${EMT_PORT})"
 else

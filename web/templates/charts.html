@@ -92,7 +92,9 @@
   }
   .chart-tab:hover { background: rgba(255,255,255,0.05); color: var(--text); }
   .chart-tab.active { background: rgba(0,212,170,0.1); color: var(--accent); border-color: var(--accent); }
-  .dcc-settle-note { display:inline-flex; align-items:center; gap:5px; margin-left:10px; padding:5px 10px; border-radius:14px; font-size:12px; font-weight:600; background:rgba(230,160,30,0.14); color:#e0a020; border:1px solid rgba(230,160,30,0.35); white-space:nowrap; cursor:default; }
+  .dcc-settle-note { display:inline-flex; align-items:center; gap:5px; margin-left:10px; padding:5px 10px; border-radius:14px; font-size:12px; font-weight:600; background:rgba(130,140,150,0.14); color:var(--muted); border:1px solid rgba(130,140,150,0.30); white-space:nowrap; cursor:default; }
+  .dcc-settle-note.amber { background:rgba(230,160,30,0.14); color:#e0a020; border-color:rgba(230,160,30,0.35); }
+  @media (max-width:768px){ .dcc-settle-note { margin-left:6px; padding:4px 8px; font-size:11px; } }
 
   /* Usage Stats floating toolbar — matches billing chart period-nav style */
   /* position:sticky works because .content is the scroll container */
@@ -2443,22 +2445,53 @@ if (!window.Chart) {
 }
 
 document.addEventListener('DOMContentLoaded', function() {
-  // DCC settlement indicator — shown only when billing runs on the DCC path
-  // and blocks are still awaiting the supplier's settled figure (issue #244:
-  // makes "N blocks awaiting DCC settlement" visible without opening Data
-  // Management, so a stuck import channel is obvious at a glance).
+  // Billing-source status indicator. Reflects the actual source config so the
+  // "N blocks awaiting DCC settlement" message only appears when DCC settlement
+  // can actually happen (an API is configured). Without an API the unsettled
+  // count is expected and permanent (local/CAD billing), so it must NOT read as
+  // "awaiting settlement" (issue: alarmed a user who had no API configured).
   (function loadSettleNote(){
     try {
       fetch(apiUrl('/api/billing-source')).then(function(r){return r.json();}).then(function(d){
         var el = document.getElementById('dcc-settle-note');
         if (!el || !d) return;
-        if (d.source === 'dcc' && d.unsettled > 0) {
-          el.textContent = '\u23f3 ' + d.unsettled + ' block' + (d.unsettled === 1 ? '' : 's') + ' awaiting DCC settlement';
-          el.title = 'These blocks are billed on EMT\u2019s provisional figure and haven\u2019t yet been reconciled to your supplier\u2019s settled DCC figure. See Data Management for detail.';
-          el.style.display = 'inline-flex';
+        var label = '', tip = '', amber = false, show = true;
+        if (d.unsupported_tariff) {
+          // BL-6: an unsupported tariff breaks billing app-wide, not just on this
+          // page — surface it in the GLOBAL notification region, not a pill in the
+          // charts topbar. Persistent (not dismissible): it must not be hidden
+          // while the bill is wrong.
+          var _tc = (d.unsupported_tariff && d.unsupported_tariff.tariff) || '';
+          if (window.EMT && EMT.notify) {
+            EMT.notify({
+              id: 'unsupported-tariff',
+              level: 'critical',
+              html: '\u26a0 <strong>Tariff not supported \u2014 rates unavailable.</strong> Your import tariff' +
+                    (_tc ? ' (' + _tc + ')' : '') + ' returns no standard unit rates. Billing for this meter will be incorrect until support is added.'
+            });
+          }
+          show = false;   // the pill is superseded by the global notification
+        } else if (!d.api_available) {
+          // No supplier API — billing is on the local/CAD figure, never reconciled
+          label = 'No API \u00b7 local billing';
+          tip = 'No supplier API is configured, so blocks are billed on the local/CAD meter figure and are never reconciled to a settled DCC figure. The unsettled count is expected \u2014 not a problem.';
+        } else if (d.source !== 'dcc') {
+          // API available but billing uses the local CAD figure as the source
+          label = 'CAD source \u00b7 API ready';
+          tip = 'A supplier API is available, but billing uses the local CAD meter figure as the source rather than DCC settlement.';
+        } else if (d.unsettled > 0) {
+          // DCC path with blocks still awaiting the supplier's settled figure
+          label = '\u23f3 ' + d.unsettled + ' block' + (d.unsettled === 1 ? '' : 's') + ' awaiting DCC settlement';
+          tip = 'These blocks are billed on EMT\u2019s provisional figure and haven\u2019t yet been reconciled to your supplier\u2019s settled DCC figure. See Data Management for detail.';
+          amber = true;
         } else {
-          el.style.display = 'none';
+          // DCC path, everything settled — nothing to flag
+          show = false;
         }
+        el.textContent = label;
+        el.title = tip;
+        el.classList.toggle('amber', amber);
+        el.style.display = show ? 'inline-flex' : 'none';
       }).catch(function(){});
     } catch(e) {}
   })();

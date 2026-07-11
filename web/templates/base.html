@@ -151,6 +151,40 @@
       border-bottom: 1px solid rgba(0,0,0,0.15);
       align-items: center; gap: 12px; flex-wrap: wrap;
     }
+
+    /* ── Global notification region (BL-6, fixes #219) ──────────────────────
+       Sits IN FLOW between the topbar and the scrolling .content, as a flex
+       sibling. Content is therefore pushed down, never covered — which is the
+       actual fix for #219 (a position:fixed toast painting over the tab row).
+       Because only .content scrolls, the region stays visible when scrolled.
+       Zero height when empty, so pages with no messages are unchanged. */
+    .notif-region {
+      flex: 0 0 auto;
+      display: flex;
+      flex-direction: column;
+    }
+    .notif-region:empty { display: none; }
+    .notif {
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      padding: 10px 24px; font-size: 13px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface); color: var(--text);
+    }
+    .notif a { color: inherit; font-weight: 600; text-decoration: underline; }
+    .notif .notif-msg { flex: 1; min-width: 0; }
+    .notif button {
+      background: rgba(255,255,255,0.16); color: inherit; border: 0;
+      border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer;
+    }
+    .notif.success { background: rgba(0,212,170,0.16); color: var(--accent);
+                     border-bottom-color: rgba(0,212,170,0.35); }
+    .notif.info    { background: rgba(70,140,230,0.16); color: #6aa6f0;
+                     border-bottom-color: rgba(70,140,230,0.35); }
+    .notif.warn    { background: rgba(230,160,30,0.16); color: #e0a020;
+                     border-bottom-color: rgba(230,160,30,0.35); }
+    .notif.critical{ background: rgba(220,60,60,0.18); color: #e05555;
+                     border-bottom-color: rgba(220,60,60,0.45); }
+    @media (max-width: 768px) { .notif { padding: 9px 14px; font-size: 12px; } }
     .meter-reset-banner.visible { display: flex; }
     .meter-reset-banner a { color: #fff; font-weight: 600; text-decoration: underline; }
     .meter-reset-banner button { background: rgba(0,0,0,0.2); border: none; color: #fff;
@@ -465,7 +499,7 @@
       </a>
     </nav>
     <div class="sidebar-footer">
-      <span>{% if app_version %}v{{ app_version }} &middot; {% endif %}port {{ server_port }}</span>
+      <span>{% if app_version %}v{{ app_version }}{% endif %}{% if instance_label %} &middot; {{ instance_label }}{% elif server_port %} &middot; port {{ server_port }}{% endif %}</span>
     </div>
   </aside>
 
@@ -482,6 +516,9 @@
     </div>
     {% block topbar %}{% endblock %}
     {% block subbar %}{% endblock %}
+    <!-- BL-6: global notification region — in flow, below the topbar, above the
+         scrolling content. Messages push content down rather than covering it. -->
+    <div class="notif-region" id="notif-region"></div>
     <div class="content">
       {% block content %}{% endblock %}
     </div>
@@ -539,6 +576,110 @@ function dismissMeterResetBanner() {
   if (banner) banner.classList.remove('visible');
   sessionStorage.setItem('meterResetDismissed', '1');
 }
+
+/* ── BL-6: global notification region ────────────────────────────────────────
+   EMT.notify({id, level, html, transient, dismissible, onDismiss})
+   - transient  : auto-removes after ~10s (e.g. "Configuration saved")
+   - persistent : sticks until dismissed or resolved (update available,
+                  unsupported tariff)
+   Messages stack; the region is zero-height when empty, so pages without
+   messages are laid out exactly as before. */
+window.EMT = window.EMT || {};
+(function () {
+  var TRANSIENT_MS = 10000;
+
+  EMT.notify = function (opts) {
+    var region = document.getElementById('notif-region');
+    if (!region) return null;
+    var id = opts.id || ('n' + Date.now());
+    EMT.dismiss(id);                       // replace, never duplicate
+
+    var el = document.createElement('div');
+    el.className = 'notif ' + (opts.level || 'info');
+    el.setAttribute('data-notif-id', id);
+
+    var msg = document.createElement('span');
+    msg.className = 'notif-msg';
+    msg.innerHTML = opts.html || '';
+    el.appendChild(msg);
+
+    if (opts.dismissible) {
+      var btn = document.createElement('button');
+      btn.textContent = 'Dismiss';
+      btn.onclick = function () {
+        EMT.dismiss(id);
+        if (typeof opts.onDismiss === 'function') opts.onDismiss();
+      };
+      el.appendChild(btn);
+    }
+    region.appendChild(el);
+
+    if (opts.transient) {
+      setTimeout(function () { EMT.dismiss(id); }, opts.transientMs || TRANSIENT_MS);
+    }
+    return id;
+  };
+
+  EMT.dismiss = function (id) {
+    var el = document.querySelector('[data-notif-id="' + id + '"]');
+    if (el && el.parentNode) el.parentNode.removeChild(el);
+  };
+})();
+
+/* ── BL-6: "update available" check ──────────────────────────────────────────
+   Supervised users get update badges from the Supervisor; unsupervised (Docker)
+   users get nothing and only learn of a release by checking the repo. Server
+   caches the GitHub lookup daily. Dismissal is PER VERSION and sticks — dismiss
+   3.3.0 and you are not asked again until something newer than 3.3.0 ships. */
+(function () {
+  var DISMISS_KEY = 'emtUpdateDismissedVersion';
+  fetch(apiUrl('/api/update-check'))
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (!d || !d.update_available || !d.latest) return;
+      if (localStorage.getItem(DISMISS_KEY) === d.latest) return;  // no nagging
+      EMT.notify({
+        id: 'update-available',
+        level: 'info',
+        dismissible: true,
+        html: '\u2b06\ufe0f <strong>Update available</strong> \u2014 v' +
+              d.latest + ' (you have v' + (d.current || '?') + ').' +
+              (d.url ? ' <a href="' + d.url + '" target="_blank" rel="noopener">Release notes</a>' : ''),
+        onDismiss: function () { localStorage.setItem(DISMISS_KEY, d.latest); }
+      });
+    })
+    .catch(function () {});
+})();
+
+/* ── BL-5: "restored from another instance" notice ───────────────────────────
+   A restored DB carries another install's lineage id (db_uuid != install_id).
+   Dismissal is persisted server-side PER db_uuid (in /data, install-scoped), so
+   a routine repeated restore of the same source — e.g. prod -> prod dev — is
+   acknowledged once and stays quiet; a genuinely new lineage still surfaces. */
+(function () {
+  fetch(apiUrl('/api/instance/notice'))
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (!d || !d.foreign || d.acknowledged) return;
+      EMT.notify({
+        id: 'foreign-restore',
+        level: 'info',
+        dismissible: true,
+        html: 'ℹ️ <strong>Restored from another instance</strong> — ' +
+              'this database was created by a different EMT install. Its backups ' +
+              'are kept separate from that instance’s. Expected if you just ' +
+              'restored a backup from elsewhere.',
+        onDismiss: function () {
+          fetch(apiUrl('/api/instance/notice/dismiss'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ db_uuid: d.db_uuid })
+          }).catch(function () {});
+        }
+      });
+    })
+    .catch(function () {});
+})();
 
 // Sync global theme toggle icon on load
 (function() {

@@ -1602,7 +1602,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         label = f"{cs['label']}  |  {currency}{cost:.2f}"
         if cs["is_current"]:
             label = "★ Current  " + label
-        calmonth_options.append(f'<option value="calmonth_{cs['index']}">{label}</option>')
+        calmonth_options.append(f'<option value="calmonth_{cs["index"]}">{label}</option>')
 
     # ── Dropdown options (quarter) ──
     quarter_options = []
@@ -1611,7 +1611,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         label = f"{qs['label']}  |  {currency}{cost:.2f}"
         if qs["is_current"]:
             label = "★ Current  " + label
-        quarter_options.append(f'<option value="quarter_{qs['index']}">{label}</option>')
+        quarter_options.append(f'<option value="quarter_{qs["index"]}">{label}</option>')
 
     # ── Dropdown options (year) ──
     year_options = []
@@ -1620,7 +1620,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         label = f"{ys['label']}  |  {currency}{cost:.2f}"
         if ys["is_current"]:
             label = "★ Current  " + label
-        year_options.append(f'<option value="year_{ys['index']}">{label}</option>')
+        year_options.append(f'<option value="year_{ys["index"]}">{label}</option>')
 
     dropdown_html = f"""
 <div class="period-nav">

@@ -43,6 +43,47 @@ def _read_version() -> str:
 
 APP_VERSION = _read_version()
 
+# Per-instance display label for the footer. This is deliberately an INSTALL
+# identity, not a data one: it must NOT come from the database (site name lives
+# in the config-period chain and travels with a restore, so prod-dev restored
+# from prod would show prod's name). Resolution order, highest first:
+#   1. the `instance_name` option (exported as EMT_INSTANCE_NAME by run.sh, or
+#      set directly in a standalone container) — the explicit per-instance
+#      override, and the ONLY distinguisher when two installs share one manifest
+#      name (the repo-URL workaround);
+#   2. the add-on's manifest `name` via Supervisor self-info ("… (DEV)");
+#   3. the container hostname (standalone last resort).
+# Memoised: resolved once per process (never changes at runtime).
+_INSTANCE_LABEL: "str | None" = None
+
+
+def _instance_label() -> str:
+    global _INSTANCE_LABEL
+    if _INSTANCE_LABEL is not None:
+        return _INSTANCE_LABEL
+    # 1. Explicit per-instance override (the `instance_name` option).
+    label = (os.environ.get("EMT_INSTANCE_NAME") or "").strip()
+    # 2. Supervised: the add-on's manifest name (distinct per install).
+    if not label:
+        token = os.environ.get("SUPERVISOR_TOKEN")
+        if token:
+            try:
+                import urllib.request
+                req = urllib.request.Request(
+                    "http://supervisor/addons/self/info",
+                    headers={"Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                label = ((data.get("data") or {}).get("name") or "").strip()
+            except Exception as e:
+                logger.info("_instance_label: supervisor self-info failed (%s)", e)
+    # 3. Standalone last resort: the container hostname.
+    if not label:
+        import socket
+        label = (socket.gethostname() or "").strip()
+    _INSTANCE_LABEL = label
+    return label
+
 
 @app.context_processor
 def inject_globals():
@@ -64,7 +105,8 @@ def inject_globals():
     except Exception:
         pass
     return {"app_version": APP_VERSION, "has_power_sensor": has_power_sensor, "has_postcode": has_postcode,
-            "server_port": int(os.environ.get("EMT_PORT") or "8099")}
+            "server_port": int(os.environ.get("EMT_PORT") or "8099"),
+            "instance_label": _instance_label()}
 
 
 class IngressMiddleware:
@@ -91,11 +133,21 @@ app.secret_key = os.urandom(24)
 DATA_DIR         = None
 CHART_DIR        = None
 import os as _os
-SHARE_BACKUP_DIR = (
-    _os.path.join("/data/energy_meter_tracker", "backup")
-    if _os.environ.get("EMT_MODE") == "standalone"
-    else "/share/energy_meter_tracker_backup"
-)
+
+
+def _share_backup_dir() -> str:
+    """BL-5: the backup dir is resolved at startup from the site slug (see
+    instance.py) and lives on `engine`. Read it there rather than keeping a
+    second, stale copy — this module used to duplicate the derivation, which
+    would silently disagree after a site rename."""
+    try:
+        import engine as _eng
+        return _eng.SHARE_BACKUP_DIR
+    except Exception:
+        return (_os.path.join("/data/energy_meter_tracker", "backup")
+                if _os.environ.get("EMT_MODE") == "standalone"
+                else "/share/energy_meter_tracker_backup")
+
 _ha_client = None   # reference to the running HAClient instance
 _event_loop = None  # asyncio event loop — captured at init time
 
@@ -2678,7 +2730,7 @@ def api_backup():
 def api_backup_info():
     """Return backup configuration info."""
     return jsonify({
-        "backup_dir": SHARE_BACKUP_DIR,
+        "backup_dir": _share_backup_dir(),
         "mode": os.environ.get("EMT_MODE", "supervised")
     })
 
@@ -2688,13 +2740,13 @@ def api_backup_list():
     """List available backup zips and last-finalise flat files."""
     import glob
     try:
-        zips = sorted(glob.glob(f"{SHARE_BACKUP_DIR}/backups/*.zip"), reverse=True)
+        zips = sorted(glob.glob(f"{_share_backup_dir()}/backups/*.zip"), reverse=True)
         # Check for flat files from last finalise
         primary = ["blocks.db"]
         legacy  = ["blocks.json"]   # written by 1.x/2.0.x, no longer updated
         flat_files = []
         for fname in primary + legacy:
-            fpath = f"{SHARE_BACKUP_DIR}/{fname}"
+            fpath = f"{_share_backup_dir()}/{fname}"
             if os.path.exists(fpath):
                 mtime = os.path.getmtime(fpath)
                 from datetime import datetime as _dt
@@ -2779,7 +2831,7 @@ def api_backup_restore():
             for fname in (selected or list(known)):
                 if fname not in known:
                     continue
-                src_path = f"{SHARE_BACKUP_DIR}/{fname}"
+                src_path = f"{_share_backup_dir()}/{fname}"
                 dst_path = os.path.join(DATA_DIR, fname)
                 if os.path.exists(src_path):
                     shutil.copy2(src_path, dst_path)
@@ -2788,7 +2840,7 @@ def api_backup_restore():
         else:
             if not zipname or "/" in zipname or "\\" in zipname:
                 return jsonify({"error": "Invalid zip name"}), 400
-            zip_path = f"{SHARE_BACKUP_DIR}/backups/{zipname}"
+            zip_path = f"{_share_backup_dir()}/backups/{zipname}"
             if not os.path.exists(zip_path):
                 return jsonify({"error": "Backup not found"}), 404
             with zipfile.ZipFile(zip_path, "r") as zf:
@@ -3106,6 +3158,108 @@ def api_disconnect_kraken():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+def _parse_version(v: str):
+    """'3.2.0' -> (3, 2, 0). Non-numeric parts sort as 0. Tolerates a 'v' prefix."""
+    v = (v or "").strip().lstrip("vV")
+    parts = []
+    for chunk in v.split(".")[:3]:
+        digits = "".join(c for c in chunk if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+_update_check_cache = {"checked_at": 0.0, "payload": None}
+_UPDATE_CHECK_TTL = 86400.0   # once a day — the release cadence is far slower
+
+
+@app.route("/api/update-check", methods=["GET"])
+def api_update_check():
+    """BL-6: is a newer release available?
+
+    Supervised users get update badges from the Supervisor; unsupervised (Docker
+    / HA Container) users get nothing and only learn of a release by checking the
+    repo manually. Cached for a day — a release lookup is not worth a request per
+    page load, and GitHub rate-limits unauthenticated calls.
+
+    Never fatal: any failure returns update_available=false, so the UI is silent
+    rather than showing an error the user can do nothing about.
+    """
+    import time
+    now = time.time()
+    if (_update_check_cache["payload"] is not None
+            and now - _update_check_cache["checked_at"] < _UPDATE_CHECK_TTL):
+        return jsonify(_update_check_cache["payload"])
+
+    payload = {"current": APP_VERSION, "latest": None, "url": None,
+               "update_available": False}
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.github.com/repos/RGx01/energy-meter-tracker-addon/releases/latest",
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": "energy-meter-tracker"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        latest = (data.get("tag_name") or "").strip()
+        if latest:
+            payload["latest"] = latest.lstrip("vV")
+            payload["url"] = data.get("html_url")
+            # If we cannot determine our OWN version, never claim an update —
+            # (0,0,0) < anything would prompt on every release, wrongly.
+            payload["update_available"] = bool(APP_VERSION) and (
+                _parse_version(latest) > _parse_version(APP_VERSION))
+    except Exception as e:
+        logger.info("api_update_check: lookup failed (non-fatal): %s", e)
+
+    _update_check_cache.update({"checked_at": now, "payload": payload})
+    return jsonify(payload)
+
+
+@app.route("/api/instance/notice", methods=["GET"])
+def api_instance_notice():
+    """BL-5: is the open database restored from another instance?
+
+    A native DB carries db_uuid == install_id; a restored one carries the source
+    install's id. Computed once at startup (engine.FOREIGN_RESTORE_NOTICE). The
+    UI shows a dismissible notice when foreign and not yet acknowledged. Never
+    fatal — any error reports "not foreign" so the UI stays silent.
+    """
+    try:
+        import engine as _eng
+        notice = getattr(_eng, "FOREIGN_RESTORE_NOTICE", None) or {}
+        return jsonify({"foreign": bool(notice.get("foreign")),
+                        "db_uuid": notice.get("db_uuid"),
+                        "acknowledged": bool(notice.get("acknowledged"))})
+    except Exception as e:
+        logger.info("api_instance_notice: %s", e)
+        return jsonify({"foreign": False, "db_uuid": None, "acknowledged": False})
+
+
+@app.route("/api/instance/notice/dismiss", methods=["POST"])
+def api_instance_notice_dismiss():
+    """BL-5: dismiss the foreign-restore notice for a data lineage. Persisted per
+    db_uuid in /data (install-scoped), so it survives the next restore — a routine
+    repeated restore of the same source is acknowledged once and stays quiet."""
+    try:
+        import engine as _eng
+        import instance as _inst
+        notice = getattr(_eng, "FOREIGN_RESTORE_NOTICE", None) or {}
+        body = request.get_json(silent=True) or {}
+        db_uuid = body.get("db_uuid") or notice.get("db_uuid")
+        if not db_uuid:
+            return jsonify({"ok": False, "error": "no db_uuid"}), 400
+        _inst.acknowledge_db_uuid(db_uuid)
+        if isinstance(getattr(_eng, "FOREIGN_RESTORE_NOTICE", None), dict) \
+                and _eng.FOREIGN_RESTORE_NOTICE.get("db_uuid") == db_uuid:
+            _eng.FOREIGN_RESTORE_NOTICE["acknowledged"] = True
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.warning("api_instance_notice_dismiss: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/billing-source", methods=["GET"])
 def api_billing_source_get():
     """Return the current global billing source and unsettled-block count."""
@@ -3115,7 +3269,8 @@ def api_billing_source_get():
         source = _eng._get_billing_source()
         unsettled = store.count_unsettled_blocks()
         return jsonify({"source": source, "unsettled": unsettled,
-                        "api_available": _eng.kraken_available()})
+                        "api_available": _eng.kraken_available(),
+                        "unsupported_tariff": _eng._rate_schedule_unsupported})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3156,6 +3311,45 @@ def api_unsettled_blocks():
         return jsonify({"count": count, "limit": limit, "blocks": out})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/history-gaps")
+def api_history_gaps():
+    """Review: missing half-hour slots in the block history (outage holes).
+
+    Read-only, and deliberately NOT gated on the supplier API: finding gaps is a
+    question about our own blocks table, which a CAD-only user can ask and get a
+    true answer to. `api_available` is returned so the UI can explain that
+    *recovering* them does need a supplier (the readings can only come from there)
+    rather than silently hiding the action.
+    """
+    try:
+        import engine as _eng
+        store = _get_store()
+        gaps = store.find_block_gaps()
+        return jsonify({"ok": True, "gaps": gaps,
+                        "total_slots": sum(g["slots"] for g in gaps),
+                        "api_available": _eng.kraken_available()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/resolve-gaps", methods=["POST"])
+def api_resolve_gaps():
+    """Act: backfill history gaps from settled supplier data.
+
+    User-triggered on purpose — an automatic sweep could not tell an outage gap
+    from blocks the user deleted deliberately, and would resurrect them.
+    """
+    try:
+        import engine as _eng
+        if not _eng.kraken_available():
+            return jsonify({"ok": False, "reason": "no_api",
+                            "error": "No supplier API configured"}), 400
+        result = _run_on_engine_loop(_eng.resolve_history_gaps(), timeout=300.0)
+        return jsonify(result), (200 if result.get("ok") else 400)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/retry-settlement", methods=["POST"])
@@ -4016,7 +4210,7 @@ def api_backup_flat_info():
 
     files = {}
     for fname in primary + legacy:
-        fpath = f"{SHARE_BACKUP_DIR}/{fname}"
+        fpath = f"{_share_backup_dir()}/{fname}"
         if fname == "meters_config.json":
             continue  # no longer a restore target — config lives inside blocks.db
         if os.path.exists(fpath):
@@ -4042,7 +4236,7 @@ def api_import_extract_zip_by_name():
         zipname = data.get("zip", "")
         if not zipname or "/" in zipname or "\\" in zipname:
             return jsonify({"error": "Invalid zip name"}), 400
-        zip_path = f"{SHARE_BACKUP_DIR}/backups/{zipname}"
+        zip_path = f"{_share_backup_dir()}/backups/{zipname}"
         if not os.path.exists(zip_path):
             return jsonify({"error": "Backup not found"}), 404
         known = {"blocks.db", "blocks.json"}
@@ -4065,7 +4259,7 @@ def _create_backup_zip(label="backup"):
     import zipfile
     import glob
     from datetime import datetime as _dt
-    backup_dir = f"{SHARE_BACKUP_DIR}/backups"
+    backup_dir = f"{_share_backup_dir()}/backups"
     os.makedirs(backup_dir, exist_ok=True)
     timestamp = _dt.utcnow().strftime("%Y%m%dT%H%M%S")
     zip_path  = f"{backup_dir}/{timestamp}_{label}.zip"

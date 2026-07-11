@@ -2199,6 +2199,120 @@ class BlockStore:
         self._conn.commit()
         return verdict
 
+    # ── BL-8: outage backfill ────────────────────────────────────────────────
+
+    BACKFILL_INTERPOLATED = 2   # blocks materialised from settled supplier data
+
+    def create_backfill_block(self, block_start: str, meter_id: str,
+                              settled_kwh: float, *,
+                              channel: str = "import",
+                              source: str = "kraken_api") -> Optional[int]:
+        """BL-8: materialise a block that does not exist, from DCC-settled data.
+
+        An outage longer than the gap-fill limit leaves no block for the period,
+        so `upsert_kraken_block` returns `missing_block` and the settled figure is
+        dropped — a permanent hole. This creates the row with the authoritative
+        kWh and marks it `needs_pass2_rerun=1`, letting the EXISTING PASS-2 drain
+        resolve the rate and standing charge for that timestamp (it fetches
+        historical rates, so any tariff — Agile included — prices correctly). We
+        deliberately do not duplicate pricing logic here.
+
+        `interpolated = BACKFILL_INTERPOLATED (2)` marks it externally sourced —
+        distinct from 1 (locally interpolated gap-fill) — so the UI can show it as
+        recovered/approximate. It carries NO sub-meter split (we were down) and,
+        having no dispatch_history, will never be picked up by the dispatch
+        reconciliation — its off-peak status is decided once, at creation.
+
+        `block_end` is derived from the covering config period's `block_minutes`.
+        Returns the new block id, or None if the block already exists or no
+        config period covers the timestamp.
+        """
+        kwh_col = "imp_kwh" if channel == "import" else "exp_kwh"
+        api_col = "imp_kwh_api" if channel == "import" else "exp_kwh_api"
+        existing = self._conn.execute(
+            f"SELECT id, {api_col}, interpolated FROM blocks "
+            "WHERE block_start = ? AND meter_id = ?",
+            (block_start, meter_id)).fetchone()
+        if existing:
+            # A backfill for the OTHER channel already created this block (import
+            # is ingested before export). Don't lose this channel's kWh — fill it.
+            # Guarded hard: only a block WE backfilled (interpolated=2) and whose
+            # settled figure for THIS channel is unset. A live metered block is
+            # never touched here (and never reaches this method anyway — we are
+            # only called on a `missing_block` verdict).
+            if existing[1] is None and existing[2] == self.BACKFILL_INTERPOLATED:
+                with self._conn:
+                    self._conn.execute(
+                        f"UPDATE blocks SET {kwh_col} = ?, {api_col} = ?, "
+                        "needs_pass2_rerun = 1 WHERE id = ?",
+                        (settled_kwh, settled_kwh, existing[0]))
+                return existing[0]
+            return None
+        cp = self.get_config_period_for_date(block_start)
+        if not cp:
+            return None
+        try:
+            bm = int(cp.get("block_minutes") or 30)
+            block_end = (datetime.fromisoformat(block_start)
+                         + timedelta(minutes=bm)).isoformat()
+        except Exception:
+            return None
+        with self._conn:
+            cur = self._conn.execute(
+                f"""INSERT INTO blocks
+                    (block_start, block_end, meter_id, config_period_id,
+                     interpolated, {kwh_col}, {api_col}, source,
+                     needs_pass2_rerun, is_provisional, finalised_from_cad)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0)""",
+                (block_start, block_end, meter_id, cp["id"],
+                 self.BACKFILL_INTERPOLATED, settled_kwh, settled_kwh, source))
+        return cur.lastrowid
+
+    def count_backfilled_blocks(self) -> int:
+        """How many blocks were materialised from settled supplier data."""
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM blocks WHERE interpolated = ?",
+            (self.BACKFILL_INTERPOLATED,)).fetchone()[0]
+
+    def find_block_gaps(self, meter_id: str = "electricity_main",
+                        *, min_age_hours: float = 48.0,
+                        now: Optional[datetime] = None) -> list:
+        """Find missing half-hour slots in the block history (BL-8 gap sweep).
+
+        The DCC poll's window is a forward-moving cursor (`last_poll_utc` → now),
+        so once it has advanced past an outage that hole is never revisited. This
+        asks the *database* where the holes are instead — exact, cheap, and it
+        finds gaps however old and however they arose.
+
+        Returns contiguous runs: [{"start", "end", "slots"}], where `end` is the
+        start of the last missing slot. Skips anything newer than `min_age_hours`
+        (DCC has not settled it yet, so a fetch would return nothing).
+        """
+        rows = [r[0] for r in self._conn.execute(
+            "SELECT block_start FROM blocks WHERE meter_id = ? ORDER BY block_start",
+            (meter_id,))]
+        if len(rows) < 2:
+            return []
+        cp = self.get_config_period_for_date(rows[0]) or {}
+        step = timedelta(minutes=int(cp.get("block_minutes") or 30))
+        cutoff = ((now or datetime.now(timezone.utc)).replace(tzinfo=None)
+                  - timedelta(hours=min_age_hours))
+        have = set(rows)
+        runs: list = []
+        t = datetime.fromisoformat(rows[0])
+        last = datetime.fromisoformat(rows[-1])
+        while t <= last:
+            if t.isoformat() not in have and t < cutoff:
+                if runs and runs[-1]["_end_dt"] + step == t:
+                    runs[-1]["_end_dt"] = t
+                    runs[-1]["slots"] += 1
+                else:
+                    runs.append({"start": t.isoformat(), "_end_dt": t, "slots": 1})
+            t += step
+        for r in runs:
+            r["end"] = r.pop("_end_dt").isoformat()
+        return runs
+
     def get_blocks_needing_pass2_rerun(self, limit: Optional[int] = None) -> list:
         """Blocks where DCC has arrived and PASS 2+3b re-run is pending.
 
