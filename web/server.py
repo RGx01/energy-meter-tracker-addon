@@ -43,6 +43,47 @@ def _read_version() -> str:
 
 APP_VERSION = _read_version()
 
+# Per-instance display label for the footer. This is deliberately an INSTALL
+# identity, not a data one: it must NOT come from the database (site name lives
+# in the config-period chain and travels with a restore, so prod-dev restored
+# from prod would show prod's name). Resolution order, highest first:
+#   1. the `instance_name` option (exported as EMT_INSTANCE_NAME by run.sh, or
+#      set directly in a standalone container) — the explicit per-instance
+#      override, and the ONLY distinguisher when two installs share one manifest
+#      name (the repo-URL workaround);
+#   2. the add-on's manifest `name` via Supervisor self-info ("… (DEV)");
+#   3. the container hostname (standalone last resort).
+# Memoised: resolved once per process (never changes at runtime).
+_INSTANCE_LABEL: "str | None" = None
+
+
+def _instance_label() -> str:
+    global _INSTANCE_LABEL
+    if _INSTANCE_LABEL is not None:
+        return _INSTANCE_LABEL
+    # 1. Explicit per-instance override (the `instance_name` option).
+    label = (os.environ.get("EMT_INSTANCE_NAME") or "").strip()
+    # 2. Supervised: the add-on's manifest name (distinct per install).
+    if not label:
+        token = os.environ.get("SUPERVISOR_TOKEN")
+        if token:
+            try:
+                import urllib.request
+                req = urllib.request.Request(
+                    "http://supervisor/addons/self/info",
+                    headers={"Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                label = ((data.get("data") or {}).get("name") or "").strip()
+            except Exception as e:
+                logger.info("_instance_label: supervisor self-info failed (%s)", e)
+    # 3. Standalone last resort: the container hostname.
+    if not label:
+        import socket
+        label = (socket.gethostname() or "").strip()
+    _INSTANCE_LABEL = label
+    return label
+
 
 @app.context_processor
 def inject_globals():
@@ -64,7 +105,8 @@ def inject_globals():
     except Exception:
         pass
     return {"app_version": APP_VERSION, "has_power_sensor": has_power_sensor, "has_postcode": has_postcode,
-            "server_port": int(os.environ.get("EMT_PORT") or "8099")}
+            "server_port": int(os.environ.get("EMT_PORT") or "8099"),
+            "instance_label": _instance_label()}
 
 
 class IngressMiddleware:
@@ -3173,6 +3215,49 @@ def api_update_check():
 
     _update_check_cache.update({"checked_at": now, "payload": payload})
     return jsonify(payload)
+
+
+@app.route("/api/instance/notice", methods=["GET"])
+def api_instance_notice():
+    """BL-5: is the open database restored from another instance?
+
+    A native DB carries db_uuid == install_id; a restored one carries the source
+    install's id. Computed once at startup (engine.FOREIGN_RESTORE_NOTICE). The
+    UI shows a dismissible notice when foreign and not yet acknowledged. Never
+    fatal — any error reports "not foreign" so the UI stays silent.
+    """
+    try:
+        import engine as _eng
+        notice = getattr(_eng, "FOREIGN_RESTORE_NOTICE", None) or {}
+        return jsonify({"foreign": bool(notice.get("foreign")),
+                        "db_uuid": notice.get("db_uuid"),
+                        "acknowledged": bool(notice.get("acknowledged"))})
+    except Exception as e:
+        logger.info("api_instance_notice: %s", e)
+        return jsonify({"foreign": False, "db_uuid": None, "acknowledged": False})
+
+
+@app.route("/api/instance/notice/dismiss", methods=["POST"])
+def api_instance_notice_dismiss():
+    """BL-5: dismiss the foreign-restore notice for a data lineage. Persisted per
+    db_uuid in /data (install-scoped), so it survives the next restore — a routine
+    repeated restore of the same source is acknowledged once and stays quiet."""
+    try:
+        import engine as _eng
+        import instance as _inst
+        notice = getattr(_eng, "FOREIGN_RESTORE_NOTICE", None) or {}
+        body = request.get_json(silent=True) or {}
+        db_uuid = body.get("db_uuid") or notice.get("db_uuid")
+        if not db_uuid:
+            return jsonify({"ok": False, "error": "no db_uuid"}), 400
+        _inst.acknowledge_db_uuid(db_uuid)
+        if isinstance(getattr(_eng, "FOREIGN_RESTORE_NOTICE", None), dict) \
+                and _eng.FOREIGN_RESTORE_NOTICE.get("db_uuid") == db_uuid:
+            _eng.FOREIGN_RESTORE_NOTICE["acknowledged"] = True
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.warning("api_instance_notice_dismiss: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/billing-source", methods=["GET"])
