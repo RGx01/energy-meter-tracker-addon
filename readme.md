@@ -289,12 +289,13 @@ The only things you set per instance are a **host port** and a **label**.
 
 #### Option 1 — install a second copy from the store (no file access needed)
 
-Home Assistant keys add-on repositories by their URL, so adding this repository a **second time under a slightly different (but equivalent) URL** makes HA treat it as a separate repository offering its own installable copy:
+Home Assistant keys add-on repositories by the exact URL string, so adding this repository a **second time under a different-but-equivalent URL** makes HA treat it as a separate repository offering its own installable copy:
 
 1. Settings → Add-ons → Add-on store → ⋮ → **Repositories**.
-2. Add the repo again with a small URL variation HA treats as distinct — for example append `.git`:
-   `https://github.com/RGx01/energy-meter-tracker-addon.git`
-   (If HA says it's already added, it normalised that variation — try another, such as a trailing `/`.)
+2. Add the repo again under a different-but-equivalent URL. Two confirmed variations:
+   - `http://github.com/RGx01/energy-meter-tracker-addon` (`http://` instead of `https://`), or
+   - `https://github.com/RGx01/energy-meter-tracker-addon.git` (append `.git`).
+   HA stores either as a distinct repository, and GitHub resolves both to the same repo, so the clone works normally.
 3. The store now lists **Energy Meter Tracker** twice. Install the second one — but **don't start it yet**.
 4. Open the new instance → **Configuration → Network** and change its **host port** from 8099 to a free one such as **8100** (or clear it to use ingress only). Both copies declare host port 8099 in the shared manifest, so without this the second one can't start.
 5. Start it. Set an **Instance name** in the Configuration tab so the EMT footer labels it, then run the **Setup Wizard** for the second property or account.
