@@ -4768,22 +4768,33 @@ def _is_ohme_provider(provider) -> bool:
 def _ohme_interpret_mode(integration, state) -> str:
     """Map a live OHME charge-mode entity state to 'smart' | 'boost' | 'idle'.
 
-    official select: 'Smart charge'→smart, 'Max charge'→boost, else idle.
+    official select: state is the underscore slug — 'smart_charge'→smart,
+                     'max_charge'→boost, else idle. Space/underscore are
+                     normalised so the display form 'Smart charge' also resolves
+                     (#286: the raw state is 'smart_charge', so matching only
+                     'smart charge' left every tick idle → nothing off-peak).
     dan-r binary:    'on'→smart, else idle. dan-r cannot report boost directly,
                      so boost is left to inference-by-absence (an out-of-window
                      drawn slot with the binary off is never captured → stays
                      peak), per the agreed dan-r asymmetry.
     """
-    sl = str(state or "").strip().lower()
+    sl = str(state or "").strip().lower().replace(" ", "_")
     if integration == "official":
-        if sl == "max charge":
+        if sl == "max_charge":
             return "boost"
-        if sl == "smart charge":
+        if sl == "smart_charge":
             return "smart"
         return "idle"
     if integration == "danr":
         return "smart" if sl in ("on", "true", "active") else "idle"
     return "idle"
+
+
+def _ohme_status_charging(status) -> bool:
+    """True if the official OHME Status sensor reports the charger actively
+    charging (ChargerStatus 'charging'). Any other state — paused, plugged_in,
+    finished, unplugged — is not an active draw."""
+    return str(status or "").strip().lower() == "charging"
 
 
 def _ohme_slot_for_now(now) -> str:
@@ -4794,12 +4805,13 @@ def _ohme_slot_for_now(now) -> str:
     return slot.isoformat()
 
 
-def _ohme_capture_slots(provider, planned, sensor_present, mode, now):
+def _ohme_capture_slots(provider, planned, sensor_present, mode, status, now):
     """Decide which dispatch slots OHME should persist this tick. PURE — all I/O
     (sensor read, persistence, logging) stays in the caller.
 
-    Returns a list of (slot_start_iso, source) pairs, or None when the provider
-    is NOT OHME (signalling the caller to use the default smart-charge path).
+    `status` is the raw OHME Status-sensor state (or None when no Status sensor is
+    available). Returns a list of (slot_start_iso, source) pairs, or None when the
+    provider is NOT OHME (signalling the caller to use the default path).
     """
     if not _is_ohme_provider(provider):
         return None
@@ -4807,11 +4819,18 @@ def _ohme_capture_slots(provider, planned, sensor_present, mode, now):
         # Optimistic: every planned-superset slot is an off-peak candidate.
         return [(s, "ohme_assumed_unverified")
                 for s in sorted(_planned_dispatch_slots_preview(planned))]
-    # Verified: the sensor is authoritative for the current slot.
-    if mode == "smart":
-        return [(_ohme_slot_for_now(now), "ohme_verified")]
-    # boost → veto (slot stays peak); idle/unknown → capture nothing.
-    return []
+    # Verified. Boost (Max charge) is never off-peak → veto; idle → nothing.
+    if mode != "smart":
+        return []
+    # When a real Status sensor is present, require the charger to be ACTIVELY
+    # charging this tick. This is precise (no capturing plugged-in-but-idle slots)
+    # AND catches replanned/"additional" slots by construction — a drawn slot is
+    # captured whenever status=charging, regardless of Octopus's planned data
+    # (#286). With no Status sensor, fall back to mode-only; the overlay's
+    # meter-draw validation then narrows to slots that actually drew.
+    if status is not None and not _ohme_status_charging(status):
+        return []
+    return [(_ohme_slot_for_now(now), "ohme_verified")]
 
 
 def _capture_ohme_slots(provider, planned) -> int:
@@ -4827,6 +4846,7 @@ def _capture_ohme_slots(provider, planned) -> int:
     sensor_present = bool(entity)
     mode = None
     raw = None
+    status_raw = None
     if sensor_present and _engine_ha is not None:
         try:
             raw = _engine_ha.get_state(entity)
@@ -4835,8 +4855,19 @@ def _capture_ohme_slots(provider, planned) -> int:
                            entity, e)
             raw = None
         mode = _ohme_interpret_mode(ohme.get("integration"), raw)
+        # Official Status sensor: the real charging-state gate (#286). Absent on
+        # dan-r / older setups → status_raw stays None → mode-only fallback.
+        status_entity = ohme.get("status_entity")
+        if status_entity:
+            try:
+                status_raw = _engine_ha.get_state(status_entity)
+            except Exception as e:
+                logger.warning("_capture_ohme_slots: status read failed (%s): %s",
+                               status_entity, e)
+                status_raw = None
 
-    pairs = _ohme_capture_slots(provider, planned, sensor_present, mode, now)
+    pairs = _ohme_capture_slots(provider, planned, sensor_present, mode,
+                                status_raw, now)
     if pairs is None:        # not OHME — caller already gated; defensive
         return 0
 
@@ -4851,12 +4882,14 @@ def _capture_ohme_slots(provider, planned) -> int:
 
     if not sensor_present:
         decision = "optimistic (no charge-mode sensor; all planned slots)"
-    elif mode == "smart":
-        decision = "verified-smart (capture current slot)"
     elif mode == "boost":
         decision = "verified-boost (veto — stays peak)"
+    elif mode != "smart":
+        decision = "verified-idle (mode not smart)"
+    elif status_raw is not None and not _ohme_status_charging(status_raw):
+        decision = "verified-smart but status not charging (skip)"
     else:
-        decision = "verified-idle (nothing active)"
+        decision = "verified-smart charging (capture current slot)"
 
     captured = 0
     for slot_start, source in pairs:
@@ -4869,10 +4902,10 @@ def _capture_ohme_slots(provider, planned) -> int:
             logger.warning("_capture_ohme_slots: persist %s failed: %s",
                            slot_start, e)
     logger.info(
-        "_capture_ohme_slots: provider=%s integration=%s mode=%s %s — "
-        "captured %d slot(s) planned=%d source_dist=%s",
-        provider, ohme.get("integration") or "none", mode or "n/a",
-        decision, captured, len(planned or []), dist)
+        "_capture_ohme_slots: provider=%s integration=%s mode=%s raw_mode=%r "
+        "status=%r %s — captured %d slot(s) planned=%d source_dist=%s",
+        provider, ohme.get("integration") or "none", mode or "n/a", raw,
+        status_raw, decision, captured, len(planned or []), dist)
     try:
         _store.prune_dispatch_slots(days=90)
     except Exception:
@@ -5319,38 +5352,56 @@ def _derive_started_slots(now_utc: datetime, planned: list,
     return [slot.isoformat()]
 
 
+# A completed-without-started dispatch below this magnitude didn't materially run:
+# too small to be a bump (which draws hard) OR a real smart charge, so it's peak.
+# Keyed on Octopus's completed ENERGY, not the meter, so it stays solar-safe.
+_RECONCILE_SMALL_COMPLETED_KWH = 0.4
+
+
 def _reconcile_decision(has_started: bool, has_completed: bool,
-                        currently_off_peak: bool) -> tuple:
+                        completed_energy, currently_off_peak: bool,
+                        small_kwh: float = _RECONCILE_SMALL_COMPLETED_KWH) -> tuple:
     """Settlement-time reconciliation of the dispatch overlay against the
-    accumulated lifecycle (design §12). Keys purely on whether the slot STARTED
+    accumulated lifecycle (design §12). Keys on whether the slot STARTED
     (SMART_CONTROL_IN_PROGRESS + planned active) — the validated smart-vs-bump,
-    solar-immune signal — never on the meter.
+    solar-immune signal — and, for the completed-without-started case, on the
+    completed ENERGY magnitude (also solar-safe; never the meter).
 
     Returns (target, reason) where target is one of:
       - 'off_peak' : started present → genuine smart charge. Restores off-peak,
                      including solar slots the meter floor wrongly rejected.
-      - 'peak'     : neither started nor completed → planned but never charged
-                     (the over-report / paused case).
-      - 'review'   : completed but NOT started → ambiguous (a missed-poll smart
-                     charge OR a bump). NEVER auto-changed — flagged for the user
-                     to check against the real bill, so we neither under-credit a
-                     missed poll nor over-credit a bump.
+      - 'peak'     : (a) neither started nor completed → planned but never charged;
+                     or (b) completed-without-started with NEGLIGIBLE energy
+                     (|completed| < small_kwh) — the dispatch didn't materially
+                     run, so it can be neither a bump nor a real charge, hence
+                     peak (fixes the 10-Jul over-credit).
+      - 'review'   : completed-without-started with SUBSTANTIAL energy — still
+                     genuinely ambiguous (a missed-poll smart charge OR a bump).
+                     Price left unchanged and the block flagged for the user to
+                     check against the real bill.
       - 'ok'       : the correct target already matches the current rate.
-    Only 'off_peak' and 'peak' are actionable; 'review' and 'ok' write nothing.
+    Only 'off_peak' and 'peak' are actionable; 'review' flags, 'ok' writes nothing.
     """
     if has_started:
         target = "off_peak"
+        reason = "started → off-peak (restore)"
     elif not has_completed:
         target = "peak"
+        reason = "never started or completed → peak (revert)"
     else:
-        return ("review",
-                "completed but not started — ambiguous (missed-poll smart or bump)")
+        mag = abs(completed_energy) if completed_energy is not None else 0.0
+        if mag < small_kwh:
+            target = "peak"
+            reason = (f"completed but not started, negligible energy "
+                      f"({mag:.2f} kWh < {small_kwh} kWh) → peak (did not run)")
+        else:
+            return ("review",
+                    f"completed ({mag:.2f} kWh) but not started — ambiguous "
+                    "(missed-poll smart or bump)")
     if (target == "off_peak" and currently_off_peak) or \
        (target == "peak" and not currently_off_peak):
         return ("ok", "already correct")
-    return (target,
-            "started → off-peak (restore)" if target == "off_peak"
-            else "no started/completed → peak (revert)")
+    return (target, reason)
 
 
 _RECONCILE_SETTLE_HOURS = 6.0     # revert/review: wait for completed (~hrs) to settle
@@ -5364,10 +5415,13 @@ async def reconcile_dispatch_overlay() -> dict:
     block whose slot was a planned smart-charge candidate, decide off-peak/peak
     from `started` / `completed` — never the meter — and reprice if it disagrees
     with the current rate. Bidirectional: RESTORES solar slots the meter floor
-    wrongly peaked, REVERTS planned-but-never-charged slots. 'review'
-    (completed-without-started) is logged and left untouched. Devices follow the
-    main rate; blocks the user manually corrected are skipped. Runs on the engine
-    loop (single store connection); regenerates charts if anything changed.
+    wrongly peaked, REVERTS planned-but-never-charged slots (and completed-without-
+    started slots whose energy is too small to have materially run). A completed-
+    without-started slot with SUBSTANTIAL energy stays genuinely ambiguous — its
+    price is left unchanged and logged (a UI to surface these for review is planned
+    for 3.3.0). Devices follow the main rate; blocks the user manually corrected
+    are skipped. Runs on the engine loop (single store connection); regenerates
+    charts if anything changed.
     """
     store = _store
     if store is None:
@@ -5401,8 +5455,14 @@ async def reconcile_dispatch_overlay() -> dict:
     n_candidates = len(rows)
     for r in rows:
         bs = r["block_start"]
-        kinds = {x[0] for x in store._conn.execute(
-            "SELECT kind FROM dispatch_history WHERE slot_start = ?", (bs,))}
+        drows = store._conn.execute(
+            "SELECT kind, energy_kwh FROM dispatch_history WHERE slot_start = ?",
+            (bs,)).fetchall()
+        kinds = {x[0] for x in drows}
+        # Octopus's completed energy for the slot (negative = charged); drives the
+        # negligible-completion → peak decision. None if no completed record yet.
+        completed_energy = next(
+            (x[1] for x in drows if x[0] == "completed" and x[1] is not None), None)
         has_started = "started" in kinds
         # A no-started slot's fate (revert vs review) hinges on completed, which
         # lands late — defer it until it clears the settle gate. A started slot is
@@ -5419,9 +5479,11 @@ async def reconcile_dispatch_overlay() -> dict:
         cur_rate = r["imp_rate"] or 0.0
         currently_off_peak = abs(cur_rate - off_peak) < 1e-6
         target, reason = _reconcile_decision(
-            has_started, "completed" in kinds, currently_off_peak)
+            has_started, "completed" in kinds, completed_energy, currently_off_peak)
         if target == "review":
             n_review += 1
+            # Genuinely ambiguous — price left unchanged. Logged only for now; a UI
+            # to surface these flagged blocks for review is planned for 3.3.0.
             logger.info("reconcile: %s REVIEW — %s (unchanged)", bs, reason)
             continue
         if target == "ok":
