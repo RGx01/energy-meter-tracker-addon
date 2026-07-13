@@ -428,27 +428,35 @@ class TestReconcileDecision(unittest.TestCase):
     started → review (never auto-changed)."""
 
     def test_started_restores_off_peak(self):
-        # solar slot: started but floored to peak -> restore
-        self.assertEqual(engine._reconcile_decision(True, True, False)[0], "off_peak")
+        # solar slot: started but floored to peak -> restore (energy irrelevant)
+        self.assertEqual(engine._reconcile_decision(True, True, -3.0, False)[0], "off_peak")
 
     def test_started_already_off_peak_is_ok(self):
-        self.assertEqual(engine._reconcile_decision(True, True, True)[0], "ok")
+        self.assertEqual(engine._reconcile_decision(True, True, -3.0, True)[0], "ok")
 
     def test_neither_reverts_to_peak(self):
         # planned, baseload pushed it off-peak, but no charge -> revert
-        self.assertEqual(engine._reconcile_decision(False, False, True)[0], "peak")
+        self.assertEqual(engine._reconcile_decision(False, False, None, True)[0], "peak")
 
     def test_neither_already_peak_is_ok(self):
-        self.assertEqual(engine._reconcile_decision(False, False, False)[0], "ok")
+        self.assertEqual(engine._reconcile_decision(False, False, None, False)[0], "ok")
 
-    def test_completed_without_started_is_review(self):
-        # ambiguous: missed-poll smart OR bump — never auto-changed either way
-        self.assertEqual(engine._reconcile_decision(False, True, True)[0], "review")
-        self.assertEqual(engine._reconcile_decision(False, True, False)[0], "review")
+    def test_completed_without_started_substantial_is_review(self):
+        # SUBSTANTIAL completed, no started → still ambiguous (missed-poll vs bump)
+        self.assertEqual(engine._reconcile_decision(False, True, -3.0, True)[0], "review")
+        self.assertEqual(engine._reconcile_decision(False, True, -3.0, False)[0], "review")
+
+    def test_completed_without_started_negligible_is_peak(self):
+        # #286 / 10-Jul: tiny completion (−0.26 kWh) can be neither a bump nor a
+        # real charge → peak. Off-peak now → actionable revert; already peak → ok.
+        self.assertEqual(engine._reconcile_decision(False, True, -0.26, True)[0], "peak")
+        self.assertEqual(engine._reconcile_decision(False, True, -0.26, False)[0], "ok")
+        # boundary: exactly at the 0.4 kWh floor is still ambiguous (review)
+        self.assertEqual(engine._reconcile_decision(False, True, -0.4, True)[0], "review")
 
     def test_started_overrides_missing_completed(self):
         # started with no completed yet (completed lands later) still → off-peak
-        self.assertEqual(engine._reconcile_decision(True, False, False)[0], "off_peak")
+        self.assertEqual(engine._reconcile_decision(True, False, None, False)[0], "off_peak")
 
 
 if __name__ == "__main__":
@@ -467,7 +475,8 @@ class TestReconcilePass(unittest.IsolatedAsyncioTestCase):
             def resolve(self, ts): return 32.3092            # £0.323092
         return S()
 
-    def _seed(self, store, slot, imp_rate, kinds, off_peak_slot=True, corrected=0):
+    def _seed(self, store, slot, imp_rate, kinds, off_peak_slot=True, corrected=0,
+              completed_kwh=-3.0):
         store._conn.execute(
             "INSERT OR IGNORE INTO config_periods (id, effective_from, billing_day, "
             "block_minutes, timezone) VALUES (1, '2020-01-01T00:00:00', 1, 30, 'UTC')")
@@ -479,7 +488,9 @@ class TestReconcilePass(unittest.IsolatedAsyncioTestCase):
             store.upsert_dispatch_slot(slot, off_peak=True, provider="Myenergi",
                                        source="smart-charge", state="planned")
         for k in kinds:
-            store.record_dispatch_history(slot, k, provider="Myenergi")
+            store.record_dispatch_history(
+                slot, k, provider="Myenergi",
+                energy_kwh=(completed_kwh if k == "completed" else None))
         store._conn.commit()
 
     async def _run(self, store):
@@ -537,14 +548,33 @@ class TestReconcilePass(unittest.IsolatedAsyncioTestCase):
                              ("2020-01-01T20:00:00",)).fetchone()
         self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)  # untouched
 
-    async def test_review_left_untouched(self):
+    async def test_review_left_untouched_but_flagged(self):
         from block_store import BlockStore
         st = BlockStore(":memory:")
-        # completed but no started -> review, no change
-        self._seed(st, "2020-01-01T20:00:00", 0.05493, ["planned", "completed"])
+        # SUBSTANTIAL completed but no started -> review: price unchanged, flagged.
+        self._seed(st, "2020-01-01T20:00:00", 0.05493, ["planned", "completed"],
+                   completed_kwh=-3.0)
         res = await self._run(st)
         self.assertEqual((res["restored"], res["reverted"], res["review"]),
                          (0, 0, 1))
+        r = st._conn.execute(
+            "SELECT imp_rate, needs_review FROM blocks WHERE block_start=?",
+            ("2020-01-01T20:00:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)   # price unchanged
+        self.assertEqual(r["needs_review"], 1)                     # now surfaced
+
+    async def test_negligible_completed_reverts_to_peak(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # #286 / 10-Jul over-credit: tiny completion (−0.26 kWh), no started, block
+        # currently off-peak -> did not materially run -> revert to peak.
+        self._seed(st, "2020-01-01T20:00:00", 0.05493, ["planned", "completed"],
+                   completed_kwh=-0.26)
+        res = await self._run(st)
+        self.assertEqual(res["reverted"], 1)
+        r = st._conn.execute("SELECT imp_rate FROM blocks WHERE block_start=?",
+                             ("2020-01-01T20:00:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.323092, places=5)  # peak
 
 
 if __name__ == "__main__":
