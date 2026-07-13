@@ -4768,22 +4768,33 @@ def _is_ohme_provider(provider) -> bool:
 def _ohme_interpret_mode(integration, state) -> str:
     """Map a live OHME charge-mode entity state to 'smart' | 'boost' | 'idle'.
 
-    official select: 'Smart charge'→smart, 'Max charge'→boost, else idle.
+    official select: state is the underscore slug — 'smart_charge'→smart,
+                     'max_charge'→boost, else idle. Space/underscore are
+                     normalised so the display form 'Smart charge' also resolves
+                     (#286: the raw state is 'smart_charge', so matching only
+                     'smart charge' left every tick idle → nothing off-peak).
     dan-r binary:    'on'→smart, else idle. dan-r cannot report boost directly,
                      so boost is left to inference-by-absence (an out-of-window
                      drawn slot with the binary off is never captured → stays
                      peak), per the agreed dan-r asymmetry.
     """
-    sl = str(state or "").strip().lower()
+    sl = str(state or "").strip().lower().replace(" ", "_")
     if integration == "official":
-        if sl == "max charge":
+        if sl == "max_charge":
             return "boost"
-        if sl == "smart charge":
+        if sl == "smart_charge":
             return "smart"
         return "idle"
     if integration == "danr":
         return "smart" if sl in ("on", "true", "active") else "idle"
     return "idle"
+
+
+def _ohme_status_charging(status) -> bool:
+    """True if the official OHME Status sensor reports the charger actively
+    charging (ChargerStatus 'charging'). Any other state — paused, plugged_in,
+    finished, unplugged — is not an active draw."""
+    return str(status or "").strip().lower() == "charging"
 
 
 def _ohme_slot_for_now(now) -> str:
@@ -4794,12 +4805,13 @@ def _ohme_slot_for_now(now) -> str:
     return slot.isoformat()
 
 
-def _ohme_capture_slots(provider, planned, sensor_present, mode, now):
+def _ohme_capture_slots(provider, planned, sensor_present, mode, status, now):
     """Decide which dispatch slots OHME should persist this tick. PURE — all I/O
     (sensor read, persistence, logging) stays in the caller.
 
-    Returns a list of (slot_start_iso, source) pairs, or None when the provider
-    is NOT OHME (signalling the caller to use the default smart-charge path).
+    `status` is the raw OHME Status-sensor state (or None when no Status sensor is
+    available). Returns a list of (slot_start_iso, source) pairs, or None when the
+    provider is NOT OHME (signalling the caller to use the default path).
     """
     if not _is_ohme_provider(provider):
         return None
@@ -4807,11 +4819,18 @@ def _ohme_capture_slots(provider, planned, sensor_present, mode, now):
         # Optimistic: every planned-superset slot is an off-peak candidate.
         return [(s, "ohme_assumed_unverified")
                 for s in sorted(_planned_dispatch_slots_preview(planned))]
-    # Verified: the sensor is authoritative for the current slot.
-    if mode == "smart":
-        return [(_ohme_slot_for_now(now), "ohme_verified")]
-    # boost → veto (slot stays peak); idle/unknown → capture nothing.
-    return []
+    # Verified. Boost (Max charge) is never off-peak → veto; idle → nothing.
+    if mode != "smart":
+        return []
+    # When a real Status sensor is present, require the charger to be ACTIVELY
+    # charging this tick. This is precise (no capturing plugged-in-but-idle slots)
+    # AND catches replanned/"additional" slots by construction — a drawn slot is
+    # captured whenever status=charging, regardless of Octopus's planned data
+    # (#286). With no Status sensor, fall back to mode-only; the overlay's
+    # meter-draw validation then narrows to slots that actually drew.
+    if status is not None and not _ohme_status_charging(status):
+        return []
+    return [(_ohme_slot_for_now(now), "ohme_verified")]
 
 
 def _capture_ohme_slots(provider, planned) -> int:
@@ -4827,6 +4846,7 @@ def _capture_ohme_slots(provider, planned) -> int:
     sensor_present = bool(entity)
     mode = None
     raw = None
+    status_raw = None
     if sensor_present and _engine_ha is not None:
         try:
             raw = _engine_ha.get_state(entity)
@@ -4835,8 +4855,19 @@ def _capture_ohme_slots(provider, planned) -> int:
                            entity, e)
             raw = None
         mode = _ohme_interpret_mode(ohme.get("integration"), raw)
+        # Official Status sensor: the real charging-state gate (#286). Absent on
+        # dan-r / older setups → status_raw stays None → mode-only fallback.
+        status_entity = ohme.get("status_entity")
+        if status_entity:
+            try:
+                status_raw = _engine_ha.get_state(status_entity)
+            except Exception as e:
+                logger.warning("_capture_ohme_slots: status read failed (%s): %s",
+                               status_entity, e)
+                status_raw = None
 
-    pairs = _ohme_capture_slots(provider, planned, sensor_present, mode, now)
+    pairs = _ohme_capture_slots(provider, planned, sensor_present, mode,
+                                status_raw, now)
     if pairs is None:        # not OHME — caller already gated; defensive
         return 0
 
@@ -4851,12 +4882,14 @@ def _capture_ohme_slots(provider, planned) -> int:
 
     if not sensor_present:
         decision = "optimistic (no charge-mode sensor; all planned slots)"
-    elif mode == "smart":
-        decision = "verified-smart (capture current slot)"
     elif mode == "boost":
         decision = "verified-boost (veto — stays peak)"
+    elif mode != "smart":
+        decision = "verified-idle (mode not smart)"
+    elif status_raw is not None and not _ohme_status_charging(status_raw):
+        decision = "verified-smart but status not charging (skip)"
     else:
-        decision = "verified-idle (nothing active)"
+        decision = "verified-smart charging (capture current slot)"
 
     captured = 0
     for slot_start, source in pairs:
@@ -4869,10 +4902,10 @@ def _capture_ohme_slots(provider, planned) -> int:
             logger.warning("_capture_ohme_slots: persist %s failed: %s",
                            slot_start, e)
     logger.info(
-        "_capture_ohme_slots: provider=%s integration=%s mode=%s %s — "
-        "captured %d slot(s) planned=%d source_dist=%s",
-        provider, ohme.get("integration") or "none", mode or "n/a",
-        decision, captured, len(planned or []), dist)
+        "_capture_ohme_slots: provider=%s integration=%s mode=%s raw_mode=%r "
+        "status=%r %s — captured %d slot(s) planned=%d source_dist=%s",
+        provider, ohme.get("integration") or "none", mode or "n/a", raw,
+        status_raw, decision, captured, len(planned or []), dist)
     try:
         _store.prune_dispatch_slots(days=90)
     except Exception:

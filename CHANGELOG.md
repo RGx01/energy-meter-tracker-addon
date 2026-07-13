@@ -1,4 +1,11 @@
 # Changelog
+ 
+## [Unreleased] — 3.2.1
+ 
+### Fixed
+ 
+- **Intelligent Octopus smart charges on the official Ohme integration were billed at peak** ([#286](https://github.com/RGx01/energy-meter-tracker-addon/issues/286)). The verified Ohme path read the charge-mode `select` and compared its state against `"smart charge"` — but the official Home Assistant `ohme` integration reports the underscore **slug** as the state (`smart_charge`), and only *displays* "Smart charge". So every tick resolved to `idle`, no slot was ever captured, and the entire smart charge was priced at the day rate. The mode match is now slug/display-agnostic (`smart_charge` / `max_charge` / `paused`, space and underscore treated alike), so the off-peak overlay applies again. **This affected every user on the official Ohme integration since the Ohme path shipped** — dan-r-integration and non-Ohme users were unaffected.
+- **Ohme off-peak capture now follows the charger's real charging state.** In addition to the fix above, the verified path now gates on the Ohme **Status** sensor (`charging`) rather than only the charge-mode setting. This captures a slot precisely when the charger is actually drawing — so mid-session pauses and Octopus/Ohme replanning that adds *further* slots ("additional slots") are handled by construction, without depending on Octopus's planned-dispatch superset (which is unreliable for Ohme, since Octopus doesn't control the charge). Setups without the Status sensor fall back to the previous mode-only behaviour. The `_capture_ohme_slots` log line now includes the raw mode and status values, so any future mismatch is visible at a glance.
 
 ## [3.2.0] — 2026-07-11
 
