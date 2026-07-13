@@ -1371,8 +1371,19 @@ def detect_bottlecapdave(states: list[dict]) -> dict:
 #     {"Smart charge","Max charge","Paused"} ("Max charge" = boost/full-speed).
 #   - Unofficial dan-r/HomeAssistant-Ohme: a "Charge Slot Active" binary_sensor,
 #     on while a (smart) charge slot is in progress — mimics an Octopus dispatch.
-_OHME_MODE_VALUES  = {"smart charge", "max charge", "paused"}
-_OHME_BOOST_VALUES = {"max charge"}
+# Canonical charge-mode state values from the official HA `ohme` integration
+# select: the STATE is the underscore slug (smart_charge / max_charge / paused);
+# only the DISPLAY is "Smart charge" etc. We normalise space↔underscore before
+# matching so both the slug and any display/legacy form resolve. (#286: the select
+# state is `smart_charge`, and matching only "smart charge" left it always idle.)
+_OHME_MODE_VALUES  = {"smart_charge", "max_charge", "paused"}
+_OHME_BOOST_VALUES = {"max_charge"}
+
+
+def _norm_ohme_state(state) -> str:
+    """Normalise an OHME select/status state for matching: lowercase, strip, and
+    treat spaces and underscores as equivalent ('Smart charge' → 'smart_charge')."""
+    return str(state or "").strip().lower().replace(" ", "_")
 
 
 def detect_ohme_charge_mode(states: list[dict]) -> dict:
@@ -1409,7 +1420,7 @@ def detect_ohme_charge_mode(states: list[dict]) -> dict:
         eid = (s.get("entity_id", "") or "")
         leid = eid.lower()
         state = s.get("state", "") or ""
-        sl = state.strip().lower()
+        sl = _norm_ohme_state(state)   # space↔underscore normalised (#286)
         if "ohme" not in leid:
             continue
         # Official ohme: a charge-mode SELECT (or any select reporting a known

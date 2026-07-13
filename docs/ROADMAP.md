@@ -6,6 +6,11 @@ Newest at the top. **Upcoming work (ranked by priority) first, then release hist
 
 ## Upcoming — ranked by priority
 
+### 3.3.0
+
+#### BL-18 — Surface flagged (`needs_review`) blocks in the UI
+*The UI half of the dispatch-reconcile ambiguity handling (deferred from 3.2.1).* The store already flags blocks `needs_review = 1` in a few places (e.g. DCC zero-blocks) and provides `get_drift_alerts()` plus clear methods — but nothing is **wired to the UI**: `get_drift_alerts()` is called by no route or template, and there is no "review list" anywhere, so flagged blocks are invisible. 3.2.1 auto-reverts the *unambiguous* over-credits (completed-without-`started` below 0.4 kWh → peak) but deliberately does **not** flag the genuinely-ambiguous ones (substantial completed-without-`started`), because there is nowhere to show them. Build the surface: (a) a small route returning `get_drift_alerts()`; (b) a **"Flagged for review"** list on the Corrections page — each row showing the block's date + reason, with a button to load it into the correction tool and a dismiss/clear (the clear method already exists); (c) a count/badge (or a BL-6 notification) so it's discoverable. Then (d) have the dispatch-reconcile `review` case set `needs_review = 1`, and clear it when a block is manually corrected. Ships the flag-setting and the UI together so the feature is whole.
+
 ### 3.2.0 — Feature release with fixes (next)
 Outage-resilience fixes (**BL-1**, **BL-8**) plus instance-isolation and notification work (**BL-5**, **BL-6** — which also fixes the overlapping-banner bug [#219]).
 
