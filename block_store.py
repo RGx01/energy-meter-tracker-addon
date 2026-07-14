@@ -865,6 +865,8 @@ class BlockStore:
             ("exp_kwh_api",        "blocks",        "REAL",                       _b_cols),
             ("finalised_from_cad", "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
             ("needs_review",       "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
+            # ── 3.3.0 BL-18: why a block was flagged for review (drift vs dispatch)
+            ("review_reason",      "blocks",        "TEXT",                       _b_cols),
             ("carbon_intensity_g", "blocks",        "REAL",                       _b_cols),
             ("rate_corrected",     "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
             ("rate_reconciled",    "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
@@ -2354,6 +2356,43 @@ class BlockStore:
         self._conn.commit()
         return cur.rowcount
 
+    def flag_grid_invariant_violations(self, tolerance: float = 1e-4) -> int:
+        """BL-19 one-time sweep: flag blocks whose sub-meter grid attribution
+        exceeds the parent's settled grid import for PASS 2 re-run.
+
+        Finds every settled main block (imp_kwh_api present, so its grid import
+        is authoritative) where the sum of its sub-meters' imp_kwh_grid exceeds
+        the main's grid import (imp_kwh) by more than `tolerance`, and sets
+        needs_pass2_rerun = 1 on that main block. The existing drain then
+        re-materialises it through the (BL-19-fixed) PASS 2, which clamps each
+        sub-meter's grid share to the available grid import.
+
+        This repairs historical violations written before the clamp fix — e.g.
+        blocks reconstructed by gap-fill during an instance outage, where the
+        main later settled small (heavy solar) but the sub-meter grid was left
+        at the full interpolated draw. Returns the number of main blocks flagged.
+        """
+        cur = self._conn.execute(
+            """
+            UPDATE blocks SET needs_pass2_rerun = 1
+            WHERE id IN (
+                SELECT b_main.id
+                FROM blocks b_main
+                JOIN meters m
+                  ON m.parent_meter_id = b_main.meter_id AND m.is_sub_meter = 1
+                JOIN blocks b_sub
+                  ON b_sub.meter_id = m.meter_id
+                 AND b_sub.block_start = b_main.block_start
+                WHERE b_main.imp_kwh_api IS NOT NULL
+                  AND b_sub.imp_kwh_grid IS NOT NULL
+                GROUP BY b_main.id, b_main.imp_kwh
+                HAVING SUM(b_sub.imp_kwh_grid) > COALESCE(b_main.imp_kwh, 0) + ?
+            )
+            """,
+            (tolerance,))
+        self._conn.commit()
+        return cur.rowcount
+
     def get_unsettled_blocks(self, main_meter_id: str = "electricity_main",
                              limit: Optional[int] = None) -> list:
         """Main-meter blocks that never received DCC import settlement.
@@ -2451,14 +2490,16 @@ class BlockStore:
         return cur.rowcount
 
     def get_drift_alerts(self) -> list:
-        """Blocks flagged needs_review = 1, for the Settings drift list.
+        """Blocks flagged needs_review = 1, for the review list (BL-18).
 
-        Returns dicts with the CAD/Mini figure, the DCC figure and the delta %
-        so the UI table can render directly. Informational only — billing_source
-        already determines which figure drives the numbers.
+        Returns dicts with the CAD/Mini figure, the DCC figure, the delta % and
+        a stored review_reason so the UI table can render directly. Informational
+        only — billing_source already determines which figure drives the numbers.
+        A flag can come from CAD/DCC settlement drift or from an ambiguous
+        dispatch-reconcile decision; review_reason (when set) names which.
         """
         rows = self._conn.execute(
-            """SELECT id, block_start, meter_id, imp_kwh, imp_kwh_api
+            """SELECT id, block_start, meter_id, imp_kwh, imp_kwh_api, review_reason
                FROM blocks
                WHERE needs_review = 1
                ORDER BY block_start"""
@@ -2473,6 +2514,13 @@ class BlockStore:
                 delta_pct = -100.0 if (cad or 0) > 0 else 0.0
             else:
                 delta_pct = None
+            reason = r["review_reason"]
+            if not reason:
+                # Legacy drift flag with no stored reason — synthesise one.
+                if delta_pct is not None:
+                    reason = f"CAD/DCC settlement drift {delta_pct:+.0f}%"
+                else:
+                    reason = "flagged for review"
             alerts.append({
                 "block_id": r["id"],
                 "block_start": r["block_start"],
@@ -2480,8 +2528,39 @@ class BlockStore:
                 "cad_kwh": cad,
                 "dcc_kwh": dcc,
                 "delta_pct": delta_pct,
+                "reason": reason,
             })
         return alerts
+
+    def flag_block_for_review(self, block_start: str, reason: str,
+                              meter_id: str = "electricity_main") -> int:
+        """BL-18: flag a single block (main meter row) for review with a reason.
+
+        Used by the dispatch reconciliation when a block is genuinely ambiguous
+        (substantial completed energy without a `started` signal). Idempotent —
+        re-flagging refreshes the reason. Returns rows affected.
+        """
+        cur = self._conn.execute(
+            "UPDATE blocks SET needs_review = 1, review_reason = ? "
+            "WHERE block_start = ? AND meter_id = ?",
+            (reason, block_start, meter_id))
+        self._conn.commit()
+        return cur.rowcount
+
+    def clear_block_review(self, block_start: str,
+                           meter_id: str = "electricity_main") -> int:
+        """BL-18: clear the review flag + reason for a single block.
+
+        Called when a previously-ambiguous block is later resolved — either the
+        reconciliation itself reaches a definite verdict, or the user applies a
+        manual correction. Returns rows affected.
+        """
+        cur = self._conn.execute(
+            "UPDATE blocks SET needs_review = 0, review_reason = NULL "
+            "WHERE block_start = ? AND meter_id = ? AND needs_review = 1",
+            (block_start, meter_id))
+        self._conn.commit()
+        return cur.rowcount
 
     def dismiss_drift_alerts(self, block_ids: Optional[list] = None) -> int:
         """Clear needs_review. All flagged blocks, or a specific subset.
@@ -2491,14 +2570,16 @@ class BlockStore:
         """
         if block_ids is None:
             cur = self._conn.execute(
-                "UPDATE blocks SET needs_review = 0 WHERE needs_review = 1"
+                "UPDATE blocks SET needs_review = 0, review_reason = NULL "
+                "WHERE needs_review = 1"
             )
         elif not block_ids:
             return 0
         else:
             placeholders = ",".join("?" for _ in block_ids)
             cur = self._conn.execute(
-                f"UPDATE blocks SET needs_review = 0 WHERE id IN ({placeholders})",
+                "UPDATE blocks SET needs_review = 0, review_reason = NULL "
+                f"WHERE id IN ({placeholders})",
                 tuple(block_ids),
             )
         self._conn.commit()

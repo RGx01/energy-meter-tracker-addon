@@ -681,6 +681,32 @@ window.EMT = window.EMT || {};
     .catch(function () {});
 })();
 
+/* \u2500\u2500 BL-18: "blocks flagged for review" notice \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+   The dispatch reconciliation leaves genuinely-ambiguous blocks unpriced and
+   flags them. Surface a dismissible pointer to the Corrections review list.
+   Dismissal remembers the count dismissed, so it only reappears when NEW blocks
+   are flagged (count rises) \u2014 resolving blocks never re-nags. */
+(function () {
+  var DISMISS_KEY = 'emtReviewDismissedCount';
+  fetch(apiUrl('/api/review-blocks'))
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      var n = (d && d.count) || 0;
+      if (!n) return;
+      if (parseInt(localStorage.getItem(DISMISS_KEY) || '0', 10) >= n) return;
+      EMT.notify({
+        id: 'blocks-flagged-review',
+        level: 'info',
+        dismissible: true,
+        html: '\ud83d\udd0e <strong>' + n + ' block' + (n === 1 ? '' : 's') +
+              ' flagged for review</strong> \u2014 a smart charge couldn\u2019t be ' +
+              'priced with confidence. <a href="' + apiUrl('/corrections') + '">Review them</a>.',
+        onDismiss: function () { localStorage.setItem(DISMISS_KEY, String(n)); }
+      });
+    })
+    .catch(function () {});
+})();
+
 // Sync global theme toggle icon on load
 (function() {
   var theme = document.documentElement.getAttribute('data-theme') || 'dark';
