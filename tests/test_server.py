@@ -340,6 +340,12 @@ class TestRouteRegistration(unittest.TestCase):
     def test_data_management_page_registered(self):
         self.assertTrue(self._registered("data_management_page"))
 
+    def test_api_review_blocks_registered(self):
+        self.assertTrue(self._registered("api_review_blocks"))
+
+    def test_api_review_blocks_dismiss_registered(self):
+        self.assertTrue(self._registered("api_review_blocks_dismiss"))
+
     def test_live_power_page_registered(self):
         self.assertTrue(self._registered("live_power_page"))
 
@@ -3697,3 +3703,117 @@ class TestInstanceLabel(unittest.TestCase):
         os.environ["SUPERVISOR_TOKEN"] = "faketoken-never-used"
         os.environ["EMT_INSTANCE_NAME"] = "Prod"
         self.assertEqual(server._instance_label(), "Prod")
+
+
+class TestReviewBlocksAPI(unittest.TestCase):
+    """BL-18 — /api/review-blocks GET lists flagged blocks with a local window
+    and reason; dismiss clears them."""
+
+    def setUp(self):
+        self.store = _make_test_store(MINIMAL_BLOCKS)
+        self.store._conn.execute(
+            "UPDATE blocks SET needs_review = 1, "
+            "review_reason = 'dispatch ambiguous: completed 2.10 kWh without started' "
+            "WHERE meter_id = 'electricity_main'")
+        # A CAD/DCC drift-style flag: needs_review set but NO review_reason. It
+        # must NOT appear in the correction review list (nothing rate-fixable).
+        self.store._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+            "imp_kwh, imp_kwh_api, needs_review) VALUES "
+            "('2026-01-16T00:00:00','2026-01-16T00:30:00','electricity_main',1,1.0,0.5,1)")
+        self.store._conn.commit()
+        self.client = make_client(store=self.store)
+
+    def test_lists_flagged_with_local_window(self):
+        r = self.client.get("/api/review-blocks")
+        self.assertEqual(r.status_code, 200)
+        d = r.get_json()
+        self.assertEqual(d["count"], 1)                   # drift block excluded
+        b = d["blocks"][0]
+        self.assertIn("without started", b["reason"])
+        self.assertEqual(b["block_start"], "2026-01-15T00:00:00")
+        self.assertEqual(b["local_date"], "2026-01-15")   # 00:00 UTC → local (GMT)
+        self.assertEqual(b["from_time"], "00:00")
+        self.assertEqual(b["to_time"], "00:30")
+
+    def test_drift_flag_excluded_and_untouched_by_dismiss_all(self):
+        # 'Dismiss all' clears the dispatch flag but leaves the drift flag set.
+        self.client.post("/api/review-blocks/dismiss", json={})
+        self.assertEqual(self.client.get("/api/review-blocks").get_json()["count"], 0)
+        drift = self.store._conn.execute(
+            "SELECT needs_review FROM blocks WHERE block_start='2026-01-16T00:00:00'").fetchone()
+        self.assertEqual(drift["needs_review"], 1)        # dormant drift flag survives
+
+    def test_dismiss_subset_clears_flag(self):
+        bid = self.store._conn.execute(
+            "SELECT id FROM blocks WHERE needs_review = 1").fetchone()[0]
+        r = self.client.post("/api/review-blocks/dismiss", json={"block_ids": [bid]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["cleared"], 1)
+        self.assertEqual(self.client.get("/api/review-blocks").get_json()["count"], 0)
+
+    def test_dismiss_all(self):
+        r = self.client.post("/api/review-blocks/dismiss", json={})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.client.get("/api/review-blocks").get_json()["count"], 0)
+
+    def test_dismiss_rejects_bad_type(self):
+        r = self.client.post("/api/review-blocks/dismiss", json={"block_ids": "nope"})
+        self.assertEqual(r.status_code, 400)
+
+
+class TestNearbyRatesAPI(unittest.TestCase):
+    """#270 — /api/corrections/nearby-rates offers the exact rates in force in
+    blocks surrounding a correction window, ranked by frequency, so the user can
+    pick rather than re-type."""
+
+    def setUp(self):
+        self.store = _make_test_store([])
+        seed = [
+            ("2026-07-10T17:00:00", 0.323092),   # peak ×3
+            ("2026-07-10T17:30:00", 0.323092),
+            ("2026-07-10T18:00:00", 0.323092),
+            ("2026-07-10T02:00:00", 0.054930),   # off-peak ×2
+            ("2026-07-10T02:30:00", 0.054930),
+            ("2026-06-01T12:00:00", 0.245000),   # far outside ±3d window → excluded
+        ]
+        for bs, rate in seed:
+            self.store._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, "
+                "config_period_id, imp_kwh, imp_rate) VALUES (?,?,?,1,1.0,?)",
+                (bs, bs, "electricity_main", rate))
+        self.store._conn.commit()
+        self.client = make_client(store=self.store)
+
+    def _get(self, channel="import", frm="2026-07-10", to="2026-07-10"):
+        return self.client.get(
+            f"/api/corrections/nearby-rates?channel={channel}&from_date={frm}&to_date={to}")
+
+    def test_ranked_by_frequency_within_window(self):
+        d = self._get().get_json()
+        self.assertEqual([x["rate"] for x in d["rates"]], [0.323092, 0.054930])
+        self.assertEqual(d["rates"][0]["count"], 3)   # peak most common
+        self.assertEqual(d["rates"][1]["count"], 2)   # off-peak next
+
+    def test_excludes_out_of_window_rate(self):
+        rates = [x["rate"] for x in self._get().get_json()["rates"]]
+        self.assertNotIn(0.245000, rates)             # the June flat rate
+
+    def test_export_channel_separate(self):
+        self.store._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+            "exp_kwh, exp_rate) VALUES "
+            "('2026-07-10T12:00:00','2026-07-10T12:30:00','electricity_main',1,1.0,0.15)")
+        self.store._conn.commit()
+        rates = [x["rate"] for x in self._get(channel="export").get_json()["rates"]]
+        self.assertEqual(rates, [0.15])
+
+    def test_bad_channel_400(self):
+        self.assertEqual(self._get(channel="nope").status_code, 400)
+
+    def test_missing_dates_400(self):
+        r = self.client.get("/api/corrections/nearby-rates?channel=import")
+        self.assertEqual(r.status_code, 400)
+
+    def test_registered(self):
+        self.assertTrue("api_corrections_nearby_rates" in server.app.view_functions)
