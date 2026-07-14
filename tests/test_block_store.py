@@ -187,6 +187,120 @@ def new_store() -> BlockStore:
     return BlockStore(":memory:")
 
 
+class TestGridInvariantSweepBL19(unittest.TestCase):
+    """BL-19 — flag_grid_invariant_violations flags only settled blocks whose
+    sub-meter grid attribution exceeds the parent's grid import."""
+
+    def setUp(self):
+        self.store = new_store()
+        self.store.insert_config_period(EXAMPLE_CONFIG_WITH_SUB,
+                                        effective_from="2026-07-01T00:00:00")
+
+    def _seed(self, start, main_grid, sub_grid, settled=True):
+        self.store.append_block(make_block_with_sub(start), config_period_id=1)
+        self.store._conn.execute(
+            "UPDATE blocks SET imp_kwh=?, imp_kwh_api=? "
+            "WHERE block_start=? AND meter_id='electricity_main'",
+            (main_grid, main_grid if settled else None, start))
+        self.store._conn.execute(
+            "UPDATE blocks SET imp_kwh_grid=? "
+            "WHERE block_start=? AND meter_id='zappi_ev'",
+            (sub_grid, start))
+        self.store._conn.commit()
+
+    def _flag(self, start):
+        return self.store._conn.execute(
+            "SELECT needs_pass2_rerun FROM blocks WHERE block_start=? "
+            "AND meter_id='electricity_main'", (start,)).fetchone()["needs_pass2_rerun"]
+
+    def test_flags_settled_violation_only(self):
+        self._seed("2026-07-10T16:30:00", main_grid=0.157, sub_grid=2.053)  # violation
+        self._seed("2026-07-10T16:00:00", main_grid=2.894, sub_grid=2.053)  # ok (main covers)
+        self._seed("2026-07-10T12:00:00", main_grid=0.10,  sub_grid=2.0,
+                   settled=False)                                            # unsettled — skip
+        self.assertEqual(self.store.flag_grid_invariant_violations(), 1)
+        self.assertEqual(self._flag("2026-07-10T16:30:00"), 1)   # flagged
+        self.assertEqual(self._flag("2026-07-10T16:00:00"), 0)   # not flagged
+        self.assertEqual(self._flag("2026-07-10T12:00:00"), 0)   # unsettled, not flagged
+
+    def test_no_violations_flags_nothing(self):
+        self._seed("2026-07-10T16:00:00", main_grid=2.894, sub_grid=2.053)
+        self.assertEqual(self.store.flag_grid_invariant_violations(), 0)
+
+    def test_tolerance_ignores_float_noise(self):
+        # sub grid a hair over main (rounding noise) must NOT flag.
+        self._seed("2026-07-10T16:00:00", main_grid=1.0, sub_grid=1.0 + 1e-6)
+        self.assertEqual(self.store.flag_grid_invariant_violations(), 0)
+
+
+class TestReviewFlagsBL18(unittest.TestCase):
+    """BL-18 — per-block review flag with a stored reason, and its clear paths."""
+
+    def setUp(self):
+        self.store = new_store()
+        self.store.insert_config_period(EXAMPLE_CONFIG)
+        self.store.append_block(make_block("2026-07-10T16:30:00", imp_kwh=0.157))
+
+    def test_flag_sets_reason_and_surfaces(self):
+        reason = "dispatch ambiguous: completed 2.10 kWh without started"
+        self.assertEqual(
+            self.store.flag_block_for_review("2026-07-10T16:30:00", reason), 1)
+        alerts = self.store.get_drift_alerts()
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["reason"], reason)
+        self.assertEqual(alerts[0]["block_start"], "2026-07-10T16:30:00")
+
+    def test_clear_block_review(self):
+        self.store.flag_block_for_review("2026-07-10T16:30:00", "x")
+        self.assertEqual(self.store.clear_block_review("2026-07-10T16:30:00"), 1)
+        self.assertEqual(self.store.get_drift_alerts(), [])
+
+    def test_dismiss_nulls_reason(self):
+        self.store.flag_block_for_review("2026-07-10T16:30:00", "x")
+        bid = self.store.get_drift_alerts()[0]["block_id"]
+        self.store.dismiss_drift_alerts([bid])
+        row = self.store._conn.execute(
+            "SELECT needs_review, review_reason FROM blocks WHERE id=?", (bid,)).fetchone()
+        self.assertEqual(row["needs_review"], 0)
+        self.assertIsNone(row["review_reason"])
+
+    def test_legacy_drift_reason_synthesised(self):
+        # A flag with no stored reason but a CAD/DCC delta gets a synthesised one.
+        self.store._conn.execute(
+            "UPDATE blocks SET needs_review=1, imp_kwh=1.0, imp_kwh_api=0.5 "
+            "WHERE meter_id='electricity_main'")
+        self.store._conn.commit()
+        self.assertTrue(
+            self.store.get_drift_alerts()[0]["reason"].startswith("CAD/DCC settlement drift"))
+
+    def _add_drift_flag(self, start="2026-07-11T00:00:00"):
+        # A drift-style flag: needs_review set, NO review_reason.
+        self.store.append_block(make_block(start, imp_kwh=1.0))
+        self.store._conn.execute(
+            "UPDATE blocks SET needs_review=1, imp_kwh_api=0.5, review_reason=NULL "
+            "WHERE block_start=? AND meter_id='electricity_main'", (start,))
+        self.store._conn.commit()
+
+    def test_get_review_blocks_excludes_drift(self):
+        self.store.flag_block_for_review("2026-07-10T16:30:00", "dispatch ambiguous")
+        self._add_drift_flag()
+        rows = self.store.get_review_blocks()
+        self.assertEqual(len(rows), 1)                       # only the dispatch flag
+        self.assertEqual(rows[0]["block_start"], "2026-07-10T16:30:00")
+        self.assertEqual(rows[0]["reason"], "dispatch ambiguous")
+
+    def test_dismiss_review_blocks_leaves_drift(self):
+        self.store.flag_block_for_review("2026-07-10T16:30:00", "dispatch ambiguous")
+        self._add_drift_flag("2026-07-11T00:00:00")
+        cleared = self.store.dismiss_review_blocks(None)     # dismiss all (scoped)
+        self.assertEqual(cleared, 1)                         # only the dispatch flag
+        self.assertEqual(self.store.get_review_blocks(), [])
+        drift = self.store._conn.execute(
+            "SELECT needs_review FROM blocks WHERE block_start='2026-07-11T00:00:00' "
+            "AND meter_id='electricity_main'").fetchone()
+        self.assertEqual(drift["needs_review"], 1)           # dormant drift survives
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests: schema and setup
 # ─────────────────────────────────────────────────────────────────────────────

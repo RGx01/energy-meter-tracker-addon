@@ -21,6 +21,21 @@
 <div id="alert-success" class="alert alert-success"></div>
 <div id="alert-error"   class="alert alert-danger"></div>
 
+<!-- BL-18: blocks the dispatch reconciliation flagged as ambiguous -->
+<div class="card" id="review-card" style="display:none;border-left:3px solid var(--accent2);">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px;">
+    <div>
+      <span style="font-size:14px;font-weight:600;">🔎 Flagged for review</span>
+      <span id="review-count" style="background:rgba(124,106,247,0.15);color:var(--accent2);font-size:11px;font-weight:600;padding:1px 8px;border-radius:10px;margin-left:8px;vertical-align:middle;"></span>
+    </div>
+    <button class="btn btn-secondary" style="font-size:12px;" onclick="reviewDismiss(null)">Dismiss all</button>
+  </div>
+  <div style="font-size:12px;color:var(--muted);margin-bottom:12px;line-height:1.6;">
+    These half-hour blocks couldn't be automatically priced with confidence — usually a smart-charge slot the supplier planned but where it's unclear whether the car actually charged. The price was left unchanged. Load one into the correction tool to set its rate, or dismiss it if the current price is right.
+  </div>
+  <div id="review-list"></div>
+</div>
+
 <div class="card">
   <div style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.7;">
     Correct standing charges or tariff rates for specific blocks in the live database.
@@ -76,8 +91,17 @@
   <!-- Value -->
   <div style="margin-bottom:14px;">
     <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;" id="corr-value-label">New standing charge (£/day)</label>
-    <input id="corr-value" type="number" min="0" step="0.000001" placeholder="e.g. 0.245000"
-      style="width:200px;box-sizing:border-box;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;font-family:inherit;">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <input id="corr-value" type="number" min="0" step="0.000001" placeholder="e.g. 0.245000"
+        style="width:200px;box-sizing:border-box;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;font-family:inherit;">
+      <!-- #270: pick an exact rate seen in surrounding blocks (rate corrections only) -->
+      <select id="corr-rate-picker" onchange="corrPickRate()" style="display:none;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;font-family:inherit;max-width:280px;">
+        <option value="">— or pick a nearby rate —</option>
+      </select>
+    </div>
+    <div id="corr-rate-picker-hint" style="display:none;font-size:11px;color:var(--muted);margin-top:4px;">
+      Rates from blocks around this window — picking one fills the exact value; you can still type your own.
+    </div>
   </div>
 
   <!-- Recalc cost (rate only) -->
@@ -142,7 +166,76 @@ document.addEventListener('DOMContentLoaded', function() {
       corrSetType('standing');
     })
     .catch(function() {});
+  loadReviewBlocks();
+  // #270: refresh the nearby-rate picker whenever the date range changes.
+  ['corr-from', 'corr-to'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.addEventListener('change', function() {
+      if (_corrType !== 'standing') loadNearbyRates();
+    });
+  });
 });
+
+// ── BL-18: "Flagged for review" list ────────────────────────────────────────
+function loadReviewBlocks() {
+  fetch(apiUrl('/api/review-blocks'))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      var card = document.getElementById('review-card');
+      var list = document.getElementById('review-list');
+      var cnt  = document.getElementById('review-count');
+      var blocks = (d && d.blocks) || [];
+      if (!blocks.length) { card.style.display = 'none'; return; }
+      card.style.display = '';
+      cnt.textContent = blocks.length;
+      list.innerHTML = blocks.map(function(b) {
+        var when = b.local_date
+          ? (b.local_date + ' ' + (b.from_time || '') + '–' + (b.to_time || ''))
+          : b.block_start;
+        var canLoad = !!b.local_date;
+        var loadBtn = canLoad
+          ? '<button class="btn" style="font-size:12px;" onclick="reviewLoadIntoTool(' +
+              "'" + b.local_date + "','" + b.from_time + "','" + b.to_time + "'" +
+            ')">Load into tool</button>'
+          : '';
+        return '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;' +
+               'padding:8px 0;border-bottom:1px solid var(--border);flex-wrap:wrap;">' +
+                 '<div style="min-width:180px;">' +
+                   '<div style="font-size:13px;font-weight:600;">' + escHtml(when) + '</div>' +
+                   '<div style="font-size:11px;color:var(--muted);">' + escHtml(b.reason || 'flagged') + '</div>' +
+                 '</div>' +
+                 '<div style="display:flex;gap:6px;">' + loadBtn +
+                   '<button class="btn btn-secondary" style="font-size:12px;" onclick="reviewDismiss(' + b.block_id + ')">Dismiss</button>' +
+                 '</div>' +
+               '</div>';
+      }).join('');
+    })
+    .catch(function() {});
+}
+
+function reviewLoadIntoTool(localDate, fromTime, toTime) {
+  corrSetType('rate-import');
+  document.getElementById('corr-from').value = localDate;
+  document.getElementById('corr-to').value   = localDate;
+  document.getElementById('corr-from-time').value = fromTime || '';
+  document.getElementById('corr-to-time').value   = toTime   || '';
+  loadNearbyRates();   // dates are set now — populate the picker for this block
+  var v = document.getElementById('corr-value');
+  v.scrollIntoView({behavior:'smooth', block:'center'});
+  v.focus();
+}
+
+function reviewDismiss(blockId) {
+  var body = (blockId === null) ? {} : { block_ids: [blockId] };
+  fetch(apiUrl('/api/review-blocks/dismiss'), {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body),
+  })
+  .then(function(r) { return r.json(); })
+  .then(function() { loadReviewBlocks(); })
+  .catch(function() {});
+}
 
 function corrSetType(t) {
   _corrType = t;
@@ -157,6 +250,8 @@ function corrSetType(t) {
   document.getElementById('corr-recalc-row').style.display  = isRate ? '' : 'none';
   document.getElementById('corr-time-row').style.display    = isRate ? '' : 'none';
   document.getElementById('corr-meter-row').style.display   = isRate ? '' : 'none';
+  document.getElementById('corr-rate-picker').style.display      = isRate ? '' : 'none';
+  document.getElementById('corr-rate-picker-hint').style.display = isRate ? '' : 'none';
   ['corr-type-standing','corr-type-rate-imp','corr-type-rate-exp'].forEach(function(id) {
     document.getElementById(id).className = 'btn';
   });
@@ -165,6 +260,44 @@ function corrSetType(t) {
   document.getElementById('corr-preview').style.display   = 'none';
   document.getElementById('corr-result').style.display    = 'none';
   document.getElementById('corr-apply-btn').style.display = 'none';
+  if (isRate) loadNearbyRates(); else clearNearbyRates();
+}
+
+// ── #270: nearby-rate picker ────────────────────────────────────────────────
+function clearNearbyRates() {
+  var sel = document.getElementById('corr-rate-picker');
+  sel.innerHTML = '<option value="">— or pick a nearby rate —</option>';
+}
+
+function corrPickRate() {
+  var sel = document.getElementById('corr-rate-picker');
+  if (sel.value) document.getElementById('corr-value').value = sel.value;
+  sel.value = '';  // reset label; the value now lives in the input (still editable)
+}
+
+function loadNearbyRates() {
+  if (_corrType === 'standing') return;
+  var from = document.getElementById('corr-from').value;
+  var to   = document.getElementById('corr-to').value;
+  var sel  = document.getElementById('corr-rate-picker');
+  if (!from || !to) { clearNearbyRates(); return; }
+  var channel = _corrType === 'rate-export' ? 'export' : 'import';
+  var sym = window._corrSym || '£';
+  var qs = '?channel=' + channel + '&from_date=' + from + '&to_date=' + to;
+  fetch(apiUrl('/api/corrections/nearby-rates' + qs))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      var rates = (d && d.rates) || [];
+      var opts = ['<option value="">— or pick a nearby rate —</option>'];
+      rates.forEach(function(x) {
+        var label = sym + Number(x.rate).toFixed(6) + '/kWh · ' + x.count +
+                    ' block' + (x.count === 1 ? '' : 's');
+        opts.push('<option value="' + x.rate + '">' + escHtml(label) + '</option>');
+      });
+      if (!rates.length) opts.push('<option value="" disabled>(no nearby rates found)</option>');
+      sel.innerHTML = opts.join('');
+    })
+    .catch(function() { clearNearbyRates(); });
 }
 
 function corrPreview() {
