@@ -21,6 +21,21 @@
 <div id="alert-success" class="alert alert-success"></div>
 <div id="alert-error"   class="alert alert-danger"></div>
 
+<!-- BL-18: blocks the dispatch reconciliation flagged as ambiguous -->
+<div class="card" id="review-card" style="display:none;border-left:3px solid var(--accent2);">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px;">
+    <div>
+      <span style="font-size:14px;font-weight:600;">🔎 Flagged for review</span>
+      <span id="review-count" style="background:rgba(124,106,247,0.15);color:var(--accent2);font-size:11px;font-weight:600;padding:1px 8px;border-radius:10px;margin-left:8px;vertical-align:middle;"></span>
+    </div>
+    <button class="btn btn-secondary" style="font-size:12px;" onclick="reviewDismiss(null)">Dismiss all</button>
+  </div>
+  <div style="font-size:12px;color:var(--muted);margin-bottom:12px;line-height:1.6;">
+    These half-hour blocks couldn't be automatically priced with confidence — usually a smart-charge slot the supplier planned but where it's unclear whether the car actually charged. The price was left unchanged. Load one into the correction tool to set its rate, or dismiss it if the current price is right.
+  </div>
+  <div id="review-list"></div>
+</div>
+
 <div class="card">
   <div style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.7;">
     Correct standing charges or tariff rates for specific blocks in the live database.
@@ -142,7 +157,68 @@ document.addEventListener('DOMContentLoaded', function() {
       corrSetType('standing');
     })
     .catch(function() {});
+  loadReviewBlocks();
 });
+
+// ── BL-18: "Flagged for review" list ────────────────────────────────────────
+function loadReviewBlocks() {
+  fetch(apiUrl('/api/review-blocks'))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      var card = document.getElementById('review-card');
+      var list = document.getElementById('review-list');
+      var cnt  = document.getElementById('review-count');
+      var blocks = (d && d.blocks) || [];
+      if (!blocks.length) { card.style.display = 'none'; return; }
+      card.style.display = '';
+      cnt.textContent = blocks.length;
+      list.innerHTML = blocks.map(function(b) {
+        var when = b.local_date
+          ? (b.local_date + ' ' + (b.from_time || '') + '–' + (b.to_time || ''))
+          : b.block_start;
+        var canLoad = !!b.local_date;
+        var loadBtn = canLoad
+          ? '<button class="btn" style="font-size:12px;" onclick="reviewLoadIntoTool(' +
+              "'" + b.local_date + "','" + b.from_time + "','" + b.to_time + "'" +
+            ')">Load into tool</button>'
+          : '';
+        return '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;' +
+               'padding:8px 0;border-bottom:1px solid var(--border);flex-wrap:wrap;">' +
+                 '<div style="min-width:180px;">' +
+                   '<div style="font-size:13px;font-weight:600;">' + escHtml(when) + '</div>' +
+                   '<div style="font-size:11px;color:var(--muted);">' + escHtml(b.reason || 'flagged') + '</div>' +
+                 '</div>' +
+                 '<div style="display:flex;gap:6px;">' + loadBtn +
+                   '<button class="btn btn-secondary" style="font-size:12px;" onclick="reviewDismiss(' + b.block_id + ')">Dismiss</button>' +
+                 '</div>' +
+               '</div>';
+      }).join('');
+    })
+    .catch(function() {});
+}
+
+function reviewLoadIntoTool(localDate, fromTime, toTime) {
+  corrSetType('rate-import');
+  document.getElementById('corr-from').value = localDate;
+  document.getElementById('corr-to').value   = localDate;
+  document.getElementById('corr-from-time').value = fromTime || '';
+  document.getElementById('corr-to-time').value   = toTime   || '';
+  var v = document.getElementById('corr-value');
+  v.scrollIntoView({behavior:'smooth', block:'center'});
+  v.focus();
+}
+
+function reviewDismiss(blockId) {
+  var body = (blockId === null) ? {} : { block_ids: [blockId] };
+  fetch(apiUrl('/api/review-blocks/dismiss'), {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body),
+  })
+  .then(function(r) { return r.json(); })
+  .then(function() { loadReviewBlocks(); })
+  .catch(function() {});
+}
 
 function corrSetType(t) {
   _corrType = t;

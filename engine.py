@@ -5459,7 +5459,7 @@ async def reconcile_dispatch_overlay() -> dict:
     settle_cutoff = (now - timedelta(hours=_RECONCILE_SETTLE_HOURS)).isoformat()
     try:
         rows = store._conn.execute(
-            """SELECT b.block_start, b.imp_kwh, b.imp_rate
+            """SELECT b.block_start, b.imp_kwh, b.imp_rate, b.needs_review
                FROM blocks b
                WHERE b.meter_id = 'electricity_main' AND b.rate_corrected = 0
                  AND b.block_start < ?
@@ -5503,11 +5503,17 @@ async def reconcile_dispatch_overlay() -> dict:
             has_started, "completed" in kinds, completed_energy, currently_off_peak)
         if target == "review":
             n_review += 1
-            # Genuinely ambiguous — price left unchanged. Logged only for now; a UI
-            # to surface these flagged blocks for review is planned for 3.3.0.
-            logger.info("reconcile: %s REVIEW — %s (unchanged)", bs, reason)
+            # Genuinely ambiguous — price left unchanged, but flag it so the UI
+            # review list (BL-18) can surface it for a human decision. Idempotent:
+            # re-flagging just refreshes the reason.
+            store.flag_block_for_review(bs, reason)
+            logger.info("reconcile: %s REVIEW — %s (flagged, price unchanged)", bs, reason)
             continue
         if target == "ok":
+            # Already correct. If it was previously flagged ambiguous and has since
+            # become decidable, clear the stale review flag.
+            if r["needs_review"]:
+                store.clear_block_review(bs)
             continue
         new_rate = off_peak if target == "off_peak" else base
         if not _DISPATCH_RECONCILE_APPLY:
@@ -5515,8 +5521,11 @@ async def reconcile_dispatch_overlay() -> dict:
                         target, bs, cur_rate, new_rate, reason)
             continue
         with store._conn:
+            # A definite verdict also clears any prior ambiguous-review flag on
+            # the main row (needs_review / review_reason).
             store._conn.execute(
                 "UPDATE blocks SET imp_rate = ?, rate_reconciled = 1, "
+                "needs_review = 0, review_reason = NULL, "
                 "imp_cost = ROUND(COALESCE(imp_kwh, 0) * ?, 6) "
                 "WHERE block_start = ? AND meter_id = 'electricity_main'",
                 (new_rate, new_rate, bs))
