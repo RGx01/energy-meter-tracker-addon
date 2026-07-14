@@ -5459,7 +5459,8 @@ async def reconcile_dispatch_overlay() -> dict:
     settle_cutoff = (now - timedelta(hours=_RECONCILE_SETTLE_HOURS)).isoformat()
     try:
         rows = store._conn.execute(
-            """SELECT b.block_start, b.imp_kwh, b.imp_rate, b.needs_review
+            """SELECT b.block_start, b.imp_kwh, b.imp_rate, b.needs_review,
+                      b.imp_kwh_api
                FROM blocks b
                WHERE b.meter_id = 'electricity_main' AND b.rate_corrected = 0
                  AND b.block_start < ?
@@ -5497,11 +5498,35 @@ async def reconcile_dispatch_overlay() -> dict:
             continue
         off_peak = round(op_pence / 100.0, 6)
         base = round(base_pence / 100.0, 6)
+        # Inside the off-peak WINDOW the base tariff is already the off-peak rate,
+        # so the block's price does not depend on any dispatch — there is nothing
+        # to reconcile (a smart charge here, e.g. under the 6-hour cap, is priced
+        # off-peak by the schedule regardless of whether it 'started'). Reverting
+        # would be a no-op and flagging it for review is a false positive. Skip,
+        # clearing any stale review flag a prior run may have set.
+        if abs(base - off_peak) < 1e-6:
+            if r["needs_review"]:
+                store.clear_block_review(bs)
+            continue
         cur_rate = r["imp_rate"] or 0.0
         currently_off_peak = abs(cur_rate - off_peak) < 1e-6
         target, reason = _reconcile_decision(
             has_started, "completed" in kinds, completed_energy, currently_off_peak)
         if target == "review":
+            # A review flag invites a manual correction, but the correction tool
+            # can only touch DCC-settled blocks. Dispatch `completed` arrives at
+            # T+hours while DCC settlement is T+1/T+2, so a block can be decidable
+            # here yet not correctable. Defer the flag until the block is actually
+            # settled (imp_kwh_api present), so the review list only ever shows
+            # blocks the user can act on. (The automatic revert path needs no user
+            # action, so it is not gated this way.)
+            if r["imp_kwh_api"] is None:
+                n_deferred += 1
+                # Retract any flag a prior run set before this gate existed — the
+                # block isn't ready for review until it settles.
+                if r["needs_review"]:
+                    store.clear_block_review(bs)
+                continue
             n_review += 1
             # Genuinely ambiguous — price left unchanged, but flag it so the UI
             # review list (BL-18) can surface it for a human decision. Idempotent:
