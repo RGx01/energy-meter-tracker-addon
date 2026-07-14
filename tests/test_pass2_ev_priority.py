@@ -112,5 +112,66 @@ class TestPass2EvGridPriority(unittest.TestCase):
         self.assertAlmostEqual(total_sub_grid, 5.566, places=3)
 
 
+def _make_block_x(main_kwh, ev_kwh, batt_kwh=0.0, *, interpolated=False,
+                  settled_api=None):
+    """Like _make_block but with control over the `interpolated` flag and whether
+    the main meter is DCC-settled (imp_kwh_api present)."""
+    b = _make_block(main_kwh, ev_kwh, batt_kwh)
+    b["interpolated"] = interpolated
+    if settled_api is not None:
+        b["meters"]["electricity_main"]["imp_kwh_api"] = settled_api
+    return b
+
+
+class TestPass2GridInvariantBL19(unittest.TestCase):
+    """BL-19 — a sub-meter's grid share must never exceed the parent's grid
+    import once that import is authoritative (live-metered or DCC-settled),
+    even on a gap-fill (interpolated) block."""
+
+    def _imp(self, block, meter):
+        return block["meters"][meter]["channels"]["import"]
+
+    def test_settled_interpolated_block_clamps_ev_grid(self):
+        # prod-dev 10-Jul 16:30: gap-fill left EV=2.053 kWh, but the main DCC-
+        # settled to 0.157 kWh. The `interpolated` flag is set, yet the settled
+        # main is the true grid boundary — so the EV grid MUST clamp to 0.157,
+        # the rest being behind-the-meter solar.
+        block = _make_block_x(0.157, 2.053, 0.0, interpolated=True, settled_api=0.157)
+        engine._apply_pass2(block)
+        ev = self._imp(block, "ev_charger")
+        self.assertAlmostEqual(ev["kwh_grid"], 0.157, places=3,
+                               msg="EV grid must clamp to the settled main import")
+        self.assertAlmostEqual(ev["kwh_battery"], 2.053 - 0.157, places=3,
+                               msg="overflow spills to self-consumption")
+
+    def test_unsettled_gap_block_preserved_as_is(self):
+        # Same gap-fill EV=2.053 but the main has NOT settled (imp_kwh_api None):
+        # the main is itself an estimate that may under-shoot, so we preserve the
+        # attribution as-is (settlement re-runs PASS 2 and re-clamps later). This
+        # guards against under-billing a real overnight grid draw.
+        block = _make_block_x(0.157, 2.053, 0.0, interpolated=True, settled_api=None)
+        engine._apply_pass2(block)
+        ev = self._imp(block, "ev_charger")
+        self.assertAlmostEqual(ev["kwh_grid"], 2.053, places=3,
+                               msg="unsettled gap block keeps as-is attribution")
+        self.assertAlmostEqual(ev["kwh_battery"], 0.0, places=3)
+
+    def test_live_overflow_block_always_clamps(self):
+        # A live (non-interpolated) block always clamps — unchanged behaviour,
+        # asserted explicitly so the invariant can't regress.
+        block = _make_block_x(0.157, 2.053, 0.0, interpolated=False, settled_api=None)
+        engine._apply_pass2(block)
+        self.assertAlmostEqual(self._imp(block, "ev_charger")["kwh_grid"], 0.157,
+                               places=3)
+
+    def test_settled_interpolated_no_violation_unchanged(self):
+        # Settled interpolated block where EV < main grid (the 16:00/17:00 blocks
+        # in the same prod-dev run): no violation, EV keeps its full draw on grid.
+        block = _make_block_x(3.979, 2.052, 0.0, interpolated=True, settled_api=3.979)
+        engine._apply_pass2(block)
+        self.assertAlmostEqual(self._imp(block, "ev_charger")["kwh_grid"], 2.052,
+                               places=3)
+
+
 if __name__ == "__main__":
     unittest.main()

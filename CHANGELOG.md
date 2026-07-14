@@ -1,5 +1,11 @@
 # Changelog
  
+## [Unreleased] — 3.3.0
+ 
+### Fixed
+ 
+- **A device could be credited more grid import than the whole house drew, on data rebuilt after an outage** (BL-19). When EMT misses live readings — for example the add-on was stopped or offline during a smart charge — it reconstructs the missing half-hours by spreading the accumulated energy across them. Those rebuilt blocks skipped the check that caps each device's grid share at what the house actually imported, so once the meter settled to its true figure (often small on a sunny, export-heavy day) a device such as an EV charger could still show far more grid energy than the house imported — over-attributing grid, and grid cost, to the device while understating its solar/battery self-supply. The whole-house bill was always correct; only the per-device split was wrong. The cap now always applies once the house's import figure is authoritative (live-metered or settled), and a one-time check on upgrade repairs any already-affected blocks (they re-price automatically over the following polls). An unsettled gap block is still left as-is until settlement lands, so a genuine overnight grid charge isn't prematurely reclassified.
+ 
 ## [3.2.1] — 2026-07-13
  
 ### Fixed

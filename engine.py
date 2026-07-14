@@ -183,6 +183,8 @@ _KRAKEN_SNAPSHOT_DONE_KEY = "pre_live_snapshot_done"
 _SETTLEMENT_SWEEP_HORIZON_DAYS = 14
 _SETTLEMENT_SWEEP_MIN_INTERVAL_S = 24 * 3600   # run at most once per day
 _STATE_LAST_SWEEP = "last_settlement_sweep_utc"
+# BL-19: run-once marker for the historical grid-invariant repair sweep.
+_BL19_GRID_SWEEP_DONE_KEY = "bl19_grid_invariant_sweep_done"
 # Chunk 5: cached rate schedules for reconcile-time rate repair. Built once per
 # poll cycle by the (async) poll task; read by the (sync) drain via the resolver
 # below. Rates stored as £/kWh (converted from the API's pence at build time).
@@ -1682,6 +1684,12 @@ def _apply_pass2(block: dict) -> None:
         grid_kwh       = parent_import.get("kwh", 0.0)
         parent_rate    = parent_import.get("rate", 0.0)
         grid_remaining = grid_kwh
+        # BL-19: is the main's grid import authoritative? A DCC-settled main
+        # (imp_kwh_api present) is the true grid boundary for the block, so the
+        # sub-meter invariant (Σ sub kwh_grid ≤ main grid import) MUST be
+        # enforced — even when the block is flagged interpolated (a gap-fill
+        # origin whose main has since settled per-half-hour). See clamp_overflow.
+        parent_settled = parent_block.get("imp_kwh_api") is not None
 
         protected   = []
         unprotected = []
@@ -1740,24 +1748,36 @@ def _apply_pass2(block: dict) -> None:
         unprotected.sort(key=lambda x: x["kwh"], reverse=True)
 
         is_interpolated = block.get("interpolated", False)
+        # BL-19: enforce the sub-meter grid invariant unless this is an UNSETTLED
+        # gap block. When the main is live-metered OR DCC-settled its grid import
+        # is authoritative, so a sub-meter can never claim more grid than the
+        # house drew — clip the overflow to grid and spill the remainder to
+        # self-consumption. The only case we still record as-is is an interpolated
+        # block whose main has NOT yet settled: there the main is itself a
+        # gap-fill estimate that may under-shoot, and clamping could push a real
+        # (e.g. overnight) grid draw into free self-consumption and under-bill.
+        # Settlement re-runs PASS 2 (imp_kwh_api set), so those self-correct then.
+        clamp_overflow = parent_settled or not is_interpolated
         for entry in protected:
             claimed = min(entry["kwh"], grid_remaining)
             if entry["kwh"] > grid_kwh:
-                if is_interpolated:
-                    # Gap-fill block — preserve energy attribution even if it exceeds
-                    # grid import (gap attribution issues are expected)
+                if not clamp_overflow:
+                    # Unsettled gap block — preserve energy attribution even if it
+                    # exceeds grid import (the main is also an estimate here).
                     logger.warning(
                         "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
-                        "gap block attribution issue, recording as-is.",
+                        "unsettled gap block, recording as-is (settlement will re-clamp).",
                         entry["meter_name"], entry["kwh"], grid_kwh,
                     )
                     claimed = entry["kwh"]
                 else:
-                    # Live block — clip to grid import (sub-meter cannot exceed grid)
+                    # Authoritative main (live or DCC-settled) — clip to grid
+                    # import; the sub-meter cannot exceed what the house imported.
                     logger.warning(
                         "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
-                        "clipping to grid import (live block).",
+                        "clipping to grid import (%s).",
                         entry["meter_name"], entry["kwh"], grid_kwh,
+                        "settled" if parent_settled else "live",
                     )
                     claimed = grid_remaining  # already set to min above
             elif claimed < entry["kwh"]:
@@ -1786,10 +1806,10 @@ def _apply_pass2(block: dict) -> None:
             claimed    = min(entry["kwh"], grid_remaining)
             battery    = entry["kwh"] - claimed
             if entry["kwh"] > grid_kwh:
-                if is_interpolated:
+                if not clamp_overflow:
                     logger.warning(
                         "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
-                        "gap block attribution issue, recording as-is.",
+                        "unsettled gap block, recording as-is (settlement will re-clamp).",
                         entry["meter_name"], entry["kwh"], grid_kwh,
                     )
                     claimed = entry["kwh"]
@@ -1797,8 +1817,9 @@ def _apply_pass2(block: dict) -> None:
                 else:
                     logger.warning(
                         "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
-                        "clipping to grid import (live block).",
+                        "clipping to grid import (%s).",
                         entry["meter_name"], entry["kwh"], grid_kwh,
+                        "settled" if parent_settled else "live",
                     )
                     # claimed already = min(kwh, grid_remaining) from above
                     battery = entry["kwh"] - claimed
@@ -6121,6 +6142,23 @@ async def engine_startup(ha: HAClient):
             )
     except Exception as _me:
         logger.warning("engine_startup: full_config_json migration failed: %s", _me)
+
+    # BL-19 one-time sweep: repair historical sub-meter grid-invariant violations
+    # (sub-meter grid > settled parent grid import), e.g. gap-fill blocks written
+    # during an outage whose main later settled small. Flag them for PASS 2
+    # re-run; the drain re-clamps them via the BL-19-fixed apportionment. Gated
+    # by a marker so it runs at most once per DB.
+    try:
+        if not _store.get_kraken_state(_BL19_GRID_SWEEP_DONE_KEY):
+            _flagged = _store.flag_grid_invariant_violations()
+            _store.set_kraken_state(_BL19_GRID_SWEEP_DONE_KEY,
+                                    datetime.now(timezone.utc).isoformat())
+            if _flagged:
+                logger.info(
+                    "engine_startup: BL-19 grid-invariant sweep flagged %d block(s) "
+                    "for re-clamp (drain will re-materialise)", _flagged)
+    except Exception as _b19e:
+        logger.warning("engine_startup: BL-19 grid-invariant sweep failed: %s", _b19e)
 
     if _store.get_current_config_period_id() is None:
         # Fresh DB — check if blocks.json exists to migrate

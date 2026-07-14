@@ -2354,6 +2354,43 @@ class BlockStore:
         self._conn.commit()
         return cur.rowcount
 
+    def flag_grid_invariant_violations(self, tolerance: float = 1e-4) -> int:
+        """BL-19 one-time sweep: flag blocks whose sub-meter grid attribution
+        exceeds the parent's settled grid import for PASS 2 re-run.
+
+        Finds every settled main block (imp_kwh_api present, so its grid import
+        is authoritative) where the sum of its sub-meters' imp_kwh_grid exceeds
+        the main's grid import (imp_kwh) by more than `tolerance`, and sets
+        needs_pass2_rerun = 1 on that main block. The existing drain then
+        re-materialises it through the (BL-19-fixed) PASS 2, which clamps each
+        sub-meter's grid share to the available grid import.
+
+        This repairs historical violations written before the clamp fix — e.g.
+        blocks reconstructed by gap-fill during an instance outage, where the
+        main later settled small (heavy solar) but the sub-meter grid was left
+        at the full interpolated draw. Returns the number of main blocks flagged.
+        """
+        cur = self._conn.execute(
+            """
+            UPDATE blocks SET needs_pass2_rerun = 1
+            WHERE id IN (
+                SELECT b_main.id
+                FROM blocks b_main
+                JOIN meters m
+                  ON m.parent_meter_id = b_main.meter_id AND m.is_sub_meter = 1
+                JOIN blocks b_sub
+                  ON b_sub.meter_id = m.meter_id
+                 AND b_sub.block_start = b_main.block_start
+                WHERE b_main.imp_kwh_api IS NOT NULL
+                  AND b_sub.imp_kwh_grid IS NOT NULL
+                GROUP BY b_main.id, b_main.imp_kwh
+                HAVING SUM(b_sub.imp_kwh_grid) > COALESCE(b_main.imp_kwh, 0) + ?
+            )
+            """,
+            (tolerance,))
+        self._conn.commit()
+        return cur.rowcount
+
     def get_unsettled_blocks(self, main_meter_id: str = "electricity_main",
                              limit: Optional[int] = None) -> list:
         """Main-meter blocks that never received DCC import settlement.

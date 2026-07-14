@@ -187,6 +187,52 @@ def new_store() -> BlockStore:
     return BlockStore(":memory:")
 
 
+class TestGridInvariantSweepBL19(unittest.TestCase):
+    """BL-19 — flag_grid_invariant_violations flags only settled blocks whose
+    sub-meter grid attribution exceeds the parent's grid import."""
+
+    def setUp(self):
+        self.store = new_store()
+        self.store.insert_config_period(EXAMPLE_CONFIG_WITH_SUB,
+                                        effective_from="2026-07-01T00:00:00")
+
+    def _seed(self, start, main_grid, sub_grid, settled=True):
+        self.store.append_block(make_block_with_sub(start), config_period_id=1)
+        self.store._conn.execute(
+            "UPDATE blocks SET imp_kwh=?, imp_kwh_api=? "
+            "WHERE block_start=? AND meter_id='electricity_main'",
+            (main_grid, main_grid if settled else None, start))
+        self.store._conn.execute(
+            "UPDATE blocks SET imp_kwh_grid=? "
+            "WHERE block_start=? AND meter_id='zappi_ev'",
+            (sub_grid, start))
+        self.store._conn.commit()
+
+    def _flag(self, start):
+        return self.store._conn.execute(
+            "SELECT needs_pass2_rerun FROM blocks WHERE block_start=? "
+            "AND meter_id='electricity_main'", (start,)).fetchone()["needs_pass2_rerun"]
+
+    def test_flags_settled_violation_only(self):
+        self._seed("2026-07-10T16:30:00", main_grid=0.157, sub_grid=2.053)  # violation
+        self._seed("2026-07-10T16:00:00", main_grid=2.894, sub_grid=2.053)  # ok (main covers)
+        self._seed("2026-07-10T12:00:00", main_grid=0.10,  sub_grid=2.0,
+                   settled=False)                                            # unsettled — skip
+        self.assertEqual(self.store.flag_grid_invariant_violations(), 1)
+        self.assertEqual(self._flag("2026-07-10T16:30:00"), 1)   # flagged
+        self.assertEqual(self._flag("2026-07-10T16:00:00"), 0)   # not flagged
+        self.assertEqual(self._flag("2026-07-10T12:00:00"), 0)   # unsettled, not flagged
+
+    def test_no_violations_flags_nothing(self):
+        self._seed("2026-07-10T16:00:00", main_grid=2.894, sub_grid=2.053)
+        self.assertEqual(self.store.flag_grid_invariant_violations(), 0)
+
+    def test_tolerance_ignores_float_noise(self):
+        # sub grid a hair over main (rounding noise) must NOT flag.
+        self._seed("2026-07-10T16:00:00", main_grid=1.0, sub_grid=1.0 + 1e-6)
+        self.assertEqual(self.store.flag_grid_invariant_violations(), 0)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests: schema and setup
 # ─────────────────────────────────────────────────────────────────────────────
