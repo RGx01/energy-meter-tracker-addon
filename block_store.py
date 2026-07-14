@@ -2532,6 +2532,51 @@ class BlockStore:
             })
         return alerts
 
+    def get_review_blocks(self) -> list:
+        """BL-18: blocks flagged for review with a stored reason — i.e. the
+        rate-actionable dispatch-reconcile ambiguities that the Corrections
+        review list surfaces.
+
+        Deliberately EXCLUDES bare needs_review flags with no review_reason
+        (CAD/DCC settlement drift): drift is a kWh disagreement, and the
+        correction tool only edits rates, so there is no action to take on it
+        here. In the default DCC billing mode drift is informational anyway
+        (settlement is authoritative). Those flags stay set as a dormant
+        diagnostic, just not shown as a correction task.
+        """
+        rows = self._conn.execute(
+            """SELECT id, block_start, meter_id, review_reason
+               FROM blocks
+               WHERE needs_review = 1 AND review_reason IS NOT NULL
+               ORDER BY block_start"""
+        ).fetchall()
+        return [{
+            "block_id": r["id"],
+            "block_start": r["block_start"],
+            "meter_id": r["meter_id"],
+            "reason": r["review_reason"],
+        } for r in rows]
+
+    def dismiss_review_blocks(self, block_ids: Optional[list] = None) -> int:
+        """BL-18: clear review flags shown in the Corrections list. Scoped to
+        dispatch-origin flags (review_reason present) so a 'dismiss all' never
+        silently touches the dormant drift diagnostics. Returns rows affected.
+        """
+        if block_ids is None:
+            cur = self._conn.execute(
+                "UPDATE blocks SET needs_review = 0, review_reason = NULL "
+                "WHERE needs_review = 1 AND review_reason IS NOT NULL")
+        elif not block_ids:
+            return 0
+        else:
+            placeholders = ",".join("?" for _ in block_ids)
+            cur = self._conn.execute(
+                "UPDATE blocks SET needs_review = 0, review_reason = NULL "
+                f"WHERE id IN ({placeholders}) AND review_reason IS NOT NULL",
+                tuple(block_ids))
+        self._conn.commit()
+        return cur.rowcount
+
     def flag_block_for_review(self, block_start: str, reason: str,
                               meter_id: str = "electricity_main") -> int:
         """BL-18: flag a single block (main meter row) for review with a reason.

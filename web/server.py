@@ -4908,7 +4908,7 @@ def api_review_blocks():
     """
     try:
         store = _get_store()
-        alerts = store.get_drift_alerts()
+        alerts = store.get_review_blocks()
         # Enrich each block with the LOCAL date + 30-min window so the UI can
         # pre-fill the correction tool exactly (block_start is naive UTC). Doing
         # the UTC→local conversion server-side with the configured timezone
@@ -4955,7 +4955,7 @@ def api_review_blocks_dismiss():
         if block_ids is not None and not isinstance(block_ids, list):
             return jsonify({"error": "block_ids must be a list or omitted"}), 400
         store = _get_store()
-        cleared = store.dismiss_drift_alerts(block_ids)
+        cleared = store.dismiss_review_blocks(block_ids)
         logger.info("api_review_blocks_dismiss: cleared %d review flag(s)", cleared)
         return jsonify({"cleared": cleared})
     except Exception as e:

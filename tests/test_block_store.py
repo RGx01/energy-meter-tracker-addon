@@ -233,6 +233,74 @@ class TestGridInvariantSweepBL19(unittest.TestCase):
         self.assertEqual(self.store.flag_grid_invariant_violations(), 0)
 
 
+class TestReviewFlagsBL18(unittest.TestCase):
+    """BL-18 — per-block review flag with a stored reason, and its clear paths."""
+
+    def setUp(self):
+        self.store = new_store()
+        self.store.insert_config_period(EXAMPLE_CONFIG)
+        self.store.append_block(make_block("2026-07-10T16:30:00", imp_kwh=0.157))
+
+    def test_flag_sets_reason_and_surfaces(self):
+        reason = "dispatch ambiguous: completed 2.10 kWh without started"
+        self.assertEqual(
+            self.store.flag_block_for_review("2026-07-10T16:30:00", reason), 1)
+        alerts = self.store.get_drift_alerts()
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["reason"], reason)
+        self.assertEqual(alerts[0]["block_start"], "2026-07-10T16:30:00")
+
+    def test_clear_block_review(self):
+        self.store.flag_block_for_review("2026-07-10T16:30:00", "x")
+        self.assertEqual(self.store.clear_block_review("2026-07-10T16:30:00"), 1)
+        self.assertEqual(self.store.get_drift_alerts(), [])
+
+    def test_dismiss_nulls_reason(self):
+        self.store.flag_block_for_review("2026-07-10T16:30:00", "x")
+        bid = self.store.get_drift_alerts()[0]["block_id"]
+        self.store.dismiss_drift_alerts([bid])
+        row = self.store._conn.execute(
+            "SELECT needs_review, review_reason FROM blocks WHERE id=?", (bid,)).fetchone()
+        self.assertEqual(row["needs_review"], 0)
+        self.assertIsNone(row["review_reason"])
+
+    def test_legacy_drift_reason_synthesised(self):
+        # A flag with no stored reason but a CAD/DCC delta gets a synthesised one.
+        self.store._conn.execute(
+            "UPDATE blocks SET needs_review=1, imp_kwh=1.0, imp_kwh_api=0.5 "
+            "WHERE meter_id='electricity_main'")
+        self.store._conn.commit()
+        self.assertTrue(
+            self.store.get_drift_alerts()[0]["reason"].startswith("CAD/DCC settlement drift"))
+
+    def _add_drift_flag(self, start="2026-07-11T00:00:00"):
+        # A drift-style flag: needs_review set, NO review_reason.
+        self.store.append_block(make_block(start, imp_kwh=1.0))
+        self.store._conn.execute(
+            "UPDATE blocks SET needs_review=1, imp_kwh_api=0.5, review_reason=NULL "
+            "WHERE block_start=? AND meter_id='electricity_main'", (start,))
+        self.store._conn.commit()
+
+    def test_get_review_blocks_excludes_drift(self):
+        self.store.flag_block_for_review("2026-07-10T16:30:00", "dispatch ambiguous")
+        self._add_drift_flag()
+        rows = self.store.get_review_blocks()
+        self.assertEqual(len(rows), 1)                       # only the dispatch flag
+        self.assertEqual(rows[0]["block_start"], "2026-07-10T16:30:00")
+        self.assertEqual(rows[0]["reason"], "dispatch ambiguous")
+
+    def test_dismiss_review_blocks_leaves_drift(self):
+        self.store.flag_block_for_review("2026-07-10T16:30:00", "dispatch ambiguous")
+        self._add_drift_flag("2026-07-11T00:00:00")
+        cleared = self.store.dismiss_review_blocks(None)     # dismiss all (scoped)
+        self.assertEqual(cleared, 1)                         # only the dispatch flag
+        self.assertEqual(self.store.get_review_blocks(), [])
+        drift = self.store._conn.execute(
+            "SELECT needs_review FROM blocks WHERE block_start='2026-07-11T00:00:00' "
+            "AND meter_id='electricity_main'").fetchone()
+        self.assertEqual(drift["needs_review"], 1)           # dormant drift survives
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests: schema and setup
 # ─────────────────────────────────────────────────────────────────────────────
