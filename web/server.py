@@ -4835,6 +4835,71 @@ def api_corrections_meters():
         return jsonify({"error": str(e)}), 500
 
 
+# Days of blocks either side of the correction window to sample rates from.
+_NEARBY_RATES_PAD_DAYS = 3
+
+
+@app.route("/api/corrections/nearby-rates", methods=["GET"])
+def api_corrections_nearby_rates():
+    """#270: the distinct main-meter rates in force in blocks SURROUNDING a
+    correction window, so the user can pick the exact stored value instead of
+    re-typing it (avoiding fat-finger / decimal-place / rounding errors).
+
+    Query: channel=import|export, from_date=YYYY-MM-DD, to_date=YYYY-MM-DD.
+    Samples blocks in [from_date - N days, to_date + N days] (N = 3), grouped by
+    the exact stored rate, ranked by how many blocks carry it (most common first)
+    so the everyday off-peak/peak values surface at the top. Full precision — the
+    UI fills the value verbatim.
+    """
+    try:
+        channel   = request.args.get("channel", "import")
+        from_date = request.args.get("from_date", "")
+        to_date   = request.args.get("to_date", "")
+        if channel not in ("import", "export"):
+            return jsonify({"error": "channel must be 'import' or 'export'"}), 400
+        if not from_date or not to_date:
+            return jsonify({"error": "from_date and to_date required"}), 400
+
+        from datetime import date as _date, timedelta as _td
+        from block_store import local_date_range_to_utc_bounds as _utc_bounds
+
+        store = _get_store()
+        cfg = load_config()
+        main_meta, main_id = {}, None
+        for mid, md in cfg.get("meters", {}).items():
+            if not (md.get("meta") or {}).get("sub_meter"):
+                main_meta, main_id = md.get("meta") or {}, mid
+                break
+        if main_id is None:
+            row = store._conn.execute(
+                "SELECT meter_id FROM meters WHERE is_sub_meter = 0 "
+                "ORDER BY meter_id LIMIT 1").fetchone()
+            main_id = row["meter_id"] if row else "electricity_main"
+        tz_name = main_meta.get("timezone", "UTC")
+
+        # Pad the window by a few days each side to sample surrounding rates.
+        pad = _td(days=_NEARBY_RATES_PAD_DAYS)
+        win_from = (_date.fromisoformat(from_date) - pad).isoformat()
+        win_to   = (_date.fromisoformat(to_date)   + pad).isoformat()
+        utc_start, utc_end = _utc_bounds(win_from, win_to, tz_name)
+
+        rate_col = "imp_rate" if channel == "import" else "exp_rate"
+        rows = store._conn.execute(
+            f"""SELECT {rate_col} AS rate, COUNT(*) AS n
+                FROM blocks
+                WHERE meter_id = ? AND block_start >= ? AND block_start < ?
+                  AND {rate_col} IS NOT NULL AND {rate_col} > 0
+                GROUP BY {rate_col}
+                ORDER BY n DESC, {rate_col}""",
+            (main_id, utc_start, utc_end)).fetchall()
+        rates = [{"rate": r["rate"], "count": r["n"]} for r in rows]
+        return jsonify({"rates": rates, "channel": channel,
+                        "window": [win_from, win_to]})
+    except Exception as e:
+        logger.error("api_corrections_nearby_rates: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/review-blocks", methods=["GET"])
 def api_review_blocks():
     """BL-18: blocks flagged needs_review = 1 (ambiguous dispatch reconcile, or
