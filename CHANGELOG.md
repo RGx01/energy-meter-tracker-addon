@@ -4,6 +4,8 @@
  
 ### Added
  
+- **Pick a nearby rate when correcting** ([#270](https://github.com/RGx01/energy-meter-tracker-addon/issues/270)). The rate correction form now offers a dropdown of the exact rates already in force in blocks *around* the correction window — the everyday off-peak and peak values — ranked by how common they are. Pick one and the field fills at full precision, so there's no mistyping, wrong decimal place, or accidental rounding. You can still type a custom value to override. The list refreshes as you change the date range, and pre-fills when you load a flagged block from the review list.
+ 
 - **"Flagged for review" list on the Corrections page** (BL-18). When a smart charge can't be priced with confidence — the supplier planned a slot but it's genuinely ambiguous whether the car actually charged — the block is now left at its current price *and surfaced for you to decide*, instead of being silently ignored. The Corrections page shows a list of these blocks with the reason and the exact half-hour window; each has a **Load into tool** button that pre-fills the correction form for that block, and a **Dismiss** if the current price is right. A dismissible notice appears across the app when new blocks are flagged (and stays quiet once acknowledged, until *more* are flagged). Flags clear themselves automatically when the block later becomes decidable or when you apply a manual correction to it.
  
 ### Fixed
