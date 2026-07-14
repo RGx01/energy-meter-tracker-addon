@@ -1,5 +1,11 @@
 # Changelog
  
+## [3.3.1] — 2026-07-14
+ 
+### Fixed
+ 
+- **The "Flagged for review" list could raise false positives** (hotfix for the 3.3.0 review list). Two kinds of half-hour block were flagged that had nothing to review: (1) blocks **inside the off-peak window**, where the price is already the off-peak rate by the tariff schedule regardless of any smart charge — so nothing a dispatch does could change it (this also covers a charge landing in the window under the 6-hour cap); and (2) blocks **not yet settled by the DCC**, which the correction tool can't act on anyway (dispatch data arrives within hours, but settlement lands a day or two later). The review list now only surfaces settled, out-of-window blocks — the ones where the off-peak price genuinely depended on a dispatch having happened. Any block flagged in error is cleared automatically on the next reconciliation, so no manual dismissal is needed.
+
 ## [3.3.0] — 2026-07-14
  
 ### Added

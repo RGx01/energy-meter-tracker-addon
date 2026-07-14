@@ -476,14 +476,15 @@ class TestReconcilePass(unittest.IsolatedAsyncioTestCase):
         return S()
 
     def _seed(self, store, slot, imp_rate, kinds, off_peak_slot=True, corrected=0,
-              completed_kwh=-3.0):
+              completed_kwh=-3.0, settled=True):
         store._conn.execute(
             "INSERT OR IGNORE INTO config_periods (id, effective_from, billing_day, "
             "block_minutes, timezone) VALUES (1, '2020-01-01T00:00:00', 1, 30, 'UTC')")
         store._conn.execute(
             "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
-            "imp_kwh, imp_rate, rate_corrected) VALUES (?,?,?,?,?,?,?)",
-            (slot, slot, "electricity_main", 1, 1.0, imp_rate, corrected))
+            "imp_kwh, imp_rate, rate_corrected, imp_kwh_api) VALUES (?,?,?,?,?,?,?,?)",
+            (slot, slot, "electricity_main", 1, 1.0, imp_rate, corrected,
+             1.0 if settled else None))
         if off_peak_slot:
             store.upsert_dispatch_slot(slot, off_peak=True, provider="Myenergi",
                                        source="smart-charge", state="planned")
@@ -551,17 +552,118 @@ class TestReconcilePass(unittest.IsolatedAsyncioTestCase):
     async def test_review_left_untouched_but_flagged(self):
         from block_store import BlockStore
         st = BlockStore(":memory:")
-        # SUBSTANTIAL completed but no started -> review: price unchanged, flagged.
+        # SUBSTANTIAL completed but no started -> review: genuinely ambiguous,
+        # price left unchanged, but the block is now FLAGGED for the UI (BL-18).
         self._seed(st, "2020-01-01T20:00:00", 0.05493, ["planned", "completed"],
                    completed_kwh=-3.0)
         res = await self._run(st)
         self.assertEqual((res["restored"], res["reverted"], res["review"]),
                          (0, 0, 1))
         r = st._conn.execute(
-            "SELECT imp_rate, needs_review FROM blocks WHERE block_start=?",
-            ("2020-01-01T20:00:00",)).fetchone()
+            "SELECT imp_rate, needs_review, review_reason FROM blocks "
+            "WHERE block_start=?", ("2020-01-01T20:00:00",)).fetchone()
         self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)   # price unchanged
-        self.assertEqual(r["needs_review"], 1)                     # now surfaced
+        self.assertEqual(r["needs_review"], 1)                     # flagged (BL-18)
+        self.assertTrue(r["review_reason"])                        # reason stored
+
+    async def test_resolved_clears_prior_review_flag(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # A block once flagged ambiguous that now resolves (started arrives ->
+        # restore off-peak) must have its stale review flag cleared.
+        self._seed(st, "2020-01-01T13:30:00", 0.323092,
+                   ["planned", "started", "completed"])
+        st._conn.execute(
+            "UPDATE blocks SET needs_review=1, review_reason='stale' "
+            "WHERE block_start=?", ("2020-01-01T13:30:00",))
+        st._conn.commit()
+        res = await self._run(st)
+        self.assertEqual(res["restored"], 1)
+        r = st._conn.execute(
+            "SELECT needs_review, review_reason FROM blocks WHERE block_start=?",
+            ("2020-01-01T13:30:00",)).fetchone()
+        self.assertEqual(r["needs_review"], 0)
+        self.assertIsNone(r["review_reason"])
+
+    async def test_review_deferred_when_unsettled(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # Substantial completed, no started, but NOT DCC-settled yet: the review
+        # task isn't correctable (tool needs settlement), so defer — don't flag.
+        self._seed(st, "2020-01-01T20:00:00", 0.05493, ["planned", "completed"],
+                   completed_kwh=-3.0, settled=False)
+        # a stale flag from before the settlement gate existed
+        st._conn.execute(
+            "UPDATE blocks SET needs_review=1, review_reason='stale' "
+            "WHERE block_start=?", ("2020-01-01T20:00:00",))
+        st._conn.commit()
+        res = await self._run(st)
+        self.assertEqual(res["review"], 0)
+        self.assertEqual(res["deferred"], 1)
+        r = st._conn.execute("SELECT needs_review FROM blocks WHERE block_start=?",
+                             ("2020-01-01T20:00:00",)).fetchone()
+        self.assertEqual(r["needs_review"], 0)      # not flagged / retracted while unsettled
+
+    async def _run_offpeak_sched(self, store):
+        # Reconcile with a schedule whose BASE rate equals the off-peak rate at
+        # the slot — i.e. the block sits inside the off-peak window.
+        import engine
+        class OffPeakSched:
+            def is_empty(self): return False
+            def off_peak_rate_near(self, ts): return 5.493
+            def resolve(self, ts): return 5.493        # base == off-peak
+        engine._store = store
+        engine._RECONCILE_SETTLE_HOURS = 0.0
+        engine._kraken_rate_schedules = {"import": OffPeakSched()}
+        try:
+            return await engine.reconcile_dispatch_overlay()
+        finally:
+            engine._store = None
+
+    async def test_offpeak_window_block_not_flagged(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # Ambiguous-looking (substantial completed, no started) but INSIDE the
+        # off-peak window, so the price is off-peak by the schedule regardless —
+        # nothing to reconcile, must not be flagged.
+        self._seed(st, "2020-01-01T02:00:00", 0.05493, ["planned", "completed"],
+                   completed_kwh=-3.0)
+        res = await self._run_offpeak_sched(st)
+        self.assertEqual(res["review"], 0)
+        r = st._conn.execute("SELECT needs_review FROM blocks WHERE block_start=?",
+                             ("2020-01-01T02:00:00",)).fetchone()
+        self.assertEqual(r["needs_review"], 0)
+
+    async def test_offpeak_window_clears_stale_flag(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        self._seed(st, "2020-01-01T02:00:00", 0.05493, ["planned", "completed"],
+                   completed_kwh=-3.0)
+        st._conn.execute(
+            "UPDATE blocks SET needs_review=1, review_reason='stale' "
+            "WHERE block_start=?", ("2020-01-01T02:00:00",))
+        st._conn.commit()
+        await self._run_offpeak_sched(st)
+        r = st._conn.execute("SELECT needs_review FROM blocks WHERE block_start=?",
+                             ("2020-01-01T02:00:00",)).fetchone()
+        self.assertEqual(r["needs_review"], 0)      # stale flag cleared
+
+    async def test_ok_clears_prior_review_flag(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # Already correctly off-peak with started -> 'ok'; a stale review flag on
+        # such a decidable block is cleared.
+        self._seed(st, "2020-01-01T13:30:00", 0.05493,
+                   ["planned", "started", "completed"])
+        st._conn.execute(
+            "UPDATE blocks SET needs_review=1, review_reason='stale' "
+            "WHERE block_start=?", ("2020-01-01T13:30:00",))
+        st._conn.commit()
+        await self._run(st)
+        r = st._conn.execute(
+            "SELECT needs_review FROM blocks WHERE block_start=?",
+            ("2020-01-01T13:30:00",)).fetchone()
+        self.assertEqual(r["needs_review"], 0)
 
     async def test_negligible_completed_reverts_to_peak(self):
         from block_store import BlockStore
