@@ -103,7 +103,11 @@ class TestPollMiniDemand(unittest.TestCase):
     """Engine-side Mini demand poller: fetch+cache, throttle, no-device."""
 
     def setUp(self):
-        engine._last_mini_demand = {"kw": None, "ts": 0.0, "wall": 0.0}
+        # ts must be far enough in the past that the monotonic throttle
+        # (_MINI_POLL_GAP = 55s) never fires. 0.0 assumed time.monotonic() >= 55,
+        # which is false on a freshly-booted CI runner — CLOCK_MONOTONIC counts
+        # from boot, so the poll was wrongly throttled there. -inf is unambiguous.
+        engine._last_mini_demand = {"kw": None, "ts": float("-inf"), "wall": 0.0}
 
     def tearDown(self):
         # asyncio.run() closes the loop and unsets it; restore one so later
