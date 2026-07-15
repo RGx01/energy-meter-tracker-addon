@@ -103,7 +103,11 @@ class TestPollMiniDemand(unittest.TestCase):
     """Engine-side Mini demand poller: fetch+cache, throttle, no-device."""
 
     def setUp(self):
-        engine._last_mini_demand = {"kw": None, "ts": 0.0, "wall": 0.0}
+        # ts must be far enough in the past that the monotonic throttle
+        # (_MINI_POLL_GAP = 55s) never fires. 0.0 assumed time.monotonic() >= 55,
+        # which is false on a freshly-booted CI runner — CLOCK_MONOTONIC counts
+        # from boot, so the poll was wrongly throttled there. -inf is unambiguous.
+        engine._last_mini_demand = {"kw": None, "ts": float("-inf"), "wall": 0.0}
 
     def tearDown(self):
         # asyncio.run() closes the loop and unsets it; restore one so later
@@ -2475,9 +2479,14 @@ class TestScheduleResolverPrecedence(unittest.TestCase):
     """
 
     def setUp(self):
-        import json, os
+        import json, os, tempfile
         from kraken_rates import RateSchedule
-        os.makedirs("/data/energy_meter_tracker", exist_ok=True)
+        # Hermetic: redirect the data dir to a per-test temp dir instead of the
+        # hardcoded /data, which isn't writable in CI or a fresh checkout.
+        self._tmp = tempfile.mkdtemp()
+        self._orig_data_dir, self._orig_config = engine.DATA_DIR, engine.CONFIG_PATH
+        engine.DATA_DIR = self._tmp
+        engine.CONFIG_PATH = os.path.join(self._tmp, "meters_config.json")
         self.cfg = {"meters": {"electricity_main": {
             "meta": {"timezone": "Europe/London", "billing_day": 1,
                      "block_minutes": 30, "currency_symbol": "£",
@@ -2503,12 +2512,10 @@ class TestScheduleResolverPrecedence(unittest.TestCase):
         ])}
 
     def tearDown(self):
-        import os
+        import shutil
         self._lj_patch.stop()
-        try:
-            os.remove(engine.CONFIG_PATH)
-        except OSError:
-            pass
+        engine.DATA_DIR, engine.CONFIG_PATH = self._orig_data_dir, self._orig_config
+        shutil.rmtree(self._tmp, ignore_errors=True)
         engine._kraken_rate_schedules = {}
 
     def _finalise(self, start, end, lkr):
@@ -2993,8 +3000,13 @@ class TestDispatchOverlayAtFinalise(unittest.TestCase):
     """
 
     def setUp(self):
-        import json
+        import json, os, tempfile
         from kraken_rates import RateSchedule
+        # Hermetic: redirect the data dir to a per-test temp dir (was hardcoded /data).
+        self._tmp = tempfile.mkdtemp()
+        self._orig_data_dir, self._orig_config = engine.DATA_DIR, engine.CONFIG_PATH
+        engine.DATA_DIR = self._tmp
+        engine.CONFIG_PATH = os.path.join(self._tmp, "meters_config.json")
         self.cfg = {"meters": {"electricity_main": {
             "meta": {"timezone": "Europe/London", "billing_day": 1,
                      "block_minutes": 30, "currency_symbol": "£",
@@ -3018,14 +3030,12 @@ class TestDispatchOverlayAtFinalise(unittest.TestCase):
         self._orig_apply = engine._DISPATCH_OVERLAY_APPLY
 
     def tearDown(self):
-        import os
+        import shutil
         self._lj.stop()
         engine._DISPATCH_OVERLAY_APPLY = self._orig_apply
         engine._kraken_rate_schedules = {}
-        try:
-            os.remove(engine.CONFIG_PATH)
-        except OSError:
-            pass
+        engine.DATA_DIR, engine.CONFIG_PATH = self._orig_data_dir, self._orig_config
+        shutil.rmtree(self._tmp, ignore_errors=True)
 
     def _finalise(self, start, end):
         blk = engine.create_block(datetime.fromisoformat(start),
@@ -3533,10 +3543,10 @@ class TestOhmeCaptureSlots(unittest.TestCase):
     def test_non_ohme_returns_none(self):
         # None signals the caller to use the default smart-charge path
         self.assertIsNone(engine._ohme_capture_slots(
-            "MYENERGI_V2", self.PLANNED, False, None, self.NOW))
+            "MYENERGI_V2", self.PLANNED, False, None, None, self.NOW))
 
     def test_optimistic_captures_all_planned_incl_bump(self):
-        pairs = engine._ohme_capture_slots("OHME", self.PLANNED, False, None, self.NOW)
+        pairs = engine._ohme_capture_slots("OHME", self.PLANNED, False, None, None, self.NOW)
         slots = {s for s, _ in pairs}
         sources = {src for _, src in pairs}
         # teeth: the bump-charge slot is captured too — Zappi's source gate drops it
@@ -3546,18 +3556,19 @@ class TestOhmeCaptureSlots(unittest.TestCase):
         self.assertEqual(sources, {"ohme_assumed_unverified"})
 
     def test_verified_smart_captures_current_slot_only(self):
-        pairs = engine._ohme_capture_slots("OHME", self.PLANNED, True, "smart", self.NOW)
+        # status=None → no Status sensor → mode-only fallback (old behaviour).
+        pairs = engine._ohme_capture_slots("OHME", self.PLANNED, True, "smart", None, self.NOW)
         # teeth: ONLY the now-slot, not the planned superset
         self.assertEqual(pairs, [("2026-04-14T13:00:00", "ohme_verified")])
 
     def test_verified_boost_captures_nothing(self):
         # teeth: planned has slots but boost vetoes — nothing captured
         self.assertEqual(
-            engine._ohme_capture_slots("OHME", self.PLANNED, True, "boost", self.NOW), [])
+            engine._ohme_capture_slots("OHME", self.PLANNED, True, "boost", None, self.NOW), [])
 
     def test_verified_idle_captures_nothing(self):
         self.assertEqual(
-            engine._ohme_capture_slots("OHME", self.PLANNED, True, "idle", self.NOW), [])
+            engine._ohme_capture_slots("OHME", self.PLANNED, True, "idle", None, self.NOW), [])
 
     def test_slot_for_now_snaps_down(self):
         from datetime import datetime as dt

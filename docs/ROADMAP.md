@@ -116,6 +116,8 @@ EMT already detects deprecated Kraken fields each poll (`check_field_deprecation
 
 Feed the existing detection into the BL-6 notification region (persistent, `warn` level).
 
+**Done — the maintainer-facing half (CI early warning).** A scheduled GitHub Action (`.github/workflows/graphql-deprecations.yml` + `.build/check_graphql_deprecations.py`) now introspects the live Kraken schema weekly and opens/updates `graphql-deprecation` issues for any field EMT selects that Octopus has flagged deprecated — mirroring BCD's `checkGraphqlDeprecations`. It reuses the same field sets as `check_field_deprecations` (extracted statically via `ast`, so one source of truth), needs no secret (introspection is unauthenticated), and fails loudly if the schema can't be fetched. This closes the "make a stranger — or the maintainer — see it" gap for the *repo* side. **Still to do:** the *user-facing* half — surface the same detection in the app (BL-6 notification region) so a running instance warns its owner, per the design above.
+
 **Known limitation, worth stating:** the check compares the live schema against a hardcoded list of the fields EMT uses. If Octopus *removes* a field outright rather than marking it deprecated, or changes how deprecation is signalled, the detector goes quiet — and a silent detector is worse than none, because it looks like everything is fine.
 
 #### BL-17 — Retire `publish_ha_sensors` and the deprecations sensor
