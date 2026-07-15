@@ -13,9 +13,14 @@ These tests pin:
 """
 
 import json
+import os
 import re
+import sys
 import unittest
 
+# Add tests/ to the path so the in-test `from test_block_store import make_block`
+# resolves (pytest runs with the repo root on the path, not tests/).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from energy_charts import generate_net_heatmap
 
 MID = "electricity_main"

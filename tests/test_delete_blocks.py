@@ -16,8 +16,14 @@ Pins the four behaviours we agreed:
 Plus: preview (count) uses the same resolution, so it can't disagree.
 """
 
+import os
+import sys
 import unittest
 
+# Sibling test modules live in this dir; pytest runs with the repo root on the
+# path (package mode), so add tests/ so `import test_block_store` resolves —
+# same line the other cross-importing test files use.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_block_store import new_store, EXAMPLE_CONFIG_WITH_SUB, make_block_with_sub, make_block
 
 MAIN = "electricity_main"
