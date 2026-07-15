@@ -32,13 +32,17 @@ PYTEST="${PYTEST:-python3 -m pytest}"
 total_pass=0 total_fail=0 total_err=0 failed_files=()
 for f in tests/test_*.py; do
   [ "$(basename "$f")" = "test_harness.py" ] && continue
-  out=$($PYTEST "$f" -q -p no:cacheprovider "$@" 2>&1 | tail -1)
+  # Capture the FULL output (with -rf short summary) so a failure surfaces the
+  # test id + traceback — otherwise a CI failure is invisible (only the count).
+  full=$($PYTEST "$f" -rf -p no:cacheprovider "$@" 2>&1)
+  out=$(tail -1 <<<"$full")
   p=$(grep -oE '[0-9]+ passed' <<<"$out" | grep -oE '[0-9]+'); p=${p:-0}
   fl=$(grep -oE '[0-9]+ failed' <<<"$out" | grep -oE '[0-9]+'); fl=${fl:-0}
   er=$(grep -oE '[0-9]+ error'  <<<"$out" | grep -oE '[0-9]+'); er=${er:-0}
   total_pass=$((total_pass+p)); total_fail=$((total_fail+fl)); total_err=$((total_err+er))
   if [ "$fl" != 0 ] || [ "$er" != 0 ]; then
     failed_files+=("$(basename "$f"): $out")
+    printf '\n──────── output for %s ────────\n%s\n' "$f" "$full"
   fi
 done
 
