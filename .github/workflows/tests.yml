@@ -38,11 +38,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
 
-      - name: Prepare /data (a few tests write their config here)
-        run: |
-          sudo mkdir -p /data/energy_meter_tracker
-          sudo chmod -R 777 /data
-
       - name: Run test suite (file-isolated)
         env:
           PYTEST: "python -m pytest"
