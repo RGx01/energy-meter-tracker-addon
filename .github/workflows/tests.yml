@@ -1,0 +1,49 @@
+name: Tests
+
+# Runs the EMT unit-test suite on every push and pull request, the same way
+# run_tests.sh runs it locally: file-isolated (each test module in its own
+# process, because several install sys.modules stubs at import time). The suite
+# includes tests/test_graphql_deprecation_check.py.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Lower bound the code supports (run_tests.sh: "Python 3.10+") and a
+        # current version — the 3.10 leg guards against 3.12-only syntax slipping
+        # in (e.g. the energy_charts f-string regression).
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Prepare /data (a few tests write here)
+        run: |
+          sudo mkdir -p /data
+          sudo chown "$(id -u):$(id -g)" /data
+
+      - name: Run test suite (file-isolated)
+        env:
+          PYTEST: "python -m pytest"
+        run: bash run_tests.sh
