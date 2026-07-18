@@ -291,6 +291,8 @@ CREATE TABLE IF NOT EXISTS dispatch_slots (
     state            TEXT,          -- 'planned' | 'started' | 'completed'
     energy_planned   REAL,          -- forecast energyAddedKwh for this slot (kWh)
     energy_completed REAL,          -- delivered energy for this slot at settlement (kWh)
+    raw_start   TEXT,               -- BL-11: exact dispatch start (naive-UTC ISO, second precision)
+    raw_end     TEXT,               -- BL-11: exact dispatch end (naive-UTC ISO, second precision)
     PRIMARY KEY (slot_start)
 );
 CREATE INDEX IF NOT EXISTS idx_dispatch_slots_start ON dispatch_slots (slot_start);
@@ -309,6 +311,8 @@ CREATE TABLE IF NOT EXISTS dispatch_history (
     energy_kwh  REAL,               -- signed kWh for this slot (negative = charge)
     first_seen  TEXT NOT NULL,      -- UTC ISO — first poll that saw this slot/kind
     last_seen   TEXT NOT NULL,      -- UTC ISO — most recent poll that saw it
+    raw_start   TEXT,               -- BL-11: exact dispatch start (naive-UTC ISO, second precision)
+    raw_end     TEXT,               -- BL-11: exact dispatch end (naive-UTC ISO, second precision)
     PRIMARY KEY (slot_start, kind)
 );
 CREATE INDEX IF NOT EXISTS idx_dispatch_history_start ON dispatch_history (slot_start);
@@ -829,6 +833,7 @@ class BlockStore:
 
         _b_cols  = {r[1] for r in self._conn.execute("PRAGMA table_info(blocks)").fetchall()}
         _ds_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(dispatch_slots)").fetchall()} if self._conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='dispatch_slots'").fetchone() else set()
+        _dh_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(dispatch_history)").fetchall()} if self._conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='dispatch_history'").fetchone() else set()
         _ph_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(power_history)").fetchall()} if self._conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='power_history'").fetchone() else set()
 
         for _col, _tbl, _defn, _col_set in [
@@ -875,6 +880,11 @@ class BlockStore:
             ("state",            "dispatch_slots", "TEXT",  _ds_cols),
             ("energy_planned",   "dispatch_slots", "REAL",  _ds_cols),
             ("energy_completed", "dispatch_slots", "REAL",  _ds_cols),
+            # ── 3.4.0 BL-11: retain the exact (second-precision) dispatch window
+            ("raw_start",        "dispatch_slots",   "TEXT",  _ds_cols),
+            ("raw_end",          "dispatch_slots",   "TEXT",  _ds_cols),
+            ("raw_start",        "dispatch_history", "TEXT",  _dh_cols),
+            ("raw_end",          "dispatch_history", "TEXT",  _dh_cols),
         ]:
             if _col not in _col_set:
                 try:
@@ -1148,6 +1158,8 @@ class BlockStore:
                              state: Optional[str] = "planned",
                              energy_planned: Optional[float] = None,
                              energy_completed: Optional[float] = None,
+                             raw_start: Optional[str] = None,
+                             raw_end: Optional[str] = None,
                              captured_at: Optional[str] = None) -> None:
         """Record (or refresh) a 30-min slot that had an Intelligent smart-charge
         dispatch. Last-write-wins on slot_start. Captured forward each poll; the
@@ -1167,8 +1179,8 @@ class BlockStore:
             self._conn.execute(
                 """INSERT INTO dispatch_slots
                        (slot_start, off_peak, provider, source, captured_at,
-                        state, energy_planned, energy_completed)
-                   VALUES (?,?,?,?,?,?,?,?)
+                        state, energy_planned, energy_completed, raw_start, raw_end)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(slot_start) DO UPDATE SET
                        off_peak    = excluded.off_peak,
                        provider    = excluded.provider,
@@ -1178,9 +1190,11 @@ class BlockStore:
                        energy_planned =
                            COALESCE(excluded.energy_planned, dispatch_slots.energy_planned),
                        energy_completed =
-                           COALESCE(excluded.energy_completed, dispatch_slots.energy_completed)""",
+                           COALESCE(excluded.energy_completed, dispatch_slots.energy_completed),
+                       raw_start   = COALESCE(excluded.raw_start, dispatch_slots.raw_start),
+                       raw_end     = COALESCE(excluded.raw_end,   dispatch_slots.raw_end)""",
                 (slot_start, 1 if off_peak else 0, provider, source, captured_at,
-                 state, energy_planned, energy_completed),
+                 state, energy_planned, energy_completed, raw_start, raw_end),
             )
 
     def get_dispatch_slot(self, slot_start: str) -> dict | None:
@@ -1189,7 +1203,7 @@ class BlockStore:
         """
         row = self._conn.execute(
             "SELECT slot_start, off_peak, provider, source, captured_at, "
-            "state, energy_planned, energy_completed "
+            "state, energy_planned, energy_completed, raw_start, raw_end "
             "FROM dispatch_slots WHERE slot_start = ?", (slot_start,)
         ).fetchone()
         return dict(row) if row else None
@@ -1198,7 +1212,7 @@ class BlockStore:
         """All dispatch_slots with slot_start in [start_iso, end_iso). Ordered."""
         return [dict(r) for r in self._conn.execute(
             "SELECT slot_start, off_peak, provider, source, captured_at, "
-            "state, energy_planned, energy_completed "
+            "state, energy_planned, energy_completed, raw_start, raw_end "
             "FROM dispatch_slots WHERE slot_start >= ? AND slot_start < ? "
             "ORDER BY slot_start", (start_iso, end_iso)
         ).fetchall()]
@@ -1222,6 +1236,8 @@ class BlockStore:
                                 provider: str | None = None,
                                 source: str | None = None,
                                 energy_kwh: float | None = None,
+                                raw_start: str | None = None,
+                                raw_end: str | None = None,
                                 seen_at: str | None = None) -> None:
         """Accumulate one (slot_start, kind) dispatch observation. OBSERVE-ONLY —
         never read for billing. first_seen is set once and preserved; last_seen
@@ -1233,14 +1249,17 @@ class BlockStore:
             self._conn.execute(
                 """INSERT INTO dispatch_history
                        (slot_start, kind, provider, source, energy_kwh,
-                        first_seen, last_seen)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                        first_seen, last_seen, raw_start, raw_end)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(slot_start, kind) DO UPDATE SET
                        provider   = COALESCE(excluded.provider, dispatch_history.provider),
                        source     = COALESCE(excluded.source,   dispatch_history.source),
                        energy_kwh = COALESCE(excluded.energy_kwh, dispatch_history.energy_kwh),
-                       last_seen  = excluded.last_seen""",
-                (slot_start, kind, provider, source, energy_kwh, seen, seen))
+                       last_seen  = excluded.last_seen,
+                       raw_start  = COALESCE(excluded.raw_start, dispatch_history.raw_start),
+                       raw_end    = COALESCE(excluded.raw_end,   dispatch_history.raw_end)""",
+                (slot_start, kind, provider, source, energy_kwh, seen, seen,
+                 raw_start, raw_end))
 
     def get_dispatch_history(self, start_iso: str, end_iso: str,
                              kind: str | None = None) -> list:
@@ -1249,13 +1268,13 @@ class BlockStore:
         if kind is not None:
             rows = self._conn.execute(
                 "SELECT slot_start, kind, provider, source, energy_kwh, "
-                "first_seen, last_seen FROM dispatch_history "
+                "first_seen, last_seen, raw_start, raw_end FROM dispatch_history "
                 "WHERE slot_start >= ? AND slot_start < ? AND kind = ? "
                 "ORDER BY slot_start", (start_iso, end_iso, kind)).fetchall()
         else:
             rows = self._conn.execute(
                 "SELECT slot_start, kind, provider, source, energy_kwh, "
-                "first_seen, last_seen FROM dispatch_history "
+                "first_seen, last_seen, raw_start, raw_end FROM dispatch_history "
                 "WHERE slot_start >= ? AND slot_start < ? "
                 "ORDER BY slot_start, kind", (start_iso, end_iso)).fetchall()
         return [dict(r) for r in rows]

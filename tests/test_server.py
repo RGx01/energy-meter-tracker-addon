@@ -3817,3 +3817,235 @@ class TestNearbyRatesAPI(unittest.TestCase):
 
     def test_registered(self):
         self.assertTrue("api_corrections_nearby_rates" in server.app.view_functions)
+
+
+class TestChargeSessionsBuilder(unittest.TestCase):
+    """BL-10 — _build_charge_sessions folds *delivered* dispatch slots into
+    all-off-peak charging sessions (one per charging period)."""
+
+    def _h(self, slot, kind, e=None, raw_start=None, raw_end=None):
+        return {"slot_start": slot, "kind": kind, "energy_kwh": e,
+                "provider": "Myenergi", "raw_start": raw_start, "raw_end": raw_end}
+
+    def test_groups_contiguous_and_splits_on_big_gap(self):
+        hist = [self._h("2026-07-10T15:00:00", "completed", -1.71),
+                self._h("2026-07-10T15:30:00", "completed", -3.42),
+                self._h("2026-07-10T20:00:00", "completed", -2.0)]   # 270m gap → new
+        s = server._build_charge_sessions(hist, {}, {})
+        self.assertEqual(len(s), 2)
+        self.assertTrue(s[0]["start"].startswith("2026-07-10T20"))   # newest-first
+        a = [x for x in s if x["start"].startswith("2026-07-10T15")][0]
+        self.assertEqual(a["n_slots"], 2)
+        self.assertAlmostEqual(a["kwh"], 5.13, places=2)
+
+    def test_bridges_inter_burst_gap_within_period(self):
+        # 20:30 → 23:30 is exactly 180 min: bridged into one session.
+        hist = [self._h("2026-07-10T20:00:00", "completed", -3.0),
+                self._h("2026-07-10T20:30:00", "completed", -3.0),
+                self._h("2026-07-10T23:30:00", "completed", -3.0)]
+        s = server._build_charge_sessions(hist, {}, {})
+        self.assertEqual(len(s), 1)
+        self.assertEqual(s[0]["n_slots"], 3)
+        # > 180 min splits.
+        hist2 = [self._h("2026-07-10T20:00:00", "completed", -3.0),
+                 self._h("2026-07-10T23:31:00", "completed", -3.0)]
+        self.assertEqual(len(server._build_charge_sessions(hist2, {}, {})), 2)
+
+    def test_planned_only_slot_dropped(self):
+        # A plan that never delivered energy is not shown at all.
+        self.assertEqual(
+            server._build_charge_sessions(
+                [self._h("2026-07-10T18:00:00", "planned", -1.9)], {}, {}), [])
+
+    def test_started_only_slot_dropped(self):
+        self.assertEqual(
+            server._build_charge_sessions(
+                [self._h("2026-07-10T18:00:00", "started")], {}, {}), [])
+
+    def test_slot_billed_at_peak_is_peak(self):
+        # A delivered slot billed at the day's peak rate reads peak (red),
+        # matching the billing charts — not off-peak.
+        s = server._build_charge_sessions(
+            [self._h("2026-07-15T19:30:00", "completed", -3.0)],
+            {"2026-07-15T19:30:00": 0.32}, {"2026-07-15": 0.32})[0]
+        self.assertFalse(s["fill"][0]["off_peak"])
+        self.assertAlmostEqual(s["peak_kwh"], 3.0, places=3)
+        self.assertEqual(s["off_peak_kwh"], 0.0)
+        self.assertIsNone(s["saving"])
+
+    def test_offpeak_slot_is_green_with_saving(self):
+        s = server._build_charge_sessions(
+            [self._h("2026-07-15T02:00:00", "completed", -3.0)],
+            {"2026-07-15T02:00:00": 0.05}, {"2026-07-15": 0.32})[0]
+        self.assertTrue(s["fill"][0]["off_peak"])
+        self.assertAlmostEqual(s["off_peak_kwh"], 3.0, places=3)
+        self.assertAlmostEqual(s["saving"], 3.0 * (0.32 - 0.05), places=3)
+
+    def test_mixed_session_splits_offpeak_and_peak(self):
+        hist = [self._h("2026-07-15T02:00:00", "completed", -3.0),   # off-peak
+                self._h("2026-07-15T02:30:00", "completed", -2.0)]   # peak
+        rates = {"2026-07-15T02:00:00": 0.05, "2026-07-15T02:30:00": 0.32}
+        s = server._build_charge_sessions(hist, rates, {"2026-07-15": 0.32})[0]
+        self.assertAlmostEqual(s["off_peak_kwh"], 3.0, places=3)
+        self.assertAlmostEqual(s["peak_kwh"], 2.0, places=3)
+        self.assertAlmostEqual(s["saving"], 3.0 * (0.32 - 0.05), places=3)
+        self.assertTrue(s["fill"][0]["off_peak"])
+        self.assertFalse(s["fill"][1]["off_peak"])
+
+    def test_unknown_rate_defaults_off_peak(self):
+        s = server._build_charge_sessions(
+            [self._h("2026-07-15T02:00:00", "completed", -3.0)], {}, {})[0]
+        self.assertTrue(s["fill"][0]["off_peak"])
+
+    def test_exact_window_raw_bounds_then_fallback(self):
+        s = server._build_charge_sessions(
+            [self._h("2026-07-10T15:00:00", "completed", -2.0,
+                     raw_start="2026-07-10T15:03:20", raw_end="2026-07-10T15:47:10")], {}, {})[0]
+        self.assertEqual(s["exact_start"], "2026-07-10T15:03:20")
+        self.assertEqual(s["exact_end"], "2026-07-10T15:47:10")
+        s2 = server._build_charge_sessions(
+            [self._h("2026-07-10T15:00:00", "completed", -1.0)], {}, {})[0]
+        self.assertEqual(s2["exact_start"], "2026-07-10T15:00:00")   # slot fallback
+        self.assertEqual(s2["exact_end"], "2026-07-10T15:30:00")
+
+    def test_status_delivered_is_completed(self):
+        s = server._build_charge_sessions(
+            [self._h("2026-07-10T15:00:00", "completed", -1.0)], {}, {})[0]
+        self.assertEqual(s["status"], "completed")
+
+    def test_charge_minutes_scales_with_fullness(self):
+        # Two full 3 kWh slots → 60 min effective.
+        full = server._build_charge_sessions(
+            [self._h("2026-07-10T02:00:00", "completed", -3.0),
+             self._h("2026-07-10T02:30:00", "completed", -3.0)], {}, {})[0]
+        self.assertEqual(full["charge_minutes"], 60)
+        # A half-full second slot scales its 30 min down to 15 → 45 total.
+        part = server._build_charge_sessions(
+            [self._h("2026-07-10T02:00:00", "completed", -3.0),
+             self._h("2026-07-10T02:30:00", "completed", -1.5)], {}, {})[0]
+        self.assertEqual(part["charge_minutes"], 45)
+
+
+class TestUpcomingDispatches(unittest.TestCase):
+    """BL-10 — _build_upcoming_dispatches surfaces future planned dispatches."""
+
+    def _h(self, slot, kind, e=None, raw_start=None, raw_end=None):
+        return {"slot_start": slot, "kind": kind, "energy_kwh": e,
+                "provider": "Ohme", "raw_start": raw_start, "raw_end": raw_end}
+
+    NOW = "2026-07-18T20:00:00"
+
+    def test_future_planned_shown_scheduled(self):
+        s = server._build_upcoming_dispatches(
+            [self._h("2026-07-18T23:30:00", "planned", -3.4),
+             self._h("2026-07-19T00:00:00", "planned", -3.4)], {}, {}, self.NOW)
+        self.assertEqual(len(s), 1)
+        self.assertEqual(s[0]["status"], "scheduled")
+        self.assertAlmostEqual(s[0]["kwh"], 6.8, places=3)
+        self.assertIsNone(s[0]["saving"])
+        self.assertTrue(all(f["off_peak"] for f in s[0]["fill"]))   # unknown rate
+
+    def test_planned_slot_at_peak_reads_peak(self):
+        s = server._build_upcoming_dispatches(
+            [self._h("2026-07-18T20:00:00", "planned", -3.4)],
+            {"2026-07-18T20:00:00": 0.32}, {"2026-07-18": 0.32}, self.NOW)[0]
+        self.assertFalse(s["fill"][0]["off_peak"])
+        self.assertAlmostEqual(s["peak_kwh"], 3.4, places=3)
+
+    def test_past_and_completed_slots_excluded(self):
+        hist = [self._h("2026-07-18T12:00:00", "planned", -3.4),   # elapsed
+                self._h("2026-07-18T20:00:00", "planned", -2.0),   # current slot…
+                self._h("2026-07-18T20:00:00", "completed", -1.0)]  # …but delivered
+        self.assertEqual(
+            server._build_upcoming_dispatches(hist, {}, {}, self.NOW), [])
+
+    def test_current_slot_included_until_it_elapses(self):
+        # slot 20:00 ends 20:30, which is after now → still upcoming.
+        s = server._build_upcoming_dispatches(
+            [self._h("2026-07-18T20:00:00", "planned", -2.0)], {}, {}, self.NOW)
+        self.assertEqual(len(s), 1)
+
+    def test_splits_on_big_gap(self):
+        s = server._build_upcoming_dispatches(
+            [self._h("2026-07-18T23:30:00", "planned", -3.4),
+             self._h("2026-07-19T05:00:00", "planned", -3.4)], {}, {}, self.NOW)
+        self.assertEqual(len(s), 2)
+
+
+class TestChargeSessionsAPI(unittest.TestCase):
+    """BL-10 — /api/charge-sessions gating + shape."""
+
+    def test_registered(self):
+        self.assertTrue("api_charge_sessions" in server.app.view_functions)
+
+    def test_gating_no_dispatch_data(self):
+        client = make_client(store=_make_test_store([]))
+        d = client.get("/api/charge-sessions").get_json()
+        self.assertFalse(d["has_data"])
+        self.assertEqual(d["sessions"], [])
+        self.assertEqual(d["upcoming"], [])
+
+    def test_returns_recent_session(self):
+        from datetime import datetime, timezone, timedelta
+        store = _make_test_store([])
+        base = (datetime.now(timezone.utc).replace(tzinfo=None)
+                - timedelta(days=1)).replace(minute=0, second=0, microsecond=0)
+        s0 = base.replace(hour=2).isoformat()
+        s1 = base.replace(hour=2, minute=30).isoformat()
+        pk = base.replace(hour=18).isoformat()
+        for slot, e in ((s0, -3.0), (s1, -3.0)):
+            store.record_dispatch_history(slot, "completed", provider="Myenergi", energy_kwh=e)
+            store._conn.execute(
+                "INSERT INTO blocks (block_start,block_end,meter_id,config_period_id,"
+                "imp_kwh,imp_rate) VALUES (?,?,?,1,1.0,0.05)", (slot, slot, "electricity_main"))
+        store._conn.execute(
+            "INSERT INTO blocks (block_start,block_end,meter_id,config_period_id,"
+            "imp_kwh,imp_rate) VALUES (?,?,?,1,1.0,0.30)", (pk, pk, "electricity_main"))
+        store._conn.commit()
+        d = make_client(store=store).get("/api/charge-sessions").get_json()
+        self.assertTrue(d["has_data"])
+        self.assertEqual(len(d["sessions"]), 1)
+        s = d["sessions"][0]
+        self.assertAlmostEqual(s["kwh"], 6.0, places=3)
+        self.assertAlmostEqual(s["off_peak_kwh"], 6.0, places=3)
+        self.assertIn("local", s)
+        self.assertIn("upcoming", d)
+
+    def test_returns_upcoming_planned(self):
+        from datetime import datetime, timezone, timedelta
+        store = _make_test_store([])
+        now = datetime.now(timezone.utc).replace(tzinfo=None, second=0, microsecond=0)
+        slot = (now + timedelta(hours=3)).replace(minute=0).isoformat()
+        store.record_dispatch_history(slot, "planned", provider="Ohme", energy_kwh=-3.4)
+        d = make_client(store=store).get("/api/charge-sessions").get_json()
+        self.assertTrue(d["has_data"])
+        self.assertEqual(d["sessions"], [])
+        self.assertEqual(len(d["upcoming"]), 1)
+        self.assertEqual(d["upcoming"][0]["status"], "scheduled")
+        self.assertIn("local", d["upcoming"][0])
+
+
+class TestResponseCompression(unittest.TestCase):
+    """gzip after_request — large text bodies are compressed for clients that
+    advertise gzip (fixes the uncompressed multi-MB chart transfer on :8099)."""
+
+    def test_large_html_gzipped_and_decodes(self):
+        import gzip as _gz
+        r = make_client().get("/charts", headers={"Accept-Encoding": "gzip"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers.get("Content-Encoding"), "gzip")
+        body = _gz.decompress(r.data)
+        self.assertIn(b"<", body)
+        self.assertIn("Accept-Encoding", r.headers.get("Vary", ""))
+
+    def test_not_compressed_without_accept_encoding(self):
+        # Werkzeug test client sends no Accept-Encoding by default.
+        r = make_client().get("/charts")
+        self.assertIsNone(r.headers.get("Content-Encoding"))
+        self.assertIn(b"<", r.data)
+
+    def test_small_body_not_compressed(self):
+        # A tiny JSON body is below the gzip threshold → left uncompressed.
+        r = make_client().post("/api/last-page", json={"page": "charts"},
+                               headers={"Accept-Encoding": "gzip"})
+        self.assertIsNone(r.headers.get("Content-Encoding"))
