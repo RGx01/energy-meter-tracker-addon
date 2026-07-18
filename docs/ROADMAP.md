@@ -6,7 +6,27 @@ Newest at the top. **Upcoming work (ranked by priority) first, then release hist
 
 ## Upcoming — ranked by priority
 
-### 3.3.0
+### 3.4.0 — Smart-charging insight + cleanup
+
+*Feature (**BL-10** + **BL-11**) plus a small cleanup (**BL-17**). The Glow / HA-recorder historical-attribution work earlier pencilled for 3.4.0 is **parked** — it still needs a design round (see `docs/historical_attribution_design.md` and the Bright/Glow theme under Longer-term). These three items are all buildable now off existing data.*
+
+#### BL-10 — IOG smart-charging card  ·  *feature*
+*A per-charge-session view, buildable now from accumulated `dispatch_history` (planned / started / completed).* Surfaces what a smart charge actually did: total kWh, the on-charge window and the off-peak (full-rate) window, and the fill/taper curve — plus the off-peak-vs-peak saving. Design in `docs/dispatch_validation_design.md`.
+
+**Placement — a dedicated card on the Overview (= Live Power) page.** Decided against folding it into the EV/Live-Power gauges: those are sensor-gated, but the charge data comes from `dispatch_history` (the IOG API), which is present for **every** IOG user *independent of whether they have an EV sub-meter or power sensor*. Gating on the gauge cards would hide the feature from API-only IOG users and put the same feature in two different homes depending on setup. So **fix the location, vary the richness**:
+- **Gate** on IOG / API-priced tariff **with dispatch data** — not on sensor cards. When off, the card isn't rendered.
+- **Base (all IOG users):** 30-minute resolution from `dispatch_history` — `started` slots give the smart-charge window, completed-energy per slot gives the fill/taper curve, **BL-11** gives the exact scheduled-window bounds.
+- **+ charger/EV power sensor:** overlay the minute-accurate actual-draw curve (the resolution upgrade).
+
+**Layout — a full-width stacked row, not a gauge-grid participant.** The Overview page tunes a `layout-a`/`layout-b` flex toggle for how the gauges and Carbon card wrap together; making the charge card a flex sibling there would force new juggle rules (a `layout-c`). Instead render it as a **full-width row** (like the existing `wide-row`) using the existing **`expandable-card`** pattern: a compact summary on the page (last/current charge: kWh, window, off-peak saved), with the fill/taper curve and per-slot detail in the expand modal. Because it sits *outside* the gauge-ci-row flex system and is rendered conditionally server-side, it needs **no** new layout variant and leaves no empty gap when absent. Order it after the SoC/EV dial cluster, above power-history. If multi-session history later outgrows the modal, spill it to an Insights view with the Overview card staying a summary.
+
+#### BL-11 — Keep raw dispatch `startDt`/`endDt` precision  ·  *enabler for BL-10*
+*Tiny; do it in the same release since BL-10 touches dispatch capture.* The Octopus API exposes dispatch `startDt`/`endDt` to the **second**; EMT snaps to 30-minute slots at capture and discards it. Retain the raw window boundaries alongside the slotted energy so BL-10 can show exact scheduled-window bounds. (This is the scheduled window, not the car's actual draw.)
+
+#### BL-17 — Retire `publish_ha_sensors` and the deprecations sensor  ·  *cleanup, now unblocked*
+*Small.* `publish_ha_sensors` gates exactly one entity — `sensor.energy_meter_tracker_api_deprecations`. It was blocked on BL-16 ("don't remove the sensor or the deprecation signal vanishes"), but that signal was only ever maintainer-facing, and the **weekly CI deprecation check** (`.github/workflows/graphql-deprecations.yml`, built alongside 3.3.x) now delivers it centrally and better — GitHub issues, no user instance needed. So the sensor carries no unique signal. Remove it, the `publish_ha_sensors` option, `PUBLISH_HA_SENSORS`, and the `run.sh` plumbing; EMT then publishes **no** HA entities at all.
+
+### 3.3.0 ✅ *(shipped — 3.3.0, hotfix 3.3.1)*
 
 #### BL-18 — Surface flagged (`needs_review`) blocks in the UI
 *The UI half of the dispatch-reconcile ambiguity handling (deferred from 3.2.1).* The store already flags blocks `needs_review = 1` in a few places (e.g. DCC zero-blocks) and provides `get_drift_alerts()` plus clear methods — but nothing is **wired to the UI**: `get_drift_alerts()` is called by no route or template, and there is no "review list" anywhere, so flagged blocks are invisible. 3.2.1 auto-reverts the *unambiguous* over-credits (completed-without-`started` below 0.4 kWh → peak) but deliberately does **not** flag the genuinely-ambiguous ones (substantial completed-without-`started`), because there is nowhere to show them. Build the surface: (a) a small route returning `get_drift_alerts()`; (b) a **"Flagged for review"** list on the Corrections page — each row showing the block's date + reason, with a button to load it into the correction tool and a dismiss/clear (the clear method already exists); (c) a count/badge (or a BL-6 notification) so it's discoverable. Then (d) have the dispatch-reconcile `review` case set `needs_review = 1`, and clear it when a block is manually corrected. Ships the flag-setting and the UI together so the feature is whole.
@@ -17,7 +37,7 @@ Newest at the top. **Upcoming work (ranked by priority) first, then release hist
 #### BL-19 — Enforce the sub-meter grid-import invariant on the fill / re-settle paths  ·  *fix*
 *Data-integrity guard. A sub-meter can be attributed more grid energy than the whole house drew.* Live apportionment already enforces it: a sub-meter claims `min(device_draw, grid_remaining)`, so per block `imp_kwh_grid ≤ main grid import` and the sum across sub-meters can't exceed it. **But the gap-fill / interpolation path and the DCC re-settlement path bypass that clamp**, so a reconstructed block can set `imp_kwh_grid = full device draw` with no cap. *Observed live:* prod-dev, 10-Jul 16:00–17:30, EV `imp_kwh_grid = 2.053 kWh` while the settled main import for that block was **0.157 kWh** — the EV was credited ~13× more grid than the house imported. Signature: a flat `2.053 / 2.053 / 2.052 / 2.053` fill run (accumulated energy spread evenly over blocks the instance had no live data for), where the continuously-running instance (prod) held the true varying profile *and* correctly clamped EV grid to 0.157. Two entry points to fix: **(a)** gap-fill / boundary-interpolation reconstructs sub-meter kWh from a bulk delta but doesn't re-derive the grid split — apply the same `grid_remaining` clamp there, spilling the remainder to self-consumption (solar/battery); **(b)** when DCC settlement revises the **main** import *downward* (heavy-solar day → tiny settled grid import), the sub-meter grid shares aren't re-clamped to the new, smaller total in PASS-2 — re-clamp them. Enforce one invariant everywhere a block is (re)written: `Σ sub-meter imp_kwh_grid ≤ main imp_kwh`. Billing impact is bounded — whole-house grid cost stays correct (the main is authoritative) — but the **device split is wrong**, over-attributing grid (and grid cost) to the sub-meter and understating its self-consumption. *Trigger here was a prod→prod-dev restore leaving prod-dev down through that window (BL-5 territory), but the defect is general: any missed-poll gap on a solar day reproduces it.* Consider a one-off sweep to clamp pre-existing violations in history. Small; aim next release.
 
-### 3.2.0 — Feature release with fixes (next)
+### 3.2.0 ✅ *(shipped)* — Feature release with fixes
 Outage-resilience fixes (**BL-1**, **BL-8**) plus instance-isolation and notification work (**BL-5**, **BL-6** — which also fixes the overlapping-banner bug [#219]).
 
 #### BL-1 — Gap marker globally freezes DCC settlement application  ·  *fix*
@@ -120,20 +140,11 @@ Feed the existing detection into the BL-6 notification region (persistent, `warn
 
 **Known limitation, worth stating:** the check compares the live schema against a hardcoded list of the fields EMT uses. If Octopus *removes* a field outright rather than marking it deprecated, or changes how deprecation is signalled, the detector goes quiet — and a silent detector is worse than none, because it looks like everything is fine.
 
-#### BL-17 — Retire `publish_ha_sensors` and the deprecations sensor
-*Small; blocked on BL-16.* Since 3.2.0 removed the four per-block sensors, `publish_ha_sensors` gates exactly one entity: `sensor.energy_meter_tracker_api_deprecations`. Two instances writing it collide harmlessly (both compute the same API-derived value), so it needs no isolation. Once BL-16 surfaces deprecations in the UI, the sensor carries no unique signal and both it and the option can be removed — EMT would then publish no HA entities at all, and `PUBLISH_HA_SENSORS` / the `run.sh` plumbing goes with it. Do **not** remove the sensor before BL-16 lands, or the deprecation signal disappears entirely.
-
 #### BL-7 — Sensor-vs-device-type sanity check
 *Low-medium — prevents a class of silent misattribution.* At device creation, warn when the assigned sensor looks inconsistent with the device type (e.g. an EV device pointed at a battery/inverter sensor). Surfaced by the forum device-usage-swap case, where an "Indra Smart Pro" EV device read the Fox battery's register for a week before it was noticed. A creation-time heuristic (entity-ID / device-class / magnitude sanity) that prompts the user to confirm would catch it before it corrupts history.
 
 #### BL-13 — Sub-meter replacement auto-detection
 *Medium — resilience.* When a device is replaced and reuses the same sensor entity ID, the cumulative read resets to zero. EMT currently relies on the user to retire the old device and add a new one. Auto-detect a significant mid-block read drop on a sub-meter and prompt the user — similar to the main-meter reset detection added in 2.9.0.
-
-#### BL-10 — Charge-session insight
-*Low-medium — a feature, buildable now off existing data.* A per-charge-session view (time on-charge, full-rate window, total kWh, fill curve) derived from the accumulated `dispatch_history` (planned/started/completed). Started-slot count gives the smart-charge window; completed-energy per slot gives the fill/taper curve. 30-minute resolution; minute-accurate actual draw needs a charger power sensor (not universal). Design discussion in `docs/dispatch_validation_design.md`.
-
-#### BL-11 — Keep raw dispatch `startDt`/`endDt` precision
-*Tiny — do it next time we touch dispatch capture.* The Octopus API exposes dispatch `startDt`/`endDt` to the **second**; EMT snaps to 30-minute slots at capture and discards it. Retain the raw window boundaries alongside the slotted energy so BL-10 can show exact scheduled-window bounds. (This is the scheduled window, not the car's actual draw.)
 
 #### BL-2 — Phantom export channel from the gap-seed
 *Low — cosmetic, never affects billing (kWh = 0).* In a no-export `api` setup the gap-seed carries a 0-kWh export channel forward, so the daily billing chart draws a 12p export-rate line despite zero actual export. Root fix: don't carry forward an export channel that has no configured source and never carried real export.

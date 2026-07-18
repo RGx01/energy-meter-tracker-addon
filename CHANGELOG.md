@@ -1,5 +1,19 @@
 # Changelog
  
+## [Unreleased] — 3.4.0
+ 
+### Added
+ 
+- **Smart-charging card on the Overview page** (BL-10). On Intelligent Octopus, the Overview page now summarises your smart charges: the latest one at a glance — energy delivered, the charge window, total charge time, whether it ran off-peak, and a subtle estimate of what smart charging saved versus peak — with an expandable view of the **last 7 days**. Each row is **one charging period** (bursts within a single overnight plug-in are merged, so a night that Octopus split into several dispatches reads as one session), and shows its per-slot fill/taper curve, exact scheduled window, off-peak-vs-peak split, and effective charge time. Only energy that **actually flowed** is shown — planned-but-never-charged forecasts no longer appear — and each half-hour is coloured by the rate it was **actually billed at**, so the card agrees with the billing charts (a slot billed at peak reads peak, not off-peak). Charges Octopus has **scheduled but not yet delivered** appear in a separate *Upcoming* section. It's built entirely from the dispatch data EMT already captures, so it appears for **every** IOG setup — including API-only ones with no EV or power sensor, and **Ohme** accounts — and simply isn't shown when there are no smart-charge dispatches. The exact scheduled window is drawn from newly-retained second-precision dispatch bounds (BL-11).
+ 
+### Fixed
+ 
+- **The Charts page could take 15–20 seconds to appear (blank until then) on direct `:8099` access.** The daily billing chart is a multi-megabyte HTML document, and the add-on's own web server sent it **uncompressed** — so on the direct container port (and Lovelace iframe/webpage cards) the browser spent the whole time downloading it, while the same page loaded in ~2s through the Home Assistant sidebar, whose ingress proxy gzips responses. The add-on now gzip-compresses its own text responses when the browser supports it (it does), cutting that transfer by roughly **12×** (a 6.6 MB chart ships as ~0.56 MB). This is unrelated to chart content, Plotly, or any recent change — it surfaced only as accumulated history pushed the file past a few megabytes. Access through the HA sidebar is unaffected (already compressed; the add-on never double-compresses).
+ 
+### Removed
+ 
+- **The `sensor.energy_meter_tracker_api_deprecations` entity and the `publish_ha_sensors` option have been removed** (BL-17). That sensor was the last Home Assistant entity EMT published, and its signal only ever mattered to the add-on's maintainer — which is now delivered better by an automated weekly check that opens a tracking issue whenever Octopus flags a GraphQL field EMT uses as deprecated. The upstream "Octopus API change ahead" persistent notification went with it. The `publish_ha_sensors` option (and its `PUBLISH_HA_SENSORS` environment variable) existed only to gate that sensor, so it's gone too — **EMT now publishes no Home Assistant entities at all**. *Breaking only if* you referenced `sensor.energy_meter_tracker_api_deprecations` in a dashboard, template or automation, or set `publish_ha_sensors` in your add-on config — remove those references. EMT still logs `kraken_field_deprecated` warnings locally, so nothing is lost from the add-on's own logs.
+
 ## [3.3.1] — 2026-07-14
  
 ### Fixed

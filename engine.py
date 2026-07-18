@@ -115,7 +115,6 @@ GAP_FILL_LIMIT_HOURS = 12  # gaps longer than this are not gap-filled
 
 _read_queue:               list         = []
 _last_known_sensor_values: dict         = {}
-_PUBLISH_HA_SENSORS: bool = os.environ.get("PUBLISH_HA_SENSORS", "true").lower() != "false"
 _engine_loop_lock:         asyncio.Lock = None   # initialised in setup()
 _engine_paused:            bool         = False
 _last_ci_fetch:            datetime | None = None   # UTC — last carbon intensity fetch
@@ -143,9 +142,6 @@ _kraken_account_number: str | None = None
 # started once at boot and exits permanently if the API wasn't yet configured.
 _engine_ha = None              # HAClient | None
 _kraken_poll_task_handle = None  # asyncio.Task | None
-# One-shot: True once the first poll has surfaced any Kraken field deprecations
-# to HA (notification + sensor). See _surface_kraken_deprecations.
-_deprecations_surfaced = False
 # True once the first (cold) engine_startup has completed in this process. The
 # rogue-total guard (clearing the in-progress block's carried reads) is valid
 # ONLY on a cold start, where those reads are stale leftovers from a previous
@@ -1603,10 +1599,10 @@ def build_gap_blocks(
 #   sensor.energy_meter_import_kwh / _export_kwh / _import_cost / _export_credit
 # They were unused and actively misleading: they published live per-block figures
 # that DCC settlement retrospectively corrects, so their values disagreed with the
-# billing EMT itself reports. Removing them also removes the only HA entity-ID
-# collision between two EMT instances. `sensor.energy_meter_tracker_api_deprecations`
-# is deliberately kept un-namespaced: it counts deprecated Kraken API fields — a
-# property of the API, not the site — so two instances write the same value.
+# billing EMT itself reports. The last remaining entity,
+# sensor.energy_meter_tracker_api_deprecations, was removed in 3.4.0 (BL-17) — its
+# deprecation signal is now handled by the CI GraphQL-deprecation check — so EMT
+# now publishes NO HA entities at all.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1926,7 +1922,7 @@ def _commit_provisional_as_final(ha: HAClient, full_block: dict,
                                   meter_name: str, block_start_iso: str,
                                   block_end_iso: str) -> None:
     """Clear the provisional flag on *meter_name* in *full_block*, re-run PASS 2,
-    write back to DB, and republish HA sensors.
+    and write back to DB.
 
     The kWh figure is left exactly as originally computed — this path is taken
     when interpolation is not appropriate (device too slow, gap too large,
@@ -4934,59 +4930,34 @@ def _capture_ohme_slots(provider, planned) -> int:
     return captured
 
 
-async def _surface_kraken_deprecations(ha, deprecations: list) -> None:
-    """Surface Kraken API field deprecations to HA so they reach the user OUTSIDE
-    the logs: a durable sensor (automatable) plus a persistent notification (the
-    sidebar bell — loud, stays until dismissed).
+def _record_ohme_dispatch_history(provider, planned, completed) -> int:
+    """BL-10: accumulate OHME planned + completed dispatches into dispatch_history.
 
-    Idempotent: the notification uses a fixed id, so re-runs update rather than
-    duplicate, and an empty list dismisses any stale notification + zeroes the
-    sensor (i.e. once you've migrated, the alert clears itself). Best-effort —
-    never raises into the poll.
+    The main _capture_dispatch_slots path records this for Kraken-controlled
+    providers, but OHME returns early (its dispatch_slots billing capture is
+    sensor-gated). The smart-charging card reads dispatch_history and colours each
+    slot by its BILLED RATE — not by the smart-vs-boost signal — so OHME's
+    unreliable source labels don't matter here; we retain every planned slot
+    (`include_all=True`) and every completed dispatch. OBSERVE-ONLY: this never
+    touches dispatch_slots or billing. Returns rows written.
     """
-    if ha is None:
-        return
-    # Respect dev-mode: publish_ha_sensors=false means this instance does not
-    # write to HA. The per-field kraken_field_deprecated WARNINGs were already
-    # logged (locally) by the client; here we only skip the HA-facing surface.
-    if not _PUBLISH_HA_SENSORS:
-        logger.info(
-            "_surface_kraken_deprecations: HA publishing disabled — %d "
-            "deprecation(s) logged only, not surfaced to HA", len(deprecations))
-        return
-    _NOTIF_ID = "emt_api_deprecation"
-    _SENSOR   = "sensor.energy_meter_tracker_api_deprecations"
-    try:
-        count = len(deprecations)
-        await ha.set_state(_SENSOR, count, {
-            "friendly_name": "EMT Octopus API deprecations",
-            "icon": "mdi:alert-decagram" if count else "mdi:check-decagram",
-            "deprecated_fields": [f'{h["type"]}.{h["name"]}' for h in deprecations],
-            "details": deprecations,
-        })
-        if count:
-            lines = "\n".join(
-                f'- `{h["type"]}.{h["name"]}` — {h["reason"] or "no reason given"}'
-                for h in deprecations)
-            await ha.call_service("persistent_notification", "create", {
-                "notification_id": _NOTIF_ID,
-                "title": "⚠️ Energy Meter Tracker: Octopus API change ahead",
-                "message": (
-                    "Octopus has flagged GraphQL field(s) the Energy Meter "
-                    "Tracker add-on relies on as **deprecated**. They still work "
-                    "for now but will be removed — migrate before then.\n\n"
-                    f"{lines}\n\n"
-                    "See the Octopus developer announcements page and the add-on "
-                    "logs (`kraken_field_deprecated`) for details."),
-            })
-            logger.warning(
-                "_surface_kraken_deprecations: raised HA notification for %d "
-                "deprecated field(s)", count)
-        else:
-            await ha.call_service("persistent_notification", "dismiss",
-                                  {"notification_id": _NOTIF_ID})
-    except Exception as e:
-        logger.warning("_surface_kraken_deprecations: failed: %s", e)
+    if _store is None:
+        return 0
+    n = 0
+    slot_energy = _planned_dispatch_slot_energy(planned, include_all=True)
+    slot_bounds = _planned_dispatch_slot_bounds(planned, include_all=True)
+    for slot_start in sorted(slot_energy):
+        rb = slot_bounds.get(slot_start) or (None, None)
+        _store.record_dispatch_history(
+            slot_start, "planned", provider=provider, source="ohme",
+            energy_kwh=slot_energy.get(slot_start), raw_start=rb[0], raw_end=rb[1])
+        n += 1
+    for slot_start, e_comp in _completed_dispatch_slot_energy(completed).items():
+        _store.record_dispatch_history(
+            slot_start, "completed", provider=provider, source="unknown",
+            energy_kwh=e_comp)
+        n += 1
+    return n
 
 
 async def _capture_dispatch_slots() -> int:
@@ -5011,14 +4982,6 @@ async def _capture_dispatch_slots() -> int:
     except Exception as e:
         logger.warning("_capture_dispatch_slots: fetch failed: %s", e)
         return 0
-    # One-shot: the first get_dispatches also ran the deprecation introspection;
-    # surface any results to HA (notification + sensor) once per process. None =
-    # introspection unavailable (disabled) → nothing to surface.
-    global _deprecations_surfaced
-    if not _deprecations_surfaced and _kraken_client.last_deprecations is not None:
-        _deprecations_surfaced = True
-        await _surface_kraken_deprecations(
-            _engine_ha, _kraken_client.last_deprecations)
     if not disp:
         return 0
     provider = disp.get("provider")
@@ -5027,20 +4990,31 @@ async def _capture_dispatch_slots() -> int:
     # OHME has its own capture-feeding rule (see _capture_ohme_slots): the Zappi
     # source=='smart-charge' gate would under-capture OHME badly.
     if _is_ohme_provider(provider):
-        return _capture_ohme_slots(provider, planned)
+        captured = _capture_ohme_slots(provider, planned)
+        # BL-10: also accumulate observe-only dispatch_history so the smart-
+        # charging card covers OHME (the billing dispatch_slots path is untouched).
+        try:
+            _record_ohme_dispatch_history(provider, planned, disp.get("completed") or [])
+        except Exception as e:
+            logger.warning("_capture_dispatch_slots: ohme history accumulation "
+                           "failed: %s", e)
+        return captured
 
     slots = _smart_charge_slots(planned)
     # NB: do NOT early-return when planned is empty. Completed dispatches land
     # AFTER the charge, by which point flexPlannedDispatches is already empty
     # (planned=0) — an early return here skipped the completed capture entirely.
     slot_energy = _planned_dispatch_slot_energy(planned) if slots else {}
+    slot_bounds = _planned_dispatch_slot_bounds(planned) if slots else {}  # BL-11
     captured = 0
     for slot_start in sorted(slots):
+        _rb = slot_bounds.get(slot_start) or (None, None)
         try:
             _store.upsert_dispatch_slot(
                 slot_start, off_peak=True, provider=provider,
                 source="smart-charge", state="planned",
-                energy_planned=slot_energy.get(slot_start))
+                energy_planned=slot_energy.get(slot_start),
+                raw_start=_rb[0], raw_end=_rb[1])
             captured += 1
         except Exception as e:
             logger.warning("_capture_dispatch_slots: persist %s failed: %s",
@@ -5090,9 +5064,11 @@ async def _capture_dispatch_slots() -> int:
     # for billing.
     try:
         for slot_start in sorted(slots):
+            _rb = slot_bounds.get(slot_start) or (None, None)
             _store.record_dispatch_history(
                 slot_start, "planned", provider=provider,
-                source="smart-charge", energy_kwh=slot_energy.get(slot_start))
+                source="smart-charge", energy_kwh=slot_energy.get(slot_start),
+                raw_start=_rb[0], raw_end=_rb[1])
         for slot_start, e_comp in _completed_dispatch_slot_energy(completed).items():
             _store.record_dispatch_history(
                 slot_start, "completed", provider=provider,
@@ -5240,7 +5216,7 @@ def _planned_dispatch_slots_preview(planned: list) -> set:
     return slots
 
 
-def _planned_dispatch_slot_energy(planned: list) -> dict:
+def _planned_dispatch_slot_energy(planned: list, include_all: bool = False) -> dict:
     """Map smart-charge planned dispatches to per-slot FORECAST energy (kWh).
 
     Companion to _planned_dispatch_slots_preview: distributes each dispatch's
@@ -5248,10 +5224,14 @@ def _planned_dispatch_slot_energy(planned: list) -> dict:
     covers, so we can persist energy_planned per slot. OBSERVE-ONLY — recorded
     for diagnostics / future validation, NOT used for billing (see
     dispatch_validation_design.md). Slots whose dispatch has no delta map to None.
+
+    `include_all` skips the smart-charge source filter — used by the OHME history
+    path, whose source labels are unreliable so every planned slot is retained.
     """
     out: dict = {}
     for d in planned or []:
-        if str(d.get("source") or "").lower() not in _SMART_CHARGE_SOURCES:
+        if (not include_all
+                and str(d.get("source") or "").lower() not in _SMART_CHARGE_SOURCES):
             continue
         start = d.get("start"); end = d.get("end")
         if not start or not end:
@@ -5283,6 +5263,46 @@ def _planned_dispatch_slot_energy(planned: list) -> dict:
                 out.setdefault(k, None)
             else:
                 out[k] = round((out.get(k) or 0.0) + per, 4)
+    return out
+
+
+def _planned_dispatch_slot_bounds(planned: list, include_all: bool = False) -> dict:
+    """Map smart-charge planned dispatches to the EXACT (second-precision) raw
+    window each slot belongs to (BL-11).
+
+    The API's start/end are precise to the second, but capture snaps energy to
+    30-min slots and discards the exact bounds. Retain them so a charge-session
+    view (BL-10) can show the true scheduled window: every 30-min slot a dispatch
+    covers carries that dispatch's (start, end) as naive-UTC ISO, so a session's
+    exact window is min(raw_start) / max(raw_end) over its slots. Mirrors the
+    slotting of _planned_dispatch_slot_energy exactly. OBSERVE-ONLY.
+    Returns {slot_start_iso: (raw_start_iso, raw_end_iso)}.
+
+    `include_all` skips the smart-charge source filter (OHME history path).
+    """
+    out: dict = {}
+    for d in planned or []:
+        if (not include_all
+                and str(d.get("source") or "").lower() not in _SMART_CHARGE_SOURCES):
+            continue
+        start = d.get("start"); end = d.get("end")
+        if not start or not end:
+            continue
+        try:
+            s = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+            e = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if s.tzinfo is not None:
+            s = s.astimezone(timezone.utc).replace(tzinfo=None)
+        if e.tzinfo is not None:
+            e = e.astimezone(timezone.utc).replace(tzinfo=None)
+        raw = (s.isoformat(), e.isoformat())
+        slot = s.replace(minute=(0 if s.minute < 30 else 30),
+                         second=0, microsecond=0)
+        while slot < e:
+            out[slot.isoformat()] = raw   # last dispatch wins on the rare overlap
+            slot = slot + timedelta(minutes=30)
     return out
 
 
@@ -5831,9 +5851,6 @@ async def engine_startup(ha: HAClient):
         logger.warning("engine_startup: lineage check failed: %s", _fre)
         FOREIGN_RESTORE_NOTICE = {"foreign": False, "db_uuid": None,
                                   "acknowledged": False}
-
-    if not _PUBLISH_HA_SENSORS:
-        logger.warning("engine_startup: HA sensor publishing DISABLED (publish_ha_sensors=false)")
 
     config = load_config()  # now reads from the open store ✓
 

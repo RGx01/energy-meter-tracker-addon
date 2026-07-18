@@ -11,6 +11,7 @@ Runs on port 8099 inside the add-on container.
 Started as a background thread from main.py alongside the engine.
 """
 
+import gzip as _gzip
 import json
 import logging
 import os
@@ -22,6 +23,52 @@ from flask import Flask, Response, jsonify, make_response, redirect, render_temp
 logger = logging.getLogger("server")
 
 app = Flask(__name__, template_folder="templates")
+
+
+# ── Response compression ──────────────────────────────────────────────────────
+# HA's ingress proxy gzips responses, but the add-on's own web server (direct
+# :8099 access, and Lovelace iframe/webpage cards) does not — so large text
+# responses like the multi-MB daily chart HTML transferred uncompressed and took
+# 15-20s to download on the direct port. Compress compressible text bodies when
+# the client advertises gzip. Safe under ingress: a body already carrying
+# Content-Encoding is passed through untouched, so nginx never double-compresses.
+_GZIP_MIN_BYTES = 1024
+_GZIP_TYPES = ("text/html", "text/css", "text/plain", "text/javascript",
+               "application/javascript", "application/json", "application/xml",
+               "image/svg+xml")
+
+
+@app.after_request
+def _compress_response(response):
+    try:
+        if "gzip" not in (request.headers.get("Accept-Encoding") or "").lower():
+            return response
+        if not (200 <= response.status_code < 300):
+            return response
+        if response.headers.get("Content-Encoding"):
+            return response
+        ctype = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype not in _GZIP_TYPES:
+            return response
+        # Materialise the body — send_file responses use direct_passthrough.
+        response.direct_passthrough = False
+        data = response.get_data()
+        if len(data) < _GZIP_MIN_BYTES:
+            return response
+        compressed = _gzip.compress(data, compresslevel=6)
+        if len(compressed) >= len(data):
+            return response
+        response.set_data(compressed)
+        response.headers["Content-Encoding"] = "gzip"
+        response.headers["Content-Length"] = str(len(compressed))
+        vary = response.headers.get("Vary")
+        if not vary:
+            response.headers["Vary"] = "Accept-Encoding"
+        elif "accept-encoding" not in vary.lower():
+            response.headers["Vary"] = vary + ", Accept-Encoding"
+    except Exception as e:
+        logger.warning("response compression failed: %s", e)
+    return response
 
 
 def _read_version() -> str:
@@ -773,8 +820,18 @@ def live_power_page():
         pass
     mini_available = mini_device and not main_meta.get("power_sensor") and not bcd_found
 
+    # BL-10: gate the smart-charging card on there being IOG dispatch data. No gap
+    # when absent — the card element isn't emitted at all.
+    has_dispatch_data = False
+    try:
+        has_dispatch_data = bool(_get_store()._conn.execute(
+            "SELECT 1 FROM dispatch_history LIMIT 1").fetchone())
+    except Exception:
+        has_dispatch_data = False
+
     return render_template(
         "live_power.html",
+        has_dispatch_data=has_dispatch_data,
         active="live_power",
         currency=currency,
         today_total=today_total,
@@ -4819,6 +4876,268 @@ def _corrections_unreconciled_count(store, from_date, to_date, channel,
         f"AND meter_id IN (SELECT meter_id FROM meters WHERE is_sub_meter = 0)",
         params).fetchone()
     return int((row["n"] if row else 0) or 0)
+
+
+_CHARGE_SESSION_BRIDGE_MIN = 180  # minutes; merge bursts within one plug-in period
+
+
+def _slot_is_off_peak(rate, peak_r):
+    """A slot billed below the day's peak rate is off-peak. Unknown rate → treat
+    as off-peak (no billing data to contradict it, avoids false peak flags)."""
+    if rate is None or peak_r is None:
+        return True
+    return rate < peak_r - 1e-6
+
+
+def _build_charge_sessions(history, rates, day_peak,
+                           bridge_min=_CHARGE_SESSION_BRIDGE_MIN):
+    """BL-10: fold *delivered* IOG dispatch slots into charging sessions.
+
+    Pure — no I/O, so it is unit-testable. Only slots that actually delivered
+    energy (a ``completed`` row with non-null kWh) are shown; planned-but-never-
+    charged forecasts are dropped so the card reflects real charging. Each slot
+    is coloured by its **actual billed rate**, so it agrees with the billing
+    charts: a delivered slot priced at the day's peak (e.g. a non-smart / bump
+    charge) shows peak, not off-peak.
+
+    `history` is a list of dispatch_history rows (slot_start, kind, energy_kwh,
+    raw_start?, raw_end?, provider). `rates` maps slot_start → the main meter's
+    billed imp_rate for that half-hour. `day_peak` maps a date (YYYY-MM-DD) →
+    that day's highest main rate. The saving is the off-peak benefit vs the day's
+    peak: ``max(0, day_peak - slot_rate) * kWh`` per slot (peak-billed slots
+    contribute nothing). Consecutive delivered slots no more than ``bridge_min``
+    minutes apart form one session, bridging IOG's inter-burst gaps within a
+    single plug-in. Windows use BL-11's second-precision raw_start/raw_end where
+    present, else the 30-min slot boundaries. Returns sessions newest-first.
+    """
+    from datetime import datetime as _dt, timedelta as _td
+    slots = {}
+    for r in history:
+        s = slots.setdefault(r["slot_start"], {
+            "started": False, "completed": None,
+            "raw_start": None, "raw_end": None, "provider": r.get("provider")})
+        k = r.get("kind")
+        if k == "completed" and r.get("energy_kwh") is not None:
+            s["completed"] = r.get("energy_kwh")
+        elif k == "started":
+            s["started"] = True
+        if r.get("raw_start"):
+            s["raw_start"] = r["raw_start"]
+        if r.get("raw_end"):
+            s["raw_end"] = r["raw_end"]
+
+    # Delivered slots only — energy that actually flowed.
+    delivered = sorted(k for k, v in slots.items() if v["completed"] is not None)
+    if not delivered:
+        return []
+
+    groups, cur, prev = [], [], None
+    for k in delivered:
+        dt = _dt.fromisoformat(k)
+        if prev is not None and (dt - prev) > _td(minutes=bridge_min):
+            groups.append(cur); cur = []
+        cur.append(k); prev = dt
+    if cur:
+        groups.append(cur)
+
+    out = []
+    for grp in groups:
+        first, last = grp[0], grp[-1]
+        end = (_dt.fromisoformat(last) + _td(minutes=30)).isoformat()
+        exact_start = min((slots[k]["raw_start"] or k) for k in grp)
+        exact_end = max(
+            (slots[k]["raw_end"] or (_dt.fromisoformat(k) + _td(minutes=30)).isoformat())
+            for k in grp)
+        kwh = op = pk = saving = 0.0
+        started_slots = 0
+        fill = []
+        for k in grp:
+            v = abs(slots[k]["completed"])
+            kwh += v
+            peak_r = day_peak.get(k[:10])
+            rate = rates.get(k)
+            is_op = _slot_is_off_peak(rate, peak_r)
+            if is_op:
+                op += v
+                # Off-peak benefit vs the day's peak rate.
+                if peak_r is not None and rate is not None and peak_r > rate:
+                    saving += (peak_r - rate) * v
+            else:
+                pk += v
+            if slots[k]["started"]:
+                started_slots += 1
+            fill.append({"slot": k, "kwh": round(v, 3), "off_peak": is_op})
+        # Effective charge time: each half-hour scaled by how full it was vs the
+        # session's fullest (≈ full-power) slot, i.e. 30 * kWh / max_slot_kWh.
+        max_e = max((f["kwh"] for f in fill), default=0.0)
+        charge_min = round(30.0 * kwh / max_e) if max_e > 1e-9 else 0
+        out.append({
+            "start": first, "end": end,
+            "exact_start": exact_start, "exact_end": exact_end,
+            "kwh": round(kwh, 3), "n_slots": len(grp),
+            "started_slots": started_slots, "status": "completed",
+            "off_peak_kwh": round(op, 3), "peak_kwh": round(pk, 3),
+            "charge_minutes": charge_min,
+            "saving": round(saving, 4) if saving > 1e-9 else None,
+            "provider": slots[first]["provider"],
+            "fill": fill,
+        })
+    out.reverse()   # newest-first
+    return out
+
+
+def _build_upcoming_dispatches(history, rates, day_peak, now_iso,
+                               bridge_min=_CHARGE_SESSION_BRIDGE_MIN):
+    """BL-10: fold *future planned* IOG dispatch slots into upcoming sessions.
+
+    Complements _build_charge_sessions. A slot qualifies if it carries a planned
+    forecast, has not yet completed, and has not fully elapsed (its 30-min end is
+    at/after now_iso). Each slot is coloured by the tariff rate for that half-hour
+    (`rates` / `day_peak`), so a plan landing in a peak half-hour reads peak.
+    Consecutive slots ≤ bridge_min apart form one session. Returns sessions
+    soonest-first, each with status 'scheduled' and saving None (a forecast).
+    """
+    from datetime import datetime as _dt, timedelta as _td
+    now = _dt.fromisoformat(now_iso)
+    slots = {}
+    for r in history:
+        s = slots.setdefault(r["slot_start"], {
+            "planned": None, "completed": None,
+            "raw_start": None, "raw_end": None, "provider": r.get("provider")})
+        k = r.get("kind")
+        if k == "planned" and r.get("energy_kwh") is not None:
+            s["planned"] = r.get("energy_kwh")
+        elif k == "completed" and r.get("energy_kwh") is not None:
+            s["completed"] = r.get("energy_kwh")
+        if r.get("raw_start"):
+            s["raw_start"] = r["raw_start"]
+        if r.get("raw_end"):
+            s["raw_end"] = r["raw_end"]
+
+    upcoming = sorted(
+        k for k, v in slots.items()
+        if v["planned"] is not None and v["completed"] is None
+        and _dt.fromisoformat(k) + _td(minutes=30) > now)
+    if not upcoming:
+        return []
+
+    groups, cur, prev = [], [], None
+    for k in upcoming:
+        dt = _dt.fromisoformat(k)
+        if prev is not None and (dt - prev) > _td(minutes=bridge_min):
+            groups.append(cur); cur = []
+        cur.append(k); prev = dt
+    if cur:
+        groups.append(cur)
+
+    out = []
+    for grp in groups:
+        first, last = grp[0], grp[-1]
+        end = (_dt.fromisoformat(last) + _td(minutes=30)).isoformat()
+        exact_start = min((slots[k]["raw_start"] or k) for k in grp)
+        exact_end = max(
+            (slots[k]["raw_end"] or (_dt.fromisoformat(k) + _td(minutes=30)).isoformat())
+            for k in grp)
+        kwh = op = pk = 0.0
+        fill = []
+        for k in grp:
+            v = abs(slots[k]["planned"])
+            kwh += v
+            is_op = _slot_is_off_peak(rates.get(k), day_peak.get(k[:10]))
+            if is_op:
+                op += v
+            else:
+                pk += v
+            fill.append({"slot": k, "kwh": round(v, 3), "off_peak": is_op})
+        max_e = max((f["kwh"] for f in fill), default=0.0)
+        charge_min = round(30.0 * kwh / max_e) if max_e > 1e-9 else 0
+        out.append({
+            "start": first, "end": end,
+            "exact_start": exact_start, "exact_end": exact_end,
+            "kwh": round(kwh, 3), "n_slots": len(grp),
+            "started_slots": 0, "status": "scheduled",
+            "off_peak_kwh": round(op, 3), "peak_kwh": round(pk, 3),
+            "charge_minutes": charge_min,
+            "saving": None, "provider": slots[first]["provider"],
+            "fill": fill,
+        })
+    return out   # soonest-first
+
+
+@app.route("/api/charge-sessions", methods=["GET"])
+def api_charge_sessions():
+    """BL-10: smart-charge sessions from dispatch_history for the Overview card.
+
+    Gated on there being dispatch data (IOG). Query `days` (default 14) sets the
+    lookback. Returns {sessions, upcoming, has_data, currency}. `sessions` are
+    delivered charges (newest-first); `upcoming` are future planned dispatches
+    (soonest-first). Each carries kWh, local windows, and a per-slot fill curve.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime as _d2, timedelta as _t2, timezone as _tzc
+        store = _get_store()
+        try:
+            days = max(1, min(int(request.args.get("days", 14)), 90))
+        except (TypeError, ValueError):
+            days = 14
+
+        cfg = load_config()
+        main_meta, main_id = {}, None
+        for mid, md in cfg.get("meters", {}).items():
+            if not (md.get("meta") or {}).get("sub_meter"):
+                main_meta, main_id = md.get("meta") or {}, mid
+                break
+        main_id = main_id or "electricity_main"
+        tz_name = main_meta.get("timezone", "UTC")
+        currency = main_meta.get("currency_symbol", "£")
+
+        now = _d2.now(_tzc.utc).replace(tzinfo=None)
+        win_start = (now - _t2(days=days)).isoformat()
+        win_end = (now + _t2(days=2)).isoformat()   # +2d captures tonight's plan
+
+        history = store.get_dispatch_history(win_start, win_end)
+        if not history:
+            return jsonify({"sessions": [], "upcoming": [],
+                            "has_data": False, "currency": currency})
+
+        # Per-slot billed rate (to colour each slot by what it actually cost) and
+        # each day's peak rate (the off-peak/peak threshold + saving baseline).
+        rates = {r["block_start"]: r["imp_rate"] for r in store._conn.execute(
+            "SELECT block_start, imp_rate FROM blocks WHERE meter_id = ? "
+            "AND block_start >= ? AND block_start < ? AND imp_rate IS NOT NULL",
+            (main_id, win_start, win_end))}
+        day_peak = {r["d"]: r["p"] for r in store._conn.execute(
+            "SELECT substr(block_start,1,10) d, MAX(imp_rate) p FROM blocks "
+            "WHERE meter_id = ? AND block_start >= ? AND block_start < ? "
+            "AND imp_rate IS NOT NULL GROUP BY d", (main_id, win_start, win_end))}
+
+        sessions = _build_charge_sessions(history, rates, day_peak)
+
+        # Attach local-time display strings (UTC→site tz), like the review list.
+        try:
+            _tz = ZoneInfo(tz_name)
+        except Exception:
+            _tz = ZoneInfo("UTC")
+
+        def _loc(iso):
+            try:
+                d = _d2.fromisoformat(iso).replace(tzinfo=ZoneInfo("UTC")).astimezone(_tz)
+                return {"date": d.strftime("%Y-%m-%d"), "time": d.strftime("%H:%M")}
+            except Exception:
+                return {"date": None, "time": None}
+
+        upcoming = _build_upcoming_dispatches(history, rates, day_peak, now.isoformat())
+
+        for s in sessions + upcoming:
+            s["local"] = {
+                "start": _loc(s["exact_start"]), "end": _loc(s["exact_end"])}
+
+        return jsonify({"sessions": sessions, "upcoming": upcoming,
+                        "has_data": True, "currency": currency})
+    except Exception as e:
+        logger.error("api_charge_sessions: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/corrections/meters", methods=["GET"])
