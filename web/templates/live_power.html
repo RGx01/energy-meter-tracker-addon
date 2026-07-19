@@ -1068,10 +1068,15 @@ function _statusPill(st){
 }
 
 function _offText(s){
-  return s.off_peak_kwh>=s.kwh-0.05 ? 'all off-peak'
-       : s.off_peak_kwh>0 ? (s.off_peak_kwh.toFixed(1)+' kWh off-peak, '
-                             +s.peak_kwh.toFixed(1)+' peak')
-       : 'all at peak';
+  if(s.off_peak_kwh>=s.kwh-0.05) return 'all off-peak';
+  if(s.off_peak_kwh<=0.05) return 'all at peak';
+  // Show the (small) peak figure at its true value so it matches the billing
+  // blocks; let the large off-peak absorb the rounding so the parts still sum
+  // to the displayed total.
+  var tot=Math.round(s.kwh*10)/10;
+  var pk=Math.round(s.peak_kwh*10)/10;
+  var op=Math.round((tot-pk)*10)/10;
+  return op.toFixed(1)+' kWh off-peak, '+pk.toFixed(1)+' peak';
 }
 
 function _fmtDur(m){

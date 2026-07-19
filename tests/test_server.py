@@ -3913,6 +3913,22 @@ class TestChargeSessionsBuilder(unittest.TestCase):
             [self._h("2026-07-10T15:00:00", "completed", -1.0)], {}, {})[0]
         self.assertEqual(s["status"], "completed")
 
+    def test_metered_energy_overrides_dispatch(self):
+        # Dispatch reports 3.0 kWh, but the metered block says 1.8 → card uses 1.8
+        # (reconciles with the bill; solar/baseload make the two differ).
+        s = server._build_charge_sessions(
+            [self._h("2026-07-15T02:00:00", "completed", -3.0)],
+            {"2026-07-15T02:00:00": 0.05}, {"2026-07-15": 0.30},
+            {"2026-07-15T02:00:00": 1.8})[0]
+        self.assertAlmostEqual(s["kwh"], 1.8, places=3)
+        self.assertAlmostEqual(s["off_peak_kwh"], 1.8, places=3)
+
+    def test_falls_back_to_dispatch_when_block_absent(self):
+        # No metered block for the slot (unsettled) → use the dispatch figure.
+        s = server._build_charge_sessions(
+            [self._h("2026-07-15T02:00:00", "completed", -3.0)], {}, {}, {})[0]
+        self.assertAlmostEqual(s["kwh"], 3.0, places=3)
+
     def test_charge_minutes_scales_with_fullness(self):
         # Two full 3 kWh slots → 60 min effective.
         full = server._build_charge_sessions(
@@ -3993,11 +4009,12 @@ class TestChargeSessionsAPI(unittest.TestCase):
         s0 = base.replace(hour=2).isoformat()
         s1 = base.replace(hour=2, minute=30).isoformat()
         pk = base.replace(hour=18).isoformat()
+        # Energy comes from the metered block imp_kwh (3.0 each); rates too.
         for slot, e in ((s0, -3.0), (s1, -3.0)):
             store.record_dispatch_history(slot, "completed", provider="Myenergi", energy_kwh=e)
             store._conn.execute(
                 "INSERT INTO blocks (block_start,block_end,meter_id,config_period_id,"
-                "imp_kwh,imp_rate) VALUES (?,?,?,1,1.0,0.05)", (slot, slot, "electricity_main"))
+                "imp_kwh,imp_rate) VALUES (?,?,?,1,3.0,0.05)", (slot, slot, "electricity_main"))
         store._conn.execute(
             "INSERT INTO blocks (block_start,block_end,meter_id,config_period_id,"
             "imp_kwh,imp_rate) VALUES (?,?,?,1,1.0,0.30)", (pk, pk, "electricity_main"))
@@ -4006,7 +4023,7 @@ class TestChargeSessionsAPI(unittest.TestCase):
         self.assertTrue(d["has_data"])
         self.assertEqual(len(d["sessions"]), 1)
         s = d["sessions"][0]
-        self.assertAlmostEqual(s["kwh"], 6.0, places=3)
+        self.assertAlmostEqual(s["kwh"], 6.0, places=3)      # dispatch 3.0 + 3.0
         self.assertAlmostEqual(s["off_peak_kwh"], 6.0, places=3)
         self.assertIn("local", s)
         self.assertIn("upcoming", d)

@@ -1815,7 +1815,10 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
             day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, chart_prefix=f"{pid_prefix}_", block_minutes=block_minutes, currency=currency, site_name=site_name)
 
         toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}"
-        open_attr    = "open" if gs["is_current"] else ""
+        # Quarter/year sections can hold 90–365 day charts; default the panel
+        # collapsed (summary-first) so switching to those modes is instant. The
+        # charts build lazily when the panel is expanded (see _renderSection).
+        open_attr    = ""
         return (
             f'<div class="period-section {pid_prefix}-section" id="{pid}" style="visibility:hidden;position:absolute;">'
             f'<details class="bill-toggle" open>'
@@ -2707,6 +2710,11 @@ function _buildDayChart(chartId) {{
 function _renderSection(section) {{
   if (!section || !window._pendingCharts) return;
   section.querySelectorAll('.chart-container').forEach(function(el) {{
+    // Skip day charts inside a collapsed panel — build them lazily when the
+    // panel is expanded (see the toggle listener in _revealSection). Stops
+    // quarter/year view synchronously building hundreds of hidden Plotly charts.
+    var det = el.closest('details.day-charts-toggle');
+    if (det && !det.open) return;
     var chartId = window._pendingCharts[el.id];
     if (chartId) {{
       delete window._pendingCharts[el.id];
@@ -2772,6 +2780,8 @@ function _revealSection(id) {{
       if (!det._listenerAdded) {{
         det.addEventListener('toggle', function() {{
           sessionStorage.setItem('energyChartsOpen_' + det.id, det.open ? '1' : '0');
+          // Build the (previously skipped) day charts now the panel is open.
+          if (det.open) _renderSection(section);
         }});
         det._listenerAdded = true;
       }}
