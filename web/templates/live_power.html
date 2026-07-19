@@ -218,6 +218,21 @@
 }
 .expand-modal-close:hover { background: rgba(255,255,255,0.15); }
 
+/* BL-10 smart-charging card: match sibling row width; scroll the session list
+   inside the modal so the background always fills (its list can exceed 900px). */
+#charge-card-wrap { max-width: 1400px; box-sizing: border-box; }
+#charge-backdrop .expand-modal { height: auto; max-height: min(900px, 96vh); }
+#charge-modal-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.charge-section-h { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--muted); font-weight: 600; margin: 14px 0 4px; }
+.charge-section-h:first-child { margin-top: 0; }
+.charge-range-btn { background: transparent; border: 1px solid var(--border);
+  color: var(--muted); border-radius: 12px; padding: 2px 12px; font-size: 12px;
+  cursor: pointer; line-height: 1.7; }
+.charge-range-btn:hover { color: var(--text); }
+.charge-range-btn.active { background: #00d4aa; color: #04241c; border-color: #00d4aa;
+  font-weight: 600; }
+
 .expandable-card {
   position: relative;
 }
@@ -910,6 +925,37 @@ function setMiniSource(enabled){
 <!-- In layout-a JS moves #carbon-card-wrap here; in layout-b it stays in wide-row -->
 </div><!-- /.gauge-ci-row -->
 
+{% if has_dispatch_data %}
+<!-- ── BL-10: IOG smart-charging card (full-width row; server-gated on dispatch
+     data, so it sits outside the gauge-ci-row flex system and leaves no gap when
+     absent). Hidden until the sessions API confirms data. ── -->
+<div class="card expandable-card" id="charge-card-wrap" style="display:none;margin-top:16px;">
+  <button class="expand-btn" title="Recent sessions" onclick="_openChargeModal()">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+      <path d="M3 3h4M3 3v4M13 3h-4M13 3v4M3 13h4M3 13v-4M13 13h-4M13 13v-4"/>
+    </svg>
+  </button>
+  <div class="card-title">🚗 Smart Charging</div>
+  <div style="font-size:11px;color:var(--muted);margin:-2px 0 4px;">Energy delivered to the car — not grid import</div>
+  <div id="charge-summary" style="color:var(--muted);font-size:13px;">Loading…</div>
+</div>
+
+<div class="expand-backdrop" id="charge-backdrop"
+     onclick="if(event.target===this)_closeChargeModal()">
+  <div class="expand-modal" role="dialog" aria-label="Smart charging detail">
+    <button class="expand-modal-close" onclick="_closeChargeModal()">✕</button>
+    <div class="card-title">🚗 Smart Charging</div>
+    <div style="font-size:12px;color:var(--muted);margin:2px 0 8px;">Energy delivered to the car (from Octopus dispatch) — not metered grid import, so solar offset and house load aren't reflected.</div>
+    <div id="charge-range" style="display:flex;gap:6px;margin:2px 0 10px;">
+      <button class="charge-range-btn" data-days="7"  onclick="_setChargeRange(7)">7 days</button>
+      <button class="charge-range-btn" data-days="30" onclick="_setChargeRange(30)">30 days</button>
+      <button class="charge-range-btn" data-days="90" onclick="_setChargeRange(90)">90 days</button>
+    </div>
+    <div id="charge-modal-body"></div>
+  </div>
+</div>
+{% endif %}
+
 <!-- ── Wide row: CI + Power History ── -->
 <div class="wide-row">
 
@@ -1015,6 +1061,171 @@ function setMiniSource(enabled){
 {% endblock %}
 
 {% block scripts %}
+<script>
+// ── BL-10: IOG smart-charging card (unconditional — must render even for
+// API-only IOG users who have no power sensor, i.e. outside the has_power_sensor
+// gate below). Card visibility is decided at runtime by the sessions API. ──────
+var _chargeSessions = [];
+var _chargeUpcoming = [];
+var _chargeCurrency = '£';
+var _chargeDays = 7;   // modal range; 90 = the dispatch_history retention ceiling
+function _cesc(s){return String(s).replace(/[&<>"]/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+
+function _statusPill(st){
+  var m={completed:['#00d4aa','Completed'],
+         in_progress:['#f0a500','Charging'],
+         scheduled:['#6b7280','Scheduled']};
+  var x=m[st]||m.scheduled;
+  return '<span style="background:'+x[0]+';color:#fff;font-size:10px;font-weight:600;'
+       + 'padding:1px 8px;border-radius:10px;vertical-align:middle;">'+x[1]+'</span>';
+}
+
+function _offText(s){
+  if(s.off_peak_kwh>=s.kwh-0.05) return 'all off-peak';
+  if(s.off_peak_kwh<=0.05) return 'all at peak';
+  // Show the (small) peak figure at its true value so it matches the billing
+  // blocks; let the large off-peak absorb the rounding so the parts still sum
+  // to the displayed total.
+  var tot=Math.round(s.kwh*10)/10;
+  var pk=Math.round(s.peak_kwh*10)/10;
+  var op=Math.round((tot-pk)*10)/10;
+  return op.toFixed(1)+' kWh off-peak, '+pk.toFixed(1)+' peak';
+}
+
+function _fmtDur(m){
+  m=Math.round(m||0);
+  if(m<60) return m+'m';
+  var h=Math.floor(m/60), r=m%60;
+  return r ? (h+'h '+r+'m') : (h+'h');
+}
+
+function _chargeSummaryHtml(s){
+  var win=(s.local.start.time||'??')+'–'+(s.local.end.time||'??');
+  var off = _offText(s);
+  var save = s.saving ? ' <span style="color:var(--muted);font-size:12px;">· saved '
+           + _chargeCurrency+s.saving.toFixed(2)+'</span>' : '';
+  return _statusPill(s.status)
+       + ' <strong style="font-size:15px;">'+s.kwh.toFixed(1)+' kWh</strong>'
+       + ' <span style="color:var(--muted);">· '+_cesc(win)+' · '+_fmtDur(s.charge_minutes)
+       + ' · '+off+'</span>'+save;
+}
+
+function _fillChartSVG(s){
+  var f=s.fill||[]; if(!f.length) return '';
+  var W=Math.max(f.length*40,160), H=88, base=H-16;
+  var max=Math.max.apply(null, f.map(function(x){return x.kwh;}).concat([0.1]));
+  var step=(W-4)/f.length;
+  var bars='', labels='', hits='';
+  f.forEach(function(x,i){
+    var h=(x.kwh/max)*(base-6);
+    var xx=i*step+4, bw=Math.max(step-6,6);
+    var col=x.off_peak?'#00d4aa':'#ff6b6b';
+    var t=_cesc(x.slot.substr(11,5));
+    bars+='<rect x="'+xx.toFixed(1)+'" y="'+(base-h).toFixed(1)+'" width="'+bw.toFixed(1)
+        +'" height="'+Math.max(h,1).toFixed(1)+'" rx="2" fill="'+col+'"/>';
+    // Full-height, full-width transparent hit target so the tooltip comes up
+    // anywhere in the column — even when the bar itself is only a sliver.
+    hits+='<rect x="'+(i*step).toFixed(1)+'" y="0" width="'+step.toFixed(1)+'" height="'+base
+        +'" fill="#000" opacity="0" pointer-events="all">'
+        +'<title>'+t+' — '+x.kwh.toFixed(2)+' kWh</title></rect>';
+    // Time label under every block.
+    labels+='<text x="'+(xx+bw/2).toFixed(1)+'" y="'+(H-3)+'" font-size="8" fill="var(--muted)" '
+        +'text-anchor="middle">'+t+'</text>';
+  });
+  return '<svg viewBox="0 0 '+W+' '+H+'" width="100%" style="max-width:'+W
+       +'px;margin-top:6px;" preserveAspectRatio="xMinYMax meet">'+bars+labels+hits+'</svg>';
+}
+
+function _sessionRowHtml(s){
+  var d=s.local.start.date||s.start.substr(0,10);
+  var win=(s.local.start.time||'')+'–'+(s.local.end.time||'');
+  var save=s.saving?(' · saved '+_chargeCurrency+s.saving.toFixed(2)):'';
+  return '<div style="padding:10px 0;border-bottom:1px solid var(--border);font-size:13px;">'
+    + '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">'
+    + '<span><strong>'+_cesc(d)+'</strong> <span style="color:var(--muted);">'+_cesc(win)+'</span></span>'
+    + '<span>'+s.kwh.toFixed(1)+' kWh '+_statusPill(s.status)+'</span></div>'
+    + '<div style="color:var(--muted);font-size:11px;margin-top:2px;">'
+    + _fmtDur(s.charge_minutes)+' charging · '+_offText(s)
+    + _cesc(save)+'</div>'
+    + _fillChartSVG(s) + '</div>';
+}
+
+function _chargeNextHint(u){
+  // Card-face hint for the soonest upcoming (planned) dispatch.
+  var win=(u.local.start.time||'??')+'–'+(u.local.end.time||'??');
+  return _statusPill('scheduled')
+       + ' <span style="color:var(--muted);">next '+_cesc(win)+' · '
+       + u.kwh.toFixed(1)+' kWh planned</span>';
+}
+
+function _openChargeModal(){
+  _renderChargeModalBody();
+  _updateChargeRangeBtns();
+  document.getElementById('charge-backdrop').classList.add('active');
+}
+function _renderChargeModalBody(){
+  var body=document.getElementById('charge-modal-body');
+  if(!body) return;
+  var html='';
+  if(_chargeUpcoming.length){
+    html += '<div class="charge-section-h">Upcoming</div>'
+          + _chargeUpcoming.map(_sessionRowHtml).join('')
+          + '<div class="charge-section-h">Recent</div>';
+  }
+  html += _chargeSessions.length
+    ? _chargeSessions.map(_sessionRowHtml).join('')
+    : '<div style="color:var(--muted);">No smart charges in this range.</div>';
+  body.innerHTML = html;
+}
+function _updateChargeRangeBtns(){
+  var btns=document.querySelectorAll('#charge-range .charge-range-btn');
+  for(var i=0;i<btns.length;i++){
+    btns[i].classList.toggle('active', parseInt(btns[i].getAttribute('data-days'),10)===_chargeDays);
+  }
+}
+function _setChargeRange(n){
+  if(n===_chargeDays) return;
+  _chargeDays=n;
+  _updateChargeRangeBtns();
+  var body=document.getElementById('charge-modal-body');
+  if(body) body.innerHTML='<div style="color:var(--muted);padding:10px 0;">Loading…</div>';
+  fetch(apiUrl('/api/charge-sessions?days='+n))
+    .then(function(r){return r.json();})
+    .then(function(d){
+      _chargeSessions=(d&&d.sessions)||[];
+      _chargeUpcoming=(d&&d.upcoming)||[];
+      _renderChargeModalBody();
+    })
+    .catch(function(){ _renderChargeModalBody(); });
+}
+function _closeChargeModal(){
+  var b=document.getElementById('charge-backdrop'); if(b) b.classList.remove('active');
+}
+
+function loadChargeSessions(){
+  var card=document.getElementById('charge-card-wrap');
+  if(!card) return;   // server-gated out (no dispatch data)
+  fetch(apiUrl('/api/charge-sessions?days='+_chargeDays))
+    .then(function(r){return r.json();})
+    .then(function(d){
+      _chargeSessions=(d&&d.sessions)||[];
+      _chargeUpcoming=(d&&d.upcoming)||[];
+      _chargeCurrency=(d&&d.currency)||'£';
+      if(!d||!d.has_data||(!_chargeSessions.length&&!_chargeUpcoming.length)){
+        card.style.display='none'; return; }
+      card.style.display='';
+      var sum = _chargeSessions.length ? _chargeSummaryHtml(_chargeSessions[0]) : '';
+      if(_chargeUpcoming.length){
+        var hint=_chargeNextHint(_chargeUpcoming[0]);
+        sum = sum ? (sum+'<div style="margin-top:4px;">'+hint+'</div>') : hint;
+      }
+      document.getElementById('charge-summary').innerHTML=sum;
+    })
+    .catch(function(){ card.style.display='none'; });
+}
+document.addEventListener('DOMContentLoaded', loadChargeSessions);
+</script>
 <script>
 // ── Server-provided gauge config ──
 var GAUGE_MAX_IMP  = {{ gauge_max_imp | default(10) }};

@@ -560,8 +560,11 @@ class TestFinaliseHorizon(unittest.TestCase):
 
     def test_finalise_skips_settled(self):
         old = "2026-05-01T00:00:00"
-        self._add(old)
-        self.store.upsert_kraken_block(old, "electricity_main", 0.5, billing_source="api")
+        self._add(old)   # make_block gives exp_kwh=0.1, so settle both channels
+        self.store.upsert_kraken_block(old, "electricity_main", 0.5,
+                                       channel="import", billing_source="api")
+        self.store.upsert_kraken_block(old, "electricity_main", 0.1,
+                                       channel="export", billing_source="api")
         self.assertEqual(
             self.store.finalise_past_horizon_blocks("2026-05-28T00:00:00"), 0)  # already DCC
 
@@ -578,6 +581,62 @@ class TestFinaliseHorizon(unittest.TestCase):
             (old,)).fetchone()
         self.assertIsNotNone(row["imp_kwh_api"])        # real settlement landed
         self.assertEqual(row["finalised_from_cad"], 0)  # flag cleared
+
+
+class TestExportSettlementUnsettled303(unittest.TestCase):
+    """#303: a block whose import is DCC-settled but whose export isn't (and did
+    export) must still count as unsettled — otherwise it ages out of the sweep
+    window and its export figure is never corrected from the estimate."""
+
+    def setUp(self):
+        self.store = BlockStore(":memory:")
+        self.store.insert_config_period(EXAMPLE_CONFIG)
+
+    def _settle(self, start, kwh, channel):
+        self.store.upsert_kraken_block(start, "electricity_main", kwh,
+                                       channel=channel, billing_source="api")
+
+    def test_export_lagging_block_is_unsettled(self):
+        s = "2026-07-09T12:00:00"
+        self.store.append_block(make_block(s, imp_kwh=4.7, exp_kwh=16.0))
+        self._settle(s, 4.7, "import")                    # import settled, export lags
+        self.assertEqual(self.store.count_unsettled_blocks(), 1)
+        self.assertEqual(self.store.get_oldest_unsettled_block_start(), s)
+        self.assertIn(s, [r["block_start"] for r in self.store.get_unsettled_blocks()])
+
+    def test_both_channels_settled_is_settled(self):
+        s = "2026-07-09T12:00:00"
+        self.store.append_block(make_block(s, imp_kwh=4.7, exp_kwh=16.0))
+        self._settle(s, 4.7, "import")
+        self._settle(s, 15.9, "export")
+        self.assertEqual(self.store.count_unsettled_blocks(), 0)
+        self.assertIsNone(self.store.get_oldest_unsettled_block_start())
+
+    def test_no_export_activity_not_chased(self):
+        # Import-only / nighttime block (exp_kwh 0): once import settles it's done.
+        s = "2026-07-09T02:00:00"
+        self.store.append_block(make_block(s, imp_kwh=0.3, exp_kwh=0.0))
+        self._settle(s, 0.3, "import")
+        self.assertEqual(self.store.count_unsettled_blocks(), 0)
+        self.assertIsNone(self.store.get_oldest_unsettled_block_start())
+
+    def test_oldest_reaches_back_past_recent_import_gap(self):
+        # The core of #303: an older export-lagging block (import already settled)
+        # must set the sweep window start, not the more-recent import gap.
+        old, recent = "2026-07-09T12:00:00", "2026-07-18T00:30:00"
+        self.store.append_block(make_block(old, imp_kwh=4.7, exp_kwh=16.0))
+        self._settle(old, 4.7, "import")                  # import settled, export lags
+        self.store.append_block(make_block(recent, imp_kwh=0.5, exp_kwh=0.0))  # import unsettled
+        self.assertEqual(self.store.get_oldest_unsettled_block_start(), old)
+
+    def test_export_settlement_drops_it_from_unsettled(self):
+        # Self-heal: once the sweep settles the lagging export, it's done.
+        s = "2026-07-09T12:00:00"
+        self.store.append_block(make_block(s, imp_kwh=4.7, exp_kwh=16.0))
+        self._settle(s, 4.7, "import")
+        self.assertEqual(self.store.count_unsettled_blocks(), 1)
+        self._settle(s, 15.9, "export")
+        self.assertEqual(self.store.count_unsettled_blocks(), 0)
 
 
 class TestAppendBlock(unittest.TestCase):

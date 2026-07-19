@@ -354,11 +354,9 @@ class TestCompletedCaptureWhenPlannedEmpty(unittest.IsolatedAsyncioTestCase):
             "completed": [{"start": "2026-07-07T04:30:00+00:00",
                            "end": "2026-07-07T05:00:00+00:00", "delta": -3.21}],
         })
-        client.last_deprecations = None
         for attr, val in (("_store", st), ("_kraken_client", client),
                           ("_kraken_discovery", {"x": 1}),
-                          ("_kraken_account_number", "ACC"),
-                          ("_deprecations_surfaced", True)):
+                          ("_kraken_account_number", "ACC")):
             setattr(engine, attr, val)
         try:
             await engine._capture_dispatch_slots()
@@ -677,6 +675,67 @@ class TestReconcilePass(unittest.IsolatedAsyncioTestCase):
         r = st._conn.execute("SELECT imp_rate FROM blocks WHERE block_start=?",
                              ("2020-01-01T20:00:00",)).fetchone()
         self.assertAlmostEqual(r["imp_rate"], 0.323092, places=5)  # peak
+
+
+class TestBL11RawDispatchBounds(unittest.TestCase):
+    """BL-11: the exact (second-precision) dispatch window is retained per slot,
+    so a charge-session view can show the true scheduled bounds instead of the
+    30-min-snapped ones."""
+
+    def test_bounds_span_slots_with_exact_values(self):
+        planned = [{"source": "smart",
+                    "start": "2026-07-07T04:33:20+00:00",
+                    "end":   "2026-07-07T05:47:10+00:00", "delta": -6.0}]
+        b = engine._planned_dispatch_slot_bounds(planned)
+        # 04:33→05:47 covers the 04:30, 05:00 and 05:30 slots …
+        self.assertEqual(set(b), {"2026-07-07T04:30:00", "2026-07-07T05:00:00",
+                                  "2026-07-07T05:30:00"})
+        # … each carrying the dispatch's EXACT bounds (to the second).
+        for v in b.values():
+            self.assertEqual(v, ("2026-07-07T04:33:20", "2026-07-07T05:47:10"))
+
+    def test_non_smart_source_excluded(self):
+        planned = [{"source": "bump-charge",
+                    "start": "2026-07-07T04:30:00+00:00",
+                    "end":   "2026-07-07T05:00:00+00:00"}]
+        self.assertEqual(engine._planned_dispatch_slot_bounds(planned), {})
+
+    def test_bad_or_missing_dates_skipped(self):
+        self.assertEqual(engine._planned_dispatch_slot_bounds(
+            [{"source": "smart", "start": None, "end": None}]), {})
+        self.assertEqual(engine._planned_dispatch_slot_bounds(
+            [{"source": "smart", "start": "nonsense", "end": "x"}]), {})
+
+    def test_store_round_trip_slots_and_history(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        st.upsert_dispatch_slot("2026-07-07T04:30:00", provider="Myenergi",
+                                source="smart-charge", state="planned",
+                                raw_start="2026-07-07T04:33:20",
+                                raw_end="2026-07-07T05:47:10")
+        row = st.get_dispatch_slot("2026-07-07T04:30:00")
+        self.assertEqual(row["raw_start"], "2026-07-07T04:33:20")
+        self.assertEqual(row["raw_end"], "2026-07-07T05:47:10")
+        st.record_dispatch_history("2026-07-07T04:30:00", "planned",
+                                   provider="Myenergi",
+                                   raw_start="2026-07-07T04:33:20",
+                                   raw_end="2026-07-07T05:47:10")
+        h = st.get_dispatch_history("2026-07-07T00:00:00", "2026-07-08T00:00:00")
+        self.assertEqual(h[0]["raw_start"], "2026-07-07T04:33:20")
+        self.assertEqual(h[0]["raw_end"], "2026-07-07T05:47:10")
+
+    def test_recapture_without_bounds_preserves_them(self):
+        # A later completed re-capture (no bounds) must not wipe the stored ones.
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        st.upsert_dispatch_slot("2026-07-07T04:30:00", source="smart-charge",
+                                raw_start="2026-07-07T04:33:20",
+                                raw_end="2026-07-07T05:47:10")
+        st.upsert_dispatch_slot("2026-07-07T04:30:00", source="smart-charge",
+                                state="completed", energy_completed=-2.0)
+        row = st.get_dispatch_slot("2026-07-07T04:30:00")
+        self.assertEqual(row["raw_start"], "2026-07-07T04:33:20")
+        self.assertEqual(row["raw_end"], "2026-07-07T05:47:10")
 
 
 if __name__ == "__main__":

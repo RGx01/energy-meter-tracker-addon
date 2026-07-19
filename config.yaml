@@ -1,6 +1,6 @@
 name: "Energy Meter Tracker"
 description: "Electricity metering engine with configurable reconciliation periods, sub-meter support, gap filling, and billing charts"
-version: "3.3.1"
+version: "3.4.0"
 slug: "energy_meter_tracker"
 init: false
 startup: application
@@ -56,12 +56,6 @@ options:
   # Meter reconciliation period in minutes (5, 15 or 30).
   # Set once before data collection begins — cannot be changed without clearing data.
   block_minutes: 30
-  # Prevents this instance writing to HA entities. Since 3.2.0 the only entity
-  # EMT publishes is sensor.energy_meter_tracker_api_deprecations (the four
-  # per-block sensors were removed), and two instances writing it collide
-  # harmlessly — they compute the same API-derived value. Kept mainly so a dev
-  # instance can stay entirely out of HA's state machine.
-  publish_ha_sensors: false
   # Optional label shown in the EMT footer to tell instances apart. Leave blank
   # to use the add-on name (from config.yaml). Set it per instance — e.g. "Prod"
   # / "Dev" — when two installs share the same add-on name (the repo-URL
@@ -74,5 +68,4 @@ schema:
   ha_token: "str?"
   timezone: "str?"
   block_minutes: "int?"  # Meter reconciliation period (5, 15 or 30)
-  publish_ha_sensors: "bool?"
   instance_name: "str?"

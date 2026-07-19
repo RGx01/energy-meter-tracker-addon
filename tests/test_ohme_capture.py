@@ -137,5 +137,59 @@ class TestOhmeDetection(unittest.TestCase):
         self.assertEqual(_norm_ohme_state("smart_charge"), "smart_charge")
 
 
+class TestOhmeDispatchHistory(unittest.TestCase):
+    """BL-10 — OHME dispatches are accumulated into dispatch_history so the
+    smart-charging card (which reads it and colours by billed rate) covers OHME."""
+
+    def setUp(self):
+        self.store = BlockStore(":memory:")
+        self._orig = engine._store
+        engine._store = self.store
+
+    def tearDown(self):
+        engine._store = self._orig
+
+    def _rows(self):
+        return self.store.get_dispatch_history(
+            "2026-07-18T00:00:00", "2026-07-20T00:00:00")
+
+    def test_records_completed_and_planned_even_for_non_smart_source(self):
+        # OHME source labels are unreliable — a 'bump-charge' planned slot and a
+        # completed dispatch must BOTH land in history (include_all path).
+        planned = [{"source": "bump-charge", "start": "2026-07-18T23:30:00Z",
+                    "end": "2026-07-19T00:00:00Z", "delta": -3.4}]
+        completed = [{"source": "unknown", "start": "2026-07-18T20:00:00Z",
+                      "end": "2026-07-18T20:30:00Z", "delta": -3.1}]
+        n = engine._record_ohme_dispatch_history("OHME", planned, completed)
+        self.assertGreaterEqual(n, 2)
+        by_kind = {}
+        for r in self._rows():
+            by_kind.setdefault(r["kind"], []).append(r)
+        self.assertIn("planned", by_kind)     # kept despite non-smart source
+        self.assertIn("completed", by_kind)
+        self.assertEqual(by_kind["planned"][0]["slot_start"], "2026-07-18T23:30:00")
+        self.assertEqual(by_kind["completed"][0]["slot_start"], "2026-07-18T20:00:00")
+
+    def test_no_store_is_safe(self):
+        engine._store = None
+        self.assertEqual(engine._record_ohme_dispatch_history("OHME", [], []), 0)
+
+
+class TestPlannedSlotIncludeAll(unittest.TestCase):
+    """include_all bypasses the smart-charge source filter (OHME history)."""
+
+    P = [{"source": "bump-charge", "start": "2026-07-18T23:30:00Z",
+          "end": "2026-07-19T00:00:00Z", "delta": -3.4}]
+
+    def test_default_filters_non_smart_source(self):
+        self.assertEqual(engine._planned_dispatch_slot_energy(self.P), {})
+
+    def test_include_all_keeps_non_smart_source(self):
+        out = engine._planned_dispatch_slot_energy(self.P, include_all=True)
+        self.assertIn("2026-07-18T23:30:00", out)
+        b = engine._planned_dispatch_slot_bounds(self.P, include_all=True)
+        self.assertIn("2026-07-18T23:30:00", b)
+
+
 if __name__ == "__main__":
     unittest.main()

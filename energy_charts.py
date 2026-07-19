@@ -968,6 +968,29 @@ def render_billing_summary(summary, currency='£', site_name=None):
         html += _rate_html
         html += _bill_total_row(raw_kwh_r, raw_cost_r)
 
+        # ── Standing charge folded into the import charge (display only) —
+        # mirrors a real bill, where energy + standing make up the import total.
+        # The kWh Total above is unchanged, and summary['total_cost'] (the Total
+        # Bill) plus Usage Stats are computed elsewhere, so nothing here moves a
+        # number — this only adds a cost-inclusive subtotal to the display.
+        if summary["standing"]:
+            _sc_groups = {}
+            for _d, _amt in sorted(summary["standing"].items()):
+                _r = round(_amt, 4)
+                _sc_groups[_r] = _sc_groups.get(_r, 0) + 1
+            for _r, _cnt in sorted(_sc_groups.items()):
+                html += f"""
+        <tr class="standing">
+          <td colspan="3">Standing charge: {_cnt} days @ {currency}{_r:.4f}/day</td>
+          <td>{_r * _cnt:.2f}</td>
+        </tr>"""
+            _incl = raw_cost_r + round(sum(summary["standing"].values()), 2)
+            _incl_str = f"({-_incl:.2f})" if _incl < 0 else f"{_incl:.2f}"
+            html += f"""
+        <tr class="channel-total">
+          <td colspan="3">Total incl. standing charge</td><td>{_incl_str}</td>
+        </tr>"""
+
         # ── Sub-meter breakdown (indented) ──
         if submeter_keys or remainder_keys:
             html += '''
@@ -1004,7 +1027,9 @@ def render_billing_summary(summary, currency='£', site_name=None):
                 _rate_html, tot_kwh_r, tot_cost_r = _bill_rate_rows(channels, currency)
                 html += _rate_html
                 html += _bill_total_row(tot_kwh_r, tot_cost_r)
-    if summary["standing"]:
+    # Standing charge for export-only accounts (no import section above, so it
+    # would otherwise not appear); the import case renders it in-section.
+    if summary["standing"] and not (remainder_keys or submeter_keys):
         rate_groups = {}
         for day_date, amount in sorted(summary["standing"].items()):
             rate = round(amount, 4)
@@ -1815,7 +1840,10 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
             day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, chart_prefix=f"{pid_prefix}_", block_minutes=block_minutes, currency=currency, site_name=site_name)
 
         toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}"
-        open_attr    = "open" if gs["is_current"] else ""
+        # Quarter/year sections can hold 90–365 day charts; default the panel
+        # collapsed (summary-first) so switching to those modes is instant. The
+        # charts build lazily when the panel is expanded (see _renderSection).
+        open_attr    = ""
         return (
             f'<div class="period-section {pid_prefix}-section" id="{pid}" style="visibility:hidden;position:absolute;">'
             f'<details class="bill-toggle" open>'
@@ -2704,11 +2732,49 @@ function _buildDayChart(chartId) {{
   _scaleChartEl(el);
 }}
 
+// One shared observer builds each day chart only as it scrolls near the
+// viewport, so revealing a year (~365 charts) never renders more than the few
+// on screen. The callback ignores anything in a section that's now hidden, so a
+// stray event that fires just after a mode switch is a no-op. There are no
+// background workers: each chart is one synchronous Plotly build on its own
+// intersection callback, and switching section disconnects the observer (below),
+// dropping everything still queued for the section you left.
+var _chartObserver = null;
+function _ensureChartObserver() {{
+  if (_chartObserver || typeof IntersectionObserver === 'undefined') return _chartObserver;
+  _chartObserver = new IntersectionObserver(function(entries) {{
+    entries.forEach(function(entry) {{
+      if (!entry.isIntersecting) return;
+      var el = entry.target;
+      _chartObserver.unobserve(el);
+      var sec = el.closest('.period-section');
+      if (!sec || sec.style.visibility === 'hidden') return;   // section left the screen
+      var chartId = window._pendingCharts && window._pendingCharts[el.id];
+      if (chartId) {{
+        delete window._pendingCharts[el.id];
+        _buildDayChart(chartId);
+      }}
+    }});
+  }}, {{ rootMargin: '600px 0px' }});   // build a little before they scroll in
+  return _chartObserver;
+}}
+
 function _renderSection(section) {{
   if (!section || !window._pendingCharts) return;
+  var obs = _ensureChartObserver();
+  // Stop watching the previous section's charts — anything queued there is
+  // dropped, so switching mode mid-render leaves nothing rendering off-screen.
+  if (obs) obs.disconnect();
   section.querySelectorAll('.chart-container').forEach(function(el) {{
-    var chartId = window._pendingCharts[el.id];
-    if (chartId) {{
+    // Skip day charts inside a collapsed panel — they get observed when the
+    // panel is expanded (see the toggle listener in _revealSection).
+    var det = el.closest('details.day-charts-toggle');
+    if (det && !det.open) return;
+    if (!window._pendingCharts[el.id]) return;   // already built
+    if (obs) {{
+      obs.observe(el);                            // build when it nears the viewport
+    }} else {{
+      var chartId = window._pendingCharts[el.id]; // no IntersectionObserver — build now
       delete window._pendingCharts[el.id];
       _buildDayChart(chartId);
     }}
@@ -2772,6 +2838,8 @@ function _revealSection(id) {{
       if (!det._listenerAdded) {{
         det.addEventListener('toggle', function() {{
           sessionStorage.setItem('energyChartsOpen_' + det.id, det.open ? '1' : '0');
+          // Build the (previously skipped) day charts now the panel is open.
+          if (det.open) _renderSection(section);
         }});
         det._listenerAdded = true;
       }}
