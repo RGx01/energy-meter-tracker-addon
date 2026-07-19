@@ -4889,27 +4889,31 @@ def _slot_is_off_peak(rate, peak_r):
     return rate < peak_r - 1e-6
 
 
-def _build_charge_sessions(history, rates, day_peak,
+def _build_charge_sessions(history, rates, day_peak, slot_kwh=None,
                            bridge_min=_CHARGE_SESSION_BRIDGE_MIN):
     """BL-10: fold *delivered* IOG dispatch slots into charging sessions.
 
-    Pure — no I/O, so it is unit-testable. Only slots that actually delivered
-    energy (a ``completed`` row with non-null kWh) are shown; planned-but-never-
-    charged forecasts are dropped so the card reflects real charging. Each slot
-    is coloured by its **actual billed rate**, so it agrees with the billing
-    charts: a delivered slot priced at the day's peak (e.g. a non-smart / bump
-    charge) shows peak, not off-peak.
+    Pure — no I/O, so it is unit-testable. Dispatch data identifies *which* slots
+    were smart-charged (a ``completed`` row); planned-but-never-charged forecasts
+    are dropped so the card reflects real charging. Each slot's **energy** is the
+    metered grid import for that half-hour (``slot_kwh``) so the card's kWh,
+    off-peak/peak split and savings reconcile with the billing charts; when a
+    block isn't present yet (unsettled), it falls back to the dispatch figure.
+    Each slot is coloured by its **actual billed rate** (``rates`` / ``day_peak``),
+    so a slot priced at the day's peak reads peak, not off-peak.
 
     `history` is a list of dispatch_history rows (slot_start, kind, energy_kwh,
     raw_start?, raw_end?, provider). `rates` maps slot_start → the main meter's
-    billed imp_rate for that half-hour. `day_peak` maps a date (YYYY-MM-DD) →
-    that day's highest main rate. The saving is the off-peak benefit vs the day's
-    peak: ``max(0, day_peak - slot_rate) * kWh`` per slot (peak-billed slots
-    contribute nothing). Consecutive delivered slots no more than ``bridge_min``
-    minutes apart form one session, bridging IOG's inter-burst gaps within a
-    single plug-in. Windows use BL-11's second-precision raw_start/raw_end where
-    present, else the 30-min slot boundaries. Returns sessions newest-first.
+    billed imp_rate for that half-hour. `slot_kwh` maps slot_start → that half-
+    hour's metered import (kWh). `day_peak` maps a date (YYYY-MM-DD) → that day's
+    highest main rate. The saving is the off-peak benefit vs the day's peak:
+    ``max(0, day_peak - slot_rate) * kWh`` per slot (peak-billed slots contribute
+    nothing). Consecutive delivered slots no more than ``bridge_min`` minutes
+    apart form one session, bridging IOG's inter-burst gaps within a single
+    plug-in. Windows use BL-11's second-precision raw_start/raw_end where present,
+    else the 30-min slot boundaries. Returns sessions newest-first.
     """
+    slot_kwh = slot_kwh or {}
     from datetime import datetime as _dt, timedelta as _td
     slots = {}
     for r in history:
@@ -4952,7 +4956,10 @@ def _build_charge_sessions(history, rates, day_peak,
         started_slots = 0
         fill = []
         for k in grp:
-            v = abs(slots[k]["completed"])
+            # Metered grid import for the half-hour (reconciles with the bill);
+            # fall back to the dispatch figure when the block isn't settled yet.
+            mv = slot_kwh.get(k)
+            v = abs(mv) if mv is not None else abs(slots[k]["completed"])
             kwh += v
             peak_r = day_peak.get(k[:10])
             rate = rates.get(k)
@@ -5101,8 +5108,12 @@ def api_charge_sessions():
             return jsonify({"sessions": [], "upcoming": [],
                             "has_data": False, "currency": currency})
 
-        # Per-slot billed rate (to colour each slot by what it actually cost) and
-        # each day's peak rate (the off-peak/peak threshold + saving baseline).
+        # Energy source = the EV's charge, from the supplier's dispatch figure —
+        # what the car actually charged, without the house baseload the meter's
+        # own import carries. (A future EV sub-meter could supply a bill-
+        # reconciled per-slot figure via `slot_kwh`; left None here.) `rates` /
+        # `day_peak` still come from the billing blocks so pricing/colouring
+        # match the bill.
         rates = {r["block_start"]: r["imp_rate"] for r in store._conn.execute(
             "SELECT block_start, imp_rate FROM blocks WHERE meter_id = ? "
             "AND block_start >= ? AND block_start < ? AND imp_rate IS NOT NULL",
