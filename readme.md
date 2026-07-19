@@ -104,6 +104,17 @@ Full documentation is on the **[GitHub Wiki](https://github.com/RGx01/energy-met
 
 ---
 
+## What's new in 3.4
+
+- **🚗 Smart-charging card (Intelligent Octopus)** — the Overview page now shows your recent smart charges: energy delivered, when it charged and for how long, off-peak vs peak, and roughly what smart charging saved versus peak. Expandable over **7, 30 or 90 days**, each session showing its per-slot fill curve and scheduled window, with upcoming (scheduled-but-not-yet-charged) dispatches listed separately. Works for every IOG setup — including API-only accounts with no EV or power sensor, and **Ohme**. It shows the car's charge from the dispatch data, so solar offset and house load aren't reflected.
+- **🧾 Standing charge folded into the import charge** — the bill summary now reads like a real supplier bill: the standing charge sits inside the "Import — total grid" section with a new **Total incl. standing charge** subtotal, instead of stranded at the bottom. Display only — totals are unchanged. (VAT still isn't modelled.)
+- **⚡ Much faster billing charts** — the daily chart is now gzip-compressed on the direct `:8099` port and in Lovelace cards (~12× smaller, so it no longer sits blank for 15–20s), and the **Quarter**/**Year** views render per-day charts only as they scroll into view instead of all ~90/365 at once — so switching period modes stays responsive.
+- **🔌 Deprecations sensor removed** — `sensor.energy_meter_tracker_api_deprecations` and the `publish_ha_sensors` option are gone, so **EMT now publishes no Home Assistant entities at all**. **Breaking** only if you referenced that sensor or set the option.
+
+See the [full changelog](CHANGELOG.md) for the complete list.
+
+---
+
 ## What's new in 3.2
 
 - **🩹 Outage recovery** — if the add-on was offline longer than the 12-hour gap-fill limit, those blocks were lost for good: the settlement poll only ever looks forward. **Data Management → Missing Data** now finds the holes and rebuilds them from your supplier's settled readings. Manual on purpose — EMT can't tell an outage from blocks you deleted deliberately.

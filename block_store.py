@@ -2412,18 +2412,28 @@ class BlockStore:
         self._conn.commit()
         return cur.rowcount
 
+    # A main-meter block still awaiting DCC settlement on a channel it should
+    # have: import not yet settled, OR export not yet settled on a block that
+    # actually exported. Issue #303: export commonly settles days after import,
+    # so keying "unsettled" on import alone let export-lagging blocks age out of
+    # the re-fetch window and never settle — freezing the export figure on its
+    # pre-settlement estimate. (Import-only accounts export 0, so the export
+    # clause never fires for them.)
+    _UNSETTLED_WHERE = ("(imp_kwh_api IS NULL "
+                        "OR (exp_kwh_api IS NULL AND exp_kwh IS NOT NULL AND exp_kwh > 0))")
+
     def get_unsettled_blocks(self, main_meter_id: str = "electricity_main",
                              limit: Optional[int] = None) -> list:
-        """Main-meter blocks that never received DCC import settlement.
+        """Main-meter blocks still awaiting DCC settlement (import or export).
 
         For the view-only 'review unsettled blocks' report (relevant only when
-        billing_source='dcc'): these are blocks running on the CAD fallback
-        because DCC import never arrived (imp_kwh_api IS NULL). Ordered newest
-        first so the most recent gaps surface at the top.
+        billing_source='dcc'): blocks running on the CAD/estimate fallback
+        because DCC hasn't settled a channel yet. Ordered newest first so the
+        most recent gaps surface at the top.
         """
         sql = ("SELECT block_start, block_end, imp_kwh, imp_kwh_api, "
                "       exp_kwh, exp_kwh_api, is_provisional "
-               "FROM blocks WHERE meter_id = ? AND imp_kwh_api IS NULL "
+               f"FROM blocks WHERE meter_id = ? AND {self._UNSETTLED_WHERE} "
                "AND finalised_from_cad = 0 "
                "ORDER BY block_start DESC")
         params: tuple = (main_meter_id,)
@@ -2433,26 +2443,27 @@ class BlockStore:
         return self._conn.execute(sql, params).fetchall()
 
     def count_unsettled_blocks(self, main_meter_id: str = "electricity_main") -> int:
-        """Count of main-meter blocks with no DCC import settlement, excluding
-        those finalised-from-CAD (past the horizon — DCC isn't coming)."""
+        """Count of main-meter blocks still awaiting DCC settlement on a channel
+        (import or export), excluding those finalised-from-CAD (past the horizon
+        — DCC isn't coming)."""
         row = self._conn.execute(
             "SELECT COUNT(*) AS n FROM blocks "
-            "WHERE meter_id = ? AND imp_kwh_api IS NULL "
+            f"WHERE meter_id = ? AND {self._UNSETTLED_WHERE} "
             "AND finalised_from_cad = 0",
             (main_meter_id,)).fetchone()
         return int(row["n"]) if row else 0
 
     def finalise_past_horizon_blocks(self, cutoff_block_start: str,
                                      main_meter_id: str = "electricity_main") -> int:
-        """Mark main-meter blocks older than cutoff_block_start that never got DCC
-        import settlement as finalised-from-CAD, so the unsettled count can reach
-        zero once DCC is no longer expected. This is DISTINCT from a real
-        settlement — imp_kwh_api stays NULL — and reversible: a later DCC
-        settlement clears the flag (see upsert_kraken_block). Returns the
-        number of blocks newly flagged."""
+        """Mark main-meter blocks older than cutoff_block_start that are still
+        awaiting DCC settlement (import or export, #303) as finalised-from-CAD,
+        so the unsettled count can reach zero once DCC is no longer expected.
+        This is DISTINCT from a real settlement — the *_api columns stay NULL —
+        and reversible: a later DCC settlement clears the flag (see
+        upsert_kraken_block). Returns the number of blocks newly flagged."""
         cur = self._conn.execute(
             "UPDATE blocks SET finalised_from_cad = 1 "
-            "WHERE meter_id = ? AND imp_kwh_api IS NULL "
+            f"WHERE meter_id = ? AND {self._UNSETTLED_WHERE} "
             "AND finalised_from_cad = 0 AND block_start < ?",
             (main_meter_id, cutoff_block_start))
         self._conn.commit()
@@ -2460,13 +2471,15 @@ class BlockStore:
 
     def get_oldest_unsettled_block_start(
             self, main_meter_id: str = "electricity_main") -> Optional[str]:
-        """Earliest block_start with no DCC import settlement, or None.
+        """Earliest block_start still awaiting DCC settlement on a channel
+        (import or export, #303), or None.
 
-        Used by the user-triggered retry to bound the re-fetch window
-        (oldest-unsettled → now)."""
+        Bounds the sweep / user-triggered retry re-fetch window
+        (oldest-unsettled → now). Including export here is what lets an
+        export-lagging block stay in the window until its export settles."""
         row = self._conn.execute(
             "SELECT MIN(block_start) AS m FROM blocks "
-            "WHERE meter_id = ? AND imp_kwh_api IS NULL",
+            f"WHERE meter_id = ? AND {self._UNSETTLED_WHERE}",
             (main_meter_id,)).fetchone()
         return row["m"] if row and row["m"] else None
 
