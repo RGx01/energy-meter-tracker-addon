@@ -35,6 +35,16 @@ logger = logging.getLogger("block_store")
 
 SCHEMA_VERSION = 1
 
+# ── 3.5.0 Historical-import provenance source values ─────────────────────────
+# Reconstructed blocks carry one of these in blocks.source. The reconstructed-
+# history delete filter matches the shared 'imported' prefix, so a bad import can
+# be wiped without touching native (live/kraken) data.
+IMPORTED_SOURCE_API     = "imported_api"       # from the Octopus consumption API
+IMPORTED_SOURCE_CSV     = "imported_csv"        # from a supplied CSV (rate-from-cost)
+IMPORTED_SOURCE_BLENDED = "imported_blended"    # go-live period straddling live capture
+IMPORTED_SOURCES        = (IMPORTED_SOURCE_API, IMPORTED_SOURCE_CSV, IMPORTED_SOURCE_BLENDED)
+IMPORTED_SOURCE_PREFIX  = "imported"            # blocks.source LIKE 'imported%'
+
 _DDL = """
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS store_meta (
@@ -74,7 +84,8 @@ CREATE TABLE IF NOT EXISTS meters (
     protected          INTEGER DEFAULT 0,  -- protected load (EV, heat pump)
     inverter_possible  INTEGER DEFAULT 0,  -- battery / inverter capable
     power_sensor       TEXT,               -- HA entity_id (main meter only)
-    postcode_prefix    TEXT,               -- UK carbon intensity (main meter only)
+    postcode_prefix    TEXT,               -- UK carbon intensity, OUTWARD CODE ONLY e.g. "SW1A" (main meter only)
+    postcode_source    TEXT,               -- 'user' | 'octopus' | 'unknown' — provenance of postcode_prefix (main meter only)
     v2x_capable             INTEGER DEFAULT 0,  -- V2G / bidirectional charging capable
     inverter_power_invert   INTEGER DEFAULT 0,  -- negate inverter power sensor value
     power_invert            INTEGER DEFAULT 0,  -- negate MAIN power sensor value (Live Power)
@@ -145,6 +156,8 @@ CREATE TABLE IF NOT EXISTS blocks (
     carbon_intensity_g  REAL,                       -- gCO2/kWh at block_start, stored at write time (survives CI table pruning)
     rate_corrected      INTEGER NOT NULL DEFAULT 0, -- 1 = user manually corrected the rate; dispatch reconciliation must not touch it
     rate_reconciled     INTEGER NOT NULL DEFAULT 0, -- 1 = dispatch reconciliation set the rate; a later PASS 2 re-run must not stomp it
+    -- ── 3.5.0 Historical import ───────────────────────────────────────────────
+    derivation_id       INTEGER,                    -- FK → historical_derivation for a reconstructed block (NULL = live)
     FOREIGN KEY (config_period_id) REFERENCES config_periods(id),
     UNIQUE (block_start, meter_id)
 );
@@ -316,6 +329,33 @@ CREATE TABLE IF NOT EXISTS dispatch_history (
     PRIMARY KEY (slot_start, kind)
 );
 CREATE INDEX IF NOT EXISTS idx_dispatch_history_start ON dispatch_history (slot_start);
+
+-- ── 3.5.0 Historical import: derivation provenance ────────────────────────────
+-- One row per reconstruction (a device-attribution over a span, or a rate for a
+-- tariff-period×tier). Reconstructed blocks point here via blocks.derivation_id,
+-- so any imported figure can answer "which sensor / rate produced this, when",
+-- and be rebuilt with new/extended data. Supersede (don't delete) on rebuild to
+-- keep the audit trail; superseded_by IS NULL = the current derivation.
+CREATE TABLE IF NOT EXISTS historical_derivation (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope           TEXT NOT NULL,              -- 'device_attribution' | 'rate'
+    subject         TEXT,                       -- device meter_id (attribution) | channel 'import'/'export' (rate)
+    period_from     TEXT NOT NULL,              -- UTC span this derivation covers
+    period_to       TEXT NOT NULL,
+    sensor_ids      TEXT,                       -- JSON list of sensor entity_ids (device scope)
+    sensor_kind     TEXT,                       -- energy_total | power | session
+    params          TEXT,                       -- JSON: split weights/ε, or rate tier + confidence
+    derived_value   REAL,                       -- derived rate (rate scope), etc.
+    confirmed_value REAL,                       -- user-confirmed rate, if overridden
+    method_version  INTEGER NOT NULL DEFAULT 1, -- bump when the algorithm changes → stale-derivation detection
+    derived_at      TEXT NOT NULL,              -- UTC ISO
+    source          TEXT,                       -- imported_api | imported_csv | recorder_probe
+    superseded_by   INTEGER,                    -- id that replaced this (NULL = current)
+    notes           TEXT,
+    FOREIGN KEY (superseded_by) REFERENCES historical_derivation(id)
+);
+CREATE INDEX IF NOT EXISTS idx_hderiv_subject ON historical_derivation (scope, subject);
+CREATE INDEX IF NOT EXISTS idx_hderiv_current ON historical_derivation (superseded_by);
 """
 
 
@@ -325,6 +365,94 @@ CREATE INDEX IF NOT EXISTS idx_dispatch_history_start ON dispatch_history (slot_
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+
+
+def outward_code(postcode) -> Optional[str]:
+    """Outward (first) part of a UK postcode, uppercased and space-stripped.
+
+    'sw1a 1aa' → 'SW1A', 'M1 1AE' → 'M1', 'EH8' → 'EH8'. This is the ONLY part
+    EMT persists (privacy: it resolves to a coarse DNO region, nothing more).
+    A full postcode may be *read* transiently to detect a change, but callers
+    must pass it through here before storage.
+    """
+    if not postcode:
+        return None
+    p = str(postcode).strip().upper()
+    if not p:
+        return None
+    if " " in p:                      # normal case: outward code is before the space
+        return p.split()[0]
+    # No space present. A UK inward code is always 3 chars (digit + 2 letters);
+    # strip it only when the tail actually looks like one, else assume already-outward.
+    if len(p) > 3:
+        tail = p[-3:]
+        if tail[0].isdigit() and tail[1:].isalpha():
+            return p[:-3]
+    return p
+
+
+def _property_key(p: dict) -> Optional[str]:
+    """Stable, NON-identifying handle for a property — a short hash of the Octopus
+    property id (or address+postcode as a fallback). Used only to group a
+    property's records and to give the reconcile/confirmation UI a stable key;
+    never stored, and not reversible to an address."""
+    import hashlib
+    pid = p.get("id")
+    if pid is not None and str(pid).strip():
+        base = "id:" + str(pid)
+    else:
+        addr = (p.get("address_line_1") or p.get("address_line1") or "").strip()
+        pc   = (p.get("postcode") or p.get("post_code") or "").strip()
+        if not (addr or pc):
+            return None
+        base = "addr:" + addr + "|" + pc
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()[:12]
+
+
+def derive_region_periods(account: dict) -> list:
+    """From a REST account payload, per-property tenancy spans for reconciliation.
+
+    Returns [{"outcode","from","to","key","hint"}] sorted by move-in date, with
+    consecutive records of the SAME property merged. Fields:
+      - outcode : OUTWARD CODE ONLY (the only part persisted) — full postcodes
+                  are read here and immediately reduced.
+      - from/to : move-in / move-out (tolerant of moved_in_at/moved_in etc.).
+      - key     : non-reversible property hash (grouping / UI handle; NOT stored).
+      - hint    : the town, for the "name this site" UI — DISPLAY-ONLY, must NOT
+                  be persisted.
+
+    Different properties that happen to share an outward code are kept SEPARATE
+    (they're different sites the user may name differently). Only when no stable
+    key is derivable do we fall back to region-level merging so behaviour never
+    regresses below the outward code.
+    """
+    spans = []
+    for p in (account.get("properties") or []):
+        oc = outward_code(p.get("postcode") or p.get("post_code"))
+        if not oc:
+            continue
+        spans.append({
+            "outcode": oc,
+            "from": p.get("moved_in_at") or p.get("moved_in") or None,
+            "to":   p.get("moved_out_at") or p.get("moved_out") or None,
+            "key":  _property_key(p),
+            "hint": (p.get("town") or None),
+        })
+    spans.sort(key=lambda s: s.get("from") or "")
+    merged: list = []
+    for s in spans:
+        same = False
+        if merged:
+            prev = merged[-1]
+            if s["key"] and prev["key"]:
+                same = (s["key"] == prev["key"])          # same physical property
+            else:
+                same = (s["outcode"] == prev["outcode"])  # fallback: same region
+        if same:
+            merged[-1]["to"] = s["to"]                     # extend the open end
+        else:
+            merged.append(dict(s))
+    return merged
 
 
 def local_date_to_utc_bounds(local_date: str, tz_name: str) -> tuple[str, str]:
@@ -675,10 +803,23 @@ class BlockStore:
     mode allows concurrent readers alongside one writer).
     """
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, *, read_only: bool = False):
         self._path = db_path
+        self._read_only = read_only
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        if read_only:
+            # Lightweight read-only companion (e.g. off-loop chart rendering):
+            # NO schema/migration DDL, guarded by query_only so it can never
+            # contend with the primary writer. Safe to use from a worker thread
+            # while the engine writes on its own WAL connection (the db is
+            # already WAL, so this connection reads the shared WAL snapshot).
+            try:
+                self._conn.execute("PRAGMA busy_timeout=5000")
+                self._conn.execute("PRAGMA query_only=ON")
+            except Exception:
+                pass
+            return
         self._apply_pragmas()
         self._ensure_schema()
         # Covering index for insights aggregation — created after migrations
@@ -843,6 +984,7 @@ class BlockStore:
             ("power_source",         "meters",         "TEXT",               _m_cols),
             ("rate_source",          "meters",         "TEXT",               _m_cols),
             ("postcode_prefix",      "meters",         "TEXT",               _m_cols),
+            ("postcode_source",      "meters",         "TEXT",               _m_cols),
             ("v2x_capable",          "meters",         "INTEGER DEFAULT 0",  _m_cols),
             ("inverter_power_invert","meters",         "INTEGER DEFAULT 0",  _m_cols),
             ("power_invert",          "meters",         "INTEGER DEFAULT 0",  _m_cols),
@@ -875,6 +1017,8 @@ class BlockStore:
             ("carbon_intensity_g", "blocks",        "REAL",                       _b_cols),
             ("rate_corrected",     "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
             ("rate_reconciled",    "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
+            # ── 3.5.0 historical-import: link a reconstructed block to its derivation
+            ("derivation_id",      "blocks",        "INTEGER",                    _b_cols),
             ("carbon_gco2_min",  "power_history",   "REAL",              _ph_cols),
             # ── 3.1.x dispatch lifecycle capture (observe-only, no billing effect)
             ("state",            "dispatch_slots", "TEXT",  _ds_cols),
@@ -892,6 +1036,19 @@ class BlockStore:
                     self._conn.commit()
                 except Exception:
                     pass  # already exists or table missing — migrate will handle it
+
+        # ── 3.5.x: tag existing (hand-entered) postcode prefixes as user-sourced ──
+        # A pre-existing postcode_prefix was typed in Settings, so record its
+        # provenance as 'user'. A one-time upgrade probe (engine) may then
+        # overwrite it from the authoritative Octopus supply address — outward
+        # code only — so a legacy wrong-region entry self-corrects.
+        try:
+            self._conn.execute(
+                "UPDATE meters SET postcode_source = 'user' "
+                "WHERE postcode_prefix IS NOT NULL AND postcode_source IS NULL")
+            self._conn.commit()
+        except Exception:
+            pass  # column not present yet on a very old shape — migrate handles it
 
         # ── 3.0.0: backfill per-channel rate / standing-charge source ─────────
         # Pre-3.0.0 (v2) configs predate the explicit "API vs sensor" toggles.
@@ -1096,6 +1253,9 @@ class BlockStore:
             "SELECT DISTINCT block_start FROM blocks "
             "WHERE carbon_intensity_g IS NULL "
             "  AND (imp_kwh IS NOT NULL OR exp_kwh IS NOT NULL) "
+            # 3.5.0: skip reconstructed history — carbon for years-old imported
+            # blocks is low value and its bulk backfill stalls the engine loop.
+            "  AND (source IS NULL OR source NOT LIKE 'imported%') "
             "ORDER BY block_start"
         )
         if limit is not None:
@@ -1105,17 +1265,31 @@ class BlockStore:
         return [r["block_start"]
                 for r in self._conn.execute(sql).fetchall()]
 
+    # Region-eligibility for carbon backfill: a live/reconstructed block is always
+    # eligible; an IMPORTED block is eligible only once its config period has a
+    # known region (postcode_prefix). Imported blocks without a region stay NULL
+    # (excluded) rather than being attributed to a guessed region.
+    _CARBON_ELIGIBLE = (
+        "((blocks.source IS NULL OR blocks.source NOT LIKE 'imported%') "
+        " OR EXISTS (SELECT 1 FROM meters m "
+        "            WHERE m.config_period_id = blocks.config_period_id "
+        "              AND m.is_sub_meter = 0 "
+        "              AND m.postcode_prefix IS NOT NULL))"
+    )
+
     def get_missing_carbon_date_range(self) -> tuple | None:
         """(min_block_start, max_block_start) over energy-bearing blocks whose
-        carbon_intensity_g IS NULL. None when there are no such blocks.
+        carbon_intensity_g IS NULL AND that are region-eligible (see
+        _CARBON_ELIGIBLE). None when there are no such blocks.
 
-        Bounds the historical carbon backfill (the v2->v3 migration): every block
-        before CI first became available carries a NULL intensity, and this is the
-        span the backfill must page the Carbon Intensity API over."""
+        Bounds the historical carbon backfill: every block before CI first became
+        available carries a NULL intensity; imported history joins the span once
+        its period's region is known."""
         row = self._conn.execute(
             "SELECT MIN(block_start) AS lo, MAX(block_start) AS hi FROM blocks "
             "WHERE carbon_intensity_g IS NULL "
-            "  AND (imp_kwh IS NOT NULL OR exp_kwh IS NOT NULL)"
+            "  AND (imp_kwh IS NOT NULL OR exp_kwh IS NOT NULL) "
+            "  AND " + self._CARBON_ELIGIBLE
         ).fetchone()
         if row and row["lo"] and row["hi"]:
             return (row["lo"], row["hi"])
@@ -1124,12 +1298,14 @@ class BlockStore:
     def get_block_starts_missing_carbon_in_range(
         self, from_iso: str, to_iso: str, limit: Optional[int] = None
     ) -> list:
-        """Distinct NULL-carbon block_start values within [from_iso, to_iso),
-        oldest-first. Used per fetched window by the historical backfill."""
+        """Distinct NULL-carbon, region-eligible block_start values within
+        [from_iso, to_iso), oldest-first. Used per fetched window by the
+        historical backfill."""
         sql = (
             "SELECT DISTINCT block_start FROM blocks "
             "WHERE carbon_intensity_g IS NULL "
             "  AND (imp_kwh IS NOT NULL OR exp_kwh IS NOT NULL) "
+            "  AND " + self._CARBON_ELIGIBLE + " "
             "  AND block_start >= ? AND block_start < ? "
             "ORDER BY block_start"
         )
@@ -1139,6 +1315,38 @@ class BlockStore:
             params.append(limit)
         return [r["block_start"]
                 for r in self._conn.execute(sql, params).fetchall()]
+
+    def extend_earliest_period_to(self, block_start_iso: str) -> bool:
+        """Move the earliest config period's `effective_from` back to cover
+        imported history that predates it (snapped to local midnight). ONLY ever
+        extends backward — never shrinks. Keeps imported blocks inside a period
+        that temporally covers them and makes Billing history show the real data
+        start rather than the go-live date. Returns True if it changed anything."""
+        if not block_start_iso:
+            return False
+        row = self._conn.execute(
+            "SELECT id, effective_from, timezone FROM config_periods "
+            "ORDER BY effective_from ASC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return False
+        snapped = self._snap_to_midnight_utc(block_start_iso, row["timezone"] or "UTC")
+        if snapped >= row["effective_from"]:
+            return False   # already covers it (or would shrink) — no-op
+        with self._conn:
+            self._conn.execute(
+                "UPDATE config_periods SET effective_from = ? WHERE id = ?",
+                (snapped, row["id"]))
+        logger.info("extend_earliest_period_to: period %d effective_from %s -> %s",
+                    row["id"], row["effective_from"], snapped)
+        return True
+
+    def rearm_carbon_backfill(self) -> None:
+        """Clear the historical-carbon backfill marker so the next scheduler tick
+        re-scans from scratch. Called when a region is newly assigned to a period
+        (reconcile / manual edit / one-time probe), which makes previously
+        region-unknown imported blocks eligible for carbon."""
+        self.set_meta("carbon_backfill_state", {})
 
     def prune_carbon_intensity(self, days: int = 4) -> int:
         """Delete carbon_intensity rows older than `days` days. Returns rows deleted."""
@@ -1696,11 +1904,19 @@ class BlockStore:
         ids.extend(r["meter_id"] for r in cur.fetchall())
         return list(dict.fromkeys(ids))
 
-    def _block_range_where(self, utc_start, utc_end, from_time, to_time, meter_ids):
+    def _block_range_where(self, utc_start, utc_end, from_time, to_time, meter_ids,
+                           reconstructed_only=False):
         """Build the shared WHERE clause + params for block date-range
-        delete/preview. `meter_ids` is None (all meters) or a list of ids."""
+        delete/preview. `meter_ids` is None (all meters) or a list of ids.
+
+        `reconstructed_only` restricts to historical-import blocks
+        (`source LIKE 'imported%'`), so a bad import can be rolled back without
+        touching native live/kraken data."""
         clauses = ["block_start >= ?", "block_start < ?"]
         params  = [utc_start, utc_end]
+
+        if reconstructed_only:
+            clauses.append("source LIKE 'imported%'")
 
         if from_time != "00:00" and to_time != "23:59":
             if from_time <= to_time:
@@ -1748,12 +1964,16 @@ class BlockStore:
 
     def delete_blocks_for_date_range(
         self, from_date: str, to_date: str, meter_id: str | None = None,
-        from_time: str = "00:00", to_time: str = "23:59", tz_name: str = "UTC"
+        from_time: str = "00:00", to_time: str = "23:59", tz_name: str = "UTC",
+        reconstructed_only: bool = False
     ) -> dict:
         """
         Delete all blocks within [from_date, to_date] local date range (inclusive),
         optionally restricted by time-of-day (UTC HH:MM) and/or to a single meter
         (which also pulls in that meter's sub-meters — see _resolve_delete_meters).
+
+        `reconstructed_only=True` limits the delete to historical-import blocks
+        (`source LIKE 'imported%'`) — the reconstructed-history rollback filter.
 
         Cascades to the rows that reference the deleted blocks: `reads` (FK
         block_id, deleted first so foreign_keys=ON can't error) and
@@ -1775,7 +1995,7 @@ class BlockStore:
 
         meter_ids = self._resolve_delete_meters(meter_id)
         where, params = self._block_range_where(
-            utc_start, utc_end, from_time, to_time, meter_ids
+            utc_start, utc_end, from_time, to_time, meter_ids, reconstructed_only
         )
 
         n_blocks, n_dates = self._count_blocks_and_local_dates(where, params, tz_name)
@@ -1848,12 +2068,14 @@ class BlockStore:
 
     def count_blocks_for_date_range(
         self, from_date: str, to_date: str, meter_id: str | None = None,
-        from_time: str = "00:00", to_time: str = "23:59", tz_name: str = "UTC"
+        from_time: str = "00:00", to_time: str = "23:59", tz_name: str = "UTC",
+        reconstructed_only: bool = False
     ) -> dict:
         """
         Preview how many blocks delete_blocks_for_date_range would remove, using
         the identical meter resolution (sentinel + sub-meter inclusion) and WHERE
-        clause so the preview can never disagree with the delete.
+        clause so the preview can never disagree with the delete. Honours
+        `reconstructed_only` identically to the delete.
         Returns {"blocks": N, "dates": N_distinct_dates}.
         """
         from_time = from_time or "00:00"
@@ -1862,12 +2084,591 @@ class BlockStore:
         utc_start, utc_end = local_date_range_to_utc_bounds(from_date, to_date, tz_name)
         meter_ids = self._resolve_delete_meters(meter_id)
         where, params = self._block_range_where(
-            utc_start, utc_end, from_time, to_time, meter_ids
+            utc_start, utc_end, from_time, to_time, meter_ids, reconstructed_only
         )
 
         n_blocks, n_dates = self._count_blocks_and_local_dates(where, params, tz_name)
         return {"blocks": n_blocks, "dates": n_dates}
 
+    def count_imported_history(self) -> dict:
+        """How much historical-import data exists: block count + date span."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n, MIN(block_start) AS lo, MAX(block_start) AS hi "
+            "FROM blocks WHERE source LIKE 'imported%'"
+        ).fetchone()
+        return {"blocks": (row["n"] or 0) if row else 0,
+                "from": row["lo"] if row else None,
+                "to":   row["hi"] if row else None}
+
+    def purge_imported_history(self) -> dict:
+        """The get-out-clause: remove ALL historical-import data and everything
+        derived from it, returning the account to its live-only state so a fresh
+        import can start clean.
+
+        Removes: imported blocks (``source LIKE 'imported%'`` — WHOLE blocks, all
+        channels, so no per-meter apportionment is left stale) and their `reads` /
+        `generation_mix`; the CSV/API **rate derivations**; and the import
+        **checkpoints + gap records** in `kraken_state`. Also clears any pending
+        region-reconcile prompt and re-arms the carbon backfill. Live/CAD/settled
+        blocks are untouched — imports never overlap them (go-live ceiling).
+        """
+        info = self.count_imported_history()
+        with self._conn:
+            reads = self._conn.execute(
+                "DELETE FROM reads WHERE block_id IN "
+                "(SELECT id FROM blocks WHERE source LIKE 'imported%')").rowcount
+            mix = self._conn.execute(
+                "DELETE FROM generation_mix WHERE block_id IN "
+                "(SELECT id FROM blocks WHERE source LIKE 'imported%')").rowcount
+            self._conn.execute("DELETE FROM blocks WHERE source LIKE 'imported%'")
+            derivs = self._conn.execute(
+                "DELETE FROM historical_derivation WHERE source LIKE 'imported%'").rowcount
+            try:
+                self._conn.execute(
+                    "DELETE FROM kraken_state WHERE key IN "
+                    "('api_import_oldest_import','api_import_done_import',"
+                    " 'api_import_oldest_export','api_import_done_export',"
+                    " 'import_gaps_import','import_gaps_export')")
+            except Exception:
+                pass   # table/keys absent → nothing to reset
+        # Clear the post-import region prompt and let carbon re-scan the survivors.
+        self.set_meta("region_reconcile_pending", None)
+        self.rearm_carbon_backfill()
+        logger.info("purge_imported_history: removed %d block(s), %d derivation(s)",
+                    info["blocks"], derivs)
+        return {"blocks": info["blocks"], "reads": reads, "generation_mix": mix,
+                "derivations": derivs, "from": info["from"], "to": info["to"]}
+
+    # ── 3.5.0 Historical-import derivation provenance ─────────────────────────
+
+    @staticmethod
+    def _row_to_derivation(row) -> dict:
+        """sqlite Row → dict, decoding the JSON columns (sensor_ids, params)."""
+        d = dict(row)
+        for k in ("sensor_ids", "params"):
+            v = d.get(k)
+            if v:
+                try:
+                    d[k] = json.loads(v)
+                except (ValueError, TypeError):
+                    pass  # leave raw string if it isn't valid JSON
+        return d
+
+    def insert_historical_derivation(
+        self, scope: str, period_from: str, period_to: str, *,
+        subject: str | None = None, sensor_ids=None, sensor_kind: str | None = None,
+        params=None, derived_value: float | None = None,
+        confirmed_value: float | None = None, method_version: int = 1,
+        derived_at: str | None = None, source: str | None = None,
+        notes: str | None = None,
+    ) -> int:
+        """Record one reconstruction (a device-attribution span, or a rate for a
+        tariff-period×tier) and return its id. `sensor_ids`/`params` may be lists
+        or dicts (stored as JSON). Pure insert — linking blocks is a separate
+        step (tag_blocks_with_derivation)."""
+        if scope not in ("device_attribution", "rate"):
+            raise ValueError(f"invalid derivation scope: {scope!r}")
+        cur = self._conn.execute(
+            """INSERT INTO historical_derivation
+                 (scope, subject, period_from, period_to, sensor_ids, sensor_kind,
+                  params, derived_value, confirmed_value, method_version,
+                  derived_at, source, superseded_by, notes)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)""",
+            (scope, subject, period_from, period_to,
+             json.dumps(sensor_ids) if sensor_ids is not None else None,
+             sensor_kind,
+             json.dumps(params) if params is not None else None,
+             derived_value, confirmed_value, int(method_version),
+             derived_at or _utc_now_iso(), source, notes),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    def get_historical_derivation(self, derivation_id: int) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM historical_derivation WHERE id = ?",
+            (derivation_id,)).fetchone()
+        return self._row_to_derivation(row) if row else None
+
+    def list_historical_derivations(
+        self, *, scope: str | None = None, subject: str | None = None,
+        current_only: bool = True,
+    ) -> list[dict]:
+        """List derivations, newest first. `current_only` hides superseded rows
+        (the audit trail is kept, not deleted)."""
+        clauses, params = [], []
+        if scope:
+            clauses.append("scope = ?"); params.append(scope)
+        if subject is not None:
+            clauses.append("subject = ?"); params.append(subject)
+        if current_only:
+            clauses.append("superseded_by IS NULL")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM historical_derivation{where} "
+            "ORDER BY derived_at DESC, id DESC", params).fetchall()
+        return [self._row_to_derivation(r) for r in rows]
+
+    def supersede_historical_derivation(self, old_id: int, new_id: int) -> None:
+        """Mark `old_id` replaced by `new_id` (rebuild). Keeps the old row for
+        audit; list_historical_derivations(current_only=True) then hides it."""
+        self._conn.execute(
+            "UPDATE historical_derivation SET superseded_by = ? WHERE id = ?",
+            (new_id, old_id))
+        self._conn.commit()
+
+    def tag_blocks_with_derivation(
+        self, derivation_id: int, meter_id: str, period_from: str, period_to: str,
+    ) -> int:
+        """Point a meter's blocks in [period_from, period_to) at a derivation.
+        Returns the number of blocks tagged. Used after writing reconstructed
+        blocks so each can answer 'which sensor/rate produced this'."""
+        cur = self._conn.execute(
+            """UPDATE blocks SET derivation_id = ?
+               WHERE meter_id = ? AND block_start >= ? AND block_start < ?""",
+            (derivation_id, meter_id, period_from, period_to))
+        self._conn.commit()
+        return cur.rowcount
+
+    def _imported_config_period_id(self, block_start: str):
+        """Config period id for a reconstructed block: the covering period, or —
+        for pre-EMT dates no live period covers — the OLDEST existing period (for
+        its timezone/billing-day/block_minutes). Returns (id, block_minutes) or
+        (None, 30)."""
+        cp = self.get_config_period_for_date(block_start)
+        if not cp:
+            row = self._conn.execute(
+                "SELECT id, block_minutes FROM config_periods "
+                "ORDER BY effective_from ASC LIMIT 1").fetchone()
+            if not row:
+                return None, 30
+            return row["id"], int(row["block_minutes"] or 30)
+        return cp["id"], int(cp.get("block_minutes") or 30)
+
+    def upsert_imported_block(
+        self, block_start: str, meter_id: str, channel: str, *,
+        kwh: float, rate: float | None, cost: float | None,
+        standing: float | None = None, source: str = IMPORTED_SOURCE_CSV,
+        derivation_id: int | None = None,
+    ) -> Optional[int]:
+        """Insert-or-merge one reconstructed block for a single channel.
+
+        Import and export for the same (block_start, meter_id) share ONE row
+        (UNIQUE constraint); each call fills only its channel's columns, so a
+        second-channel call never clears the first. `cost` is stored inc-VAT in £
+        (billing sums it directly), `rate` is £/kWh, `standing` is the day's
+        charge (once-per-day billing picks the start-of-day value). `interpolated`
+        stays 0 — the CSV house figure is exact, not approximate; `source` marks
+        it reconstructed. Returns the block id."""
+        kcol, rcol, ccol = (("imp_kwh", "imp_rate", "imp_cost") if channel == "import"
+                            else ("exp_kwh", "exp_rate", "exp_cost"))
+        cp_id, bm = self._imported_config_period_id(block_start)
+        if cp_id is None:
+            return None
+        try:
+            block_end = (datetime.fromisoformat(block_start)
+                         + timedelta(minutes=bm)).isoformat()
+        except ValueError:
+            return None
+        with self._conn:
+            cur = self._conn.execute(
+                f"""INSERT INTO blocks
+                      (block_start, block_end, meter_id, config_period_id,
+                       interpolated, {kcol}, {rcol}, {ccol}, standing_charge,
+                       source, derivation_id)
+                    VALUES (?,?,?,?,0,?,?,?,?,?,?)
+                    ON CONFLICT(block_start, meter_id) DO UPDATE SET
+                       {kcol} = excluded.{kcol},
+                       {rcol} = excluded.{rcol},
+                       {ccol} = excluded.{ccol},
+                       standing_charge = CASE
+                           WHEN excluded.standing_charge IS NULL
+                                OR excluded.standing_charge = 0
+                                THEN blocks.standing_charge   -- export (0) never clobbers
+                           WHEN blocks.source LIKE 'imported%'
+                                OR blocks.standing_charge IS NULL
+                                OR blocks.standing_charge = 0
+                           THEN excluded.standing_charge ELSE blocks.standing_charge END,
+                       source = excluded.source,
+                       derivation_id = COALESCE(blocks.derivation_id, excluded.derivation_id)""",
+                (block_start, block_end, meter_id, cp_id,
+                 kwh, rate, cost, (standing or 0.0), source, derivation_id))
+            row = self._conn.execute(
+                "SELECT id FROM blocks WHERE block_start = ? AND meter_id = ?",
+                (block_start, meter_id)).fetchone()
+        return row["id"] if row else cur.lastrowid
+
+    def upsert_imported_blocks(
+        self, rows: list, meter_id: str, channel: str, *,
+        source: str = IMPORTED_SOURCE_CSV, derivation_id: int | None = None,
+    ) -> int:
+        """Bulk insert-or-merge reconstructed blocks for one channel in a SINGLE
+        transaction (one commit for the whole batch), returning the count written.
+
+        This is the hot path for the API import: committing per block (thousands
+        of fsyncs) blocks the async event loop long enough to starve the HA
+        WebSocket heartbeat → reconnect storm. One transaction per chunk fixes it.
+        `rows`: list of {start, kwh, rate, cost, standing}. Same per-channel merge
+        semantics as upsert_imported_block; config-period id is cached per day."""
+        kcol, rcol, ccol = (("imp_kwh", "imp_rate", "imp_cost") if channel == "import"
+                            else ("exp_kwh", "exp_rate", "exp_cost"))
+        sql = (f"""INSERT INTO blocks
+                     (block_start, block_end, meter_id, config_period_id,
+                      interpolated, {kcol}, {rcol}, {ccol}, standing_charge,
+                      source, derivation_id)
+                   VALUES (?,?,?,?,0,?,?,?,?,?,?)
+                   ON CONFLICT(block_start, meter_id) DO UPDATE SET
+                      {kcol} = excluded.{kcol},
+                      {rcol} = excluded.{rcol},
+                      {ccol} = excluded.{ccol},
+                      standing_charge = CASE
+                          WHEN excluded.standing_charge IS NULL
+                               OR excluded.standing_charge = 0
+                               THEN blocks.standing_charge   -- export (0) never clobbers
+                          WHEN blocks.source LIKE 'imported%'
+                               OR blocks.standing_charge IS NULL
+                               OR blocks.standing_charge = 0
+                          THEN excluded.standing_charge ELSE blocks.standing_charge END,
+                      source = excluded.source,
+                      derivation_id = COALESCE(blocks.derivation_id, excluded.derivation_id)""")
+        cp_cache: dict = {}
+        written = 0
+        with self._conn:      # ONE transaction / one commit for the whole batch
+            for r in rows:
+                start = r.get("start")
+                if not start:
+                    continue
+                day = start[:10]
+                if day not in cp_cache:
+                    cp_cache[day] = self._imported_config_period_id(start)
+                cp_id, bm = cp_cache[day]
+                if cp_id is None:
+                    continue
+                try:
+                    block_end = (datetime.fromisoformat(start)
+                                 + timedelta(minutes=bm)).isoformat()
+                except ValueError:
+                    continue
+                self._conn.execute(sql, (
+                    start, block_end, meter_id, cp_id,
+                    r.get("kwh") or 0.0, r.get("rate"), r.get("cost"),
+                    (r.get("standing") or 0.0), source, derivation_id))
+                written += 1
+        return written
+
+    # ── Import re-price repair queue ─────────────────────────────────────────
+    # During the bulk import, some Measurements responses come back with the kWh
+    # but no billed cost / TOU bucket (a degraded/partial response under load),
+    # so those half-hours are priced from the tariff *schedule* (peak if they fall
+    # outside the fixed off-peak window) instead of Octopus's real dispatch-aware
+    # OFF_PEAK cost. We record each such slot here; a calm, targeted re-fetch
+    # (engine.repair_import_pricing) later re-queries just these and re-prices in
+    # place. The Measurements API DOES have the cost — proven by the cost probe —
+    # so a small quiet query reliably returns it.
+    def add_reprice_queue(self, channel: str, starts) -> None:
+        """Queue imported block_starts (for `channel`) that were schedule-priced
+        because Measurements returned no billed cost. Deduped, persisted in meta."""
+        starts = [s for s in (starts or []) if s]
+        if not starts:
+            return
+        q = self.get_meta("import_reprice_queue", None) or {}
+        merged = set(q.get(channel) or []) | set(starts)
+        q[channel] = sorted(merged)
+        self.set_meta("import_reprice_queue", q)
+
+    def get_reprice_queue(self) -> dict:
+        """{'import': [start,...], 'export': [...]} of slots awaiting re-price."""
+        return self.get_meta("import_reprice_queue", None) or {}
+
+    def reprice_queue_count(self) -> int:
+        q = self.get_reprice_queue()
+        return sum(len(v or []) for v in q.values())
+
+    def clear_reprice_queue_slots(self, channel: str, starts) -> None:
+        """Remove `starts` from the channel's queue (they've been re-priced)."""
+        if not starts:
+            return
+        q = self.get_meta("import_reprice_queue", None) or {}
+        if channel not in q:
+            return
+        remaining = sorted(set(q[channel]) - set(starts))
+        if remaining:
+            q[channel] = remaining
+        else:
+            q.pop(channel, None)
+        self.set_meta("import_reprice_queue", q)
+
+    def reprice_imported_block(self, start: str, meter_id: str, channel: str,
+                               rate, cost) -> bool:
+        """Update an IMPORTED block's rate + cost in place (source LIKE
+        'imported%' only — never touches live/settled rows), ONLY when the value
+        actually differs (so the returned rowcount = a genuine correction, which
+        the repair pass uses as its 'recovered' signal). Returns True if changed."""
+        rcol, ccol = (("imp_rate", "imp_cost") if channel == "import"
+                      else ("exp_rate", "exp_cost"))
+        with self._conn:
+            cur = self._conn.execute(
+                f"UPDATE blocks SET {rcol} = ?, {ccol} = ? "
+                f"WHERE block_start = ? AND meter_id = ? AND source LIKE 'imported%' "
+                f"AND (COALESCE({rcol}, -1) != ? OR COALESCE({ccol}, -1) != ?)",
+                (rate, cost, start, meter_id, rate, cost))
+        return cur.rowcount > 0
+
+    def set_block_carbon(self, block_start: str, meter_id: str,
+                         intensity_g, carbon_g) -> bool:
+        """Write carbon IN PLACE for one block+meter — a targeted UPDATE of only
+        the carbon columns. Critically it does NOT round-trip the whole row: the
+        read→mutate→append_block_replace path drops `source` (and imp_kwh_api /
+        is_provisional / derivation_id, and re-homes config_period_id), which
+        silently untagged every imported block the carbon backfill touched. This
+        preserves the tag and everything else. Returns True if a row changed."""
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE blocks SET carbon_intensity_g = ?, carbon_g = ? "
+                "WHERE block_start = ? AND meter_id = ?",
+                (intensity_g, carbon_g, block_start, meter_id))
+        return cur.rowcount > 0
+
+    def retag_untagged_imports(self) -> dict:
+        """Repair blocks the carbon round-trip bug wiped from 'imported_api' to
+        NULL. Anchor go-live to the earliest LIVE-signature block (a real meter
+        read, or a kraken_api source); anything BEFORE it that is NULL-source with
+        no meter read is reconstruction, so re-tag it 'imported_api'. Never touches
+        live/settled rows. Idempotent. Returns {retagged, go_live}."""
+        row = self._conn.execute(
+            "SELECT MIN(block_start) AS gl FROM blocks "
+            "WHERE imp_read_start IS NOT NULL OR source = 'kraken_api'").fetchone()
+        go_live = row["gl"] if row else None
+        if not go_live:
+            return {"retagged": 0, "go_live": None}
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE blocks SET source = 'imported_api' "
+                "WHERE source IS NULL AND block_start < ? AND imp_read_start IS NULL",
+                (go_live,))
+        logger.info("retag_untagged_imports: re-tagged %d block(s) before go-live %s",
+                    cur.rowcount, go_live)
+        return {"retagged": cur.rowcount, "go_live": go_live}
+
+    def sweep_implausible_sub_blocks(self, *, max_kw: float = 120.0,
+                                     dry_run: bool = True) -> dict:
+        """One-off repair for the #307 lost-opener spike: a device sub-meter whose
+        OPENING register read was lost/zeroed booked its whole lifetime register as
+        one interval (prod: house_battery read_start=0 / read_end=6137 → 6137 kWh in
+        a half-hour, whose carbon = 6137×intensity dwarfed the real total).
+
+        Physically impossible: no domestic device moves > `max_kw`. Any sub-meter
+        block whose imp_kwh exceeds the block's ceiling (`block_minutes/60 × max_kw`;
+        120 kW → 60 kWh for a half-hour) is a lost-opener glitch. For each:
+          • set imp_kwh = imp_kwh_grid (the PASS-2 grid-clipped, house-bounded value
+            — the only trustworthy part; the glitch lives in the remainder), and
+            BASELINE imp_read_start onto imp_read_end so the register stays continuous
+            (the next block still opens at the true register);
+          • zero imp_kwh_remainder; recompute carbon_g from the corrected kWh;
+          • flag needs_review = 1 with a reason.
+        LEAVES imp_kwh_grid and imp_cost UNTOUCHED — the grid clip already bounded them
+        to the correct house import, so billing/cost is unaffected.
+
+        dry_run=True previews only. Returns {count, ceiling_kwh, applied, blocks:[...]}.
+        """
+        row = self._conn.execute(
+            "SELECT block_minutes FROM config_periods "
+            "ORDER BY effective_from DESC LIMIT 1").fetchone()
+        block_minutes = (row["block_minutes"] if row and row["block_minutes"] else 30)
+        ceiling = round(block_minutes / 60.0 * float(max_kw), 3)
+        subs = [r["meter_id"] for r in self._conn.execute(
+            "SELECT DISTINCT meter_id FROM meters WHERE parent_meter_id IS NOT NULL")]
+        if not subs:
+            return {"count": 0, "ceiling_kwh": ceiling, "applied": False, "blocks": []}
+        ph = ",".join("?" * len(subs))
+        rows = self._conn.execute(
+            f"SELECT block_start, meter_id, imp_kwh, imp_kwh_grid, imp_read_start, "
+            f"       imp_read_end, carbon_g, carbon_intensity_g "
+            f"FROM blocks WHERE meter_id IN ({ph}) AND imp_kwh > ? "
+            f"ORDER BY imp_kwh DESC", (*subs, ceiling)).fetchall()
+        preview = [{"block_start": r["block_start"], "meter_id": r["meter_id"],
+                    "imp_kwh": r["imp_kwh"],
+                    "corrected_kwh": r["imp_kwh_grid"] or 0.0,
+                    "read_start": r["imp_read_start"], "read_end": r["imp_read_end"],
+                    "carbon_g": r["carbon_g"]} for r in rows]
+        if not dry_run and rows:
+            with self._conn:
+                self._conn.execute(
+                    f"UPDATE blocks SET "
+                    f"  imp_kwh = COALESCE(imp_kwh_grid, 0), "
+                    f"  imp_read_start = COALESCE(imp_read_end, imp_read_start), "
+                    f"  imp_kwh_remainder = 0, "
+                    f"  carbon_g = ROUND(COALESCE(imp_kwh_grid, 0) "
+                    f"                   * COALESCE(carbon_intensity_g, 0), 4), "
+                    f"  needs_review = 1, "
+                    f"  review_reason = 'implausible sub-meter kWh clamped "
+                    f"(#307 lost opener)' "
+                    f"WHERE meter_id IN ({ph}) AND imp_kwh > ?", (*subs, ceiling))
+        logger.info("sweep_implausible_sub_blocks: %s %d block(s) over %.1f kWh "
+                    "ceiling (%d kW × %d min)",
+                    "clamped" if (not dry_run and rows) else "previewed",
+                    len(rows), ceiling, int(max_kw), block_minutes)
+        return {"count": len(rows), "ceiling_kwh": ceiling,
+                "applied": bool(not dry_run and rows), "blocks": preview}
+
+    def reprice_imported_blocks_from_csv(self, csv_text: str,
+                                         meter_id: str = "electricity_main",
+                                         channel: str = "import") -> dict:
+        """Overlay EXACT billed cost + rate onto imported blocks from an Octopus
+        CSV export — the billing source of truth. For dispatch slots Octopus's
+        Measurements API returns with NO cost/label (so they can't be priced via
+        the API, only via the bill), this is the only way to match the bill: for
+        every CSV half-hour, set the block's cost = the CSV cost and rate =
+        cost/kWh. The CSV 'Estimated Cost Inc. Tax' column is pence inc-VAT, which
+        is exactly EMT's stored convention (£ inc-VAT). Only imported blocks are
+        touched, only where the value differs. Returns {checked, changed, from, to}.
+        """
+        import csv as _csv
+        import io as _io
+        from datetime import datetime as _dt, timezone as _tz
+        rcol, ccol = (("imp_rate", "imp_cost") if channel == "import"
+                      else ("exp_rate", "exp_cost"))
+        checked = changed = 0
+        lo = hi = None
+        changed_starts = []
+        reader = _csv.reader(_io.StringIO(csv_text))
+        next(reader, None)                        # header
+        with self._conn:
+            for row in reader:
+                if not row or not str(row[0]).strip():
+                    continue
+                try:
+                    kwh = float(row[0]); cost_p = float(row[1]); start_local = str(row[3]).strip()
+                    utc = (_dt.fromisoformat(start_local).astimezone(_tz.utc)
+                           .strftime("%Y-%m-%dT%H:%M:%S"))
+                except (IndexError, ValueError):
+                    continue
+                cost = round(cost_p / 100.0, 6)
+                rate = round(cost / kwh, 6) if kwh > 0 else None
+                checked += 1
+                lo = utc if (lo is None or utc < lo) else lo
+                hi = utc if (hi is None or utc > hi) else hi
+                cur = self._conn.execute(
+                    f"UPDATE blocks SET {rcol} = ?, {ccol} = ? "
+                    f"WHERE block_start = ? AND meter_id = ? AND source LIKE 'imported%' "
+                    f"AND (COALESCE({rcol}, -1) != ? OR COALESCE({ccol}, -1) != ?)",
+                    (rate, cost, utc, meter_id, rate, cost))
+                if cur.rowcount > 0:
+                    changed += 1
+                    changed_starts.append(utc)
+        if changed_starts:
+            self.clear_reprice_queue_slots(channel, changed_starts)
+        logger.info("reprice_imported_blocks_from_csv[%s]: %d changed of %d (%s..%s)",
+                    channel, changed, checked, lo, hi)
+        return {"checked": checked, "changed": changed, "from": lo, "to": hi}
+
+    def get_imported_block_starts(self, from_iso: str, to_iso: str,
+                                  meter_id: str = "electricity_main") -> list:
+        """block_starts of IMPORTED blocks in [from, to) for a meter — the target
+        set for a range-based re-price reconcile that runs WITHOUT a re-import."""
+        rows = self._conn.execute(
+            "SELECT block_start FROM blocks WHERE source LIKE 'imported%' "
+            "AND meter_id = ? AND block_start >= ? AND block_start < ? "
+            "ORDER BY block_start", (meter_id, from_iso, to_iso)).fetchall()
+        return [r["block_start"] for r in rows]
+
+    def apply_csv_import(
+        self, channel_csvs: dict, meter_id: str = "electricity_main", *,
+        periods_by_channel: dict | None = None, overrides: dict | None = None,
+    ) -> dict:
+        """Parse Octopus per-channel CSV(s), derive rates (rate-from-cost), and
+        write reconstructed `imported_csv` blocks + one `rate` derivation per
+        (channel, tariff period). `channel_csvs` = {'import': csv_text, 'export':
+        csv_text}. `periods_by_channel` (optional) = {channel: [(from,to),...]}
+        agreement bounds; None ⇒ one period per channel.
+
+        `overrides` (optional) carries the wizard's user-confirmed rates:
+        {channel: {period_index(str): {tier_label: rate}}}. A tier's override
+        replaces the derived aggregate for its blocks and is stored as the
+        derivation's confirmed_value.
+
+        Import is written before export so both settle onto the shared row.
+        Returns a per-channel summary with blocks written, period rate derivations,
+        and the re-price-vs-CSV-cost reconciliation."""
+        import csv_import as _ci
+        periods_by_channel = periods_by_channel or {}
+        overrides = overrides or {}
+        out: dict = {"ok": True, "meter_id": meter_id, "channels": {},
+                     "span": {"from": None, "to": None}}
+        # Import first (house figure) so export merges onto existing rows.
+        for channel in ("import", "export"):
+            text = channel_csvs.get(channel)
+            if not text:
+                continue
+            parsed = _ci.parse_octopus_csv(text, channel)
+            if not parsed["ok"]:
+                out["channels"][channel] = {"ok": False, "errors": parsed["errors"]}
+                continue
+            blocks = parsed["blocks"]
+            if blocks:
+                cf = blocks[0]["block_start"]
+                ct = blocks[-1].get("block_end") or blocks[-1]["block_start"]
+                if out["span"]["from"] is None or cf < out["span"]["from"]:
+                    out["span"]["from"] = cf
+                if out["span"]["to"] is None or ct > out["span"]["to"]:
+                    out["span"]["to"] = ct
+            deriv = _ci.derive_rates(blocks, periods=periods_by_channel.get(channel))
+            ch_ov = overrides.get(channel, {}) or {}
+
+            # One rate derivation per tariff period; blocks link to theirs.
+            period_meta = []            # (from, to, derivation_id, tier_override_map)
+            for i, p in enumerate(deriv["periods"]):
+                ov_i = {k: float(v) for k, v in (ch_ov.get(str(i)) or {}).items()}
+                tiers = [dict(t) for t in (p.get("tiers") or [])]
+                for t in tiers:                       # fold confirmations into params
+                    if t.get("label") in ov_i:
+                        t["confirmed_rate"] = ov_i[t["label"]]
+                derived_primary = min((t["rate"] for t in tiers if t.get("rate") is not None),
+                                      default=None)
+                confirmed_primary = min(ov_i.values()) if ov_i else None
+                did = self.insert_historical_derivation(
+                    "rate", p["from"], p["to"], subject=channel,
+                    params={"kind": p["kind"], "tiers": tiers,
+                            "standing_daily": p.get("standing_daily")},
+                    derived_value=derived_primary, confirmed_value=confirmed_primary,
+                    source=IMPORTED_SOURCE_CSV, notes="rate-from-cost (CSV import)")
+                period_meta.append((p["from"], p["to"], did, ov_i))
+
+            def _period_for(start):
+                for f, t, d, ov in period_meta:
+                    if f <= start < t:
+                        return d, ov
+                return (period_meta[-1][2], period_meta[-1][3]) if period_meta else (None, {})
+
+            # Standing charge is per-day (sum the per-interval apportioned column).
+            day_standing: dict = {}
+            for b in blocks:
+                day_standing[b["block_start"][:10]] = (
+                    day_standing.get(b["block_start"][:10], 0.0) + (b.get("standing") or 0.0))
+
+            written = 0
+            eff_flags: dict = {}        # for reconciliation with confirmed rates
+            for b in blocks:
+                flag = deriv["flags"].get(b["block_start"]) or {}
+                did, ov = _period_for(b["block_start"])
+                rate = ov.get(flag.get("tier"), flag.get("rate"))
+                eff_flags[b["block_start"]] = {"tier": flag.get("tier"), "rate": rate}
+                bid = self.upsert_imported_block(
+                    b["block_start"], meter_id, channel,
+                    kwh=b["kwh"], rate=rate, cost=b.get("cost"),
+                    standing=day_standing.get(b["block_start"][:10]),
+                    derivation_id=did)
+                if bid is not None:
+                    written += 1
+
+            out["channels"][channel] = {
+                "ok": True, "blocks_written": written,
+                "period_derivations": [d for _f, _t, d, _o in period_meta],
+                "off_peak_kwh": deriv["off_peak_kwh"], "peak_kwh": deriv["peak_kwh"],
+                "reconcile": _ci.reconcile(blocks, eff_flags),
+                "parse_errors": parsed["errors"],
+            }
+        return out
 
     def backup(self, dst_path: str) -> None:
         """Hot backup to dst_path using SQLite's online backup API."""
@@ -2038,20 +2839,30 @@ class BlockStore:
             "SELECT * FROM blocks WHERE id = ?", (block_id,)
         ).fetchone()
 
-    def get_oldest_block_start(self, meter_id: Optional[str] = None) -> Optional[str]:
+    def get_oldest_block_start(self, meter_id: Optional[str] = None,
+                               *, exclude_imported: bool = False) -> Optional[str]:
         """Return the earliest block_start in the store, or None if empty.
 
         Drives the data-driven backfill window: the ingester fetches DCC from
         this point to now (capped). Backfilling earlier than the oldest block
         is pointless — upsert_kraken_block would only return missing_block.
+
+        `exclude_imported=True` ignores reconstructed/imported blocks
+        (source LIKE 'imported%'), so the historical-import "go-live" ceiling is
+        where LIVE recording actually began — not wherever a previous partial
+        import happened to write. Without this a partial import lowers the
+        ceiling below its own gap, and the gap can never be topped up.
         """
+        where = []
+        params: list = []
         if meter_id:
-            row = self._conn.execute(
-                "SELECT MIN(block_start) AS m FROM blocks WHERE meter_id = ?",
-                (meter_id,)).fetchone()
-        else:
-            row = self._conn.execute(
-                "SELECT MIN(block_start) AS m FROM blocks").fetchone()
+            where.append("meter_id = ?")
+            params.append(meter_id)
+        if exclude_imported:
+            where.append("(source IS NULL OR source NOT LIKE 'imported%')")
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        row = self._conn.execute(
+            "SELECT MIN(block_start) AS m FROM blocks" + clause, params).fetchone()
         return row["m"] if row and row["m"] else None
 
     def classify_kraken_block(
@@ -2295,6 +3106,18 @@ class BlockStore:
             "SELECT COUNT(*) FROM blocks WHERE interpolated = ?",
             (self.BACKFILL_INTERPOLATED,)).fetchone()[0]
 
+    def channel_slots_present(self, channel: str, from_iso: str, to_iso: str,
+                              meter_id: str = "electricity_main") -> int:
+        """Count blocks in [from_iso, to_iso] inclusive that HAVE this channel's
+        kWh. Used to reconcile a persisted import-gap against reality: a gap whose
+        slots now carry data has been filled and should drop from the display."""
+        col = "imp_kwh" if channel == "import" else "exp_kwh"
+        row = self._conn.execute(
+            f"SELECT COUNT(*) FROM blocks WHERE meter_id = ? "
+            f"AND block_start >= ? AND block_start <= ? AND {col} IS NOT NULL",
+            (meter_id, from_iso, to_iso)).fetchone()
+        return int(row[0]) if row else 0
+
     def find_block_gaps(self, meter_id: str = "electricity_main",
                         *, min_age_hours: float = 48.0,
                         now: Optional[datetime] = None) -> list:
@@ -2419,38 +3242,58 @@ class BlockStore:
     # the re-fetch window and never settle — freezing the export figure on its
     # pre-settlement estimate. (Import-only accounts export 0, so the export
     # clause never fires for them.)
+    # 3.5.0: reconstructed history (`imported_*`) is authoritative and pre-dates
+    # EMT — DCC will NEVER settle it, so it must be excluded or every imported
+    # block (imp_kwh_api NULL) is counted "awaiting DCC settlement" and chased by
+    # the settlement sweep forever.
     _UNSETTLED_WHERE = ("(imp_kwh_api IS NULL "
-                        "OR (exp_kwh_api IS NULL AND exp_kwh IS NOT NULL AND exp_kwh > 0))")
+                        "OR (exp_kwh_api IS NULL AND exp_kwh IS NOT NULL AND exp_kwh > 0)) "
+                        "AND (source IS NULL OR source NOT LIKE 'imported%')")
 
     def get_unsettled_blocks(self, main_meter_id: str = "electricity_main",
-                             limit: Optional[int] = None) -> list:
+                             limit: Optional[int] = None,
+                             since_iso: Optional[str] = None) -> list:
         """Main-meter blocks still awaiting DCC settlement (import or export).
 
         For the view-only 'review unsettled blocks' report (relevant only when
         billing_source='dcc'): blocks running on the CAD/estimate fallback
         because DCC hasn't settled a channel yet. Ordered newest first so the
         most recent gaps surface at the top.
+
+        `since_iso` floors the result at a settlement-horizon boundary — a block
+        older than the horizon is not "awaiting DCC" (settlement lands within
+        days; anything older either settled or never will), so the caller passes
+        `now − horizon` to keep the count honest even before the settlement sweep
+        has finalised past-horizon blocks.
         """
         sql = ("SELECT block_start, block_end, imp_kwh, imp_kwh_api, "
                "       exp_kwh, exp_kwh_api, is_provisional "
                f"FROM blocks WHERE meter_id = ? AND {self._UNSETTLED_WHERE} "
-               "AND finalised_from_cad = 0 "
-               "ORDER BY block_start DESC")
-        params: tuple = (main_meter_id,)
+               "AND finalised_from_cad = 0")
+        params: list = [main_meter_id]
+        if since_iso:
+            sql += " AND block_start >= ?"
+            params.append(since_iso)
+        sql += " ORDER BY block_start DESC"
         if limit is not None:
             sql += " LIMIT ?"
-            params = (main_meter_id, limit)
+            params.append(limit)
         return self._conn.execute(sql, params).fetchall()
 
-    def count_unsettled_blocks(self, main_meter_id: str = "electricity_main") -> int:
+    def count_unsettled_blocks(self, main_meter_id: str = "electricity_main",
+                               since_iso: Optional[str] = None) -> int:
         """Count of main-meter blocks still awaiting DCC settlement on a channel
-        (import or export), excluding those finalised-from-CAD (past the horizon
-        — DCC isn't coming)."""
-        row = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM blocks "
-            f"WHERE meter_id = ? AND {self._UNSETTLED_WHERE} "
-            "AND finalised_from_cad = 0",
-            (main_meter_id,)).fetchone()
+        (import or export), excluding those finalised-from-CAD. `since_iso` floors
+        the count at the settlement horizon (see get_unsettled_blocks) so historic
+        / never-settling blocks don't inflate the 'awaiting DCC settlement' badge."""
+        sql = ("SELECT COUNT(*) AS n FROM blocks "
+               f"WHERE meter_id = ? AND {self._UNSETTLED_WHERE} "
+               "AND finalised_from_cad = 0")
+        params: list = [main_meter_id]
+        if since_iso:
+            sql += " AND block_start >= ?"
+            params.append(since_iso)
+        row = self._conn.execute(sql, params).fetchone()
         return int(row["n"]) if row else 0
 
     def finalise_past_horizon_blocks(self, cutoff_block_start: str,
@@ -3028,6 +3871,464 @@ class BlockStore:
         row = cur.fetchone()
         return dict(row) if row else None
 
+    # ── Region timeline (per-period postcode → DNO region for carbon) ──────────
+    def get_postcode_prefix_at(self, date_iso: str) -> tuple:
+        """(outward_code, source) for the config period effective at date_iso.
+
+        Resolves via get_config_period_for_date → that period's MAIN meter.
+        Pre-EMT/imported dates (no covering period) fall back to the OLDEST
+        period, matching where imported blocks are attached. Returns
+        (None, None) when there is no period or no postcode is configured.
+
+        This is the per-date region lookup carbon backfill must use instead of a
+        single global postcode, so a house move (a new period with a different
+        outward code) attributes the correct region either side of the move.
+        """
+        cp = self.get_config_period_for_date(date_iso)
+        if cp is None:
+            row = self._conn.execute(
+                "SELECT id FROM config_periods ORDER BY effective_from ASC LIMIT 1"
+            ).fetchone()
+            if not row:
+                return (None, None)
+            cp_id = row["id"]
+        else:
+            cp_id = cp["id"]
+        r = self._conn.execute(
+            "SELECT postcode_prefix, postcode_source FROM meters "
+            "WHERE config_period_id = ? AND is_sub_meter = 0 "
+            "ORDER BY id ASC LIMIT 1",
+            (cp_id,)
+        ).fetchone()
+        if not r:
+            return (None, None)
+        try:
+            src = r["postcode_source"]
+        except (KeyError, IndexError):
+            src = None
+        return (r["postcode_prefix"], src)
+
+    def set_period_postcode(self, period_id: int, outcode, source: str) -> None:
+        """Set the outward code + provenance on a config period's MAIN meter."""
+        with self._conn:
+            self._conn.execute(
+                "UPDATE meters SET postcode_prefix = ?, postcode_source = ? "
+                "WHERE config_period_id = ? AND is_sub_meter = 0",
+                (outward_code(outcode), source, period_id)
+            )
+
+    def apply_region_periods(self, spans: list, *, overwrite_user: bool = False) -> dict:
+        """Auto-apply probed region spans (see derive_region_periods) onto the
+        config-period timeline. Idempotent and privacy-preserving (outward code
+        only). NEVER overwrites a user-set postcode unless overwrite_user=True.
+
+        Single region (the common case, incl. never-moved accounts): stamp that
+        outward code onto every period's main meter that lacks a user value —
+        this fully "auto-applies" and lets carbon resolve historically.
+
+        Multiple regions (a move): this needs a *historical* config-period split,
+        for which there is no validated primitive yet (insert_config_period only
+        appends a new current period). To avoid unvalidated surgery on
+        billing-affecting history, we stamp the latest region where safe and
+        return split_required=True with the spans, so the split can be done
+        deliberately (and reviewed) rather than silently. See ROADMAP 3.5.1 /
+        docs/region_timeline_design.md.
+        """
+        clean = []
+        for s in (spans or []):
+            oc = outward_code(s.get("outcode") or s.get("postcode"))
+            if oc:
+                clean.append({**s, "outcode": oc})
+        if not clean:
+            return {"applied": 0, "outcodes": [], "split_required": False,
+                    "reason": "no region data"}
+
+        outs = sorted({s["outcode"] for s in clean})
+        periods = self._conn.execute(
+            "SELECT id FROM config_periods ORDER BY effective_from ASC"
+        ).fetchall()
+
+        def _stamp(period_id: int, oc: str) -> bool:
+            m = self._conn.execute(
+                "SELECT postcode_prefix, postcode_source FROM meters "
+                "WHERE config_period_id = ? AND is_sub_meter = 0 "
+                "ORDER BY id ASC LIMIT 1", (period_id,)
+            ).fetchone()
+            if not m:
+                return False
+            try:
+                src = m["postcode_source"]
+            except (KeyError, IndexError):
+                src = None
+            if m["postcode_prefix"] and src == "user" and not overwrite_user:
+                return False   # never clobber a user-set value
+            if m["postcode_prefix"] == oc and src == "octopus":
+                return False   # already applied — idempotent no-op
+            self.set_period_postcode(period_id, oc, "octopus")
+            return True
+
+        applied = 0
+        if len(outs) == 1:
+            for p in periods:
+                if _stamp(p["id"], outs[0]):
+                    applied += 1
+            return {"applied": applied, "outcodes": outs, "split_required": False}
+
+        # Multiple regions → a move. Stamp the most-recent region where safe and flag.
+        latest = sorted(clean, key=lambda s: (s.get("from") or ""))[-1]["outcode"]
+        for p in periods:
+            if _stamp(p["id"], latest):
+                applied += 1
+        logger.warning(
+            "apply_region_periods: %d distinct regions %s imply a historical "
+            "config-period split (a property move); applied latest region %r to "
+            "existing periods only. Historical split NOT performed automatically.",
+            len(outs), outs, latest)
+        return {"applied": applied, "outcodes": outs, "split_required": True,
+                "spans": clean}
+
+    # ── Region reconciliation (post-import confirmation flow) ──────────────────
+    @staticmethod
+    def _site_for_date(sites: list, date_iso: str) -> Optional[dict]:
+        """The tenancy whose [from, to) span contains date_iso (to=None → open).
+        On overlap, the one with the latest `from` wins (most specific)."""
+        best = None
+        for s in sites:
+            frm = s.get("from") or ""
+            to  = s.get("to")
+            if date_iso >= frm and (to is None or date_iso < to):
+                if best is None or frm > (best.get("from") or ""):
+                    best = s
+        return best
+
+    def _needs_split_at(self, from_iso: str):
+        """(period_dict, snapped_iso) if a boundary at from_iso would genuinely
+        divide an existing period; else (None, None)."""
+        if not from_iso:
+            return (None, None)
+        cp = self.get_config_period_for_date(from_iso)
+        if not cp:
+            return (None, None)
+        snapped = self._snap_to_midnight_utc(from_iso, cp.get("timezone") or "UTC")
+        if snapped <= cp["effective_from"]:
+            return (None, None)                       # boundary already present
+        if cp.get("effective_to") is not None and snapped >= cp["effective_to"]:
+            return (None, None)
+        return (cp, snapped)
+
+    def plan_region_reconciliation(self, derived: list) -> dict:
+        """Read-only. Given derived tenancy spans (derive_region_periods), compute
+        the plan to align the config-period timeline to the property history:
+
+            {"needs_confirmation": bool,
+             "sites": [{outcode, from, to, key, hint, block_count,
+                        site_name(prefill|None), needs_name}],
+             "split_dates": [iso, ...]}   # boundaries Apply will create
+
+        `needs_confirmation` is True when any site lacks a name or any split is
+        needed. Nothing is mutated."""
+        sites = []
+        for s in (derived or []):
+            oc = outward_code(s.get("outcode"))
+            if not oc:
+                continue
+            sites.append({"outcode": oc, "from": s.get("from"), "to": s.get("to"),
+                          "key": s.get("key"), "hint": s.get("hint")})
+        periods = self._conn.execute(
+            "SELECT effective_from, effective_to, site_name FROM config_periods "
+            "ORDER BY effective_from ASC").fetchall()
+        if not sites or not periods:
+            return {"needs_confirmation": False, "sites": [], "split_dates": []}
+
+        split_dates = []
+        for s in sites:
+            for d in (s.get("from"), s.get("to")):   # a bounded span may need both ends cut
+                cp, _snap = self._needs_split_at(d)
+                if cp is not None:
+                    split_dates.append(d)
+
+        out_sites = []
+        for s in sites:
+            frm = s.get("from") or ""
+            to  = s.get("to")
+            if to is None:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) c FROM blocks WHERE block_start >= ?", (frm,)).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) c FROM blocks WHERE block_start >= ? AND block_start < ?",
+                    (frm, to)).fetchone()
+            block_count = row["c"] if row else 0
+            prefill = None
+            for p in periods:
+                pf = p["effective_from"]
+                if pf >= frm and (to is None or pf < to) and p["site_name"]:
+                    prefill = p["site_name"]
+                    break
+            out_sites.append({**s, "block_count": block_count,
+                              "site_name": prefill, "needs_name": prefill is None})
+
+        needs = any(x["needs_name"] for x in out_sites) or bool(split_dates)
+        return {"needs_confirmation": needs, "sites": out_sites,
+                "split_dates": sorted(set(split_dates))}
+
+    def apply_region_reconciliation(self, sites: list) -> dict:
+        """Apply a confirmed reconciliation: split config periods at each move
+        boundary, then stamp every period with its tenancy's outward code
+        (source 'octopus') and, where supplied, its user-confirmed site name.
+        `sites` = [{outcode, from, to, site_name?}]. Returns counts."""
+        splits = 0
+        boundaries = []
+        for s in sites:
+            if s.get("from"):
+                boundaries.append(s["from"])
+            if s.get("to"):
+                boundaries.append(s["to"])      # cut the far end of a bounded span too
+        for d in sorted(set(boundaries)):
+            cp, _snap = self._needs_split_at(d)
+            if cp is not None:
+                self.split_config_period_at(cp["id"], d)
+                splits += 1
+        stamped = 0
+        periods = self._conn.execute(
+            "SELECT id, effective_from, effective_to FROM config_periods ORDER BY effective_from ASC"
+        ).fetchall()
+        for p in periods:
+            site = self._site_for_date(sites, p["effective_from"])
+            if not site:
+                continue
+            oc = outward_code(site.get("outcode"))
+            is_active = p["effective_to"] is None
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE meters SET postcode_prefix = ?, postcode_source = 'octopus' "
+                    "WHERE config_period_id = ? AND is_sub_meter = 0", (oc, p["id"]))
+                # NEVER rename the ACTIVE period — its site_name is the instance /
+                # backup-folder identity (see instance.py). A historic import only
+                # labels EARLIER (past-address) periods; the current site name is
+                # managed via normal config, and a real future move creates a new
+                # current period. Region (postcode) is always safe to stamp.
+                if site.get("site_name") and not is_active:
+                    self._conn.execute(
+                        "UPDATE config_periods SET site_name = ? WHERE id = ?",
+                        (site["site_name"], p["id"]))
+            stamped += 1
+        logger.info("apply_region_reconciliation: %d split(s), %d period(s) stamped",
+                    splits, stamped)
+        return {"splits": splits, "stamped": stamped}
+
+    def plan_csv_reconciliation(self, from_iso: str, to_iso) -> dict:
+        """Reconcile plan for a CSV import span. Unlike the API path, CSV carries
+        NO provenance, so the single site is **region-editable**: the user names
+        it AND supplies the outward code. If they skip, the blocks stay on their
+        existing period(s) with region unknown (carbon excluded) — i.e. the data
+        blends into whatever period already covers it. Returns the same shape as
+        plan_region_reconciliation with one site + region_editable=True."""
+        if not from_iso:
+            return {"needs_confirmation": False, "sites": [], "split_dates": [], "source": "csv"}
+        if to_iso is None:
+            row = self._conn.execute(
+                "SELECT COUNT(*) c FROM blocks WHERE block_start >= ?", (from_iso,)).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT COUNT(*) c FROM blocks WHERE block_start >= ? AND block_start < ?",
+                (from_iso, to_iso)).fetchone()
+        block_count = row["c"] if row else 0
+        prefill = None
+        for p in self._conn.execute(
+                "SELECT effective_from, site_name FROM config_periods "
+                "ORDER BY effective_from ASC").fetchall():
+            pf = p["effective_from"]
+            if pf >= from_iso and (to_iso is None or pf < to_iso) and p["site_name"]:
+                prefill = p["site_name"]
+                break
+        split_dates = []
+        for d in (from_iso, to_iso):
+            cp, _snap = self._needs_split_at(d)
+            if cp is not None:
+                split_dates.append(d)
+        site = {"outcode": None, "from": from_iso, "to": to_iso, "key": None,
+                "hint": None, "region_editable": True, "block_count": block_count,
+                "site_name": prefill, "needs_name": prefill is None}
+        return {"needs_confirmation": True, "sites": [site],
+                "split_dates": sorted(set(split_dates)), "source": "csv"}
+
+    # ── Pre-import site confirmation (create covering periods BEFORE import) ────
+    # The reconcile flow above SPLITS periods AFTER an import — which cannot
+    # create a period earlier than the oldest existing one, so a past address is
+    # only labelled from the earliest existing period forward. The canonical flow
+    # is instead to CONFIRM the property history FIRST and create the covering
+    # periods up front, so every imported block lands in its correct period from
+    # the first write (correctly regioned + carbon-eligible), with no post-hoc
+    # split or block reassignment. See docs/region_timeline_design.md.
+
+    def create_covering_period(self, from_iso: str, to_iso,
+                               *, outcode=None, site_name: Optional[str] = None,
+                               based_on_period_id: Optional[int] = None) -> int:
+        """Create a config period covering ``[from, to)`` by CLONING an existing
+        period's config (meters + channels) and stamping its region (outward code)
+        and site name. Intended for the PRE-import flow: the range is empty (no
+        blocks exist yet), so nothing is reassigned and the chain of *other*
+        periods is untouched — the caller (apply_pre_import_sites) guarantees
+        contiguity. ``to`` may be None only for an open-ended (current) period,
+        but in practice covering periods are bounded. Returns the new period id."""
+        ref_id = based_on_period_id or self.get_current_config_period_id()
+        if ref_id is None:
+            row = self._conn.execute(
+                "SELECT id FROM config_periods ORDER BY effective_from ASC LIMIT 1"
+            ).fetchone()
+            ref_id = row["id"] if row else None
+        if ref_id is None:
+            raise ValueError("create_covering_period: no reference period to clone")
+        ref = self.get_config_period(ref_id)
+        tz = ref.get("timezone") or "UTC"
+        frm = self._snap_to_midnight_utc(from_iso, tz)
+        to = self._snap_to_midnight_utc(to_iso, tz) if to_iso else None
+        if to is not None and to <= frm:
+            raise ValueError("create_covering_period: to must be after from")
+        with self._conn:
+            cur = self._conn.execute(
+                """INSERT INTO config_periods
+                       (effective_from, effective_to, billing_day, block_minutes,
+                        timezone, currency_symbol, currency_code, site_name,
+                        supplier, change_reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (frm, to, ref["billing_day"], ref["block_minutes"], ref["timezone"],
+                 ref["currency_symbol"], ref["currency_code"], site_name,
+                 ref.get("supplier"), "Historical site (pre-import)"))
+            new_id = cur.lastrowid
+            self._copy_meters_to_period(ref_id, new_id)
+        if outcode:
+            self.set_period_postcode(new_id, outcode, "octopus")
+        logger.info("create_covering_period: [%s,%s) region=%s site=%r → period %d",
+                    frm, to, outward_code(outcode), site_name, new_id)
+        return new_id
+
+    def _period_starting_at(self, from_iso: str) -> Optional[int]:
+        """Id of a config period whose effective_from equals from_iso (snapped in
+        the timeline's timezone), or None. Gives apply_pre_import_sites its
+        idempotency: a re-run updates the existing period instead of duplicating."""
+        if not from_iso:
+            return None
+        row = self._conn.execute(
+            "SELECT timezone FROM config_periods ORDER BY effective_from ASC LIMIT 1"
+        ).fetchone()
+        tz = (row["timezone"] if row else None) or "UTC"
+        snapped = self._snap_to_midnight_utc(from_iso, tz)
+        hit = self._conn.execute(
+            "SELECT id FROM config_periods WHERE effective_from = ? LIMIT 1",
+            (snapped,)).fetchone()
+        return hit["id"] if hit else None
+
+    def _stamp_region_if_free(self, period_id: int, oc: str) -> bool:
+        """Stamp outward code (source 'octopus') onto a period's main meter unless
+        it already carries a USER value. Returns True if it changed anything."""
+        m = self._conn.execute(
+            "SELECT postcode_prefix, postcode_source FROM meters "
+            "WHERE config_period_id = ? AND is_sub_meter = 0 ORDER BY id ASC LIMIT 1",
+            (period_id,)).fetchone()
+        if not m:
+            return False
+        try:
+            src = m["postcode_source"]
+        except (KeyError, IndexError):
+            src = None
+        if m["postcode_prefix"] and src == "user":
+            return False
+        if m["postcode_prefix"] == oc and src == "octopus":
+            return False
+        self.set_period_postcode(period_id, oc, "octopus")
+        return True
+
+    def plan_pre_import_sites(self, derived: list) -> dict:
+        """Read-only. Classify derived tenancy spans (derive_region_periods) for
+        the PRE-import confirmation UI:
+
+            {"needs_confirmation": bool,
+             "sites": [{outcode, from, to, key, hint, is_current,
+                        site_name(prefill|None), needs_name}]}
+
+        The latest span (to=None) is the CURRENT site — shown read-only and
+        prefilled from the active period's site_name, because that name is the
+        instance / backup-folder identity (see instance.py) and must not change on
+        a historic import. Earlier spans are PAST sites the user names; each will
+        become a new covering period. needs_confirmation is True only when there
+        is at least one past site to name (a single-site account confirms nothing
+        and goes straight to import). Nothing is mutated."""
+        spans = []
+        for s in (derived or []):
+            oc = outward_code(s.get("outcode"))
+            if not oc:
+                continue
+            spans.append({"outcode": oc, "from": s.get("from"), "to": s.get("to"),
+                          "key": s.get("key"), "hint": s.get("hint")})
+        spans.sort(key=lambda s: s.get("from") or "")
+        if not spans:
+            return {"needs_confirmation": False, "sites": []}
+        arow = self._conn.execute(
+            "SELECT site_name FROM config_periods WHERE effective_to IS NULL "
+            "ORDER BY effective_from DESC LIMIT 1").fetchone()
+        active_name = arow["site_name"] if arow else None
+        out = []
+        for s in spans:
+            is_current = s.get("to") is None
+            out.append({**s, "is_current": is_current,
+                        "site_name": active_name if is_current else None,
+                        "needs_name": (not is_current)})
+        return {"needs_confirmation": any(x["needs_name"] for x in out),
+                "sites": out}
+
+    def apply_pre_import_sites(self, sites: list) -> dict:
+        """Create/extend config periods to match confirmed tenancy sites BEFORE an
+        import runs, so imported blocks land in the right period from the first
+        write. ``sites`` = [{outcode, from, to, site_name?}] (as confirmed in the
+        UI). Order of operations matters for contiguity:
+
+          1. CURRENT tenancy (to=None): extend the ACTIVE period's effective_from
+             back to its move-in (backward only — never shrinks, never renames:
+             instance identity) and stamp its region. Done FIRST, while the active
+             period is still the earliest, so the extend targets it.
+          2. PAST tenancies: create a covering period for each (or, on a re-run,
+             update the existing one). Each abuts the next via the tenancy spans.
+
+        Idempotent. Returns {"created", "extended", "stamped"}."""
+        clean = sorted([s for s in (sites or []) if s.get("from")],
+                       key=lambda s: s["from"])
+        if not clean:
+            return {"created": 0, "extended": False, "stamped": 0}
+        current = next((s for s in clean if s.get("to") is None), None)
+        past = [s for s in clean if s.get("to") is not None]
+        extended = False
+        stamped = 0
+        # 1. Current tenancy → extend + region-stamp the active period (no rename).
+        if current:
+            extended = self.extend_earliest_period_to(current["from"])
+            oc = outward_code(current.get("outcode"))
+            aid = self.get_current_config_period_id()
+            if oc and aid and self._stamp_region_if_free(aid, oc):
+                stamped += 1
+        # 2. Past tenancies → create (or update) covering periods.
+        created = 0
+        for s in past:
+            oc = outward_code(s.get("outcode"))
+            existing = self._period_starting_at(s["from"])
+            if existing is not None:
+                if oc:
+                    self.set_period_postcode(existing, oc, "octopus")
+                if s.get("site_name"):
+                    with self._conn:
+                        self._conn.execute(
+                            "UPDATE config_periods SET site_name = ? "
+                            "WHERE id = ? AND effective_to IS NOT NULL",
+                            (s["site_name"], existing))
+            else:
+                self.create_covering_period(
+                    s["from"], s["to"], outcode=oc, site_name=s.get("site_name"))
+                created += 1
+        logger.info("apply_pre_import_sites: created=%d extended=%s stamped=%d",
+                    created, extended, stamped)
+        return {"created": created, "extended": extended, "stamped": stamped}
+
     def _snap_to_midnight_utc(self, raw_from: str, tz_name: str) -> str:
         """Snap a UTC ISO timestamp to local midnight, returned as UTC ISO."""
         try:
@@ -3069,15 +4370,16 @@ class BlockStore:
             dev_pwr_s   = meta.get("device_power_sensor")
             pv_pwr_s    = meta.get("pv_power_sensor")
 
+            postcode_src = meta.get("postcode_source")
             cur = self._conn.execute(
                 """INSERT INTO meters
                        (config_period_id, meter_id, is_sub_meter, parent_meter_id,
                         device_label, protected, inverter_possible,
-                        power_sensor, power_source, postcode_prefix, v2x_capable,
+                        power_sensor, power_source, postcode_prefix, postcode_source, v2x_capable,
                         meter_type, soc_sensor, inverter_power_sensor, inverter_power_invert,
                         device_power_sensor, pv_power_sensor, rate_source, power_invert,
                         device_power_invert)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(config_period_id, meter_id) DO UPDATE SET
                        is_sub_meter            = excluded.is_sub_meter,
                        parent_meter_id         = excluded.parent_meter_id,
@@ -3088,6 +4390,7 @@ class BlockStore:
                        power_source            = excluded.power_source,
                        rate_source             = excluded.rate_source,
                        postcode_prefix         = excluded.postcode_prefix,
+                       postcode_source         = excluded.postcode_source,
                        v2x_capable             = excluded.v2x_capable,
                        meter_type              = excluded.meter_type,
                        soc_sensor              = excluded.soc_sensor,
@@ -3100,7 +4403,7 @@ class BlockStore:
                        retired_at              = COALESCE(meters.retired_at, excluded.retired_at),
                        retired_reason          = COALESCE(meters.retired_reason, excluded.retired_reason)""",
                 (period_id, meter_id, is_sub, parent, device,
-                 protected, inv_poss, power_s, power_src, postcode, v2x,
+                 protected, inv_poss, power_s, power_src, postcode, postcode_src, v2x,
                  meter_type, soc_s, inv_pwr_s, inv_invert, dev_pwr_s, pv_pwr_s, rate_src, pwr_invert,
                  dev_invert)
             )
@@ -3185,6 +4488,11 @@ class BlockStore:
                 pass
             if m["postcode_prefix"]:
                 meta["postcode_prefix"] = m["postcode_prefix"]
+            try:
+                if m["postcode_source"]:
+                    meta["postcode_source"] = m["postcode_source"]
+            except (KeyError, IndexError):
+                pass
             if m["v2x_capable"]:
                 meta["v2x_capable"] = True
             try:
@@ -3305,6 +4613,104 @@ class BlockStore:
 
         logger.info("insert_config_period: new period id=%d effective_from=%s", period_id, now)
         return period_id
+
+    # ── Region timeline: historical config-period split ───────────────────────
+    def _copy_meters_to_period(self, src_period_id: int, dst_period_id: int) -> None:
+        """Deep-copy every meter (and its channels) from one config period to
+        another, preserving all columns except the surrogate keys. Used by
+        split_config_period_at so the new half is a faithful config clone."""
+        m_cols = [r[1] for r in self._conn.execute("PRAGMA table_info(meters)").fetchall()]
+        copy_cols = [c for c in m_cols if c not in ("id", "config_period_id")]
+        col_list = ", ".join(copy_cols)
+        placeholders = ", ".join("?" for _ in copy_cols)
+        src_rows = self._conn.execute(
+            f"SELECT id, {col_list} FROM meters WHERE config_period_id = ?",
+            (src_period_id,)
+        ).fetchall()
+        mc_cols = [r[1] for r in self._conn.execute("PRAGMA table_info(meter_channels)").fetchall()]
+        ch_cols = [c for c in mc_cols if c not in ("id", "meter_id")]
+        ch_list = ", ".join(ch_cols)
+        ch_ph = ", ".join("?" for _ in ch_cols)
+        for row in src_rows:
+            old_meter_id = row["id"]
+            vals = [row[c] for c in copy_cols]
+            cur = self._conn.execute(
+                f"INSERT INTO meters (config_period_id, {col_list}) VALUES (?, {placeholders})",
+                [dst_period_id] + vals
+            )
+            new_meter_id = cur.lastrowid
+            if ch_cols:
+                for ch in self._conn.execute(
+                    f"SELECT {ch_list} FROM meter_channels WHERE meter_id = ?",
+                    (old_meter_id,)
+                ).fetchall():
+                    self._conn.execute(
+                        f"INSERT INTO meter_channels (meter_id, {ch_list}) VALUES (?, {ch_ph})",
+                        [new_meter_id] + [ch[c] for c in ch_cols]
+                    )
+
+    def split_config_period_at(self, period_id: int, split_date_iso: str,
+                               *, change_reason: Optional[str] = None) -> int:
+        """Divide an existing config period at a past date into two contiguous
+        periods, preserving billing history.
+
+        The ORIGINAL period keeps the earlier span ``[effective_from, split)``.
+        A NEW period covers the later span ``[split, effective_to)`` with a full
+        COPY of the original's meters + channels. Every block whose ``block_start``
+        is >= split is reassigned to the new period; earlier blocks stay.
+
+        This is the primitive the region timeline needs to record a mid-history
+        property move (``insert_config_period`` only ever appends a *new current*
+        period). The caller sets the region/site on whichever half applies.
+
+        ``split_date_iso`` is snapped to local midnight (the period's timezone),
+        matching ``insert_config_period``. Returns the NEW period's id.
+
+        Raises ``ValueError`` if the split is not strictly inside the period.
+        """
+        cp = self.get_config_period(period_id)
+        if not cp:
+            raise ValueError(f"config period {period_id} not found")
+        tz_name = cp.get("timezone") or "UTC"
+        split = self._snap_to_midnight_utc(split_date_iso, tz_name)
+        ef_from = cp["effective_from"]
+        ef_to   = cp.get("effective_to")   # None for the active period
+        if split <= ef_from:
+            raise ValueError("split date must be after the period's effective_from")
+        if ef_to is not None and split >= ef_to:
+            raise ValueError("split date must be before the period's effective_to")
+
+        with self._conn:
+            cur = self._conn.execute(
+                """INSERT INTO config_periods
+                       (effective_from, effective_to, billing_day, block_minutes,
+                        timezone, currency_symbol, currency_code, site_name,
+                        supplier, change_reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    split, ef_to,
+                    cp["billing_day"], cp["block_minutes"], cp["timezone"],
+                    cp["currency_symbol"], cp["currency_code"],
+                    cp.get("site_name"), cp.get("supplier"),
+                    change_reason or "Region timeline split",
+                )
+            )
+            new_id = cur.lastrowid
+            self._copy_meters_to_period(period_id, new_id)
+            # Shrink the original to the earlier half.
+            self._conn.execute(
+                "UPDATE config_periods SET effective_to = ? WHERE id = ?",
+                (split, period_id)
+            )
+            # Reassign the later blocks to the new period.
+            self._conn.execute(
+                "UPDATE blocks SET config_period_id = ? "
+                "WHERE config_period_id = ? AND block_start >= ?",
+                (new_id, period_id, split)
+            )
+        logger.info("split_config_period_at: period %d split at %s → new period %d",
+                    period_id, split, new_id)
+        return new_id
 
     def migrate_full_config_json(self) -> int:
         """

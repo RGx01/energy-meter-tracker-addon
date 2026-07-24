@@ -53,6 +53,11 @@
     </select>
   </div>
 
+  <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:14px;cursor:pointer;">
+    <input type="checkbox" id="del-reconstructed">
+    Only historical imports in this range (leave live / CAD / settled data intact)
+  </label>
+
   <button class="btn btn-secondary" onclick="deleteBlocksPreview()" style="margin-bottom:12px;">Preview</button>
 
   <div id="del-preview" style="display:none;margin-bottom:12px;">
@@ -68,6 +73,33 @@
 
   <div id="del-success" class="alert alert-success" style="display:none;"></div>
   <div id="del-error"   class="alert alert-danger"  style="display:none;"></div>
+</div>
+
+<!-- Get-out clause: wipe all historical imports -->
+<div class="card" style="border-color:var(--danger);">
+  <div style="font-weight:600;margin-bottom:6px;">Delete all historical imported data</div>
+  <div style="font-size:13px;color:var(--muted);margin-bottom:14px;line-height:1.7;">
+    Removes <strong>every</strong> block created by a historical import (API or CSV) and everything derived from it —
+    rate derivations, import checkpoints and gap records — returning your account to its live-only state so you can
+    re-import cleanly. Your live / CAD / settled data is <strong>untouched</strong>. A backup is taken automatically first.
+    Use this if an import went wrong and you don't have a backup to restore.
+  </div>
+
+  <button class="btn btn-secondary" onclick="purgePreview()" style="margin-bottom:12px;">Preview</button>
+
+  <div id="purge-preview" style="display:none;margin-bottom:12px;">
+    <div id="purge-preview-text" style="font-size:13px;padding:10px 14px;background:var(--surface);border:1px solid var(--border);border-radius:6px;margin-bottom:10px;"></div>
+    <div id="purge-confirm-row" style="display:none;">
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px;cursor:pointer;">
+        <input type="checkbox" id="purge-confirm-check" onchange="document.getElementById('purge-confirm-btn').disabled=!this.checked;">
+        I understand this removes all imported history (a backup will be taken first)
+      </label>
+      <button class="btn btn-danger" id="purge-confirm-btn" onclick="purgeApply()" disabled>Delete all imported data</button>
+    </div>
+  </div>
+
+  <div id="purge-success" class="alert alert-success" style="display:none;"></div>
+  <div id="purge-error"   class="alert alert-danger"  style="display:none;"></div>
 </div>
 {% endblock %}
 
@@ -137,7 +169,7 @@ function deleteBlocksPreview() {
   fetch(apiUrl('/api/blocks/delete/preview'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from_date: fromDate, from_time: fromTime, to_date: toDate, to_time: toTime, meter_id: meterId })
+    body: JSON.stringify({ from_date: fromDate, from_time: fromTime, to_date: toDate, to_time: toTime, meter_id: meterId, reconstructed_only: document.getElementById('del-reconstructed').checked })
   })
   .then(function(r) { return r.json(); })
   .then(function(d) {
@@ -181,7 +213,7 @@ function deleteBlocksApply() {
   fetch(apiUrl('/api/blocks/delete'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from_date: fromDate, from_time: fromTime, to_date: toDate, to_time: toTime, meter_id: meterId, confirmed: true })
+    body: JSON.stringify({ from_date: fromDate, from_time: fromTime, to_date: toDate, to_time: toTime, meter_id: meterId, reconstructed_only: document.getElementById('del-reconstructed').checked, confirmed: true })
   })
   .then(function(r) { return r.json(); })
   .then(function(d) {
@@ -204,6 +236,50 @@ function deleteBlocksApply() {
     errEl.style.display  = 'block';
     confBtn.disabled     = false;
   });
+}
+
+// ── Purge ALL historical imports ───────────────────────────────────────────────
+function purgePreview() {
+  var pv  = document.getElementById('purge-preview');
+  var tx  = document.getElementById('purge-preview-text');
+  var row = document.getElementById('purge-confirm-row');
+  var chk = document.getElementById('purge-confirm-check');
+  var btn = document.getElementById('purge-confirm-btn');
+  var err = document.getElementById('purge-error');
+  var succ= document.getElementById('purge-success');
+  err.style.display = 'none'; succ.style.display = 'none';
+  fetch(apiUrl('/api/historical/purge-preview'))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      pv.style.display = 'block'; chk.checked = false; btn.disabled = true;
+      if (d.error) { err.textContent = d.error; err.style.display = 'block'; pv.style.display = 'none'; return; }
+      if (!d.blocks) { tx.textContent = 'No historical imported data found.'; row.style.display = 'none'; return; }
+      var span = d.from ? (' (' + (d.from || '').substr(0,10) + ' → ' + (d.to || '').substr(0,10) + ')') : '';
+      tx.innerHTML = '<strong>' + d.blocks.toLocaleString() + ' imported blocks</strong>' + span +
+        ', plus their rate derivations and import checkpoints, will be permanently deleted.';
+      row.style.display = 'block';
+    })
+    .catch(function(e) { err.textContent = 'Preview failed: ' + e.message; err.style.display = 'block'; });
+}
+function purgeApply() {
+  var btn = document.getElementById('purge-confirm-btn');
+  var err = document.getElementById('purge-error');
+  var succ= document.getElementById('purge-success');
+  var pv  = document.getElementById('purge-preview');
+  btn.disabled = true; err.style.display = 'none';
+  fetch(apiUrl('/api/historical/purge'), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ confirmed: true })
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.error) { err.textContent = d.error; err.style.display = 'block'; btn.disabled = false; return; }
+    pv.style.display = 'none';
+    succ.textContent = 'Removed ' + (d.blocks || 0).toLocaleString() + ' imported blocks' +
+      (d.backup ? ' (backup: ' + d.backup + ')' : '') + '. You can re-import cleanly from Data Management.';
+    succ.style.display = 'block';
+  })
+  .catch(function(e) { err.textContent = 'Delete failed: ' + e.message; err.style.display = 'block'; btn.disabled = false; });
 }
 </script>
 {% endblock %}

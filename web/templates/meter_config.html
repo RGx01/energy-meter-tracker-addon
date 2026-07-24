@@ -428,6 +428,11 @@ var _serverConfig = JSON.parse(JSON.stringify(config));
 let entities = [];
 var hasData  = {{ has_data | tojson }};
 var DATA_SOURCE_MODE = {{ data_source_mode | tojson }};
+// True when an API key is actually stored. The mode (api/cad+api) lives in the
+// DB; the credentials live in a separate file that backups DON'T include. So a
+// restore onto a fresh install can leave mode=api with NO key — in which case
+// the "connected" UI is a lie and the user must re-enter the key.
+var HAS_CREDENTIALS = {{ has_credentials | tojson }};
 var OHME_DETECTION = {{ ohme_detection | tojson }};
 // Timezone select HTML — rendered server-side to avoid JS string escaping issues
 var TZ_SELECT_HTML = {{ tz_select_html | tojson }};
@@ -575,6 +580,10 @@ function buildMainCard(meterId, meter) {
   var _mi     = wizModeFieldInfo(dsMode, meta.supplier);
   var usesApi = _mi.usesApi;
   var noLocal = _mi.noLocal;
+  // API mode selected but no stored credentials (e.g. restored onto a fresh
+  // install — creds aren't in backups). The "connected" UI would otherwise lie.
+  var credsMissing = usesApi &&
+    (typeof HAS_CREDENTIALS !== 'undefined') && !HAS_CREDENTIALS;
   var supLabel = _mi.supLabel;
   var supPoss = supLabel + '\u2019s';     // "your supplier's" / "Octopus Energy's"
   var modeLabel = _mi.modeLabel;
@@ -596,7 +605,20 @@ function buildMainCard(meterId, meter) {
     '</div>' +
 
     '<div class="info-box">' +
-      '<strong>Data source: ' + esc(modeLabel) + '</strong>' +
+      (credsMissing
+        ? '<div style="margin:-2px 0 12px;padding:10px 12px;border:1px solid #b45309;border-radius:6px;background:rgba(180,83,9,0.10);color:var(--fg);font-size:12px;line-height:1.5;">' +
+            '⚠ <strong>API mode is set, but no API credentials are stored.</strong> ' +
+            'This usually happens after restoring a backup onto a fresh install — your ' +
+            'stored key isn’t part of the backup. Import readings and settlement are ' +
+            '<strong>paused</strong> until you re-enter it.' +
+            '<div style="margin-top:8px;">' +
+              '<button class="btn btn-primary btn-sm js-reconnect-octopus">Re-enter API key</button>' +
+            '</div>' +
+          '</div>'
+        : '') +
+      '<strong>Data source: ' + esc(modeLabel) +
+        (credsMissing ? ' <span style="color:#b45309;font-weight:600;">(credentials missing)</span>' : '') +
+        '</strong>' +
       '<ul>' +
         (noLocal
           ? '<li>Import readings come from ' + esc(supLabel) + ' settlement' +
@@ -1109,6 +1131,11 @@ function onContainerClick(e) {
     if (t) { t.value = ''; t.dispatchEvent(new Event('change', { bubbles: true })); }
   } else if (el.classList.contains('js-disconnect-octopus')) {
     openDisconnectModal();
+  } else if (el.classList.contains('js-reconnect-octopus')) {
+    // API mode with no stored key — jump straight into the setup wizard, which
+    // includes the credentials step for any API mode, so the user can re-enter
+    // the key without changing anything else.
+    startWizard();
   }
 }
 

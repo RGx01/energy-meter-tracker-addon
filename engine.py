@@ -181,6 +181,9 @@ _SETTLEMENT_SWEEP_MIN_INTERVAL_S = 24 * 3600   # run at most once per day
 _STATE_LAST_SWEEP = "last_settlement_sweep_utc"
 # BL-19: run-once marker for the historical grid-invariant repair sweep.
 _BL19_GRID_SWEEP_DONE_KEY = "bl19_grid_invariant_sweep_done"
+# #307: run-once marker for the lost-opener device-spike self-heal. The write-point
+# guard prevents NEW spikes, so this only needs to clean pre-guard history once.
+_SPIKE_SWEEP_DONE_KEY = "implausible_sub_block_sweep_done"
 # Chunk 5: cached rate schedules for reconcile-time rate repair. Built once per
 # poll cycle by the (async) poll task; read by the (sync) drain via the resolver
 # below. Rates stored as £/kWh (converted from the API's pence at build time).
@@ -725,22 +728,67 @@ def io_save_file(path: str, content: str):
 # Backup to /share
 # ─────────────────────────────────────────────────────────────────────────────
 
+_backup_in_progress = False
+
+
 def _backup_to_share():
-    """Backup data files to SHARE_BACKUP_DIR after each block finalise."""
+    """Backup data files to SHARE_BACKUP_DIR after each block finalise — OFF the
+    event loop.
+
+    Root cause of the ~every-30-min "restart" (diagnosed 2026-07): this ran
+    SYNCHRONOUSLY on the finalise path and `store.backup()` copies the whole DB to
+    /share (frequently a slow network mount). At tens of MB it took ~40s, stalling
+    the asyncio loop — so the HA WebSocket heartbeat timed out, HA dropped the
+    connection, and the reconnect re-ran the full engine_startup. It only LOOKED
+    like a restart.
+
+    Now it runs in a worker thread with its OWN read connection: the engine's
+    `self._conn` is bound to the loop thread and SQLite forbids cross-thread use,
+    while WAL lets a separate reader snapshot the DB consistently while the engine
+    keeps writing. An overlap guard skips a block if the previous (slow) backup is
+    still going, so a slow /share can't pile up backups."""
+    global _backup_in_progress
+    if _backup_in_progress:
+        logger.info("_backup_to_share: previous backup still running — skipping")
+        return
     try:
-        ensure_dir(SHARE_BACKUP_DIR)
-        # Backup SQLite DB using online backup API (safe while engine is writing)
-        store = get_store()
-        store.backup(f"{SHARE_BACKUP_DIR}/blocks.db")
-        # Copy remaining JSON files
-        for filename in ("meters_config.json",):  # current_block state is in DB
-            src_path = f"{DATA_DIR}/{filename}"
-            dst_path = f"{SHARE_BACKUP_DIR}/{filename}"
-            if os.path.exists(src_path):
-                shutil.copy2(src_path, dst_path)
-        logger.info("_backup_to_share: backup written to %s", SHARE_BACKUP_DIR)
-    except Exception as e:
-        logger.warning("_backup_to_share: failed: %s", e)
+        db_path = get_store()._path
+    except Exception:
+        return
+
+    def _work():
+        global _backup_in_progress
+        import sqlite3 as _sqlite
+        try:
+            ensure_dir(SHARE_BACKUP_DIR)
+            src = _sqlite.connect(db_path)          # fresh connection in THIS thread
+            try:
+                dst = _sqlite.connect(f"{SHARE_BACKUP_DIR}/blocks.db")
+                try:
+                    src.backup(dst, pages=256, sleep=0.02)
+                finally:
+                    dst.close()
+            finally:
+                src.close()
+            for filename in ("meters_config.json",):  # current_block state is in DB
+                src_path = f"{DATA_DIR}/{filename}"
+                if os.path.exists(src_path):
+                    shutil.copy2(src_path, f"{SHARE_BACKUP_DIR}/{filename}")
+            logger.info("_backup_to_share: backup written to %s", SHARE_BACKUP_DIR)
+        except Exception as e:
+            logger.warning("_backup_to_share: failed: %s", e)
+        finally:
+            _backup_in_progress = False
+
+    _backup_in_progress = True
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None:
+        loop.run_in_executor(None, _work)           # off the loop — never stalls the tick
+    else:
+        _work()                                     # no loop (sync/test) — inline
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1242,6 +1290,20 @@ _ROGUE_BLOCK_KWH_CEILING = 500.0
 # means a lost opener. Kept well above any real charge so session-energy sensors
 # (which count a genuine 10–50 kWh charge) are never clamped.
 _ROGUE_SUB_BLOCK_KWH_CEILING = 60.0
+# #307: generalise the flat 60 kWh ceiling to any block length — no domestic device
+# sustains 120 kW, so block_minutes/60 × 120 kW is the physical impossibility line
+# (60 kWh for a 30-min block, matching the flat value above). Used by the write-point
+# guard in _apply_pass2 so gap-fill / reconstruction / recovery can't bypass it.
+_MAX_PLAUSIBLE_DEVICE_KW = 120.0
+
+
+def _max_plausible_block_kwh(block_minutes=None) -> float:
+    try:
+        bm = int(block_minutes or get_block_minutes() or 30)
+    except Exception:
+        bm = 30
+    return bm / 60.0 * _MAX_PLAUSIBLE_DEVICE_KW
+
 
 def compute_channel(channel: dict, parent_rates=None, is_sub_meter: bool = False,
                     meter_id: str = "?", channel_id: str = "?") -> dict:
@@ -1609,15 +1671,22 @@ def build_gap_blocks(
 # Chart generation helper
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_charts(store: "BlockStore"):
+def generate_charts(store: "BlockStore", config: dict = None):
     """
     Generate all charts from the BlockStore.
     Queries only the data each chart needs rather than loading all blocks.
+
+    `config` may be passed in so this can run on a WORKER THREAD with a dedicated
+    read-only `store` (see _generate_charts_offloaded): callers on a background
+    thread MUST pass config, because load_config() reads the engine's primary
+    connection and must never be touched cross-thread (the 3.1.3 segfault). When
+    omitted (on-loop callers) it's loaded here as before.
     """
     if store.count_blocks() == 0:
         logger.info("generate_charts: no blocks, skipping")
         return
-    config        = load_config()
+    if config is None:
+        config = load_config()
     main_meta     = {}
     for meter_data in config.get("meters", {}).values():
         if not (meter_data.get("meta") or {}).get("sub_meter"):
@@ -1643,6 +1712,87 @@ def generate_charts(store: "BlockStore"):
         logger.info("generate_charts: daily usage chart written (tz=%s, bm=%s, currency=%s)", timezone_name, block_minutes, currency_symbol)
     except Exception as e:
         logger.error("generate_charts: daily chart error: %s", e)
+
+
+_charts_rendering = False        # guard: at most one off-loop render at a time
+_charts_task = None              # held reference so a fire-and-forget task isn't GC'd
+
+
+async def _generate_charts_offloaded():
+    """Render charts OFF the event loop, in a thread executor, using a DEDICATED
+    read-only DB connection.
+
+    Chart generation over a large history can take tens of seconds. Run
+    synchronously on the engine loop it stalls the HA WebSocket heartbeat →
+    HA drops the connection → reconnect re-runs engine_startup → renders again →
+    a self-perpetuating reconnect storm. Running it in a worker thread keeps the
+    loop responsive.
+
+    Thread-safety: the worker uses its OWN read-only BlockStore (never the
+    engine's writer connection — the 3.1.3 cross-thread SQLite segfault), and we
+    resolve `config` HERE on the loop and pass it in, since load_config() reads
+    the primary connection. Falls back to an inline render on any error.
+    """
+    import asyncio as _asyncio
+    from block_store import BlockStore
+    global _charts_rendering
+    if _store is None:
+        return
+    if _charts_rendering:
+        logger.info("generate_charts: a render is already in progress — skipping")
+        return
+    _charts_rendering = True
+    try:
+        try:
+            cfg = load_config()      # on the loop (reads the primary connection)
+        except Exception:
+            cfg = None
+
+        def _work():
+            ro = None
+            try:
+                ro = BlockStore(BLOCKS_DB_PATH, read_only=True)
+                generate_charts(ro, config=cfg)
+            finally:
+                if ro is not None:
+                    try:
+                        ro.close()
+                    except Exception:
+                        pass
+
+        loop = _asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, _work)
+        except Exception as e:
+            logger.warning("generate_charts: offload failed (%s) — rendering inline", e)
+            try:
+                generate_charts(_store, config=cfg)
+            except Exception as _e2:
+                logger.error("generate_charts: inline fallback failed: %s", _e2)
+    finally:
+        _charts_rendering = False
+
+
+def _schedule_chart_regen() -> None:
+    """Regenerate charts OFF the event loop when possible — via
+    _generate_charts_offloaded (its own read-only connection + in-progress guard).
+    A synchronous render over 2+ years of blocks takes long enough to stall the HA
+    WebSocket heartbeat, which drops the connection and re-runs startup: a
+    reconnect→re-finalise→re-render storm. Firing it as a loop task keeps the tick
+    responsive. Falls back to an inline render only when there is no running loop
+    (e.g. a non-async caller)."""
+    import asyncio as _aio
+    try:
+        loop = _aio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None:
+        loop.create_task(_generate_charts_offloaded())
+        return
+    try:
+        generate_charts(get_store())
+    except Exception as e:
+        logger.warning("_schedule_chart_regen: inline fallback failed: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1698,6 +1848,32 @@ def _apply_pass2(block: dict) -> None:
             if not sub_import:
                 continue
             delta = sub_import.get("kwh", 0.0)
+            # #307: physical-plausibility backstop at the shared write point. A lost
+            # or zeroed OPENING register books the whole lifetime register as one
+            # interval (prod: house_battery 0 → 6137 = 6137 kWh in a half-hour). That
+            # is impossible for any device — clamp IMMEDIATELY, never defer to
+            # settlement (which must only refine a sane figure, never pass an
+            # impossibility). Sensor-agnostic: a session-energy sensor's real charge
+            # never reaches this ceiling, so this can't mis-fire on a Zappi/session
+            # reset. Baseline read_start onto read_end so the register stays
+            # continuous, zero the block, and flag for review.
+            _ceiling = _max_plausible_block_kwh((meta or {}).get("block_minutes"))
+            if delta > _ceiling:
+                logger.warning(
+                    "PASS 2: %s implausible %.1f kWh in one block (> %.1f kWh "
+                    "ceiling) — lost-opener/glitch; clamping to 0 and baselining "
+                    "register (#307), flagged for review.",
+                    meter_name, delta, _ceiling)
+                _re = sub_import.get("read_end")
+                if _re is not None:
+                    sub_import["read_start"] = _re
+                sub_import["kwh"] = 0.0
+                sub_import["kwh_grid"] = 0.0
+                sub_import["kwh_battery"] = 0.0
+                sub_import["cost"] = 0.0
+                sub_import["needs_review"] = True
+                meter_block["needs_review"] = True
+                continue
             if delta < 0:
                 # Reset detected mid-block — read_end is the kWh accumulated since
                 # the reset. Use it directly rather than skipping the block.
@@ -1970,6 +2146,22 @@ def _apply_intensity_to_block(block: dict, intensity: float) -> None:
         meter_block["carbon_intensity_g"] = intensity
 
 
+def _persist_block_carbon(block: dict, start: str) -> int:
+    """Write the per-meter carbon set by _apply_intensity_to_block IN PLACE
+    (targeted carbon-column UPDATE per meter). Replaces append_block_replace on
+    the carbon paths, which round-tripped the whole row and silently wiped the
+    `source` tag (untagging every imported block carbon touched). Returns rows
+    updated."""
+    if _store is None:
+        return 0
+    n = 0
+    for meter_name, mb in (block.get("meters") or {}).items():
+        if _store.set_block_carbon(start, meter_name,
+                                   mb.get("carbon_intensity_g"), mb.get("carbon_g")):
+            n += 1
+    return n
+
+
 def _attribute_block_carbon(block: dict, start: str) -> bool:
     """Look up the nearest carbon-intensity slot for *start* and attribute
     carbon_g (+ persist carbon_intensity_g) to every meter in *block*.
@@ -2021,6 +2213,8 @@ def _recover_missing_carbon(limit: int = 200) -> int:
     """
     if _store is None:
         return 0
+    if _store.get_meta("carbon_paused", None):
+        return 0
     try:
         starts = _store.get_block_starts_missing_carbon(limit=limit)
     except Exception as e:
@@ -2035,7 +2229,7 @@ def _recover_missing_carbon(limit: int = 200) -> int:
             continue
         if _attribute_block_carbon(block, start):
             try:
-                append_block_replace(block)
+                _persist_block_carbon(block, start)   # in place — keeps source tag
                 recovered += 1
                 logger.info("_recover_missing_carbon: backfilled carbon for %s",
                             start)
@@ -2044,10 +2238,12 @@ def _recover_missing_carbon(limit: int = 200) -> int:
                                "%s: %s", start, e)
         # If not attributed, the CI slot isn't available (aged out) — skip.
     if recovered:
-        try:
-            generate_charts(_store)
-        except Exception as e:
-            logger.warning("_recover_missing_carbon: chart regen failed: %s", e)
+        # OFF the loop (see _schedule_chart_regen): a synchronous full-history
+        # render here stalls the HA WebSocket heartbeat, and after a big import
+        # (2+ years of blocks, ~90s/render) that kicks off a
+        # reconnect → re-startup → re-render storm. The in-progress guard coalesces
+        # overlapping renders across successive carbon ticks.
+        _schedule_chart_regen()
         logger.info("_recover_missing_carbon: recovered %d block(s)", recovered)
     return recovered
 
@@ -2993,8 +3189,10 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
     # long offline gap this would regenerate charts once per missing block,
     # causing minutes of CPU load. Charts are regenerated once at startup
     # (generate_charts in engine_startup) and again on the first live block.
+    # Render OFF the loop (offloaded, read-only connection) so a large-history
+    # render can't stall the tick / HA heartbeat (→ reconnect storm).
     if not interpolated:
-        generate_charts(get_store())
+        _schedule_chart_regen()
 
     # ── Backup to /share ───────────────────────────────────────────────────
     _backup_to_share()
@@ -3304,35 +3502,46 @@ async def _run_historical_carbon_backfill(window_days: int = 13,
         win_end = min(cur_dt + _td(days=window_days), hi_dt)
         f_iso = cur_dt.strftime("%Y-%m-%dT%H:%MZ")
         t_iso = win_end.strftime("%Y-%m-%dT%H:%MZ")
-        try:
-            # Offload ONLY the blocking network fetch; DB stays on this thread.
-            if loop is not None:
-                ci_map = await loop.run_in_executor(
-                    None, _fetch_carbon_intensity_range, postcode, f_iso, t_iso)
-            else:
-                ci_map = _fetch_carbon_intensity_range(postcode, f_iso, t_iso)
-        except Exception as e:
-            logger.warning("_run_historical_carbon_backfill: fetch failed "
-                           "%s..%s: %s — pausing, will resume", f_iso, t_iso, e)
-            _store.set_meta(_CARBON_BACKFILL_MARKER,
-                            {"cursor": cur_dt.isoformat(), "done": False})
-            return backfilled
-
-        for start in _store.get_block_starts_missing_carbon_in_range(
-                cur_dt.isoformat(), win_end.isoformat()):
-            intensity = _nearest_intensity_from_map(ci_map, start)
-            if intensity is None:
-                continue
-            block = _store.get_block_dict_by_start(start)
-            if not block:
-                continue
-            _apply_intensity_to_block(block, intensity)
+        # Resolve each block's region from its config period and fetch CI PER
+        # region — so a mid-history property move attributes the correct region to
+        # old blocks, not the current postcode. Blocks with no resolvable region
+        # were already excluded by get_block_starts_missing_carbon_in_range.
+        starts = _store.get_block_starts_missing_carbon_in_range(
+            cur_dt.isoformat(), win_end.isoformat())
+        by_oc: dict = {}
+        for start in starts:
+            oc = _store.get_postcode_prefix_at(start)[0] or postcode
+            if oc:
+                by_oc.setdefault(oc, []).append(start)
+        for oc, oc_starts in by_oc.items():
             try:
-                append_block_replace(block)
-                backfilled += 1
+                # Offload ONLY the blocking network fetch; DB stays on this thread.
+                if loop is not None:
+                    ci_map = await loop.run_in_executor(
+                        None, _fetch_carbon_intensity_range, oc, f_iso, t_iso)
+                else:
+                    ci_map = _fetch_carbon_intensity_range(oc, f_iso, t_iso)
             except Exception as e:
-                logger.warning("_run_historical_carbon_backfill: persist failed "
-                               "%s: %s", start, e)
+                logger.warning("_run_historical_carbon_backfill: fetch failed "
+                               "%s..%s (%s): %s — pausing, will resume",
+                               f_iso, t_iso, oc, e)
+                _store.set_meta(_CARBON_BACKFILL_MARKER,
+                                {"cursor": cur_dt.isoformat(), "done": False})
+                return backfilled
+            for start in oc_starts:
+                intensity = _nearest_intensity_from_map(ci_map, start)
+                if intensity is None:
+                    continue
+                block = _store.get_block_dict_by_start(start)
+                if not block:
+                    continue
+                _apply_intensity_to_block(block, intensity)
+                try:
+                    _persist_block_carbon(block, start)   # in place — keeps source tag
+                    backfilled += 1
+                except Exception as e:
+                    logger.warning("_run_historical_carbon_backfill: persist failed "
+                                   "%s: %s", start, e)
 
         cur_dt = win_end
         windows += 1
@@ -3356,11 +3565,11 @@ async def _run_historical_carbon_backfill(window_days: int = 13,
         _store.set_meta(_CARBON_BACKFILL_MARKER,
                         {"done": True, "completed_at": _now()})
         if backfilled:
-            try:
-                generate_charts(_store)
-            except Exception as e:
-                logger.warning("_run_historical_carbon_backfill: chart regen "
-                               "failed: %s", e)
+            # OFF the loop: a synchronous render over 2+ years of freshly-carbonned
+            # blocks takes ~90s and stalls the HA heartbeat → reconnect →
+            # re-startup → re-render storm (the exact failure a large historical
+            # backfill produced). This runs once, only when the span is fully swept.
+            await _generate_charts_offloaded()
         logger.info("_run_historical_carbon_backfill: complete — %d block(s) "
                     "backfilled", backfilled)
     elif backfilled > 0:
@@ -3408,6 +3617,14 @@ def _maybe_backfill_historical_carbon() -> None:
     global _carbon_backfill_running
     try:
         if _store is None or not _get_postcode() or _carbon_backfill_running:
+            return
+        if _store.get_meta("carbon_paused", None):     # manual kill switch
+            return
+        # Don't compete with an active historical import — both do heavy work on
+        # the engine's single DB connection. Defer; the next CI tick re-checks
+        # (and the import's completion re-arms the marker anyway).
+        if api_import_running():
+            logger.info("_maybe_backfill_historical_carbon: import job active — deferring")
             return
         state = _store.get_meta(_CARBON_BACKFILL_MARKER, {}) or {}
         if state.get("done"):
@@ -4555,6 +4772,1658 @@ async def retry_settlement_for_unsettled(now=None, max_lookback_days=None) -> di
             "unsettled_before": before, "unsettled_after": after,
             "window": [period_from, period_to],
             "errors": summary.get("errors", [])}
+
+
+async def probe_recorder_statistics(entity_ids: list, days: int = 800) -> dict:
+    """READ-ONLY historical-import spike: fetch HA long-term statistics for the
+    chosen sensors and return per-sensor probe reports characterising retention,
+    cadence, gaps, state_class/energy-vs-power and DST/timestamp behaviour.
+
+    No writes, no block creation — purely diagnostic. Runs on the engine loop
+    (the WS listener that resolves the command futures lives there)."""
+    import statistics_probe as _sp
+    if _engine_ha is None:
+        return {"ok": False, "reason": "no_ha", "reports": []}
+    ids = [e for e in (entity_ids or []) if e]
+    if not ids:
+        return {"ok": True, "reports": [], "window": None}
+    days = max(1, min(int(days), 2000))
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=days)).isoformat()
+    end = now.isoformat()
+    try:
+        meta_list = await _engine_ha.get_statistic_ids()
+    except Exception as e:
+        logger.warning("probe_recorder_statistics: list_statistic_ids failed: %s", e)
+        meta_list = []
+    meta_by_id = {m.get("statistic_id"): m for m in (meta_list or [])}
+    try:
+        stats = await _engine_ha.get_statistics(ids, start, end, period="hour")
+    except Exception as e:
+        logger.warning("probe_recorder_statistics: statistics_during_period failed: %s", e)
+        return {"ok": False, "reason": "stats_failed", "error": str(e),
+                "window": [start, end], "reports": []}
+    reports = [_sp.build_sensor_probe(eid, stats.get(eid) or [], meta_by_id.get(eid))
+               for eid in ids]
+    return {"ok": True, "window": [start, end], "reports": reports}
+
+
+async def probe_consumption_retention() -> dict:
+    """READ-ONLY historical-import spike: measure how far back the Octopus API
+    reaches per channel (import vs export), using two cheap single-row boundary
+    fetches each. Reports earliest/latest per channel and the export-vs-import
+    lag — the number that decides what a future import can promise (export is
+    simply unavailable before its own start). No writes, no block creation.
+
+    Returns {ok, channels:{import:{...}, export:{...}}, lag_days, reason?}."""
+    import consumption_probe as _cp
+    if not kraken_available():
+        return {"ok": False, "reason": "no_api", "channels": {}}
+    # Far-past floor: without a period_from the consumption endpoint defaults to
+    # only the last ~week, so the "earliest" query would return a recent date,
+    # not the meter's true start. This floor predates smart-meter rollout, so the
+    # ascending scan starts from the real earliest interval.
+    floor = "2015-01-01T00:00:00Z"
+    disc = _kraken_discovery or {}
+    out: dict = {"ok": True, "channels": {}}
+    for name in ("import", "export"):
+        ch = disc.get(name) or {}
+        mpan, serial = ch.get("mpan"), ch.get("serial")
+        if not mpan or not serial:
+            out["channels"][name] = {"channel": name, "available": False,
+                                     "note": "no meter of this kind discovered"}
+            continue
+        try:
+            first = await _kraken_client.get_consumption_boundary(
+                mpan, serial, period_from=floor)
+            last = await _kraken_client.get_consumption_boundary(
+                mpan, serial, newest=True, period_from=floor)
+        except Exception as e:
+            logger.warning("probe_consumption_retention: %s fetch failed: %s", name, e)
+            out["channels"][name] = {"channel": name, "available": False,
+                                     "note": f"fetch failed: {e}"}
+            continue
+        out["channels"][name] = _cp.build_consumption_boundary(name, first, last)
+    out["lag_days"] = _cp.export_lag_days(out["channels"])
+    return out
+
+
+async def diagnose_consumption_retention() -> dict:
+    """READ-ONLY deep diagnostic: enumerate EVERY meter point + serial on the
+    account and report each serial's reachable consumption span. Distinguishes
+    (a) API endpoint retention shorter than the website, (b) a meter exchange —
+    an older serial the website aggregates but EMT's newest-serial probe misses,
+    or (c) a boundary/query artifact. For each serial it also counts rows just
+    BELOW the reported earliest, so a boundary that isn't a true data start is
+    exposed. Writes nothing.
+
+    Returns {ok, meter_points:[{mpan_tail, is_export, meter_count, meters:[...]}]}.
+    Serials/MPANs are tail-masked so shared screenshots stay safe while still
+    distinguishing meters."""
+    import consumption_probe as _cp
+    from datetime import datetime as _dt
+    if not kraken_available():
+        return {"ok": False, "reason": "no_api", "meter_points": []}
+    floor = "2015-01-01T00:00:00Z"
+    try:
+        account = await _kraken_client.get_account()
+    except Exception as e:
+        logger.warning("diagnose_consumption_retention: get_account failed: %s", e)
+        return {"ok": False, "reason": "account_failed", "error": str(e),
+                "meter_points": []}
+
+    def _tail(s):
+        return ("…" + s[-6:]) if s and len(s) > 6 else (s or "?")
+
+    def _z(dt):
+        return (dt.astimezone(timezone.utc).replace(tzinfo=None)
+                .isoformat(timespec="seconds") + "Z")
+
+    out: dict = {"ok": True, "meter_points": []}
+    for prop in account.get("properties", []) or []:
+        for emp in prop.get("electricity_meter_points", []) or []:
+            mpan = emp.get("mpan")
+            is_export = bool(emp.get("is_export"))
+            chan = "export" if is_export else "import"
+            meters = emp.get("meters", []) or []
+            # Agreement (tariff) history — already on the account payload, no
+            # extra calls. Surfaces whether the consumption boundary lines up
+            # with a tariff change (bundled meter exchange) or predates it (so a
+            # tariff change is NOT the cause). Earliest valid_from ≈ supply start.
+            ags = sorted((emp.get("agreements", []) or []),
+                         key=lambda a: a.get("valid_from") or "")
+            agreements = [{"valid_from": a.get("valid_from"),
+                           "valid_to": a.get("valid_to"),
+                           "tariff": a.get("tariff_code")} for a in ags]
+            supply_start = (agreements[0]["valid_from"] if agreements else None)
+            mreps: list = []
+            for m in meters:
+                serial = m.get("serial_number")
+                if not serial:
+                    continue
+                try:
+                    first = await _kraken_client.get_consumption_boundary(
+                        mpan, serial, period_from=floor)
+                    last = await _kraken_client.get_consumption_boundary(
+                        mpan, serial, newest=True, period_from=floor)
+                except Exception as e:
+                    mreps.append({"serial_tail": _tail(serial), "channel": chan,
+                                  "available": False, "note": f"fetch failed: {e}"})
+                    continue
+                rep = _cp.build_consumption_boundary(chan, first, last)
+                rep["serial_tail"] = _tail(serial)
+                # Below-boundary check: any rows in the ~45 days before the
+                # reported earliest? >0 ⇒ 'earliest' is NOT a true data start
+                # (a query artifact); 0 ⇒ it's a real wall for this serial.
+                rep["rows_just_below_earliest"] = None
+                rep["earliest_below"] = None
+                if rep.get("earliest"):
+                    try:
+                        e0 = _dt.fromisoformat(rep["earliest"])
+                        below = await _kraken_client.get_consumption(
+                            mpan, serial,
+                            period_from=_z(e0 - timedelta(days=45)),
+                            period_to=_z(e0 - timedelta(seconds=1)))
+                        rep["rows_just_below_earliest"] = len(below)
+                        # Surface WHERE the below-rows sit: a handful of isolated
+                        # rows at the boundary (DST/half-open-interval edge) is not
+                        # recoverable history; a full run of them is real under-reach.
+                        starts = [b.get("interval_start") for b in below
+                                  if b.get("interval_start")]
+                        rep["earliest_below"] = min(starts) if starts else None
+                    except Exception as e:
+                        logger.info("diagnose: below-boundary probe failed: %s", e)
+                mreps.append(rep)
+            out["meter_points"].append({
+                "mpan_tail": _tail(mpan), "is_export": is_export,
+                "meter_count": len(meters), "meters": mreps,
+                "supply_start": supply_start,
+                "agreement_count": len(agreements),
+                "agreements": agreements,
+            })
+    return out
+
+
+async def plan_api_import(requested_from=None, *, chunk_days: int = 60) -> dict:
+    """READ-ONLY preview for the API import route: compute, per channel, the window
+    it would import — from the earliest agreement (~join) up to go-live (EMT's
+    oldest block) — and the newest→oldest chunk count. Matches the apply, which
+    fetches GraphQL Measurements (reaching the account's full history, not the
+    REST ~2-year wall). Writes nothing.
+
+    Returns {ok, go_live, channels:{import:{available,window,chunk_count}, ...}}."""
+    import api_import as _ai
+    if not kraken_available():
+        return {"ok": False, "reason": "no_api", "channels": {}}
+    try:
+        # Ceiling = oldest LIVE block, ignoring reconstructed/imported blocks — so
+        # a previous partial import doesn't lower the ceiling below its own gap.
+        go_live = _store.get_oldest_block_start(exclude_imported=True)
+    except Exception:
+        go_live = None
+    if not go_live:
+        return {"ok": False, "reason": "no_go_live", "channels": {},
+                "note": "no existing blocks to tile up to yet"}
+    disc = _kraken_discovery or {}
+    out: dict = {"ok": True, "go_live": go_live, "channels": {}}
+    for name in ("import", "export"):
+        info = disc.get(name) or {}
+        if not info.get("mpan"):
+            out["channels"][name] = {"ok": False, "available": False}
+            continue
+        # Fast, PURE preview — no network. Reuse the data-floor if a prior import
+        # or "Check start dates" already resolved it; otherwise fall back to the
+        # agreement floor. The import itself runs the (network) boundary probe to
+        # extend the floor to the true data start, so the preview must not block
+        # or time out on API calls (it has the shortest route timeout).
+        floor = (requested_from or _hist_floor_cache.get(name)
+                 or _earliest_agreement_from(info))
+        if not floor:
+            gl_dt = _ai._naive_utc(go_live)
+            floor = _ai._iso(gl_dt - timedelta(days=1100)) if gl_dt else None
+        window = _ai.clamp_window(floor, go_live)
+        if not window.get("ok"):
+            out["channels"][name] = {"ok": False, "available": True,
+                                     "note": window.get("note")}
+            continue
+        chunks = _ai.plan_chunks(window["from"], window["to"], chunk_days=chunk_days)
+        out["channels"][name] = {
+            "ok": True, "available": True, "chunk_count": len(chunks),
+            "window": {"from": window["from"], "to": window["to"]}}
+    return out
+
+
+_API_IMPORT_CHECKPOINT = "api_import_oldest"   # kraken_state key (per channel suffix)
+
+
+def _earliest_agreement_from(info: dict):
+    """Earliest agreement valid_from (naive-UTC iso) for a channel, or None — the
+    import floor (roughly account join)."""
+    import api_import as _ai
+    froms = [a.get("valid_from") for a in (info.get("agreements") or [])
+             if a.get("valid_from")]
+    naive = sorted(f for f in (_ai._iso(_ai._naive_utc(x)) for x in froms) if f)
+    return naive[0] if naive else None
+
+
+async def diagnose_import_range(*, probe_days: int = 1) -> dict:
+    """READ-ONLY: for each channel report the earliest supplier *agreement*, the
+    resolved import floor (the earliest half-hour Measurements actually returns —
+    which is what the import USES), and whether real data was found before the
+    agreement.
+
+    Uses the same robust 30-day-window probing as the import floor
+    (`_data_floor_for`), NOT a single day — export is intermittent (solar only),
+    so a 1-day probe can land on a zero-export day and falsely report "no data".
+    Writes nothing.
+    """
+    def _mask(v):
+        v = str(v or "")
+        return (v[:2] + "…" + v[-1]) if len(v) > 3 else ("…" if v else None)
+    if _kraken_client is None or not _kraken_discovery:
+        return {"ok": False, "reason": "no_api"}
+    acct = _kraken_account_number
+    out: dict = {"ok": True, "account_masked": _mask(acct) if acct else None,
+                 "channels": {}}
+    for channel in ("import", "export"):
+        info = (_kraken_discovery or {}).get(channel) or {}
+        mpan = info.get("mpan")
+        if not mpan:
+            continue
+        agreement = _earliest_agreement_from(info)
+        data_floor = await _data_floor_for(channel, info)   # robust 30-day probe
+        _hist_floor_cache[channel] = data_floor   # so the (pure) Preview plan matches
+        extended = bool(agreement and data_floor and data_floor < agreement)
+        out["channels"][channel] = {
+            "mpan_masked": _mask(mpan),
+            "agreement_floor": agreement,
+            "import_starts_at": data_floor,           # what the import will use
+            "data_before_floor": extended,            # earlier than the agreement?
+            "earliest_seen_before_floor": data_floor if extended else None,
+        }
+        logger.info("diagnose_import_range: %s agreement=%s import_starts_at=%s "
+                    "extended=%s", channel, agreement, data_floor, extended)
+    return out
+
+
+# Per-run cache of the resolved import floor per channel, so the (few) boundary
+# probes run once per import/preview, not per slice. Cleared on restart.
+_hist_floor_cache: dict = {}
+
+
+async def _data_floor_for(channel: str, info: dict):
+    """The import floor for a channel: the earliest half-hour the Measurements API
+    actually returns — which can be EARLIER than the earliest supplier *agreement*
+    (e.g. solar export that ran before a formal export agreement was signed).
+
+    The agreement floor (`_earliest_agreement_from`) was clamping the import there,
+    silently dropping real earlier history. Because Measurements carries the billed
+    cost per interval, pre-agreement half-hours still price correctly (cost from the
+    API; rate falls back to cost÷kWh where no tariff schedule covers them).
+
+    Cheap presence-probe: 30-day windows stepping ~6 months back from the agreement
+    floor, one small page each (we only need to know IF data exists). A single empty
+    window is tolerated (a mid-history outage); two in a row ends the scan. Returns
+    the earlier of the agreement floor and the oldest window with data. Never floors
+    HIGHER than the agreement (worst case = prior behaviour); agreement floor on any
+    error."""
+    import api_import as _ai
+    agree = _earliest_agreement_from(info)
+    mpan = info.get("mpan")
+    if not mpan or _kraken_client is None:
+        return agree
+    anchor = _ai._naive_utc(agree) if agree else None
+    if anchor is None:
+        return agree
+    direction = "GENERATION" if channel == "export" else "CONSUMPTION"
+    step, win = 183, 30
+    oldest_data = None
+    empties = 0
+    for i in range(1, 15):        # up to ~7 years of 6-month steps
+        ps = anchor - timedelta(days=step * i)
+        pe = ps + timedelta(days=win)
+        try:
+            rows = await _kraken_client.get_measurements(
+                mpan, _ai._iso(ps) + "Z", _ai._iso(pe) + "Z",
+                account_number=_kraken_account_number, direction=direction,
+                page_size=100, max_pages=1)
+        except Exception:
+            break
+        if rows:
+            hits = [r["start"] for r in rows if r.get("start")]
+            if hits:
+                oldest_data = min(hits) if oldest_data is None else min(oldest_data, min(hits))
+            empties = 0
+        else:
+            empties += 1
+            if empties >= 2:
+                break
+    if oldest_data and (agree is None or oldest_data < agree):
+        logger.info("_data_floor_for: %s floor extended %s → %s "
+                    "(data predates agreement)", channel, agree, oldest_data)
+        return oldest_data
+    return agree
+
+
+async def _cached_data_floor(channel: str, info: dict, *, restart: bool = False):
+    """`_data_floor_for` memoised per run (cleared on restart, like rate segs)."""
+    if restart:
+        _hist_floor_cache.pop(channel, None)
+    if channel not in _hist_floor_cache:
+        _hist_floor_cache[channel] = await _data_floor_for(channel, info)
+    return _hist_floor_cache[channel]
+
+
+# Per-run cache of (valid_from, valid_to, RateSchedule) segments per channel, so
+# the tariff rates are fetched once per import (not per slice). Cleared on restart.
+_hist_rate_segs_cache: dict = {}
+
+
+async def _build_channel_rate_segs(channel: str):
+    """Per-agreement rate schedules for a channel, from the discovered agreement
+    history. Used to give imported blocks a CLEAN tariff rate (and to price the
+    half-hours where Measurements returned kWh but no cost)."""
+    import api_import as _ai
+    from kraken_api_client import KrakenAPIClient
+    from kraken_rates import build_rate_schedule
+    info = (_kraken_discovery or {}).get(channel) or {}
+    segs = []
+    for a in (info.get("agreements") or []):
+        tariff = a.get("tariff_code")
+        vf, vt = a.get("valid_from"), a.get("valid_to")
+        if not tariff:
+            continue
+        product = KrakenAPIClient._tariff_to_product_code(tariff)
+        if not product:
+            continue
+        nvf = _ai._iso(_ai._naive_utc(vf)) if vf else "0000-01-01T00:00:00"
+        nvt = _ai._iso(_ai._naive_utc(vt)) if vt else None
+        # Skip a degenerate agreement window (valid_from >= valid_to): the REST
+        # rate API rejects it with HTTP 400 "period_from must not be greater than
+        # period_to", and a zero/negative span can price nothing anyway. Octopus
+        # emits these for superseded/back-to-back old agreements.
+        if nvt is not None and nvf >= nvt:
+            logger.info("_build_channel_rate_segs: skipping %s (%s) — empty "
+                        "agreement window %s..%s", tariff, channel, nvf, nvt)
+            continue
+        try:
+            rs = await build_rate_schedule(_kraken_client, product, tariff,
+                                           period_from=vf, period_to=vt)
+        except Exception as e:
+            logger.warning("_build_channel_rate_segs: %s %s failed: %s",
+                           channel, tariff, e)
+            continue
+        if not rs.is_empty():
+            segs.append((nvf, nvt, rs))
+    return segs
+
+
+# Per-run cache of per-agreement standing-charge schedules per channel.
+_hist_standing_segs_cache: dict = {}
+
+
+async def _build_channel_standing_segs(channel: str):
+    """Per-agreement STANDING-CHARGE schedules for a channel — the authoritative,
+    complete source for the daily standing charge. Measurements' STANDING_CHARGE_COST
+    is patchy (whole stretches come back with none), so imported days are priced
+    from this schedule and only fall back to the Measurements figure where the
+    schedule doesn't cover the date."""
+    import api_import as _ai
+    from kraken_api_client import KrakenAPIClient
+    from kraken_rates import build_standing_charge_schedule
+    info = (_kraken_discovery or {}).get(channel) or {}
+    segs = []
+    for a in (info.get("agreements") or []):
+        tariff = a.get("tariff_code")
+        vf, vt = a.get("valid_from"), a.get("valid_to")
+        if not tariff:
+            continue
+        product = KrakenAPIClient._tariff_to_product_code(tariff)
+        if not product:
+            continue
+        nvf = _ai._iso(_ai._naive_utc(vf)) if vf else "0000-01-01T00:00:00"
+        nvt = _ai._iso(_ai._naive_utc(vt)) if vt else None
+        # Skip a degenerate agreement window (valid_from >= valid_to) — same HTTP
+        # 400 guard as the rate builder (see _build_channel_rate_segs).
+        if nvt is not None and nvf >= nvt:
+            logger.info("_build_channel_standing_segs: skipping %s (%s) — empty "
+                        "agreement window %s..%s", tariff, channel, nvf, nvt)
+            continue
+        try:
+            sc = await build_standing_charge_schedule(
+                _kraken_client, product, tariff, period_from=vf, period_to=vt)
+        except Exception as e:
+            logger.warning("_build_channel_standing_segs: %s %s failed: %s",
+                           channel, tariff, e)
+            continue
+        if not sc.is_empty():
+            segs.append((nvf, nvt, sc))
+    return segs
+
+
+def _standing_for(standing_segs, day_iso):
+    """Daily standing charge £/day for a date (YYYY-MM-DD) from the schedule, or
+    None if uncovered. Resolve at midday to avoid midnight/DST boundary edges.
+    Native pence/day → £/day."""
+    ts = day_iso + "T12:00:00"
+    for vf, vt, sched in standing_segs:
+        if ts >= vf and (vt is None or ts < vt):
+            v = sched.resolve(ts)
+            if v is None:
+                # A standing charge persists until it next changes. The API can
+                # return records with an explicit valid_to and no open successor,
+                # so resolve() stops carrying the rate forward past that date and
+                # returns None — dropping us to the patchier Measurements figure
+                # (the 0.5040 vs 0.504559 boundary mismatch). Carry the LAST known
+                # rate at/before this date forward instead.
+                periods = getattr(sched, "_periods", None) or []
+                earlier = [r for (pf, _pt, r) in periods if pf <= ts]
+                v = earlier[-1] if earlier else None
+            if v is not None:
+                return round(v / 100.0, 6)
+            # Segment matched but its schedule has nothing at/before this date —
+            # keep looking (overlapping agreements) before giving up.
+    return None
+
+
+def _tariff_rate_for(rate_segs, start, off_peak):
+    """Clean £/kWh for a block from the tariff schedule, keyed by its bucket:
+    OFF_PEAK→day's low rate, STANDARD→day's high rate, unknown→time-of-day
+    resolve. None if uncovered. Native pence → £."""
+    for vf, vt, sched in rate_segs:
+        if start >= vf and (vt is None or start < vt):
+            if off_peak is True:
+                lo, _hi = sched.day_rate_bounds(start)
+                v = lo
+            elif off_peak is False:
+                _lo, hi = sched.day_rate_bounds(start)
+                v = hi
+            else:
+                v = sched.resolve(start)
+            return round(v / 100.0, 6) if v is not None else None
+    return None
+
+
+def _billed_rate(rate_segs, start, off_peak, meas_cost, kwh,
+                 tol: float = 0.001):
+    """£/kWh for an imported slot, choosing the right source of truth by tariff type.
+
+    The rate-source axis is whether the slot carries a time-of-use (OFF_PEAK/
+    STANDARD) label:
+
+    * NO label (off_peak is None) — a CONTINUOUS / published-rate tariff: flat
+      export, Agile (either direction). Here the SCHEDULE is authoritative — it is
+      the exact per-slot published rate. Billed cost÷kWh is only penny-rounding
+      jitter that shatters one flat/Agile rate into dozens of near-identical
+      buckets (the export-fragmentation bug). So we PREFER the schedule, and use
+      billed only as a fallback when the schedule can't cover the slot.
+
+    * WITH a label (off_peak True/False) — a BANDED, dispatch-aware tariff (IOG):
+      Octopus's billed cost is truth. It captures dispatched charging outside the
+      fixed off-peak window, and it avoids the price-cap transition-DAY hazard
+      where day_rate_bounds sees both the old and new rate and would pick the
+      wrong band. We still prefer the clean scheduled rate, but ONLY when it
+      agrees with billed to within `tol` (0.1p); otherwise trust cost÷kWh.
+
+    With no billed cost at all we fall back to the schedule (time/label based).
+    Returns £/kWh or None.
+
+    NOTE the discriminator is NOT the label alone: export slots come back labelled
+    STANDARD_RATE (→ off_peak False, not None), so "no label" would miss them. What
+    actually separates a published-rate slot from a dispatch one is whether the
+    tariff is BANDED that day — a distinct off-peak vs peak rate (IOG) vs a single
+    rate all day (flat export, fixed import). Agile carries no label at all
+    (off_peak None) and is resolved per-slot."""
+    sched = _tariff_rate_for(rate_segs, start, off_peak)
+    # Continuous / unlabelled tariff (Agile): _tariff_rate_for used resolve() for the
+    # exact per-slot published rate — always prefer it over billed jitter.
+    if off_peak is None and sched is not None:
+        return sched
+    # Labelled slot (IOG import, or flat export tagged STANDARD_RATE). Decide by
+    # whether the tariff is BANDED on this day. A SINGLE rate for the day (flat
+    # export / fixed import) ⇒ the schedule is the published truth and billed
+    # cost÷kWh is only penny-rounding jitter that fragments it — prefer the
+    # schedule. Distinct off-peak/peak rates ⇒ dispatch-aware IOG ⇒ billed stays
+    # truth (out-of-window dispatch + price-cap transition-day safety).
+    if sched is not None:
+        lo = hi = None
+        for vf, vt, s in rate_segs:
+            if s is not None and start >= vf and (vt is None or start < vt):
+                lo, hi = s.day_rate_bounds(start)
+                break
+        if lo is not None and lo == hi:      # flat tariff that day → schedule is truth
+            return sched
+    if meas_cost is not None and (kwh or 0) > 0:
+        billed = round(meas_cost / kwh, 6)
+        if sched is not None and abs(sched - billed) <= tol:
+            return sched
+        return billed
+    return sched
+
+
+def _import_pricing_flag(channel: str, kwh, meas_cost, buckets,
+                         threshold: float = 1.0):
+    """Diagnostic classifier for the IOG-dispatch pricing gap.
+
+    A material-kWh IMPORT slot that Measurements returned WITHOUT a billed cost is
+    priced from the time-of-day tariff schedule — which cannot know an IOG dispatch
+    charged the car OUTSIDE the fixed off-peak window, so it is peak-priced (an
+    over-charge). Returns (is_fallback_material, is_no_bucket):
+      - is_fallback_material: material kWh, no Measurements cost (schedule-priced)
+      - is_no_bucket        : AND Octopus sent NO TOU bucket at all (label list
+                              empty) — i.e. a data omission, not a STANDARD label.
+    Distinguishes 'Octopus omitted the bucket' from 'genuinely labelled peak', to
+    tell a settlement-timing gap from a permanent omission before we change pricing.
+    """
+    if channel != "import" or meas_cost is not None or (kwh or 0) < threshold:
+        return (False, False)
+    return (True, not bool(buckets))
+
+
+def _record_import_gaps(channel: str, gaps_key: str, checkpoint, imported) -> None:
+    """Detect runs of MISSING half-hours this slice reveals — within the fetched
+    set and at the checkpoint boundary — and APPEND them to the persisted
+    per-channel gap list (kraken_state JSON). `imported` is newest→oldest.
+    Non-fatal."""
+    import json as _json
+    import api_import as _ai
+    try:
+        seq = ([checkpoint] if checkpoint else []) + list(imported)   # descending
+        new_gaps = []
+        for i in range(len(seq) - 1):
+            try:
+                a = datetime.fromisoformat(seq[i])          # newer
+                b = datetime.fromisoformat(seq[i + 1])      # older
+            except Exception:
+                continue
+            missing = int((a - b).total_seconds() // 1800) - 1        # 30-min slots
+            if missing > 0:
+                new_gaps.append({
+                    "from": _ai._iso(b + timedelta(minutes=30)),
+                    "to": _ai._iso(a - timedelta(minutes=30)),
+                    "count": missing,
+                })
+        if not new_gaps:
+            return
+        try:
+            existing = _json.loads(_store.get_kraken_state(gaps_key) or "[]")
+        except Exception:
+            existing = []
+        existing.extend(new_gaps)
+        _store.set_kraken_state(gaps_key, _json.dumps(existing))
+    except Exception as e:
+        logger.info("import: gap recording skipped (%s): %s", channel, e)
+
+
+def api_import_gaps() -> dict:
+    """Persisted reconstruction gaps per channel (missing half-hour runs found
+    during the historical import), for the import page to display without any
+    re-query. Returns {channels:{import:{gaps:[...], missing:N}, export:{...}}}.
+
+    Self-clearing: each persisted gap is reconciled against the live blocks table —
+    once its slots carry data (a later import or a backfill filled them), the gap is
+    pruned from the stored list, so the display reflects what's ACTUALLY still
+    missing rather than a stale snapshot from import time."""
+    import json as _json
+    out = {"channels": {}}
+    if _store is None:
+        return out
+    for channel in ("import", "export"):
+        try:
+            gaps = _json.loads(_store.get_kraken_state("import_gaps_" + channel) or "[]")
+        except Exception:
+            gaps = []
+        # Reconcile against reality — drop gaps whose slots are now all filled.
+        kept = []
+        for g in gaps:
+            gf = g.get("from")
+            gt = g.get("to") or gf
+            need = int(g.get("count") or 0)
+            try:
+                have = _store.channel_slots_present(channel, gf, gt) if gf else 0
+            except Exception:
+                have = 0
+            if need <= 0 or have < need:
+                kept.append(g)
+        if len(kept) != len(gaps):
+            try:
+                _store.set_kraken_state("import_gaps_" + channel, _json.dumps(kept))
+            except Exception:
+                pass
+            gaps = kept
+        missing = sum(int(g.get("count") or 0) for g in gaps)
+        gaps_sorted = sorted(gaps, key=lambda g: g.get("from") or "", reverse=True)
+        out["channels"][channel] = {"gaps": gaps_sorted, "missing": missing,
+                                    "gap_count": len(gaps)}
+    return out
+
+
+async def import_api_history(requested_from=None, *, chunk_days: int = 60,
+                             max_chunks: int = 6, pace_s: float = 0.0,
+                             headroom_frac: float = 0.25, dry_run: bool = False,
+                             restart: bool = False, recover_costs: bool = True,
+                             recover_pace_s: float = 0.4,
+                             meter_id: str = "electricity_main") -> dict:
+    """API import route apply — INCREMENTAL and rate-limit-aware.
+
+    Fetches half-hourly GraphQL Measurements (kWh + billed cost + Octopus's own
+    OFF_PEAK/STANDARD_RATE label) newest→oldest and writes `imported_api` blocks.
+    Pricing is exact and dispatch-aware (no tariff reconstruction / clustering).
+
+    Bounded per call: processes at most `max_chunks` chunks, resuming from the
+    per-channel checkpoint, so a full-history import spans several short calls (the
+    UI loops until `done`). Between chunks it paces (`pace_s`, which also yields the
+    engine loop) and checks `rateLimitInfo` — if remaining points fall below
+    `headroom_frac × limit` it PAUSES (leaving budget for BCD / EMT's live poll)
+    and returns `reason: 'rate_limit'` so the caller resumes later. `restart` clears
+    the checkpoint to begin again from go-live. Reversible via the reconstructed-
+    history delete filter."""
+    import asyncio as _asyncio
+    import api_import as _ai
+    from block_store import IMPORTED_SOURCE_API
+    if not kraken_available():
+        return {"ok": False, "reason": "no_api", "channels": {}}
+    if _store is None:      # e.g. a restore closed the store — never write to it
+        return {"ok": False, "reason": "no_store", "channels": {}}
+    try:
+        # Oldest LIVE block (ignore reconstructed/imported) so a prior partial
+        # import doesn't wall off its own gap — see plan_api_import.
+        go_live = _store.get_oldest_block_start(exclude_imported=True)
+    except Exception:
+        go_live = None
+    if not go_live:
+        return {"ok": False, "reason": "no_go_live", "channels": {}}
+    disc = _kraken_discovery or {}
+    out: dict = {"ok": True, "go_live": go_live, "dry_run": dry_run, "channels": {}}
+    all_done = True
+    for channel in ("import", "export"):
+        info = disc.get(channel) or {}
+        mpan = info.get("mpan")
+        if not mpan:
+            out["channels"][channel] = {"ok": False, "available": False, "done": True}
+            continue
+        ck_key = _API_IMPORT_CHECKPOINT + "_" + channel
+        done_key = "api_import_done_" + channel
+        gaps_key = "import_gaps_" + channel
+        if restart and not dry_run:
+            _store.set_kraken_state(ck_key, "")
+            _store.set_kraken_state(done_key, "")
+            _store.set_kraken_state(gaps_key, "")
+            # Fresh run → drop this channel's stale reprice-queue entries so the
+            # queue reflects only THIS import's no-cost slots (it's cumulative
+            # otherwise, carrying flags from earlier/broken runs).
+            try:
+                _store.clear_reprice_queue_slots(
+                    channel, _store.get_reprice_queue().get(channel) or [])
+            except Exception:
+                pass
+        if not dry_run and _store.get_kraken_state(done_key) == "1":
+            out["channels"][channel] = {"ok": True, "done": True,
+                                        "reason": "already_done", "written": 0}
+            continue
+        direction = "GENERATION" if channel == "export" else "CONSUMPTION"
+
+        # Tariff rate schedules (fetched once per run, cached; cleared on restart)
+        # → clean display rate + a price for half-hours Measurements returns
+        # without cost.
+        if restart and not dry_run:
+            _hist_rate_segs_cache.pop(channel, None)
+            _hist_standing_segs_cache.pop(channel, None)
+        if channel not in _hist_rate_segs_cache:
+            _hist_rate_segs_cache[channel] = await _build_channel_rate_segs(channel)
+        rate_segs = _hist_rate_segs_cache[channel]
+        # Standing-charge schedule (authoritative, complete) — see _standing_for.
+        if channel not in _hist_standing_segs_cache:
+            _hist_standing_segs_cache[channel] = \
+                await _build_channel_standing_segs(channel)
+        standing_segs = _hist_standing_segs_cache[channel]
+
+        floor = requested_from or await _cached_data_floor(channel, info,
+                                                            restart=restart)
+        if not floor:
+            gl_dt = _ai._naive_utc(go_live)
+            floor = _ai._iso(gl_dt - timedelta(days=1100)) if gl_dt else None
+        checkpoint = (_store.get_kraken_state(ck_key) or None) if not dry_run else None
+        hi = checkpoint or go_live
+        window = _ai.clamp_window(floor, hi)
+        if not window.get("ok"):
+            if not dry_run:
+                _store.set_kraken_state(done_key, "1")
+            out["channels"][channel] = {"ok": True, "done": True,
+                                        "reason": "completed", "written": 0}
+            continue
+        chunks = _ai.plan_chunks(window["from"], window["to"], chunk_days=chunk_days)
+        slice_ = chunks[:max_chunks]
+
+        # Fetch the slice, paced + rate-limit-aware.
+        by_start: dict = {}
+        fetch_error = None
+        paused = False
+        for c in slice_:
+            if headroom_frac > 0:
+                try:
+                    rl = await _kraken_client.get_rate_limit()
+                except Exception:
+                    rl = None
+                if rl:
+                    low = (rl.get("remaining") is not None and rl.get("pointsLimit")
+                           and rl["remaining"] < headroom_frac * rl["pointsLimit"])
+                    if rl.get("isBlocked") or low:
+                        paused = True
+                        break
+            try:
+                rows = await _kraken_client.get_measurements(
+                    mpan, c["from"] + "Z", c["to"] + "Z", direction=direction)
+            except Exception as e:
+                fetch_error = str(e)
+                break
+            for r in (rows or []):
+                if r.get("start"):
+                    by_start[r["start"]] = r
+            # ── EXPORT REST fallback ─────────────────────────────────────────
+            # The half-hourly *Measurements* export feed can begin LATER than the
+            # raw meter readings — Octopus bills export monthly from meter install
+            # but its settled half-hourly export series may only start months
+            # later. Export has no off-peak/dispatch, so raw REST kWh priced from
+            # the tariff schedule (a flat OUTGOING rate OR Agile Outgoing's
+            # half-hourly rate, both via resolve()) reproduces the bill exactly.
+            # Fill any half-hour REST returns that Measurements didn't.
+            if channel == "export" and info.get("serial"):
+                # Match Measurements' EXCLUSIVE upper bound: the REST endpoint
+                # includes the period_to boundary interval, which is the NEXT
+                # (newer) chunk's oldest half-hour. Re-adding it here makes this
+                # slice's newest timestamp one step higher than the checkpoint
+                # expects, so the newest→oldest contiguity check rejects the whole
+                # slice and halts the import at the slice boundary.
+                _chunk_top = _ai._iso(_ai._naive_utc(c["to"] + "Z"))
+                try:
+                    rest_rows = await _kraken_client.get_consumption(
+                        mpan, info["serial"],
+                        period_from=c["from"] + "Z", period_to=c["to"] + "Z")
+                except Exception as _rest_e:
+                    rest_rows = []
+                    logger.info("import: export REST fallback fetch failed "
+                                "(%s..%s): %s", c["from"], c["to"], _rest_e)
+                for rr in (rest_rows or []):
+                    _isv = rr.get("interval_start")
+                    st = _ai._iso(_ai._naive_utc(_isv)) if _isv else None
+                    if st and (_chunk_top is None or st < _chunk_top) \
+                            and st not in by_start:
+                        by_start[st] = {
+                            "start": st,
+                            "kwh": float(rr.get("consumption") or 0.0),
+                            "cost_incl": None,      # priced from the tariff below
+                            "off_peak": None,       # export: no off-peak bucket
+                            "standing_incl": 0.0,
+                        }
+            if pace_s:
+                await _asyncio.sleep(pace_s)
+
+        # Import EVERY fetched half-hour — do NOT halt at internal discontinuities.
+        # Real supplier data has gaps: settlement thinning near where the settled
+        # half-hourly series begins, the DST spring-forward's missing hour, meter
+        # comms dropouts. Halting at the first gap permanently stopped the backfill
+        # short (it kept tripping on chunk boundaries, then the March DST change).
+        # Reconstructed history is allowed to have holes; termination is by reaching
+        # the floor, or by a fully-empty chunk (no_more_data) once we descend below
+        # where the data actually begins.
+        starts = sorted(by_start.keys(), reverse=True)
+        imported = list(starts)
+        halted_at = None
+
+        # Record any gaps (runs of missing half-hours) this slice reveals, so the
+        # reconstruction's holes are surfaced to the user instead of silently
+        # under-reporting a bill period. Zero-export nights come back as zero-value
+        # rows (not omitted), so a gap here is a genuine hole — a DCC/settlement
+        # outage. Persisted per channel; survives reload without re-querying.
+        if not dry_run:
+            _record_import_gaps(channel, gaps_key, checkpoint, imported)
+
+        # Standing charge per day. PREFER the tariff standing-charge schedule
+        # (authoritative + complete); only fall back to the summed Measurements
+        # figure where the schedule doesn't cover the date. Measurements'
+        # STANDING_CHARGE_COST is patchy (whole stretches return none → £0/day),
+        # which was silently under-billing the reconstructed range.
+        meas_standing: dict = {}
+        meas_count: dict = {}
+        for st in imported:
+            d = st[:10]
+            meas_standing[d] = (meas_standing.get(d, 0.0)
+                                + (by_start[st].get("standing_incl") or 0.0))
+            meas_count[d] = meas_count.get(d, 0) + 1
+        try:
+            _slots_per_day = int(round(24 * 60 / max(1, int(get_block_minutes()))))
+        except Exception:
+            _slots_per_day = 48
+        day_standing: dict = {}
+        for d in meas_standing:
+            sc = _standing_for(standing_segs, d)
+            if sc is not None:
+                day_standing[d] = sc
+            else:
+                # Measurements spreads the daily standing charge across the day's
+                # intervals, so a PARTIAL day (a gap or the go-live boundary) sums
+                # to only a FRACTION of the charge (e.g. ¾ × 0.4512 = 0.3384). You
+                # pay the full standing charge regardless of how many half-hours
+                # have data — extrapolate the present intervals back to a whole day.
+                n = meas_count.get(d, 0)
+                day_standing[d] = (round(meas_standing[d] / n * _slots_per_day, 6)
+                                   if n else meas_standing[d])
+
+        priced = off_peak = 0
+        fb_material = fb_no_bucket = 0     # IOG-dispatch pricing diagnostic
+        fb_samples = []
+        fb_starts = []                     # ALL no-cost material slots → reprice queue
+        rows_to_write = []
+        for st in imported:
+            r = by_start[st]
+            kwh = r.get("kwh") or 0.0
+            meas_cost = r.get("cost_incl")
+            ofp = r.get("off_peak")
+            # Rate: Octopus's billed cost is truth — use cost÷kWh, keeping the clean
+            # scheduled rate only when it agrees (so a mis-dated price-cap change in
+            # the local schedule can't stamp a rate that contradicts the bill).
+            rate = _billed_rate(rate_segs, st, ofp, meas_cost, kwh)
+            # Cost: exact billed figure if Measurements gave one; otherwise
+            # reconstruct kWh × tariff-rate (fills the cost-missing half-hours).
+            if meas_cost is not None:
+                cost = meas_cost
+            elif rate is not None and kwh > 0:
+                cost = round(kwh * rate, 6)
+            else:
+                cost = None
+            if cost is not None:
+                priced += 1
+            if ofp:
+                off_peak += 1
+            # Diagnostic: a material-kWh slot Measurements gave no cost for is
+            # schedule-priced and can't reflect an out-of-window IOG dispatch.
+            _fb, _nb = _import_pricing_flag(channel, kwh, meas_cost, r.get("buckets"))
+            if _fb:
+                fb_material += 1
+                fb_starts.append(st)       # queue for the calm re-price repair pass
+                if _nb:
+                    fb_no_bucket += 1
+                if len(fb_samples) < 25:
+                    fb_samples.append({"start": st, "kwh": round(kwh, 3),
+                                       "off_peak": ofp, "buckets": r.get("buckets") or []})
+            # Standing charge is an IMPORT-meter charge on the shared block row —
+            # the export channel must not write it (it would clobber the import's
+            # value with 0, since OUTGOING tariffs have no standing charge).
+            _standing = day_standing.get(st[:10]) if channel == "import" else None
+            rows_to_write.append({"start": st, "kwh": kwh, "rate": rate,
+                                  "cost": cost, "standing": _standing})
+        # Total flagged this chunk BEFORE in-pass recovery reduces it — the "raised"
+        # figure the post-import health summary reports.
+        flags_raised_ch = fb_material
+        healed_in_pass = 0
+        # ── In-pass cost recovery ────────────────────────────────────────────
+        # The material no-cost slots above are the empty-`statistics` signature
+        # Octopus emits under the bulk fetch's load — NOT a genuine gap (proven:
+        # an isolated single-slot re-fetch returns the real OFF_PEAK/STANDARD cost
+        # deterministically). So before writing, re-fetch each one calmly, in its
+        # own single-slot query, and price it from the REAL cost. This makes the
+        # import self-heal in one pass instead of leaving it to the repair pass.
+        if (recover_costs and not dry_run and fb_starts
+                and channel == "import" and _kraken_client is not None):
+            try:
+                _rec = await _kraken_client.recover_measurement_costs(
+                    mpan, fb_starts, direction=direction, pace_s=recover_pace_s)
+            except Exception as _re:
+                _rec = {}
+                logger.info("import cost recovery: skipped (%s)", _re)
+            if _rec:
+                _idx = {row["start"]: row for row in rows_to_write}
+                _healed = []
+                for st, node in _rec.items():
+                    row = _idx.get(st)
+                    mc = node.get("cost_incl")
+                    if row is None or mc is None:
+                        continue
+                    ofp = node.get("off_peak")
+                    kwh = row.get("kwh") or 0.0
+                    # Billed cost is truth — cost÷kWh, keeping the clean scheduled
+                    # rate only when it agrees (price-cap-safe).
+                    rate = _billed_rate(rate_segs, st, ofp, mc, kwh)
+                    if row.get("cost") is None:
+                        priced += 1
+                    if ofp and not row.get("_was_off_peak"):
+                        off_peak += 1
+                    row["cost"] = mc
+                    row["rate"] = rate
+                    row["_was_off_peak"] = bool(ofp)
+                    _healed.append(st)
+                if _healed:
+                    _healset = set(_healed)
+                    fb_starts = [s for s in fb_starts if s not in _healset]
+                    fb_material = len(fb_starts)
+                    fb_no_bucket = min(fb_no_bucket, fb_material)
+                    healed_in_pass = len(_healed)
+                    logger.info(
+                        "import cost recovery [%s]: healed %d/%d no-cost slot(s) "
+                        "in-pass via isolated re-fetch; %d still queued for repair",
+                        channel, len(_healed), len(_rec) + 0, fb_material)
+            # Strip the private helper key before persisting rows.
+            for row in rows_to_write:
+                row.pop("_was_off_peak", None)
+
+        # IOG-dispatch pricing diagnostic: surface (and persist) how many material
+        # slots Octopus gave no cost for, and how many had NO TOU bucket at all —
+        # the signal that tells a settlement-timing gap from a permanent omission.
+        if fb_material:
+            logger.warning(
+                "import pricing diag [%s]: %d material slot(s) (kWh>=1.0) had NO "
+                "Measurements cost → schedule-priced (peak if out-of-window); %d of "
+                "those had NO TOU bucket at all. Samples: %s",
+                channel, fb_material, fb_no_bucket, fb_samples[:8])
+            try:
+                _diag = _store.get_meta("import_pricing_diag", None) or {}
+                cur = _diag.get(channel) or {"material": 0, "no_bucket": 0, "samples": []}
+                cur["material"] += fb_material
+                cur["no_bucket"] += fb_no_bucket
+                cur["samples"] = (cur["samples"] + fb_samples)[:50]
+                _diag[channel] = cur
+                _diag["updated_at"] = _dt_now_iso_safe()
+                _store.set_meta("import_pricing_diag", _diag)
+            except Exception as _de:
+                logger.warning("import pricing diag: persist failed: %s", _de)
+            # Queue the no-cost slots for the calm re-price repair pass.
+            try:
+                _store.add_reprice_queue(channel, fb_starts)
+            except Exception as _qe:
+                logger.warning("import reprice queue: persist failed: %s", _qe)
+
+        written = 0
+        if not dry_run and rows_to_write:
+            # One transaction for the whole chunk (not a commit per block) so the
+            # write doesn't stall the async loop and starve the HA WebSocket.
+            written = _store.upsert_imported_blocks(
+                rows_to_write, meter_id, channel, source=IMPORTED_SOURCE_API)
+            await _asyncio.sleep(0)      # yield the loop after the batch write
+        if not dry_run and imported:
+            _store.set_kraken_state(ck_key, imported[-1])
+
+        # Done when: gap-halt, or this slice reached the floor (all chunks fit),
+        # or no data left below (past the account's start) — but never when paused
+        # or a fetch failed (those must resume).
+        reached_floor = len(chunks) <= max_chunks
+        no_more_data = (not by_start) and (not paused) and (not fetch_error)
+        done = bool(halted_at) or ((reached_floor or no_more_data)
+                                   and not paused and not fetch_error)
+        reason = ("halted" if halted_at else "rate_limit" if paused
+                  else "fetch_error" if fetch_error
+                  else "completed" if done else "more")
+        if done and not dry_run:
+            _store.set_kraken_state(done_key, "1")
+        if not done:
+            all_done = False
+
+        out["channels"][channel] = {
+            "ok": True, "done": done, "reason": reason,
+            "fetched": len(by_start), "imported": len(imported),
+            "written": written, "priced": priced, "off_peak_intervals": off_peak,
+            "fallback_material": fb_material, "fallback_no_bucket": fb_no_bucket,
+            "flags_raised": flags_raised_ch, "healed_in_pass": healed_in_pass,
+            "halted_at": halted_at, "fetch_error": fetch_error, "paused": paused,
+            "oldest": (imported[-1] if imported else checkpoint),
+            "window": {"from": window["from"], "to": window["to"]},
+        }
+    out["done"] = all_done
+    return out
+
+
+# kWh above which an import slot labelled STANDARD (peak) by a WIDE re-fetch window
+# is treated as a mislabelled IOG dispatch and escalated to the narrow single-slot
+# ladder. Genuine peak HOUSE load rarely reaches this in a half-hour; an IOG charge
+# slot is ~3–3.6 kWh (7 kW). The ladder self-corrects a false positive (a real peak
+# slot stays STANDARD), so this only costs an extra calm query on the wrong guess.
+_DISPATCH_RECHECK_KWH = 2.0
+
+
+async def repair_import_pricing(from_date=None, to_date=None, *,
+                                window_days: int = 7, pace_s: float = 1.0,
+                                max_windows: int = 400, headroom_frac: float = 0.15,
+                                channels=("import", "export"), count_only: bool = False,
+                                meter_id: str = "electricity_main") -> dict:
+    """Calm, targeted re-price of imported half-hours the bulk import mispriced
+    because a Measurements response came back with the kWh but an unresolved
+    (empty) cost `metaData` — a partial success under the import's back-to-back
+    load, which we then priced from the tariff schedule (peak if out-of-window).
+
+    This re-queries the SAME slots one small, well-spaced window at a time and
+    re-prices each block in place from the real OFF_PEAK/STANDARD cost. Because a
+    calm query reliably returns the cost (proven by the cost probe), this is BOTH
+    the fix AND the root-cause test: the returned split says how many were
+    recovered by a calm re-fetch (⇒ the misses were load-induced partial
+    responses, not a genuine Octopus gap) vs how many are still cost-less
+    (⇒ genuinely unavailable).
+
+    Targets:
+      - from_date/to_date given → ALL imported blocks in that local range
+        (runs on the CURRENT DB — no re-import needed; pick a narrow range first).
+      - otherwise → the persisted reprice queue (auto-populated by the last
+        import's no-cost slots).
+
+    Returns {ok, recovered, still_missing, checked, windows, remaining}.
+    """
+    global _kraken_client, _store
+    if _store is None or _kraken_client is None or not kraken_available():
+        return {"ok": False, "reason": "no api / store", "recovered": 0}
+    import asyncio as _asyncio
+    import api_import as _ai
+    from datetime import datetime as _dt2, timedelta as _td2
+
+    def _d(s):
+        return _dt2.fromisoformat(str(s).replace(" ", "T").split(".")[0])
+
+    # Resolve the per-channel target start lists.
+    targets: dict = {"import": [], "export": []}
+    if from_date or to_date:
+        f_iso = _ai._iso(_ai._naive_utc((from_date or "2000-01-01") + "T00:00:00Z"))
+        # `to_date` is INCLUSIVE of the whole picked day → advance one day for the
+        # exclusive upper bound (+ a little slack for the BST local/UTC offset), so
+        # "18 → 25" actually covers the 25th, not up to its 00:00.
+        if to_date:
+            t_iso = _ai._iso(_dt2.fromisoformat(to_date) + _td2(days=1, hours=1))
+        else:
+            t_iso = "2100-01-01T00:00:00"
+        starts = _store.get_imported_block_starts(f_iso, t_iso, meter_id)
+        # Only fill the channels the caller asked for — the range tool is IMPORT
+        # pricing, and re-pricing export from cost÷kWh fragments its (usually flat)
+        # rate into many buckets. `channels` scopes it; default keeps both.
+        targets["import"] = list(starts) if "import" in channels else []
+        targets["export"] = list(starts) if "export" in channels else []
+    else:
+        q = _store.get_reprice_queue()
+        targets["import"] = sorted(q.get("import") or []) if "import" in channels else []
+        targets["export"] = sorted(q.get("export") or []) if "export" in channels else []
+
+    # Count-only preview: how many blocks a run would touch, no API calls, no writes.
+    if count_only:
+        return {"ok": True, "count_only": True,
+                "import": len(targets["import"]), "export": len(targets["export"]),
+                "count": len(targets["import"]) + len(targets["export"]),
+                "mode": ("range" if (from_date or to_date) else "queue")}
+
+    recovered = still_missing = checked = windows_done = 0
+    still_missing_starts: list = []   # the actual slots left cost-less (inspectable)
+    throttled = False                 # stopped early because the rate-limit ran low
+
+    async def _headroom_low() -> bool:
+        """True if the Octopus points allowance is blocked or below headroom_frac
+        of the limit — so we STOP re-fetching (rate limits are cumulative/hourly:
+        pushing on only makes later windows come back cost-less, which is the very
+        thing this repair exists to avoid). The caller re-runs once it recovers."""
+        if headroom_frac <= 0:
+            return False
+        try:
+            rl = await _kraken_client.get_rate_limit()
+        except Exception:
+            return False
+        if not rl:
+            return False
+        if rl.get("isBlocked"):
+            return True
+        rem, lim = rl.get("remaining"), rl.get("pointsLimit")
+        return bool(rem is not None and lim and rem < headroom_frac * lim)
+
+    for channel in channels:
+        if throttled:
+            break
+        starts = sorted(targets.get(channel) or [])
+        if not starts:
+            continue
+        info = (_kraken_discovery or {}).get(channel) or {}
+        mpan = info.get("mpan")
+        if not mpan:
+            continue
+        direction = "GENERATION" if channel == "export" else "CONSUMPTION"
+        try:
+            if channel not in _hist_rate_segs_cache:
+                _hist_rate_segs_cache[channel] = await _build_channel_rate_segs(channel)
+            rate_segs = _hist_rate_segs_cache[channel]
+        except Exception as e:
+            logger.warning("repair_import_pricing: rate segs failed (%s): %s", channel, e)
+            continue
+
+        # Slots the window re-fetch STILL returns no cost for — retried one at a
+        # time (single-slot, the calmest request) after the window pass, since the
+        # probe showed an isolated single-slot query recovers what a wider window
+        # under load does not.
+        sm_starts: list = []
+        # Group targets into <=window_days spans so each re-fetch is small + calm.
+        groups, cur_group, anchor = [], [], None
+        for st in starts:
+            d = _d(st)
+            if anchor is None or (d - anchor) < _td2(days=window_days):
+                anchor = anchor or d
+                cur_group.append(st)
+            else:
+                groups.append(cur_group)
+                cur_group, anchor = [st], d
+        if cur_group:
+            groups.append(cur_group)
+
+        for grp in groups:
+            if windows_done >= max_windows:
+                break
+            if await _headroom_low():
+                throttled = True
+                logger.info("repair_import_pricing: rate-limit headroom low — "
+                            "pausing after %d window(s); re-run to continue",
+                            windows_done)
+                break
+            # Anchor the window a day BEFORE the first slot: the OFF_PEAK label of
+            # an IOG dispatch slot is only returned when the query window reaches
+            # back to the charging run's start (proven — the label is window-
+            # contextual and monotonic, so over-reaching is safe). Without this a
+            # slot at the leading edge of the group would come back STANDARD (peak).
+            win_from = _ai._iso(_d(grp[0]) - _td2(days=1))
+            win_to = _ai._iso(_d(grp[-1]) + _td2(minutes=int(get_block_minutes() or 30)))
+            try:
+                rows = await _kraken_client.get_measurements(
+                    mpan, win_from + "Z", win_to + "Z", direction=direction)
+            except Exception as e:
+                logger.info("repair_import_pricing: refetch failed %s..%s: %s",
+                            win_from, win_to, e)
+                continue
+            by_start = {r["start"]: r for r in (rows or []) if r.get("start")}
+            fixed = []
+            for st in grp:
+                r = by_start.get(st)
+                if not r:
+                    continue
+                checked += 1
+                mc = r.get("cost_incl")
+                if mc is None:            # window still no cost → try single-slot below
+                    sm_starts.append(st)
+                    continue
+                ofp = r.get("off_peak")
+                kwh = r.get("kwh") or 0
+                rate = _billed_rate(rate_segs, st, ofp, mc, kwh)
+                if _store.reprice_imported_block(st, meter_id, channel, rate, mc):
+                    recovered += 1
+                    fixed.append(st)
+                # Wide re-fetch windows return a self-consistent STANDARD (peak) label
+                # AND cost for an off-peak IOG dispatch charged OUTSIDE the core
+                # window, so this window pass 'confirms' the wrong peak price and
+                # changes nothing — the reason a plain date-range repair can't shift
+                # the split. A MATERIAL import slot still labelled STANDARD is almost
+                # certainly such a dispatch, so escalate it to the narrow single-slot
+                # ladder below, which reliably returns OFF_PEAK for a real dispatch
+                # (and leaves genuine peak untouched — a cheap re-check on a wrong guess).
+                if (channel == "import" and ofp is False
+                        and kwh >= _DISPATCH_RECHECK_KWH and st not in sm_starts):
+                    sm_starts.append(st)
+            if fixed and not (from_date or to_date):
+                _store.clear_reprice_queue_slots(channel, fixed)
+            windows_done += 1
+            if pace_s:
+                await _asyncio.sleep(pace_s)
+
+        # Context-anchored straggler pass: the window re-fetch left these cost-less;
+        # recover_measurement_costs re-fetches each in a wide day-anchored window
+        # (calm + retried). Skip it when throttled — adding load would only produce
+        # more empties. Only slots still empty afterwards are truly left for a re-run.
+        if sm_starts and not throttled:
+            try:
+                _rec = await _kraken_client.recover_measurement_costs(
+                    mpan, sm_starts, direction=direction, pace_s=pace_s or 0.4)
+            except Exception as e:
+                _rec = {}
+                logger.info("repair_import_pricing: single-slot pass failed: %s", e)
+            fixed_ss = []
+            for st in sm_starts:
+                node = _rec.get(st)
+                mc = node.get("cost_incl") if node else None
+                if mc is None:
+                    still_missing += 1
+                    still_missing_starts.append(st)
+                    continue
+                ofp = node.get("off_peak")
+                rate = _billed_rate(rate_segs, st, ofp, mc, node.get("kwh") or 0)
+                if _store.reprice_imported_block(st, meter_id, channel, rate, mc):
+                    recovered += 1
+                    fixed_ss.append(st)
+            if fixed_ss and not (from_date or to_date):
+                _store.clear_reprice_queue_slots(channel, fixed_ss)
+
+    if recovered:
+        await _regen_charts_after_import_async({"written": {"import": recovered}})
+    remaining = _store.reprice_queue_count()
+    # Self-diagnostic: how much imported data exists at all + how many targets we
+    # resolved — so a "0 checked" result says WHY (no imports vs none in range vs
+    # empty queue) instead of leaving us blind.
+    info = {}
+    try:
+        info = _store.count_imported_history()
+    except Exception:
+        pass
+    n_targets = len(targets.get("import") or []) + (0 if (from_date or to_date)
+                                                    else len(targets.get("export") or []))
+    logger.info("repair_import_pricing: recovered %d, still-missing %d (of %d "
+                "checked) in %d window(s); targets=%d imported_total=%s (%s..%s)",
+                recovered, still_missing, checked, windows_done, n_targets,
+                info.get("blocks"), info.get("from"), info.get("to"))
+    return {"ok": True, "recovered": recovered, "still_missing": still_missing,
+            "checked": checked, "windows": windows_done, "remaining": remaining,
+            "targets": n_targets, "mode": ("range" if (from_date or to_date) else "queue"),
+            "throttled": throttled,   # stopped early on low rate-limit headroom
+            "missing": sorted(still_missing_starts)[:200],   # inspectable leftovers
+            "imported_blocks": info.get("blocks"),
+            "imported_from": info.get("from"), "imported_to": info.get("to")}
+
+
+# ── API import as a background job (pause / resume / cancel) ──────────────────
+# The import runs as a task on the engine loop, not driven by the browser, so it
+# survives navigating away and can be paused/cancelled. State is in-memory (single
+# add-on process); the per-channel checkpoint in kraken_state means a restart
+# mid-import loses only the job UI, not the progress (re-Start resumes idempotently).
+_api_import_job: dict = {"status": "idle"}
+
+
+def api_import_status() -> dict:
+    """JSON-safe snapshot of the background import job."""
+    return {k: v for k, v in _api_import_job.items() if k != "task"}
+
+
+def api_import_running() -> bool:
+    return _api_import_job.get("status") in ("running", "paused", "rate_limited")
+
+
+def api_import_control(action: str) -> dict:
+    """pause / resume / cancel the running import (sets a flag the worker polls)."""
+    j = _api_import_job
+    if not api_import_running():
+        return {"ok": False, "status": j.get("status"), "note": "no active import"}
+    if action == "pause":
+        j["control"] = "pause"
+    elif action == "resume":
+        j["control"] = "run"
+    elif action == "cancel":
+        j["control"] = "cancel"
+    else:
+        return {"ok": False, "error": f"unknown action: {action}"}
+    return {"ok": True, "status": j.get("status"), "control": j["control"]}
+
+
+def _regen_charts_after_import(j) -> None:
+    """Rebuild the pre-built billing/heatmap charts after an import so the views
+    reflect the imported blocks immediately — not only after the next live block
+    finalises. Only runs if the import actually wrote something. Non-fatal."""
+    try:
+        written = j.get("written") or {}
+        if not any((written.get(ch) or 0) for ch in written):
+            return
+        if _store is not None and _store.count_blocks():
+            # Off the loop (read-only connection) — a synchronous render over the
+            # full imported history stalls the tick / HA heartbeat (→ restart).
+            _schedule_chart_regen()
+            logger.info("api_import: charts regenerated after import "
+                        "(import=%d export=%d)",
+                        written.get("import", 0), written.get("export", 0))
+    except Exception as e:
+        logger.warning("api_import: chart regen after import failed: %s", e)
+
+
+async def _regen_charts_after_import_async(j) -> None:
+    """Terminal-step chart regen for the background import job — AWAITS the render.
+
+    _regen_charts_after_import fires the render as a fire-and-forget loop task
+    (right for the live tick, which must not stall the HA heartbeat). At the END
+    of the import job, though, we want the job to only report 'done' once the
+    charts actually reflect the imported history — and awaiting here is safe
+    because the import job IS the background work (it is not the live tick, so
+    the heartbeat is unaffected). Same write-gate + non-fatal contract."""
+    try:
+        written = j.get("written") or {}
+        if not any((written.get(ch) or 0) for ch in written):
+            return
+        if _store is not None and _store.count_blocks():
+            await _generate_charts_offloaded()
+            logger.info("api_import: charts regenerated after import "
+                        "(import=%d export=%d)",
+                        written.get("import", 0), written.get("export", 0))
+    except Exception as e:
+        logger.warning("api_import: chart regen after import failed: %s", e)
+
+
+def _import_extend_floor(earliest_import, plan) -> "str | None":
+    """The earliest date it is SAFE to pull the current (oldest existing) config
+    period's start back to after an import.
+
+    Normally the earliest imported block. BUT when a **move** is detected (the
+    region probe stashed a multi-site reconcile plan awaiting confirmation), the
+    oldest existing period is the CURRENT site — so we stop at that site's move-in
+    (the latest tenancy's `from`) and never cross into an earlier site's span.
+    That prevents pre-move data (and its carbon region) being claimed by the
+    current site before the user confirms the split. Pure/testable."""
+    if plan and plan.get("needs_confirmation"):
+        froms = [s.get("from") for s in (plan.get("sites") or []) if s.get("from")]
+        if froms:
+            return max(froms)
+    return earliest_import
+
+
+def _finalise_after_import() -> None:
+    """Post-import housekeeping:
+
+    1. **Extend the earliest config period** back to cover the imported history,
+       so Billing history reflects the real data start (not the go-live date) and
+       every imported block falls inside a period that temporally covers it —
+       clamped by `_import_extend_floor` so a pending move never swallows an
+       earlier site.
+    2. **Re-arm the carbon backfill** so a (re-)import's NULL-carbon blocks fill
+       automatically (a stale `unfilled_from` marker would otherwise block the
+       self-heal re-arm). DEFERRED while a move awaits confirmation — pre-move
+       blocks would resolve to the current region until the split is applied; the
+       reconcile-apply re-arms once the sites (and regions) are set.
+    """
+    if _store is None:
+        return
+    move_pending = False
+    try:
+        plan = _store.get_meta("region_reconcile_pending", None)
+        move_pending = bool(plan and plan.get("needs_confirmation"))
+        info = _store.count_imported_history()
+        floor = _import_extend_floor(info.get("from"), plan)
+        if floor:
+            _store.extend_earliest_period_to(floor)
+    except Exception as e:
+        logger.warning("_finalise_after_import: period extend failed: %s", e)
+    if move_pending:
+        logger.info("_finalise_after_import: move awaiting confirmation — "
+                    "deferring carbon re-arm to the reconcile apply")
+        return
+    try:
+        _store.rearm_carbon_backfill()
+    except Exception as e:
+        logger.warning("_finalise_after_import: carbon re-arm failed: %s", e)
+
+
+async def _drain_reprice_queue_after_import(j: dict | None = None,
+                                            *, pace_s: float = 0.4) -> dict:
+    """Auto FINAL calm recovery pass — run once when the bulk import completes.
+
+    The in-pass recovery (recover_measurement_costs during the import loop) runs
+    UNDER the import's own load, so a few IOG dispatch slots — charged off-peak
+    OUTSIDE the fixed off-peak window (e.g. a morning top-up) — can still come back
+    with empty `statistics`, get schedule-priced at PEAK, and land in the reprice
+    queue. Left there, they inflate the PEAK side of the off-peak/peak split (the
+    classic wrong-split symptom). Nothing drained that queue except a manual
+    'reprice queue' / 'Fix a date range' click — which is why the split only came
+    right when repaired by hand.
+
+    Now that the import is finished the connection is calm, so the look-back ladder
+    finally has the window context it needs: draining the queue here relabels those
+    slots OFF_PEAK and reprices them from the REAL cost, correcting the split
+    automatically. Non-fatal; a rate-limit pause or a genuine gap simply leaves the
+    remainder queued for the next import or a manual re-run."""
+    out = {"recovered": 0, "still_missing": 0, "throttled": False, "ran": False}
+    try:
+        if _store is None or not kraken_available():
+            return out
+        if _store.reprice_queue_count() <= 0:
+            return out
+        res = await repair_import_pricing(pace_s=pace_s)     # queue mode (no dates)
+        out.update({"recovered": res.get("recovered", 0),
+                    "still_missing": res.get("still_missing", 0),
+                    "throttled": bool(res.get("throttled")), "ran": True})
+        logger.info("final recovery pass: recovered %d, still-missing %d%s "
+                    "(auto-drained the reprice queue post-import)",
+                    out["recovered"], out["still_missing"],
+                    " — throttled, remainder still queued" if out["throttled"] else "")
+    except Exception as e:
+        logger.warning("final recovery pass failed (queue left intact): %s", e)
+    if j is not None:
+        j["final_recovery"] = out
+    return out
+
+
+_IMPORT_HEALTH_KEY = "import_health_summary"
+
+
+def _persist_import_health(j: dict) -> None:
+    """Persist a compact post-import health summary to kraken_state so the import
+    page's health panel renders on ANY load, not only right after a run. 'remaining'
+    is always re-read LIVE from the reprice queue; raised/auto_recovered are this
+    run's tallies (in-pass + final calm drain)."""
+    import json as _json
+    if _store is None:
+        return
+    info = {}
+    try:
+        info = _store.count_imported_history() or {}
+    except Exception:
+        pass
+    remaining = 0
+    try:
+        remaining = int(_store.reprice_queue_count())
+    except Exception:
+        pass
+    summary = {
+        "raised": int(j.get("flags_raised") or 0),
+        "auto_recovered": int(j.get("auto_recovered") or 0),
+        "remaining": remaining,
+        "blocks": int(info.get("blocks") or 0),
+        "from": info.get("from"),
+        "to": info.get("to"),
+        "finished_at": _dt_now_iso_safe(),
+    }
+    _store.set_kraken_state(_IMPORT_HEALTH_KEY, _json.dumps(summary))
+
+
+def api_import_health() -> dict:
+    """Post-import health summary for the import page's persistent panel. Reads the
+    persisted run summary and overlays the LIVE remaining-queue count, so 'still
+    need a retry' drops the instant a repair clears slots."""
+    import json as _json
+    out = {"ok": True, "have": False, "raised": 0, "auto_recovered": 0,
+           "remaining": 0, "blocks": 0, "from": None, "to": None}
+    if _store is None:
+        return out
+    try:
+        raw = _store.get_kraken_state(_IMPORT_HEALTH_KEY)
+        if raw:
+            out.update(_json.loads(raw))
+            out["have"] = True
+    except Exception:
+        pass
+    try:
+        out["remaining"] = int(_store.reprice_queue_count())
+    except Exception:
+        pass
+    return out
+
+
+_REGION_CLOBBER_MARKER   = "region_probe_clobber_done"   # store_meta: one-time upgrade overwrite
+_REGION_RECONCILE_MARKER = "region_reconcile_pending"    # store_meta: plan awaiting user confirmation
+_PREIMPORT_SITES_MARKER  = "preimport_sites_applied"     # store_meta: sites confirmed+created BEFORE this import
+
+
+async def discover_pre_import_sites() -> dict:
+    """READ-ONLY. Fetch the account's property history and classify it for the
+    PRE-import 'confirm your sites' wizard step (BlockStore.plan_pre_import_sites).
+
+    Returns {"ok": True, "needs_confirmation": bool, "sites": [...]} — the latest
+    tenancy is the current site (read-only instance name), earlier ones are past
+    addresses the user names so a covering period can be created for each BEFORE
+    the import runs, letting every imported block land in the right (correctly
+    regioned, carbon-eligible) period from the first write. Writes nothing. A
+    never-moved account returns needs_confirmation False so the wizard skips
+    straight to the import."""
+    global _kraken_client, _kraken_account_number, _store
+    try:
+        if _kraken_client is None or _store is None:
+            return {"ok": False, "error": "no API / store"}
+        from block_store import derive_region_periods
+        account = await _kraken_client.get_account(_kraken_account_number)
+        spans = derive_region_periods(account or {})
+        plan = _store.plan_pre_import_sites(spans)
+        return {"ok": True, **plan}
+    except Exception as e:
+        logger.warning("discover_pre_import_sites: %s", e)
+        return {"ok": False, "error": str(e) or type(e).__name__}
+
+
+async def _probe_and_apply_region_periods() -> dict | None:
+    """If the API is configured, read the account's property address history,
+    reduce it to OUTWARD CODES only, and stamp the DNO region onto the config
+    period timeline (BlockStore.apply_region_periods). Best-effort; never raises.
+
+    This is the region foundation for historical carbon: it records which region
+    applied when, so carbon can later be attributed per-period rather than from a
+    single global postcode. Full postcodes are never stored — only the outward
+    code (see block_store.outward_code / derive_region_periods).
+
+    ONE-TIME upgrade clobber: the first time this runs on a given DB, it
+    overwrites even a user-entered postcode with the authoritative Octopus supply
+    address (so a legacy wrong-region entry — e.g. DE1 where the supply is DE65 —
+    self-corrects). After that it respects manual edits (overwrite_user=False),
+    so CSV-only users and deliberate overrides stand."""
+    global _kraken_client, _kraken_account_number, _store
+    try:
+        if _kraken_client is None or _store is None:
+            return None
+        from block_store import derive_region_periods
+        account = await _kraken_client.get_account(_kraken_account_number)
+        spans = derive_region_periods(account or {})
+        if not spans:
+            return None
+        # A move (or an unnamed site) needs the user to name sites and confirm the
+        # config-period split — stash the plan for the confirmation UI rather than
+        # silently rewriting billing history.
+        plan = _store.plan_region_reconciliation(spans)
+        if plan.get("needs_confirmation"):
+            _store.set_meta(_REGION_RECONCILE_MARKER, plan)
+            logger.info("_probe_and_apply_region_periods: %d site(s) need "
+                        "confirmation, %d split(s) proposed — stashed for UI",
+                        len(plan.get("sites") or []), len(plan.get("split_dates") or []))
+            return plan
+        # Single site, nothing to confirm → silent apply (with one-time clobber).
+        first_time = not (_store.get_meta(_REGION_CLOBBER_MARKER, None))
+        res = _store.apply_region_periods(spans, overwrite_user=first_time)
+        if first_time:
+            _store.set_meta(_REGION_CLOBBER_MARKER, _dt_now_iso_safe())
+        if res.get("applied"):
+            try:
+                _store.rearm_carbon_backfill()   # region now known → re-scan carbon
+            except Exception:
+                pass
+        logger.info("_probe_and_apply_region_periods: regions=%s applied=%d "
+                    "split_required=%s one_time_clobber=%s",
+                    res.get("outcodes"), res.get("applied"),
+                    res.get("split_required"), first_time)
+        return res
+    except Exception as e:
+        logger.warning("_probe_and_apply_region_periods: %s", e)
+        return None
+
+
+async def run_api_import_job(requested_from=None, *, chunk_days: int = 60,
+                             max_chunks: int = 1, pace_s: float = 1.5,
+                             headroom_frac: float = 0.25) -> None:
+    """Background worker: loop `import_api_history` slices until done, honouring
+    the pause/cancel control flag between slices and during rate-limit cooldown.
+    Updates `_api_import_job` for the status endpoint. Never raises."""
+    j = _api_import_job
+    j.clear()
+    j.update({"status": "running", "phase": "importing", "control": "run",
+              "started_at": _dt_now_iso_safe(),
+              "written": {"import": 0, "export": 0}, "oldest": {},
+              "flags_raised": 0, "auto_recovered": 0,
+              "reason": None, "error": None, "done": False, "go_live": None})
+    first = True
+    try:
+        while True:
+            ctl = j.get("control")
+            if ctl == "cancel":
+                j["status"] = "cancelled"
+                await _regen_charts_after_import_async(j)   # show what did import
+                return
+            if ctl == "pause":
+                j["status"] = "paused"
+                await asyncio.sleep(1.0)
+                continue
+            j["status"] = "running"
+            j["phase"] = "importing"
+            res = await import_api_history(
+                requested_from, chunk_days=chunk_days, max_chunks=max_chunks,
+                pace_s=pace_s, headroom_frac=headroom_frac, restart=first)
+            first = False
+            if not res.get("ok"):
+                j["status"] = "error"
+                j["error"] = res.get("reason") or "failed"
+                return
+            j["go_live"] = res.get("go_live")
+            rate_limited = False
+            for ch, c in (res.get("channels") or {}).items():
+                if not isinstance(c, dict):
+                    continue
+                j["written"][ch] = j["written"].get(ch, 0) + (c.get("written") or 0)
+                # Post-import health tallies (see _persist_import_health).
+                j["flags_raised"] = j.get("flags_raised", 0) + (c.get("flags_raised") or 0)
+                j["auto_recovered"] = j.get("auto_recovered", 0) + (c.get("healed_in_pass") or 0)
+                if c.get("oldest"):
+                    j["oldest"][ch] = c["oldest"]
+                if c.get("reason") == "rate_limit":
+                    rate_limited = True
+            if res.get("done"):
+                # Block-writing is finished, but a calm tail (region probe →
+                # price recovery → chart rebuild) still runs. Surface it as phases
+                # so the UI shows progress instead of a frozen block count.
+                j["done"] = True
+                j["status"] = "finalising"
+                j["phase"] = "finalising"
+                # Foundation for historical carbon: record which DNO region applied
+                # when, from the account's property history (outward code only).
+                # If the user already confirmed + created the site periods BEFORE
+                # this import (the pre-import wizard step), the timeline is already
+                # correct per period — running the post-import probe again would
+                # re-stamp the latest region across the past periods, so skip it
+                # (consume the marker) and let the pre-import layout stand.
+                try:
+                    if _store and _store.get_meta(_PREIMPORT_SITES_MARKER, None):
+                        _store.set_meta(_PREIMPORT_SITES_MARKER, None)
+                        logger.info("run_api_import_job: pre-import sites already "
+                                    "applied — skipping post-import region probe")
+                    else:
+                        await _probe_and_apply_region_periods()
+                except Exception as _e:
+                    logger.warning("run_api_import_job: region probe failed: %s", _e)
+                try:
+                    _finalise_after_import()
+                except Exception as _e:
+                    logger.warning("run_api_import_job: post-import finalise failed: %s", _e)
+                # Auto final calm recovery: drain the reprice queue now the connection
+                # is calm, so the few off-peak-outside-window dispatch slots the bulk
+                # load left peak-priced get relabelled OFF_PEAK — fixing the split
+                # automatically instead of needing a manual 'reprice queue' click.
+                j["phase"] = "recovering_prices"
+                try:
+                    _fin = await _drain_reprice_queue_after_import(j)
+                    j["auto_recovered"] = j.get("auto_recovered", 0) + (_fin.get("recovered") or 0)
+                except Exception as _e:
+                    logger.warning("run_api_import_job: final recovery pass failed: %s", _e)
+                j["phase"] = "rebuilding_charts"
+                await _regen_charts_after_import_async(j)
+                try:
+                    _persist_import_health(j)
+                except Exception as _e:
+                    logger.warning("run_api_import_job: health persist failed: %s", _e)
+                j["status"] = "done"
+                j["phase"] = "done"
+                return
+            if rate_limited:
+                j["status"] = "rate_limited"
+                for _ in range(60):     # ~60s cooldown, but stay responsive
+                    if j.get("control") in ("cancel", "pause"):
+                        break
+                    await asyncio.sleep(1.0)
+    except Exception as e:
+        logger.warning("run_api_import_job: failed: %s", e)
+        j["status"] = "error"
+        j["error"] = str(e)
 
 
 async def _maybe_run_settlement_sweep() -> None:
@@ -6032,47 +7901,58 @@ async def engine_startup(ha: HAClient):
         if not postcode:
                 return
         loop = _aio.get_running_loop()
-        def _do_fetch():
-            try:
-                slots = _fetch_carbon_intensity(postcode)
-                for slot in slots:
-                    _store.upsert_carbon_intensity(
-                        slot["captured_at"], postcode,
-                        slot["intensity_forecast"], slot["ci_index"],
-                        slot["intensity_actual"]
-                    )
-                _store.prune_carbon_intensity(days=4)
-                return len(slots)
-            except urllib.error.URLError as e:
-                logger.warning("engine_startup: CI fetch failed: %s — will retry on first tick", e)
-                return 0
-            except Exception as e:
-                logger.warning("engine_startup: CI fetch error: %s", e)
-                return 0
+        # Offload ONLY the blocking NETWORK fetch to the executor. All DB writes
+        # stay on the loop thread — the engine owns a single SQLite connection
+        # (check_same_thread=False), so a DB write from the executor thread races
+        # the loop-thread writers (poll/finalise/historical-carbon) on that one
+        # connection and corrupts it: "cannot commit - no transaction is active" /
+        # "error return without exception set". (Same rule the historical carbon
+        # backfill already follows.)
         try:
-            n = await _aio.wait_for(loop.run_in_executor(None, _do_fetch), timeout=_CI_TIMEOUT)
-            if n:
-                global _last_ci_fetch
-                _last_ci_fetch = datetime.now(timezone.utc).replace(tzinfo=None)
-                logger.info("engine_startup: CI fetch complete — %d slots for %s", n, postcode)
-                # Now that CI is populated, backfill carbon for any blocks left
-                # NULL by an outage gap-fill (the carbon-gap recovery).
-                try:
-                    rec = await loop.run_in_executor(None, _recover_missing_carbon)
-                    if rec:
-                        logger.info("engine_startup: carbon recovery backfilled "
-                                    "%d block(s)", rec)
-                except Exception as e:
-                    logger.warning("engine_startup: carbon recovery failed: %s", e)
-                # Historical backfill (v2->v3 migration) — run-once, resumable,
-                # paged; dispatched to a worker thread so it never blocks startup.
-                try:
-                    _maybe_backfill_historical_carbon()
-                except Exception as e:
-                    logger.warning("engine_startup: historical backfill schedule "
-                                   "failed: %s", e)
+            slots = await _aio.wait_for(
+                loop.run_in_executor(None, _fetch_carbon_intensity, postcode),
+                timeout=_CI_TIMEOUT)
         except _aio.TimeoutError:
             logger.warning("engine_startup: CI fetch timed out after %ds — will retry on first tick", _CI_TIMEOUT)
+            return
+        except urllib.error.URLError as e:
+            logger.warning("engine_startup: CI fetch failed: %s — will retry on first tick", e)
+            return
+        except Exception as e:
+            logger.warning("engine_startup: CI fetch error: %s", e)
+            return
+        # DB writes on the loop thread.
+        n = 0
+        try:
+            for slot in (slots or []):
+                _store.upsert_carbon_intensity(
+                    slot["captured_at"], postcode,
+                    slot["intensity_forecast"], slot["ci_index"],
+                    slot["intensity_actual"])
+                n += 1
+            _store.prune_carbon_intensity(days=4)
+        except Exception as e:
+            logger.warning("engine_startup: CI persist error: %s", e)
+        if n:
+            global _last_ci_fetch
+            _last_ci_fetch = datetime.now(timezone.utc).replace(tzinfo=None)
+            logger.info("engine_startup: CI fetch complete — %d slots for %s", n, postcode)
+            # Carbon-gap recovery — DB work, so run it ON THE LOOP THREAD (not an
+            # executor) for the same single-connection reason.
+            try:
+                rec = _recover_missing_carbon()
+                if rec:
+                    logger.info("engine_startup: carbon recovery backfilled "
+                                "%d block(s)", rec)
+            except Exception as e:
+                logger.warning("engine_startup: carbon recovery failed: %s", e)
+            # Historical backfill (run-once, resumable, paged) — dispatched as a
+            # loop task; keeps its own DB work on the loop thread.
+            try:
+                _maybe_backfill_historical_carbon()
+            except Exception as e:
+                logger.warning("engine_startup: historical backfill schedule "
+                               "failed: %s", e)
 
     import asyncio as _asyncio
     await _asyncio.gather(
@@ -6210,6 +8090,25 @@ async def engine_startup(ha: HAClient):
                     "for re-clamp (drain will re-materialise)", _flagged)
     except Exception as _b19e:
         logger.warning("engine_startup: BL-19 grid-invariant sweep failed: %s", _b19e)
+
+    # #307 one-time self-heal: a lost/zeroed opening register books a device's whole
+    # lifetime register as one interval (prod: house_battery 0→6137 kWh in a
+    # half-hour, wrecking its carbon). Physically impossible, so we detect + repair
+    # it automatically — no user action. The write-point guard stops NEW ones, so
+    # this runs at most once per DB (marker-gated); repaired blocks are flagged
+    # needs_review so they surface in the review list. Cost/billing is untouched.
+    try:
+        if not _store.get_kraken_state(_SPIKE_SWEEP_DONE_KEY):
+            _sw = _store.sweep_implausible_sub_blocks(dry_run=False)
+            _store.set_kraken_state(_SPIKE_SWEEP_DONE_KEY,
+                                    datetime.now(timezone.utc).isoformat())
+            if _sw.get("count"):
+                logger.warning(
+                    "engine_startup: #307 self-heal repaired %d implausible device "
+                    "block(s) (> %.0f kWh in one block) — flagged for review",
+                    _sw["count"], _sw.get("ceiling_kwh", 0))
+    except Exception as _spe:
+        logger.warning("engine_startup: #307 device-spike self-heal failed: %s", _spe)
 
     if _store.get_current_config_period_id() is None:
         # Fresh DB — check if blocks.json exists to migrate
@@ -6582,14 +8481,24 @@ async def engine_startup(ha: HAClient):
         except Exception as _ci_err:
             logger.warning("engine_startup: immediate CI tick failed: %s", _ci_err)
 
-    # ── Startup charts ───────────────────────────────────────────────────
-    generate_charts(_store)
-
     # ── 3.0.0 Kraken discovery (read-only; no polling yet) ────────────────
+    # Runs BEFORE the (potentially slow) startup chart render so the supplier API
+    # is activated first — chart generation on a large history can take tens of
+    # seconds and must not gate API discovery / polling behind it.
     try:
         await _kraken_startup_discovery()
     except Exception as _kd_e:
         logger.warning("engine_startup: kraken discovery skipped: %s", _kd_e)
+
+    # ── One-time region-timeline reconciliation (historical-carbon foundation) ──
+    # With the API just discovered, stamp the DNO region (OUTWARD CODE ONLY) onto
+    # the config-period timeline from the account's supply address. The first run
+    # on a DB overwrites a legacy hand-entered postcode (e.g. a wrong region) with
+    # the authoritative one; later runs respect manual edits. Best-effort.
+    try:
+        await _probe_and_apply_region_periods()
+    except Exception as _rp_e:
+        logger.warning("engine_startup: region probe skipped: %s", _rp_e)
 
     # Teardown guard for a Change Setup api→cad transition. When the mode no
     # longer uses the API, _kraken_startup_discovery returns early and never
@@ -6609,6 +8518,19 @@ async def engine_startup(ha: HAClient):
     if (_engine_ha is not None and _kraken_client is not None
             and _kraken_discovery and mode_uses_api()):
         _ensure_kraken_poll_task_running()
+
+    # ── Startup charts (LAST, OFF the loop, FIRE-AND-FORGET) ──────────────
+    # Rendered in a worker thread (dedicated read-only connection) AND not
+    # awaited, so: (1) engine_startup — and the web server that waits on it —
+    # completes immediately instead of sitting behind a tens-of-seconds render;
+    # (2) the render never stalls the HA WebSocket heartbeat, which was dropping
+    # the connection and triggering a reconnect→re-startup→re-render storm. The
+    # in-flight guard means a reconnect that re-runs startup won't stack renders.
+    global _charts_task
+    try:
+        _charts_task = asyncio.create_task(_generate_charts_offloaded())
+    except Exception as _ct_e:
+        logger.warning("engine_startup: could not schedule chart render: %s", _ct_e)
 
     # Mark cold start done: any later engine_startup in this process (HA
     # reconnect / config-save) is warm and must not run the rogue-total guard.

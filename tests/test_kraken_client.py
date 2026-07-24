@@ -223,6 +223,56 @@ class TestClientRequests(unittest.TestCase):
         self.assertEqual(rows[0]["consumption"], 0.1)
         self.assertEqual(rows[1]["consumption"], 0.2)
 
+    def test_get_consumption_boundary_earliest(self):
+        page = {"results": [{"consumption": 0.1,
+                             "interval_start": "2024-06-12T13:00:00Z",
+                             "interval_end": "2024-06-12T13:30:00Z"}],
+                "next": "https://api.octopus.energy/should-not-follow"}
+
+        def route(url, params):
+            return FakeResp(200, page)
+
+        c = self._client({"/v1/electricity-meter-points/": route})
+        row = run(c.get_consumption_boundary("1000000000001", "11111111"))
+        # Single-page fetch: earliest ordering, page_size=1, and the `next`
+        # cursor is NOT followed (only one call recorded).
+        self.assertEqual(row["interval_start"], "2024-06-12T13:00:00Z")
+        self.assertEqual(len(c._session.calls), 1)
+        params = c._session.calls[0][1]
+        self.assertEqual(params["order_by"], "period")
+        self.assertEqual(params["page_size"], 1)
+
+    def test_get_consumption_boundary_latest(self):
+        page = {"results": [{"consumption": 0.2,
+                             "interval_start": "2026-07-19T20:00:00Z",
+                             "interval_end": "2026-07-19T20:30:00Z"}],
+                "next": None}
+        c = self._client({"/v1/electricity-meter-points/":
+                          (lambda url, params: FakeResp(200, page))})
+        row = run(c.get_consumption_boundary("1000000000001", "11111111",
+                                             newest=True))
+        self.assertEqual(row["interval_start"], "2026-07-19T20:00:00Z")
+        self.assertEqual(c._session.calls[0][1]["order_by"], "-period")
+
+    def test_get_consumption_boundary_passes_period_from(self):
+        # A far-past floor must reach the API, else it defaults to only the last
+        # ~week and the "earliest" is wrong.
+        page = {"results": [{"consumption": 0.1,
+                             "interval_start": "2024-06-12T13:00:00Z"}],
+                "next": None}
+        c = self._client({"/v1/electricity-meter-points/":
+                          (lambda url, params: FakeResp(200, page))})
+        run(c.get_consumption_boundary("1000000000001", "11111111",
+                                       period_from="2015-01-01T00:00:00Z"))
+        self.assertEqual(c._session.calls[0][1]["period_from"],
+                         "2015-01-01T00:00:00Z")
+
+    def test_get_consumption_boundary_empty(self):
+        c = self._client({"/v1/electricity-meter-points/":
+                          FakeResp(200, {"results": [], "next": None})})
+        row = run(c.get_consumption_boundary("1000000000001", "11111111"))
+        self.assertIsNone(row)
+
     def test_get_unit_rates(self):
         payload = {"results": [{"value_inc_vat": 24.5,
                                 "valid_from": "2026-05-01T00:00:00Z",
@@ -331,6 +381,26 @@ def _gql_errors(errors):
     return FakeResp(200, {"errors": errors})
 
 
+def _meas_node(start, kwh, tou_label, tou_incl, *, standing_incl="1.12"):
+    """A measurements edge in the shape the live API returns."""
+    return {"node": {
+        "value": kwh, "unit": "kwh", "startAt": start, "endAt": start,
+        "metaData": {"statistics": [
+            {"type": "STANDING_CHARGE_COST", "label": None,
+             "costInclTax": {"estimatedAmount": standing_incl},
+             "costExclTax": {"estimatedAmount": "1.07"}},
+            {"type": "TOU_BUCKET_COST", "label": tou_label,
+             "costInclTax": {"estimatedAmount": tou_incl},
+             "costExclTax": {"estimatedAmount": "0"}},
+        ]}}}
+
+
+def _meas_page(edges, *, has_next=False, cursor=None):
+    return {"account": {"properties": [{"measurements": {
+        "edges": edges,
+        "pageInfo": {"hasNextPage": has_next, "endCursor": cursor}}}]}}
+
+
 class TestGraphQLToken(unittest.TestCase):
     def _client(self, gql_responses):
         c = KrakenAPIClient("test-key", "A-ABCD1234")
@@ -429,15 +499,75 @@ class TestGraphQLQueries(unittest.TestCase):
         self.assertEqual(rows[0]["demand"], -250)
         self.assertEqual(rows[0]["consumption"], 1234567)
 
+    def test_get_measurements_parses_cost_and_label(self):
+        resp = _meas_page([
+            _meas_node("2024-07-01T01:00:00+01:00", "0.108", "OFF_PEAK",
+                       "0.75603780000", standing_incl="1.12"),
+            _meas_node("2024-07-01T05:30:00+01:00", "0.001", "STANDARD_RATE",
+                       "0.02278395000", standing_incl="1.12"),
+        ])
+        c = self._client([_gql_data(resp)])
+        rows = run(c.get_measurements("2600000000000", "2024-07-01T00:00:00Z",
+                                      "2024-07-02T00:00:00Z"))
+        self.assertEqual(len(rows), 2)
+        # +01:00 01:00 → naive-UTC 00:00.
+        self.assertEqual(rows[0]["start"], "2024-07-01T00:00:00")
+        self.assertTrue(rows[0]["off_peak"])                     # OFF_PEAK label
+        self.assertAlmostEqual(rows[0]["cost_incl"], 0.0075604, places=6)  # pence→£
+        self.assertAlmostEqual(rows[0]["standing_incl"], 0.0112, places=6)
+        self.assertEqual(rows[0]["kwh"], 0.108)
+        self.assertFalse(rows[1]["off_peak"])                    # STANDARD_RATE
+
+    def test_get_measurements_paginates(self):
+        c = self._client([
+            _gql_data(_meas_page(
+                [_meas_node("2024-07-01T01:00:00+01:00", "0.1", "OFF_PEAK", "0.7")],
+                has_next=True, cursor="c1")),
+            _gql_data(_meas_page(
+                [_meas_node("2024-07-01T01:30:00+01:00", "0.1", "OFF_PEAK", "0.7")],
+                has_next=False)),
+        ])
+        rows = run(c.get_measurements("2600000000000", "s", "e"))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(c._session.post_calls), 2)          # followed the cursor
+
+    def test_parse_node_mixed_label_is_none(self):
+        node = {"value": "1.0", "startAt": "2024-07-01T01:00:00+01:00",
+                "endAt": "2024-07-01T01:30:00+01:00", "metaData": {"statistics": [
+                    {"type": "TOU_BUCKET_COST", "label": "OFF_PEAK",
+                     "costInclTax": {"estimatedAmount": "3.0"}},
+                    {"type": "TOU_BUCKET_COST", "label": "STANDARD_RATE",
+                     "costInclTax": {"estimatedAmount": "5.0"}}]}}
+        p = KrakenAPIClient._parse_measurement_node(node)
+        self.assertIsNone(p["off_peak"])                          # mixed buckets
+        self.assertAlmostEqual(p["cost_incl"], 0.08, places=4)    # (3+5)p → £0.08
+
     def test_rate_limit_info(self):
-        c = self._client([_gql_data({"rateLimitInfo":
-                                     {"pointsUsed": 80, "pointsLimit": 100}})])
+        c = self._client([_gql_data({"rateLimitInfo": {"pointsAllowanceRateLimit": {
+            "limit": 100, "remainingPoints": 20, "usedPoints": 80,
+            "ttl": 3600, "isBlocked": False}}})])
         info = run(c.get_rate_limit())
         self.assertEqual(info["remaining"], 20)
+        self.assertEqual(info["pointsLimit"], 100)
+        self.assertFalse(info["isBlocked"])
 
     def test_rate_limit_info_absent(self):
         c = self._client([_gql_data({})])
         self.assertIsNone(run(c.get_rate_limit()))
+
+    def test_rate_limit_unavailable_disables_after_first_failure(self):
+        # A tenant whose rateLimitInfo type differs (HTTP 400) must not be
+        # re-queried every chunk — one failure disables the check.
+        c = self._client([])
+        calls = {"n": 0}
+        async def _boom(*a, **k):
+            calls["n"] += 1
+            raise KrakenAPIError("HTTP 400: Cannot query field 'pointsUsed'")
+        c._graphql = _boom
+        self.assertIsNone(run(c.get_rate_limit()))
+        self.assertIsNone(run(c.get_rate_limit()))
+        self.assertIsNone(run(c.get_rate_limit()))
+        self.assertEqual(calls["n"], 1)     # queried once, then cached off
 
     def test_get_dispatches_normalises_fields(self):
         # Current API surface (post-3.0.3/3.0.4 migration):
@@ -890,6 +1020,96 @@ class TestConnectionMessageForEdgeBlock(unittest.TestCase):
         res = run(self._client(FakeResp(401, text="nope")).test_connection())
         self.assertFalse(res["ok"])
         self.assertIn("check API key", res["detail"])
+
+
+class TestGraphqlDeprecationSetCompleteness(unittest.TestCase):
+    """Guard against the field sets that drive the weekly GraphQL-deprecation
+    check (_EMT_GRAPHQL_FIELDS / _EMT_GRAPHQL_TYPED_FIELDS) silently drifting from
+    the queries. Every output field EMT selects in a GraphQL query must be either
+    registered for the deprecation check, explicitly ignored, or in the documented
+    generic/connection allowlist below — so a new query field can never slip in
+    unmonitored (which is exactly how the whole Measurements API went uncovered).
+    """
+
+    # Relay-connection + generic scalar fields deliberately NOT bare-name matched
+    # (they'd false-positive against unrelated types). Tracked for type-scoped
+    # matching via _EMT_GRAPHQL_TYPED_FIELDS — see ROADMAP.
+    GENERIC_ALLOWLIST = {
+        "edges", "node", "pageInfo", "hasNextPage", "endCursor",
+        "value", "unit", "limit", "ttl",
+    }
+
+    @staticmethod
+    def _str_of(node):
+        import ast
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return (TestGraphqlDeprecationSetCompleteness._str_of(node.left) or "") + \
+                   (TestGraphqlDeprecationSetCompleteness._str_of(node.right) or "")
+        return None
+
+    @classmethod
+    def _query_strings(cls, src):
+        import ast, re
+        out = []
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Assign):
+                s = cls._str_of(node.value)
+                if s and re.search(r"\b(query|mutation)\b", s) and "{" in s:
+                    out.append(s)
+        return out
+
+    @staticmethod
+    def _fields_in_query(q):
+        """Output-selection field names in a GraphQL query string. Drops balanced
+        (...) argument groups (args + INPUT fields), $variables, @directives, the
+        operation/fragment name, `... on Type` conditions, and __introspection."""
+        import re
+        buf, depth = [], 0
+        for ch in q:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0:
+                buf.append(ch)
+        body = "".join(buf)
+        body = re.sub(r"\$[A-Za-z_]\w*", " ", body)
+        body = re.sub(r"@[A-Za-z_]\w*", " ", body)
+        fields, skip = set(), False
+        for t in re.findall(r"[A-Za-z_]\w*", body):
+            if t in ("query", "mutation", "fragment") or t == "on":
+                skip = True
+                continue
+            if skip:
+                skip = False
+                continue
+            if t in ("true", "false", "null") or t.startswith("__"):
+                continue
+            fields.add(t)
+        return fields
+
+    def test_every_selected_field_is_registered_or_allowlisted(self):
+        import os
+        src_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "kraken_api_client.py")
+        src = open(src_path).read()
+        covered = (set(kc._EMT_GRAPHQL_FIELDS)
+                   | {f for _t, f in kc._EMT_GRAPHQL_TYPED_FIELDS}
+                   | {f for _t, f in kc._DEPRECATION_IGNORE}
+                   | self.GENERIC_ALLOWLIST)
+        selected = set()
+        for q in self._query_strings(src):
+            if "__schema" in q:      # the introspection query is meta, not data
+                continue
+            selected |= self._fields_in_query(q)
+        missing = sorted(selected - covered)
+        self.assertEqual(
+            missing, [],
+            "GraphQL fields selected by a query but not registered for the "
+            "deprecation check (add to _EMT_GRAPHQL_FIELDS / _EMT_GRAPHQL_TYPED_FIELDS, "
+            f"or the test's GENERIC_ALLOWLIST): {missing}")
 
 
 if __name__ == "__main__":

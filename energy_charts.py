@@ -711,14 +711,21 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
                     if not meter_m.get("sub_meter"):
                         rs = channel.get("read_start")
                         re = channel.get("read_end")
-                        if meter_summary[key][rate]["read_start"] is None or (rs is not None and rs < meter_summary[key][rate]["read_start"]):
-                            meter_summary[key][rate]["read_start"] = rs
-                        if re is not None:
-                            meter_summary[key][rate]["read_end"] = re
-                        if meter_totals[key]["read_start"] is None or (rs is not None and rs < meter_totals[key]["read_start"]):
-                            meter_totals[key]["read_start"] = rs
-                        if re is not None:
-                            meter_totals[key]["read_end"] = re
+                        # A cumulative meter register only increases, so the
+                        # period's opening read is the SMALLEST real read and the
+                        # closing is the LARGEST. Ignore 0/None reads: gap /
+                        # interpolated / reset blocks and register-less sources
+                        # (CAD power sensors, API Measurements) carry 0, and the old
+                        # MIN-start / last-wins-end aggregation let a single such
+                        # block drag the displayed Start/End to 0.000 even when real
+                        # reads exist for the period.
+                        for _tgt in (meter_summary[key][rate], meter_totals[key]):
+                            if rs is not None and rs > 0 and (
+                                    _tgt["read_start"] is None or rs < _tgt["read_start"]):
+                                _tgt["read_start"] = rs
+                            if re is not None and re > 0 and (
+                                    _tgt["read_end"] is None or re > _tgt["read_end"]):
+                                _tgt["read_end"] = re
                 except Exception:
                     pass
 

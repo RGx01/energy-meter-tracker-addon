@@ -105,6 +105,23 @@ class RateSchedule:
                 rates.append(rate)
         return min(rates) if rates else None
 
+    def day_rate_bounds(self, ts: str):
+        """(min_rate, max_rate) over the calendar day of ts — i.e. (off-peak,
+        peak) for a banded tariff, or (r, r) for a flat one. (None, None) if the
+        day isn't covered. Used to give imported blocks a CLEAN tariff rate keyed
+        by their OFF_PEAK/STANDARD label instead of a jittery cost÷kWh."""
+        if not self._periods:
+            return (None, None)
+        day = str(ts)[:10]
+        day_start, day_end = day + "T00:00:00", day + "T23:59:59"
+        rates = []
+        for vfrom, vto, rate in self._periods:
+            if vfrom > day_end:
+                break
+            if vto is None or vto > day_start:
+                rates.append(rate)
+        return (min(rates), max(rates)) if rates else (None, None)
+
     @classmethod
     def from_api_records(cls, records: list[dict]) -> "RateSchedule":
         """Build from raw standard-unit-rates results, choosing one payment

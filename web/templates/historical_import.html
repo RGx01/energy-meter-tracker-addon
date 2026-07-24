@@ -1,0 +1,787 @@
+{% extends "base.html" %}
+
+{% block topbar %}
+<div class="topbar">
+  <div>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:2px;">
+      <a href="{{ url_for('data_management_page') }}" style="color:var(--muted);text-decoration:none;">Data Management</a> &nbsp;/
+    </div>
+    <h2>Historical Import <span style="font-size:12px;color:var(--muted);">(beta)</span></h2>
+    <div class="sub">Reconstruct energy history from before EMT was recording</div>
+  </div>
+  <a href="{{ url_for('data_management_page') }}" class="btn btn-secondary">← Data Management</a>
+</div>
+{% endblock %}
+
+{% block content %}
+<!-- Step 1 — intro + API coverage -->
+<div class="card" id="step-intro">
+  <div style="font-size:13px;color:var(--muted);line-height:1.7;margin-bottom:14px;">
+    Import half-hourly history from your supplier. This is a <strong>best-endeavours
+    reconstruction</strong>: imported blocks are flagged and can be removed at any time
+    (Delete Blocks → reconstructed history). Two routes:
+    the <strong>API</strong> (Octopus) fetches each half-hour's kWh together with
+    Octopus's own <strong>billed cost and off-peak/peak label</strong> — so it's
+    <strong>exact and dispatch-aware, including IOG</strong>, and reaches your
+    <strong>full history</strong>. The <strong>CSV</strong> route is for non-Octopus
+    suppliers or an offline website export.
+  </div>
+
+  <!-- API import (primary, Octopus) -->
+  <div id="api-import-panel" style="border-top:1px solid var(--border);padding-top:12px;">
+    <div style="font-weight:600;margin-bottom:4px;">API import — Octopus, full history</div>
+    <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:8px;">
+      Each half-hour comes with Octopus's <strong>billed cost + OFF_PEAK/STANDARD_RATE
+      label</strong>, so the rate and off/peak split are exact — a smart-charged evening
+      slot is correctly priced off-peak (no tariff lookup, IOG included). If a slot comes
+      back without its cost (Octopus can drop it when the connection is busy), the import
+      quietly re-fetches that slot on its own and prices it from the real figure.
+      Reversible via Delete Blocks → reconstructed history.
+    </div>
+    <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:8px;padding:8px 10px;background:var(--bg-subtle,rgba(127,127,127,0.08));border-radius:6px;">
+      <strong>This can take a while.</strong> Octopus rate-limits the API and gets
+      progressively stricter the harder it's pushed, so the import runs in paced, resumable
+      steps and eases off automatically when the hourly allowance runs low (it pauses and
+      resumes on its own — leaving budget for your live readings). <strong>Other apps on the
+      same Octopus account share that allowance</strong> — the Octopus app, the Home
+      Assistant Octopus (BottlecapDave) integration, or any other API tool — so if one of
+      those is busy at the same time, the import will slow down or pause until the budget
+      recovers. That's expected; just leave it running.
+    </div>
+    <button class="btn btn-secondary" id="btn-api-plan" onclick="planApi()">Preview plan</button>
+    <button class="btn btn-secondary" id="btn-range-diag" onclick="diagnoseRange()">Check start dates</button>
+    <button class="btn btn-secondary" id="btn-meter-hist" onclick="meterHistory()">Meter history</button>
+    <span id="api-plan-status" style="font-size:13px;color:var(--muted);margin-left:8px;"></span>
+    <div id="api-plan-out" style="margin-top:8px;font-size:13px;"></div>
+    <span id="range-diag-status" style="font-size:13px;color:var(--muted);"></span>
+    <div id="range-diag-out" style="margin-top:8px;font-size:13px;"></div>
+    <div id="meter-hist-out" style="margin-top:8px;font-size:13px;"></div>
+    <div id="api-apply-row" style="display:none;margin-top:10px;">
+      <div id="site-plan-block" style="display:none;margin-bottom:12px;padding:10px;border:1px solid var(--border);border-radius:8px;">
+        <div style="font-weight:600;margin-bottom:4px;">Confirm your sites</div>
+        <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:8px;">
+          Your Octopus account shows more than one address across this history. Name each
+          <strong>past</strong> address so its data is filed under the right site and DNO region
+          before the import runs. Your current site keeps its name (it's this instance's identity).
+        </div>
+        <div id="site-plan-rows"></div>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:8px;cursor:pointer;">
+        <input type="checkbox" id="api-confirm" onchange="document.getElementById('btn-api-start').disabled=!this.checked;">
+        Import these blocks (a backup is taken first). Runs in the background — you can
+        leave this page; pause, resume or cancel any time.
+      </label>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <button class="btn" id="btn-api-start" onclick="startApi()" disabled>Start import</button>
+        <button class="btn btn-secondary" id="btn-api-pause" onclick="controlApi('pause')" style="display:none;">Pause</button>
+        <button class="btn btn-secondary" id="btn-api-resume" onclick="controlApi('resume')" style="display:none;">Resume</button>
+        <button class="btn btn-secondary" id="btn-api-cancel" onclick="controlApi('cancel')" style="display:none;">Cancel</button>
+        <span id="api-apply-status" style="font-size:13px;color:var(--muted);margin-left:4px;"></span>
+      </div>
+    </div>
+    <div id="api-apply-out" style="margin-top:8px;font-size:13px;"></div>
+
+    <!-- Persistent pricing-health panel: raised / auto-recovered / still remaining.
+         Reads /api-import/health on every load, not just right after an import. -->
+    <div id="import-health" style="margin-top:12px;"></div>
+
+    <div id="api-gaps-out" style="margin-top:10px;font-size:13px;"></div>
+
+    <!-- Repair tools: collapsed by default — a healthy import needs none of these -->
+    <details style="margin-top:14px;border-top:1px solid var(--border);padding-top:12px;">
+      <summary style="cursor:pointer;font-weight:600;">Repair tools
+        <span style="font-weight:400;font-size:12px;color:var(--muted);">— only if a rate still looks wrong</span>
+      </summary>
+      <div style="font-size:12px;color:var(--muted);line-height:1.6;margin:8px 0 10px;">
+        A healthy import needs none of these — the pricing health panel above shows if anything's
+        outstanding. Each re-fetches half-hours with a <strong>calm</strong> query and re-prices them
+        from Octopus's real billed figures. Pick by <strong>what looks wrong</strong>:
+      </div>
+
+      <!-- Option 1: flagged-queue mode (no-cost slots) -->
+      <div style="margin-bottom:12px;">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px;">
+          <button class="btn" id="btn-reprice-queue" onclick="repriceQueue()">Fix flagged slots</button>
+          <span style="color:var(--muted);">fewest requests</span>
+        </div>
+        <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-top:4px;">
+          Re-fetches only the slots the import <strong>flagged as missing a cost</strong> — smart-charged
+          (IOG) half-hours Octopus dropped, which then defaulted to the <strong>peak</strong> rate.
+          Use when <strong>dispatched charging shows as peak</strong> instead of off-peak. Leaves every
+          already-priced slot untouched.
+        </div>
+      </div>
+
+      <!-- Option 2: date-range mode (every block, flagged or not) -->
+      <div style="margin-bottom:10px;">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px;">
+          <label>From <input type="date" id="reprice-from" value="2025-10-18" style="font-size:13px;"></label>
+          <label>To <input type="date" id="reprice-to" value="2025-10-25" style="font-size:13px;"></label>
+          <label style="font-size:13px;"><input type="checkbox" id="reprice-include-export"> also fix export</label>
+          <button class="btn btn-secondary" id="btn-reprice" onclick="repricePricing()">Fix a date range</button>
+          <span id="reprice-status" style="color:var(--muted);"></span>
+        </div>
+        <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-top:4px;">
+          Re-checks <strong>every imported half-hour</strong> in the range — flagged or not — and re-prices
+          each. Use when a <strong>rate looks wrong on a slot that already has a cost</strong> (e.g. after a
+          tariff or price-cap change, where the rate no longer matches the cost). Flagged-slot mode can't
+          reach these — they were never flagged. By default it fixes <strong>import</strong> only; tick
+          <strong>also fix export</strong> to collapse a fragmented flat/Agile export rate back to its clean
+          scheduled value. It tells you how many blocks it will touch and asks you to confirm first. Start
+          with a <strong>narrow</strong> range (a week), then widen.
+        </div>
+      </div>
+
+      <div style="font-size:12px;color:var(--muted);line-height:1.5;margin-bottom:4px;">
+        In the results: <em>re-priced</em> = slots corrected · <em>not recovered</em> = Octopus didn't
+        return a cost this pass (usually a busy connection — re-run to retry).
+      </div>
+      <div id="reprice-out" style="margin-top:8px;font-size:13px;"></div>
+
+      <div style="margin-top:12px;padding-top:10px;border-top:1px dashed var(--border);">
+        <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:6px;">
+          <strong>Match the bill exactly (from CSV) — last resort.</strong> Almost every slot can be
+          fixed with the two tools above. Only if a handful <em>still</em> won't price after repeated
+          repair, download the Octopus consumption CSV for the affected period and upload it here to
+          set each half-hour's cost straight from your bill.
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px;">
+          <input type="file" id="reprice-csv-file" accept=".csv,text/csv" style="font-size:13px;">
+          <button class="btn btn-secondary" id="btn-reprice-csv" onclick="repriceFromCsv()">Reprice from CSV</button>
+          <span id="reprice-csv-status" style="color:var(--muted);"></span>
+        </div>
+        <div id="reprice-csv-out" style="margin-top:6px;font-size:13px;"></div>
+      </div>
+    </details>
+  </div>
+
+  <!-- CSV import (secondary) -->
+  <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:12px;">
+    <div style="font-size:13px;color:var(--muted);margin-bottom:8px;">
+      Not on Octopus, or importing an offline/older export? Use the CSV route
+      (rate derived from the export's per-block cost).
+    </div>
+    <button class="btn btn-secondary" onclick="goStep('upload')">Start CSV import →</button>
+  </div>
+</div>
+
+<!-- Step 2 — upload -->
+<div class="card" id="step-upload" style="display:none;">
+  <div style="font-weight:600;margin-bottom:4px;">1 · Upload your Octopus CSV export</div>
+  <div style="font-size:13px;color:var(--muted);line-height:1.7;margin-bottom:14px;">
+    Export "Consumption" from your Octopus account (per meter). Add the export/outgoing
+    file too if you have one. Columns expected: Consumption (kWh), Estimated Cost Inc. Tax,
+    Standing Charge Inc. Tax, Start, End.
+  </div>
+  <div style="display:grid;grid-template-columns:120px 1fr;gap:10px 14px;align-items:center;font-size:13px;">
+    <label>Import CSV</label>
+    <input type="file" id="import-file" accept=".csv,text/csv">
+    <label>Export CSV <span style="color:var(--muted);">(optional)</span></label>
+    <input type="file" id="export-file" accept=".csv,text/csv">
+  </div>
+  <div style="margin-top:8px;font-size:12px;color:var(--muted);">
+    Need the format? <a href="#"
+      onclick="event.preventDefault(); window.location = apiUrl('/api/historical/csv-template');"
+      style="color:var(--accent);">⬇ Download a blank CSV template</a>
+    — the required columns and the exact date/time format, with example rows.
+  </div>
+  <div style="margin-top:14px;display:flex;gap:10px;align-items:center;">
+    <button class="btn btn-secondary" onclick="goStep('intro')">← Back</button>
+    <button class="btn" id="btn-preview" onclick="doPreview()">Preview rates →</button>
+    <span id="preview-status" style="font-size:13px;color:var(--muted);"></span>
+  </div>
+</div>
+
+<!-- Step 3 — review + confirm -->
+<div class="card" id="step-review" style="display:none;">
+  <div style="font-weight:600;margin-bottom:4px;">2 · Review &amp; confirm rates</div>
+  <div style="font-size:13px;color:var(--muted);line-height:1.7;margin-bottom:14px;">
+    Rates below are derived from the CSV cost (aggregated across each period so rounding
+    cancels). Adjust any that look off — the confidence hints where to look. Off-peak is the
+    lower tier; dispatched charging is counted off-peak automatically.
+  </div>
+  <div id="review-out"></div>
+  <div style="margin-top:14px;">
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px;cursor:pointer;">
+      <input type="checkbox" id="confirm-check" onchange="document.getElementById('btn-apply').disabled=!this.checked;">
+      I understand this writes reconstructed blocks (a backup is taken first; reversible)
+    </label>
+    <div style="display:flex;gap:10px;align-items:center;">
+      <button class="btn btn-secondary" onclick="goStep('upload')">← Back</button>
+      <button class="btn" id="btn-apply" onclick="doApply()" disabled>Import history</button>
+      <span id="apply-status" style="font-size:13px;color:var(--muted);"></span>
+    </div>
+  </div>
+</div>
+
+<!-- Step 4 — done -->
+<div class="card" id="step-done" style="display:none;">
+  <div style="font-weight:600;margin-bottom:8px;">✓ Import complete</div>
+  <div id="done-out" style="font-size:13px;line-height:1.8;"></div>
+  <div style="margin-top:14px;">
+    <a href="{{ url_for('data_management_page') }}" class="btn btn-secondary">← Data Management</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+var STATE = { import_csv: null, export_csv: null, preview: null };
+
+function goStep(s){
+  ["intro","upload","review","done"].forEach(function(k){
+    document.getElementById("step-"+k).style.display = (k===s) ? "block" : "none";
+  });
+}
+function _esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+function _p(v){ return (v==null)?'—':(v*100).toFixed(2)+'p'; }     // £/kWh → p/kWh
+function _gbp(v){ return (v==null)?'—':'£'+Number(v).toFixed(2); }
+
+function _readFile(id){
+  return new Promise(function(res){
+    var f = document.getElementById(id).files[0];
+    if(!f){ res(null); return; }
+    var r = new FileReader();
+    r.onload = function(){ res(r.result); };
+    r.readAsText(f);
+  });
+}
+
+function planApi(){
+  var st = document.getElementById('api-plan-status');
+  var out = document.getElementById('api-plan-out');
+  st.textContent = 'Planning…'; out.innerHTML = '';
+  document.getElementById('api-apply-row').style.display = 'none';
+  fetch(apiUrl('/api/historical/api-import/plan'), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+    .then(function(r){return r.json();}).then(function(d){
+      st.textContent = '';
+      if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(d.error||d.reason||'failed')+'</span>'; return; }
+      var html = '<div style="color:var(--muted);">Tiles up to go-live '+_esc((d.go_live||'').substr(0,10))+':</div>';
+      ["import","export"].forEach(function(chn){
+        var c = (d.channels||{})[chn]; if(!c) return;
+        if(!c.ok){ html += '<div style="text-transform:capitalize;">'+chn+': '+_esc(c.note||'not available')+'</div>'; return; }
+        html += '<div style="text-transform:capitalize;">'+chn+': <strong>'+_esc(c.window.from.substr(0,10))+'</strong> → '
+          + _esc(c.window.to.substr(0,10))+' · '+c.chunk_count+' chunks</div>';
+      });
+      out.innerHTML = html;
+      document.getElementById('api-confirm').checked = false;
+      document.getElementById('btn-api-start').disabled = true;
+      document.getElementById('api-apply-row').style.display = 'block';
+      loadSitePlan();
+    }).catch(function(e){ st.textContent = 'failed: '+e; });
+}
+
+// Pre-import site discovery: if the account shows more than one address, the user
+// names the past sites and we create covering config periods BEFORE the import, so
+// every imported block lands in the right (correctly regioned) period. A never-moved
+// account needs no confirmation and goes straight to import.
+var SITE_PLAN = { needs:false, applied:false, sites:[] };
+function loadSitePlan(){
+  SITE_PLAN = { needs:false, applied:false, sites:[] };
+  var block = document.getElementById('site-plan-block');
+  var rows = document.getElementById('site-plan-rows');
+  block.style.display = 'none'; rows.innerHTML = '';
+  document.getElementById('btn-api-start').textContent = 'Start import';
+  fetch(apiUrl('/api/historical/site-plan')).then(function(r){return r.json();}).then(function(d){
+    if(!d || !d.ok || !d.needs_confirmation){ SITE_PLAN.needs = false; return; }
+    SITE_PLAN.needs = true; SITE_PLAN.sites = d.sites || [];
+    var html = '';
+    (d.sites || []).forEach(function(s, i){
+      var span = _esc((s.from||'').substr(0,10)) + ' → ' + (s.to ? _esc(s.to.substr(0,10)) : 'now');
+      if(s.is_current){
+        html += '<div style="margin:6px 0;font-size:13px;">📍 <strong>'+_esc(s.site_name||'Current site')
+          + '</strong> · '+_esc(s.outcode||'')+' · '+span
+          + ' <span style="color:var(--muted);">(current — unchanged)</span></div>';
+      } else {
+        var ph = _esc(s.hint || 'Previous address');
+        html += '<div style="margin:6px 0;font-size:13px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">'
+          + '<span style="color:var(--muted);min-width:150px;">'+_esc(s.outcode||'')+' · '+span+'</span>'
+          + '<input type="text" data-site-idx="'+i+'" placeholder="Name this site — '+ph+'" value="'
+          + (s.site_name ? _esc(s.site_name) : '') + '" style="flex:1;min-width:180px;"></div>';
+      }
+    });
+    rows.innerHTML = html;
+    block.style.display = 'block';
+    document.getElementById('btn-api-start').textContent = 'Confirm sites & import';
+  }).catch(function(){ SITE_PLAN.needs = false; });
+}
+
+// Diagnostic: where does each channel's import start, and does Measurements data
+// exist BEFORE that? Import floors at each channel's earliest supplier agreement,
+// which is why export can begin later than import.
+function diagnoseRange(){
+  var st = document.getElementById('range-diag-status');
+  var out = document.getElementById('range-diag-out');
+  st.textContent = 'Checking… (probes the API back ~4 years)'; out.innerHTML = '';
+  fetch(apiUrl('/api/historical/import-range-diagnostic'), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+    .then(function(r){return r.json();}).then(function(d){
+      st.textContent = '';
+      if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(d.error||d.reason||'failed')+'</span>'; return; }
+      var html = '';
+      ["import","export"].forEach(function(chn){
+        var c = (d.channels||{})[chn]; if(!c) return;
+        var starts = c.import_starts_at ? _esc(c.import_starts_at.substr(0,10)) : 'unknown';
+        var agree = c.agreement_floor ? _esc(c.agreement_floor.substr(0,10)) : null;
+        html += '<div style="text-transform:capitalize;margin-bottom:4px;"><strong>'+chn+'</strong>: import starts '+starts;
+        if(c.data_before_floor){
+          html += ' — <span style="color:var(--warning-color,#b45309);">reaches earlier than your agreement'
+            + (agree ? ' ('+agree+')' : '')+'</span>';
+        } else if(agree && starts === agree){
+          html += ' — <span style="color:var(--muted);">at your earliest agreement; no meter data found before it</span>';
+        } else {
+          html += ' — <span style="color:var(--muted);">earliest half-hour the API returns</span>';
+        }
+        html += '</div>';
+      });
+      html += '<div style="color:var(--muted);font-size:12px;margin-top:4px;">The floor follows the DATA: it probes 30-day windows back from your earliest agreement and starts wherever the API actually returns readings. '
+        + 'If the Octopus website shows history earlier than this, it is usually under a different meter/MPAN (a meter exchange) or a data source the half-hourly API does not expose.</div>';
+      out.innerHTML = html;
+    }).catch(function(e){ st.textContent = 'failed: '+e; });
+}
+
+// Deep diagnostic: enumerate every meter point + serial on the account with how
+// far back each reaches. A meter exchange (older serial, or a second export MPAN)
+// is where the website's extra history usually lives.
+function meterHistory(){
+  var st = document.getElementById('range-diag-status');
+  var out = document.getElementById('meter-hist-out');
+  st.textContent = 'Enumerating meters…'; out.innerHTML = '';
+  fetch(apiUrl('/api/historical/consumption-diagnostic'), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+    .then(function(r){return r.json();}).then(function(d){
+      st.textContent = '';
+      if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(d.error||d.reason||'failed')+'</span>'; return; }
+      var html = '';
+      (d.meter_points||[]).forEach(function(mp){
+        var chan = mp.is_export ? 'Export' : 'Import';
+        html += '<div style="margin-top:6px;"><strong>'+chan+'</strong> MPAN …'+_esc(mp.mpan_tail||'')
+          + ' — '+mp.meter_count+' meter(s)'
+          + (mp.supply_start ? ', supply from '+_esc((mp.supply_start||'').substr(0,10)) : '')+'</div>';
+        (mp.meters||[]).forEach(function(m){
+          if(m.available === false){
+            html += '<div style="margin-left:14px;color:var(--muted);">serial '+_esc(m.serial_tail||'?')+': '+_esc(m.note||'unavailable')+'</div>';
+            return;
+          }
+          var e = m.earliest ? _esc(m.earliest.substr(0,10)) : '?';
+          var l = m.latest ? _esc(m.latest.substr(0,10)) : '?';
+          var below = (m.rows_just_below_earliest||0) > 0
+            ? ' <span style="color:var(--warning-color,#b45309);">('+m.rows_just_below_earliest+' rows exist below — under-reaching)</span>' : '';
+          html += '<div style="margin-left:14px;">serial '+_esc(m.serial_tail||'?')+': '+e+' → '+l+below+'</div>';
+        });
+      });
+      html += '<div style="color:var(--muted);font-size:12px;margin-top:4px;">Earlier export under a different MPAN, or an older serial on the same MPAN (a meter exchange), is where the website’s extra history lives. If a serial shows the export you expect, tell me and I can target it.</div>';
+      out.innerHTML = html || '<span style="color:var(--muted);">No meter points returned.</span>';
+    }).catch(function(e){ st.textContent = 'failed: '+e; });
+}
+
+var _statusTimer = null;
+var STATUS_LABEL = {
+  running: 'Importing…', finalising: 'Finishing up…', paused: 'Paused',
+  rate_limited: 'Paused (API rate limit — resumes automatically)',
+  done: '✓ Import complete', cancelled: 'Cancelled', error: 'Error', idle: ''
+};
+// After the last block is written a calm tail runs (price recovery, chart rebuild).
+// Naming the phase stops it looking stalled at a frozen block count.
+var PHASE_LABEL = {
+  importing: 'Fetching half-hours…', finalising: 'Finishing up…',
+  recovering_prices: 'Recovering prices on a calm retry…',
+  rebuilding_charts: 'Rebuilding charts…', done: ''
+};
+
+function _apiButtons(status){
+  function show(id, on){ document.getElementById(id).style.display = on ? '' : 'none'; }
+  var active = (status==='running' || status==='rate_limited');
+  show('btn-api-start', !active && status!=='paused');
+  show('btn-api-pause', active);
+  show('btn-api-resume', status==='paused');
+  show('btn-api-cancel', active || status==='paused');
+  document.getElementById('btn-api-start').disabled =
+    !(document.getElementById('api-confirm') && document.getElementById('api-confirm').checked)
+    || active || status==='paused';
+}
+
+function _renderApiStatus(d){
+  var out = document.getElementById('api-apply-out');
+  var st  = document.getElementById('api-apply-status');
+  var status = d.status || 'idle';
+  st.textContent = STATUS_LABEL[status] || status;
+  // During the post-import tail, show the live phase so it doesn't look stalled.
+  if(status==='finalising' && PHASE_LABEL[d.phase]) st.textContent = PHASE_LABEL[d.phase];
+  if(d.error) st.textContent = 'Error: ' + _esc(d.error);
+  var w = d.written || {}, o = d.oldest || {};
+  var html = '';
+  ["import","export"].forEach(function(chn){
+    if(!(chn in w) && !(chn in o)) return;
+    html += '<div><strong style="text-transform:capitalize;">'+chn+'</strong>: '
+      + (w[chn]||0)+' blocks'
+      + (o[chn] ? ' · back to '+_esc((o[chn]||'').substr(0,10)) : '')+'</div>';
+  });
+  if(status==='done') html += '<div style="color:var(--muted);margin-top:4px;">Charts are rebuilt automatically — see the pricing health below. Undo any time via Delete Blocks → reconstructed history.</div>';
+  out.innerHTML = html;
+  _apiButtons(status);
+}
+
+function pollStatus(){
+  fetch(apiUrl('/api/historical/api-import/status')).then(function(r){return r.json();}).then(function(d){
+    if(d && d.status && d.status !== 'idle'){
+      document.getElementById('api-apply-row').style.display = 'block';
+      _renderApiStatus(d);
+    }
+    // Keep polling through the post-import tail (finalising) too, so the phase
+    // updates instead of the UI sitting on a frozen block count.
+    var active = d && (d.status==='running' || d.status==='paused'
+      || d.status==='rate_limited' || d.status==='finalising');
+    if(_statusTimer) clearTimeout(_statusTimer);
+    if(active){ _statusTimer = setTimeout(pollStatus, 3000); }
+    else { loadImportGaps(); loadImportHealth(); }   // refresh once it settles
+  }).catch(function(){});
+}
+
+// Reconstruction gaps (missing half-hour runs, e.g. a DCC/settlement outage) are
+// persisted, so we can show them on page load without re-running the import.
+function loadImportGaps(){
+  fetch(apiUrl('/api/historical/api-import/gaps')).then(function(r){return r.json();}).then(function(d){
+    var el = document.getElementById('api-gaps-out'); if(!el) return;
+    var chans = (d && d.channels) || {};
+    var total = (((chans.import||{}).missing)||0) + (((chans.export||{}).missing)||0);
+    if(!total){ el.innerHTML = ''; return; }
+    var html = '<div style="padding:10px 12px;border:1px solid #b45309;border-radius:6px;'
+      + 'background:rgba(180,83,9,0.08);">'
+      + '⚠ <strong>Missing half-hours</strong> — these came back empty from the supplier '
+      + '(usually a meter outage or late settlement), so bills and totals over these periods '
+      + 'are understated. Fill them from a CSV below; each gap clears from this list as soon '
+      + 'as its slots have data.';
+    ["import","export"].forEach(function(chn){
+      var c = chans[chn]; if(!c || !c.missing) return;
+      html += '<div style="margin-top:6px;text-transform:capitalize;"><strong>'+chn+'</strong>: '
+        + c.missing + ' missing half-hour' + (c.missing===1?'':'s') + ' in ' + c.gap_count
+        + ' gap' + (c.gap_count===1?'':'s') + ':</div>';
+      (c.gaps||[]).slice(0,12).forEach(function(g){
+        var dl = apiUrl('/api/historical/gap-template?channel=' + encodeURIComponent(chn)
+          + '&from=' + encodeURIComponent(g.from || '')
+          + '&to='   + encodeURIComponent(g.to || '') + '&inclusive=1');
+        html += '<div style="margin-left:14px;color:var(--muted);">'
+          + _esc((g.from||'').replace('T',' ').substr(0,16)) + '  →  '
+          + _esc((g.to||'').replace('T',' ').substr(0,16))
+          + '  (' + g.count + ') '
+          + '<a href="' + dl + '" download style="color:var(--accent);margin-left:6px;white-space:nowrap;">⬇ CSV to fill</a>'
+          + '</div>';
+      });
+      if((c.gaps||[]).length > 12){ html += '<div style="margin-left:14px;color:var(--muted);">…and '
+        + ((c.gaps.length)-12) + ' more</div>'; }
+    });
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(function(){});
+}
+
+// Persistent pricing-health panel. Octopus can return a half-hour's energy but not
+// its price under load; those default to peak, get flagged, and are re-fetched
+// calmly. This shows raised → auto-recovered → still-remaining, with a one-click
+// retry for the remainder. Renders on every page load from the persisted summary.
+function loadImportHealth(){
+  var el = document.getElementById('import-health'); if(!el) return;
+  fetch(apiUrl('/api/historical/api-import/health')).then(function(r){return r.json();}).then(function(d){
+    if(!d || !d.have){ el.innerHTML = ''; return; }
+    var raised = d.raised||0, rec = d.auto_recovered||0, rem = d.remaining||0;
+    var range = (d.from && d.to)
+      ? _esc((d.from||'').substr(0,10)) + ' → ' + _esc((d.to||'').substr(0,10)) : '';
+    var rows = '';
+    if(raised > 0){
+      rows += _healthRow('flag','var(--muted)',
+        raised + ' half-hour' + (raised===1?'':'s') + ' came back without a price', 'raised at import');
+      if(rec > 0) rows += _healthRow('check','#15803d',
+        rec + ' auto-recovered on the calm retry', 'done for you', 'rgba(21,128,61,0.08)');
+    }
+    if(rem > 0){
+      rows += '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;'
+        + 'background:rgba(180,83,9,0.08);border-radius:6px;margin-top:6px;">'
+        + '<span style="color:#b45309;">●</span>'
+        + '<span style="font-size:13px;color:#b45309;">'+rem+' still need a retry</span>'
+        + '<button class="btn btn-secondary" style="margin-left:auto;font-size:12px;padding:2px 10px;" '
+        + 'onclick="repriceQueue()">Retry '+rem+'</button></div>';
+    } else if(raised > 0){
+      rows += _healthRow('check','#15803d','All prices recovered — nothing outstanding', '', 'rgba(21,128,61,0.08)');
+    }
+    var head = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">'
+      + '<strong style="font-size:14px;">Pricing health</strong>'
+      + (range ? '<span style="margin-left:auto;font-size:12px;color:var(--muted);">'+range+'</span>' : '')
+      + '</div>'
+      + '<div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:10px;">'
+      + 'Octopus sometimes returns a half-hour’s energy but not its price when many requests run '
+      + 'back-to-back. Those default to the peak rate, so we flag them and re-fetch them calmly.</div>';
+    el.innerHTML = '<div style="border:1px solid var(--border);border-radius:8px;padding:12px 14px;">'
+      + head + (rows || '<div style="font-size:13px;color:var(--muted);">No pricing issues from the last import.</div>')
+      + '</div>';
+  }).catch(function(){});
+}
+function _healthRow(icon, color, text, tag, bg){
+  var mark = icon==='check' ? '✓' : '⚑';
+  return '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;margin-top:6px;'
+    + (bg ? 'background:'+bg+';' : 'background:rgba(127,127,127,0.06);') + '">'
+    + '<span style="color:'+color+';">'+mark+'</span>'
+    + '<span style="font-size:13px;'+(bg&&icon==='check'?'color:'+color+';':'')+'">'+_esc(text)+'</span>'
+    + (tag ? '<span style="margin-left:auto;font-size:12px;color:'+(bg?color:'var(--muted)')+';">'+_esc(tag)+'</span>' : '')
+    + '</div>';
+}
+
+function startApi(){
+  // Discover → confirm → import: if past sites need naming, create their covering
+  // periods FIRST, then start the import so blocks land in the right period.
+  if(SITE_PLAN.needs && !SITE_PLAN.applied){ applySitesThenStart(); return; }
+  _doStart();
+}
+
+function applySitesThenStart(){
+  var st = document.getElementById('api-apply-status');
+  document.getElementById('btn-api-start').disabled = true;
+  st.textContent = 'Saving sites…';
+  var sites = SITE_PLAN.sites.map(function(s, i){
+    var out = { outcode: s.outcode, from: s.from, to: s.to };
+    if(!s.is_current){
+      var inp = document.querySelector('[data-site-idx="'+i+'"]');
+      out.site_name = inp ? inp.value.trim() : '';
+    }
+    return out;
+  });
+  fetch(apiUrl('/api/historical/site-plan/apply'), {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ sites: sites })
+  }).then(function(r){return r.json();}).then(function(d){
+    if(!d.ok){
+      st.textContent = 'Sites error: '+_esc(d.error||'failed');
+      document.getElementById('btn-api-start').disabled = false; return;
+    }
+    SITE_PLAN.applied = true;
+    document.getElementById('site-plan-block').style.display = 'none';
+    _doStart();
+  }).catch(function(e){
+    st.textContent = 'Sites request failed: '+e;
+    document.getElementById('btn-api-start').disabled = false;
+  });
+}
+
+function _doStart(){
+  document.getElementById('btn-api-start').disabled = true;
+  document.getElementById('api-apply-status').textContent = 'Backing up & starting…';
+  fetch(apiUrl('/api/historical/api-import/start'), {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ confirmed: true })
+  }).then(function(r){return r.json();}).then(function(d){
+    if(!d.ok){ document.getElementById('api-apply-status').textContent = 'Error: '+_esc(d.error||'failed'); _apiButtons('idle'); return; }
+    pollStatus();
+  }).catch(function(e){ document.getElementById('api-apply-status').textContent = 'Request failed: '+e; });
+}
+
+function _repriceRun(body, btn){
+  var st = document.getElementById('reprice-status');
+  var out = document.getElementById('reprice-out');
+  btn.disabled = true; st.textContent = 'Re-fetching (calm, one window at a time)…'; out.innerHTML = '';
+  fetch(apiUrl('/api/historical/reprice-repair'), {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  }).then(function(r){return r.json();}).then(function(d){
+    btn.disabled = false; st.textContent = '';
+    if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(d.error||'failed')+'</span>'; return; }
+    var totalTxt = (d.imported_blocks!=null)
+      ? (d.imported_blocks+' imported block(s)'
+         + (d.imported_from?(' spanning '+_esc((d.imported_from||'').substr(0,10))+' → '+_esc((d.imported_to||'').substr(0,10))):''))
+      : '';
+    var why;
+    if(d.checked === 0){
+      if(d.mode === 'queue') why = 'The flagged-slot queue is empty — nothing to fix (either no import has run on this build, or it was already cleared).';
+      else if(!d.imported_blocks) why = 'This DB has NO imported blocks at all — nothing to re-price.';
+      else why = 'No imported blocks fall in that date range. '+totalTxt+' — pick dates inside that span.';
+    } else if(d.throttled){
+      why = 'Paused after '+d.windows+' window(s): Octopus’s rate-limit allowance ran low (it’s cumulative and shared with other apps on your account). Corrected '+d.recovered+' slot(s) so far — wait a few minutes for the allowance to recover, then re-run to continue.';
+    } else if(d.recovered > 0 && d.still_missing === 0){
+      why = 'Calm re-fetch corrected all '+d.recovered+' mispriced slot(s) — the bulk import dropped these under load, now fixed.';
+    } else if(d.still_missing > 0){
+      why = d.still_missing+' slot(s) weren’t recovered on this pass — Octopus can drop a slot’s cost when the connection is busy; re-run to retry (it usually clears). The slots are listed below so you can check them.';
+    } else {
+      why = 'All '+d.checked+' slot(s) checked were already correctly priced — nothing to change here.';
+    }
+    var missTxt = (d.still_missing > 0) ? (d.still_missing+' not recovered') : 'all recovered';
+    var html =
+      '<div><strong>'+d.recovered+'</strong> slot(s) re-priced · <strong>'+_esc(missTxt)
+      + '</strong> · '+d.checked+' checked · '+d.windows+' window(s) · mode: '+_esc(d.mode||'')+'</div>'
+      + '<div style="color:var(--muted);margin-top:4px;">'+why+'</div>';
+    if(d.missing && d.missing.length){
+      html += '<details style="margin-top:6px;"><summary style="cursor:pointer;color:var(--muted);">'
+        + 'Show '+d.missing.length+' slot(s) not recovered</summary>'
+        + '<div style="font-family:monospace;font-size:12px;margin-top:4px;line-height:1.5;">'
+        + d.missing.map(function(s){return _esc(String(s).replace('T',' '));}).join('<br>')
+        + '</div></details>';
+    }
+    out.innerHTML = html;
+  }).catch(function(e){ btn.disabled = false; st.textContent = 'Request failed: '+e; });
+}
+
+function repricePricing(){
+  var st = document.getElementById('reprice-status');
+  var from = document.getElementById('reprice-from').value;
+  var to = document.getElementById('reprice-to').value;
+  if(!from || !to){ st.textContent = 'Pick a from and to date.'; return; }
+  if(to < from){ st.textContent = 'The “to” date can’t be before the “from” date.'; return; }
+  var inclExport = document.getElementById('reprice-include-export').checked;
+  var btn = document.getElementById('btn-reprice');
+  btn.disabled = true; st.textContent = 'Counting blocks…';
+  // Preview first: how many blocks will this touch? Confirm before running.
+  fetch(apiUrl('/api/historical/reprice-repair'), {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ from_date: from, to_date: to, preview: true, include_export: inclExport })
+  }).then(function(r){return r.json();}).then(function(d){
+    btn.disabled = false; st.textContent = '';
+    if(!d.ok){ document.getElementById('reprice-out').innerHTML =
+      '<span style="color:var(--danger);">'+_esc(d.error||'failed')+'</span>'; return; }
+    if(!d.count){ document.getElementById('reprice-out').innerHTML =
+      '<div style="color:var(--muted);">No imported blocks fall in '+_esc(from)+' → '+_esc(to)+'. Check the dates (including the year).</div>'; return; }
+    if(!window.confirm('This will re-check '+d.count+' '+(inclExport?'import + export':'import')+' block(s) between '
+        + from + ' and ' + to + ', re-pricing any that are wrong.\n\n'
+        + (inclExport?'Export is included.':'Export blocks are not touched.')+' Proceed?')){
+      st.textContent = 'Cancelled.'; return;
+    }
+    _repriceRun({ from_date: from, to_date: to, include_export: inclExport }, btn);
+  }).catch(function(e){ btn.disabled = false; st.textContent = 'Request failed: '+e; });
+}
+
+function repriceQueue(){
+  _repriceRun({}, document.getElementById('btn-reprice-queue'));   // no dates → queue mode
+}
+
+function repriceFromCsv(){
+  var st = document.getElementById('reprice-csv-status');
+  var out = document.getElementById('reprice-csv-out');
+  var btn = document.getElementById('btn-reprice-csv');
+  var f = document.getElementById('reprice-csv-file').files[0];
+  if(!f){ st.textContent = 'Choose a CSV file first.'; return; }
+  btn.disabled = true; st.textContent = 'Reading…'; out.innerHTML = '';
+  var r = new FileReader();
+  r.onload = function(){
+    st.textContent = 'Applying billed costs…';
+    fetch(apiUrl('/api/historical/reprice-from-csv'), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ csv: r.result })
+    }).then(function(x){return x.json();}).then(function(d){
+      btn.disabled = false; st.textContent = '';
+      if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(d.error||'failed')+'</span>'; return; }
+      out.innerHTML = '<strong>'+d.changed+'</strong> block(s) re-priced from the bill · '
+        + d.checked+' rows read'
+        + (d.from?(' · '+_esc((d.from||'').substr(0,10))+' → '+_esc((d.to||'').substr(0,10))):'')
+        + '<div style="color:var(--muted);margin-top:4px;">These now carry Octopus\'s exact billed cost — regenerate charts to see it.</div>';
+    }).catch(function(e){ btn.disabled = false; st.textContent = 'Request failed: '+e; });
+  };
+  r.readAsText(f);
+}
+
+function controlApi(action){
+  fetch(apiUrl('/api/historical/api-import/control'), {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ action: action })
+  }).then(function(r){return r.json();}).then(function(){ pollStatus(); }).catch(function(){});
+}
+
+function doPreview(){
+  var st = document.getElementById('preview-status');
+  st.textContent = 'Reading…';
+  Promise.all([_readFile('import-file'), _readFile('export-file')]).then(function(vals){
+    STATE.import_csv = vals[0]; STATE.export_csv = vals[1];
+    if(!STATE.import_csv && !STATE.export_csv){ st.textContent = 'Pick at least an import CSV.'; return; }
+    st.textContent = 'Deriving rates…';
+    fetch(apiUrl('/api/historical/csv/preview'), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({import_csv: STATE.import_csv, export_csv: STATE.export_csv})
+    }).then(function(r){return r.json();}).then(function(d){
+      st.textContent = '';
+      if(!d.ok){ st.textContent = 'Error: '+(d.error||'failed'); return; }
+      STATE.preview = d;
+      renderReview(d);
+      goStep('review');
+    }).catch(function(e){ st.textContent = 'Request failed: '+e; });
+  });
+}
+
+function renderReview(d){
+  var html = '';
+  ["import","export"].forEach(function(channel){
+    var c = (d.channels||{})[channel];
+    if(!c) return;
+    html += '<div style="font-weight:600;text-transform:capitalize;margin-top:12px;">'+channel+'</div>';
+    if(!c.ok){ html += '<div style="color:var(--danger);font-size:13px;">Parse failed: '
+      + _esc((c.errors&&c.errors[0]&&c.errors[0].reason)||'unknown')+'</div>'; return; }
+    var rec = c.reconcile||{};
+    var recBadge = rec.ok
+      ? '<span style="color:var(--success,green);">reconciles ('+rec.pct_diff+'%)</span>'
+      : '<span style="color:var(--danger);">off by '+_gbp(rec.abs_diff)+' ('+rec.pct_diff+'%) — check rates</span>';
+    html += '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">'
+      + c.block_count+' blocks · off-peak '+(c.off_peak_kwh||0).toFixed(1)+' kWh · peak '
+      + (c.peak_kwh||0).toFixed(1)+' kWh · re-price vs CSV cost: '+recBadge
+      + ((c.parse_errors&&c.parse_errors.length)?(' · '+c.parse_errors.length+' skipped rows'):'')+'</div>';
+    (c.periods||[]).forEach(function(p, pi){
+      html += '<div style="font-size:12px;color:var(--muted);margin:8px 0 3px;">Period '
+        + _esc((p.from||'').substr(0,10))+' → '+_esc((p.to||'').substr(0,10))
+        + ' · '+_esc(p.kind)+' · standing '+_p(p.standing_daily)+'/day</div>';
+      html += '<table style="font-size:13px;border-collapse:collapse;"><tr style="color:var(--muted);text-align:left;">'
+        + '<th style="padding:0 12px 3px 0;">Tier</th><th style="padding:0 12px 3px 0;">Rate (p/kWh)</th>'
+        + '<th style="padding:0 12px 3px 0;">kWh</th><th style="padding:0 12px 3px 0;">Confidence</th></tr>';
+      (p.tiers||[]).forEach(function(t){
+        var pval = (t.rate!=null)?(t.rate*100).toFixed(2):'';
+        var conf = Math.round((t.confidence||0)*100);
+        html += '<tr><td style="padding:2px 12px 2px 0;">'+_esc(t.label)+'</td>'
+          + '<td style="padding:2px 12px 2px 0;"><input type="number" step="0.01" value="'+pval+'"'
+          + ' data-ch="'+channel+'" data-pi="'+pi+'" data-tier="'+_esc(t.label)+'"'
+          + ' style="width:90px;"></td>'
+          + '<td style="padding:2px 12px 2px 0;">'+(t.kwh!=null?t.kwh.toFixed(1):'—')+'</td>'
+          + '<td style="padding:2px 12px 2px 0;color:'+(conf<50?'var(--danger)':'var(--muted)')+';">'+conf+'%</td></tr>';
+      });
+      html += '</table>';
+    });
+  });
+  document.getElementById('review-out').innerHTML = html || '<div style="color:var(--muted);">Nothing to import.</div>';
+  document.getElementById('confirm-check').checked = false;
+  document.getElementById('btn-apply').disabled = true;
+}
+
+function collectOverrides(){
+  var ov = {};
+  document.querySelectorAll('#review-out input[type=number]').forEach(function(inp){
+    var v = parseFloat(inp.value);
+    if(isNaN(v)) return;
+    var ch = inp.dataset.ch, pi = inp.dataset.pi, tier = inp.dataset.tier;
+    ov[ch] = ov[ch] || {}; ov[ch][pi] = ov[ch][pi] || {};
+    ov[ch][pi][tier] = v / 100.0;    // p/kWh → £/kWh
+  });
+  return ov;
+}
+
+function doApply(){
+  var st = document.getElementById('apply-status');
+  document.getElementById('btn-apply').disabled = true;
+  st.textContent = 'Backing up & importing…';
+  fetch(apiUrl('/api/historical/csv/apply'), {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      import_csv: STATE.import_csv, export_csv: STATE.export_csv,
+      overrides: collectOverrides(), confirmed: true })
+  }).then(function(r){return r.json();}).then(function(d){
+    if(!d.ok){ st.textContent = 'Error: '+(d.error||'failed'); document.getElementById('btn-apply').disabled=false; return; }
+    st.textContent = '';
+    var html = '';
+    ["import","export"].forEach(function(ch){
+      var c = (d.channels||{})[ch]; if(!c||!c.ok) return;
+      html += '<div><strong style="text-transform:capitalize;">'+ch+'</strong>: '
+        + c.blocks_written+' blocks written · reconciles '
+        + (c.reconcile&&c.reconcile.ok?'✓':'⚠ ('+(c.reconcile?c.reconcile.pct_diff:'?')+'%)')+'</div>';
+    });
+    html += '<div style="color:var(--muted);margin-top:6px;">Backup: '+_esc(d.backup||'(none)')
+      + '. Regenerate charts to see the imported history. To undo: Delete Blocks → reconstructed history.</div>';
+    document.getElementById('done-out').innerHTML = html;
+    goStep('done');
+  }).catch(function(e){ st.textContent = 'Request failed: '+e; document.getElementById('btn-apply').disabled=false; });
+}
+
+// On load: if a background API import is already running (e.g. you navigated
+// away and came back), reflect it and start polling.
+document.addEventListener('DOMContentLoaded', function(){ pollStatus(); loadImportGaps(); loadImportHealth(); });
+</script>
+{% endblock %}
