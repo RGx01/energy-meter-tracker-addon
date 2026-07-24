@@ -10,6 +10,8 @@
     <button class="btn btn-secondary" id="btn-backup" onclick="doManualBackup()">💾 Backup Now</button>
     <a href="{{ url_for('delete_blocks_page') }}" class="btn btn-secondary">🗑️ Delete Blocks</a>
     <a href="{{ url_for('corrections_page') }}" class="btn btn-secondary">🔧 Corrections</a>
+    <a href="{{ url_for('historical_probe_page') }}" class="btn btn-secondary">🔬 Recorder Probe <span style="font-size:10px;opacity:0.7;">beta</span></a>
+    <a href="{{ url_for('historical_import_page') }}" class="btn btn-secondary">📥 Historical Import <span style="font-size:10px;opacity:0.7;">beta</span></a>
   </div>
 </div>
 {% endblock %}
@@ -595,10 +597,8 @@ async function confirmRestore() {
     });
     const data = await r.json();
     if (data.ok) {
-      const el = document.getElementById('alert-success');
-      el.textContent = '✓ Restored: ' + checked.join(', ') + '. Reloading…';
-      setTimeout(function() { sessionStorage.setItem('emt_db_restored', Date.now()); window.location.reload(); }, 2500);
-      el.classList.add('show');
+      _restoreWasRunning = true;   // a restore we started → reload when it finishes
+      pollRestoreStatus();
     } else {
       showError(data.error || 'Restore failed');
     }
@@ -606,6 +606,43 @@ async function confirmRestore() {
     showError(e.message);
   }
 }
+
+// The restore runs in the background (survives navigation). Poll its status and
+// reflect it in the banner; reload once it completes so the UI shows fresh data.
+var _restoreWasRunning = false;
+var _restoreTimer = null;
+function pollRestoreStatus() {
+  fetch(apiUrl('/api/backup/restore/status')).then(function(r){ return r.json(); }).then(function(d) {
+    var el = document.getElementById('alert-success');
+    if (d.status === 'running') {
+      _restoreWasRunning = true;
+      // Safe to navigate away in the browser — but the DB is being rewritten, so
+      // rebuilding or restarting the ADD-ON now can interrupt the write. Say so.
+      var _stepTxt = String(d.step || '').replace(/[<>&]/g, function(c){
+        return c === '<' ? '&lt;' : c === '>' ? '&gt;' : '&amp;'; });
+      el.innerHTML = '⏳ <strong>Restoring…</strong> ' + _stepTxt +
+        ' — safe to leave this page. <strong>Do not rebuild or restart the ' +
+        'add-on until this finishes</strong> (it would interrupt the restore).';
+      el.classList.add('show');
+      if (_restoreTimer) clearTimeout(_restoreTimer);
+      _restoreTimer = setTimeout(pollRestoreStatus, 1500);
+    } else if (d.status === 'done' && _restoreWasRunning) {
+      el.textContent = '✓ Restored: ' + ((d.restored || []).join(', ') || 'complete') + '. Reloading…';
+      el.classList.add('show');
+      setTimeout(function() { sessionStorage.setItem('emt_db_restored', Date.now()); window.location.reload(); }, 1800);
+    } else if (d.status === 'error' && _restoreWasRunning) {
+      el.classList.remove('show');
+      showError(d.error || 'Restore failed');
+    }
+    // idle / stale-done from a prior session → do nothing (no reload loop)
+  }).catch(function() {
+    if (_restoreTimer) clearTimeout(_restoreTimer);
+    _restoreTimer = setTimeout(pollRestoreStatus, 3000);
+  });
+}
+// On load: if a restore is already running (e.g. you navigated away and back),
+// pick it up and reflect progress.
+document.addEventListener('DOMContentLoaded', pollRestoreStatus);
 
 // ── Backup ────────────────────────────────────────────────────────────────────
 async function doManualBackup() {

@@ -52,6 +52,8 @@ bs = types.ModuleType("block_store")
 bs.BlockStore              = BlockStore
 bs.open_block_store        = lambda path: _test_store
 bs.migrate_json_to_sqlite  = migrate_json_to_sqlite
+bs.outward_code            = _bs_module.outward_code
+bs.derive_region_periods   = _bs_module.derive_region_periods
 sys.modules["block_store"] = bs
 
 # Now import the engine
@@ -79,6 +81,94 @@ def rate(value, ts):
 # ─────────────────────────────────────────────────────────────────────────────
 # floor_to_block (configurable block size)
 # ─────────────────────────────────────────────────────────────────────────────
+
+class TestImportExtendFloor(unittest.TestCase):
+    """Move-aware floor for pulling the earliest config period back after import."""
+
+    def test_no_move_uses_earliest_import(self):
+        self.assertEqual(
+            engine._import_extend_floor("2024-07-01T00:00:00", None),
+            "2024-07-01T00:00:00")
+
+    def test_dismissed_plan_uses_earliest_import(self):
+        # a plan that doesn't need confirmation shouldn't clamp
+        self.assertEqual(
+            engine._import_extend_floor("2024-07-01T00:00:00",
+                                        {"needs_confirmation": False}),
+            "2024-07-01T00:00:00")
+
+    def test_pending_move_clamps_to_current_site_move_in(self):
+        # two sites; extend must stop at the LATEST tenancy's move-in, never
+        # crossing into the earlier site's span
+        plan = {"needs_confirmation": True, "sites": [
+            {"outcode": "EH8", "from": "2020-01-01T00:00:00", "to": "2023-03-01T00:00:00"},
+            {"outcode": "M1",  "from": "2023-03-01T00:00:00", "to": None},
+        ]}
+        self.assertEqual(
+            engine._import_extend_floor("2020-01-01T00:00:00", plan),
+            "2023-03-01T00:00:00")
+
+
+class TestDiscoverPreImportSites(unittest.TestCase):
+    """Pre-import site discovery coro: reads the account, derives tenancy spans,
+    and delegates to BlockStore.plan_pre_import_sites (read-only)."""
+
+    def setUp(self):
+        self._saved_client = engine._kraken_client
+        self._saved_store = engine._store
+
+    def tearDown(self):
+        engine._kraken_client = self._saved_client
+        engine._store = self._saved_store
+
+    def _store_with_active(self):
+        store = BlockStore(":memory:")
+        with store._conn:
+            pid = store._conn.execute(
+                "INSERT INTO config_periods (effective_from, effective_to, billing_day, "
+                "block_minutes, timezone, currency_symbol, currency_code, site_name) "
+                "VALUES ('2026-06-03T00:00:00', NULL, 1, 30, 'UTC', '£', 'GBP', 'Home')").lastrowid
+            store._conn.execute(
+                "INSERT INTO meters (config_period_id, meter_id, is_sub_meter) "
+                "VALUES (?, 'electricity_main', 0)", (pid,))
+        return store
+
+    def test_move_needs_confirmation(self):
+        import asyncio
+        engine._store = self._store_with_active()
+        client = MagicMock()
+
+        async def _acct(_):
+            return {"properties": [
+                {"id": 1, "postcode": "EH8 9YL", "town": "Edinburgh",
+                 "moved_in_at": "2018-01-01", "moved_out_at": "2023-06-01"},
+                {"id": 2, "postcode": "M1 1AE", "town": "Manchester",
+                 "moved_in_at": "2023-06-01", "moved_out_at": None}]}
+        client.get_account = _acct
+        engine._kraken_client = client
+        res = asyncio.run(engine.discover_pre_import_sites())
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["needs_confirmation"])
+        by = {s["outcode"]: s for s in res["sites"]}
+        self.assertTrue(by["EH8"]["needs_name"])
+        self.assertTrue(by["M1"]["is_current"])
+        self.assertEqual(by["M1"]["site_name"], "Home")
+
+    def test_single_site_no_confirmation(self):
+        import asyncio
+        engine._store = self._store_with_active()
+        client = MagicMock()
+
+        async def _acct(_):
+            return {"properties": [
+                {"id": 2, "postcode": "M1 1AE", "town": "Manchester",
+                 "moved_in_at": "2020-01-01", "moved_out_at": None}]}
+        client.get_account = _acct
+        engine._kraken_client = client
+        res = asyncio.run(engine.discover_pre_import_sites())
+        self.assertTrue(res["ok"])
+        self.assertFalse(res["needs_confirmation"])
+
 
 class TestPowerValueToKw(unittest.TestCase):
     """Unit-aware power conversion for power_history (BCD current_demand is W)."""
@@ -905,37 +995,6 @@ class TestBuildGapBlocksSubMeterRate(unittest.TestCase):
             ch = bat["channels"]["import"]
             self.assertNotEqual(ch["rate"], 0.0,
                 msg="Sub-meter gap block rate must not be 0.0 when last_known_rates is available")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# _PUBLISH_HA_SENSORS flag
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestPublishHASensorsFlag(unittest.TestCase):
-    """Tests that _PUBLISH_HA_SENSORS is correctly read from the environment."""
-
-    def test_default_is_true(self):
-        """_PUBLISH_HA_SENSORS defaults to True when env var absent."""
-        import os
-        env_val = os.environ.get("PUBLISH_HA_SENSORS", "true")
-        result = env_val.lower() != "false"
-        self.assertTrue(result, "Should default to True when PUBLISH_HA_SENSORS not set")
-
-    def test_false_string_disables(self):
-        """PUBLISH_HA_SENSORS=false evaluates to False."""
-        result = "false".lower() != "false"
-        self.assertFalse(result)
-
-    def test_true_string_enables(self):
-        """PUBLISH_HA_SENSORS=true evaluates to True."""
-        result = "true".lower() != "false"
-        self.assertTrue(result)
-
-    def test_case_insensitive(self):
-        """PUBLISH_HA_SENSORS=FALSE (uppercase) also disables."""
-        result = "FALSE".lower() != "false"
-        self.assertFalse(result)
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2757,6 +2816,32 @@ class TestCarbonGapRecovery(unittest.TestCase):
         self.assertAlmostEqual(r["carbon_intensity_g"], 239.0, places=1)
         self.assertAlmostEqual(r["carbon_g"], round(2.948 * 239.0, 4), places=2)
 
+    def test_recovery_render_is_offloaded_not_synchronous(self):
+        # Regression: recovery ran generate_charts() synchronously on the loop; over
+        # a large imported history that ~90s render stalled the HA heartbeat and fed
+        # the reconnect→re-startup→re-render storm. It must offload via
+        # _schedule_chart_regen, never render synchronously on the loop.
+        self.store._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, "
+            "config_period_id, interpolated, imp_kwh, imp_rate, imp_cost, "
+            "standing_charge, carbon_intensity_g) "
+            "VALUES (?,?,?,?,1,?,?,?,?,NULL)",
+            ("2026-06-05T20:00:00", "2026-06-05T20:30:00", "electricity_main",
+             self.cp, 2.948, 0.32309, 0.9527, 0.50))
+        self.store._conn.commit()
+        sync_calls = {"n": 0}
+        engine.generate_charts = lambda *a, **kw: sync_calls.__setitem__("n", sync_calls["n"] + 1)
+        sched = {"n": 0}
+        orig_sched = engine._schedule_chart_regen
+        engine._schedule_chart_regen = lambda: sched.__setitem__("n", sched["n"] + 1)
+        try:
+            rec = engine._recover_missing_carbon()
+        finally:
+            engine._schedule_chart_regen = orig_sched
+        self.assertEqual(rec, 1)
+        self.assertEqual(sched["n"], 1, "recovery render must be offloaded")
+        self.assertEqual(sync_calls["n"], 0, "must not render synchronously on the loop")
+
     def test_recovery_skips_when_no_ci_slot(self):
         # NULL-carbon block whose time has no CI slot (aged out) → not recovered.
         self.store._conn.execute(
@@ -2779,6 +2864,477 @@ class TestCarbonGapRecovery(unittest.TestCase):
         mb = block["meters"]["electricity_main"]
         self.assertAlmostEqual(mb["carbon_intensity_g"], 239.0, places=1)
         self.assertAlmostEqual(mb["carbon_g"], round(2.948 * 239.0, 4), places=2)
+
+
+class TestRepairImportPricing(unittest.TestCase):
+    """Calm re-price repair (range mode): recovers slots a fresh Measurements
+    query now returns a cost for, and reports the ones still cost-less — the split
+    that confirms whether the misses were load-induced (recoverable) or real gaps."""
+
+    def setUp(self):
+        self._saved = (engine._store, engine._kraken_client,
+                       getattr(engine, "_kraken_discovery", None),
+                       engine._tariff_rate_for, engine.kraken_available,
+                       engine._generate_charts_offloaded)
+        self._cache = dict(engine._hist_rate_segs_cache)
+
+    def tearDown(self):
+        (engine._store, engine._kraken_client, engine._kraken_discovery,
+         engine._tariff_rate_for, engine.kraken_available,
+         engine._generate_charts_offloaded) = self._saved
+        engine._hist_rate_segs_cache.clear()
+        engine._hist_rate_segs_cache.update(self._cache)
+
+    def _store(self):
+        store = BlockStore(":memory:")
+        with store._conn:
+            cp = store._conn.execute(
+                "INSERT INTO config_periods (effective_from, billing_day, block_minutes, "
+                "timezone, currency_symbol, currency_code) "
+                "VALUES ('2025-10-01T00:00:00',1,30,'Europe/London','£','GBP')").lastrowid
+            store._conn.execute(
+                "INSERT INTO meters (config_period_id, meter_id, is_sub_meter) "
+                "VALUES (?, 'electricity_main', 0)", (cp,))
+            for bs in ("2025-10-21T18:30:00", "2025-10-21T19:00:00"):
+                store._conn.execute(
+                    "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                    "imp_kwh, imp_rate, imp_cost, source) "
+                    "VALUES (?,?,'electricity_main',?,3.0,0.28124,0.945,'imported_api')",
+                    (bs, bs, cp))
+        return store
+
+    def test_range_recovers_available_and_flags_missing(self):
+        import asyncio
+        store = self._store()
+        engine._store = store
+        engine._kraken_discovery = {"import": {"mpan": "M"}, "export": {}}
+        engine.kraken_available = lambda: True
+        engine._hist_rate_segs_cache.clear()
+        engine._hist_rate_segs_cache["import"] = [("2000-01-01T00:00:00", None, None)]
+        engine._tariff_rate_for = lambda segs, st, ofp: (0.07 if ofp else 0.28124)
+
+        async def _noop_charts():
+            return None
+        engine._generate_charts_offloaded = _noop_charts
+
+        client = MagicMock()
+
+        async def _meas(mpan, start, end, *, direction="CONSUMPTION"):
+            return [
+                {"start": "2025-10-21T18:30:00", "kwh": 3.0, "cost_incl": 0.21, "off_peak": True},
+                {"start": "2025-10-21T19:00:00", "kwh": 3.0, "cost_incl": None, "off_peak": None},
+            ]
+        client.get_measurements = _meas
+        engine._kraken_client = client
+
+        # pace_s>0 exercises the inter-window sleep (regression: it referenced a
+        # function-local asyncio alias that wasn't imported here → NameError).
+        res = asyncio.run(engine.repair_import_pricing("2025-10-21", "2025-10-22", pace_s=0.001))
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["recovered"], 1)
+        self.assertEqual(res["still_missing"], 1)
+        # the leftover is now inspectable (its exact timestamp is returned)
+        self.assertEqual(res["missing"], ["2025-10-21T19:00:00"])
+        r = store._conn.execute(
+            "SELECT imp_rate, imp_cost FROM blocks "
+            "WHERE block_start='2025-10-21T18:30:00'").fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.07)      # off-peak rate applied
+        self.assertAlmostEqual(r["imp_cost"], 0.21)      # exact billed cost
+        # the still-missing slot is untouched (kept its schedule price)
+        r2 = store._conn.execute(
+            "SELECT imp_rate FROM blocks WHERE block_start='2025-10-21T19:00:00'").fetchone()
+        self.assertAlmostEqual(r2["imp_rate"], 0.28124)
+
+    def test_material_peak_slot_escalated_to_ladder(self):
+        # THE stubborn-split fix. A MATERIAL import slot the WIDE window re-confirms as
+        # STANDARD/peak (self-consistent peak label AND cost → window pass changes
+        # nothing) is escalated to the NARROW ladder, which proves it OFF_PEAK and
+        # reprices it — correcting the off-peak/peak split a plain range repair can't.
+        import asyncio
+        store = self._store()
+        engine._store = store
+        engine._kraken_discovery = {"import": {"mpan": "M"}, "export": {}}
+        engine.kraken_available = lambda: True
+        engine._hist_rate_segs_cache.clear()
+        engine._hist_rate_segs_cache["import"] = [("2000-01-01T00:00:00", None, None)]
+        engine._tariff_rate_for = lambda segs, st, ofp: (0.07 if ofp else 0.28124)
+
+        async def _noop_charts():
+            return None
+        engine._generate_charts_offloaded = _noop_charts
+
+        client = MagicMock()
+
+        # Wide window: both slots come back STANDARD (peak) with a self-consistent
+        # peak cost (3 kWh × 0.28124) → window pass reprices to the same peak (no-op).
+        async def _meas(mpan, start, end, *, direction="CONSUMPTION"):
+            return [
+                {"start": "2025-10-21T18:30:00", "kwh": 3.0, "cost_incl": 0.84372, "off_peak": False},
+                {"start": "2025-10-21T19:00:00", "kwh": 3.0, "cost_incl": 0.84372, "off_peak": False},
+            ]
+        client.get_measurements = _meas
+
+        # Narrow ladder: proves BOTH slots OFF_PEAK with the real off-peak cost.
+        async def _recover(mpan, starts, *, direction="CONSUMPTION", pace_s=0.4):
+            return {s: {"start": s, "kwh": 3.0, "cost_incl": 0.21, "off_peak": True}
+                    for s in starts}
+        client.recover_measurement_costs = _recover
+        engine._kraken_client = client
+
+        res = asyncio.run(engine.repair_import_pricing("2025-10-21", "2025-10-22", pace_s=0))
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["still_missing"], 0)
+        for bs in ("2025-10-21T18:30:00", "2025-10-21T19:00:00"):
+            r = store._conn.execute(
+                "SELECT imp_rate, imp_cost FROM blocks WHERE block_start=?", (bs,)).fetchone()
+            self.assertAlmostEqual(r["imp_rate"], 0.07)     # split corrected to off-peak
+            self.assertAlmostEqual(r["imp_cost"], 0.21)
+
+    def test_genuine_peak_material_slot_stays_peak_not_flagged_missing(self):
+        # A MATERIAL slot that IS genuinely peak: escalated to the ladder, which still
+        # returns STANDARD → repriced to the same peak (no change) and NOT counted as
+        # 'not recovered'. The escalation self-corrects a false positive for free.
+        import asyncio
+        store = self._store()
+        engine._store = store
+        engine._kraken_discovery = {"import": {"mpan": "M"}, "export": {}}
+        engine.kraken_available = lambda: True
+        engine._hist_rate_segs_cache.clear()
+        engine._hist_rate_segs_cache["import"] = [("2000-01-01T00:00:00", None, None)]
+        engine._tariff_rate_for = lambda segs, st, ofp: (0.07 if ofp else 0.28124)
+
+        async def _noop_charts():
+            return None
+        engine._generate_charts_offloaded = _noop_charts
+
+        client = MagicMock()
+
+        async def _meas(mpan, start, end, *, direction="CONSUMPTION"):
+            return [
+                {"start": "2025-10-21T18:30:00", "kwh": 3.0, "cost_incl": 0.84372, "off_peak": False},
+                {"start": "2025-10-21T19:00:00", "kwh": 3.0, "cost_incl": 0.84372, "off_peak": False},
+            ]
+        client.get_measurements = _meas
+
+        # Ladder ALSO returns STANDARD (genuinely peak) with the peak cost.
+        async def _recover(mpan, starts, *, direction="CONSUMPTION", pace_s=0.4):
+            return {s: {"start": s, "kwh": 3.0, "cost_incl": 0.84372, "off_peak": False}
+                    for s in starts}
+        client.recover_measurement_costs = _recover
+        engine._kraken_client = client
+
+        res = asyncio.run(engine.repair_import_pricing("2025-10-21", "2025-10-22", pace_s=0))
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["still_missing"], 0)     # not miscounted as missing
+        for bs in ("2025-10-21T18:30:00", "2025-10-21T19:00:00"):
+            r = store._conn.execute(
+                "SELECT imp_rate FROM blocks WHERE block_start=?", (bs,)).fetchone()
+            self.assertAlmostEqual(r["imp_rate"], 0.28124)   # stays peak
+
+    def test_count_only_previews_import_scope(self):
+        # The confirm step: count_only returns how many blocks a run would touch,
+        # with NO API calls and NO writes. channels=('import',) excludes export so
+        # the range tool can't fragment export rates.
+        import asyncio
+        store = self._store()
+        engine._store = store
+        engine._kraken_client = MagicMock()          # preview needs no calls, guard needs a client
+        engine._kraken_discovery = {"import": {"mpan": "M"}, "export": {}}
+        engine.kraken_available = lambda: True
+        res = asyncio.run(engine.repair_import_pricing(
+            "2025-10-21", "2025-10-22", channels=("import",), count_only=True))
+        self.assertTrue(res["ok"] and res["count_only"])
+        self.assertEqual(res["import"], 2)     # the two seeded import blocks
+        self.assertEqual(res["export"], 0)     # export not in scope
+        self.assertEqual(res["count"], 2)
+        # unchanged in the DB (count is pure preview)
+        self.assertAlmostEqual(store._conn.execute(
+            "SELECT imp_rate FROM blocks WHERE block_start='2025-10-21T18:30:00'"
+        ).fetchone()[0], 0.28124)
+
+    def test_throttled_stops_when_headroom_low(self):
+        # When the Octopus points allowance is low, the repair STOPS rather than
+        # pushing on (which would only produce more cost-less responses). It reports
+        # throttled=True and does no fetching; the user re-runs once it recovers.
+        import asyncio
+        store = self._store()
+        engine._store = store
+        engine._kraken_discovery = {"import": {"mpan": "M"}, "export": {}}
+        engine.kraken_available = lambda: True
+        engine._hist_rate_segs_cache.clear()
+        engine._hist_rate_segs_cache["import"] = [("2000-01-01T00:00:00", None, None)]
+        engine._tariff_rate_for = lambda segs, st, ofp: 0.07
+
+        async def _noop_charts():
+            return None
+        engine._generate_charts_offloaded = _noop_charts
+
+        client = MagicMock()
+
+        async def _rl():
+            return {"isBlocked": False, "remaining": 5, "pointsLimit": 1000}  # 0.5% left
+
+        async def _meas(*a, **k):
+            raise AssertionError("must not fetch measurements while throttled")
+        client.get_rate_limit = _rl
+        client.get_measurements = _meas
+        engine._kraken_client = client
+
+        res = asyncio.run(engine.repair_import_pricing("2025-10-21", "2025-10-22", pace_s=0))
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["throttled"])
+        self.assertEqual(res["recovered"], 0)
+        self.assertEqual(res["windows"], 0)
+
+
+class TestFinalRecoveryPass(unittest.TestCase):
+    """Auto final calm recovery: when a bulk import finishes, drain the reprice queue
+    once (calm) so the off-peak-outside-window dispatch slots the load left peak-priced
+    get relabelled OFF_PEAK — fixing the split without a manual 'reprice queue' click."""
+
+    def setUp(self):
+        self._saved = (engine._store, engine.kraken_available,
+                       engine.repair_import_pricing)
+
+    def tearDown(self):
+        (engine._store, engine.kraken_available,
+         engine.repair_import_pricing) = self._saved
+
+    def test_drains_queue_when_nonempty(self):
+        import asyncio
+        engine._store = MagicMock()
+        engine._store.reprice_queue_count.return_value = 6
+        engine.kraken_available = lambda: True
+        calls = {}
+
+        async def _fake_repair(*a, **k):
+            calls["ran"] = True
+            return {"ok": True, "recovered": 6, "still_missing": 0, "throttled": False}
+        engine.repair_import_pricing = _fake_repair
+
+        j = {}
+        out = asyncio.run(engine._drain_reprice_queue_after_import(j))
+        self.assertTrue(calls.get("ran"))
+        self.assertTrue(out["ran"])
+        self.assertEqual(out["recovered"], 6)
+        self.assertEqual(j["final_recovery"]["recovered"], 6)
+
+    def test_noop_when_queue_empty(self):
+        import asyncio
+        engine._store = MagicMock()
+        engine._store.reprice_queue_count.return_value = 0
+        engine.kraken_available = lambda: True
+
+        async def _fake_repair(*a, **k):
+            raise AssertionError("must not run the repair when the queue is empty")
+        engine.repair_import_pricing = _fake_repair
+
+        out = asyncio.run(engine._drain_reprice_queue_after_import())
+        self.assertFalse(out["ran"])
+        self.assertEqual(out["recovered"], 0)
+
+    def test_noop_when_no_api(self):
+        import asyncio
+        engine._store = MagicMock()
+        engine._store.reprice_queue_count.return_value = 6
+        engine.kraken_available = lambda: False
+
+        async def _fake_repair(*a, **k):
+            raise AssertionError("must not run the repair without an API connection")
+        engine.repair_import_pricing = _fake_repair
+
+        out = asyncio.run(engine._drain_reprice_queue_after_import())
+        self.assertFalse(out["ran"])
+
+    def test_throttle_is_surfaced_and_nonfatal(self):
+        import asyncio
+        engine._store = MagicMock()
+        engine._store.reprice_queue_count.return_value = 6
+        engine.kraken_available = lambda: True
+
+        async def _fake_repair(*a, **k):
+            return {"ok": True, "recovered": 2, "still_missing": 4, "throttled": True}
+        engine.repair_import_pricing = _fake_repair
+
+        j = {}
+        out = asyncio.run(engine._drain_reprice_queue_after_import(j))
+        self.assertTrue(out["ran"])
+        self.assertTrue(out["throttled"])
+        self.assertEqual(out["still_missing"], 4)
+
+
+class TestBilledRate(unittest.TestCase):
+    """Octopus's billed cost is authoritative: the stored rate is cost÷kWh, keeping
+    the clean scheduled value only when it agrees — so a mis-dated price-cap change
+    in the LOCAL schedule can't stamp a rate that contradicts the block's cost."""
+
+    class _Sched:
+        def __init__(self, lo_p, hi_p):
+            self.lo_p, self.hi_p = lo_p, hi_p           # native pence
+
+        def day_rate_bounds(self, ts):
+            return (self.lo_p, self.hi_p)
+
+        def resolve(self, ts):
+            return self.hi_p
+
+    def _segs(self, lo_p, hi_p):
+        return [("2000-01-01T00:00:00", None, self._Sched(lo_p, hi_p))]
+
+    def test_prefers_clean_schedule_when_it_agrees(self):
+        # sched off-peak 7.00p; billed 6.9986p (rounding) → keep the tidy 0.0700.
+        r = engine._billed_rate(self._segs(7.0, 28.0),
+                                "2025-10-14T02:00:00", True, 0.069986, 1.0)
+        self.assertEqual(r, 0.07)
+
+    def test_trusts_billed_when_schedule_stale(self):
+        # 31 Mar: the schedule wrongly holds the 1-Apr price-cap rate (5.493p), but
+        # Octopus billed 9p (cost 0.2624 for 2.916 kWh) → rate must be the billed 9p,
+        # NOT the stale scheduled 5.49p.
+        r = engine._billed_rate(self._segs(5.493, 32.3092),
+                                "2026-03-31T02:30:00", True, 0.2624, 2.916)
+        self.assertAlmostEqual(r, round(0.2624 / 2.916, 6))   # ≈ 0.09
+        self.assertGreater(r, 0.08)                           # definitely not 0.0549
+
+    def test_no_billed_cost_uses_schedule(self):
+        r = engine._billed_rate(self._segs(7.0, 28.0),
+                                "2025-10-14T02:00:00", True, None, 1.0)
+        self.assertEqual(r, 0.07)                             # off-peak scheduled rate
+
+    def test_zero_kwh_uses_schedule_no_divide(self):
+        r = engine._billed_rate(self._segs(7.0, 28.0),
+                                "2025-10-14T14:00:00", False, 0.0, 0.0)
+        self.assertEqual(r, 0.28)                             # peak scheduled, no ZeroDiv
+
+    def test_flat_export_labelled_standard_prefers_schedule(self):
+        # THE export bug: Octopus labels export slots STANDARD_RATE, so they parse to
+        # off_peak=False (NOT None). The tariff is flat that day (lo==hi==15p), so the
+        # schedule is truth — a small slot billing to 0.14870 must still snap to the
+        # tidy 0.15, not fragment. (Keying on "no label" missed this — off_peak False.)
+        r = engine._billed_rate(self._segs(15.0, 15.0),
+                                "2025-09-15T14:00:00", False, 0.14870, 1.0)
+        self.assertEqual(r, 0.15)
+
+    def test_flat_export_no_label_also_prefers_schedule(self):
+        # Some export slots carry no bucket at all → off_peak None; still flat → 0.15.
+        r = engine._billed_rate(self._segs(15.0, 15.0),
+                                "2025-09-15T14:00:00", None, 0.14870, 1.0)
+        self.assertEqual(r, 0.15)
+
+    def test_banded_iog_peak_labelled_false_keeps_billed(self):
+        # IOG peak also parses off_peak=False, but the day is BANDED (7p/28p, lo≠hi) →
+        # dispatch-aware → billed stays truth. A stale-schedule 31-Mar-style case: the
+        # schedule holds 28p but Octopus billed 9p → must NOT snap to the flat branch.
+        r = engine._billed_rate(self._segs(7.0, 28.0),
+                                "2026-03-31T14:00:00", False, 0.2624, 2.916)
+        self.assertAlmostEqual(r, round(0.2624 / 2.916, 6))   # ≈ 0.09, the billed rate
+        self.assertLess(r, 0.15)                              # definitely not 0.28
+
+    def test_continuous_agile_prefers_per_slot_resolve(self):
+        # Agile: no label → _tariff_rate_for uses resolve() (per-slot). resolve here
+        # returns the hi_p=17.493p slot rate; billed jitters to 0.17490 → prefer the
+        # clean scheduled 0.17493, not the jittery billed.
+        r = engine._billed_rate(self._segs(9.9, 17.493),
+                                "2025-10-18T14:00:00", None, 0.17490, 1.0)
+        self.assertEqual(r, 0.17493)
+
+    def test_continuous_falls_back_to_billed_when_uncovered(self):
+        # No schedule coverage (empty segs) → sched is None → billed is the fallback,
+        # even for a continuous/unlabelled slot.
+        r = engine._billed_rate([], "2025-09-15T14:00:00", None, 0.15, 1.0)
+        self.assertEqual(r, 0.15)
+
+
+class TestImportPricingFlag(unittest.TestCase):
+    """IOG-dispatch pricing diagnostic classifier. A material-kWh import slot that
+    Measurements returned with no billed cost is schedule-priced (peak if out of
+    the fixed window) — flag it, and note whether Octopus sent no TOU bucket."""
+
+    def test_material_no_cost_no_bucket_is_flagged(self):
+        self.assertEqual(engine._import_pricing_flag("import", 2.5, None, []),
+                         (True, True))
+
+    def test_material_no_cost_with_standard_bucket_not_no_bucket(self):
+        # Octopus DID send a bucket (labelled STANDARD) but no cost → still a
+        # fallback, but not a data omission.
+        self.assertEqual(
+            engine._import_pricing_flag("import", 2.5, None, ["STANDARD_RATE"]),
+            (True, False))
+
+    def test_cost_present_not_flagged(self):
+        self.assertEqual(engine._import_pricing_flag("import", 2.5, 0.51, []),
+                         (False, False))
+
+    def test_small_kwh_not_flagged(self):
+        self.assertEqual(engine._import_pricing_flag("import", 0.2, None, []),
+                         (False, False))
+
+    def test_export_channel_never_flagged(self):
+        self.assertEqual(engine._import_pricing_flag("export", 5.0, None, []),
+                         (False, False))
+
+
+class TestBuildChannelRateSegsDegenerateWindow(unittest.TestCase):
+    """Regression: iterating ALL historical agreements fetched even superseded old
+    tariffs whose valid_from >= valid_to, which the REST rate API rejects with
+    HTTP 400 'period_from must not be greater than period_to' (noisy warnings on
+    every import). Such degenerate windows must be skipped without a fetch."""
+
+    def setUp(self):
+        self._orig_disc = getattr(engine, "_kraken_discovery", None)
+        self._orig_client = engine._kraken_client
+        engine._kraken_client = MagicMock()
+
+    def tearDown(self):
+        engine._kraken_discovery = self._orig_disc
+        engine._kraken_client = self._orig_client
+
+    def _run_with_fake_builder(self, builder_name, coro_factory):
+        import asyncio
+        import kraken_rates
+        called = []
+
+        class _Sched:
+            def is_empty(self):
+                return False
+
+        async def _fake(client, product, tariff, *, period_from=None,
+                        period_to=None, **kw):
+            called.append(tariff)
+            return _Sched()
+
+        orig = getattr(kraken_rates, builder_name)
+        setattr(kraken_rates, builder_name, _fake)
+        try:
+            segs = asyncio.run(coro_factory())
+        finally:
+            setattr(kraken_rates, builder_name, orig)
+        return called, segs
+
+    def test_rate_builder_skips_degenerate_window(self):
+        engine._kraken_discovery = {"import": {"agreements": [
+            {"tariff_code": "E-1R-VAR-22-11-01-B",          # from >= to → skip
+             "valid_from": "2022-11-01T00:00:00Z", "valid_to": "2022-11-01T00:00:00Z"},
+            {"tariff_code": "E-1R-INTELLI-FIX-12M-26-03-17-B",   # valid → fetched
+             "valid_from": "2026-03-17T00:00:00Z", "valid_to": None},
+        ]}}
+        called, segs = self._run_with_fake_builder(
+            "build_rate_schedule", lambda: engine._build_channel_rate_segs("import"))
+        self.assertEqual(called, ["E-1R-INTELLI-FIX-12M-26-03-17-B"])
+        self.assertEqual(len(segs), 1)
+
+    def test_standing_builder_skips_degenerate_window(self):
+        engine._kraken_discovery = {"export": {"agreements": [
+            {"tariff_code": "E-1R-OUTGOING-FIX-12M-19-05-13-B",   # from >= to → skip
+             "valid_from": "2019-05-13T00:00:00Z", "valid_to": "2019-05-13T00:00:00Z"},
+            {"tariff_code": "E-1R-OUTGOING-VAR-24-10-26-B",       # valid → fetched
+             "valid_from": "2024-10-26T00:00:00Z", "valid_to": None},
+        ]}}
+        called, segs = self._run_with_fake_builder(
+            "build_standing_charge_schedule",
+            lambda: engine._build_channel_standing_segs("export"))
+        self.assertEqual(called, ["E-1R-OUTGOING-VAR-24-10-26-B"])
+        self.assertEqual(len(segs), 1)
 
 
 class TestDispatchSlotCapture(unittest.TestCase):
@@ -3665,6 +4221,55 @@ class TestRecomputeRemaindersForWindow(unittest.TestCase):
             res["recompute_parent"], res["recompute_from"], res["recompute_to"])
         # ev's 0.3 returns to the main; battery's 0.5 still subtracted.
         self.assertAlmostEqual(self._parent_remainder(), 1.5, places=4)
+
+
+class TestBackupToShareOffloaded(unittest.TestCase):
+    """The per-finalise backup must not run on the event loop — synchronous
+    store.backup() to a slow /share stalled the HA WebSocket heartbeat every block
+    (→ reconnect + full engine_startup, looked like a 30-min restart). Verify it
+    still produces a valid backup (via a fresh connection) and resets its guard."""
+
+    def setUp(self):
+        self._saved_store = engine._store
+        self._saved_dir = engine.SHARE_BACKUP_DIR
+        engine._backup_in_progress = False
+
+    def tearDown(self):
+        engine._store = self._saved_store
+        engine.SHARE_BACKUP_DIR = self._saved_dir
+
+    def test_backup_writes_valid_db_and_resets_guard(self):
+        import tempfile, os, sqlite3
+        from block_store import BlockStore
+        tmpdb = tempfile.mktemp(suffix=".db")
+        bkdir = tempfile.mkdtemp()
+        try:
+            s = BlockStore(tmpdb)
+            s.insert_config_period({"meters": {"electricity_main": {"meta": {
+                "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
+                "currency_symbol": "£", "currency_code": "GBP", "site": "H"}}}})
+            engine._store = s
+            engine.SHARE_BACKUP_DIR = bkdir
+            engine._backup_to_share()                    # no running loop → inline
+            dst = os.path.join(bkdir, "blocks.db")
+            self.assertTrue(os.path.exists(dst))
+            self.assertFalse(engine._backup_in_progress)  # guard reset after run
+            c = sqlite3.connect(dst)
+            n = c.execute("SELECT COUNT(*) FROM config_periods").fetchone()[0]
+            c.close()
+            self.assertEqual(n, 1)                        # backup is a real, complete DB
+        finally:
+            for p in (tmpdb, os.path.join(bkdir, "blocks.db")):
+                if os.path.exists(p):
+                    os.remove(p)
+
+    def test_overlap_guard_skips_while_running(self):
+        # If a slow backup is still going, the next finalise skips rather than
+        # piling a second writer onto the same dst file.
+        engine._backup_in_progress = True
+        engine._store = MagicMock()          # would raise if actually used
+        engine._backup_to_share()            # must no-op immediately
+        self.assertTrue(engine._backup_in_progress)   # untouched (still "running")
 
 
 if __name__ == "__main__":

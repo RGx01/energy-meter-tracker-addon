@@ -390,3 +390,57 @@ class HAClient:
         mid = self._msg_id
         self._msg_id += 1
         return mid
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Generic WebSocket command (request → awaited result)
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def ws_command(self, command_type: str, *, timeout: float = 45.0,
+                         **params):
+        """Send a WebSocket command and await its `result`.
+
+        Uses the existing id→Future correlation resolved in _handle_message.
+        Raises RuntimeError on HA error, TimeoutError if no reply in `timeout`.
+        Requires the listener loop to be running (it resolves the future).
+        """
+        if self._ws is None:
+            raise RuntimeError("ha_client: WebSocket not connected")
+        msg_id = self._next_id()
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        self._pending[msg_id] = future
+        try:
+            await self._ws.send_json({"id": msg_id, "type": command_type, **params})
+            return await asyncio.wait_for(future, timeout=timeout)
+        finally:
+            self._pending.pop(msg_id, None)
+
+    # ── Recorder statistics (read-only; historical-import probe) ────────────
+
+    async def get_statistic_ids(self, statistic_type: str | None = None) -> list:
+        """`recorder/list_statistic_ids` — metadata for every long-term statistic:
+        [{statistic_id, unit_of_measurement, has_mean, has_sum, ...}].
+        `statistic_type` optionally filters to 'sum' or 'mean'. Read-only."""
+        params = {}
+        if statistic_type:
+            params["statistic_type"] = statistic_type
+        res = await self.ws_command("recorder/list_statistic_ids", **params)
+        return res or []
+
+    async def get_statistics(self, statistic_ids: list[str],
+                             start_time: str, end_time: str,
+                             period: str = "hour",
+                             types: list[str] | None = None) -> dict:
+        """`recorder/statistics_during_period` — long-term statistics for the
+        given sensors over [start_time, end_time). Returns
+        {statistic_id: [{start, end, sum?, state?, mean?, ...}]}. Read-only.
+
+        `start_time`/`end_time` are ISO-8601 strings; `period` is
+        'hour'/'day'/'5minute'/'month'. `types` selects the columns
+        (default: state, sum, mean, min, max, change)."""
+        res = await self.ws_command(
+            "recorder/statistics_during_period",
+            start_time=start_time, end_time=end_time,
+            statistic_ids=list(statistic_ids), period=period,
+            types=types or ["state", "sum", "mean", "min", "max", "change"])
+        return res or {}

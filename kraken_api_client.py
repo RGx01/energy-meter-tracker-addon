@@ -29,6 +29,7 @@ import base64
 import logging
 import random
 import time
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import aiohttp
@@ -43,6 +44,13 @@ _PAGE_SIZE = 1500      # consumption rows per page (API max is large; keep sane)
 # GraphQL rate-limit error code (Kraken). Surfaced in the errors[] array of an
 # otherwise-200 response. Verified against Octopus GraphQL guides.
 _GQL_RATE_LIMIT_CODE = "KT-CT-1199"
+# Two further documented usage-constraint codes (docs.octopus.energy/graphql/
+# guides/basics — "Usage constraints"). Unlike KT-CT-1199 these are NOT fixed by
+# waiting: the request itself is too big, so the fix is a SMALLER query (fewer
+# fields / a narrower window), not a retry. We surface them distinctly so the
+# import can react (shrink the window) and the log names the real cause.
+_GQL_COMPLEXITY_CODE = "KT-CT-1188"   # request complexity > 200
+_GQL_NODE_LIMIT_CODE = "KT-CT-1189"   # > 10,000 nodes requested in one query
 # Kraken returns this code when a requested field has been disabled/removed —
 # the definitive "the schema changed under us" signal (drift canary).
 _GQL_DISABLED_FIELD_CODE = "KT-CT-1113"
@@ -74,6 +82,20 @@ def _mask(value: Optional[str]) -> str:
     if len(s) <= 2:
         return "…"
     return s[0] + "…" + s[-1]
+
+
+def _iso_naive_utc(s) -> Optional[str]:
+    """Offset-aware (or Z) ISO string → naive-UTC ISO string, or None.
+    e.g. '2024-07-01T01:00:00+01:00' → '2024-07-01T00:00:00'."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.replace(microsecond=0).isoformat()
 
 
 # SmartFlex device classification — the IOG-controllable charging devices whose
@@ -111,6 +133,17 @@ _EMT_GRAPHQL_FIELDS = {
     "meta", "source", "location",
     # devices (provider / charge-point discovery)
     "devices", "provider", "deviceType", "status", "current", "make", "model",
+    # historical import — GraphQL Measurements API (get_measurements). These drive
+    # the whole backfill (kWh + billed cost + off/peak label), so a silent upstream
+    # deprecation must surface. (Relay-connection generics — edges/node/value/unit/
+    # pageInfo — are deliberately left out here; they need type-scoped matching to
+    # avoid false positives — tracked as a backlog item.)
+    "properties", "measurements", "startAt", "endAt",
+    "metaData", "statistics", "label", "costInclTax", "costExclTax",
+    "estimatedAmount",
+    # rate-limit pacing (import back-off watches the points allowance) + IOG state
+    "pointsAllowanceRateLimit", "usedPoints", "remainingPoints", "isBlocked",
+    "currentState",
 }
 # Fields too GENERIC to match by bare name (e.g. `id` exists on nearly every
 # type and is deprecated on many EMT never touches — ledgers, payments, …). We
@@ -122,8 +155,12 @@ _EMT_GRAPHQL_TYPED_FIELDS = {
     ("SmartFlexVehicle", "id"),
 }
 # Enum VALUES EMT passes or compares literally — a rename/removal silently
-# breaks logic (telemetry grouping, live-device test, charging-device match).
-_EMT_GRAPHQL_ENUMS = _CHARGING_DEVICE_TYPES | {"TEN_SECONDS", "LIVE"}
+# breaks logic (telemetry grouping, live-device test, charging-device match, and
+# the historical-import Measurements filter: reading frequency + direction).
+_EMT_GRAPHQL_ENUMS = _CHARGING_DEVICE_TYPES | {
+    "TEN_SECONDS", "LIVE",
+    "THIRTY_MIN_INTERVAL", "CONSUMPTION", "GENERATION",
+}
 
 # Known same-NAME collisions: a deprecated field whose name is in the set above
 # but which sits on a (type, position) EMT never selects. Kept at (type, field)
@@ -324,6 +361,13 @@ class KrakenAuthError(KrakenAPIError):
 
 class KrakenRateLimitError(KrakenAPIError):
     """429 — REST rate limit hit. Caller should back off."""
+
+
+class KrakenQueryTooLargeError(KrakenAPIError):
+    """GraphQL complexity (KT-CT-1188) or node-count (KT-CT-1189) limit exceeded.
+    NOT fixed by waiting — the request is too big. The caller should retry with a
+    SMALLER window / fewer fields. Distinct from KrakenRateLimitError so the
+    import narrows the window instead of pointlessly backing off."""
 
 
 class KrakenCooldownError(KrakenAPIError):
@@ -540,6 +584,40 @@ class KrakenAPIClient:
         logger.info("get_consumption: mpan=%s serial=%s → %d rows",
                     _mask(mpan), _mask(serial), len(rows))
         return rows
+
+    async def get_consumption_boundary(
+        self, mpan: str, serial: str, *, newest: bool = False,
+        period_from: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Cheap single-row retention probe: the earliest (default) or latest
+        half-hourly interval available for a meter, WITHOUT paging the whole
+        series. Returns one row dict {consumption, interval_start, interval_end}
+        or None if the meter has no data.
+
+        `order_by='period'` is earliest-first, `-period` latest-first; with
+        `page_size=1` we read just the boundary row from a single page.
+
+        IMPORTANT: pass `period_from` (a far-past floor). Without it the endpoint
+        defaults to only the most recent ~week, so `order_by='period'` returns
+        the earliest of *that* window, not the meter's true earliest. A wide
+        floor makes the ascending scan start from real history. Used by the
+        read-only export-retention probe to measure how far back each channel
+        (import vs export) reaches before any historical import is attempted."""
+        path = (f"/v1/electricity-meter-points/{mpan}"
+                f"/meters/{serial}/consumption/")
+        params: dict[str, Any] = {
+            "order_by": "-period" if newest else "period",
+            "page_size": 1,
+        }
+        if period_from:
+            params["period_from"] = period_from
+        page = await self._get(path, params)          # single page, no pagination
+        results = (page or {}).get("results") or []
+        row = results[0] if results else None
+        logger.info("get_consumption_boundary: mpan=%s serial=%s newest=%s → %s",
+                    _mask(mpan), _mask(serial), newest,
+                    (row or {}).get("interval_start") if row else "<none>")
+        return row
 
     # ── tariff charges ──────────────────────────────────────────────────────
     async def get_unit_rates(
@@ -816,6 +894,17 @@ class KrakenAPIClient:
             if _GQL_RATE_LIMIT_CODE in codes:
                 raise KrakenRateLimitError(
                     "GraphQL rate limit (KT-CT-1199)", status=429)
+            # Complexity / node-count limits: the request is too big. Waiting
+            # won't help — surface distinctly so the caller shrinks the window.
+            if _GQL_COMPLEXITY_CODE in codes or _GQL_NODE_LIMIT_CODE in codes:
+                which = ("complexity (>200)" if _GQL_COMPLEXITY_CODE in codes
+                         else "node count (>10,000)")
+                logger.warning(
+                    "kraken_query_too_large: GraphQL %s limit exceeded on "
+                    "operation=%s — this needs a SMALLER window, not a retry.",
+                    which, _operation_name(query))
+                raise KrakenQueryTooLargeError(
+                    f"GraphQL query too large: {which} limit exceeded")
             # Schema-drift canary: a renamed/removed/disabled field is how a Kraken
             # API change first reaches us. Surface it LOUDLY and with a greppable
             # token so it stands out from generic "unavailable" lines — this turns
@@ -937,6 +1026,226 @@ class KrakenAPIClient:
             "id": device_id, "start": start, "end": end, "grouping": grouping})
         return data.get("smartMeterTelemetry", []) or []
 
+    async def get_measurements(
+        self, mpan: str, start: str, end: str, *,
+        account_number: Optional[str] = None, direction: str = "CONSUMPTION",
+        timezone_name: str = "Europe/London", page_size: int = 500,
+        max_pages: int = 400, quiet: bool = False,
+    ) -> list[dict]:
+        """Half-hourly consumption WITH cost + TOU bucket from the GraphQL
+        Measurements API (paginated). Unlike REST /consumption/ this carries the
+        billed cost per interval AND Octopus's own OFF_PEAK / STANDARD_RATE label —
+        the authoritative, dispatch-aware off/peak split (a dispatched peak slot is
+        labelled OFF_PEAK). Amounts are pence in the API; returned as £.
+
+        `direction` = CONSUMPTION (import) | GENERATION (export). Returns a list of
+        normalised dicts (see _parse_measurement_node): start/end (naive-UTC iso),
+        kwh, cost_incl/excl (£, energy), standing_incl/excl (£, per interval),
+        off_peak (bool|None), buckets."""
+        acct = account_number or self.account_number
+        if not acct:
+            raise ValueError("account_number required for get_measurements")
+        _dir = "GENERATION" if str(direction).upper() == "GENERATION" else "CONSUMPTION"
+        query = (
+            "query meas($acc: String!, $mpan: String!, $start: DateTime!, "
+            "$end: DateTime!, $first: Int!, $after: String) {"
+            "  account(accountNumber: $acc) {"
+            "    properties {"
+            "      measurements(first: $first, after: $after, startAt: $start, "
+            "        endAt: $end, timezone: \"" + timezone_name + "\", "
+            "        utilityFilters: [{ electricityFilters: { "
+            "          readingFrequencyType: THIRTY_MIN_INTERVAL, "
+            "          marketSupplyPointId: $mpan, readingDirection: " + _dir + " } }]) {"
+            "        edges { node { value unit "
+            "          ... on IntervalMeasurementType { startAt endAt "
+            "            metaData { statistics { type label "
+            "              costInclTax { estimatedAmount } "
+            "              costExclTax { estimatedAmount } } } } } }"
+            "        pageInfo { hasNextPage endCursor } } } } }"
+        )
+        out: list[dict] = []
+        after: Optional[str] = None
+        for _ in range(max(1, max_pages)):
+            data = await self._graphql(query, {
+                "acc": acct, "mpan": mpan, "start": start, "end": end,
+                "first": page_size, "after": after})
+            props = ((data.get("account") or {}).get("properties")) or []
+            conn = None
+            for p in props:
+                m = p.get("measurements")
+                if m and (m.get("edges") or m.get("pageInfo")):
+                    conn = m
+                    break
+            if conn is None:
+                break
+            for edge in (conn.get("edges") or []):
+                parsed = self._parse_measurement_node(edge.get("node") or {})
+                if parsed is not None:
+                    out.append(parsed)
+            page = conn.get("pageInfo") or {}
+            if not page.get("hasNextPage"):
+                break
+            after = page.get("endCursor")
+            if not after:
+                break
+        out.sort(key=lambda r: r["start"])
+        if not quiet:
+            logger.info("get_measurements: mpan=%s %s..%s dir=%s → %d intervals",
+                        _mask(mpan), start, end, _dir, len(out))
+        return out
+
+    async def recover_measurement_costs(
+        self, mpan: str, starts, *, account_number: Optional[str] = None,
+        direction: str = "CONSUMPTION", timezone_name: str = "Europe/London",
+        lookback_ladder=(1, 3, 6), pace_s: float = 0.4, max_attempts: int = 2,
+    ) -> dict:
+        """Recover the billed cost + dispatch-aware label for slots the bulk fetch
+        returned with kWh but NO cost. Built around two proven facts (cost probe):
+
+        1. COMPLEXITY STRIP (deterministic) — Octopus strips a slot's `statistics`
+           (empty, kWh intact, 200, no error) when the QUERY WINDOW is expensive:
+           a small window returns the cost 100% of the time, even for a heavy
+           dispatched slot, while a 12h window *over a dense charging run* comes
+           back empty 100% of the time (too many heavy nodes → over the per-query
+           complexity budget). A window over quiet data is fine at any size. So the
+           cure is a SMALL window — never a wide one over a charging run.
+        2. WINDOW CONTEXT — for an IOG dispatched slot OUTSIDE the core off-peak
+           window (e.g. a morning charge), the OFF_PEAK label only appears once the
+           window reaches back to the run's start (≤3h observed); a too-narrow
+           window returns the raw STANDARD (peak) tariff. Core-off-peak overnight
+           slots need NO look-back — a ±1h window already labels them OFF_PEAK.
+
+        Reconciling the two: a LOOK-BACK LADDER. Try the smallest window first
+        (`lookback_ladder[0]`h before → slot+1h); accept immediately on OFF_PEAK
+        (the truth, and reliable at small sizes); only widen to the next rung if it
+        came back STANDARD (might just lack context) — stopping the instant a rung
+        returns OFF_PEAK. This never sends a wide window over a dense run (those
+        resolve OFF_PEAK on the first rung), so it dodges the strip. A rung that
+        DOES come back empty is skipped; whatever STANDARD the smallest rung gave is
+        kept as the fallback. One fetch opportunistically claims any other pending
+        slot it returns OFF_PEAK for. Newest-first so a run's later slots sweep up
+        earlier ones. Returns {start: parsed_node} for slots recovered WITH a cost;
+        the rest are omitted so the caller keeps its fallback.
+
+        `starts` are naive-UTC iso strings. Read-only. Paced so recovery doesn't
+        re-create the load.
+        """
+        from datetime import datetime as _dt, timedelta as _td
+        recovered: dict = {}
+        pending: set = set()
+        for s in dict.fromkeys(starts or []):
+            if not s:
+                continue
+            try:
+                _dt.fromisoformat(s)
+            except (TypeError, ValueError):
+                continue
+            pending.add(s)
+        total = len(pending)
+        ladder = [max(1, int(h)) for h in (lookback_ladder or (1,))]
+
+        async def _fetch(base, lb_h):
+            ws = (base - _td(hours=lb_h)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+            we = (base + _td(hours=1)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+            try:
+                rows = await self.get_measurements(
+                    mpan, ws, we, account_number=account_number,
+                    direction=direction, timezone_name=timezone_name, quiet=True)
+            except KrakenAPIError:
+                return {}
+            return {r["start"]: r for r in rows if r.get("start")}
+
+        for attempt in range(1, max(1, max_attempts) + 1):
+            if not pending:
+                break
+            for s in sorted(pending, reverse=True):    # newest-first
+                if s not in pending:                   # swept up already
+                    continue
+                base = _dt.fromisoformat(s)
+                chosen = None                          # first STANDARD seen (fallback)
+                for lb_h in ladder:
+                    by_start = await _fetch(base, lb_h)
+                    # Opportunistically claim any pending slot this window proves
+                    # OFF_PEAK (OFF_PEAK is the truth; a STANDARD for another slot
+                    # might just lack ITS context, so don't claim those here).
+                    for p in list(pending):
+                        hit = by_start.get(p)
+                        if hit and hit.get("cost_incl") is not None and hit.get("off_peak"):
+                            recovered[p] = hit
+                            pending.discard(p)
+                    hit = by_start.get(s)
+                    if hit and hit.get("cost_incl") is not None:
+                        if hit.get("off_peak"):
+                            chosen = hit               # truth → stop widening
+                            break
+                        chosen = chosen or hit         # remember STANDARD, keep widening
+                    if pace_s:
+                        await asyncio.sleep(pace_s)
+                if chosen is not None and s in pending:
+                    recovered[s] = chosen
+                    pending.discard(s)
+            if pending and attempt < max_attempts and pace_s:
+                await asyncio.sleep(pace_s * attempt)
+        if total:
+            logger.info(
+                "recover_measurement_costs: mpan=%s recovered %d/%d slot(s) via "
+                "look-back ladder %s (%d still missing)",
+                _mask(mpan), len(recovered), total, tuple(ladder),
+                total - len(recovered))
+        return recovered
+
+    @staticmethod
+    def _parse_measurement_node(node: dict) -> Optional[dict]:
+        """One measurements edge node → normalised dict, or None for a non-interval
+        node. Energy cost sums the TOU_BUCKET_COST statistic(s); off_peak derives
+        from their label(s) (all OFF_PEAK → True; none OFF_PEAK → False; mixed →
+        None). Standing sums STANDING_CHARGE_COST. Pence → £."""
+        st = node.get("startAt")
+        if not st:
+            return None
+
+        def _amt(block):
+            try:
+                return float((block or {}).get("estimatedAmount"))
+            except (TypeError, ValueError):
+                return 0.0
+
+        energy_incl = energy_excl = standing_incl = standing_excl = 0.0
+        saw_energy = saw_standing = False
+        labels: set = set()
+        for s in (((node.get("metaData") or {}).get("statistics")) or []):
+            if s.get("type") == "STANDING_CHARGE_COST":
+                standing_incl += _amt(s.get("costInclTax"))
+                standing_excl += _amt(s.get("costExclTax"))
+                saw_standing = True
+            else:                                   # TOU_BUCKET_COST / any energy line
+                energy_incl += _amt(s.get("costInclTax"))
+                energy_excl += _amt(s.get("costExclTax"))
+                saw_energy = True
+                if s.get("label"):
+                    labels.add(s.get("label"))
+        off_peak = None
+        if labels:
+            if labels <= {"OFF_PEAK"}:
+                off_peak = True
+            elif "OFF_PEAK" not in labels:
+                off_peak = False
+        try:
+            kwh = float(node.get("value") or 0)
+        except (TypeError, ValueError):
+            kwh = 0.0
+        return {
+            "start": _iso_naive_utc(st),
+            "end": _iso_naive_utc(node.get("endAt")),
+            "kwh": kwh,
+            "cost_incl": round(energy_incl / 100.0, 6) if saw_energy else None,
+            "cost_excl": round(energy_excl / 100.0, 6) if saw_energy else None,
+            "standing_incl": round(standing_incl / 100.0, 6) if saw_standing else None,
+            "standing_excl": round(standing_excl / 100.0, 6) if saw_standing else None,
+            "off_peak": off_peak,
+            "buckets": sorted(labels),
+        }
+
     async def check_field_deprecations(self) -> None:
         """Introspect the live schema and WARN for any field/enum EMT uses that
         Kraken has flagged deprecated — the grace-window warning BEFORE removal.
@@ -998,8 +1307,10 @@ class KrakenAPIClient:
                                  "name": ev.get("name"),
                                  "reason": ev.get("deprecationReason")})
 
-        # Publish for the engine to surface (HA notification + sensor). None means
-        # "never successfully checked"; [] means "checked, all clear".
+        # Retained on the client (logged locally as kraken_field_deprecated
+        # WARNINGs above; the HA sensor/notification surface was removed in 3.4.0,
+        # BL-17 — the CI GraphQL-deprecation check is the signal now). Kept for a
+        # possible future in-app surface. None = never checked; [] = all clear.
         self.last_deprecations = hits
         _ign = f" ({ignored} known name-collision(s) ignored)" if ignored else ""
         if not hits:
@@ -1200,24 +1511,39 @@ class KrakenAPIClient:
 
     async def get_rate_limit(self) -> Optional[dict]:
         """rateLimitInfo — points used / limit. Returns None if the field is
-        unavailable on this account (field names per spec; verify live).
+        unavailable on this account (field names vary by Kraken tenant).
 
-        Per spec: back off when remaining < 20.
+        Once a call fails (e.g. the tenant's rateLimitInfo type differs), we
+        DISABLE further checks for this client's lifetime — otherwise every
+        import chunk fires a doomed query and spams the log. Callers treat None
+        as "headroom unknown" and fall back to pacing + reactive KT-CT-1199
+        backoff. Per spec: back off when remaining < 20.
         """
-        query = "query { rateLimitInfo { pointsUsed pointsLimit } }"
+        if getattr(self, "_rate_limit_unavailable", False):
+            return None
+        # The points budget lives under rateLimitInfo.pointsAllowanceRateLimit;
+        # fields are limit / remainingPoints / usedPoints / ttl / isBlocked
+        # (verified via introspection — the type is PointsAllowanceRateLimitInformation).
+        query = ("query { rateLimitInfo { pointsAllowanceRateLimit { "
+                 "limit remainingPoints usedPoints ttl isBlocked } } }")
         try:
             data = await self._graphql(query)
         except KrakenAPIError as e:
-            logger.warning("get_rate_limit: unavailable (%s)", e)
+            self._rate_limit_unavailable = True
+            logger.warning("get_rate_limit: unavailable — disabling headroom "
+                           "checks for this session (%s)", str(e)[:140])
             return None
-        info = data.get("rateLimitInfo")
+        info = ((data.get("rateLimitInfo") or {})
+                .get("pointsAllowanceRateLimit")) or {}
         if not info:
             return None
-        used = info.get("pointsUsed")
-        limit = info.get("pointsLimit")
-        remaining = (limit - used) if (used is not None and limit is not None) \
-            else None
-        return {"pointsUsed": used, "pointsLimit": limit, "remaining": remaining}
+        used = info.get("usedPoints")
+        limit = info.get("limit")
+        remaining = info.get("remainingPoints")
+        if remaining is None and used is not None and limit is not None:
+            remaining = limit - used
+        return {"pointsUsed": used, "pointsLimit": limit, "remaining": remaining,
+                "ttl": info.get("ttl"), "isBlocked": bool(info.get("isBlocked"))}
 
 
 # ── JWT helper (used by GraphQL token handling in Chunk 3b; defined here so

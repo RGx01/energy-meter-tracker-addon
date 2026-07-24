@@ -1,0 +1,305 @@
+{% extends "base.html" %}
+
+{% block topbar %}
+<div class="topbar">
+  <div>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:2px;">
+      <a href="{{ url_for('data_management_page') }}" style="color:var(--muted);text-decoration:none;">Data Management</a>
+      &nbsp;/
+    </div>
+    <h2>Recorder History Probe <span style="font-size:12px;color:var(--muted);">(beta · read-only)</span></h2>
+    <div class="sub">Characterise what long-term history HA holds per sensor — before importing anything</div>
+  </div>
+  <div style="display:flex;gap:8px;">
+    <a href="{{ url_for('data_management_page') }}" class="btn btn-secondary">← Data Management</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div style="font-size:13px;color:var(--muted);line-height:1.7;margin-bottom:16px;">
+    This is a <strong>read-only diagnostic</strong>. It reads Home Assistant's long-term
+    statistics for the sensors you choose and reports how far back they go, their cadence,
+    any gaps, whether they're energy or power, and how timestamps behave across DST.
+    <strong>It writes nothing and creates no blocks.</strong> Pick a sensor per device,
+    run it, and share the report to help scope historical import.
+  </div>
+
+  <div id="rows"></div>
+  <div style="margin:10px 0 16px;">
+    <button class="btn btn-secondary" onclick="_addRow()">+ Add sensor</button>
+  </div>
+
+  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+    <label style="font-size:13px;color:var(--muted);">Look back
+      <input type="number" id="days" value="800" min="1" max="2000"
+             style="width:80px;margin-left:6px;"> days
+    </label>
+    <button class="btn" id="btn-run" onclick="_runProbe()">Run probe</button>
+    <span id="probe-status" style="font-size:13px;color:var(--muted);"></span>
+  </div>
+</div>
+
+<div id="probe-results"></div>
+
+<div class="card" style="margin-top:18px;">
+  <div style="font-weight:600;margin-bottom:4px;">Octopus API retention</div>
+  <div style="font-size:13px;color:var(--muted);line-height:1.7;margin-bottom:14px;">
+    Checks <strong>how far back</strong> your import and export consumption reach on the
+    Octopus API — export usually goes back less far than import. This is a
+    <strong>read-only</strong> boundary check (two tiny lookups per channel); it imports
+    nothing. Needs the API to be connected.
+  </div>
+  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+    <button class="btn" id="btn-export-probe" onclick="_runExportProbe()">Check API retention</button>
+    <button class="btn btn-secondary" id="btn-consumption-diag" onclick="_runConsumptionDiag()">Deep diagnostic (all meters)</button>
+    <span id="export-probe-status" style="font-size:13px;color:var(--muted);"></span>
+  </div>
+  <div id="export-probe-results" style="margin-top:12px;"></div>
+  <div id="consumption-diag-results" style="margin-top:12px;"></div>
+</div>
+
+<datalist id="entity-list"></datalist>
+{% endblock %}
+
+{% block scripts %}
+<script>
+var _entities = [];
+
+function _rowHtml(label, entity){
+  return '<div class="probe-row" style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;">'
+    + '<input class="probe-label" placeholder="Device label (e.g. EV charger)" value="'+(label||'')+'" style="flex:1;min-width:160px;">'
+    + '<input class="probe-entity" list="entity-list" placeholder="sensor.entity_id" value="'+(entity||'')+'" style="flex:2;min-width:220px;">'
+    + '<button class="btn btn-secondary" onclick="this.parentNode.remove()" title="Remove" style="padding:4px 10px;">✕</button>'
+    + '</div>';
+}
+function _addRow(label, entity){
+  document.getElementById('rows').insertAdjacentHTML('beforeend', _rowHtml(label, entity));
+}
+
+function _loadEntities(){
+  fetch(apiUrl('/api/entities')).then(function(r){return r.json();}).then(function(d){
+    var list = Array.isArray(d) ? d : (d.entities || []);
+    _entities = list.map(function(e){ return e.entity_id || e; }).filter(Boolean).sort();
+    var dl = document.getElementById('entity-list');
+    dl.innerHTML = _entities.map(function(id){ return '<option value="'+id+'">'; }).join('');
+  }).catch(function(){});
+}
+
+function _fmtDays(d){ return (d==null) ? '?' : d+' days'; }
+
+function _reportCard(row, rep){
+  var head = '<div style="font-weight:600;">'+_esc(row.label||'(unlabelled)')
+           + ' <span style="color:var(--muted);font-weight:400;font-size:12px;">'+_esc(row.entity)+'</span></div>';
+  if(!rep || !rep.found){
+    return '<div class="card" style="margin-bottom:12px;">'+head
+      + '<div style="color:var(--danger);font-size:13px;margin-top:6px;">No long-term statistics found for this sensor.'
+      + (rep && rep.note ? ' '+_esc(rep.note) : '') + '</div></div>';
+  }
+  function kv(k,v){ return '<div><span style="color:var(--muted);">'+k+':</span> '+v+'</div>'; }
+  var kind = rep.value_kind==='energy_sum' ? 'energy (cumulative kWh — good)'
+           : rep.value_kind==='power_mean' ? 'power (mean W — energy is smeared)'
+           : 'unknown';
+  var cad = rep.cadence_seconds ? (Math.round(rep.cadence_seconds/60)+' min'
+            + (rep.cadence_matches_hourly ? ' (hourly ✓)' : ' (not hourly!)')) : '?';
+  var dst = (rep.dst_samples && rep.dst_samples.length)
+          ? rep.dst_samples.map(function(s){ return s.at_utc+' → offset '+s.local_offset_changed_to
+              +' (Δ '+s.delta_from_prev_hours+'h)'; }).join('<br>')
+          : 'none in window';
+  var body = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:6px 18px;font-size:13px;margin-top:8px;">'
+    + kv('Type', kind)
+    + kv('Unit', _esc(rep.unit||'?'))
+    + kv('Earliest', _esc((rep.earliest||'?').substr(0,16)))
+    + kv('Latest', _esc((rep.latest||'?').substr(0,16)))
+    + kv('Span', _fmtDays(rep.span_days))
+    + kv('Cadence', cad)
+    + kv('Coverage', (rep.coverage_pct!=null?rep.coverage_pct+'%':'?')+' ('+rep.count+' buckets)')
+    + kv('Gaps', (rep.gap_count||0))
+    + kv('Timestamp format', _esc(rep.raw_start_kind||'?'))
+    + '</div>'
+    + '<div style="font-size:12px;color:var(--muted);margin-top:8px;">DST offset changes: '+dst+'</div>';
+  return '<div class="card" style="margin-bottom:12px;">'+head+body+'</div>';
+}
+
+function _esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+
+var _lastResult = null;
+function _runProbe(){
+  var rows = [].slice.call(document.querySelectorAll('.probe-row')).map(function(el){
+    return { label: el.querySelector('.probe-label').value.trim(),
+             entity: el.querySelector('.probe-entity').value.trim() };
+  }).filter(function(r){ return r.entity; });
+  if(!rows.length){ document.getElementById('probe-status').textContent='Add at least one sensor.'; return; }
+  var days = parseInt(document.getElementById('days').value,10) || 800;
+  document.getElementById('btn-run').disabled = true;
+  document.getElementById('probe-status').textContent = 'Querying HA statistics…';
+  document.getElementById('probe-results').innerHTML = '';
+  fetch(apiUrl('/api/historical/probe'), {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ entity_ids: rows.map(function(r){return r.entity;}), days: days })
+  }).then(function(r){return r.json();}).then(function(d){
+    document.getElementById('btn-run').disabled = false;
+    if(!d.ok){ document.getElementById('probe-status').textContent = 'Error: '+(d.error||d.reason||'failed'); return; }
+    _lastResult = { window: d.window, days: days, sensors: rows, reports: d.reports };
+    var byId = {}; (d.reports||[]).forEach(function(rep){ byId[rep.statistic_id]=rep; });
+    document.getElementById('probe-status').innerHTML = 'Window: '+ (d.window? _esc(d.window[0].substr(0,10))+' → now' : '?')
+      + ' &nbsp;·&nbsp; <a href="#" onclick="_copyReport();return false;">Copy report (JSON)</a>';
+    document.getElementById('probe-results').innerHTML =
+      rows.map(function(r){ return _reportCard(r, byId[r.entity]); }).join('');
+  }).catch(function(e){
+    document.getElementById('btn-run').disabled = false;
+    document.getElementById('probe-status').textContent = 'Request failed: '+e;
+  });
+}
+
+function _copyReport(){
+  if(!_lastResult) return;
+  var txt = JSON.stringify(_lastResult, null, 2);
+  (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject()).then(function(){
+    document.getElementById('probe-status').innerHTML += ' — copied';
+  }).catch(function(){
+    var ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta);
+    ta.select(); try{document.execCommand('copy');}catch(e){} ta.remove();
+  });
+}
+
+function _chDate(s){ return (s && s.earliest) ? _esc(s.earliest.substr(0,10)) : '—'; }
+function _chLatest(s){ return (s && s.latest) ? _esc(s.latest.substr(0,10)) : '—'; }
+
+function _exportProbeHtml(d){
+  var ch = d.channels || {};
+  function row(name, s){
+    if(!s || !s.available){
+      return '<tr><td style="padding:4px 12px 4px 0;text-transform:capitalize;">'+name+'</td>'
+        + '<td colspan="3" style="color:var(--muted);">not available'
+        + (s && s.note ? ' — '+_esc(s.note) : '')+'</td></tr>';
+    }
+    return '<tr><td style="padding:4px 12px 4px 0;text-transform:capitalize;">'+name+'</td>'
+      + '<td style="padding:4px 12px 4px 0;">'+_chDate(s)+'</td>'
+      + '<td style="padding:4px 12px 4px 0;">'+_chLatest(s)+'</td>'
+      + '<td style="padding:4px 0;">'+(s.span_days!=null?s.span_days+' days':'—')+'</td></tr>';
+  }
+  var head = '<table style="font-size:13px;border-collapse:collapse;margin-bottom:10px;">'
+    + '<tr style="color:var(--muted);text-align:left;">'
+    + '<th style="padding:0 12px 4px 0;font-weight:600;">Channel</th>'
+    + '<th style="padding:0 12px 4px 0;font-weight:600;">Earliest</th>'
+    + '<th style="padding:0 12px 4px 0;font-weight:600;">Latest</th>'
+    + '<th style="padding:0 4px 4px 0;font-weight:600;">Span</th></tr>'
+    + row('import', ch.import) + row('export', ch.export) + '</table>';
+  var lag = '';
+  if(d.lag_days == null){
+    lag = '<div style="font-size:13px;color:var(--muted);">Export lag vs import: not comparable (a channel is unavailable).</div>';
+  } else if(d.lag_days === 0){
+    lag = '<div style="font-size:13px;">Export reaches as far back as import — full history importable on both.</div>';
+  } else {
+    var before = (ch.export && ch.export.earliest) ? ch.export.earliest.substr(0,10) : '?';
+    lag = '<div style="font-size:13px;">Export history reaches <strong>'+d.lag_days
+        + ' days</strong> less than import — before <strong>'+_esc(before)
+        + '</strong> only import can be reconstructed.</div>';
+  }
+  return head + lag;
+}
+
+function _runExportProbe(){
+  var btn = document.getElementById('btn-export-probe');
+  var st  = document.getElementById('export-probe-status');
+  var res = document.getElementById('export-probe-results');
+  btn.disabled = true; st.textContent = 'Checking Octopus…'; res.innerHTML = '';
+  fetch(apiUrl('/api/historical/export-probe'), {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'
+  }).then(function(r){return r.json();}).then(function(d){
+    btn.disabled = false;
+    if(!d.ok){ st.textContent = 'Error: '+(d.error||d.reason||'failed'); return; }
+    st.textContent = '';
+    res.innerHTML = _exportProbeHtml(d);
+  }).catch(function(e){ btn.disabled = false; st.textContent = 'Request failed: '+e; });
+}
+
+var _UNDER_REACH_MIN = 24;   // <24 rows below = edge/DST artifact, not real history
+
+function _diagMeterHtml(mp){
+  var head = '<div style="font-weight:600;margin-top:10px;">'
+    + (mp.is_export ? 'Export MPAN ' : 'Import MPAN ') + _esc(mp.mpan_tail)
+    + ' <span style="color:var(--muted);font-weight:400;font-size:12px;">'
+    + mp.meter_count + ' meter'+(mp.meter_count!==1?'s':'')+'</span></div>';
+  var rows = (mp.meters||[]).map(function(m){
+    if(!m.available){
+      return '<tr><td style="padding:3px 12px 3px 0;">'+_esc(m.serial_tail||'?')+'</td>'
+        + '<td colspan="4" style="color:var(--muted);">not available'
+        + (m.note?' — '+_esc(m.note):'')+'</td></tr>';
+    }
+    var below = m.rows_just_below_earliest;
+    var belowTxt;
+    if(below==null){ belowTxt = '—'; }
+    else if(below >= _UNDER_REACH_MIN){ belowTxt = '<span style="color:var(--danger);">'+below+' (real data below!)</span>'; }
+    else if(below > 0){ belowTxt = '<span style="color:var(--muted);">'+below+' edge row'+(below!==1?'s':'')
+        + (m.earliest_below ? ' @ '+_esc(m.earliest_below.substr(0,10)) : '')+'</span>'; }
+    else { belowTxt = '0 (hard wall)'; }
+    return '<tr><td style="padding:3px 12px 3px 0;">'+_esc(m.serial_tail||'?')+'</td>'
+      + '<td style="padding:3px 12px 3px 0;">'+_esc((m.earliest||'?').substr(0,10))+'</td>'
+      + '<td style="padding:3px 12px 3px 0;">'+_esc((m.latest||'?').substr(0,10))+'</td>'
+      + '<td style="padding:3px 12px 3px 0;">'+(m.span_days!=null?m.span_days+'d':'—')+'</td>'
+      + '<td style="padding:3px 0;">'+belowTxt+'</td></tr>';
+  }).join('');
+  var table = '<table style="font-size:13px;border-collapse:collapse;margin-top:4px;">'
+    + '<tr style="color:var(--muted);text-align:left;">'
+    + '<th style="padding:0 12px 4px 0;font-weight:600;">Serial</th>'
+    + '<th style="padding:0 12px 4px 0;font-weight:600;">Earliest</th>'
+    + '<th style="padding:0 12px 4px 0;font-weight:600;">Latest</th>'
+    + '<th style="padding:0 12px 4px 0;font-weight:600;">Span</th>'
+    + '<th style="padding:0 4px 4px 0;font-weight:600;">Rows below earliest</th></tr>'
+    + rows + '</table>';
+  var ags = mp.agreements || [];
+  var agHtml = '';
+  if(ags.length){
+    var start = mp.supply_start ? mp.supply_start.substr(0,10) : '?';
+    var list = ags.map(function(a){
+      return _esc((a.valid_from||'?').substr(0,10)) + ' → '
+        + _esc(a.valid_to ? a.valid_to.substr(0,10) : 'now')
+        + (a.tariff ? ' <span style="color:var(--muted);">'+_esc(a.tariff)+'</span>' : '');
+    }).join('<br>');
+    agHtml = '<div style="font-size:12px;color:var(--muted);margin-top:6px;">'
+      + 'Supply/agreement start: <strong style="color:var(--text);">'+_esc(start)+'</strong>'
+      + ' · '+ags.length+' agreement'+(ags.length!==1?'s':'')
+      + '<div style="margin-top:3px;line-height:1.6;">'+list+'</div></div>';
+  }
+  return head + table + agHtml;
+}
+
+function _runConsumptionDiag(){
+  var btn = document.getElementById('btn-consumption-diag');
+  var st  = document.getElementById('export-probe-status');
+  var res = document.getElementById('consumption-diag-results');
+  btn.disabled = true; st.textContent = 'Enumerating meters (may take a few seconds)…'; res.innerHTML = '';
+  fetch(apiUrl('/api/historical/consumption-diagnostic'), {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'
+  }).then(function(r){return r.json();}).then(function(d){
+    btn.disabled = false;
+    if(!d.ok){ st.textContent = 'Error: '+(d.error||d.reason||'failed'); return; }
+    st.textContent = '';
+    var mps = d.meter_points||[];
+    if(!mps.length){ res.innerHTML = '<div style="font-size:13px;color:var(--muted);">No meter points found.</div>'; return; }
+    var multi = mps.some(function(mp){ return mp.meter_count>1; });
+    var realBelow = mps.some(function(mp){ return (mp.meters||[]).some(function(m){
+      return m.rows_just_below_earliest >= _UNDER_REACH_MIN; }); });
+    var edgeBelow = mps.some(function(mp){ return (mp.meters||[]).some(function(m){
+      var b=m.rows_just_below_earliest; return b>0 && b<_UNDER_REACH_MIN; }); });
+    var hint = '';
+    if(multi){ hint = 'A meter point has <strong>more than one serial</strong> — likely a meter exchange. Compare the older serial\'s earliest date with the website.'; }
+    else if(realBelow){ hint = 'A substantial run of rows exists <strong>below</strong> a reported earliest — the boundary query is under-reaching (not a true limit).'; }
+    else { hint = 'Single serial, no meaningful history below the earliest — the earliest is a <strong>real API limit</strong> for this serial'
+        + (edgeBelow ? ' (the odd edge row is a DST/interval artifact, not recoverable history)' : '')
+        + '. If it sits ~2 years back while your agreements go further, that\'s the consumption endpoint\'s rolling retention — older data needs the CSV route.'; }
+    res.innerHTML = '<div style="font-size:13px;margin-bottom:6px;">'+hint+'</div>' + mps.map(_diagMeterHtml).join('');
+  }).catch(function(e){ btn.disabled = false; st.textContent = 'Request failed: '+e; });
+}
+
+document.addEventListener('DOMContentLoaded', function(){
+  _loadEntities();
+  _addRow('Whole house (main meter)', '');
+  _addRow('', '');
+});
+</script>
+{% endblock %}

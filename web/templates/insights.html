@@ -76,7 +76,16 @@
     min-width: 120px;
     text-align: center;
     color: var(--text);
+    cursor: ns-resize;
+    user-select: none;
+    touch-action: none;
+    padding: 2px 6px;
+    border-radius: var(--radius);
+    border: 1px solid transparent;
+    transition: border-color .12s, background .12s;
   }
+  #ins-period-label:hover { border-color: var(--border); background: rgba(255,255,255,0.04); }
+  #ins-period-label::after { content: " ⇅"; font-size: 10px; color: var(--muted); opacity: .6; }
   @media (max-width: 768px) {
     .topbar .sub { display: none; }
     .topbar { padding: 8px 12px; gap: 6px; flex-wrap: nowrap; align-items: center; }
@@ -720,7 +729,11 @@ var _insMode    = 'month';   // 'month' | 'year'
 var _insCompare = null;      // null | 'prev' | 'year' | 'lastyear'
 var _calYear    = new Date().getFullYear();
 var _calMonth   = new Date().getMonth() + 1;  // 1-12
-var _dataBounds = { earliest: null, latest: null };  // from /api/insights/data-bounds
+var _dataBounds  = { earliest: null, latest: null };  // CARBON range — from /api/insights/data-bounds
+var _usageBounds = { earliest: null, latest: null };  // full energy range (incl. imported history)
+// The Usage tab has kWh/cost back through imported history that predates carbon,
+// so its nav/compare gating must use the full energy range, not the carbon one.
+function insBounds() { return _activeInsightTab === 'usage' ? _usageBounds : _dataBounds; }
 var _trendChart = null;
 
 var _EMT_VERSION = "{{ app_version or '2.8.1' }}";
@@ -1703,9 +1716,92 @@ function navPeriod(dir) {
   loadPeriod();
 }
 
+// ── Rolodex period scrubber (wheel + drag on the period label) ────────────────
+// Unlike the Charts page, each period change here triggers a network fetch, so
+// we update the label text LIVE as you scrub and DEBOUNCE the fetch until the
+// gesture settles. The label element is static (not rebuilt per render), so the
+// listeners are attached once. Steps are clamped to the available data range,
+// which on the Usage tab is the full energy range (see insBounds()).
+var _insScrubTimer = null;
+function insStep(delta) {
+  if (!delta) return;
+  var now = new Date();
+  var b = insBounds();
+  var earliest = b.earliest ? new Date(b.earliest) : null;
+  if (_insMode === 'month') {
+    var y = _calYear, m = _calMonth + delta;
+    while (m > 12) { m -= 12; y++; }
+    while (m < 1)  { m += 12; y--; }
+    var maxY = now.getFullYear(), maxM = now.getMonth() + 1;   // current month is the newest viewable
+    if (y > maxY || (y === maxY && m > maxM)) { y = maxY; m = maxM; }
+    if (earliest) {
+      var eY = earliest.getFullYear(), eM = earliest.getMonth() + 1;
+      if (y < eY || (y === eY && m < eM)) { y = eY; m = eM; }
+    }
+    if (y === _calYear && m === _calMonth) return;
+    _calYear = y; _calMonth = m;
+  } else {
+    var yy = _calYear + delta;
+    if (yy > now.getFullYear()) yy = now.getFullYear();
+    if (earliest && yy < earliest.getFullYear()) yy = earliest.getFullYear();
+    if (yy === _calYear) return;
+    _calYear = yy;
+  }
+  // Live label preview
+  document.getElementById('ins-period-label').textContent = (_insMode === 'month')
+    ? new Date(_calYear, _calMonth - 1, 1).toLocaleString('default', {month: 'long', year: 'numeric'})
+    : String(_calYear);
+  // Debounce the expensive fetch until scrubbing stops
+  clearTimeout(_insScrubTimer);
+  _insScrubTimer = setTimeout(function() {
+    _insSaveState(); updatePeriodNav(); loadPeriod();
+  }, 260);
+}
+
+var _insWheelAcc = 0, _insWheelLast = 0, _insRolodexAttached = false;
+var INS_WHEEL_THRESHOLD = 50, INS_WHEEL_MAX = 6, INS_DRAG_STEP = 44;
+function insAttachRolodex() {
+  if (_insRolodexAttached) return;
+  var lbl = document.getElementById('ins-period-label');
+  if (!lbl) return;
+  _insRolodexAttached = true;
+  lbl.title = 'Scroll or drag to change period';
+  lbl.addEventListener('wheel', function(e) {
+    e.preventDefault();
+    var now = Date.now();
+    var dy = e.deltaY;
+    if (e.deltaMode === 1) dy *= 16; else if (e.deltaMode === 2) dy *= 100;
+    if ((_insWheelAcc > 0) !== (dy > 0) || (now - _insWheelLast) > 250) _insWheelAcc = 0;
+    _insWheelLast = now;
+    _insWheelAcc += dy;
+    var n = Math.trunc(_insWheelAcc / INS_WHEEL_THRESHOLD);
+    if (n !== 0) {
+      _insWheelAcc -= n * INS_WHEEL_THRESHOLD;
+      if (n >  INS_WHEEL_MAX) n =  INS_WHEEL_MAX;
+      if (n < -INS_WHEEL_MAX) n = -INS_WHEEL_MAX;
+      insStep(n);
+    }
+  }, { passive: false });
+  var dragY = null, acc = 0;
+  lbl.addEventListener('pointerdown', function(e) {
+    dragY = e.clientY; acc = 0;
+    try { lbl.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+  lbl.addEventListener('pointermove', function(e) {
+    if (dragY === null) return;
+    acc += (e.clientY - dragY); dragY = e.clientY;
+    while (acc >=  INS_DRAG_STEP) { insStep(1);  acc -= INS_DRAG_STEP; }
+    while (acc <= -INS_DRAG_STEP) { insStep(-1); acc += INS_DRAG_STEP; }
+  });
+  function _end() { dragY = null; }
+  lbl.addEventListener('pointerup', _end);
+  lbl.addEventListener('pointercancel', _end);
+}
+
 function updatePeriodNav() {
   var now      = new Date();
-  var earliest = _dataBounds.earliest ? new Date(_dataBounds.earliest) : null;
+  var _bounds  = insBounds();  // carbon range on the Carbon tab, full energy range on Usage
+  var earliest = _bounds.earliest ? new Date(_bounds.earliest) : null;
   var label, atFuture, atPast;
 
   if (_insMode === 'month') {
@@ -1872,7 +1968,10 @@ async function initInsights() {
     // Fetch data bounds to gate navigation and compare buttons
     var br = await fetch(apiUrl('/api/insights/data-bounds'));
     var bd = await br.json();
-    if (!bd.error && bd.earliest) _dataBounds = bd;
+    if (!bd.error) {
+      if (bd.earliest)       _dataBounds  = { earliest: bd.earliest,       latest: bd.latest };
+      if (bd.usage_earliest) _usageBounds = { earliest: bd.usage_earliest, latest: bd.usage_latest };
+    }
 
     // Fetch billing periods for trend chart
     var pr = await fetch(apiUrl('/api/insights/periods'));
@@ -1914,6 +2013,7 @@ async function initInsights() {
     } catch(e) {}
 
     updatePeriodNav();
+    insAttachRolodex();
     loadPeriod();
 
   } catch(e) {

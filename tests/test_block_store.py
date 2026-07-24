@@ -364,6 +364,68 @@ class TestSchema(unittest.TestCase):
                 try: os.remove(p + ext)
                 except OSError: pass
 
+    def test_reimport_overwrites_imported_standing(self):
+        # A re-import MUST re-price standing charge on blocks it owns — the old
+        # guard only wrote standing when the existing value was NULL/0, so a
+        # corrected figure could never land on a re-run.
+        store = BlockStore(":memory:")
+        store.insert_config_period(EXAMPLE_CONFIG)
+        base = dict(kwh=0.1, rate=0.07, cost=0.007)
+        store.upsert_imported_blocks(
+            [dict(start="2026-02-04T00:00:00", standing=0.1188, **base)],
+            "electricity_main", "import", source="imported_api")
+        store.upsert_imported_blocks(     # corrected standing
+            [dict(start="2026-02-04T00:00:00", standing=0.4752, **base)],
+            "electricity_main", "import", source="imported_api")
+        row = store._conn.execute(
+            "SELECT standing_charge FROM blocks "
+            "WHERE block_start='2026-02-04T00:00:00'").fetchone()
+        self.assertAlmostEqual(row["standing_charge"], 0.4752, places=4)
+        store.close()
+
+    def test_export_channel_does_not_clobber_standing(self):
+        # Standing charge lives on the shared block row. The export channel (no
+        # standing charge → passes NULL) must NOT overwrite the import channel's
+        # value with null/0 — the regression that zeroed every imported day.
+        store = BlockStore(":memory:")
+        store.insert_config_period(EXAMPLE_CONFIG)
+        store.upsert_imported_blocks(
+            [dict(start="2026-02-04T00:00:00", standing=0.4752, kwh=0.1,
+                  rate=0.07, cost=0.007)],
+            "electricity_main", "import", source="imported_api")
+        store.upsert_imported_blocks(     # export for the SAME row, standing None
+            [dict(start="2026-02-04T00:00:00", standing=None, kwh=0.5,
+                  rate=0.15, cost=0.075)],
+            "electricity_main", "export", source="imported_api")
+        row = store._conn.execute(
+            "SELECT standing_charge, exp_kwh FROM blocks "
+            "WHERE block_start='2026-02-04T00:00:00'").fetchone()
+        self.assertAlmostEqual(row["standing_charge"], 0.4752, places=4)
+        self.assertAlmostEqual(row["exp_kwh"], 0.5, places=4)   # export still lands
+        store.close()
+
+    def test_import_preserves_live_standing(self):
+        # An import must NOT clobber a genuine live/settled block's standing.
+        store = BlockStore(":memory:")
+        store.insert_config_period(EXAMPLE_CONFIG)
+        pid = store._conn.execute(
+            "SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+        store._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, "
+            "config_period_id, standing_charge) VALUES (?,?,?,?,?)",
+            ("2026-06-10T00:00:00", "2026-06-10T00:30:00", "electricity_main",
+             pid, 0.504559))      # live block (source NULL)
+        store._conn.commit()
+        store.upsert_imported_blocks(
+            [dict(start="2026-06-10T00:00:00", standing=0.4752, kwh=0.1,
+                  rate=0.07, cost=0.007)],
+            "electricity_main", "import", source="imported_api")
+        row = store._conn.execute(
+            "SELECT standing_charge FROM blocks "
+            "WHERE block_start='2026-06-10T00:00:00'").fetchone()
+        self.assertAlmostEqual(row["standing_charge"], 0.504559, places=6)
+        store.close()
+
     def test_foreign_keys_on(self):
         store = new_store()
         cur = store._conn.execute("PRAGMA foreign_keys")
@@ -382,6 +444,40 @@ class TestSchema(unittest.TestCase):
         self.assertNotIn("idx_blocks_date", indexes)
         self.assertNotIn("idx_blocks_ym", indexes)
         store.close()
+
+    def test_read_only_mode_reads_but_rejects_writes(self):
+        # The off-loop chart renderer opens a read-only companion: it must read
+        # the writer's data but never be able to write (query_only), so it can't
+        # contend with or corrupt the primary connection.
+        import tempfile, os
+        p = tempfile.mktemp(suffix=".db")
+        try:
+            w = BlockStore(p)
+            w.insert_config_period(EXAMPLE_CONFIG)
+            pid = w._conn.execute(
+                "SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+            w._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, "
+                "config_period_id) VALUES (?,?,?,?)",
+                ("2026-05-01T00:00:00", "2026-05-01T00:30:00",
+                 "electricity_main", pid))
+            w._conn.commit()
+
+            ro = BlockStore(p, read_only=True)
+            self.assertEqual(ro.count_blocks(), 1)          # reads the writer's data
+            with self.assertRaises(Exception):              # query_only blocks writes
+                ro._conn.execute(
+                    "INSERT INTO blocks (block_start, block_end, meter_id, "
+                    "config_period_id) VALUES (?,?,?,?)",
+                    ("2026-05-02T00:00:00", "2026-05-02T00:30:00",
+                     "electricity_main", pid))
+                ro._conn.commit()
+            ro.close()
+            w.close()
+        finally:
+            for ext in ("", "-wal", "-shm"):
+                try: os.remove(p + ext)
+                except OSError: pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -637,6 +733,22 @@ class TestExportSettlementUnsettled303(unittest.TestCase):
         self.assertEqual(self.store.count_unsettled_blocks(), 1)
         self._settle(s, 15.9, "export")
         self.assertEqual(self.store.count_unsettled_blocks(), 0)
+
+    def test_imported_history_not_counted_unsettled(self):
+        # 3.5.0: a reconstructed block (imp_kwh set, imp_kwh_api NULL, and it did
+        # export) must NOT count as awaiting DCC settlement — DCC never settles
+        # pre-EMT history, so it would otherwise be chased forever.
+        self.store.upsert_imported_block(
+            "2024-07-01T12:00:00", "electricity_main", "import",
+            kwh=4.7, rate=0.07, cost=0.329, standing=0.53, source="imported_api")
+        self.store.upsert_imported_block(
+            "2024-07-01T12:00:00", "electricity_main", "export",
+            kwh=16.0, rate=0.15, cost=2.4, source="imported_api")
+        self.assertEqual(self.store.count_unsettled_blocks(), 0)
+        self.assertIsNone(self.store.get_oldest_unsettled_block_start())
+        # A genuine live block is still counted (guard against over-broad filter).
+        self.store.append_block(make_block("2026-07-09T12:00:00", imp_kwh=1.0, exp_kwh=0.0))
+        self.assertEqual(self.store.count_unsettled_blocks(), 1)
 
 
 class TestAppendBlock(unittest.TestCase):
@@ -4365,3 +4477,140 @@ class TestDeleteKrakenState(unittest.TestCase):
         self.store.delete_kraken_state("last_poll_utc")
         self.assertIsNone(self.store.get_kraken_state("last_poll_utc"))
         self.assertEqual(self.store.get_kraken_state("billing_source"), "dcc")
+
+
+from block_store import IMPORTED_SOURCE_API, IMPORTED_SOURCE_CSV
+
+
+class TestHistoricalImportFoundation(unittest.TestCase):
+    """3.5.0 block-store groundwork: derivation table + block link, imported
+    source flags, and the reconstructed-history delete filter."""
+
+    def setUp(self):
+        import sys, types
+        eio = types.ModuleType("energy_engine_io"); eio.load_json = lambda *a, **kw: {}
+        sys.modules.setdefault("energy_engine_io", eio)
+        self.store = BlockStore(":memory:")
+        self.store.insert_config_period({"meters": {"electricity_main": {"meta": {
+            "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
+            "currency_symbol": "£", "currency_code": "GBP", "site": "Home"}}}})
+        self.cp_id = self.store._conn.execute(
+            "SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+
+    def _insert_block(self, start, *, meter_id="electricity_main", source=None):
+        self.store._conn.execute(
+            """INSERT INTO blocks (block_start, block_end, meter_id,
+                 config_period_id, interpolated, imp_kwh, imp_cost, source)
+               VALUES (?,?,?,?,0,1.0,0.07,?)""",
+            (start, start, meter_id, self.cp_id, source))
+        self.store._conn.commit()
+
+    # ── schema ────────────────────────────────────────────────────────────
+    def test_schema_has_link_and_table(self):
+        cols = {r[1] for r in self.store._conn.execute(
+            "PRAGMA table_info(blocks)").fetchall()}
+        self.assertIn("derivation_id", cols)
+        t = self.store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='historical_derivation'").fetchone()
+        self.assertIsNotNone(t)
+
+    # ── derivation CRUD ─────────────────────────────────────────────────────
+    def test_insert_get_roundtrip_json(self):
+        did = self.store.insert_historical_derivation(
+            "device_attribution", "2024-07-01T00:00:00", "2025-01-01T00:00:00",
+            subject="zappi_ev", sensor_ids=["sensor.a", "sensor.b"],
+            sensor_kind="energy_total", params={"eps": 0.02},
+            source=IMPORTED_SOURCE_CSV)
+        d = self.store.get_historical_derivation(did)
+        self.assertEqual(d["scope"], "device_attribution")
+        self.assertEqual(d["sensor_ids"], ["sensor.a", "sensor.b"])   # JSON decoded
+        self.assertEqual(d["params"], {"eps": 0.02})
+        self.assertIsNone(d["superseded_by"])
+
+    def test_invalid_scope_raises(self):
+        with self.assertRaises(ValueError):
+            self.store.insert_historical_derivation("nonsense", "a", "b")
+
+    def test_supersede_hides_from_current(self):
+        old = self.store.insert_historical_derivation(
+            "rate", "2024-01-01", "2024-06-01", subject="import", derived_value=7.0)
+        new = self.store.insert_historical_derivation(
+            "rate", "2024-01-01", "2024-06-01", subject="import", derived_value=7.5)
+        self.store.supersede_historical_derivation(old, new)
+        current = self.store.list_historical_derivations(scope="rate", current_only=True)
+        self.assertEqual([d["id"] for d in current], [new])
+        allrows = self.store.list_historical_derivations(scope="rate", current_only=False)
+        self.assertEqual({d["id"] for d in allrows}, {old, new})   # audit trail kept
+
+    # ── block tagging ───────────────────────────────────────────────────────
+    def test_tag_blocks_over_span(self):
+        self._insert_block("2024-07-01T00:00:00", source=IMPORTED_SOURCE_CSV)
+        self._insert_block("2024-07-01T00:30:00", source=IMPORTED_SOURCE_CSV)
+        self._insert_block("2025-02-01T00:00:00", source=IMPORTED_SOURCE_CSV)   # outside span
+        did = self.store.insert_historical_derivation(
+            "rate", "2024-07-01T00:00:00", "2025-01-01T00:00:00", subject="import")
+        n = self.store.tag_blocks_with_derivation(
+            did, "electricity_main", "2024-07-01T00:00:00", "2025-01-01T00:00:00")
+        self.assertEqual(n, 2)
+        tagged = self.store._conn.execute(
+            "SELECT COUNT(*) FROM blocks WHERE derivation_id = ?", (did,)).fetchone()[0]
+        self.assertEqual(tagged, 2)
+
+    def test_imported_blocks_skip_carbon_backfill(self):
+        # A native NULL-carbon block IS a carbon-backfill candidate; a
+        # reconstructed one is NOT (skips the expensive CI backfill).
+        self._insert_block("2024-07-01T00:00:00", source=None)
+        self._insert_block("2024-07-01T00:30:00", source=IMPORTED_SOURCE_CSV)
+        starts = self.store.get_block_starts_missing_carbon()
+        self.assertIn("2024-07-01T00:00:00", starts)
+        self.assertNotIn("2024-07-01T00:30:00", starts)
+        self.assertEqual(self.store.get_missing_carbon_date_range(),
+                         ("2024-07-01T00:00:00", "2024-07-01T00:00:00"))
+
+    def test_bulk_upsert_writes_and_merges(self):
+        imp = [{"start": "2024-07-01T00:00:00", "kwh": 1.0, "rate": 0.07,
+                "cost": 0.07, "standing": 0.53},
+               {"start": "2024-07-01T00:30:00", "kwh": 1.0, "rate": 0.07,
+                "cost": 0.07, "standing": 0.53}]
+        n = self.store.upsert_imported_blocks(
+            imp, "electricity_main", "import", source=IMPORTED_SOURCE_API)
+        self.assertEqual(n, 2)
+        # Export merges onto the same rows (no new rows).
+        exp = [{"start": "2024-07-01T00:00:00", "kwh": 0.5, "rate": 0.15,
+                "cost": 0.075, "standing": None}]
+        self.store.upsert_imported_blocks(
+            exp, "electricity_main", "export", source=IMPORTED_SOURCE_API)
+        rows = self.store._conn.execute(
+            "SELECT imp_cost, exp_cost FROM blocks WHERE source='imported_api' "
+            "ORDER BY block_start").fetchall()
+        self.assertEqual(len(rows), 2)                       # export merged, not added
+        self.assertAlmostEqual(rows[0]["imp_cost"], 0.07, places=4)
+        self.assertAlmostEqual(rows[0]["exp_cost"], 0.075, places=4)
+
+    # ── reconstructed-history delete filter ─────────────────────────────────
+    def test_reconstructed_only_delete_spares_native(self):
+        self._insert_block("2025-01-15T10:00:00", source=None)                 # live
+        self._insert_block("2025-01-15T11:00:00", source="kraken_api")         # native
+        self._insert_block("2025-01-15T12:00:00", source=IMPORTED_SOURCE_API)  # imported
+        self._insert_block("2025-01-15T13:00:00", source=IMPORTED_SOURCE_CSV)  # imported
+        prev = self.store.count_blocks_for_date_range(
+            "2025-01-15", "2025-01-15", tz_name="UTC", reconstructed_only=True)
+        self.assertEqual(prev["blocks"], 2)
+        res = self.store.delete_blocks_for_date_range(
+            "2025-01-15", "2025-01-15", tz_name="UTC", reconstructed_only=True)
+        self.assertEqual(res["deleted"], 2)
+        srcs = {r[0] for r in self.store._conn.execute(
+            "SELECT source FROM blocks").fetchall()}
+        self.assertEqual(srcs, {None, "kraken_api"})   # native survive
+
+    def test_default_delete_removes_all(self):
+        self._insert_block("2025-02-10T10:00:00", source=None)
+        self._insert_block("2025-02-10T11:00:00", source=IMPORTED_SOURCE_CSV)
+        res = self.store.delete_blocks_for_date_range(
+            "2025-02-10", "2025-02-10", tz_name="UTC")
+        self.assertEqual(res["deleted"], 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

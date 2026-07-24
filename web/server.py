@@ -1892,6 +1892,14 @@ def data_management_page():
     return render_template("data_management.html", active="data_management")
 
 
+@app.route("/historical-probe")
+def historical_probe_page():
+    """Beta, read-only: recorder long-term-statistics probe (historical-import
+    spike). Lets the user pick a sensor per device and characterise what history
+    is available. Creates nothing."""
+    return render_template("historical_probe.html", active="data_management")
+
+
 @app.route("/billing-history")
 def billing_history_page():
     return render_template("billing_history.html", active="settings")
@@ -2362,6 +2370,12 @@ def api_config_history():
             SELECT cp.id, cp.effective_from, cp.effective_to, cp.billing_day,
                    cp.block_minutes, cp.timezone, cp.currency_symbol, cp.currency_code,
                    cp.site_name, cp.supplier, cp.change_reason,
+                   (SELECT postcode_prefix FROM meters
+                      WHERE config_period_id = cp.id AND is_sub_meter = 0
+                      ORDER BY id ASC LIMIT 1) as postcode_prefix,
+                   (SELECT postcode_source FROM meters
+                      WHERE config_period_id = cp.id AND is_sub_meter = 0
+                      ORDER BY id ASC LIMIT 1) as postcode_source,
                    COUNT(DISTINCT b.block_start) as block_count
             FROM config_periods cp
             LEFT JOIN blocks b ON b.config_period_id = cp.id
@@ -2383,6 +2397,8 @@ def api_config_history():
                 "site_name":      r["site_name"],
                 "supplier":       r["supplier"],
                 "change_reason":  r["change_reason"],
+                "postcode_prefix":r["postcode_prefix"],
+                "postcode_source":r["postcode_source"],
                 "block_count":    r["block_count"],
             })
         # Include the configured timezone for client-side date formatting
@@ -2399,6 +2415,56 @@ def api_config_history():
         return jsonify({"periods": rows, "timezone": cfg_tz})
     except Exception as e:
         logger.error("api_config_history: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/region/reconcile")
+def api_region_reconcile_get():
+    """Pending region-reconciliation plan (the post-import 'name your sites'
+    step). Returns {pending: False} when there's nothing to confirm."""
+    try:
+        store = _get_store()
+        plan = store.get_meta("region_reconcile_pending", None)
+        if not plan or not plan.get("needs_confirmation"):
+            return jsonify({"pending": False})
+        return jsonify({"pending": True, "plan": plan})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/region/reconcile/apply", methods=["POST"])
+def api_region_reconcile_apply():
+    """Apply a confirmed reconciliation: split at each move boundary and stamp
+    every period's region (outward code) + user-supplied site name.
+    Body: {"sites": [{outcode, from, to, site_name}]}."""
+    try:
+        store = _get_store()
+        data = request.get_json(force=True) or {}
+        sites = data.get("sites") or []
+        if not sites:
+            return jsonify({"error": "no sites supplied"}), 400
+        res = store.apply_region_reconciliation(sites)
+        store.set_meta("region_reconcile_pending", None)   # clear pending
+        store.rearm_carbon_backfill()   # new regions → re-scan carbon
+        try:
+            _rebuild_config_period_chain(store)
+        except Exception as _e:
+            logger.warning("api_region_reconcile_apply: chain rebuild failed: %s", _e)
+        logger.info("api_region_reconcile_apply: %s", res)
+        return jsonify({"ok": True, **res})
+    except Exception as e:
+        logger.error("api_region_reconcile_apply: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/region/reconcile/dismiss", methods=["POST"])
+def api_region_reconcile_dismiss():
+    """Dismiss the pending reconciliation without applying it."""
+    try:
+        store = _get_store()
+        store.set_meta("region_reconcile_pending", None)
+        return jsonify({"ok": True})
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
@@ -2448,6 +2514,11 @@ def api_config_history_create():
             if "currency_code"   in data: meta["currency_code"]   = currency_code
             if "site_name"       in data: meta["site_name"]       = site_name
             if "supplier"        in data: meta["supplier"]        = supplier
+            # Postcode is main-meter-only (outward code); a manual entry is 'user'.
+            if "postcode" in data and not meta.get("sub_meter"):
+                from block_store import outward_code as _oc
+                meta["postcode_prefix"] = _oc(data.get("postcode"))
+                meta["postcode_source"] = "user"
             md["meta"] = meta
 
         with store._conn:
@@ -2497,7 +2568,17 @@ def api_config_history_update(period_id):
             "currency_symbol", "currency_code", "site_name", "supplier",
         }
         updates = {k: v for k, v in data.items() if k in allowed}
-        if not updates:
+
+        # `postcode` is not a config_periods column — it lives on the period's MAIN
+        # meter (outward code only). Handle it separately: a manual edit here is a
+        # user value, so mark provenance 'user'. Empty string clears it.
+        postcode_edit = "postcode" in data
+        postcode_outcode = None
+        if postcode_edit:
+            from block_store import outward_code as _outcode
+            postcode_outcode = _outcode(data.get("postcode"))
+
+        if not updates and not postcode_edit:
             return jsonify({"error": "No valid fields to update"}), 400
 
         # Type coerce numeric fields
@@ -2527,15 +2608,26 @@ def api_config_history_update(period_id):
                 return jsonify({"error": "Effective From must be before Effective To"}), 400
 
         # Build UPDATE statement
-        set_clause = ", ".join(f"{k} = ?" for k in updates)
-        values     = list(updates.values()) + [period_id]
         with store._conn:
-            store._conn.execute(
-                f"UPDATE config_periods SET {set_clause} WHERE id = ?",
-                values
-            )
+            if updates:
+                set_clause = ", ".join(f"{k} = ?" for k in updates)
+                store._conn.execute(
+                    f"UPDATE config_periods SET {set_clause} WHERE id = ?",
+                    list(updates.values()) + [period_id]
+                )
+            if postcode_edit:
+                # Outward code only; a manual edit is provenance 'user'.
+                store._conn.execute(
+                    "UPDATE meters SET postcode_prefix = ?, postcode_source = 'user' "
+                    "WHERE config_period_id = ? AND is_sub_meter = 0",
+                    (postcode_outcode, period_id)
+                )
+        if postcode_edit:
+            store.rearm_carbon_backfill()   # a region change may free carbon backfill
 
-        logger.info("api_config_history_update: period %d updated %s", period_id, list(updates.keys()))
+        logger.info("api_config_history_update: period %d updated %s%s",
+                    period_id, list(updates.keys()),
+                    " +postcode" if postcode_edit else "")
 
         # Rebuild the contiguous chain: sort all periods by effective_from,
         # then set each period's effective_to = next period's effective_from.
@@ -2822,28 +2914,118 @@ def api_backup_list():
         return jsonify({"zips": [], "flat": []})
 
 
+_restore_job = {"status": "idle"}
+
+
+def _atomic_restore_write(dest, fill):
+    """Write `dest` atomically: fill a temp file, fsync it, then os.replace into
+    place. An interrupted restore (e.g. the add-on being rebuilt/restarted
+    mid-write) then leaves EITHER the old file OR the complete new one — never a
+    truncated/zero-length blocks.db that would open as a fresh EMPTY database
+    (the failure that silently wiped a user's data after a restore→rebuild).
+    `fill(fh)` writes the file body to the open temp handle."""
+    tmp = dest + ".restore-tmp"
+    try:
+        with open(tmp, "wb") as _t:
+            fill(_t)
+            _t.flush()
+            os.fsync(_t.fileno())
+        os.replace(tmp, dest)          # atomic on POSIX
+        # fsync the directory so the rename itself is durable
+        try:
+            _dfd = os.open(os.path.dirname(dest) or ".", os.O_RDONLY)
+            try: os.fsync(_dfd)
+            finally: os.close(_dfd)
+        except Exception:
+            pass
+    finally:
+        if os.path.exists(tmp):
+            try: os.remove(tmp)
+            except Exception: pass
+
+
 @app.route("/api/backup/restore", methods=["POST"])
 def api_backup_restore():
-    """Restore selected data files from a named backup zip or from last-finalise flat files."""
-    global _store
-    import zipfile, shutil, sys as _sys_r
+    """Start a restore as a BACKGROUND job and return at once — so it completes
+    even if the user navigates away. Poll /api/backup/restore/status for progress."""
     try:
-        data      = request.get_json(force=True)
+        data      = request.get_json(force=True) or {}
         zipname   = data.get("zip", "")
         selected  = data.get("files", None)
         from_flat = data.get("from_flat", False)
-        known     = {"blocks.db", "blocks.json"}
-
         if not from_flat:
             if not zipname or "/" in zipname or "\\" in zipname:
                 return jsonify({"error": "Invalid zip name"}), 400
+            if not os.path.exists(f"{_share_backup_dir()}/backups/{zipname}"):
+                return jsonify({"error": "Backup not found"}), 404
+        if _restore_job.get("status") == "running":
+            return jsonify({"error": "a restore is already running",
+                            "status": _restore_job}), 409
+        _restore_job.clear()
+        _restore_job.update({"status": "running", "step": "starting",
+                             "restored": None, "error": None})
+        threading.Thread(target=_restore_worker,
+                         args=(zipname, selected, from_flat),
+                         daemon=True, name="restore").start()
+        return jsonify({"ok": True, "status": "running"})
+    except Exception as e:
+        logger.error("api_backup_restore(launch): %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/backup/restore/status", methods=["GET"])
+def api_backup_restore_status():
+    """Poll the background restore job's progress/status."""
+    return jsonify(_restore_job)
+
+
+def _restore_worker(zipname, selected, from_flat):
+    """Background restore worker (runs in its own thread; survives navigation).
+    Updates _restore_job at each phase. Restores selected data files from a named
+    backup zip or from last-finalise flat files."""
+    global _store
+    import zipfile, shutil, sys as _sys_r
+    _j = _restore_job
+    _atomic_write = _atomic_restore_write
+    def _step(s):
+        _j["step"] = s
+        logger.info("restore: %s", s)
+    try:
+        known = {"blocks.db", "blocks.json"}
 
         # ── Step 1: pause engine ─────────────────────────────────────────────
         _eng_r = _sys_r.modules.get("engine")
         if _eng_r and hasattr(_eng_r, "pause_engine"):
             _eng_r.pause_engine()
 
+        # ── Step 1b: STOP any running API import before touching the DB ───────
+        # The background import writes via the SQLite store on the engine loop.
+        # Closing that store under it (Step 3) uses a freed connection from
+        # another thread → segfault. Cancel it and wait for it to actually stop;
+        # if it won't, abort the restore rather than risk crashing the process.
+        if getattr(_eng_r, "api_import_running", None) and _eng_r.api_import_running():
+            _step("stopping the running import")
+            import time as _t_r
+            try:
+                _eng_r.api_import_control("cancel")
+            except Exception:
+                pass
+            stopped = False
+            for _ in range(120):        # up to ~60s
+                if not _eng_r.api_import_running():
+                    stopped = True
+                    break
+                _t_r.sleep(0.5)
+            if not stopped:
+                if hasattr(_eng_r, "resume_engine"):
+                    _eng_r.resume_engine()
+                _j["status"] = "error"
+                _j["error"] = ("An import was still finishing — restore aborted. "
+                               "Try again in a moment.")
+                return
+
         # ── Step 2: pre-restore backup (stores still open — backup needs them) ─
+        _step("taking a safety backup")
         _create_backup_zip(label="pre_restore")
 
         # ── Step 3: checkpoint WAL then close ALL store connections ───────────
@@ -2882,6 +3064,7 @@ def api_backup_restore():
         except Exception as _pre_e:
             logger.warning("api_backup_restore: pre-restore cleanup failed: %s", _pre_e)
 
+        _step("restoring files")
         restored = []
 
         if from_flat:
@@ -2891,15 +3074,16 @@ def api_backup_restore():
                 src_path = f"{_share_backup_dir()}/{fname}"
                 dst_path = os.path.join(DATA_DIR, fname)
                 if os.path.exists(src_path):
-                    shutil.copy2(src_path, dst_path)
+                    with open(src_path, "rb") as _src:
+                        _atomic_write(dst_path,
+                                      lambda d, _s=_src: shutil.copyfileobj(_s, d))
                     restored.append(fname)
             logger.info("api_backup_restore: restored flat files %s", restored)
         else:
-            if not zipname or "/" in zipname or "\\" in zipname:
-                return jsonify({"error": "Invalid zip name"}), 400
             zip_path = f"{_share_backup_dir()}/backups/{zipname}"
             if not os.path.exists(zip_path):
-                return jsonify({"error": "Backup not found"}), 404
+                _j["status"] = "error"; _j["error"] = "Backup not found"
+                return
             with zipfile.ZipFile(zip_path, "r") as zf:
                 for name in zf.namelist():
                     basename = os.path.basename(name)
@@ -2909,8 +3093,8 @@ def api_backup_restore():
                         continue
                     dest = os.path.join(DATA_DIR, basename)
                     with zf.open(name) as zf_src:
-                        with open(dest, "wb") as dst:
-                            dst.write(zf_src.read())
+                        _atomic_write(dest,
+                                      lambda d, _s=zf_src: shutil.copyfileobj(_s, d))
                     restored.append(basename)
             logger.info("api_backup_restore: restored %s from %s", restored, zipname)
 
@@ -2934,6 +3118,7 @@ def api_backup_restore():
                 logger.warning("api_backup_restore: legacy migration failed: %s", _e)
 
         # ── Reset stores and fix WAL before any further DB access ────────────
+        _step("reinitialising")
         if "blocks.db" in restored or "blocks.json" in restored:
             # Close web server store
             if _store:
@@ -2997,10 +3182,13 @@ def api_backup_restore():
         if "blocks.db" in restored or "blocks.json" in restored:
             _regen_charts_safely()
 
-        return jsonify({"ok": True, "restored": restored})
+        _j["restored"] = restored
+        _j["status"] = "done"
+        _step("done")
     except Exception as e:
         logger.error("api_backup_restore: %s", e)
-        return jsonify({"error": str(e)}), 500
+        _j["status"] = "error"
+        _j["error"] = str(e)
     finally:
         # Always resume engine — reset_store already called above on success,
         # but we must resume even if an exception occurred mid-restore
@@ -3031,6 +3219,11 @@ def settings_page():
         _ds_mode = _eng.get_data_source_mode()
     except Exception:
         _ds_mode = "cad"
+    try:
+        import engine as _eng2
+        _has_creds = _eng2.has_kraken_credentials()
+    except Exception:
+        _has_creds = False
     return render_template(
         "meter_config.html",
         config=cfg,
@@ -3038,6 +3231,7 @@ def settings_page():
         tz_select_html=tz_select_html,
         has_data=has_data,
         data_source_mode=_ds_mode,
+        has_credentials=_has_creds,
         ohme_detection=_ohme_detection()
     )
 
@@ -3100,9 +3294,16 @@ def api_data_source_mode_get():
     try:
         import engine as _eng
         mode = _eng.get_data_source_mode()
+        uses_api = _eng.mode_uses_api(mode)
+        has_creds = _eng.has_kraken_credentials()
         return jsonify({"mode": mode,
-                        "uses_api": _eng.mode_uses_api(mode),
-                        "uses_mini": _eng.mode_uses_mini(mode)})
+                        "uses_api": uses_api,
+                        "uses_mini": _eng.mode_uses_mini(mode),
+                        "has_credentials": has_creds,
+                        # API mode restored/selected but no stored key — e.g. after
+                        # restoring a backup onto a fresh /data (creds live in a
+                        # file that backups don't include).
+                        "credentials_missing": bool(uses_api and not has_creds)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3317,6 +3518,21 @@ def api_instance_notice_dismiss():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+def _settlement_horizon_floor() -> str:
+    """UTC-ISO cutoff = now − the DCC settlement horizon. Blocks older than this
+    can't still be 'awaiting DCC settlement' (settlement lands within days), so
+    the unsettled badge/list floors here — keeping historic/imported reconstructed
+    blocks (which never settle) out of the count regardless of whether the
+    settlement sweep has run to finalise them yet."""
+    from datetime import datetime, timezone, timedelta
+    try:
+        import engine as _eng
+        days = int(getattr(_eng, "_SETTLEMENT_SWEEP_HORIZON_DAYS", 14))
+    except Exception:
+        days = 14
+    return (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)).isoformat()
+
+
 @app.route("/api/billing-source", methods=["GET"])
 def api_billing_source_get():
     """Return the current global billing source and unsettled-block count."""
@@ -3324,9 +3540,15 @@ def api_billing_source_get():
         import engine as _eng
         store = _get_store()
         source = _eng._get_billing_source()
-        unsettled = store.count_unsettled_blocks()
+        unsettled = store.count_unsettled_blocks(since_iso=_settlement_horizon_floor())
+        _uses_api = _eng.mode_uses_api()
+        _has_creds = _eng.has_kraken_credentials()
         return jsonify({"source": source, "unsettled": unsettled,
                         "api_available": _eng.kraken_available(),
+                        # API/DCC mode is selected but the stored API key is gone
+                        # (typically after restoring a backup onto a fresh install
+                        # — creds aren't in the backup). Distinct from "no API".
+                        "credentials_missing": bool(_uses_api and not _has_creds),
                         "unsupported_tariff": _eng._rate_schedule_unsupported})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -3358,8 +3580,9 @@ def api_unsettled_blocks():
     try:
         store = _get_store()
         limit = int(request.args.get("limit", 500))
-        count = store.count_unsettled_blocks()
-        rows = store.get_unsettled_blocks(limit=limit)
+        _floor = _settlement_horizon_floor()
+        count = store.count_unsettled_blocks(since_iso=_floor)
+        rows = store.get_unsettled_blocks(limit=limit, since_iso=_floor)
         out = [{"block_start": r["block_start"],
                 "imp_kwh": r["imp_kwh"],
                 "exp_kwh": r["exp_kwh"],
@@ -3425,6 +3648,572 @@ def api_retry_settlement():
         return jsonify(result), status
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/probe", methods=["POST"])
+def api_historical_probe():
+    """READ-ONLY beta diagnostic (historical-import spike): probe HA long-term
+    statistics for the chosen per-device sensors, to characterise retention,
+    cadence, gaps, energy-vs-power and DST/timestamp behaviour before building
+    the historical import. Creates no blocks and writes nothing.
+
+    Body: {"entity_ids": [...] } or {"sensors": [{"device","entity_id"},...]},
+    optional "days" (lookback, default 800, max 2000)."""
+    try:
+        import engine as _eng
+        body = request.get_json(force=True, silent=True) or {}
+        entity_ids = body.get("entity_ids") or [
+            (s or {}).get("entity_id") for s in (body.get("sensors") or [])]
+        entity_ids = [e for e in entity_ids if e]
+        if not entity_ids:
+            return jsonify({"ok": False, "error": "no sensors selected"}), 400
+        try:
+            days = max(1, min(int(body.get("days", 800)), 2000))
+        except (TypeError, ValueError):
+            days = 800
+        result = _run_on_engine_loop(
+            _eng.probe_recorder_statistics(entity_ids, days), timeout=120.0)
+        return jsonify(result), (200 if result.get("ok") else 400)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/export-probe", methods=["POST"])
+def api_export_probe():
+    """READ-ONLY beta diagnostic (historical-import spike): measure how far back
+    the Octopus API reaches for import vs export, via cheap single-row boundary
+    fetches. No body — uses the discovered meters. Creates nothing, writes
+    nothing. Gated on an available API (nothing to probe otherwise)."""
+    try:
+        import engine as _eng
+        if not _eng.kraken_available():
+            return jsonify({"ok": False, "error": "no API connected"}), 400
+        result = _run_on_engine_loop(
+            _eng.probe_consumption_retention(), timeout=60.0)
+        return jsonify(result), (200 if result.get("ok") else 400)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/consumption-diagnostic", methods=["POST"])
+def api_consumption_diagnostic():
+    """READ-ONLY deep diagnostic: enumerate every meter point + serial on the
+    account with each serial's reachable consumption span, to tell apart an API
+    retention limit, a meter exchange, or a query artifact. No body. Writes
+    nothing. Gated on an available API."""
+    try:
+        import engine as _eng
+        if not _eng.kraken_available():
+            return jsonify({"ok": False, "error": "no API connected"}), 400
+        result = _run_on_engine_loop(
+            _eng.diagnose_consumption_retention(), timeout=180.0)
+        return jsonify(result), (200 if result.get("ok") else 400)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/import-range-diagnostic", methods=["POST"])
+def api_import_range_diagnostic():
+    """READ-ONLY: report where each channel's import starts (its earliest supplier
+    agreement) and probe the Measurements API for data BEFORE that floor — so we
+    can tell whether real history exists earlier than where the import began
+    (e.g. import from 01/07/24, export from a later export-agreement date). Writes
+    nothing. Gated on an available API."""
+    try:
+        import engine as _eng
+        if not _eng.kraken_available():
+            return jsonify({"ok": False, "error": "no API connected"}), 400
+        result = _run_on_engine_loop(
+            _eng.diagnose_import_range(), timeout=120.0)
+        return jsonify(result), (200 if result.get("ok") else 400)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/site-plan", methods=["GET"])
+def api_historical_site_plan():
+    """READ-ONLY. Discover the account's property history for the PRE-import
+    'confirm your sites' step. Returns {ok, needs_confirmation, sites[]}. When
+    needs_confirmation is False (never-moved account), the wizard skips straight
+    to the import. Writes nothing."""
+    try:
+        import engine as _eng
+        if not _eng.kraken_available():
+            return jsonify({"ok": False, "error": "no API connected"}), 400
+        result = _run_on_engine_loop(_eng.discover_pre_import_sites(), timeout=60.0)
+        return jsonify(result), (200 if result.get("ok") else 400)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/site-plan/apply", methods=["POST"])
+def api_historical_site_plan_apply():
+    """Create/extend config periods to match the user-confirmed tenancy sites
+    BEFORE the import runs, so imported blocks land in the right period from the
+    first write. Body: {"sites": [{outcode, from, to, site_name?}]}. Sets a marker
+    so the post-import region probe doesn't re-stamp the layout. Backs up first."""
+    try:
+        store = _get_store()
+        data = request.get_json(force=True, silent=True) or {}
+        sites = data.get("sites") or []
+        if not sites:
+            return jsonify({"ok": False, "error": "no sites supplied"}), 400
+        try:
+            backup = os.path.basename(_create_backup_zip(label="pre-import-sites"))
+        except Exception as be:
+            backup = None
+            logger.warning("site-plan apply: backup failed (continuing): %s", be)
+        from datetime import datetime as _dt_now
+        res = store.apply_pre_import_sites(sites)
+        store.set_meta("preimport_sites_applied", _dt_now.utcnow().isoformat())
+        store.rearm_carbon_backfill()   # new regions → re-scan carbon after import
+        try:
+            _rebuild_config_period_chain(store)
+        except Exception as _e:
+            logger.warning("site-plan apply: chain rebuild failed: %s", _e)
+        logger.info("api_historical_site_plan_apply: %s", res)
+        return jsonify({"ok": True, "backup": backup, **res})
+    except Exception as e:
+        logger.error("api_historical_site_plan_apply: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/api-import/plan", methods=["POST"])
+def api_historical_api_plan():
+    """READ-ONLY preview for the API import route: the per-channel window and
+    newest→oldest chunk plan (clamped to the ~2-year wall + go-live). No writes."""
+    try:
+        import engine as _eng
+        if not _eng.kraken_available():
+            return jsonify({"ok": False, "error": "no API connected"}), 400
+        body = request.get_json(force=True, silent=True) or {}
+        try:
+            chunk_days = max(1, min(int(body.get("chunk_days", 60)), 120))
+        except (TypeError, ValueError):
+            chunk_days = 60
+        result = _run_on_engine_loop(
+            _eng.plan_api_import(body.get("from"), chunk_days=chunk_days), timeout=60.0)
+        return jsonify(result), (200 if result.get("ok") else 400)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/api-import/apply", methods=["POST"])
+def api_historical_api_apply():
+    """API import route apply: fetch consumption newest→oldest, price via
+    per-agreement historical schedules, write imported_api blocks (backup first).
+    `dry_run` previews counts without writing; a real write requires confirmed=true.
+    Reversible via the reconstructed-history delete filter."""
+    try:
+        import engine as _eng
+        if not _eng.kraken_available():
+            return jsonify({"ok": False, "error": "no API connected"}), 400
+        body = request.get_json(force=True, silent=True) or {}
+        dry_run = bool(body.get("dry_run"))
+        if not dry_run and not body.get("confirmed"):
+            return jsonify({"ok": False, "error": "confirmation required"}), 400
+        restart = bool(body.get("restart"))
+        try:
+            chunk_days = max(1, min(int(body.get("chunk_days", 60)), 120))
+        except (TypeError, ValueError):
+            chunk_days = 60
+        try:
+            max_chunks = max(1, min(int(body.get("max_chunks", 6)), 60))
+        except (TypeError, ValueError):
+            max_chunks = 6
+        try:
+            pace_s = min(max(float(body.get("pace_s", 1.5)), 0.0), 10.0)
+        except (TypeError, ValueError):
+            pace_s = 1.5
+        # Backup once, at the start of a run (the first / restart call), not on
+        # every incremental continuation.
+        backup = None
+        if not dry_run and restart:
+            try:
+                backup = os.path.basename(_create_backup_zip(label="pre-api-import"))
+            except Exception as be:
+                logger.warning("api import: backup failed (continuing): %s", be)
+        result = _run_on_engine_loop(
+            _eng.import_api_history(body.get("from"), chunk_days=chunk_days,
+                                    max_chunks=max_chunks, pace_s=pace_s,
+                                    dry_run=dry_run, restart=restart), timeout=300.0)
+        result["backup"] = backup
+        return jsonify(result), (200 if result.get("ok") else 400)
+    except Exception as e:
+        logger.error("api_historical_api_apply: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/api-import/start", methods=["POST"])
+def api_historical_api_start():
+    """Start the API import as a BACKGROUND job (survives navigating away; can be
+    paused/resumed/cancelled). Takes a backup, then schedules the worker on the
+    engine loop and returns immediately. Poll /status; drive /control."""
+    try:
+        import engine as _eng
+        import asyncio as _asyncio
+        if not _eng.kraken_available():
+            return jsonify({"ok": False, "error": "no API connected"}), 400
+        body = request.get_json(force=True, silent=True) or {}
+        if not body.get("confirmed"):
+            return jsonify({"ok": False, "error": "confirmation required"}), 400
+        if _eng.api_import_running():
+            return jsonify({"ok": False, "error": "an import is already running",
+                            "status": _eng.api_import_status()}), 409
+        if not (_event_loop and _event_loop.is_running()):
+            return jsonify({"ok": False, "error": "engine loop not running"}), 500
+        try:
+            chunk_days = max(1, min(int(body.get("chunk_days", 60)), 120))
+        except (TypeError, ValueError):
+            chunk_days = 60
+        try:
+            max_chunks = max(1, min(int(body.get("max_chunks", 1)), 60))
+        except (TypeError, ValueError):
+            max_chunks = 1
+        try:
+            pace_s = min(max(float(body.get("pace_s", 1.5)), 0.0), 10.0)
+        except (TypeError, ValueError):
+            pace_s = 1.5
+        backup = None
+        try:
+            backup = os.path.basename(_create_backup_zip(label="pre-api-import"))
+        except Exception as be:
+            logger.warning("api import: backup failed (continuing): %s", be)
+        _asyncio.run_coroutine_threadsafe(
+            _eng.run_api_import_job(body.get("from"), chunk_days=chunk_days,
+                                    max_chunks=max_chunks, pace_s=pace_s),
+            _event_loop)      # fire-and-forget; poll /status
+        return jsonify({"ok": True, "status": "running", "backup": backup})
+    except Exception as e:
+        logger.error("api_historical_api_start: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/api-import/control", methods=["POST"])
+def api_historical_api_control():
+    """pause / resume / cancel the running background import."""
+    try:
+        import engine as _eng
+        body = request.get_json(force=True, silent=True) or {}
+        return jsonify(_eng.api_import_control(body.get("action", "")))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/api-import/status", methods=["GET"])
+def api_historical_api_status():
+    """Poll the background import job's progress/status."""
+    try:
+        import engine as _eng
+        return jsonify(_eng.api_import_status())
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/api-import/gaps", methods=["GET"])
+def api_historical_api_gaps():
+    """Persisted reconstruction gaps (missing half-hour runs) per channel from the
+    last import — so the import page can show holes without re-querying. Read-only."""
+    try:
+        import engine as _eng
+        return jsonify(_eng.api_import_gaps())
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/api-import/health", methods=["GET"])
+def api_historical_api_health():
+    """Post-import health summary (flags raised / auto-recovered / still remaining,
+    plus imported range) for the import page's persistent panel. 'remaining' is read
+    live from the reprice queue. Read-only."""
+    try:
+        import engine as _eng
+        return jsonify(_eng.api_import_health())
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/reprice-repair", methods=["POST"])
+def api_historical_reprice_repair():
+    """Calm, targeted re-price of imported half-hours the bulk import mispriced
+    (Measurements returned kWh but empty cost metaData under load). Re-queries the
+    slots one small window at a time and re-prices in place. Also the root-cause
+    test: the response's recovered/still_missing split says whether a calm re-fetch
+    recovers what the loaded import missed (⇒ load-induced) or not (⇒ real gap).
+
+    Body: {from_date?, to_date?, preview?, include_export?}. YYYY-MM-DD; omit dates
+    to use the reprice queue. `preview` counts the affected blocks WITHOUT running
+    (for a confirm step). Range mode defaults to IMPORT-only; set `include_export`
+    to also reprice export — now that _billed_rate prefers the flat/Agile schedule
+    for a published-rate slot, this COLLAPSES a fragmented export rate back to its
+    clean scheduled value (it no longer fragments it from cost÷kWh)."""
+    try:
+        import engine as _eng
+        if not _eng.kraken_available():
+            return jsonify({"ok": False, "error": "no API connected"}), 400
+        body = request.get_json(force=True, silent=True) or {}
+        from_date = (body.get("from_date") or "").strip() or None
+        to_date = (body.get("to_date") or "").strip() or None
+        preview = bool(body.get("preview"))
+        # Date validation: end must not precede start.
+        if from_date and to_date and to_date < from_date:
+            return jsonify({"ok": False,
+                            "error": "The 'to' date can't be before the 'from' date."}), 400
+        # Range mode defaults to import-only (the tool's purpose); queue mode keeps
+        # whatever was flagged. include_export opts back into export re-pricing.
+        if from_date or to_date:
+            channels = ("import", "export") if body.get("include_export") else ("import",)
+        else:
+            channels = ("import", "export")
+        result = _run_on_engine_loop(
+            _eng.repair_import_pricing(from_date, to_date, channels=channels,
+                                       count_only=preview),
+            timeout=(60.0 if preview else 1800.0))
+        return jsonify(result), (200 if result.get("ok") else 400)
+    except Exception as e:
+        logger.error("api_historical_reprice_repair: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/retag-imports", methods=["POST"])
+def api_historical_retag_imports():
+    """Repair blocks the carbon round-trip bug wiped from 'imported_api' to NULL:
+    re-tag reconstruction blocks (pre-go-live, no meter read) as imported_api.
+    No re-import, no API cost — pure local repair. Returns {retagged, go_live}."""
+    try:
+        store = _get_store()
+        res = store.retag_untagged_imports()
+        try:
+            _rebuild_config_period_chain(store)
+        except Exception as _e:
+            logger.warning("api_historical_retag_imports: chain rebuild failed: %s", _e)
+        logger.info("api_historical_retag_imports: %s", res)
+        return jsonify({"ok": True, **res})
+    except Exception as e:
+        logger.error("api_historical_retag_imports: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/blocks/sweep-implausible", methods=["GET", "POST"])
+def api_blocks_sweep_implausible():
+    """#307 one-off repair for lost-opener device spikes (e.g. house_battery
+    read_start=0 / read_end=6137 → 6137 kWh in a half-hour, wrecking carbon). GET
+    previews the offending blocks (dry-run); POST applies: clamp imp_kwh to the
+    grid-bounded value, baseline the register, recompute carbon, flag needs_review
+    — leaving imp_kwh_grid / imp_cost (billing) untouched. Regenerates charts on
+    apply. Returns {ok, count, ceiling_kwh, applied, blocks:[...]}."""
+    try:
+        store = _get_store()
+        apply = (request.method == "POST")
+        res = store.sweep_implausible_sub_blocks(dry_run=not apply)
+        if apply and res.get("applied"):
+            try:
+                _regen_charts_safely()
+            except Exception as _e:
+                logger.warning("api_blocks_sweep_implausible: chart regen failed: %s", _e)
+        logger.info("api_blocks_sweep_implausible: %s (applied=%s)",
+                    {k: res[k] for k in ("count", "ceiling_kwh", "applied")}, apply)
+        return jsonify({"ok": True, **res})
+    except Exception as e:
+        logger.error("api_blocks_sweep_implausible: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/carbon/pause", methods=["GET", "POST"])
+def api_carbon_pause():
+    """Get or set the carbon-backfill kill switch. POST {"paused": true|false}.
+    While paused, the historical backfill and live recovery both stand down."""
+    try:
+        store = _get_store()
+        if request.method == "POST":
+            data = request.get_json(force=True, silent=True) or {}
+            paused = bool(data.get("paused"))
+            store.set_meta("carbon_paused", True if paused else None)
+            logger.info("api_carbon_pause: carbon backfill %s",
+                        "PAUSED" if paused else "resumed")
+            return jsonify({"ok": True, "paused": paused})
+        return jsonify({"ok": True, "paused": bool(store.get_meta("carbon_paused", None))})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/reprice-from-csv", methods=["POST"])
+def api_historical_reprice_from_csv():
+    """Overlay exact billed cost/rate onto imported blocks from an Octopus CSV
+    export (the billing source of truth) — the only way to price dispatch slots
+    Octopus's Measurements API returns with no cost. Body: {csv, channel?}."""
+    try:
+        store = _get_store()
+        data = request.get_json(force=True, silent=True) or {}
+        csv_text = (data.get("csv") or data.get("import_csv") or "").strip()
+        channel = data.get("channel") or "import"
+        if not csv_text:
+            return jsonify({"ok": False, "error": "no CSV supplied"}), 400
+        res = store.reprice_imported_blocks_from_csv(csv_text, channel=channel)
+        if res.get("changed"):
+            try:
+                import engine as _eng
+                _run_on_engine_loop(_eng._generate_charts_offloaded(), timeout=300.0)
+            except Exception as _e:
+                logger.warning("reprice-from-csv: chart regen failed: %s", _e)
+        return jsonify({"ok": True, **res})
+    except Exception as e:
+        logger.error("api_historical_reprice_from_csv: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/historical-import")
+def historical_import_page():
+    """Historical import wizard (3.5.0). Currently the CSV route: upload the
+    Octopus per-channel export, review the cost-derived rates, confirm, import."""
+    return render_template("historical_import.html", active="data_management")
+
+
+def _csv_channel_texts(body):
+    texts = {}
+    for channel in ("import", "export"):
+        t = body.get(channel + "_csv") or body.get(channel)
+        if t:
+            texts[channel] = t
+    return texts
+
+
+@app.route("/api/historical/csv/preview", methods=["POST"])
+def api_historical_csv_preview():
+    """Parse + derive rates from the Octopus CSV(s) WITHOUT writing — the wizard's
+    review/confirm step. Pure (no backup, no blocks): shows per-period tiers, the
+    cost-derived rates + confidence, off/peak split, and the reconciliation."""
+    try:
+        import csv_import as _ci
+        body = request.get_json(force=True, silent=True) or {}
+        texts = _csv_channel_texts(body)
+        if not texts:
+            return jsonify({"ok": False, "error": "no CSV provided"}), 400
+        out = {"ok": True, "channels": {}}
+        for channel, text in texts.items():
+            parsed = _ci.parse_octopus_csv(text, channel)
+            if not parsed["ok"]:
+                out["channels"][channel] = {"ok": False, "errors": parsed["errors"]}
+                continue
+            deriv = _ci.derive_rates(parsed["blocks"])
+            out["channels"][channel] = {
+                "ok": True, "block_count": len(parsed["blocks"]),
+                "parse_errors": parsed["errors"], "periods": deriv["periods"],
+                "off_peak_kwh": deriv["off_peak_kwh"], "peak_kwh": deriv["peak_kwh"],
+                "reconcile": _ci.reconcile(parsed["blocks"], deriv["flags"]),
+            }
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/csv/apply", methods=["POST"])
+def api_historical_csv_apply():
+    """Back up, then write reconstructed imported_csv blocks from the CSV(s) with
+    the user's confirmed rate overrides. Requires confirmed=true. Reversible via
+    the reconstructed-history delete filter."""
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        if not body.get("confirmed"):
+            return jsonify({"ok": False, "error": "confirmation required"}), 400
+        texts = _csv_channel_texts(body)
+        if not texts:
+            return jsonify({"ok": False, "error": "no CSV provided"}), 400
+        meter_id = body.get("meter_id") or "electricity_main"
+        overrides = body.get("overrides") or {}
+        backup = None
+        try:
+            backup = os.path.basename(_create_backup_zip(label="pre-csv-import"))
+        except Exception as be:
+            logger.warning("csv apply: backup failed (continuing): %s", be)
+        store = _get_store()
+        result = store.apply_csv_import(
+            texts, meter_id=meter_id, overrides=overrides)
+        result["backup"] = backup
+        # Offer a region/site confirmation for the imported span. CSV carries no
+        # provenance, so the user names the site AND sets the region; skipping
+        # leaves the data blended into whatever period already covers it (carbon
+        # excluded). The panel lives on the Billing history page.
+        try:
+            span = result.get("span") or {}
+            if span.get("from"):
+                plan = store.plan_csv_reconciliation(span["from"], span.get("to"))
+                if plan.get("needs_confirmation"):
+                    store.set_meta("region_reconcile_pending", plan)
+                    result["region_reconcile"] = True
+        except Exception as _re:
+            logger.warning("csv apply: region plan failed: %s", _re)
+        return jsonify(result)
+    except Exception as e:
+        logger.error("api_historical_csv_apply: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+def _period_block_minutes_tz(store, from_iso):
+    """(block_minutes, timezone) for the config period covering from_iso, with
+    sane fallbacks — used to render template timestamps on the right grid/tz."""
+    bm, tz = 30, "Europe/London"
+    try:
+        cp = store.get_config_period_for_date(from_iso) if from_iso else None
+        if not cp:
+            cp = store._conn.execute(
+                "SELECT block_minutes, timezone FROM config_periods "
+                "ORDER BY effective_from DESC LIMIT 1").fetchone()
+        if cp:
+            bm = int(cp["block_minutes"] or 30)
+            tz = cp["timezone"] or "Europe/London"
+    except Exception:
+        pass
+    return bm, tz
+
+
+@app.route("/api/historical/gap-template")
+def api_historical_gap_template():
+    """Download a per-half-hour CSV pre-filled with Start/End for a gap, ready for
+    the user to fill Consumption + Cost from their bill. Query: from, to (UTC ISO),
+    channel (import|export, for the filename)."""
+    try:
+        from flask import Response
+        import csv_import as _ci
+        frm = request.args.get("from")
+        to  = request.args.get("to")
+        channel = (request.args.get("channel") or "import").strip().lower()
+        inclusive = (request.args.get("inclusive") or "").lower() in ("1", "true", "yes")
+        if not frm or not to:
+            return jsonify({"error": "from and to are required"}), 400
+        bm, tz = _period_block_minutes_tz(_get_store(), frm)
+        # A persisted gap's `to` is the LAST missing slot's start (inclusive); the
+        # generator is half-open, so extend the end by one block to include it.
+        if inclusive:
+            from datetime import datetime as _dt, timedelta as _td
+            try:
+                _t = _dt.fromisoformat(str(to).replace("Z", "").split("+")[0])
+                to = (_t + _td(minutes=bm)).isoformat()
+            except Exception:
+                pass
+        csv_text = _ci.gap_template_csv(frm, to, block_minutes=bm, tz_name=tz)
+        fname = f"emt-gap-{channel}-{frm[:10]}_to_{to[:10]}.csv"
+        return Response(csv_text, mimetype="text/csv",
+                        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+    except Exception as e:
+        logger.error("api_historical_gap_template: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/historical/csv-template")
+def api_historical_csv_template():
+    """Download a small illustrative CSV template (headers + example rows in the
+    exact time format) for users supplying their own consumption CSV."""
+    try:
+        from flask import Response
+        import csv_import as _ci
+        bm, _tz = _period_block_minutes_tz(_get_store(), None)
+        csv_text = _ci.blank_template_csv(block_minutes=bm)
+        return Response(csv_text, mimetype="text/csv",
+                        headers={"Content-Disposition": 'attachment; filename="emt-consumption-template.csv"'})
+    except Exception as e:
+        logger.error("api_historical_csv_template: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/insights/periods")
@@ -3718,18 +4507,37 @@ def api_insights_billing_period():
 
 @app.route("/api/insights/data-bounds")
 def api_insights_data_bounds():
-    """Return earliest and latest block dates with carbon data."""
+    """Date bounds for the Insights page nav/compare gating.
+
+    Returns TWO ranges, because the Carbon and Usage tabs have different data:
+      - earliest/latest             → blocks that carry CARBON data (carbon_g),
+                                       which only exists from v2.3.0 onward. The
+                                       Carbon tab gates on this.
+      - usage_earliest/usage_latest → ALL blocks for the meter, including
+                                       historical imports that have kWh/cost but
+                                       no carbon. The Usage tab gates on this, so
+                                       "vs last year"/"vs last month" comparisons
+                                       into backfilled months aren't wrongly
+                                       disabled.
+    """
     try:
         store = _get_store()
         row = store._conn.execute(
-            """SELECT MIN(block_start) as earliest, MAX(block_start) as latest
+            """SELECT
+                 MIN(block_start) AS usage_earliest,
+                 MAX(block_start) AS usage_latest,
+                 MIN(CASE WHEN carbon_g IS NOT NULL THEN block_start END) AS c_earliest,
+                 MAX(CASE WHEN carbon_g IS NOT NULL THEN block_start END) AS c_latest
                FROM blocks
-               WHERE meter_id = 'electricity_main'
-                 AND carbon_g IS NOT NULL"""
+               WHERE meter_id = 'electricity_main'"""
         ).fetchone()
         return jsonify({
-            "earliest": row["earliest"][:10] if row and row["earliest"] else None,
-            "latest":   row["latest"][:10]   if row and row["latest"]   else None,
+            # Carbon range (unchanged meaning — Carbon tab uses these)
+            "earliest": row["c_earliest"][:10] if row and row["c_earliest"] else None,
+            "latest":   row["c_latest"][:10]   if row and row["c_latest"]   else None,
+            # Full energy range (Usage tab uses these)
+            "usage_earliest": row["usage_earliest"][:10] if row and row["usage_earliest"] else None,
+            "usage_latest":   row["usage_latest"][:10]   if row and row["usage_latest"]   else None,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -4652,6 +5460,22 @@ def api_db_vacuum():
 
 # ── Block deletion ────────────────────────────────────────────────────────────────────────────────
 
+def _delete_window_to_utc_times(from_time, to_time, tz_name, from_date, to_date):
+    """Resolve the delete's time-of-day window to the UTC HH:MM the store filters on.
+
+    A WHOLE-DAY window (00:00–23:59) must NOT become a UTC time-of-day filter: the
+    local-date→UTC bounds (local_date_range_to_utc_bounds) already cover complete
+    local days. Converting the day boundaries to UTC under BST turns 23:59 local
+    into 22:59 UTC → `TIME(block_start) <= '22:59'`, which excludes the 23:00–23:59
+    UTC band that IS local midnight — so 2 blocks/day (00:00 & 00:30 local) survive
+    every delete. Only an EXPLICIT partial window is converted for the filter.
+    """
+    if from_time == "00:00" and to_time == "23:59":
+        return "00:00", "23:59"            # whole day → rely on the date bounds only
+    return (_corrections_time_to_utc(from_time, tz_name, from_date),
+            _corrections_time_to_utc(to_time, tz_name, to_date))
+
+
 @app.route("/api/blocks/delete/preview", methods=["POST"])
 def api_blocks_delete_preview():
     """
@@ -4677,10 +5501,11 @@ def api_blocks_delete_preview():
             if not (_md.get("meta") or {}).get("sub_meter"):
                 _tz_name = (_md.get("meta") or {}).get("timezone", "UTC")
                 break
-        from_time_utc = _corrections_time_to_utc(from_time, _tz_name, from_date)
-        to_time_utc   = _corrections_time_to_utc(to_time,   _tz_name, to_date)
+        from_time_utc, to_time_utc = _delete_window_to_utc_times(
+            from_time, to_time, _tz_name, from_date, to_date)
+        reconstructed_only = bool(data.get("reconstructed_only"))
         store = _get_store()
-        result = store.count_blocks_for_date_range(from_date, to_date, meter_id, from_time_utc, to_time_utc, _tz_name)
+        result = store.count_blocks_for_date_range(from_date, to_date, meter_id, from_time_utc, to_time_utc, _tz_name, reconstructed_only)
         return jsonify(result)
     except Exception as e:
         logger.error("api_blocks_delete_preview: %s", e)
@@ -4715,10 +5540,11 @@ def api_blocks_delete():
             if not (_md.get("meta") or {}).get("sub_meter"):
                 _tz_name = (_md.get("meta") or {}).get("timezone", "UTC")
                 break
-        from_time_utc = _corrections_time_to_utc(from_time, _tz_name, from_date)
-        to_time_utc   = _corrections_time_to_utc(to_time,   _tz_name, to_date)
+        from_time_utc, to_time_utc = _delete_window_to_utc_times(
+            from_time, to_time, _tz_name, from_date, to_date)
+        reconstructed_only = bool(data.get("reconstructed_only"))
         store = _get_store()
-        result = store.delete_blocks_for_date_range(from_date, to_date, meter_id, from_time_utc, to_time_utc, _tz_name)
+        result = store.delete_blocks_for_date_range(from_date, to_date, meter_id, from_time_utc, to_time_utc, _tz_name, reconstructed_only)
         # A device-only delete leaves the parent main meter's remainder stale for
         # those windows — recompute it (PASS 2) against the surviving sub-meters.
         if result.get("recompute_parent"):
@@ -4742,6 +5568,42 @@ def api_blocks_delete():
         return jsonify({"error": str(e)}), 400
     except Exception as e:
         logger.error("api_blocks_delete: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/historical/purge-preview")
+def api_historical_purge_preview():
+    """How much historical-import data would a purge remove (block count + span)."""
+    try:
+        return jsonify(_get_store().count_imported_history())
+    except Exception as e:
+        logger.error("api_historical_purge_preview: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/historical/purge", methods=["POST"])
+def api_historical_purge():
+    """The get-out-clause: back up, then delete ALL historical-import data and
+    everything derived from it (imported blocks, rate derivations, import
+    checkpoints/gaps). Requires confirmed=true. Live data is untouched."""
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        if not body.get("confirmed"):
+            return jsonify({"error": "confirmation required"}), 400
+        store = _get_store()
+        backup = None
+        try:
+            backup = os.path.basename(_create_backup_zip(label="pre-purge-import"))
+        except Exception as be:
+            logger.warning("purge: backup failed (continuing): %s", be)
+        result = store.purge_imported_history()
+        result["backup"] = backup
+        _regen_charts_safely()
+        logger.info("api_historical_purge: removed %d imported block(s) (backup=%s)",
+                    result.get("blocks"), backup)
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        logger.error("api_historical_purge: %s", e)
         return jsonify({"error": str(e)}), 500
 
 

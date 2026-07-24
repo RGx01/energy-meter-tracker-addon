@@ -62,6 +62,8 @@
   You can edit dates on any period if a change was entered retrospectively.
 </div>
 
+<div id="reconcile-panel" style="display:none;margin-bottom:20px;"></div>
+
 <div id="history-loading" style="color:var(--muted);font-size:13px;padding:20px 0;">Loading…</div>
 <div id="history-container" style="display:none;"></div>
 
@@ -126,6 +128,13 @@
         <input id="edit-supplier" type="text" placeholder="e.g. Octopus Energy"
           class="modal-input">
       </div>
+    </div>
+
+    <div style="margin-bottom:16px;">
+      <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px;">Postcode (carbon region)</label>
+      <input id="edit-postcode" type="text" maxlength="5" placeholder="e.g. DE65"
+        class="modal-input" style="text-transform:uppercase;">
+      <div style="font-size:11px;color:var(--muted);margin-top:4px;">Outward code only (the first part) — sets the carbon-intensity region for this period. Your full postcode is never stored.</div>
     </div>
 
     <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);margin-bottom:10px;">Notes</div>
@@ -215,7 +224,96 @@ function fromLocalInput(val) {
 }
 
 // ── Load ──────────────────────────────────────────────────────────────────────
+// ── Region reconciliation (post-import "name your sites") ──────────────────────
+var _reconcilePlan = null;
+function loadReconcile() {
+  fetch(apiUrl('/api/region/reconcile'))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      var panel = document.getElementById('reconcile-panel');
+      if (!d || !d.pending || !d.plan) { panel.style.display = 'none'; return; }
+      _reconcilePlan = d.plan;
+      renderReconcile(d.plan);
+    })
+    .catch(function() {});
+}
+function renderReconcile(plan) {
+  var panel = document.getElementById('reconcile-panel');
+  var isCsv = (plan.source === 'csv');
+  var rows = (plan.sites || []).map(function(s, i) {
+    var range = fmtDt(s.from) + ' – ' + (s.to ? fmtDt(s.to) : 'current');
+    var hint  = s.hint ? ' · ' + escHtml(s.hint) : (s.region_editable ? ' · imported CSV' : '');
+    var regionCell = s.region_editable
+      ? '<input id="rec-oc-' + i + '" type="text" maxlength="5" class="modal-input" ' +
+          'placeholder="Region e.g. DE65" value="' + escHtml(s.outcode || '') + '" style="text-transform:uppercase;">'
+      : '<div style="font-size:13px;"><strong>' + escHtml(s.outcode || '—') + '</strong></div>';
+    return '<div style="display:grid;grid-template-columns:1.4fr 0.8fr 1fr;gap:8px;align-items:center;padding:8px 0;border-top:1px solid var(--border);">' +
+      '<div style="font-size:12px;color:var(--muted);">' + range +
+        ' · ' + (s.block_count || 0).toLocaleString() + ' blocks' + hint + '</div>' +
+      regionCell +
+      '<input id="rec-site-' + i + '" type="text" class="modal-input" ' +
+        'placeholder="' + (s.needs_name ? 'Name this site' : '') + '" ' +
+        'value="' + escHtml(s.site_name || '') + '">' +
+    '</div>';
+  }).join('');
+  var splitNote = (plan.split_dates && plan.split_dates.length)
+    ? '<div style="font-size:12px;color:var(--muted);margin-top:8px;">Applying will split your billing history at ' +
+        plan.split_dates.length + ' date' + (plan.split_dates.length > 1 ? 's' : '') + '.</div>'
+    : '';
+  var intro = isCsv
+    ? 'Your CSV import covered the range below. Optionally set the region (for carbon) and name the site — ' +
+      'or Dismiss to leave it as-is (it stays in your existing billing period). Only the postcode’s outward code is stored.'
+    : 'Your import found the property history below. Dates and regions are set automatically from your account — ' +
+      'just name each site (only the postcode’s outward code is stored).';
+  panel.innerHTML =
+    '<div style="border:1px solid var(--accent);border-radius:var(--radius);padding:16px;background:rgba(0,212,170,0.05);">' +
+      '<div style="font-weight:600;font-size:14px;margin-bottom:4px;">📍 ' + (isCsv ? 'Name your imported data' : 'Confirm your sites') + '</div>' +
+      '<div style="font-size:13px;color:var(--muted);margin-bottom:8px;">' + intro + '</div>' +
+      rows + splitNote +
+      '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px;">' +
+        '<button class="btn" style="font-size:13px;" onclick="dismissReconcile()">Dismiss</button>' +
+        '<button class="btn btn-primary" style="font-size:13px;" onclick="applyReconcile()">Apply</button>' +
+      '</div>' +
+    '</div>';
+  panel.style.display = 'block';
+}
+function applyReconcile() {
+  if (!_reconcilePlan) return;
+  var sites = (_reconcilePlan.sites || []).map(function(s, i) {
+    var el = document.getElementById('rec-site-' + i);
+    var oc = document.getElementById('rec-oc-' + i);
+    return { outcode: (oc ? oc.value.trim().toUpperCase() : s.outcode) || null,
+             from: s.from, to: s.to,
+             site_name: (el && el.value.trim()) || s.site_name || null };
+  });
+  // CSV: if no region was given, don't apply a blank region — just dismiss.
+  var anyRegion = sites.some(function(x){ return x.outcode; });
+  if (_reconcilePlan.source === 'csv' && !anyRegion) { dismissReconcile(); return; }
+  fetch(apiUrl('/api/region/reconcile/apply'), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sites: sites })
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.ok) {
+      document.getElementById('reconcile-panel').style.display = 'none';
+      _reconcilePlan = null;
+      showSuccess('Sites confirmed. Billing history updated.');
+      load();
+    } else { showError(d.error || 'Could not apply.'); }
+  })
+  .catch(function(e) { showError(e.message); });
+}
+function dismissReconcile() {
+  fetch(apiUrl('/api/region/reconcile/dismiss'), { method: 'POST' })
+    .then(function() {
+      document.getElementById('reconcile-panel').style.display = 'none';
+      _reconcilePlan = null;
+    });
+}
+
 function load() {
+  loadReconcile();
   fetch(apiUrl('/api/config/history'))
     .then(function(r) { return r.json(); })
     .then(function(data) {
@@ -259,6 +357,7 @@ function render() {
     ];
     if (p.site_name) meta.push('<strong>Site</strong> ' + escHtml(p.site_name));
     if (p.supplier)  meta.push('<strong>Supplier</strong> ' + escHtml(p.supplier));
+    if (p.postcode_prefix) meta.push('<strong>Region</strong> ' + escHtml(p.postcode_prefix));
 
     var blockInfo = p.block_count > 0
       ? '<span style="color:var(--muted);font-size:12px;">' + p.block_count.toLocaleString() + ' blocks recorded under this config</span>'
@@ -338,6 +437,7 @@ function openEdit(id) {
   document.getElementById('edit-currency-code').value   = (p.currency_code || '').toUpperCase();
   document.getElementById('edit-site-name').value     = p.site_name || '';
   document.getElementById('edit-supplier').value      = p.supplier || '';
+  document.getElementById('edit-postcode').value      = p.postcode_prefix || '';
   document.getElementById('edit-reason').value        = p.change_reason || '';
   var _mt = document.querySelector('#edit-modal div[style*="font-size:15px"]'); if (_mt) _mt.textContent = 'Edit Config Period';
   document.getElementById('edit-modal').style.display = 'flex';
@@ -368,6 +468,7 @@ function saveEdit() {
   var currencySymbol = document.getElementById('edit-currency-symbol').value.trim();
   var currencyCode   = document.getElementById('edit-currency-code').value.trim().toUpperCase();
   var siteName       = document.getElementById('edit-site-name').value.trim() || null;
+  var postcodeVal    = document.getElementById('edit-postcode').value.trim().toUpperCase();
   var reasonVal      = document.getElementById('edit-reason').value.trim() || null;
 
   if (!fromVal) { showError('Effective From date is required'); return; }
@@ -395,6 +496,7 @@ function saveEdit() {
       currency_code:   currencyCode,
       site_name:       siteName,
       supplier:        document.getElementById('edit-supplier').value.trim() || null,
+      postcode:        postcodeVal,
       change_reason:   reasonVal,
     })
   })
@@ -447,6 +549,8 @@ function newPeriod() {
   document.getElementById('edit-currency-symbol').value = active.currency_symbol || '£';
   document.getElementById('edit-currency-code').value = active.currency_code || 'GBP';
   document.getElementById('edit-site-name').value     = active.site_name || '';
+  document.getElementById('edit-supplier').value      = active.supplier || '';
+  document.getElementById('edit-postcode').value      = active.postcode_prefix || '';
   document.getElementById('edit-reason').value        = '';
   // Hide effective_to — not relevant when creating (chain rebuild sets it)
   var toWrap = document.getElementById('edit-to-wrap');

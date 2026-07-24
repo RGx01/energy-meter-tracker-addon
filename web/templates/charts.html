@@ -163,6 +163,25 @@
     min-width: 110px;
     text-align: center;
   }
+  .bar-period-label.bar-rolodex {
+    cursor: ns-resize;
+    user-select: none;
+    touch-action: none;
+    padding: 2px 8px;
+    border-radius: var(--radius);
+    border: 1px solid transparent;
+    transition: border-color .12s, background .12s;
+  }
+  .bar-period-label.bar-rolodex:hover {
+    border-color: var(--border);
+    background: rgba(255,255,255,0.04);
+  }
+  .bar-period-label.bar-rolodex::after {
+    content: " ⇅";
+    font-size: 10px;
+    color: var(--muted);
+    opacity: .6;
+  }
   .bar-year-btn {
     font-size: 12px;
     padding: 3px 10px;
@@ -586,6 +605,10 @@ window.EMTSpiral=(function(){
       <div class="bar-seg" id="bar-view-seg">
         <button class="bar-seg-btn active" onclick="barSetView('totals',this)">Totals</button>
         <button class="bar-seg-btn"        onclick="barSetView('net',this)">Net</button>
+      </div>
+      <div class="bar-seg" id="bar-order-seg" style="display:none;" title="Order monthly bars by calendar date, or grouped by month across years">
+        <button class="bar-seg-btn active" onclick="barSetOrder('date',this)">Date</button>
+        <button class="bar-seg-btn"        onclick="barSetOrder('month',this)">Month</button>
       </div>
       <label id="bar-standing-wrap" style="display:none; align-items:center; gap:6px; font-size:12px; color:var(--muted); cursor:pointer;">
         <input type="checkbox" id="bar-standing-cb" onchange="barSaveState(); barRender();" style="width:14px;height:14px;accent-color:var(--accent);cursor:pointer;">
@@ -1423,6 +1446,7 @@ var barCurrency = '£';
 var barPeriod = 'daily';
 var barMetric = 'kwh';
 var barView = 'totals';
+var barMonthOrder = 'date';  // monthly bar ordering: 'date' (chronological) or 'month' (month-first, then year)
 var barCalendar = false;   // false = billing periods, true = calendar periods
 var barBillingDay = 1;
 var barDailyMonth = null;  // now a bKey string e.g. "2026-04-15"
@@ -1449,6 +1473,7 @@ function barSaveState() {
       period:   barPeriod,
       metric:   barMetric,
       view:     barView,
+      order:    barMonthOrder,
       calendar: barCalendar,
       bKey:     typeof barDailyMonth === 'string' ? barDailyMonth : (barDailyMonth ? (barDailyMonth.year + '-' + String(barDailyMonth.month).padStart(2,'0') + '-01') : null),
       years:    barActiveYears ? [...barActiveYears] : [],
@@ -1465,6 +1490,7 @@ function barLoadState(availableYears) {
     if (['daily','monthly','yearly'].indexOf(st.period) !== -1) barPeriod = st.period;
     if (['kwh','cost','co2'].indexOf(st.metric) !== -1)       barMetric = st.metric;
     if (['totals','net'].indexOf(st.view) !== -1)              barView   = st.view;
+    if (['date','month'].indexOf(st.order) !== -1)             barMonthOrder = st.order;
     if (typeof st.calendar === 'boolean')                      barCalendar = st.calendar;
     // Restore billing period selection (bKey e.g. "2026-04-15")
     if (st.bKey) {
@@ -1548,6 +1574,12 @@ function barSyncUI() {
   });
   document.querySelectorAll('#bar-view-seg .bar-seg-btn').forEach(function(b){
     b.classList.toggle('active', b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'"+barView+"'") !== -1);
+  });
+  // Order toggle — only meaningful for the monthly view
+  var orderSeg = document.getElementById('bar-order-seg');
+  if (orderSeg) orderSeg.style.display = (barPeriod === 'monthly') ? 'inline-flex' : 'none';
+  document.querySelectorAll('#bar-order-seg .bar-seg-btn').forEach(function(b){
+    b.classList.toggle('active', b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'"+barMonthOrder+"'") !== -1);
   });
   // Sync sort button label
   var sortBtn = document.getElementById('bar-sort-btn');
@@ -1768,36 +1800,48 @@ function barGetDataForPeriod() {
   }
   if (barPeriod === 'monthly') {
     var activeYrs = barGetYears().filter(function(y){ return barActiveYears.has(y); });
+    var monthFirst = (barMonthOrder === 'month');
     var buckets = [];
     if (barCalendar) {
       activeYrs.forEach(function(y) {
         var months = [...new Set(barData.filter(function(r){return r.year===y;}).map(function(r){return r.month;}))].sort(function(a,b){return a-b;});
         months.forEach(function(m){ buckets.push({y:y,m:m}); });
       });
-      buckets.sort(function(a,b){ return a.y!==b.y ? a.y-b.y : a.m-b.m; });
+      // Month order: sort by month, then year (Jan '24, Jan '25, Jan '26, Feb '24 …).
+      // Date order: chronological (year, then month).
+      if (monthFirst) buckets.sort(function(a,b){ return a.m!==b.m ? a.m-b.m : a.y-b.y; });
+      else            buckets.sort(function(a,b){ return a.y!==b.y ? a.y-b.y : a.m-b.m; });
+      // In month order the year must always show on the axis (no legend).
+      var showYear = monthFirst || activeYrs.length > 1;
       return {
-        labels:  buckets.map(function(b){ return MONTHS_SHORT[b.m-1]+(activeYrs.length>1?' '+b.y:''); }),
-        aggList: buckets.map(function(b){ return barAggRows(function(r){ return r.year===b.y && r.month===b.m; }); })
+        labels:  buckets.map(function(b){ return MONTHS_SHORT[b.m-1]+(showYear?' '+b.y:''); }),
+        aggList: buckets.map(function(b){ return barAggRows(function(r){ return r.year===b.y && r.month===b.m; }); }),
+        bucketYears: buckets.map(function(b){ return b.y; }),
+        monthOrder: monthFirst
       };
     } else {
       var seen = {};
       barData.forEach(function(r) {
         var k = barBillingKey(r);
-        var key = k.bKey;
-        if (!seen[key]) seen[key] = key;
+        if (!seen[k.bKey]) seen[k.bKey] = true;
       });
-      buckets = Object.keys(seen).sort();
+      var keys = Object.keys(seen);
+      // Month order: sort by the billing period's start month, then the full key (year).
+      if (monthFirst) keys.sort(function(a,b){ var ma=+a.slice(5,7), mb=+b.slice(5,7); return ma!==mb ? ma-mb : a.localeCompare(b); });
+      else            keys.sort();
       return {
-        labels:  buckets.map(function(bk){
+        labels:  keys.map(function(bk){
           // Label: "Apr 2026" from first row with this bKey
           var sample = barData.find(function(r){ return barBillingKey(r).bKey===bk; });
           if (!sample) return bk.slice(0,7);
           var d = new Date(bk + 'T00:00:00Z');
           return MONTHS_SHORT[d.getUTCMonth()] + ' ' + d.getUTCFullYear();
         }),
-        aggList: buckets.map(function(bk){
+        aggList: keys.map(function(bk){
           return barAggRows(function(r){ return barBillingKey(r).bKey===bk; });
-        })
+        }),
+        bucketYears: keys.map(function(bk){ return +bk.slice(0,4); }),
+        monthOrder: monthFirst
       };
     }
   }
@@ -1864,6 +1908,9 @@ function barYLabel(v) {
 
 function barRender() {
   if (!barData) return;
+  // Order toggle (Date/Month) is only meaningful for the monthly view
+  var _orderSeg = document.getElementById('bar-order-seg');
+  if (_orderSeg) _orderSeg.style.display = (barPeriod === 'monthly') ? 'inline-flex' : 'none';
   // Show/hide standing charge toggle (cost mode only)
   var sw = document.getElementById('bar-standing-wrap');
   if (sw) sw.style.display = barMetric === 'cost' ? 'flex' : 'none';
@@ -1916,6 +1963,10 @@ function barRender() {
   // Set consistent CO2 unit for this render before building datasets or labels
   if (barMetric === 'co2') barCo2SetUnit(pd.aggList);
   var datasets = barGetDatasets(pd.labels, pd.aggList);
+  // Month order: shade each bar by its year (older lighter → newer darker) so
+  // adjacent same-month bars from different years are distinguishable. No legend
+  // is needed — the x-axis already carries the month and year.
+  if (pd.monthOrder && pd.bucketYears) barApplyYearGradient(datasets, pd.bucketYears);
   var ctx = document.getElementById('barChart');
   var wrap = document.getElementById('bar-chart-wrap');
   if (barChartInstance) { barChartInstance.destroy(); barChartInstance = null; }
@@ -2005,6 +2056,207 @@ function barBuildLegend() {
   el.innerHTML += dot(barExportColor, 'Export');
 }
 
+// ── Year gradient (month-ordered monthly view) ──────────────────────────────
+function barParseColor(col) {
+  if (typeof col !== 'string') return null;
+  col = col.trim();
+  if (col[0] === '#') {
+    var h = col.slice(1);
+    if (h.length === 3) h = h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+    if (h.length >= 6) return { r:parseInt(h.slice(0,2),16), g:parseInt(h.slice(2,4),16), b:parseInt(h.slice(4,6),16), a:1 };
+  }
+  var m = col.match(/rgba?\(([^)]+)\)/);
+  if (m) { var p = m[1].split(',').map(function(x){ return parseFloat(x); }); return { r:p[0], g:p[1], b:p[2], a:(p[3]==null?1:p[3]) }; }
+  return null;
+}
+function barMixWhite(col, t) {
+  // t in [0,1]: 0 = original colour, 1 = white
+  var c = barParseColor(col); if (!c) return col;
+  var r = Math.round(c.r + (255-c.r)*t),
+      g = Math.round(c.g + (255-c.g)*t),
+      b = Math.round(c.b + (255-c.b)*t);
+  return 'rgba(' + r + ',' + g + ',' + b + ',' + (c.a==null?1:c.a) + ')';
+}
+function barApplyYearGradient(datasets, years) {
+  var uniq = [...new Set(years)].sort(function(a,b){ return a-b; });
+  var minY = uniq[0], maxY = uniq[uniq.length-1];
+  var span = Math.max(1, maxY - minY);
+  datasets.forEach(function(ds) {
+    var base = ds.backgroundColor;
+    ds.backgroundColor = years.map(function(y, i) {
+      var c = Array.isArray(base) ? base[i] : base;   // preserve per-point colours (e.g. Net view)
+      var t = ((maxY - y) / span) * 0.6;              // oldest year lightened up to 60% toward white
+      return barMixWhite(c, t);
+    });
+  });
+}
+
+// ── Rolodex stepper for the daily period navigator ──────────────────────────
+function barStepDaily(delta) {
+  if (!delta) return;
+  if (!barCalendar) {
+    var keys = [...new Set(barData.map(function(r){ return barBillingKey(r).bKey; }))].sort();
+    if (!keys.length) return;
+    var i = keys.indexOf(barDailyMonth);
+    if (i < 0) i = keys.length - 1;
+    var ni = Math.min(keys.length - 1, Math.max(0, i + delta));
+    if (ni !== i) { barDailyMonth = keys[ni]; barSaveState(); barRender(); }
+  } else {
+    if (typeof barDailyMonth === 'string') {
+      var d = new Date(barDailyMonth + 'T00:00:00Z');
+      barDailyMonth = { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1 };
+    }
+    if (!barDailyMonth || typeof barDailyMonth !== 'object') {
+      var n = new Date(); barDailyMonth = { year: n.getFullYear(), month: n.getMonth() + 1 };
+    }
+    // Clamp to the available calendar-month range so scrolling can't run off into empty months.
+    var lo = null, hi = null;
+    barData.forEach(function(r){
+      var ym = r.year*12 + (r.month-1);
+      if (lo === null || ym < lo) lo = ym;
+      if (hi === null || ym > hi) hi = ym;
+    });
+    var cur = barDailyMonth.year*12 + (barDailyMonth.month-1);
+    var tgt = cur + delta;
+    if (lo !== null) tgt = Math.min(hi, Math.max(lo, tgt));
+    if (tgt !== cur) {
+      barDailyMonth = { year: Math.floor(tgt/12), month: (tgt%12) + 1 };
+      barSaveState(); barRender();
+    }
+  }
+}
+// Sorted list of billing-period keys present in the data.
+function barDailyKeys() {
+  return [...new Set(barData.map(function(r){ return barBillingKey(r).bKey; }))].sort();
+}
+// "3 Jul – 2 Aug 2026" style range label for a billing-period key. Self-contained
+// so the drag-preview can render any period without committing to it.
+function barBillingRangeLabel(bk) {
+  if (!bk) return '—';
+  var periodRows = barData.filter(function(r){ return barBillingKey(r).bKey === bk; });
+  if (!periodRows.length) return bk;
+  var sorted = periodRows.slice().sort(function(a,b){
+    return (a.year*10000+a.month*100+a.day)-(b.year*10000+b.month*100+b.day);
+  });
+  var first = sorted[0];
+  var fStr = first.day + ' ' + MONTHS_SHORT[first.month-1];
+  var endStr;
+  if (first.billing_period_end) {
+    var epd = new Date(first.billing_period_end + 'T00:00:00Z');
+    epd.setUTCDate(epd.getUTCDate() - 1); // exclusive→inclusive
+    endStr = epd.getUTCDate() + ' ' + MONTHS_SHORT[epd.getUTCMonth()] + ' ' + epd.getUTCFullYear();
+  } else {
+    var keys = barDailyKeys();
+    var idx = keys.indexOf(bk);
+    if (idx >= 0 && idx + 1 < keys.length) {
+      var nextD = new Date(keys[idx + 1] + 'T00:00:00Z');
+      nextD.setUTCDate(nextD.getUTCDate() - 1);
+      endStr = nextD.getUTCDate() + ' ' + MONTHS_SHORT[nextD.getUTCMonth()] + ' ' + nextD.getUTCFullYear();
+    } else {
+      var bkDate  = new Date(bk + 'T00:00:00Z');
+      var bd      = first.billing_day || barBillingDay;
+      var bkDay   = bkDate.getUTCDate();
+      var bkMonth = bkDate.getUTCMonth() + 1;
+      var bkYear  = bkDate.getUTCFullYear();
+      var endM, endY;
+      if (bkDay < bd) { endM = bkMonth; endY = bkYear; }
+      else { endM = bkMonth + 1; endY = bkYear; if (endM > 12) { endM = 1; endY++; } }
+      var endDay = bd - 1;
+      if (endDay < 1) { endM--; if (endM < 1) { endM = 12; endY--; } endDay = new Date(endY, endM, 0).getDate(); }
+      endStr = endDay + ' ' + MONTHS_SHORT[endM-1] + ' ' + endY;
+    }
+  }
+  return fStr + ' – ' + endStr;
+}
+
+// --- Rolodex scroll sensitivity -------------------------------------------
+// TRACKPAD two-finger scroll and MOUSE WHEEL both come through the `wheel`
+// handler below. It's a proportional scrubber: accumulate scroll distance and
+// move one month per BAR_WHEEL_THRESHOLD px, carrying any remainder forward, so
+// a small nudge moves one month and a longer swipe moves several — no time
+// throttle. LOWER the threshold = MORE sensitive (fewer px per month).
+// (BAR_DRAG_STEP only affects click-and-drag with the button held down.)
+var _barWheelAcc = 0;      // accumulated wheel delta (module-scope: element is recreated each render)
+var _barWheelLast = 0;     // timestamp of last wheel event (to detect a gesture pause)
+var BAR_WHEEL_THRESHOLD = 50;   // normalized px of scroll per month step (lower = more sensitive)
+var BAR_WHEEL_MAX_STEPS = 6;    // cap months moved by a single event, so a hard flick can't rocket away
+var BAR_DRAG_STEP = 44;         // px of click-drag needed per month step (does NOT affect scrolling)
+function barMakeRolodex(lbl) {
+  lbl.classList.add('bar-rolodex');
+  lbl.title = 'Scroll or drag to change period';
+  lbl.addEventListener('wheel', function(e) {
+    e.preventDefault();
+    var now = Date.now();
+    // Normalize delta to pixels: browsers report wheel in pixels (0), lines (1)
+    // or pages (2). Without this a "line mode" trackpad reports deltaY≈1–3 and
+    // any pixel threshold is meaningless.
+    var dy = e.deltaY;
+    if (e.deltaMode === 1) dy *= 16;        // lines → ~px
+    else if (e.deltaMode === 2) dy *= 100;  // pages → ~px
+    // Reset the accumulator if the direction flipped or the gesture paused.
+    if ((_barWheelAcc > 0) !== (dy > 0) || (now - _barWheelLast) > 250) _barWheelAcc = 0;
+    _barWheelLast = now;
+    _barWheelAcc += dy;
+    var n = Math.trunc(_barWheelAcc / BAR_WHEEL_THRESHOLD);   // whole months this crosses
+    if (n !== 0) {
+      _barWheelAcc -= n * BAR_WHEEL_THRESHOLD;                // carry the remainder
+      if (n >  BAR_WHEEL_MAX_STEPS) n =  BAR_WHEEL_MAX_STEPS;
+      if (n < -BAR_WHEEL_MAX_STEPS) n = -BAR_WHEEL_MAX_STEPS;
+      barStepDaily(n);                                        // one re-render for the whole event
+    }
+  }, { passive: false });
+  // Drag to scrub — the primary interaction on TOUCH (phones/tablets), which
+  // emit no wheel events. During the drag we only update the label TEXT to
+  // preview the target period (months fly by like a rolodex); the chart is
+  // re-rendered once, on release. This avoids the "one month per swipe" trap of
+  // re-rendering mid-gesture (which would replace this element and drop the
+  // pointer capture). A tap that doesn't move commits nothing.
+  var drag = null;
+  lbl.addEventListener('pointerdown', function(e) {
+    if (!barData || !barData.length) return;
+    try { lbl.setPointerCapture(e.pointerId); } catch (err) {}
+    drag = { y0: e.clientY, moved: false };
+    if (!barCalendar) {
+      drag.keys = barDailyKeys();
+      drag.base = drag.keys.indexOf(barDailyMonth);
+      if (drag.base < 0) drag.base = drag.keys.length - 1;
+      drag.tgt = drag.base;
+    } else {
+      var lo = null, hi = null;
+      barData.forEach(function(r){ var ym = r.year*12 + (r.month-1); if (lo===null||ym<lo) lo=ym; if (hi===null||ym>hi) hi=ym; });
+      var cur;
+      if (typeof barDailyMonth === 'object' && barDailyMonth) cur = barDailyMonth.year*12 + (barDailyMonth.month-1);
+      else { var n = new Date(); cur = n.getFullYear()*12 + n.getMonth(); }
+      drag.lo = lo; drag.hi = hi; drag.base = cur; drag.tgt = cur;
+    }
+  });
+  lbl.addEventListener('pointermove', function(e) {
+    if (!drag) return;
+    var offset = Math.trunc((e.clientY - drag.y0) / BAR_DRAG_STEP);  // down = forward, matches wheel
+    if (offset !== 0) drag.moved = true;
+    if (!barCalendar) {
+      drag.tgt = Math.min(drag.keys.length - 1, Math.max(0, drag.base + offset));
+      lbl.textContent = barBillingRangeLabel(drag.keys[drag.tgt]);
+    } else {
+      drag.tgt = Math.min(drag.hi, Math.max(drag.lo, drag.base + offset));
+      lbl.textContent = MONTHS_SHORT[drag.tgt % 12] + ' ' + Math.floor(drag.tgt / 12);
+    }
+  });
+  function _commit() {
+    if (!drag) return;
+    var d = drag; drag = null;
+    if (!d.moved) return;   // a tap, not a scrub — leave selection unchanged
+    if (!barCalendar) {
+      if (d.keys[d.tgt] !== barDailyMonth) { barDailyMonth = d.keys[d.tgt]; barSaveState(); barRender(); }
+    } else {
+      barDailyMonth = { year: Math.floor(d.tgt / 12), month: (d.tgt % 12) + 1 };
+      barSaveState(); barRender();
+    }
+  }
+  lbl.addEventListener('pointerup', _commit);
+  lbl.addEventListener('pointercancel', _commit);
+}
+
 function barBuildSubBar() {
   var bar = document.getElementById('bar-sub-bar');
   bar.innerHTML = '';
@@ -2020,13 +2272,10 @@ function barBuildSubBar() {
 
       var prev = document.createElement('button'); prev.className = 'bar-nav-btn'; prev.textContent = '\u2190';
       prev.disabled = (curIdx <= 0);
-      prev.onclick = function() {
-        var keys = [...new Set(barData.map(function(r){ return barBillingKey(r).bKey; }))].sort();
-        var i = keys.indexOf(barDailyMonth);
-        if (i > 0) { barDailyMonth = keys[i-1]; barSaveState(); barRender(); }
-      };
+      prev.onclick = function() { barStepDaily(-1); };
 
       var lbl = document.createElement('span'); lbl.className = 'bar-period-label';
+      barMakeRolodex(lbl);
       var periodRows = barData.filter(function(r){ return barBillingKey(r).bKey === barDailyMonth; });
       if (periodRows.length > 0 && barDailyMonth) {
         var sorted = periodRows.slice().sort(function(a,b){
@@ -2071,11 +2320,7 @@ function barBuildSubBar() {
       }
       var next = document.createElement('button'); next.className = 'bar-nav-btn'; next.textContent = '\u2192';
       next.disabled = (curIdx >= allBKeys.length - 1);
-      next.onclick = function() {
-        var keys = [...new Set(barData.map(function(r){ return barBillingKey(r).bKey; }))].sort();
-        var i = keys.indexOf(barDailyMonth);
-        if (i < keys.length - 1) { barDailyMonth = keys[i+1]; barSaveState(); barRender(); }
-      };
+      next.onclick = function() { barStepDaily(1); };
 
       bar.appendChild(prev); bar.appendChild(lbl); bar.appendChild(next);
     } else {
@@ -2085,24 +2330,13 @@ function barBuildSubBar() {
         barDailyMonth = { year: now2.getFullYear(), month: now2.getMonth() + 1 };
       }
       var prev = document.createElement('button'); prev.className = 'bar-nav-btn'; prev.textContent = '\u2190';
-      prev.onclick = function() {
-        if (typeof barDailyMonth === 'string') {
-          var d2 = new Date(barDailyMonth + 'T00:00:00Z');
-          barDailyMonth = { year: d2.getUTCFullYear(), month: d2.getUTCMonth() + 1 };
-        }
-        barDailyMonth.month--; if(barDailyMonth.month<1){barDailyMonth.month=12;barDailyMonth.year--;} barSaveState(); barRender();
-      };
+      prev.onclick = function() { barStepDaily(-1); };
       var lbl = document.createElement('span'); lbl.className = 'bar-period-label';
+      barMakeRolodex(lbl);
       var _dm = typeof barDailyMonth === 'object' ? barDailyMonth : { year: parseInt(barDailyMonth), month: parseInt(barDailyMonth.slice(5,7)) };
       lbl.textContent = MONTHS_SHORT[_dm.month-1] + ' ' + _dm.year;
       var next = document.createElement('button'); next.className = 'bar-nav-btn'; next.textContent = '\u2192';
-      next.onclick = function() {
-        if (typeof barDailyMonth === 'string') {
-          var d3 = new Date(barDailyMonth + 'T00:00:00Z');
-          barDailyMonth = { year: d3.getUTCFullYear(), month: d3.getUTCMonth() + 1 };
-        }
-        barDailyMonth.month++; if(barDailyMonth.month>12){barDailyMonth.month=1;barDailyMonth.year++;} barSaveState(); barRender();
-      };
+      next.onclick = function() { barStepDaily(1); };
       bar.appendChild(prev); bar.appendChild(lbl); bar.appendChild(next);
     }  } else {
     var lbl2 = document.createElement('span');
@@ -2436,6 +2670,7 @@ function barSetActive(segId, el) { document.querySelectorAll('#'+segId+' .bar-se
 function barSetPeriod(v, el) { barPeriod = v; barSetActive('bar-period-seg', el); barSaveState(); barRender(); }
 function barSetMetric(v, el) { barMetric = v; barSetActive('bar-metric-seg', el); barSaveState(); barRender(); }
 function barSetView(v, el)   { barView = v;   barSetActive('bar-view-seg', el);   barSaveState(); barRender(); }
+function barSetOrder(v, el)  { barMonthOrder = v; barSetActive('bar-order-seg', el); barSaveState(); barRender(); }
 function barSetCalendar(v, el) { barCalendar = v; barSetActive('bar-cal-seg', el); barSaveState(); barRender(); }
 
 if (!window.Chart) {
@@ -2471,6 +2706,13 @@ document.addEventListener('DOMContentLoaded', function() {
             });
           }
           show = false;   // the pill is superseded by the global notification
+        } else if (d.credentials_missing) {
+          // API/DCC mode is set but the stored key is gone (typically after a
+          // restore onto a fresh install; creds are not in the backup). NOT the
+          // same as "no API" - this is a broken API config the user must fix.
+          label = '⚠ API mode · credentials missing';
+          tip = 'This meter is in supplier-API/DCC mode, but no API credentials are stored — usually after restoring a backup onto a fresh install (credentials aren’t part of the backup). Import readings and settlement are paused. Re-enter your API key in Settings to resume.';
+          amber = true;
         } else if (!d.api_available) {
           // No supplier API — billing is on the local/CAD figure, never reconciled
           label = 'No API \u00b7 local billing';
