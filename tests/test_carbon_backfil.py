@@ -175,6 +175,35 @@ class TestHistoricalCarbonBackfill(unittest.TestCase):
         self.assertEqual(offloaded["n"], 1, "completion render must be offloaded")
         self.assertEqual(sync_calls["n"], 0, "must not render synchronously on the loop")
 
+    def test_backfill_preserves_imported_source_tag(self):
+        # THE root-cause regression: the carbon backfill used to round-trip the
+        # whole row (append_block_replace) and silently wipe `source` to NULL,
+        # untagging every imported block it filled. It must now write carbon IN
+        # PLACE and leave the tag intact.
+        self.st._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+            "interpolated, imp_kwh, imp_rate, imp_cost, standing_charge, "
+            "carbon_intensity_g, source) VALUES (?,?,?,?,0,?,?,?,?,NULL,'imported_api')",
+            ("2026-05-01T10:00:00", "2026-05-01T10:00:00", "electricity_main",
+             self.cp, 2.0, 0.30, 0.60, 0.50))
+        self.st._conn.commit()
+        engine._fetch_carbon_intensity_range = lambda pc, f, t: {"2026-05-01T10:00": 200.0}
+        n = asyncio.run(engine._run_historical_carbon_backfill())
+        self.assertEqual(n, 1)
+        r = self.st._conn.execute(
+            "SELECT source, carbon_intensity_g, carbon_g FROM blocks "
+            "WHERE block_start='2026-05-01T10:00:00'").fetchone()
+        self.assertEqual(r["source"], "imported_api")     # tag SURVIVES the carbon fill
+        self.assertAlmostEqual(r["carbon_intensity_g"], 200.0)
+        self.assertAlmostEqual(r["carbon_g"], round(2.0 * 200.0, 4))
+
+    def test_paused_flag_stops_recovery(self):
+        # The kill switch: while carbon_paused, the recovery sweep stands down.
+        _insert_null_block(self.st, "2026-05-01T10:00:00", 2.0, self.cp)
+        self.st.set_meta("carbon_paused", True)
+        self.assertEqual(engine._recover_missing_carbon(), 0)
+        self.assertEqual(_carbon_of(self.st, "2026-05-01T10:00:00"), (None, None))
+
     def test_run_once_marker_short_circuits(self):
         _insert_null_block(self.st, "2026-05-01T10:00:00", 2.0, self.cp)
         engine._fetch_carbon_intensity_range = lambda pc, f, t: {
@@ -243,19 +272,19 @@ class TestHistoricalCarbonBackfill(unittest.TestCase):
         _insert_null_block(self.st, "2026-05-01T10:30:00", 1.0, self.cp)
         engine._fetch_carbon_intensity_range = lambda pc, f, t: {
             "2026-05-01T10:00": 200.0, "2026-05-01T10:30": 210.0}
-        real = engine.append_block_replace
+        real = engine._persist_block_carbon    # carbon now writes IN PLACE (keeps source)
         flaky = {"calls": 0}
 
-        def _flaky(block):
+        def _flaky(block, start):
             flaky["calls"] += 1
             if flaky["calls"] == 1:        # fail the first block of the pass
                 raise RuntimeError("simulated persist failure")
-            return real(block)
-        engine.append_block_replace = _flaky
+            return real(block, start)
+        engine._persist_block_carbon = _flaky
         try:
             n1 = asyncio.run(engine._run_historical_carbon_backfill())
         finally:
-            engine.append_block_replace = real
+            engine._persist_block_carbon = real
         self.assertEqual(n1, 1)                       # one persisted, one failed
         mk = self.st.get_meta(self.MARKER)
         self.assertFalse(mk.get("done"),
