@@ -1311,7 +1311,20 @@ class TestApiCsvTemplates(unittest.TestCase):
         self.assertTrue(pend["plan"]["sites"][0]["region_editable"])
 
 
+class _InlineThread:
+    """threading.Thread stand-in that runs the target synchronously on .start(),
+    so a backgrounded delete/purge completes deterministically within the test."""
+    def __init__(self, target=None, args=(), kwargs=None, **kw):
+        self._target, self._args, self._kwargs = target, args, kwargs or {}
+    def start(self):
+        if self._target:
+            self._target(*self._args, **self._kwargs)
+
+
 class TestApiHistoricalPurge(unittest.TestCase):
+    def setUp(self):
+        server._delete_job = {"status": "idle"}
+
     def _store(self):
         store = BlockStore(":memory:")
         with store._conn:
@@ -1332,18 +1345,68 @@ class TestApiHistoricalPurge(unittest.TestCase):
         r = client.post("/api/historical/purge", json={})
         self.assertEqual(r.status_code, 400)
 
-    def test_purge_preview_and_apply(self):
+    def test_purge_runs_in_background_and_reports_done(self):
         store = self._store()
         client = make_client(store=store)
         self.assertEqual(json.loads(client.get("/api/historical/purge-preview").data)["blocks"], 1)
-        with patch("server._create_backup_zip", return_value="/tmp/b.zip"), \
+        with patch("server.threading.Thread", _InlineThread), \
+             patch("server._create_backup_zip", return_value="/tmp/b.zip"), \
              patch("server._regen_charts_safely", return_value=None):
             r = client.post("/api/historical/purge", json={"confirmed": True})
+        # Launch returns immediately with 'running'; the worker (inlined) finished.
         self.assertEqual(r.status_code, 200)
-        d = json.loads(r.data)
-        self.assertTrue(d["ok"])
-        self.assertEqual(d["blocks"], 1)
+        self.assertEqual(json.loads(r.data)["status"], "running")
+        st = json.loads(client.get("/api/blocks/delete/status").data)
+        self.assertEqual(st["status"], "done")
+        self.assertEqual(st["kind"], "purge")
+        self.assertEqual(st["result"]["blocks"], 1)
+        # Data actually purged.
         self.assertEqual(json.loads(client.get("/api/historical/purge-preview").data)["blocks"], 0)
+
+    def test_delete_range_runs_in_background(self):
+        store = self._store()
+        client = make_client(store=store)
+        with patch("server.threading.Thread", _InlineThread), \
+             patch("server._regen_charts_safely", return_value=None):
+            r = client.post("/api/blocks/delete", json={
+                "from_date": "2024-03-01", "to_date": "2024-03-01", "confirmed": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(json.loads(r.data)["status"], "running")
+        st = json.loads(client.get("/api/blocks/delete/status").data)
+        self.assertEqual(st["status"], "done")
+        self.assertEqual(st["kind"], "delete")
+        self.assertEqual(st["result"]["deleted"], 1)
+
+    def test_delete_409_when_already_running(self):
+        client = make_client(store=self._store())
+        server._delete_job = {"status": "running", "kind": "delete", "step": "deleting blocks"}
+        r = client.post("/api/blocks/delete", json={
+            "from_date": "2024-03-01", "to_date": "2024-03-01", "confirmed": True})
+        self.assertEqual(r.status_code, 409)
+        rp = client.post("/api/historical/purge", json={"confirmed": True})
+        self.assertEqual(rp.status_code, 409)
+
+
+class TestApiBackup(unittest.TestCase):
+    """Manual backup returns the filename AND its byte size, so the UI can confirm
+    'Backup ready: <name> (<size>)' (the create-backup feedback BL item)."""
+
+    def test_backup_returns_path_and_size(self):
+        import tempfile
+        client = make_client()
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tf:
+            tf.write(b"x" * 2048)
+            p = tf.name
+        try:
+            with patch("server._create_backup_zip", return_value=p):
+                r = client.post("/api/backup")
+            self.assertEqual(r.status_code, 200)
+            d = json.loads(r.data)
+            self.assertTrue(d["ok"])
+            self.assertEqual(d["path"], os.path.basename(p))
+            self.assertEqual(d["size"], 2048)
+        finally:
+            os.remove(p)
 
 
 class TestApiRegionReconcile(unittest.TestCase):
@@ -4806,6 +4869,67 @@ class TestImportGapsEndpoint(unittest.TestCase):
             self.assertEqual(j["channels"]["export"]["missing"], 144)
         finally:
             del engine.api_import_gaps
+
+
+class TestSweepImplausibleEndpoint(unittest.TestCase):
+    """#307: GET previews lost-opener device spikes (dry-run, no writes); POST
+    applies the clamp and regenerates charts."""
+
+    def setUp(self):
+        import tempfile
+        from block_store import BlockStore
+        self.tmp = tempfile.mktemp(suffix=".db")
+        s = BlockStore(self.tmp)
+        s.insert_config_period({"meters": {
+            "electricity_main": {"meta": {
+                "billing_day": 1, "block_minutes": 30, "timezone": "Europe/London",
+                "currency_symbol": "£", "currency_code": "GBP", "site": "Home"}},
+            "house_battery": {"meta": {
+                "sub_meter": True, "parent_meter": "electricity_main",
+                "device": "Solax Battery", "billing_day": 1, "block_minutes": 30,
+                "timezone": "Europe/London", "currency_symbol": "£",
+                "currency_code": "GBP"}},
+        }})
+        cp = s._conn.execute("SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+        s._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+            "imp_kwh, imp_kwh_grid, imp_cost, imp_read_start, imp_read_end, carbon_g, "
+            "carbon_intensity_g) VALUES "
+            "('2026-07-21T09:30:00','2026-07-21T10:00:00','house_battery',?,"
+            "6137.592,0.0,0.0,0.0,6137.592,859262.88,140.0)", (cp,))
+        s._conn.commit()
+        self.store = s
+        self.client = server.app.test_client()
+
+    def tearDown(self):
+        import os
+        self.store._conn.close()
+        if os.path.exists(self.tmp):
+            os.remove(self.tmp)
+
+    def test_get_previews_without_writing(self):
+        with patch.object(server, "_get_store", return_value=self.store):
+            r = self.client.get("/api/blocks/sweep-implausible")
+        d = json.loads(r.data)
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["count"], 1)
+        self.assertFalse(d["applied"])
+        self.assertAlmostEqual(self.store._conn.execute(
+            "SELECT imp_kwh FROM blocks WHERE block_start='2026-07-21T09:30:00'"
+        ).fetchone()[0], 6137.592)                       # dry-run wrote nothing
+
+    def test_post_applies_and_clamps(self):
+        with patch.object(server, "_get_store", return_value=self.store), \
+             patch.object(server, "_regen_charts_safely", return_value=None):
+            r = self.client.post("/api/blocks/sweep-implausible")
+        d = json.loads(r.data)
+        self.assertTrue(d["ok"] and d["applied"])
+        row = self.store._conn.execute(
+            "SELECT imp_kwh, carbon_g, needs_review FROM blocks "
+            "WHERE block_start='2026-07-21T09:30:00'").fetchone()
+        self.assertEqual(row["imp_kwh"], 0.0)
+        self.assertEqual(row["carbon_g"], 0.0)
+        self.assertEqual(row["needs_review"], 1)
 
 
 if __name__ == "__main__":

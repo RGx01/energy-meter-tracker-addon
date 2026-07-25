@@ -47,6 +47,14 @@
       Assistant Octopus (BottlecapDave) integration, or any other API tool — so if one of
       those is busy at the same time, the import will slow down or pause until the budget
       recovers. That's expected; just leave it running.
+      <div style="margin-top:6px;">
+        <strong>After the import, a background pricing check runs</strong> to give the
+        smart-charge (IOG) half-hours their exact off-peak price. It's rate-limited the
+        same way, so on a <strong>large multi-year history</strong> — or while other apps
+        are using the account — it can take a good while and will pause and resume on its
+        own. You don't need to wait or do anything; the pricing-health panel below shows
+        its progress and updates when it's done.
+      </div>
     </div>
     <button class="btn btn-secondary" id="btn-api-plan" onclick="planApi()">Preview plan</button>
     <button class="btn btn-secondary" id="btn-range-diag" onclick="diagnoseRange()">Check start dates</button>
@@ -85,6 +93,11 @@
          Reads /api-import/health on every load, not just right after an import. -->
     <div id="import-health" style="margin-top:12px;"></div>
 
+    <!-- Live status of the deferred pricing-verification pass (runs after an import,
+         paced + rate-limit-gated). Self-heals the off-peak/peak split with no manual
+         tool; survives navigation via poll-on-load. -->
+    <div id="verify-status" style="margin-top:10px;"></div>
+
     <div id="api-gaps-out" style="margin-top:10px;font-size:13px;"></div>
 
     <!-- Repair tools: collapsed by default — a healthy import needs none of these -->
@@ -94,25 +107,11 @@
       </summary>
       <div style="font-size:12px;color:var(--muted);line-height:1.6;margin:8px 0 10px;">
         A healthy import needs none of these — the pricing health panel above shows if anything's
-        outstanding. Each re-fetches half-hours with a <strong>calm</strong> query and re-prices them
-        from Octopus's real billed figures. Pick by <strong>what looks wrong</strong>:
+        outstanding, and offers a one-click retry for any flagged slots. This re-fetches half-hours
+        with a <strong>calm</strong> query and re-prices them from Octopus's real billed figures.
       </div>
 
-      <!-- Option 1: flagged-queue mode (no-cost slots) -->
-      <div style="margin-bottom:12px;">
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px;">
-          <button class="btn" id="btn-reprice-queue" onclick="repriceQueue()">Fix flagged slots</button>
-          <span style="color:var(--muted);">fewest requests</span>
-        </div>
-        <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-top:4px;">
-          Re-fetches only the slots the import <strong>flagged as missing a cost</strong> — smart-charged
-          (IOG) half-hours Octopus dropped, which then defaulted to the <strong>peak</strong> rate.
-          Use when <strong>dispatched charging shows as peak</strong> instead of off-peak. Leaves every
-          already-priced slot untouched.
-        </div>
-      </div>
-
-      <!-- Option 2: date-range mode (every block, flagged or not) -->
+      <!-- Date-range mode (every block, flagged or not) -->
       <div style="margin-bottom:10px;">
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px;">
           <label>From <input type="date" id="reprice-from" value="2025-10-18" style="font-size:13px;"></label>
@@ -141,7 +140,8 @@
       <div style="margin-top:12px;padding-top:10px;border-top:1px dashed var(--border);">
         <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:6px;">
           <strong>Match the bill exactly (from CSV) — last resort.</strong> Almost every slot can be
-          fixed with the two tools above. Only if a handful <em>still</em> won't price after repeated
+          fixed by the automatic verify pass, the health-panel retry, or the date-range tool above.
+          Only if a handful <em>still</em> won't price after repeated
           repair, download the Octopus consumption CSV for the affected period and upload it here to
           set each half-hour's cost straight from your bill.
         </div>
@@ -433,7 +433,7 @@ function pollStatus(){
       || d.status==='rate_limited' || d.status==='finalising');
     if(_statusTimer) clearTimeout(_statusTimer);
     if(active){ _statusTimer = setTimeout(pollStatus, 3000); }
-    else { loadImportGaps(); loadImportHealth(); }   // refresh once it settles
+    else { loadImportGaps(); loadPricingHealth(); }   // refresh once it settles
   }).catch(function(){});
 }
 
@@ -475,46 +475,152 @@ function loadImportGaps(){
   }).catch(function(){});
 }
 
-// Persistent pricing-health panel. Octopus can return a half-hour's energy but not
-// its price under load; those default to peak, get flagged, and are re-fetched
-// calmly. This shows raised → auto-recovered → still-remaining, with a one-click
-// retry for the remainder. Renders on every page load from the persisted summary.
-function loadImportHealth(){
+// Unified pricing-health card. Two checks run after an import; this shows BOTH as
+// one honest sequence so the page never looks "finished" while work continues:
+//   1 - Missing prices: Octopus can return a half-hour's energy but not its price
+//       under load; those default to peak, get flagged, and are re-fetched calmly.
+//   2 - Off-peak / peak split: a deferred, rate-limit-gated pass re-checks history
+//       (newest first) so smart-charge slots the bulk import couldn't label get their
+//       real off-peak price. Bills keep settling until this finishes.
+var _verifyTimer = null;
+function _fmtDur(s){
+  s = Math.max(0, parseInt(s,10)||0);
+  if(s < 60) return s + 's';
+  var m = Math.floor(s/60), sec = s%60;
+  if(m < 60) return m + 'm ' + sec + 's';
+  var h = Math.floor(m/60); m = m%60;
+  return h + 'h ' + m + 'm';
+}
+// Collapsed list of the day-ranges the pass actually changed, so 'corrected N' is
+// auditable (answers 'what was fixed on which days').
+function _corrHtml(list){
+  list = list || [];
+  if(!list.length) return '';
+  var rows = list.slice().reverse().map(function(c){
+    return '<div style="color:var(--muted);margin-left:2px;">'
+      + _esc((c.from||'').substr(0,10)) + ' → ' + _esc((c.to||'').substr(0,10))
+      + ' · ' + (c.repriced||0) + ' corrected</div>';
+  }).join('');
+  return '<details style="margin-top:6px;"><summary style="cursor:pointer;font-size:12px;color:var(--muted);">'
+    + 'Which days changed (' + list.length + ')</summary>'
+    + '<div style="font-size:12px;margin-top:4px;max-height:160px;overflow:auto;">' + rows + '</div></details>';
+}
+function loadPricingHealth(){
   var el = document.getElementById('import-health'); if(!el) return;
-  fetch(apiUrl('/api/historical/api-import/health')).then(function(r){return r.json();}).then(function(d){
-    if(!d || !d.have){ el.innerHTML = ''; return; }
+  var vs = document.getElementById('verify-status'); if(vs) vs.innerHTML = '';  // merged in here now
+  Promise.all([
+    fetch(apiUrl('/api/historical/api-import/health')).then(function(r){return r.json();}).catch(function(){return null;}),
+    fetch(apiUrl('/api/historical/api-import/verify-status')).then(function(r){return r.json();}).catch(function(){return null;})
+  ]).then(function(res){
+    var d = res[0] || {}, v = res[1] || {};
+    var vst = v && v.status;
+    var vActive = (vst==='running' || vst==='waiting' || vst==='paused');
+    var haveHealth = !!(d && d.have);
+    if(!haveHealth && !vActive && vst!=='done'){ el.innerHTML = ''; if(_verifyTimer){clearTimeout(_verifyTimer);_verifyTimer=null;} return; }
+
     var raised = d.raised||0, rec = d.auto_recovered||0, rem = d.remaining||0;
     var range = (d.from && d.to)
-      ? _esc((d.from||'').substr(0,10)) + ' → ' + _esc((d.to||'').substr(0,10)) : '';
-    var rows = '';
-    if(raised > 0){
-      rows += _healthRow('flag','var(--muted)',
-        raised + ' half-hour' + (raised===1?'':'s') + ' came back without a price', 'raised at import');
-      if(rec > 0) rows += _healthRow('check','#15803d',
-        rec + ' auto-recovered on the calm retry', 'done for you', 'rgba(21,128,61,0.08)');
+      ? _esc((d.from||'').substr(0,10)) + ' \u2192 ' + _esc((d.to||'').substr(0,10)) : '';
+
+    // top-right badge: the at-a-glance "is it finished?" answer
+    var badge = '';
+    if(vActive){
+      var tot0 = v.chunks_total||0, done0 = v.chunks_done||0;
+      var pct0 = tot0 ? Math.round(100*done0/tot0) : 0;
+      var lbl = (vst==='paused') ? 'Paused \u00b7 '+pct0+'%' : 'Verifying \u00b7 '+pct0+'%';
+      badge = '<span style="margin-left:auto;font-size:12px;font-weight:600;color:#b45309;'
+        + 'background:rgba(180,83,9,0.10);border-radius:999px;padding:2px 10px;">\u23f3 '+lbl+'</span>';
+    } else if(vst==='done' || (haveHealth && rem===0)){
+      badge = '<span style="margin-left:auto;font-size:12px;font-weight:600;color:#15803d;'
+        + 'background:rgba(21,128,61,0.10);border-radius:999px;padding:2px 10px;">\u2713 Up to date</span>';
     }
-    if(rem > 0){
-      rows += '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;'
-        + 'background:rgba(180,83,9,0.08);border-radius:6px;margin-top:6px;">'
-        + '<span style="color:#b45309;">●</span>'
-        + '<span style="font-size:13px;color:#b45309;">'+rem+' still need a retry</span>'
-        + '<button class="btn btn-secondary" style="margin-left:auto;font-size:12px;padding:2px 10px;" '
-        + 'onclick="repriceQueue()">Retry '+rem+'</button></div>';
-    } else if(raised > 0){
-      rows += _healthRow('check','#15803d','All prices recovered — nothing outstanding', '', 'rgba(21,128,61,0.08)');
+
+    var head = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">'
+      + '<strong style="font-size:14px;">Pricing health</strong>' + badge + '</div>'
+      + (range ? '<div style="font-size:12px;color:var(--muted);margin-bottom:8px;">'+range+'</div>' : '');
+
+    var intro = '<div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:8px;">'
+      + 'Two checks run after an import: recovering any prices Octopus dropped under load, '
+      + 'then verifying the off-peak/peak split. Recent periods are done first.</div>';
+
+    var body = '';
+
+    // ---- Step 1 - missing prices ----
+    if(haveHealth){
+      body += '<div style="font-size:12px;font-weight:600;color:var(--muted);margin:6px 0 2px;">1 \u00b7 Missing prices</div>';
+      if(raised > 0){
+        body += _healthRow('flag','var(--muted)',
+          raised + ' half-hour' + (raised===1?'':'s') + ' came back without a price', 'raised at import');
+        if(rec > 0) body += _healthRow('check','#15803d',
+          rec + ' auto-recovered on the calm retry', 'recovered', 'rgba(21,128,61,0.08)');
+        if(rem > 0){
+          body += '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;'
+            + 'background:rgba(180,83,9,0.08);border-radius:6px;margin-top:6px;">'
+            + '<span style="color:#b45309;">\u25cf</span>'
+            + '<span style="font-size:13px;color:#b45309;">'+rem+' still need a retry</span>'
+            + '<button class="btn btn-secondary" style="margin-left:auto;font-size:12px;padding:2px 10px;" '
+            + 'onclick="repriceQueue(this)">Retry '+rem+'</button></div>';
+        } else {
+          body += _healthRow('check','#15803d','All prices recovered \u2014 nothing outstanding', '', 'rgba(21,128,61,0.08)');
+        }
+      } else {
+        body += _healthRow('check','#15803d','No missing prices \u2014 every half-hour came back priced.', '', 'rgba(21,128,61,0.08)');
+      }
     }
-    var head = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">'
-      + '<strong style="font-size:14px;">Pricing health</strong>'
-      + (range ? '<span style="margin-left:auto;font-size:12px;color:var(--muted);">'+range+'</span>' : '')
-      + '</div>'
-      + '<div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:10px;">'
-      + 'Octopus sometimes returns a half-hour’s energy but not its price when many requests run '
-      + 'back-to-back. Those default to the peak rate, so we flag them and re-fetch them calmly.</div>';
+
+    // ---- Step 2 - off-peak / peak split verification ----
+    if(vActive || vst==='done'){
+      body += '<div style="font-size:12px;font-weight:600;color:var(--muted);margin:12px 0 2px;">2 \u00b7 Off-peak / peak split</div>';
+      if(vActive){
+        var tot = v.chunks_total||0, done = v.chunks_done||0;
+        var pct = tot ? Math.round(100*done/tot) : 0;
+        var per = (v.from && v.to) ? (_esc(v.from)+' \u2192 '+_esc(v.to)) : '';
+        var line = (vst==='paused')
+          ? 'Paused \u2014 Octopus API allowance is low; it will resume on its own.'
+          : (vst==='waiting')
+            ? 'Waiting for the API allowance to recover \u2014 other apps on your Octopus account share it. Resumes automatically.'
+            : 'Verifying \u2014 checking recent periods first, working back through your history.';
+        body += '<div style="border:1px solid rgba(180,83,9,0.35);border-radius:6px;padding:10px 12px;'
+          + 'background:rgba(180,83,9,0.05);margin-top:4px;">'
+          + '<div style="font-size:13px;color:#b45309;font-weight:600;">\u23f3 '+line+'</div>'
+          + '<div style="height:6px;background:rgba(127,127,127,0.15);border-radius:999px;margin:8px 0 6px;overflow:hidden;">'
+          + '<div style="height:100%;width:'+pct+'%;background:#b45309;border-radius:999px;transition:width .4s;"></div></div>'
+          + '<div style="font-size:12px;color:var(--muted);">'
+          + done+' of '+tot+' periods ('+pct+'%)' + (per?(' \u00b7 now on '+per):'')
+          + (v.repriced?(' \u00b7 '+v.repriced+' corrected so far'):'')
+          + (v.elapsed_s?(' \u00b7 '+_fmtDur(v.elapsed_s)+' elapsed'):'') + '</div>'
+          + _corrHtml(v.corrections)
+          + '<div style="font-size:12px;color:var(--muted);margin-top:6px;line-height:1.5;">'
+          + 'This is still running, so some past bills \u2014 especially smart-charge / off-peak totals like a recent monthly bill \u2014 may read high until it reaches them. '
+          + 'They correct themselves automatically. Safe to leave this page; on a large multi-year history it can take a while and will pause and resume around the API allowance.'
+          + '</div></div>';
+      } else {
+        var took = v.elapsed_s ? (' in ' + _fmtDur(v.elapsed_s)) : '';
+        var lead = v.stale ? 'Last verified' : 'Split verified';
+        body += '<div style="border:1px solid rgba(21,128,61,0.3);border-radius:6px;padding:8px 12px;'
+          + 'background:rgba(21,128,61,0.06);margin-top:4px;font-size:13px;color:#15803d;">\u2713 '
+          + (v.repriced ? (lead+' \u2014 corrected '+v.repriced+' slot'+(v.repriced===1?'':'s')+took
+                           + '. Bills across your history are now final.')
+                        : (lead+' \u2014 everything was already priced correctly'+took+'.'))
+          + '</div>' + _corrHtml(v.corrections);
+      }
+    } else if(haveHealth){
+      body += '<div style="font-size:12px;color:var(--muted);margin-top:10px;">'
+        + 'A background pricing check verifies the off-peak/peak split after each import; '
+        + 'its progress will appear here.</div>';
+    }
+
     el.innerHTML = '<div style="border:1px solid var(--border);border-radius:8px;padding:12px 14px;">'
-      + head + (rows || '<div style="font-size:13px;color:var(--muted);">No pricing issues from the last import.</div>')
-      + '</div>';
+      + head + intro + body + '</div>';
+
+    if(_verifyTimer){ clearTimeout(_verifyTimer); _verifyTimer = null; }
+    if(vActive){ _verifyTimer = setTimeout(loadPricingHealth, 4000); }
   }).catch(function(){});
 }
+// Back-compat aliases (older call sites / post-action refreshes).
+function loadImportHealth(){ loadPricingHealth(); }
+function loadVerifyStatus(){ loadPricingHealth(); }
+
 function _healthRow(icon, color, text, tag, bg){
   var mark = icon==='check' ? '✓' : '⚑';
   return '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;margin-top:6px;'
@@ -576,12 +682,14 @@ function _doStart(){
 function _repriceRun(body, btn){
   var st = document.getElementById('reprice-status');
   var out = document.getElementById('reprice-out');
-  btn.disabled = true; st.textContent = 'Re-fetching (calm, one window at a time)…'; out.innerHTML = '';
+  if(btn) btn.disabled = true;
+  st.textContent = 'Re-fetching (calm, one window at a time)…'; out.innerHTML = '';
   fetch(apiUrl('/api/historical/reprice-repair'), {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify(body)
   }).then(function(r){return r.json();}).then(function(d){
-    btn.disabled = false; st.textContent = '';
+    if(btn) btn.disabled = false;
+    st.textContent = '';
     if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(d.error||'failed')+'</span>'; return; }
     var totalTxt = (d.imported_blocks!=null)
       ? (d.imported_blocks+' imported block(s)'
@@ -614,7 +722,7 @@ function _repriceRun(body, btn){
         + '</div></details>';
     }
     out.innerHTML = html;
-  }).catch(function(e){ btn.disabled = false; st.textContent = 'Request failed: '+e; });
+  }).catch(function(e){ if(btn) btn.disabled = false; st.textContent = 'Request failed: '+e; });
 }
 
 function repricePricing(){
@@ -645,8 +753,11 @@ function repricePricing(){
   }).catch(function(e){ btn.disabled = false; st.textContent = 'Request failed: '+e; });
 }
 
-function repriceQueue(){
-  _repriceRun({}, document.getElementById('btn-reprice-queue'));   // no dates → queue mode
+function repriceQueue(btn){
+  // Queue mode (no dates). Triggered from the Pricing-health panel's "Retry N"
+  // button, which passes itself as `btn`. The old standalone "Fix flagged slots"
+  // button was retired (the verify pass + this contextual retry cover it).
+  _repriceRun({}, btn || null);
 }
 
 function repriceFromCsv(){
@@ -782,6 +893,6 @@ function doApply(){
 
 // On load: if a background API import is already running (e.g. you navigated
 // away and came back), reflect it and start polling.
-document.addEventListener('DOMContentLoaded', function(){ pollStatus(); loadImportGaps(); loadImportHealth(); });
+document.addEventListener('DOMContentLoaded', function(){ pollStatus(); loadImportGaps(); loadPricingHealth(); });
 </script>
 {% endblock %}

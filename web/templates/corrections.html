@@ -133,7 +133,7 @@ async function doManualBackup() {
     var data = await r.json();
     if (data.ok) {
       var el = document.getElementById('alert-success');
-      if (el) { el.textContent = '✓ Backup created: ' + data.path; el.classList.add('show'); setTimeout(function() { el.classList.remove('show'); }, 6000); }
+      if (el) { el.textContent = '✓ Backup ready: ' + data.path + (data.size ? ' (' + EMT.fmtBytes(data.size) + ')' : ''); el.classList.add('show'); setTimeout(function() { el.classList.remove('show'); }, 8000); }
     } else {
       var el = document.getElementById('alert-error');
       if (el) { el.textContent = '✕ ' + (data.error || 'Backup failed'); el.classList.add('show'); }

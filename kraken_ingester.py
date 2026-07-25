@@ -204,8 +204,9 @@ class KrakenIngester:
                 self.import_mpan, self.import_serial,
                 period_from=period_from, period_to=period_to)
         except Exception as e:
-            summary["errors"].append(f"import fetch failed: {e}")
-            logger.warning("poll: import fetch failed: %s", e)
+            _msg = str(e) or type(e).__name__
+            summary["errors"].append(f"import fetch failed: {_msg}")
+            logger.warning("poll: import fetch failed: %s", _msg)
             return summary
 
         summary["import_rows"] = len(rows)
@@ -339,8 +340,9 @@ class KrakenIngester:
                     except Exception as e:
                         summary["errors"].append(f"export row store: {e}")
             except Exception as e:
-                summary["errors"].append(f"export fetch failed: {e}")
-                logger.warning("poll: export fetch failed: %s", e)
+                _msg = str(e) or type(e).__name__   # some timeouts stringify empty
+                summary["errors"].append(f"export fetch failed: {_msg}")
+                logger.warning("poll: export fetch failed: %s", _msg)
 
         # Advance the cursor only on a real (non-dry) poll that saw data —
         # and only when advance_cursor is set (the retry path opts out so it

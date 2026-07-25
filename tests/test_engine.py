@@ -2945,13 +2945,15 @@ class TestRepairImportPricing(unittest.TestCase):
             "SELECT imp_rate FROM blocks WHERE block_start='2025-10-21T19:00:00'").fetchone()
         self.assertAlmostEqual(r2["imp_rate"], 0.28124)
 
-    def test_material_peak_slot_escalated_to_ladder(self):
-        # THE stubborn-split fix. A MATERIAL import slot the WIDE window re-confirms as
-        # STANDARD/peak (self-consistent peak label AND cost → window pass changes
-        # nothing) is escalated to the NARROW ladder, which proves it OFF_PEAK and
-        # reprices it — correcting the off-peak/peak split a plain range repair can't.
+    def test_refetch_window_forward_pads_past_targets(self):
+        # Regression (suspect-prefilter): the OFF_PEAK label of an IOG dispatch is
+        # only returned when the query window spans the WHOLE charge run. A lone
+        # suspect at a run's LEADING edge (later slots already off-peak → skipped)
+        # would get a window ending AT the target, cutting off the run's tail, so
+        # Octopus returns STANDARD (peak) — the exact October regression. The window
+        # must pad a day on BOTH sides of the target span, not end at the last slot.
         import asyncio
-        store = self._store()
+        store = self._store()   # imported blocks at 2025-10-21 18:30 and 19:00
         engine._store = store
         engine._kraken_discovery = {"import": {"mpan": "M"}, "export": {}}
         engine.kraken_available = lambda: True
@@ -2963,73 +2965,20 @@ class TestRepairImportPricing(unittest.TestCase):
             return None
         engine._generate_charts_offloaded = _noop_charts
 
-        client = MagicMock()
-
-        # Wide window: both slots come back STANDARD (peak) with a self-consistent
-        # peak cost (3 kWh × 0.28124) → window pass reprices to the same peak (no-op).
-        async def _meas(mpan, start, end, *, direction="CONSUMPTION"):
-            return [
-                {"start": "2025-10-21T18:30:00", "kwh": 3.0, "cost_incl": 0.84372, "off_peak": False},
-                {"start": "2025-10-21T19:00:00", "kwh": 3.0, "cost_incl": 0.84372, "off_peak": False},
-            ]
-        client.get_measurements = _meas
-
-        # Narrow ladder: proves BOTH slots OFF_PEAK with the real off-peak cost.
-        async def _recover(mpan, starts, *, direction="CONSUMPTION", pace_s=0.4):
-            return {s: {"start": s, "kwh": 3.0, "cost_incl": 0.21, "off_peak": True}
-                    for s in starts}
-        client.recover_measurement_costs = _recover
-        engine._kraken_client = client
-
-        res = asyncio.run(engine.repair_import_pricing("2025-10-21", "2025-10-22", pace_s=0))
-        self.assertTrue(res["ok"])
-        self.assertEqual(res["still_missing"], 0)
-        for bs in ("2025-10-21T18:30:00", "2025-10-21T19:00:00"):
-            r = store._conn.execute(
-                "SELECT imp_rate, imp_cost FROM blocks WHERE block_start=?", (bs,)).fetchone()
-            self.assertAlmostEqual(r["imp_rate"], 0.07)     # split corrected to off-peak
-            self.assertAlmostEqual(r["imp_cost"], 0.21)
-
-    def test_genuine_peak_material_slot_stays_peak_not_flagged_missing(self):
-        # A MATERIAL slot that IS genuinely peak: escalated to the ladder, which still
-        # returns STANDARD → repriced to the same peak (no change) and NOT counted as
-        # 'not recovered'. The escalation self-corrects a false positive for free.
-        import asyncio
-        store = self._store()
-        engine._store = store
-        engine._kraken_discovery = {"import": {"mpan": "M"}, "export": {}}
-        engine.kraken_available = lambda: True
-        engine._hist_rate_segs_cache.clear()
-        engine._hist_rate_segs_cache["import"] = [("2000-01-01T00:00:00", None, None)]
-        engine._tariff_rate_for = lambda segs, st, ofp: (0.07 if ofp else 0.28124)
-
-        async def _noop_charts():
-            return None
-        engine._generate_charts_offloaded = _noop_charts
-
+        cap = {}
         client = MagicMock()
 
         async def _meas(mpan, start, end, *, direction="CONSUMPTION"):
-            return [
-                {"start": "2025-10-21T18:30:00", "kwh": 3.0, "cost_incl": 0.84372, "off_peak": False},
-                {"start": "2025-10-21T19:00:00", "kwh": 3.0, "cost_incl": 0.84372, "off_peak": False},
-            ]
+            cap["start"], cap["end"] = start, end
+            return []
         client.get_measurements = _meas
-
-        # Ladder ALSO returns STANDARD (genuinely peak) with the peak cost.
-        async def _recover(mpan, starts, *, direction="CONSUMPTION", pace_s=0.4):
-            return {s: {"start": s, "kwh": 3.0, "cost_incl": 0.84372, "off_peak": False}
-                    for s in starts}
-        client.recover_measurement_costs = _recover
         engine._kraken_client = client
 
-        res = asyncio.run(engine.repair_import_pricing("2025-10-21", "2025-10-22", pace_s=0))
-        self.assertTrue(res["ok"])
-        self.assertEqual(res["still_missing"], 0)     # not miscounted as missing
-        for bs in ("2025-10-21T18:30:00", "2025-10-21T19:00:00"):
-            r = store._conn.execute(
-                "SELECT imp_rate FROM blocks WHERE block_start=?", (bs,)).fetchone()
-            self.assertAlmostEqual(r["imp_rate"], 0.28124)   # stays peak
+        asyncio.run(engine.repair_import_pricing("2025-10-21", "2025-10-21", pace_s=0))
+        # last target is 19:00 on the 21st → window must reach into the 22nd (tail),
+        # and back-pad before the first target into the 20th (run start).
+        self.assertGreaterEqual(cap["end"][:10], "2025-10-22")
+        self.assertLessEqual(cap["start"][:10], "2025-10-20")
 
     def test_count_only_previews_import_scope(self):
         # The confirm step: count_only returns how many blocks a run would touch,
@@ -3161,6 +3110,243 @@ class TestFinalRecoveryPass(unittest.TestCase):
         self.assertTrue(out["ran"])
         self.assertTrue(out["throttled"])
         self.assertEqual(out["still_missing"], 4)
+
+
+class TestImportHealthAndGaps(unittest.TestCase):
+    """Post-import health summary (raised/auto-recovered/remaining) persists and reads
+    back with a LIVE remaining count; persisted gaps self-clear once their slots fill."""
+
+    def setUp(self):
+        self._saved = engine._store
+
+    def tearDown(self):
+        engine._store = self._saved
+
+    def _store(self):
+        from block_store import BlockStore
+        s = BlockStore(":memory:")
+        with s._conn:
+            cp = s._conn.execute(
+                "INSERT INTO config_periods (effective_from, billing_day, block_minutes, "
+                "timezone, currency_symbol, currency_code) "
+                "VALUES ('2025-10-01T00:00:00',1,30,'Europe/London','£','GBP')").lastrowid
+            s._conn.execute(
+                "INSERT INTO meters (config_period_id, meter_id, is_sub_meter) "
+                "VALUES (?, 'electricity_main', 0)", (cp,))
+        return s, cp
+
+    def _add_block(self, s, cp, start):
+        with s._conn:
+            s._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                "imp_kwh, imp_rate, imp_cost, source) "
+                "VALUES (?,?,'electricity_main',?,1.0,0.07,0.07,'imported_api')",
+                (start, start, cp))
+
+    def test_health_persist_and_read_with_live_remaining(self):
+        s, cp = self._store()
+        engine._store = s
+        self._add_block(s, cp, "2025-10-05T00:00:00")
+        s.add_reprice_queue("import", ["2025-10-05T05:00:00", "2025-10-05T05:30:00"])
+        engine._persist_import_health(
+            {"flags_raised": 12, "auto_recovered": 10,
+             "written": {"import": 100, "export": 50}, "oldest": {}})
+        h = engine.api_import_health()
+        self.assertTrue(h["have"])
+        self.assertEqual(h["raised"], 12)
+        self.assertEqual(h["auto_recovered"], 10)
+        self.assertEqual(h["remaining"], 2)          # LIVE queue count, not the stored one
+        # Clearing the queue since the import drops remaining on the next read.
+        s.clear_reprice_queue_slots("import", ["2025-10-05T05:00:00", "2025-10-05T05:30:00"])
+        self.assertEqual(engine.api_import_health()["remaining"], 0)
+
+    def test_no_health_when_never_imported(self):
+        s, _ = self._store()
+        engine._store = s
+        self.assertFalse(engine.api_import_health()["have"])
+
+    def test_gap_self_clears_when_filled(self):
+        import json
+        s, cp = self._store()
+        engine._store = s
+        # gap A's two slots now have data → prune; gap B still missing → keep.
+        self._add_block(s, cp, "2025-10-05T02:00:00")
+        self._add_block(s, cp, "2025-10-05T02:30:00")
+        gaps = [
+            {"from": "2025-10-05T02:00:00", "to": "2025-10-05T02:30:00", "count": 2},
+            {"from": "2025-10-09T03:00:00", "to": "2025-10-09T03:30:00", "count": 2},
+        ]
+        s.set_kraken_state("import_gaps_import", json.dumps(gaps))
+        imp = engine.api_import_gaps()["channels"]["import"]
+        self.assertEqual(imp["gap_count"], 1)        # filled gap pruned
+        self.assertEqual(imp["missing"], 2)          # only the still-missing run remains
+        remaining = json.loads(s.get_kraken_state("import_gaps_import"))
+        self.assertEqual([g["from"] for g in remaining], ["2025-10-09T03:00:00"])
+
+
+class TestDeferredVerifyPricing(unittest.IsolatedAsyncioTestCase):
+    """Deferred, rate-limit-gated pricing verification: re-checks the imported span in
+    resumable chunks, waiting for the API allowance to recover, so the out-of-window
+    dispatch slots the bulk import mislabelled self-heal with no manual tool."""
+
+    def setUp(self):
+        self._saved = (engine._store, engine.kraken_available, engine._kraken_client,
+                       engine.repair_import_pricing)
+        self._vj = dict(engine._verify_job)
+
+    def tearDown(self):
+        (engine._store, engine.kraken_available, engine._kraken_client,
+         engine.repair_import_pricing) = self._saved
+        engine._verify_job.clear(); engine._verify_job.update(self._vj)
+
+    def _store(self, sfrom="2025-10-01T00:00:00", sto="2025-10-31T00:00:00"):
+        s = MagicMock()
+        s.count_imported_history.return_value = {"from": sfrom, "to": sto, "blocks": 100}
+        self._state = {}
+        s.get_kraken_state.side_effect = lambda k: self._state.get(k)
+        s.set_kraken_state.side_effect = lambda k, v: self._state.__setitem__(k, v)
+        return s
+
+    async def test_verifies_span_in_chunks_and_reports_done(self):
+        engine._store = self._store()          # 30-day span, chunk_days=15 → 2 chunks
+        engine.kraken_available = lambda: True
+        cli = MagicMock()
+        async def _rl():                       # healthy allowance
+            return {"remaining": 1000, "pointsLimit": 1000, "isBlocked": False}
+        cli.get_rate_limit = _rl
+        engine._kraken_client = cli
+        calls = []
+        async def _repair(fr, to, **kw):
+            calls.append((fr, to)); return {"recovered": 3, "checked": 50, "throttled": False}
+        engine.repair_import_pricing = _repair
+        res = await engine.run_deferred_verify_pricing(chunk_days=15, wait_s=0)
+        self.assertTrue(res["ran"])
+        self.assertEqual(engine._verify_job["status"], "done")
+        self.assertGreaterEqual(len(calls), 2)                 # split into chunks
+        self.assertEqual(engine._verify_job["repriced"], 3 * len(calls))
+        # cursor cleared on completion
+        self.assertEqual(self._state.get("verify_pricing_cursor"), "")
+
+    async def test_waits_for_allowance_then_proceeds(self):
+        engine._store = self._store("2025-10-01T00:00:00", "2025-10-10T00:00:00")  # 1 chunk
+        engine.kraken_available = lambda: True
+        cli = MagicMock()
+        seq = [True, True, False]              # low, low, then healthy
+        async def _rl():
+            blocked = seq.pop(0) if seq else False
+            return {"isBlocked": blocked, "remaining": 0 if blocked else 1000, "pointsLimit": 1000}
+        cli.get_rate_limit = _rl
+        engine._kraken_client = cli
+        ran = {"n": 0}
+        async def _repair(fr, to, **kw):
+            ran["n"] += 1; return {"recovered": 1, "checked": 10, "throttled": False}
+        engine.repair_import_pricing = _repair
+        await engine.run_deferred_verify_pricing(chunk_days=30, wait_s=0)
+        self.assertEqual(engine._verify_job["status"], "done")
+        self.assertEqual(ran["n"], 1)          # proceeded only after the allowance recovered
+
+    async def test_noop_when_nothing_imported(self):
+        s = MagicMock(); s.count_imported_history.return_value = {"from": None, "to": None}
+        engine._store = s
+        engine.kraken_available = lambda: True
+        res = await engine.run_deferred_verify_pricing()
+        self.assertFalse(res.get("ran"))
+
+    def test_status_accessor_returns_copy(self):
+        engine._verify_job.clear()
+        engine._verify_job.update({"status": "running", "chunks_done": 1})
+        snap = engine.api_verify_pricing_status()
+        snap["status"] = "mutated"
+        self.assertEqual(engine._verify_job["status"], "running")   # not mutated
+
+    async def test_records_corrections_duration_and_persists_summary(self):
+        engine._store = self._store()          # 30-day span, chunk_days=15 → 2 chunks
+        engine.kraken_available = lambda: True
+        cli = MagicMock()
+        async def _rl():
+            return {"remaining": 1000, "pointsLimit": 1000, "isBlocked": False}
+        cli.get_rate_limit = _rl
+        engine._kraken_client = cli
+        async def _repair(fr, to, **kw):
+            return {"recovered": 2, "checked": 5, "skipped": 1440, "throttled": False}
+        engine.repair_import_pricing = _repair
+        await engine.run_deferred_verify_pricing(chunk_days=15, wait_s=0)
+        j = engine._verify_job
+        self.assertEqual(j["status"], "done")
+        self.assertIn("elapsed_s", j)                       # duration captured
+        self.assertGreaterEqual(j["skipped"], 2880)         # suspect-skip surfaced
+        self.assertTrue(j["corrections"])                   # per-day-range breakdown
+        self.assertTrue(all("from" in c and "repriced" in c for c in j["corrections"]))
+        # a completion summary is persisted for after-restart display
+        self.assertIn(engine._VERIFY_SUMMARY_KEY, self._state)
+
+    def test_reset_pricing_health_clears_previous_run(self):
+        s = self._store()
+        engine._store = s
+        self._state[engine._IMPORT_HEALTH_KEY] = '{"raised": 9}'
+        self._state[engine._VERIFY_SUMMARY_KEY] = '{"repriced": 9}'
+        self._state[engine._VERIFY_CURSOR_KEY] = '2025-10-01T00:00:00'
+        engine._verify_job.clear(); engine._verify_job.update({"status": "done", "repriced": 9})
+        engine._reset_pricing_health()
+        self.assertEqual(self._state.get(engine._IMPORT_HEALTH_KEY), "")
+        self.assertEqual(self._state.get(engine._VERIFY_SUMMARY_KEY), "")
+        self.assertEqual(self._state.get(engine._VERIFY_CURSOR_KEY), "")
+        self.assertEqual(engine._verify_job["status"], "idle")
+        s.clear_reprice_queue.assert_called_once()   # queue emptied for the fresh run
+
+    def test_status_falls_back_to_persisted_summary_when_idle(self):
+        import json as _json
+        engine._verify_job.clear(); engine._verify_job.update({"status": "idle"})
+        s = MagicMock()
+        s.get_kraken_state.side_effect = lambda k: (
+            _json.dumps({"status": "done", "stale": True, "repriced": 7, "elapsed_s": 42})
+            if k == engine._VERIFY_SUMMARY_KEY else None)
+        engine._store = s
+        snap = engine.api_verify_pricing_status()
+        self.assertEqual(snap["status"], "done")
+        self.assertTrue(snap.get("stale"))
+        self.assertEqual(snap["repriced"], 7)
+
+
+class TestRepriceSuspect(unittest.TestCase):
+    """The suspect prefilter that lets the verify pass skip already-correct slots
+    (a whole-range re-query → a targeted one). A slot is worth a calm re-fetch only
+    when a re-check could actually change it: no stored cost, or a BANDED day priced
+    at the peak band with material energy (the out-of-window dispatch signature)."""
+
+    class _Seg:
+        def __init__(self, lo, hi): self._b = (lo, hi)
+        def day_rate_bounds(self, _start): return self._b
+
+    def _segs(self, lo, hi):
+        return [("2025-10-01T00:00:00", "2025-11-01T00:00:00", self._Seg(lo, hi))]
+
+    def _row(self, rate, kwh, cost, start="2025-10-15T02:00:00"):
+        return {"start": start, "imp_rate": rate, "imp_kwh": kwh, "imp_cost": cost,
+                "exp_rate": rate, "exp_kwh": kwh, "exp_cost": cost}
+
+    def test_peak_band_material_is_suspect(self):
+        segs = self._segs(0.05, 0.30)
+        self.assertTrue(engine._reprice_suspect("import", self._row(0.30, 2.5, 0.75), segs, 1.0))
+
+    def test_off_peak_slot_skipped(self):
+        segs = self._segs(0.05, 0.30)
+        self.assertFalse(engine._reprice_suspect("import", self._row(0.05, 2.5, 0.13), segs, 1.0))
+
+    def test_no_cost_always_suspect(self):
+        segs = self._segs(0.05, 0.30)
+        self.assertTrue(engine._reprice_suspect("import", self._row(0.30, 0.1, None), segs, 1.0))
+
+    def test_immaterial_kwh_skipped(self):
+        segs = self._segs(0.05, 0.30)
+        self.assertFalse(engine._reprice_suspect("import", self._row(0.30, 0.2, 0.06), segs, 1.0))
+
+    def test_flat_day_skipped(self):
+        segs = self._segs(0.30, 0.30)       # lo == hi → no peak/off-peak split
+        self.assertFalse(engine._reprice_suspect("import", self._row(0.30, 2.5, 0.75), segs, 1.0))
+
+    def test_missing_row_is_rechecked(self):
+        self.assertTrue(engine._reprice_suspect("import", None, self._segs(0.05, 0.30), 1.0))
 
 
 class TestBilledRate(unittest.TestCase):

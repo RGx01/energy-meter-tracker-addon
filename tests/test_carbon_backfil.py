@@ -297,6 +297,62 @@ class TestHistoricalCarbonBackfill(unittest.TestCase):
         self.assertTrue(self.st.get_meta(self.MARKER)["done"])
         self.assertIsNone(self.st.get_missing_carbon_date_range())
 
+    def test_straggler_refetch_fills_thin_wide_window(self):
+        # A thin/empty wide-window CI response must not strand the slot: the narrow
+        # per-day straggler refetch recovers it (the Jan 1-10 gap mechanism).
+        import datetime as _d
+        _insert_null_block(self.st, "2026-05-01T10:00:00", 2.0, self.cp)
+
+        def _fetch(pc, f, t):
+            fa = _d.datetime.fromisoformat(f.replace("Z", ""))
+            ta = _d.datetime.fromisoformat(t.replace("Z", ""))
+            if (ta - fa) <= _d.timedelta(days=1):     # narrow per-day straggler
+                return {"2026-05-01T10:00": 123.0}
+            return {}                                  # wide window comes back thin
+        engine._fetch_carbon_intensity_range = _fetch
+        n = asyncio.run(engine._run_historical_carbon_backfill(window_days=13))
+        self.assertEqual(n, 1)
+        self.assertEqual(_carbon_of(self.st, "2026-05-01T10:00:00"),
+                         (123.0, round(2.0 * 123.0, 4)))
+        self.assertTrue(self.st.get_meta(self.MARKER)["done"])
+
+    def test_unfillable_pass_sets_retry_after_not_permanent(self):
+        # Nothing comes back this pass → the marker must record a retry_after
+        # cool-down (self-healing), NOT a permanent tombstone.
+        _insert_null_block(self.st, "2026-05-01T10:00:00", 2.0, self.cp)
+        engine._fetch_carbon_intensity_range = lambda pc, f, t: {}
+        n = asyncio.run(engine._run_historical_carbon_backfill())
+        self.assertEqual(n, 0)
+        mk = self.st.get_meta(self.MARKER)
+        self.assertTrue(mk["done"])
+        self.assertIn("retry_after", mk)                  # cool-down, not permanent
+        self.assertEqual(mk["unfilled_from"], "2026-05-01T10:00:00")
+
+    def test_stuck_done_marker_rearms_when_gaps_remain(self):
+        # An OLD permanent tombstone (done + unfilled_from, no retry_after) must
+        # re-arm so the gap gets another attempt — the existing-DB self-heal.
+        engine._api_import_job = {"status": "idle"}
+        _insert_null_block(self.st, "2026-05-01T10:00:00", 2.0, self.cp)
+        self.st.set_meta(self.MARKER,
+                         {"done": True, "unfilled_from": "2026-05-01T10:00:00"})
+        engine._maybe_backfill_historical_carbon()        # no running loop → re-arm then return
+        self.assertFalse(self.st.get_meta(self.MARKER)["done"])
+
+    def test_stuck_marker_respects_retry_after_cooldown(self):
+        import datetime as _d
+        engine._api_import_job = {"status": "idle"}
+        _insert_null_block(self.st, "2026-05-01T10:00:00", 2.0, self.cp)
+        future = (_d.datetime.utcnow() + _d.timedelta(hours=6)).isoformat()
+        self.st.set_meta(self.MARKER, {"done": True,
+                         "unfilled_from": "2026-05-01T10:00:00", "retry_after": future})
+        engine._maybe_backfill_historical_carbon()
+        self.assertTrue(self.st.get_meta(self.MARKER)["done"])   # still cooling down
+        past = (_d.datetime.utcnow() - _d.timedelta(hours=1)).isoformat()
+        self.st.set_meta(self.MARKER, {"done": True,
+                         "unfilled_from": "2026-05-01T10:00:00", "retry_after": past})
+        engine._maybe_backfill_historical_carbon()
+        self.assertFalse(self.st.get_meta(self.MARKER)["done"])  # cool-down elapsed → re-arm
+
     def test_default_window_under_api_cap(self):
         # The Carbon Intensity API rejects >=14-day ranges (HTTP 400 — observed in
         # prod on an exactly-14-day window). The default must stay strictly under.

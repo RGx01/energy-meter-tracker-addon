@@ -3366,6 +3366,7 @@ def _fetch_carbon_intensity(postcode: str) -> list:
 # intensity straight onto the blocks. Gated on "postcode exists"; runs once
 # (persistent marker); resumable (cursor); throttled to sub-14-day windows.
 _CARBON_BACKFILL_MARKER = "carbon_backfill_state"   # store_meta key
+_CARBON_RETRY_HOURS = 24                             # cool-down before re-attempting gaps
 _carbon_backfill_running = False                    # in-process re-entry guard
 
 
@@ -3463,6 +3464,10 @@ async def _run_historical_carbon_backfill(window_days: int = 13,
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     import asyncio as _aio
     _now = lambda: _dt.now(_tz.utc).replace(tzinfo=None).isoformat()
+    # Cool-down before re-attempting gaps that a pass couldn't fill — so we self-heal
+    # transient CI outages without hammering the API for genuinely-absent recent data.
+    _retry_after = lambda: (_dt.now(_tz.utc).replace(tzinfo=None)
+                            + _td(hours=_CARBON_RETRY_HOURS)).isoformat()
     if _store is None:
         return 0
     postcode = _get_postcode()
@@ -3496,6 +3501,27 @@ async def _run_historical_carbon_backfill(window_days: int = 13,
     except RuntimeError:
         loop = None
 
+    def _apply_from_map(start, cmap):
+        """Match a block to the nearest CI slot in `cmap` and persist carbon in
+        place. Shared by the wide-window and the narrow per-day straggler pass.
+        Returns True if written, None if no CI slot matched (a FETCH gap the
+        straggler pass should refetch), False on a block/persist error (leave it for
+        the next pass — a narrow refetch wouldn't help)."""
+        intensity = _nearest_intensity_from_map(cmap, start)
+        if intensity is None:
+            return None
+        block = _store.get_block_dict_by_start(start)
+        if not block:
+            return False
+        _apply_intensity_to_block(block, intensity)
+        try:
+            _persist_block_carbon(block, start)
+            return True
+        except Exception as e:
+            logger.warning("_run_historical_carbon_backfill: persist failed %s: %s",
+                           start, e)
+            return False
+
     backfilled = 0
     windows = 0
     while cur_dt < hi_dt and windows < max_windows:
@@ -3528,20 +3554,36 @@ async def _run_historical_carbon_backfill(window_days: int = 13,
                 _store.set_meta(_CARBON_BACKFILL_MARKER,
                                 {"cursor": cur_dt.isoformat(), "done": False})
                 return backfilled
+            missing = []
             for start in oc_starts:
-                intensity = _nearest_intensity_from_map(ci_map, start)
-                if intensity is None:
-                    continue
-                block = _store.get_block_dict_by_start(start)
-                if not block:
-                    continue
-                _apply_intensity_to_block(block, intensity)
-                try:
-                    _persist_block_carbon(block, start)   # in place — keeps source tag
+                r = _apply_from_map(start, ci_map)
+                if r is True:
                     backfilled += 1
+                elif r is None:
+                    missing.append(start)     # fetch gap → narrow refetch below
+                # False (block/persist error) → leave for the next pass
+            # Straggler pass: a thin wide-window CI response (a transient regional
+            # outage, or a slow/partial return) leaves gaps the forward-only cursor
+            # would otherwise strand. Retry the still-NULL slots with a NARROW
+            # per-day fetch — the calmest request — which reliably returns what the
+            # 13-day window missed. Mirrors the pricing single-slot recovery.
+            for _day in sorted({s[:10] for s in missing}):
+                try:
+                    _d0 = _dt.fromisoformat(_day)
+                    df = _d0.strftime("%Y-%m-%dT00:00Z")
+                    dto = (_d0 + _td(days=1)).strftime("%Y-%m-%dT00:00Z")
+                    if loop is not None:
+                        day_map = await loop.run_in_executor(
+                            None, _fetch_carbon_intensity_range, oc, df, dto)
+                    else:
+                        day_map = _fetch_carbon_intensity_range(oc, df, dto)
                 except Exception as e:
-                    logger.warning("_run_historical_carbon_backfill: persist failed "
-                                   "%s: %s", start, e)
+                    logger.info("_run_historical_carbon_backfill: straggler refetch "
+                                "%s (%s) failed: %s", _day, oc, e)
+                    continue
+                for start in [m for m in missing if m[:10] == _day]:
+                    if _apply_from_map(start, day_map) is True:
+                        backfilled += 1
 
         cur_dt = win_end
         windows += 1
@@ -3580,9 +3622,11 @@ async def _run_historical_carbon_backfill(window_days: int = 13,
         if attempts >= 6:
             _store.set_meta(_CARBON_BACKFILL_MARKER,
                             {"done": True, "completed_at": _now(),
-                             "unfilled_from": remaining[0]})
+                             "unfilled_from": remaining[0],
+                             "retry_after": _retry_after()})
             logger.warning("_run_historical_carbon_backfill: gaps remain from %s "
-                           "after %d retries — marking done", remaining[0], attempts)
+                           "after %d rapid retries — cooling down, will re-attempt "
+                           "later", remaining[0], attempts)
         else:
             _store.set_meta(_CARBON_BACKFILL_MARKER,
                             {"cursor": remaining[0], "done": False,
@@ -3591,14 +3635,17 @@ async def _run_historical_carbon_backfill(window_days: int = 13,
                         "gaps remain from %s — will retry (%d)",
                         backfilled, remaining[0], attempts)
     else:
-        # A whole pass filled nothing yet NULL blocks remain → those slots are
-        # genuinely unattributable (no CI data). Stop to avoid an infinite retry.
+        # A whole pass filled nothing yet NULL blocks remain. Likely a transient CI
+        # outage (recent slots may not have settled; a regional window came back
+        # thin). Cool down rather than freeze forever: record retry_after so a later
+        # trigger re-attempts. Old slots almost always settle, so this self-heals.
         _store.set_meta(_CARBON_BACKFILL_MARKER,
                         {"done": True, "completed_at": _now(),
-                         "unfilled_from": remaining[0]})
+                         "unfilled_from": remaining[0],
+                         "retry_after": _retry_after()})
         logger.warning("_run_historical_carbon_backfill: span swept but NULL "
-                       "blocks remain from %s and none could be attributed — "
-                       "marking done (unfillable)", remaining[0])
+                       "blocks remain from %s and none filled this pass — cooling "
+                       "down, will re-attempt after %s", remaining[0], _retry_after())
     return backfilled
 
 
@@ -3628,13 +3675,24 @@ def _maybe_backfill_historical_carbon() -> None:
             return
         state = _store.get_meta(_CARBON_BACKFILL_MARKER, {}) or {}
         if state.get("done"):
-            if state.get("unfilled_from"):
-                return   # already concluded the remainder is unattributable
             remaining = _store.get_missing_carbon_date_range()
             if remaining is None:
-                return   # genuinely complete
-            logger.info("_maybe_backfill_historical_carbon: done marker but NULL "
-                        "carbon blocks remain from %s — re-arming", remaining[0])
+                return   # genuinely complete — no eligible NULL carbon blocks left
+            # Gaps remain. A prior pass may have tombstoned them (unfilled_from) after
+            # a transient CI outage — but old slots settle and are almost always
+            # fillable later, so we must NOT freeze forever. Re-attempt on a slow
+            # cadence: honour retry_after so we don't hammer the API for genuinely
+            # recent/absent data, but always re-arm once the cool-down has passed.
+            ra = state.get("retry_after")
+            if state.get("unfilled_from") and ra:
+                from datetime import datetime as _dt3, timezone as _tz3
+                try:
+                    if _dt3.now(_tz3.utc).replace(tzinfo=None).isoformat() < ra:
+                        return   # still cooling down; re-check after retry_after
+                except Exception:
+                    pass
+            logger.info("_maybe_backfill_historical_carbon: NULL carbon blocks remain "
+                        "from %s — re-arming (retry)", remaining[0])
             _store.set_meta(_CARBON_BACKFILL_MARKER,
                             {"cursor": remaining[0], "done": False})
         import asyncio as _aio
@@ -5301,6 +5359,44 @@ def _billed_rate(rate_segs, start, off_peak, meas_cost, kwh,
     return sched
 
 
+def _reprice_suspect(channel, row, rate_segs, min_kwh: float) -> bool:
+    """Cheap LOCAL test the suspect-only reprice uses to decide whether a re-fetch
+    could actually improve a block — so it skips slots that are already correct
+    instead of re-querying the whole range (the reason the pass ran as long as the
+    import). A block is a SUSPECT when:
+      - it has no billed cost stored (imp/exp_cost is None) — always re-check; or
+      - it's a BANDED (IOG) day AND priced at the PEAK band with material energy
+        (>= min_kwh) — the signature of an out-of-window smart-charge dispatch the
+        bulk import couldn't label off-peak.
+    Everything else — already-off-peak slots, flat/Agile days (no split to fix),
+    and immaterial (<min_kwh) slots — a re-check can't make more correct, so skip.
+    Missing row ⇒ re-check (be safe). Returns True to re-check."""
+    if row is None:
+        return True
+    imp = (channel == "import")
+    rate = row.get("imp_rate") if imp else row.get("exp_rate")
+    kwh  = (row.get("imp_kwh") if imp else row.get("exp_kwh")) or 0.0
+    cost = row.get("imp_cost") if imp else row.get("exp_cost")
+    if cost is None:
+        return True
+    if kwh < min_kwh:
+        return False
+    start = row.get("start")
+    lo = hi = None
+    for vf, vt, s in rate_segs:
+        if s is not None and start >= vf and (vt is None or start < vt):
+            try:
+                lo, hi = s.day_rate_bounds(start)
+            except Exception:
+                lo = hi = None
+            break
+    if lo is None or hi is None or lo == hi:
+        return False                      # flat / Agile day → no peak/off-peak split
+    if rate is None:
+        return True
+    return rate > (lo + hi) / 2.0          # priced at the peak band → possible dispatch
+
+
 def _import_pricing_flag(channel: str, kwh, meas_cost, buckets,
                          threshold: float = 1.0):
     """Diagnostic classifier for the IOG-dispatch pricing gap.
@@ -5772,18 +5868,11 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
     return out
 
 
-# kWh above which an import slot labelled STANDARD (peak) by a WIDE re-fetch window
-# is treated as a mislabelled IOG dispatch and escalated to the narrow single-slot
-# ladder. Genuine peak HOUSE load rarely reaches this in a half-hour; an IOG charge
-# slot is ~3–3.6 kWh (7 kW). The ladder self-corrects a false positive (a real peak
-# slot stays STANDARD), so this only costs an extra calm query on the wrong guess.
-_DISPATCH_RECHECK_KWH = 2.0
-
-
 async def repair_import_pricing(from_date=None, to_date=None, *,
                                 window_days: int = 7, pace_s: float = 1.0,
                                 max_windows: int = 400, headroom_frac: float = 0.15,
                                 channels=("import", "export"), count_only: bool = False,
+                                suspect_only: bool = False, suspect_min_kwh: float = 1.0,
                                 meter_id: str = "electricity_main") -> dict:
     """Calm, targeted re-price of imported half-hours the bulk import mispriced
     because a Measurements response came back with the kWh but an unresolved
@@ -5818,6 +5907,7 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
 
     # Resolve the per-channel target start lists.
     targets: dict = {"import": [], "export": []}
+    suspect_rows: dict = {}          # start → current pricing, for the suspect prefilter
     if from_date or to_date:
         f_iso = _ai._iso(_ai._naive_utc((from_date or "2000-01-01") + "T00:00:00Z"))
         # `to_date` is INCLUSIVE of the whole picked day → advance one day for the
@@ -5833,6 +5923,17 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
         # rate into many buckets. `channels` scopes it; default keeps both.
         targets["import"] = list(starts) if "import" in channels else []
         targets["export"] = list(starts) if "export" in channels else []
+        # Suspect-only (the auto verify pass): read each block's CURRENT pricing once
+        # so we can locally skip slots a re-fetch can't improve — turning a whole-range
+        # re-query into a targeted one. Falls back to full range if the read fails.
+        if suspect_only:
+            try:
+                for _r in _store.get_imported_block_pricing(f_iso, t_iso, meter_id):
+                    suspect_rows[_r["start"]] = _r
+            except Exception as _se:
+                logger.warning("repair_import_pricing: suspect prefilter read failed "
+                               "(%s) — running full range", _se)
+                suspect_only = False
     else:
         q = _store.get_reprice_queue()
         targets["import"] = sorted(q.get("import") or []) if "import" in channels else []
@@ -5845,7 +5946,7 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                 "count": len(targets["import"]) + len(targets["export"]),
                 "mode": ("range" if (from_date or to_date) else "queue")}
 
-    recovered = still_missing = checked = windows_done = 0
+    recovered = still_missing = checked = windows_done = skipped = 0
     still_missing_starts: list = []   # the actual slots left cost-less (inspectable)
     throttled = False                 # stopped early because the rate-limit ran low
 
@@ -5886,6 +5987,18 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
             logger.warning("repair_import_pricing: rate segs failed (%s): %s", channel, e)
             continue
 
+        # Suspect prefilter (auto verify pass): drop already-correct slots locally so
+        # the API only sees the ones a re-fetch could actually fix.
+        if suspect_only and (from_date or to_date):
+            _before = len(starts)
+            starts = [st for st in starts
+                      if _reprice_suspect(channel, suspect_rows.get(st), rate_segs, suspect_min_kwh)]
+            skipped += (_before - len(starts))
+            logger.info("repair_import_pricing[%s]: suspect prefilter %d → %d slot(s)",
+                        channel, _before, len(starts))
+            if not starts:
+                continue
+
         # Slots the window re-fetch STILL returns no cost for — retried one at a
         # time (single-slot, the calmest request) after the window pass, since the
         # probe showed an isolated single-slot query recovers what a wider window
@@ -5913,13 +6026,19 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                             "pausing after %d window(s); re-run to continue",
                             windows_done)
                 break
-            # Anchor the window a day BEFORE the first slot: the OFF_PEAK label of
-            # an IOG dispatch slot is only returned when the query window reaches
-            # back to the charging run's start (proven — the label is window-
-            # contextual and monotonic, so over-reaching is safe). Without this a
-            # slot at the leading edge of the group would come back STANDARD (peak).
+            # Pad the window a day on BOTH sides of the target span: an IOG
+            # dispatch's OFF_PEAK label is only returned when the query window spans
+            # the WHOLE charge run, not just the target slot(s). The back-pad reaches
+            # the run's start; the FORWARD pad reaches its tail. The forward pad is
+            # essential once the suspect prefilter is in play: a run's later slots may
+            # already be off-peak (so they're skipped), leaving a lone suspect at the
+            # run's LEADING edge — e.g. the 05:30 start of a 05:30–07:00 charge. Ending
+            # the window at that slot cuts off the run's continuation, and Octopus then
+            # returns STANDARD (peak) for it. Padding forward keeps the run in context.
+            # (The label is monotonic, so over-reaching is always safe; extra fetched
+            #  rows are context only — we still write just the target slots.)
             win_from = _ai._iso(_d(grp[0]) - _td2(days=1))
-            win_to = _ai._iso(_d(grp[-1]) + _td2(minutes=int(get_block_minutes() or 30)))
+            win_to = _ai._iso(_d(grp[-1]) + _td2(days=1))
             try:
                 rows = await _kraken_client.get_measurements(
                     mpan, win_from + "Z", win_to + "Z", direction=direction)
@@ -5944,17 +6063,6 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                 if _store.reprice_imported_block(st, meter_id, channel, rate, mc):
                     recovered += 1
                     fixed.append(st)
-                # Wide re-fetch windows return a self-consistent STANDARD (peak) label
-                # AND cost for an off-peak IOG dispatch charged OUTSIDE the core
-                # window, so this window pass 'confirms' the wrong peak price and
-                # changes nothing — the reason a plain date-range repair can't shift
-                # the split. A MATERIAL import slot still labelled STANDARD is almost
-                # certainly such a dispatch, so escalate it to the narrow single-slot
-                # ladder below, which reliably returns OFF_PEAK for a real dispatch
-                # (and leaves genuine peak untouched — a cheap re-check on a wrong guess).
-                if (channel == "import" and ofp is False
-                        and kwh >= _DISPATCH_RECHECK_KWH and st not in sm_starts):
-                    sm_starts.append(st)
             if fixed and not (from_date or to_date):
                 _store.clear_reprice_queue_slots(channel, fixed)
             windows_done += 1
@@ -6007,6 +6115,8 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                 info.get("blocks"), info.get("from"), info.get("to"))
     return {"ok": True, "recovered": recovered, "still_missing": still_missing,
             "checked": checked, "windows": windows_done, "remaining": remaining,
+            "skipped": skipped,       # already-correct slots the suspect prefilter dropped
+            "suspect_only": bool(suspect_only),
             "targets": n_targets, "mode": ("range" if (from_date or to_date) else "queue"),
             "throttled": throttled,   # stopped early on low rate-limit headroom
             "missing": sorted(still_missing_starts)[:200],   # inspectable leftovers
@@ -6180,7 +6290,227 @@ async def _drain_reprice_queue_after_import(j: dict | None = None,
     return out
 
 
+# ── Deferred pricing verification ─────────────────────────────────────────────
+# The bulk import mislabels the leading/trailing/one-off half-hours of an IOG
+# smart charge (an out-of-window dispatch): they come back bucket-less, get the
+# peak default, and are too small to be 'flagged' for the in-pass recovery — so a
+# fresh import leaves the off-peak/peak split slightly wrong and the only reliable
+# cure is re-checking every slot with a CALM, look-back-wide window (exactly what
+# 'Fix a date range' does). That needs a rested rate-limit allowance, which the
+# import itself has just spent — so we run it DEFERRED: after the import, in calm,
+# resumable, newest-first chunks, gated on the API allowance, so the split self-
+# heals with no user action and no manual tool. Progress is reported live.
+_VERIFY_CURSOR_KEY = "verify_pricing_cursor"     # kraken_state: oldest date still to verify
+_VERIFY_SUMMARY_KEY = "verify_pricing_summary"   # kraken_state: last completed run summary
+_verify_job: dict = {"status": "idle"}
+
+
+def _persist_verify_summary(j: dict) -> None:
+    """Persist a compact summary of the last completed verify pass so the import
+    page can show 'last verified: corrected N over <span>, took <t>' on any load —
+    including after an add-on restart clears the in-memory job."""
+    import json as _json
+    if _store is None:
+        return
+    try:
+        _store.set_kraken_state(_VERIFY_SUMMARY_KEY, _json.dumps({
+            "status": "done", "stale": True,
+            "repriced": int(j.get("repriced") or 0),
+            "checked": int(j.get("checked") or 0),
+            "skipped": int(j.get("skipped") or 0),
+            "elapsed_s": int(j.get("elapsed_s") or 0),
+            "corrections": (j.get("corrections") or [])[-60:],
+            "finished_at": j.get("finished_at"),
+        }))
+    except Exception as e:
+        logger.warning("verify pricing: persist summary failed: %s", e)
+
+
+def api_verify_pricing_status() -> dict:
+    """JSON-safe snapshot of the deferred pricing-verification pass. When no pass is
+    live (idle — e.g. after a restart), fall back to the last persisted summary so
+    the UI can still show what the previous run corrected and how long it took."""
+    import json as _json
+    if _verify_job.get("status") in (None, "idle") and _store is not None:
+        try:
+            raw = _store.get_kraken_state(_VERIFY_SUMMARY_KEY)
+            if raw:
+                return _json.loads(raw)
+        except Exception:
+            pass
+    return dict(_verify_job)
+
+
+async def _verify_allowance_low(headroom_frac: float) -> bool:
+    """True if the Octopus rate-limit allowance is too low to re-check calmly
+    (blocked, or remaining < headroom_frac × limit) — so the verify pass should
+    wait. Best-effort: a failed/absent rate-limit read is treated as 'ok to go'."""
+    try:
+        rl = await _kraken_client.get_rate_limit()
+    except Exception:
+        return False
+    if not rl:
+        return False
+    if rl.get("isBlocked"):
+        return True
+    rem, lim = rl.get("remaining"), rl.get("pointsLimit")
+    return bool(rem is not None and lim and rem < headroom_frac * lim)
+
+
+async def run_deferred_verify_pricing(*, chunk_days: int = 30, headroom_frac: float = 0.5,
+                                      wait_s: float = 60.0, max_wait_cycles: int = 120,
+                                      restart: bool = True) -> dict:
+    """Re-check the imported period's PRICING calmly, in resumable newest-first
+    chunks gated on the rate-limit allowance. Idempotent (re-pricing a correct slot
+    is a no-op). Runs on the engine loop; every await yields, so the heartbeat is
+    unaffected. `restart` resets the cursor to the newest edge (fresh pass); omit it
+    to RESUME an interrupted pass from its persisted cursor."""
+    global _verify_job
+    _asyncio = __import__("asyncio")
+    _dt = datetime
+    _td = timedelta
+    if _store is None or not kraken_available():
+        return {"ran": False}
+    try:
+        info = _store.count_imported_history() or {}
+    except Exception:
+        info = {}
+    sfrom, sto = info.get("from"), info.get("to")
+    if not sfrom or not sto:
+        return {"ran": False}
+    try:
+        lo = _dt.fromisoformat(str(sfrom)[:19])
+        hi = _dt.fromisoformat(str(sto)[:19])
+    except ValueError:
+        return {"ran": False}
+    if restart:
+        cursor = hi
+        try:
+            _store.set_kraken_state(_VERIFY_CURSOR_KEY, cursor.isoformat())
+        except Exception:
+            pass
+    else:
+        cur_raw = _store.get_kraken_state(_VERIFY_CURSOR_KEY)
+        try:
+            cursor = _dt.fromisoformat(cur_raw[:19]) if cur_raw else hi
+        except (ValueError, TypeError):
+            cursor = hi
+    total_chunks = max(1, int((hi - lo).days // chunk_days) + 1)
+    done_chunks = max(0, total_chunks - (max(1, int((cursor - lo).days // chunk_days) + 1)))
+    _t0 = __import__("time").monotonic()
+    corrections: list = []        # per-chunk {from,to,repriced} for days actually changed
+    _verify_job.clear()
+    _verify_job.update({"status": "running", "phase": "verifying",
+                        "chunks_total": total_chunks, "chunks_done": done_chunks,
+                        "repriced": 0, "checked": 0, "skipped": 0, "elapsed_s": 0,
+                        "from": None, "to": None, "corrections": [],
+                        "started_at": _dt_now_iso_safe()})
+    repriced = checked = skipped = 0
+    logger.info("verify pricing: starting over %s..%s in ~%d chunk(s)",
+                lo.date(), hi.date(), total_chunks)
+    try:
+        while cursor > lo:
+            c_to = cursor
+            c_from = max(lo, cursor - _td(days=chunk_days))
+            # Gate on the allowance — wait (yielding) until the API is calm enough.
+            waited = 0
+            while waited < max_wait_cycles and await _verify_allowance_low(headroom_frac):
+                _verify_job["status"] = "waiting"
+                _verify_job["phase"] = "waiting for API allowance to recover"
+                await _asyncio.sleep(wait_s)
+                waited += 1
+            if waited >= max_wait_cycles:
+                _verify_job["status"] = "paused"
+                _verify_job["phase"] = "paused — API allowance still low, will resume"
+                logger.info("verify pricing: paused (allowance low); cursor left at %s",
+                            cursor.isoformat())
+                return {"ran": True, "paused": True, "repriced": repriced}
+            _verify_job["status"] = "running"
+            _verify_job["phase"] = "verifying"
+            _verify_job["from"] = c_from.date().isoformat()
+            _verify_job["to"] = c_to.date().isoformat()
+            try:
+                res = await repair_import_pricing(
+                    c_from.date().isoformat(), c_to.date().isoformat(),
+                    channels=("import",), pace_s=0.4, suspect_only=True)
+            except Exception as e:
+                logger.warning("verify pricing: chunk %s..%s failed: %s",
+                               c_from.date(), c_to.date(), e)
+                res = {}
+            _cr = int(res.get("recovered") or 0)
+            _ck = int(res.get("checked") or 0)
+            _sk = int(res.get("skipped") or 0)
+            repriced += _cr; checked += _ck; skipped += _sk
+            _elapsed = int(__import__("time").monotonic() - _t0)
+            logger.info("verify pricing: %s..%s — corrected %d of %d re-checked "
+                        "(%d already-correct skipped) · %ds elapsed",
+                        c_from.date(), c_to.date(), _cr, _ck, _sk, _elapsed)
+            if res.get("throttled"):
+                # Paused mid-chunk on low headroom — do NOT advance the cursor; wait
+                # and retry the same chunk (idempotent) once the allowance recovers.
+                _verify_job.update({"status": "waiting",
+                                    "phase": "waiting for API allowance to recover",
+                                    "repriced": repriced, "checked": checked,
+                                    "skipped": skipped, "elapsed_s": _elapsed})
+                await _asyncio.sleep(wait_s)
+                continue
+            if _cr > 0:               # record only the days that actually changed
+                corrections.append({"from": c_from.date().isoformat(),
+                                    "to": c_to.date().isoformat(), "repriced": _cr})
+                corrections[:] = corrections[-60:]
+            cursor = c_from
+            try:
+                _store.set_kraken_state(_VERIFY_CURSOR_KEY, cursor.isoformat())
+            except Exception:
+                pass
+            _verify_job.update({"chunks_done": _verify_job.get("chunks_done", 0) + 1,
+                                "repriced": repriced, "checked": checked,
+                                "skipped": skipped, "elapsed_s": _elapsed,
+                                "corrections": list(corrections)})
+        try:
+            _store.set_kraken_state(_VERIFY_CURSOR_KEY, "")   # completed → clear cursor
+        except Exception:
+            pass
+        _elapsed = int(__import__("time").monotonic() - _t0)
+        _verify_job.update({"status": "done", "phase": "done",
+                            "repriced": repriced, "checked": checked, "skipped": skipped,
+                            "elapsed_s": _elapsed, "corrections": list(corrections),
+                            "finished_at": _dt_now_iso_safe()})
+        _persist_verify_summary(dict(_verify_job))
+        logger.info("verify pricing: complete — corrected %d slot(s) across %d day-range(s) "
+                    "(re-checked %d, skipped %d already-correct) in %ds",
+                    repriced, len(corrections), checked, skipped, _elapsed)
+        return {"ran": True, "repriced": repriced, "checked": checked,
+                "skipped": skipped, "elapsed_s": _elapsed}
+    except Exception as e:
+        logger.warning("verify pricing pass failed: %s", e)
+        _verify_job.update({"status": "error", "error": str(e)})
+        return {"ran": True, "error": str(e)}
+
+
 _IMPORT_HEALTH_KEY = "import_health_summary"
+
+
+def _reset_pricing_health() -> None:
+    """Clear the PREVIOUS import's pricing-health + verify state so the panel resets
+    the moment a new import starts, instead of showing stale 'raised/recovered' or a
+    'Last verified' summary from the run being replaced. The fresh run repopulates
+    everything as it goes; the reprice queue is cleared so 'still need a retry' can't
+    carry over slots the new import will re-flag itself."""
+    global _verify_job
+    if _store is None:
+        return
+    for k in (_IMPORT_HEALTH_KEY, _VERIFY_SUMMARY_KEY, _VERIFY_CURSOR_KEY):
+        try:
+            _store.set_kraken_state(k, "")
+        except Exception:
+            pass
+    try:
+        _store.clear_reprice_queue()
+    except Exception:
+        pass
+    _verify_job.clear()
+    _verify_job.update({"status": "idle"})
 
 
 def _persist_import_health(j: dict) -> None:
@@ -6333,6 +6663,7 @@ async def run_api_import_job(requested_from=None, *, chunk_days: int = 60,
               "written": {"import": 0, "export": 0}, "oldest": {},
               "flags_raised": 0, "auto_recovered": 0,
               "reason": None, "error": None, "done": False, "go_live": None})
+    _reset_pricing_health()          # clear the PREVIOUS run's health/verify panel
     first = True
     try:
         while True:
@@ -6411,6 +6742,15 @@ async def run_api_import_job(requested_from=None, *, chunk_days: int = 60,
                     _persist_import_health(j)
                 except Exception as _e:
                     logger.warning("run_api_import_job: health persist failed: %s", _e)
+                # Deferred, rate-limit-gated pricing verification: re-check the whole
+                # imported span calmly to relabel the out-of-window dispatch slots the
+                # bulk import couldn't (the small off-peak/peak-split error). Runs
+                # DETACHED on the loop so the import job reports 'done' immediately —
+                # the verify has its own live status the UI polls.
+                try:
+                    asyncio.create_task(run_deferred_verify_pricing())
+                except Exception as _e:
+                    logger.warning("run_api_import_job: verify launch failed: %s", _e)
                 j["status"] = "done"
                 j["phase"] = "done"
                 return
@@ -7352,6 +7692,13 @@ async def reconcile_dispatch_overlay() -> dict:
                       b.imp_kwh_api
                FROM blocks b
                WHERE b.meter_id = 'electricity_main' AND b.rate_corrected = 0
+                 -- NEVER reconcile IMPORTED history. Imported blocks carry Octopus's
+                 -- ACTUAL BILLED, dispatch-aware rate (the ground truth) — the local
+                 -- lifecycle heuristic ("we never saw it start → it didn't charge")
+                 -- is invalid for history EMT wasn't running for, and would revert a
+                 -- genuinely-off-peak charge to peak overnight, silently un-fixing an
+                 -- import (the 'October regressed on its own' bug).
+                 AND (b.source IS NULL OR b.source NOT LIKE 'imported%')
                  AND b.block_start < ?
                  AND EXISTS (SELECT 1 FROM dispatch_slots s
                              WHERE s.slot_start = b.block_start AND s.off_peak = 1)

@@ -531,6 +531,82 @@ class TestGraphQLQueries(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(len(c._session.post_calls), 2)          # followed the cursor
 
+    def test_recover_rung1_off_peak_stops_immediately(self):
+        # An overnight core-off-peak slot returns OFF_PEAK from the SMALL (rung-1,
+        # −1h) window, so recovery accepts it and does NOT widen — one fetch, no
+        # wide window over the dense run (a wide window there is what gets stripped).
+        slot = "2026-01-15T02:00:00"
+        c = self._client([_gql_data(_meas_page([
+            _meas_node("2026-01-15T02:00:00+00:00", "6.326", "OFF_PEAK", "34.7")]))])
+        rec = run(c.recover_measurement_costs("2600000000000", [slot], pace_s=0))
+        self.assertIn(slot, rec)
+        self.assertTrue(rec[slot]["off_peak"])
+        self.assertEqual(len(c._session.post_calls), 1)          # no widening
+        _u, body, _h, _a = c._session.post_calls[0]
+        self.assertEqual(body["variables"]["start"], "2026-01-15T01:00:00Z")  # −1h
+        self.assertEqual(body["variables"]["end"], "2026-01-15T03:00:00Z")    # +1h
+
+    def test_recover_ladder_widens_for_context(self):
+        # A morning dispatch-extended slot: rung-1 (−1h) lacks the run's start so it
+        # returns STANDARD; the ladder widens to rung-2 (−3h) which returns OFF_PEAK
+        # and wins. Proves context is recovered WITHOUT a huge window.
+        slot = "2026-01-15T08:00:00"
+        standard = _gql_data(_meas_page([
+            _meas_node("2026-01-15T08:00:00+00:00", "3.6", "STANDARD_RATE", "101.0")]))
+        offpeak = _gql_data(_meas_page([
+            _meas_node("2026-01-15T08:00:00+00:00", "3.6", "OFF_PEAK", "25.2")]))
+        c = self._client([standard, offpeak])
+        rec = run(c.recover_measurement_costs("2600000000000", [slot], pace_s=0))
+        self.assertTrue(rec[slot]["off_peak"])                    # OFF_PEAK won
+        self.assertAlmostEqual(rec[slot]["cost_incl"], 0.252, places=4)
+        self.assertEqual(len(c._session.post_calls), 2)           # widened once
+        _u, b0, _h, _a = c._session.post_calls[0]
+        _u, b1, _h, _a = c._session.post_calls[1]
+        self.assertEqual(b0["variables"]["start"], "2026-01-15T07:00:00Z")  # −1h
+        self.assertEqual(b1["variables"]["start"], "2026-01-15T05:00:00Z")  # −3h
+
+    def test_recover_omits_genuinely_empty(self):
+        # Every rung comes back empty (stripped/no cost) → the slot is omitted so
+        # the caller keeps its fallback; a price is never invented.
+        empty = lambda: _gql_data(_meas_page([
+            {"node": {"value": "3.0", "unit": "kwh",
+                      "startAt": "2026-01-15T02:00:00+00:00",
+                      "endAt": "2026-01-15T02:30:00+00:00",
+                      "metaData": {"statistics": []}}}]))
+        c = self._client([empty(), empty()])
+        rec = run(c.recover_measurement_costs(
+            "2600000000000", ["2026-01-15T02:00:00"], pace_s=0,
+            lookback_ladder=(1,), max_attempts=2))
+        self.assertEqual(rec, {})
+
+    def test_recover_opportunistic_sweep(self):
+        # ONE rung-1 window claims every pending slot it proves OFF_PEAK. Newest-
+        # first, the 08:00 window covers 07:30 too; the far-off slot needs its own
+        # fetch. Two POSTs, all three recovered — not one request per slot.
+        s1a, s1b = "2026-01-15T07:30:00", "2026-01-15T08:00:00"
+        s2 = "2026-01-10T22:30:00"
+        sweep = _gql_data(_meas_page([
+            _meas_node("2026-01-15T07:30:00+00:00", "3.6", "OFF_PEAK", "25.4"),
+            _meas_node("2026-01-15T08:00:00+00:00", "3.5", "OFF_PEAK", "25.0")]))
+        other = _gql_data(_meas_page([
+            _meas_node("2026-01-10T22:30:00+00:00", "3.1", "OFF_PEAK", "21.8")]))
+        c = self._client([sweep, other])
+        rec = run(c.recover_measurement_costs(
+            "2600000000000", [s1a, s1b, s2], pace_s=0))
+        self.assertEqual(set(rec), {s1a, s1b, s2})
+        self.assertEqual(len(c._session.post_calls), 2)   # not one-per-slot
+
+    def test_query_too_large_raises_distinct_error(self):
+        # KT-CT-1188 (complexity) / KT-CT-1189 (node count) must raise the
+        # distinct too-large error, not a generic KrakenAPIError, so the caller
+        # shrinks the window instead of pointlessly retrying.
+        from kraken_api_client import KrakenQueryTooLargeError
+        c = self._client([_gql_errors([
+            {"message": "Query exceeds maximum allowed node count",
+             "extensions": {"errorCode": "KT-CT-1189"}}])])
+        with self.assertRaises(KrakenQueryTooLargeError):
+            run(c.get_device_id())
+
     def test_parse_node_mixed_label_is_none(self):
         node = {"value": "1.0", "startAt": "2024-07-01T01:00:00+01:00",
                 "endAt": "2024-07-01T01:30:00+01:00", "metaData": {"statistics": [

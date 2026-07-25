@@ -2866,10 +2866,15 @@ def api_backup_create():
 
 @app.route("/api/backup", methods=["POST"])
 def api_backup():
-    """Create a manual backup zip of all data files."""
+    """Create a manual backup zip of all data files. Returns the filename and its
+    size so the UI can confirm 'Backup ready: <name> (<size>)'."""
     try:
         path = _create_backup_zip(label="manual")
-        return jsonify({"ok": True, "path": os.path.basename(path)})
+        try:
+            size = os.path.getsize(path)
+        except Exception:
+            size = None
+        return jsonify({"ok": True, "path": os.path.basename(path), "size": size})
     except Exception as e:
         logger.error("api_backup: %s", e)
         return jsonify({"error": str(e)}), 500
@@ -3929,6 +3934,18 @@ def api_historical_api_health():
     try:
         import engine as _eng
         return jsonify(_eng.api_import_health())
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/api-import/verify-status", methods=["GET"])
+def api_historical_verify_status():
+    """Live status of the deferred, rate-limit-gated pricing-verification pass that
+    runs after an import (chunk progress, slots corrected, waiting-for-allowance).
+    Read-only."""
+    try:
+        import engine as _eng
+        return jsonify(_eng.api_verify_pricing_status())
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -5512,12 +5529,90 @@ def api_blocks_delete_preview():
         return jsonify({"error": str(e)}), 500
 
 
+# Background delete/purge job — shared status so the UI can show a persistent
+# "Deleting... don't rebuild/restart" banner that survives navigation, exactly
+# like the restore job. Only one destructive op runs at a time (both use this).
+_delete_job = {"status": "idle"}
+
+
+def _delete_step(s):
+    _delete_job["step"] = s
+    logger.info("delete: %s", s)
+
+
+@app.route("/api/blocks/delete/status", methods=["GET"])
+def api_blocks_delete_status():
+    """Poll the background delete/purge job's progress/status."""
+    return jsonify(_delete_job)
+
+
+def _delete_worker(from_date, from_time_utc, to_date, to_time_utc,
+                   meter_id, tz_name, reconstructed_only):
+    """Background date-range delete worker (own thread; survives navigation).
+    Same store access as the old synchronous route (off the engine loop thread),
+    just with progress reported into _delete_job."""
+    _j = _delete_job
+    try:
+        _delete_step("deleting blocks")
+        store = _get_store()
+        result = store.delete_blocks_for_date_range(
+            from_date, to_date, meter_id, from_time_utc, to_time_utc,
+            tz_name, reconstructed_only)
+        # A device-only delete leaves the parent main meter's remainder stale for
+        # those windows; recompute it (PASS 2) against the surviving sub-meters.
+        if result.get("recompute_parent"):
+            try:
+                import engine as _eng
+                _delete_step("recomputing meter remainders")
+                result["remainders_recomputed"] = _eng.recompute_remainders_for_window(
+                    result["recompute_parent"], result["recompute_from"],
+                    result["recompute_to"])
+            except Exception as _re:
+                logger.error("_delete_worker: remainder recompute failed: %s", _re)
+                result["remainders_recomputed"] = 0
+        _delete_step("rebuilding charts")
+        _regen_charts_safely()
+        logger.info("_delete_worker: deleted %d blocks across %d dates "
+                    "(meter=%s)", result.get("deleted"), result.get("dates"),
+                    meter_id or "all")
+        _j.update({"status": "done", "kind": "delete", "result": result, "error": None})
+    except Exception as e:
+        logger.error("_delete_worker: %s", e)
+        _j.update({"status": "error", "error": str(e)})
+
+
+def _purge_worker():
+    """Background 'delete all imported data' worker (own thread). Backs up first,
+    purges every imported block + derivations + checkpoints, rebuilds charts."""
+    _j = _delete_job
+    try:
+        store = _get_store()
+        backup = None
+        try:
+            _delete_step("taking a safety backup")
+            backup = os.path.basename(_create_backup_zip(label="pre-purge-import"))
+        except Exception as be:
+            logger.warning("purge: backup failed (continuing): %s", be)
+        _delete_step("deleting all imported data")
+        result = store.purge_imported_history()
+        result["backup"] = backup
+        _delete_step("rebuilding charts")
+        _regen_charts_safely()
+        logger.info("_purge_worker: removed %d imported block(s) (backup=%s)",
+                    result.get("blocks"), backup)
+        _j.update({"status": "done", "kind": "purge",
+                   "result": {"ok": True, **result}, "error": None})
+    except Exception as e:
+        logger.error("_purge_worker: %s", e)
+        _j.update({"status": "error", "error": str(e)})
+
+
 @app.route("/api/blocks/delete", methods=["POST"])
 def api_blocks_delete():
     """
-    Delete blocks for a date range.
+    Delete blocks for a date range as a BACKGROUND job — returns at once so it
+    finishes even if the user navigates away. Poll /api/blocks/delete/status.
     Body: { from_date, to_date, meter_id?, confirmed: true }
-    Returns: { deleted, dates }
     """
     try:
         data      = request.get_json(force=True) or {}
@@ -5533,6 +5628,9 @@ def api_blocks_delete():
             return jsonify({"error": "from_date must not be after to_date"}), 400
         if not confirmed:
             return jsonify({"error": "confirmed must be true"}), 400
+        if _delete_job.get("status") == "running":
+            return jsonify({"error": "a delete is already running",
+                            "status": _delete_job}), 409
         # Convert local times to UTC using the configured timezone
         _cfg = load_config()
         _tz_name = "UTC"
@@ -5543,27 +5641,15 @@ def api_blocks_delete():
         from_time_utc, to_time_utc = _delete_window_to_utc_times(
             from_time, to_time, _tz_name, from_date, to_date)
         reconstructed_only = bool(data.get("reconstructed_only"))
-        store = _get_store()
-        result = store.delete_blocks_for_date_range(from_date, to_date, meter_id, from_time_utc, to_time_utc, _tz_name, reconstructed_only)
-        # A device-only delete leaves the parent main meter's remainder stale for
-        # those windows — recompute it (PASS 2) against the surviving sub-meters.
-        if result.get("recompute_parent"):
-            try:
-                import engine as _eng
-                result["remainders_recomputed"] = _eng.recompute_remainders_for_window(
-                    result["recompute_parent"], result["recompute_from"], result["recompute_to"]
-                )
-            except Exception as _re:
-                logger.error("api_blocks_delete: remainder recompute failed: %s", _re)
-                result["remainders_recomputed"] = 0
-        # Regenerate the pre-built charts so deleted blocks disappear immediately
-        # (also makes Delete blocks usable as the #260 lifetime-dump workaround).
-        _regen_charts_safely()
-        logger.info(
-            "api_blocks_delete: deleted %d blocks across %d dates (%s\u2192%s meter=%s)",
-            result["deleted"], result["dates"], from_date, to_date, meter_id or "all"
-        )
-        return jsonify(result)
+        _delete_job.clear()
+        _delete_job.update({"status": "running", "kind": "delete",
+                            "step": "starting", "result": None, "error": None})
+        threading.Thread(
+            target=_delete_worker,
+            args=(from_date, from_time_utc, to_date, to_time_utc,
+                  meter_id, _tz_name, reconstructed_only),
+            daemon=True, name="delete").start()
+        return jsonify({"ok": True, "status": "running"})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
@@ -5590,18 +5676,14 @@ def api_historical_purge():
         body = request.get_json(force=True, silent=True) or {}
         if not body.get("confirmed"):
             return jsonify({"error": "confirmation required"}), 400
-        store = _get_store()
-        backup = None
-        try:
-            backup = os.path.basename(_create_backup_zip(label="pre-purge-import"))
-        except Exception as be:
-            logger.warning("purge: backup failed (continuing): %s", be)
-        result = store.purge_imported_history()
-        result["backup"] = backup
-        _regen_charts_safely()
-        logger.info("api_historical_purge: removed %d imported block(s) (backup=%s)",
-                    result.get("blocks"), backup)
-        return jsonify({"ok": True, **result})
+        if _delete_job.get("status") == "running":
+            return jsonify({"error": "a delete is already running",
+                            "status": _delete_job}), 409
+        _delete_job.clear()
+        _delete_job.update({"status": "running", "kind": "purge",
+                            "step": "starting", "result": None, "error": None})
+        threading.Thread(target=_purge_worker, daemon=True, name="purge").start()
+        return jsonify({"ok": True, "status": "running"})
     except Exception as e:
         logger.error("api_historical_purge: %s", e)
         return jsonify({"error": str(e)}), 500

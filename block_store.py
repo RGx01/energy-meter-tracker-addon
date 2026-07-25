@@ -2384,6 +2384,11 @@ class BlockStore:
         q = self.get_reprice_queue()
         return sum(len(v or []) for v in q.values())
 
+    def clear_reprice_queue(self) -> None:
+        """Empty the whole reprice queue — used when a NEW import starts, so the
+        previous run's flagged slots don't carry over into the fresh run's health."""
+        self.set_meta("import_reprice_queue", {})
+
     def clear_reprice_queue_slots(self, channel: str, starts) -> None:
         """Remove `starts` from the channel's queue (they've been re-priced)."""
         if not starts:
@@ -2571,6 +2576,21 @@ class BlockStore:
             "AND meter_id = ? AND block_start >= ? AND block_start < ? "
             "ORDER BY block_start", (meter_id, from_iso, to_iso)).fetchall()
         return [r["block_start"] for r in rows]
+
+    def get_imported_block_pricing(self, from_iso: str, to_iso: str,
+                                   meter_id: str = "electricity_main") -> list:
+        """Per-block CURRENT pricing for IMPORTED blocks in [from, to) — the cheap
+        local read a suspect-only reprice uses to skip already-correct slots without
+        touching the API. Returns dicts: block_start + imp/exp rate, kwh, cost."""
+        rows = self._conn.execute(
+            "SELECT block_start, imp_rate, imp_kwh, imp_cost, exp_rate, exp_kwh, exp_cost "
+            "FROM blocks WHERE source LIKE 'imported%' AND meter_id = ? "
+            "AND block_start >= ? AND block_start < ? ORDER BY block_start",
+            (meter_id, from_iso, to_iso)).fetchall()
+        return [{"start": r["block_start"],
+                 "imp_rate": r["imp_rate"], "imp_kwh": r["imp_kwh"], "imp_cost": r["imp_cost"],
+                 "exp_rate": r["exp_rate"], "exp_kwh": r["exp_kwh"], "exp_cost": r["exp_cost"]}
+                for r in rows]
 
     def apply_csv_import(
         self, channel_csvs: dict, meter_id: str = "electricity_main", *,

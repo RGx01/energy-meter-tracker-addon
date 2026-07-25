@@ -189,11 +189,12 @@ async def build_rate_schedule(
             product_code, tariff_code,
             period_from=period_from, period_to=period_to)
     except Exception as e:
+        _msg = str(e) or type(e).__name__   # timeouts can stringify empty
         logger.warning("build_rate_schedule: fetch failed for %s/%s: %s",
-                       product_code, tariff_code, e)
+                       product_code, tariff_code, _msg)
         if raise_on_error:
             raise RateFetchError(
-                f"unit-rate fetch failed for {product_code}/{tariff_code}: {e}"
+                f"unit-rate fetch failed for {product_code}/{tariff_code}: {_msg}"
             ) from e
         return RateSchedule([])
     if not records:
@@ -274,7 +275,7 @@ async def build_standing_charge_schedule(
             period_from=period_from, period_to=period_to)
     except Exception as e:
         logger.warning("build_standing_charge_schedule: fetch failed for %s/%s: %s",
-                       product_code, tariff_code, e)
+                       product_code, tariff_code, str(e) or type(e).__name__)
         return RateSchedule([])
     sched = RateSchedule.from_api_records(records)
     logger.info("build_standing_charge_schedule: %s/%s → %d periods",

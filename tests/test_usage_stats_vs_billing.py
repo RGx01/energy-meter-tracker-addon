@@ -1521,5 +1521,51 @@ class TestMixedSourceBillingAgreement(unittest.TestCase):
             msg="Standing once per local day across the mode boundary")
 
 
+class TestBillingReadsIgnoreZeros(unittest.TestCase):
+    """Period Start/End meter reads must come from REAL register reads. A gap /
+    reset / register-less block that carries read 0 must not drag the displayed
+    Start/End to 0.000 — the reported bug (CAD start always 0; API export 0/0 even
+    though real export reads exist alongside a few zero-read blocks)."""
+
+    def _ins(self, store, cp, start, rs, re, kwh=1.0, cost=0.2):
+        store._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id,"
+            " imp_kwh, imp_rate, imp_cost, imp_read_start, imp_read_end) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (start, start, "electricity_main", cp, kwh, 0.2, cost, rs, re))
+        store._conn.commit()
+
+    def test_zero_reads_do_not_drag_period_boundaries(self):
+        store, cp = make_store()
+        self._ins(store, cp, "2026-06-01T00:00:00", 1000.0, 1002.0)
+        self._ins(store, cp, "2026-06-01T00:30:00", 0.0, 0.0, kwh=0.0, cost=0.0)  # gap/reset
+        self._ins(store, cp, "2026-06-01T01:00:00", 1002.0, 1005.0)
+        _s = datetime(2026, 6, 1, 0, 0); _e = datetime(2026, 6, 2, 0, 0)
+        blocks = store.get_blocks_for_range(_s, _e)
+        summary = ec.calculate_billing_summary_for_period(blocks, _s, _e, store=store)
+        imp = next((t for k, t in summary["totals"].items()
+                    if k.lower().endswith("import")
+                    and not (summary["meter_meta"].get(k) or {}).get("is_submeter")), None)
+        self.assertIsNotNone(imp)
+        self.assertEqual(imp["read_start"], 1000.0)   # min POSITIVE, not the 0 gap block
+        self.assertEqual(imp["read_end"], 1005.0)      # max, not last-wins 0
+
+    def test_all_zero_reads_leaves_none(self):
+        # A register-less source (CAD power sensor / API Measurements) carries all-0
+        # reads → no reads line at all (None), not a misleading Start/End 0.000.
+        store, cp = make_store()
+        self._ins(store, cp, "2026-06-01T00:00:00", 0.0, 0.0)
+        self._ins(store, cp, "2026-06-01T00:30:00", 0.0, 0.0)
+        _s = datetime(2026, 6, 1, 0, 0); _e = datetime(2026, 6, 2, 0, 0)
+        blocks = store.get_blocks_for_range(_s, _e)
+        summary = ec.calculate_billing_summary_for_period(blocks, _s, _e, store=store)
+        imp = next((t for k, t in summary["totals"].items()
+                    if k.lower().endswith("import")
+                    and not (summary["meter_meta"].get(k) or {}).get("is_submeter")), None)
+        self.assertIsNotNone(imp)
+        self.assertIsNone(imp["read_start"])          # nothing real → suppressed, not 0
+        self.assertIsNone(imp["read_end"])
+
+
 if __name__ == "__main__":
     unittest.main()
