@@ -951,7 +951,7 @@ function showChart(name, btn) {
       }
     }
   }
-  try { localStorage.setItem('emt_chart_tab', name); } catch(e) {}
+  try { localStorage.setItem(EMT.lsKey('emt_chart_tab'), name); } catch(e) {}
   updateToggleLabel(name);
   setTimeout(function() { _suppressResize = false; }, 200);
 }
@@ -1441,7 +1441,7 @@ function _doPdfExport(win, iconSrc) {
 
 // ── Usage Stats Bar Chart ─────────────────────────────────────────────────────
 var barData = null;
-var barSortDesc = (localStorage.getItem('emt_bar_sort_desc') !== 'false'); // default newest first
+var barSortDesc = (localStorage.getItem(EMT.lsKey('emt_bar_sort_desc')) !== 'false'); // default newest first
 var barCurrency = '£';
 var barPeriod = 'daily';
 var barMetric = 'kwh';
@@ -1469,7 +1469,7 @@ function barIncStanding() {
 function barSaveState() {
   try {
     var cb = document.getElementById('bar-standing-cb');
-    localStorage.setItem('emt_bar_state', JSON.stringify({
+    localStorage.setItem(EMT.lsKey('emt_bar_state'), JSON.stringify({
       period:   barPeriod,
       metric:   barMetric,
       view:     barView,
@@ -1484,7 +1484,7 @@ function barSaveState() {
 
 function barLoadState(availableYears) {
   try {
-    var raw = localStorage.getItem('emt_bar_state');
+    var raw = localStorage.getItem(EMT.lsKey('emt_bar_state'));
     if (!raw) return;
     var st = JSON.parse(raw);
     if (['daily','monthly','yearly'].indexOf(st.period) !== -1) barPeriod = st.period;
@@ -1826,6 +1826,10 @@ function barGetDataForPeriod() {
         if (!seen[k.bKey]) seen[k.bKey] = true;
       });
       var keys = Object.keys(seen);
+      // Respect the year filter (the toggle chips) — a billing period belongs to the
+      // year it STARTS in, which is what its axis label shows. Without this the year
+      // toggles did nothing in billing mode (they only worked in calendar mode).
+      keys = keys.filter(function(bk){ return activeYrs.indexOf(+bk.slice(0,4)) !== -1; });
       // Month order: sort by the billing period's start month, then the full key (year).
       if (monthFirst) keys.sort(function(a,b){ var ma=+a.slice(5,7), mb=+b.slice(5,7); return ma!==mb ? ma-mb : a.localeCompare(b); });
       else            keys.sort();
@@ -1855,9 +1859,9 @@ function barGetDataForPeriod() {
     } else {
       var activeYrs = barGetYears().filter(function(y){ return barActiveYears.has(y); });
       var bYears = [...new Set(barData.map(function(r){ return barBillingKey(r).bKey.slice(0,4); }))].sort();
-      bYears = bYears.filter(function(by){
-        return barData.some(function(r){ return barBillingKey(r).bKey.slice(0,4)===by && activeYrs.includes(r.year); });
-      });
+      // Keep only billing years the year filter has active (a billing period belongs
+      // to the year it starts in) — so the toggles work in billing mode too.
+      bYears = bYears.filter(function(by){ return activeYrs.indexOf(+by) !== -1; });
       return {
         labels:  bYears.map(String),
         aggList: bYears.map(function(by){
@@ -2596,7 +2600,7 @@ function barBuildTable() {
 
 function barToggleSort() {
   barSortDesc = !barSortDesc;
-  localStorage.setItem('emt_bar_sort_desc', barSortDesc ? 'true' : 'false');
+  localStorage.setItem(EMT.lsKey('emt_bar_sort_desc'), barSortDesc ? 'true' : 'false');
   var btn = document.getElementById('bar-sort-btn');
   if (btn) btn.textContent = barSortDesc ? '↓ Latest first' : '↑ Oldest first';
   var arrow = document.getElementById('bar-sort-arrow');
@@ -2761,7 +2765,7 @@ document.addEventListener('DOMContentLoaded', function() {
   // so we wait 350ms — enough for layout to be stable without feeling slow.
   setTimeout(function() {
     var saved = null;
-    try { saved = localStorage.getItem('emt_chart_tab'); } catch(e) {}
+    try { saved = localStorage.getItem(EMT.lsKey('emt_chart_tab')); } catch(e) {}
     var tabs = document.querySelectorAll('.chart-tab');
     if (saved === 'heatmap') { showChart('heatmap', tabs[1]); }
     else if (saved === 'spiral') { showChart('spiral', tabs[2]); }
@@ -2771,14 +2775,38 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 // Refresh the active chart whenever the page becomes visible again
-// (handles tab switching, browser tab focus, and ingress navigation)
-document.addEventListener('visibilitychange', function() {
-  if (document.visibilityState === 'visible') {
-    chartsLoaded = {};
-    if (_activeChart === 'bar') { barInit(); }
+// (handles tab switching, browser tab focus, and ingress navigation).
+// The refresh rebuilds the chart's DOM, which would otherwise snap scroll back
+// to the top every time you switch apps/tabs and return — so we capture the
+// scroll position first and restore it once the (async) rebuild has laid out.
+function _captureChartScroll() {
+  var bw = document.getElementById('bar-table-wrap');
+  return {
+    win: window.scrollY || document.documentElement.scrollTop || 0,
+    bar: bw ? bw.scrollTop : 0
+  };
+}
+function _restoreChartScroll(s) {
+  if (!s) return;
+  if (s.win) window.scrollTo(0, s.win);
+  var bw = document.getElementById('bar-table-wrap');
+  if (bw && s.bar) bw.scrollTop = s.bar;
+}
+document.addEventListener('visibilitychange', async function() {
+  if (document.visibilityState !== 'visible') return;
+  var _scroll = _captureChartScroll();
+  chartsLoaded = {};
+  try {
+    if (_activeChart === 'bar') { await barInit(); }
     else if (_activeChart === 'spiral') { if (window.EMTSpiral) EMTSpiral.init(); }
-    else { loadChartContent(_activeChart || 'daily'); }
-  }
+    else { await loadChartContent(_activeChart || 'daily'); }
+  } catch (e) { /* leave scroll as-is on failure */ }
+  // Restore after layout settles (rebuild + lazy day-chart render).
+  requestAnimationFrame(function() {
+    _restoreChartScroll(_scroll);
+    setTimeout(function() { _restoreChartScroll(_scroll); }, 80);
+    setTimeout(function() { _restoreChartScroll(_scroll); }, 250);
+  });
 });
 
 

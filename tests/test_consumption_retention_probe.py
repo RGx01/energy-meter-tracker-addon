@@ -418,6 +418,42 @@ class TestApiImportApply(unittest.TestCase):
         self.assertAlmostEqual(row["imp_rate"], 0.07, places=4)   # tariff schedule
         self.assertAlmostEqual(row["imp_cost"], 0.07, places=4)   # 1.0 kWh × 0.07
 
+    def test_in_pass_recovery_heals_no_cost_slot(self):
+        # The bulk fetch returns a material slot with NO cost — the empty-statistics
+        # signature Octopus emits under load. In-pass recovery re-fetches it in an
+        # isolated single-slot query and gets the real OFF_PEAK billed cost, so the
+        # block is priced from the EXACT figure (0.21), not the schedule fallback
+        # (1.0kWh × 0.07 = 0.07). And having healed it, it is NOT queued for repair.
+        class _RecoverClient(_FakeMeasClient):
+            async def recover_measurement_costs(self, mpan, starts, *,
+                                                direction="CONSUMPTION",
+                                                pace_s=0.4, **kw):
+                node = {"start": "2024-07-01T00:00:00", "kwh": 1.0,
+                        "cost_incl": 0.21, "off_peak": True}
+                return {s: node for s in starts if s == node["start"]}
+
+        engine._kraken_client = _RecoverClient(
+            [_iv("2024-07-01T00:00:00", 1.0, None, off_peak=None)])   # cost=None
+        asyncio.run(engine.import_api_history(restart=True, max_chunks=6, pace_s=0))
+        row = self.store._conn.execute(
+            "SELECT imp_cost, imp_rate FROM blocks "
+            "WHERE source='imported_api'").fetchone()
+        self.assertAlmostEqual(row["imp_cost"], 0.21, places=4)   # exact billed, recovered
+        # healed → nothing left in the reprice queue for a later pass
+        self.assertFalse(self.store.get_reprice_queue().get("import"))
+
+    def test_recovery_disabled_leaves_schedule_price(self):
+        # With recover_costs=False the no-cost slot stays schedule-priced and is
+        # queued for the repair pass — proving recovery is what changes the outcome.
+        engine._kraken_client = _FakeMeasClient(
+            [_iv("2024-07-01T00:00:00", 1.0, None, off_peak=None)])
+        asyncio.run(engine.import_api_history(
+            restart=True, max_chunks=6, pace_s=0, recover_costs=False))
+        row = self.store._conn.execute(
+            "SELECT imp_cost FROM blocks WHERE source='imported_api'").fetchone()
+        self.assertAlmostEqual(row["imp_cost"], 0.07, places=4)   # schedule fallback
+        self.assertTrue(self.store.get_reprice_queue().get("import"))
+
     def test_dry_run_writes_nothing(self):
         engine._kraken_client = _FakeMeasClient(self._contig())
         r = asyncio.run(engine.import_api_history(dry_run=True))

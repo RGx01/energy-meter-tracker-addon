@@ -647,20 +647,27 @@ document.addEventListener('DOMContentLoaded', pollRestoreStatus);
 // ── Backup ────────────────────────────────────────────────────────────────────
 async function doManualBackup() {
   var btn = document.getElementById('btn-backup') || document.getElementById('btn-backup2');
+  var el  = document.getElementById('alert-success');
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Backing up...'; }
+  // In-flight banner, same style as restore/delete — so the user sees it working,
+  // not just the result. (Backup is a quick synchronous copy, so no polling needed.)
+  if (el) { el.innerHTML = '⏳ <strong>Creating backup…</strong> copying the database — this only takes a moment.'; el.classList.add('show'); }
   try {
     var r    = await fetch(apiUrl('/api/backup'), { method: 'POST' });
     var data = await r.json();
     if (data.ok) {
-      const el = document.getElementById('alert-success');
-      el.textContent = '✓ Backup created: ' + data.path;
-      el.classList.add('show');
-      setTimeout(function() { el.classList.remove('show'); }, 6000);
+      if (el) {
+        el.textContent = '✓ Backup ready: ' + data.path + (data.size ? ' (' + EMT.fmtBytes(data.size) + ')' : '');
+        el.classList.add('show');
+        setTimeout(function() { el.classList.remove('show'); }, 8000);
+      }
       loadBackupList();
     } else {
+      if (el) el.classList.remove('show');
       showError(data.error || 'Backup failed');
     }
   } catch(e) {
+    if (el) el.classList.remove('show');
     showError(e.message);
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '💾 Backup Now'; }

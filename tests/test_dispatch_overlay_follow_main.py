@@ -535,6 +535,34 @@ class TestReconcilePass(unittest.IsolatedAsyncioTestCase):
                              ("2020-01-01T20:00:00",)).fetchone()
         self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)  # untouched
 
+    async def test_skip_imported_block(self):
+        # THE 'October regressed overnight' bug. An IMPORTED block priced off-peak
+        # from Octopus's ACTUAL BILLED cost, with a planned-only dispatch record
+        # (EMT was not running then, so it never saw the charge start/complete), must
+        # NOT be reverted to peak — the billed rate is ground truth. Contrast
+        # test_revert_non_charging_slot, where the same shape WITHOUT an imported
+        # source IS reverted.
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        st._conn.execute(
+            "INSERT OR IGNORE INTO config_periods (id, effective_from, billing_day, "
+            "block_minutes, timezone) VALUES (1, '2020-01-01T00:00:00', 1, 30, 'UTC')")
+        st._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+            "imp_kwh, imp_rate, rate_corrected, imp_kwh_api, source) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            ("2020-01-01T20:00:00", "2020-01-01T20:00:00", "electricity_main", 1,
+             1.0, 0.05493, 0, 1.0, "imported_api"))
+        st.upsert_dispatch_slot("2020-01-01T20:00:00", off_peak=True,
+                                provider="Myenergi", source="smart-charge", state="planned")
+        st.record_dispatch_history("2020-01-01T20:00:00", "planned", provider="Myenergi")
+        st._conn.commit()
+        res = await self._run(st)
+        self.assertEqual(res["reverted"], 0)                 # imported block untouched
+        r = st._conn.execute("SELECT imp_rate FROM blocks WHERE block_start=?",
+                             ("2020-01-01T20:00:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)  # billed off-peak preserved
+
     async def test_skip_pre_accumulation_slot(self):
         from block_store import BlockStore
         st = BlockStore(":memory:")

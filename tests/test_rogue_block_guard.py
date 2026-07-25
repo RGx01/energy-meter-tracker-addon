@@ -186,5 +186,49 @@ class TestSubMeterRogueBlockGuard(unittest.TestCase):
             ch, is_sub_meter=True, meter_id="battery", channel_id="import")["kwh"], 0.0)
 
 
+class TestPass2PlausibilityGuard(unittest.TestCase):
+    """#307: the write-point guard in _apply_pass2 clamps a physically-impossible
+    sub-meter delta IMMEDIATELY — even on an unsettled/interpolated gap block that
+    bypasses compute_channel and where the old PASS-2 grid clip would defer. This is
+    the exact prod incident: house_battery 0 → 6137 kWh booked during a power cut."""
+
+    def _block(self, sub_kwh, sub_read_end, grid_kwh, *, interpolated=True,
+               settled=False):
+        return {
+            "interpolated": interpolated,
+            "meters": {
+                "electricity_main": {
+                    "meta": {"block_minutes": 30},
+                    "imp_kwh_api": (grid_kwh if settled else None),
+                    "channels": {"import": {"kwh": grid_kwh, "rate": 0.30}},
+                },
+                "house_battery": {
+                    "meta": {"sub_meter": True, "parent_meter": "electricity_main",
+                             "block_minutes": 30, "meter_type": "battery"},
+                    "channels": {"import": {"kwh": sub_kwh, "read_end": sub_read_end,
+                                            "rate": 0.30}},
+                },
+            },
+        }
+
+    def test_clamps_impossible_delta_even_when_unsettled(self):
+        blk = self._block(6137.592, 6137.592, grid_kwh=0.0,
+                          interpolated=True, settled=False)   # deferral condition
+        engine._apply_pass2(blk)
+        sub = blk["meters"]["house_battery"]["channels"]["import"]
+        self.assertEqual(sub["kwh"], 0.0)                     # clamped despite unsettled
+        self.assertEqual(sub["kwh_grid"], 0.0)
+        self.assertEqual(sub["read_start"], 6137.592)         # register baselined
+        self.assertTrue(blk["meters"]["house_battery"].get("needs_review"))
+
+    def test_legitimate_device_draw_untouched(self):
+        blk = self._block(2.8, 6317.5, grid_kwh=3.0)
+        engine._apply_pass2(blk)
+        sub = blk["meters"]["house_battery"]["channels"]["import"]
+        self.assertAlmostEqual(sub["kwh"], 2.8)               # real draw kept
+        self.assertNotIn("read_start", sub)                   # not baselined
+        self.assertIsNone(blk["meters"]["house_battery"].get("needs_review"))
+
+
 if __name__ == "__main__":
     unittest.main()

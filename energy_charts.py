@@ -2408,6 +2408,10 @@ body {{
 .chart-container {{
   flex: 1 1 0;
   min-width: 0;
+  /* Reserve the day-chart height BEFORE it's lazily built, so a chart that
+     materialises above the viewport (scrolling up) doesn't grow from ~0 and shove
+     the scroll position. Matches the built layout height floor below. */
+  min-height: 320px;
 }}
 /* ── Day data table ───────────────────────────── */
 .day-chart-wrap {{ flex-wrap: wrap; }}
@@ -2698,9 +2702,13 @@ function _buildDayChart(chartId) {{
     yaxis2: {{title:cur+'/kWh', overlaying:'y', side:'right', showgrid:false, titlefont:{{size:11,color:tc.axisC}}, tickfont:{{color:tc.axisC}}}},
     legend: {{orientation:'h', x:0.5, xanchor:'center', y:-0.28, yanchor:'top', font:{{size:11,color:tc.axisC}}}}
   }};
-  var wrap = el.closest('.day-chart-wrap');
-  var wrapH = wrap ? wrap.offsetHeight : 0;
-  layout.height = Math.max(wrapH > 0 ? wrapH : 0, 320);
+  // Build to the CONTAINER's own (reserved) height — not the whole wrap. The wrap
+  // also includes the full-width data tables below the chart, so measuring it made
+  // the built chart overshoot AND, because the empty container had no reserved
+  // height, the wrap grew when the chart appeared — the scroll-jump on lazy build.
+  // The container carries min-height:320, so this is a stable 320 before and after.
+  var elH = el.offsetHeight;
+  layout.height = Math.max(elH > 0 ? elH : 0, 320);
 
   function _alignY2() {{
     var y1range = el._fullLayout.yaxis.range;

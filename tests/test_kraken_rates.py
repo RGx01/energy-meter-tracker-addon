@@ -156,5 +156,74 @@ class TestNewIOGTariffFallback(unittest.TestCase):
         self.assertTrue(sched.is_empty())   # guard territory
 
 
+class _FakeRateClient:
+    """Stand-in exposing get_unit_rates with controllable per-bucket behaviour."""
+
+    def __init__(self, standard=None, day=None, night=None,
+                 raise_std=False, raise_dn=False):
+        self.standard, self.day, self.night = standard, day, night
+        self.raise_std, self.raise_dn = raise_std, raise_dn
+
+    async def get_unit_rates(self, product, tariff, *,
+                             rate_type="standard-unit-rates",
+                             period_from=None, period_to=None):
+        if rate_type == "standard-unit-rates":
+            if self.raise_std:
+                raise RuntimeError("boom (standard)")
+            return self.standard or []
+        if self.raise_dn:
+            raise RuntimeError("boom (day/night)")
+        if rate_type == "day-unit-rates":
+            return self.day or []
+        if rate_type == "night-unit-rates":
+            return self.night or []
+        return []
+
+
+_REC = [{"value_inc_vat": 5.0, "valid_from": "2026-07-01T00:00:00Z",
+         "valid_to": None}]
+
+
+class TestBuildRateScheduleFetchErrors(unittest.TestCase):
+    """A FAILED rate fetch must be distinguishable from a genuinely-empty one, so
+    the caller doesn't mislabel a transient API failure as 'tariff unsupported'."""
+
+    def test_success_returns_schedule(self):
+        s = run(build_rate_schedule(_FakeRateClient(standard=_REC), "P",
+                                    "E-1R-P-A", raise_on_error=True))
+        self.assertFalse(s.is_empty())
+
+    def test_fetch_error_raises_when_requested(self):
+        from kraken_rates import RateFetchError
+        with self.assertRaises(RateFetchError):
+            run(build_rate_schedule(_FakeRateClient(raise_std=True), "P",
+                                    "E-1R-P-A", raise_on_error=True))
+
+    def test_fetch_error_returns_empty_by_default(self):
+        # Default (raise_on_error=False) keeps the graceful-empty behaviour that
+        # pricing/drain callers rely on.
+        s = run(build_rate_schedule(_FakeRateClient(raise_std=True), "P",
+                                    "E-1R-P-A"))
+        self.assertTrue(s.is_empty())
+
+    def test_genuinely_empty_returns_empty_without_raising(self):
+        # Standard empty AND day/night empty = a real unsupported tariff: empty
+        # schedule, NOT an error.
+        s = run(build_rate_schedule(_FakeRateClient(standard=[], day=[], night=[]),
+                                    "P", "E-1R-P-A", raise_on_error=True))
+        self.assertTrue(s.is_empty())
+
+    def test_daynight_fallback_error_raises(self):
+        from kraken_rates import RateFetchError
+        with self.assertRaises(RateFetchError):
+            run(build_rate_schedule(_FakeRateClient(standard=[], raise_dn=True),
+                                    "P", "E-1R-P-A", raise_on_error=True))
+
+    def test_daynight_fallback_success(self):
+        s = run(build_rate_schedule(_FakeRateClient(standard=[], day=_REC, night=[]),
+                                    "P", "E-1R-P-A", raise_on_error=True))
+        self.assertFalse(s.is_empty())
+
+
 if __name__ == "__main__":
     unittest.main()
