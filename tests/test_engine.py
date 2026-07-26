@@ -2980,6 +2980,66 @@ class TestRepairImportPricing(unittest.TestCase):
         self.assertGreaterEqual(cap["end"][:10], "2025-10-22")
         self.assertLessEqual(cap["start"][:10], "2025-10-20")
 
+    def test_opportunistic_neighbour_repriced_downward_only(self):
+        # Suspect-only: a material dispatch slot's fetched window already carries the
+        # correct label for its small EDGE neighbours (below the kWh threshold, so
+        # not suspects themselves). They must be corrected DOWNWARD from the fetched
+        # data (peak→off-peak) at no extra API cost — but an already-off-peak
+        # neighbour must never be raised to peak, even if the re-fetch says peak.
+        import asyncio
+        store = BlockStore(":memory:")
+        with store._conn:
+            cp = store._conn.execute(
+                "INSERT INTO config_periods (effective_from, billing_day, block_minutes, "
+                "timezone, currency_symbol, currency_code) "
+                "VALUES ('2025-10-01T00:00:00',1,30,'Europe/London','£','GBP')").lastrowid
+            store._conn.execute(
+                "INSERT INTO meters (config_period_id, meter_id, is_sub_meter, postcode_prefix) "
+                "VALUES (?, 'electricity_main', 0, 'DE65')", (cp,))
+            for bs, kwh, rate in (("2025-10-02T05:30:00", 5.0, 0.28),   # material peak suspect
+                                  ("2025-10-02T05:00:00", 0.2, 0.28),   # sub-threshold edge, peak
+                                  ("2025-10-02T03:00:00", 0.5, 0.07)):  # already off-peak
+                store._conn.execute(
+                    "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                    "imp_kwh, imp_rate, imp_cost, source) VALUES (?,?,'electricity_main',?,?,?,?,'imported_api')",
+                    (bs, bs, cp, kwh, rate, round(kwh * rate, 4)))
+        engine._store = store
+        engine._kraken_discovery = {"import": {"mpan": "M"}, "export": {}}
+        engine.kraken_available = lambda: True
+
+        class _Seg:
+            def day_rate_bounds(self, _s):
+                return (7.0, 28.12)       # banded day, PENCE (schedule native units)
+        engine._hist_rate_segs_cache.clear()
+        engine._hist_rate_segs_cache["import"] = [("2000-01-01T00:00:00", None, _Seg())]
+        engine._tariff_rate_for = lambda segs, st, ofp: (0.07 if ofp else 0.28)
+
+        async def _noop():
+            return None
+        engine._generate_charts_offloaded = _noop
+
+        client = MagicMock()
+
+        async def _meas(mpan, start, end, *, direction="CONSUMPTION"):
+            return [
+                {"start": "2025-10-02T05:30:00", "kwh": 5.0, "cost_incl": 0.35, "off_peak": True},
+                {"start": "2025-10-02T05:00:00", "kwh": 0.2, "cost_incl": 0.014, "off_peak": True},
+                {"start": "2025-10-02T03:00:00", "kwh": 0.5, "cost_incl": 0.14, "off_peak": False},
+            ]
+        client.get_measurements = _meas
+        engine._kraken_client = client
+
+        res = asyncio.run(engine.repair_import_pricing(
+            "2025-10-02", "2025-10-02", channels=("import",), pace_s=0, suspect_only=True))
+
+        def rate_of(bs):
+            return store._conn.execute(
+                "SELECT imp_rate FROM blocks WHERE block_start=?", (bs,)).fetchone()["imp_rate"]
+        self.assertAlmostEqual(rate_of("2025-10-02T05:30:00"), 0.07)   # material suspect fixed
+        self.assertAlmostEqual(rate_of("2025-10-02T05:00:00"), 0.07)   # edge neighbour corrected DOWN
+        self.assertGreaterEqual(res["opportunistic"], 1)
+        self.assertAlmostEqual(rate_of("2025-10-02T03:00:00"), 0.07)   # off-peak neighbour NOT raised
+
     def test_count_only_previews_import_scope(self):
         # The confirm step: count_only returns how many blocks a run would touch,
         # with NO API calls and NO writes. channels=('import',) excludes export so
@@ -3308,6 +3368,194 @@ class TestDeferredVerifyPricing(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snap["repriced"], 7)
 
 
+class TestAttributionCore(unittest.TestCase):
+    """The pure heart of recorder attribution: stitch hourly device energy from
+    cumulative statistics (reset-aware, multi-sensor), and split each hour across
+    its half-hour blocks weighted by the house import shape."""
+
+    def test_stitch_sum_delta_drops_resets(self):
+        series = {"s1": [
+            {"start": "2025-03-01T00:00:00+00:00", "sum": 100.0},
+            {"start": "2025-03-01T01:00:00+00:00", "sum": 102.0},   # +2.0
+            {"start": "2025-03-01T02:00:00+00:00", "sum": 1.0},     # reset → dropped
+            {"start": "2025-03-01T03:00:00+00:00", "sum": 1.5},     # +0.5
+        ]}
+        out = engine._stitch_hourly_energy(series, ["s1"])
+        self.assertNotIn("2025-03-01T00:00:00", out)                # no prior → no delta
+        self.assertAlmostEqual(out["2025-03-01T01:00:00"], 2.0)
+        self.assertNotIn("2025-03-01T02:00:00", out)                # reset dropped
+        self.assertAlmostEqual(out["2025-03-01T03:00:00"], 0.5)
+
+    def test_stitch_priority_first_sensor_wins_overlap(self):
+        series = {
+            "new": [{"start": "2025-03-01T01:00:00+00:00", "change": 5.0}],
+            "old": [{"start": "2025-03-01T00:00:00+00:00", "change": 3.0},
+                    {"start": "2025-03-01T01:00:00+00:00", "change": 9.0}],
+        }
+        out = engine._stitch_hourly_energy(series, ["new", "old"])
+        self.assertAlmostEqual(out["2025-03-01T01:00:00"], 5.0)     # new wins the overlap
+        self.assertAlmostEqual(out["2025-03-01T00:00:00"], 3.0)     # old fills earlier hour
+
+    def test_stitch_epoch_ms_timestamps(self):
+        # 2025-03-01T01:00:00Z == 1740790800000 ms
+        series = {"s": [{"start": 1740790800000, "change": 1.25}]}
+        out = engine._stitch_hourly_energy(series, ["s"])
+        self.assertAlmostEqual(out["2025-03-01T01:00:00"], 1.25)
+
+    def test_split_by_import_shape(self):
+        self.assertEqual(engine._split_hour_to_blocks(6.0, [3.0, 1.0]), [4.5, 1.5])
+        self.assertEqual(engine._split_hour_to_blocks(6.0, [0.0, 0.0]), [3.0, 3.0])  # equal fallback
+        self.assertEqual(engine._split_hour_to_blocks(0.0, [2.0, 1.0]), [0.0, 0.0])
+
+
+class TestWriteDeviceIntoBlock(unittest.TestCase):
+    """The per-block write path: add a tagged device sub-meter, run PASS 2/3, and
+    never overwrite an existing device row. (PASS-2 maths itself is tested elsewhere;
+    here we assert the dict it's handed and the skip rules.)"""
+
+    def setUp(self):
+        self._saved = (engine._apply_pass2, engine._recompute_pass3_totals,
+                       engine._recompute_block_carbon, engine.append_block_replace,
+                       engine.get_store)
+        engine._apply_pass2 = lambda b: None
+        engine._recompute_pass3_totals = lambda b: None
+        engine._recompute_block_carbon = lambda b: None
+        st = MagicMock(); st.RECORDER_ATTRIBUTED_SOURCE = "recorder_attributed"
+        engine.get_store = lambda: st
+
+    def tearDown(self):
+        (engine._apply_pass2, engine._recompute_pass3_totals,
+         engine._recompute_block_carbon, engine.append_block_replace,
+         engine.get_store) = self._saved
+
+    def test_adds_tagged_device_then_is_idempotent(self):
+        written = []
+        engine.append_block_replace = lambda b: written.append(b)
+        block = {"meters": {"electricity_main": {"channels": {"import": {"kwh": 4.0}}}}}
+        self.assertTrue(engine._write_device_into_block(block, "ev_charger", "electricity_main", 1.0))
+        dev = block["meters"]["ev_charger"]
+        self.assertEqual(dev["source"], "recorder_attributed")     # only the device row tagged
+        self.assertTrue(dev["meta"]["sub_meter"])
+        self.assertEqual(dev["meta"]["parent_meter"], "electricity_main")
+        self.assertAlmostEqual(dev["channels"]["import"]["kwh"], 1.0)
+        self.assertEqual(len(written), 1)
+        # already present → never overwrite; missing parent → skip
+        self.assertFalse(engine._write_device_into_block(block, "ev_charger", "electricity_main", 9.0))
+        self.assertFalse(engine._write_device_into_block({"meters": {}}, "ev_charger", "electricity_main", 1.0))
+
+
+class TestAttributeHour(unittest.TestCase):
+    """Split one hour across its half-hour blocks by house import shape, write where
+    the device isn't already present, and count blocks with no house control total."""
+
+    def setUp(self):
+        self._saved = (engine.get_store, engine._write_device_into_block)
+
+    def tearDown(self):
+        (engine.get_store, engine._write_device_into_block) = self._saved
+
+    def test_import_shape_split_skip_existing_and_no_house(self):
+        b1 = {"meters": {"electricity_main": {"channels": {"import": {"kwh": 3.0}}}}}
+        b2 = {"meters": {"electricity_main": {"channels": {"import": {"kwh": 1.0}}},
+                         "ev_charger": {}}}                  # device already present
+        by = {"2025-03-01T02:00:00": b1, "2025-03-01T02:30:00": b2}
+        store = MagicMock(); store.get_block_dict_by_start.side_effect = by.get
+        engine.get_store = lambda: store
+        writes = []
+
+        def _w(block, dev, parent, kwh):
+            if dev in (block.get("meters") or {}):
+                return False
+            writes.append(kwh); return True
+        engine._write_device_into_block = _w
+
+        w, s, nh = engine._attribute_hour("2025-03-01T02:00:00", "ev_charger",
+                                          "electricity_main", 4.0, block_minutes=30)
+        self.assertEqual((w, s, nh), (1, 1, 0))              # b1 written, b2 skipped
+        self.assertAlmostEqual(writes[0], 3.0)              # 4 kWh split 3:1 → b1 gets 3.0
+
+    def test_missing_house_block_counts_as_no_control_total(self):
+        store = MagicMock(); store.get_block_dict_by_start.return_value = None
+        engine.get_store = lambda: store
+        engine._write_device_into_block = lambda *a: True
+        w, s, nh = engine._attribute_hour("2025-03-01T02:00:00", "ev", "main", 4.0)
+        self.assertEqual((w, s, nh), (0, 0, 2))             # both blocks absent
+
+
+class TestRunAttributionJob(unittest.IsolatedAsyncioTestCase):
+    """The background job: fetch → stitch → walk oldest-first → ledger, cooperative
+    with pause/cancel and deferring to a delete."""
+
+    def setUp(self):
+        self._saved = (engine._engine_ha, engine.get_store, engine._attribute_hour,
+                       engine.get_block_minutes, engine.delete_in_progress)
+        self._j = dict(engine._attribution_job)
+
+    def tearDown(self):
+        (engine._engine_ha, engine.get_store, engine._attribute_hour,
+         engine.get_block_minutes, engine.delete_in_progress) = self._saved
+        engine._attribution_job.clear(); engine._attribution_job.update(self._j)
+
+    async def test_stitches_walks_and_records_run(self):
+        ha = MagicMock()
+        async def _stats(ids, s, e, period="hour"):
+            return {ids[0]: [{"start": "2025-03-01T00:00:00+00:00", "change": 1.0},
+                             {"start": "2025-03-01T01:00:00+00:00", "change": 2.0}]}
+        ha.get_statistics = _stats
+        engine._engine_ha = ha
+        engine.get_block_minutes = lambda: 30
+        engine.delete_in_progress = lambda: False
+        store = MagicMock(); store.get_parent_meter_id.return_value = "electricity_main"
+        engine.get_store = lambda: store
+        calls = []
+        engine._attribute_hour = lambda hour, dev, parent, kwh, block_minutes=30: (
+            calls.append((hour, kwh)) or (2, 0, 0))
+
+        res = await engine.run_attribution_job("ev_charger", ["sensor.ev"])
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["written"], 4)                     # 2 hours × 2 blocks
+        self.assertEqual(engine._attribution_job["status"], "done")
+        store.record_attribution_run.assert_called_once()
+        self.assertEqual([c[0] for c in calls],
+                         ["2025-03-01T00:00:00", "2025-03-01T01:00:00"])   # oldest first
+        self.assertEqual([c[1] for c in calls], [1.0, 2.0])               # stitched energy
+
+
+class TestBackoutRecorderAttribution(unittest.TestCase):
+    """One-click undo for a recorder-attribution run: delete the tagged device blocks
+    and re-derive the parent remainder over the (exclusive-end) span, then drop the run."""
+
+    def setUp(self):
+        self._saved = (engine.get_store, engine.recompute_remainders_for_window,
+                       engine.get_block_minutes)
+
+    def tearDown(self):
+        (engine.get_store, engine.recompute_remainders_for_window,
+         engine.get_block_minutes) = self._saved
+
+    def test_backout_by_run_deletes_and_recomputes_parent(self):
+        calls = []
+        store = MagicMock()
+        store.get_attribution_runs.return_value = [
+            {"run_id": "r1", "meter_id": "ev_charger",
+             "from": "2025-03-01T00:00:00", "to": "2025-03-01T00:30:00"}]
+        store.delete_recorder_attributed.return_value = {
+            "deleted": 2, "meters": ["ev_charger"], "parents": ["electricity_main"],
+            "from": "2025-03-01T00:00:00", "to": "2025-03-01T00:30:00"}
+        engine.get_store = lambda: store
+        engine.get_block_minutes = lambda: 30
+        engine.recompute_remainders_for_window = lambda p, lo, hi: calls.append((p, lo, hi)) or 2
+
+        res = engine.backout_recorder_attribution(run_id="r1")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["deleted"], 2)
+        store.delete_recorder_attributed.assert_called_once_with(
+            meter_id="ev_charger", from_iso="2025-03-01T00:00:00", to_iso="2025-03-01T00:30:00")
+        # parent remainder recomputed over the span with an EXCLUSIVE +1-block end
+        self.assertEqual(calls, [("electricity_main", "2025-03-01T00:00:00", "2025-03-01T01:00:00")])
+        store.remove_attribution_run.assert_called_once_with("r1")
+
+
 class TestRepriceSuspect(unittest.TestCase):
     """The suspect prefilter that lets the verify pass skip already-correct slots
     (a whole-range re-query → a targeted one). A slot is worth a calm re-fetch only
@@ -3315,38 +3563,57 @@ class TestRepriceSuspect(unittest.TestCase):
     at the peak band with material energy (the out-of-window dispatch signature)."""
 
     class _Seg:
-        def __init__(self, lo, hi): self._b = (lo, hi)
+        # day_rate_bounds returns the schedule's native units: PENCE.
+        def __init__(self, lo_p, hi_p): self._b = (lo_p, hi_p)
         def day_rate_bounds(self, _start): return self._b
 
-    def _segs(self, lo, hi):
-        return [("2025-10-01T00:00:00", "2025-11-01T00:00:00", self._Seg(lo, hi))]
+    def _segs(self, lo_p, hi_p):
+        return [("2025-10-01T00:00:00", "2025-11-01T00:00:00", self._Seg(lo_p, hi_p))]
 
     def _row(self, rate, kwh, cost, start="2025-10-15T02:00:00"):
+        # imp_rate is in £ (what's stored on blocks); schedule bounds are pence.
         return {"start": start, "imp_rate": rate, "imp_kwh": kwh, "imp_cost": cost,
                 "exp_rate": rate, "exp_kwh": kwh, "exp_cost": cost}
 
     def test_peak_band_material_is_suspect(self):
-        segs = self._segs(0.05, 0.30)
+        segs = self._segs(5.0, 30.0)        # pence bands → £ midpoint 0.175
         self.assertTrue(engine._reprice_suspect("import", self._row(0.30, 2.5, 0.75), segs, 1.0))
 
     def test_off_peak_slot_skipped(self):
-        segs = self._segs(0.05, 0.30)
+        segs = self._segs(5.0, 30.0)
         self.assertFalse(engine._reprice_suspect("import", self._row(0.05, 2.5, 0.13), segs, 1.0))
 
     def test_no_cost_always_suspect(self):
-        segs = self._segs(0.05, 0.30)
+        segs = self._segs(5.0, 30.0)
         self.assertTrue(engine._reprice_suspect("import", self._row(0.30, 0.1, None), segs, 1.0))
 
     def test_immaterial_kwh_skipped(self):
-        segs = self._segs(0.05, 0.30)
+        segs = self._segs(5.0, 30.0)
         self.assertFalse(engine._reprice_suspect("import", self._row(0.30, 0.2, 0.06), segs, 1.0))
 
-    def test_flat_day_skipped(self):
-        segs = self._segs(0.30, 0.30)       # lo == hi → no peak/off-peak split
+    def test_pence_units_peak_slot_flagged(self):
+        # Regression: day_rate_bounds is PENCE; comparing a £ rate against it without
+        # the /100 made the peak-band branch ALWAYS false (nothing ever selected).
+        segs = self._segs(7.0, 28.12)       # real IOG bands in pence
+        self.assertTrue(engine._reprice_suspect("import", self._row(0.2812, 5.0, 1.4), segs, 1.0))
+
+    def test_flat_schedule_uses_observed_floor(self):
+        # IOG: off-peak isn't in the schedule → bounds read flat. The observed floor
+        # (£, from the data) must still flag a peak-priced material slot.
+        flat = self._segs(28.12, 28.12)     # schedule shows only the peak band
+        row = self._row(0.2812, 5.0, 1.4)
+        self.assertFalse(engine._reprice_suspect("import", row, flat, 1.0))            # no floor → blind
+        self.assertTrue(engine._reprice_suspect("import", row, flat, 1.0, 0.07))       # floor 0.07 → flagged
+        # an off-peak slot on the same flat schedule is NOT flagged
+        op = self._row(0.07, 5.0, 0.35)
+        self.assertFalse(engine._reprice_suspect("import", op, flat, 1.0, 0.07))
+
+    def test_flat_day_skipped_without_floor(self):
+        segs = self._segs(30.0, 30.0)       # lo == hi and no floor → nothing to do
         self.assertFalse(engine._reprice_suspect("import", self._row(0.30, 2.5, 0.75), segs, 1.0))
 
     def test_missing_row_is_rechecked(self):
-        self.assertTrue(engine._reprice_suspect("import", None, self._segs(0.05, 0.30), 1.0))
+        self.assertTrue(engine._reprice_suspect("import", None, self._segs(5.0, 30.0), 1.0))
 
 
 class TestBilledRate(unittest.TestCase):

@@ -1277,6 +1277,12 @@ class BlockStore:
         "              AND m.postcode_prefix IS NOT NULL))"
     )
 
+    # Reconstructed device attribution from the HA recorder. A distinct source so the
+    # reconstructed device layer is identifiable and removable WITHOUT touching live
+    # or imported house totals — the reversibility contract (see attribution design).
+    RECORDER_ATTRIBUTED_SOURCE = "recorder_attributed"
+    _ATTRIBUTION_RUNS_KEY = "recorder_attribution_runs"   # store_meta ledger
+
     def get_missing_carbon_date_range(self) -> tuple | None:
         """(min_block_start, max_block_start) over energy-bearing blocks whose
         carbon_intensity_g IS NULL AND that are region-eligible (see
@@ -2138,6 +2144,84 @@ class BlockStore:
                     info["blocks"], derivs)
         return {"blocks": info["blocks"], "reads": reads, "generation_mix": mix,
                 "derivations": derivs, "from": info["from"], "to": info["to"]}
+
+    # ── Recorder device attribution — reversible layer ────────────────────────
+
+    def delete_recorder_attributed(self, meter_id=None, from_iso=None,
+                                   to_iso=None) -> dict:
+        """Delete recorder-attributed device blocks, optionally scoped to a meter
+        and/or a [from, to) window. The undo primitive: removes ONLY the
+        reconstructed device rows (source='recorder_attributed'), never live or
+        imported house totals. Returns {deleted, meters, parents, from, to} — the
+        caller recomputes each affected parent's remainder over [from, to)."""
+        where = ["source = ?"]
+        params = [self.RECORDER_ATTRIBUTED_SOURCE]
+        if meter_id:
+            where.append("meter_id = ?"); params.append(meter_id)
+        if from_iso:
+            where.append("block_start >= ?"); params.append(from_iso)
+        if to_iso:
+            where.append("block_start < ?"); params.append(to_iso)
+        clause = " AND ".join(where)
+        meters = [r["meter_id"] for r in self._conn.execute(
+            f"SELECT DISTINCT meter_id FROM blocks WHERE {clause}", params).fetchall()]
+        parents = []
+        for mid in meters:
+            pr = self._conn.execute(
+                "SELECT parent_meter_id FROM meters WHERE meter_id = ? "
+                "AND parent_meter_id IS NOT NULL LIMIT 1", (mid,)).fetchone()
+            p = pr["parent_meter_id"] if pr else None
+            if p and p not in parents:
+                parents.append(p)
+        span = self._conn.execute(
+            f"SELECT MIN(block_start) lo, MAX(block_start) hi FROM blocks WHERE {clause}",
+            params).fetchone()
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM reads WHERE block_id IN "
+                f"(SELECT id FROM blocks WHERE {clause})", params)
+            cur = self._conn.execute(f"DELETE FROM blocks WHERE {clause}", params)
+        return {"deleted": cur.rowcount, "meters": meters, "parents": parents,
+                "from": span["lo"] if span else None,
+                "to": span["hi"] if span else None}
+
+    def get_parent_meter_id(self, meter_id: str):
+        """The parent meter_id of a sub-meter (or None). Falls back to the main
+        (non-sub) meter when the sub-meter row has no explicit parent."""
+        r = self._conn.execute(
+            "SELECT parent_meter_id FROM meters WHERE meter_id = ? "
+            "AND parent_meter_id IS NOT NULL LIMIT 1", (meter_id,)).fetchone()
+        if r and r["parent_meter_id"]:
+            return r["parent_meter_id"]
+        main = self._conn.execute(
+            "SELECT meter_id FROM meters WHERE is_sub_meter = 0 LIMIT 1").fetchone()
+        return main["meter_id"] if main else None
+
+    def count_recorder_attributed(self) -> dict:
+        """Summary of the reconstructed device layer: total rows + per-meter span,
+        for the attribution page / back-out UI."""
+        rows = self._conn.execute(
+            "SELECT meter_id, COUNT(*) n, MIN(block_start) lo, MAX(block_start) hi "
+            "FROM blocks WHERE source = ? GROUP BY meter_id ORDER BY meter_id",
+            (self.RECORDER_ATTRIBUTED_SOURCE,)).fetchall()
+        return {"total": sum(r["n"] for r in rows),
+                "meters": [{"meter_id": r["meter_id"], "blocks": r["n"],
+                            "from": r["lo"], "to": r["hi"]} for r in rows]}
+
+    def record_attribution_run(self, run: dict) -> None:
+        """Append a run to the attribution ledger (run_id, meter_id, span, sensors,
+        created_at, blocks_written) so a user can see and undo each run."""
+        runs = self.get_meta(self._ATTRIBUTION_RUNS_KEY, None) or []
+        runs.append(dict(run))
+        self.set_meta(self._ATTRIBUTION_RUNS_KEY, runs[-200:])
+
+    def get_attribution_runs(self) -> list:
+        return self.get_meta(self._ATTRIBUTION_RUNS_KEY, None) or []
+
+    def remove_attribution_run(self, run_id: str) -> None:
+        runs = self.get_meta(self._ATTRIBUTION_RUNS_KEY, None) or []
+        self.set_meta(self._ATTRIBUTION_RUNS_KEY,
+                      [r for r in runs if r.get("run_id") != run_id])
 
     # ── 3.5.0 Historical-import derivation provenance ─────────────────────────
 

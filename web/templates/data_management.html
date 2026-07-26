@@ -738,7 +738,14 @@ async function loadBackupList() {
       html += '<div style="color:var(--muted);font-size:13px;">No zip backups yet.</div>';
     } else {
       var rows = zips.map(function(z) {
-        return '<div style="display:flex;align-items:center;justify-content:space-between;font-family:var(--mono);font-size:12px;padding:6px 0;border-bottom:1px solid var(--border);"><span>' + z + '</span><button class="btn btn-secondary btn-sm" onclick="restoreFromZip(\'' + z + '\')">↩ Restore</button></div>';
+        var zq = z.replace(/'/g, "\\'");
+        return '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;font-family:var(--mono);font-size:12px;padding:6px 0;border-bottom:1px solid var(--border);">'
+          + '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + z + '</span>'
+          + '<span style="display:flex;gap:6px;flex:none;">'
+          + '<button class="btn btn-secondary btn-sm" onclick="downloadBackup(\'' + zq + '\')">⬇ Download</button>'
+          + '<button class="btn btn-secondary btn-sm" onclick="restoreFromZip(\'' + zq + '\')">↩ Restore</button>'
+          + '<button class="btn btn-secondary btn-sm" style="color:var(--danger);" onclick="deleteBackup(\'' + zq + '\')">🗑 Delete</button>'
+          + '</span></div>';
       }).join('');
       var needsScroll = zips.length > 5;
       html += '<div style="' + (needsScroll ? 'max-height:196px;overflow-y:auto;' : '') + '">' + rows + '</div>' +
@@ -749,6 +756,38 @@ async function loadBackupList() {
   } catch(e) {
     var el = document.getElementById('backup-list');
     if (el) el.innerHTML = '<div style="color:var(--danger);font-size:13px;">Failed to load backups: ' + e.message + '</div>';
+  }
+}
+
+// Download a backup zip — the browser handles the file; a brief banner confirms it.
+function downloadBackup(z) {
+  var el = document.getElementById('alert-success');
+  if (el) { el.textContent = '⬇ Downloading ' + z + '…'; el.classList.add('show'); setTimeout(function() { el.classList.remove('show'); }, 5000); }
+  window.location.href = apiUrl('/api/backup/download/' + encodeURIComponent(z));
+}
+
+// Delete a backup zip — same in-flight banner pattern as restore/create, with a
+// confirm first (it removes the file permanently).
+async function deleteBackup(z) {
+  if (!window.confirm('Delete backup "' + z + '"?\n\nThis permanently removes the file and cannot be undone.')) return;
+  var el = document.getElementById('alert-success');
+  if (el) { el.innerHTML = '⏳ <strong>Deleting backup…</strong> ' + z; el.classList.add('show'); }
+  try {
+    var r    = await fetch(apiUrl('/api/backup/delete'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ zip: z })
+    });
+    var data = await r.json();
+    if (data.ok) {
+      if (el) { el.textContent = '✓ Backup deleted: ' + z; el.classList.add('show'); setTimeout(function() { el.classList.remove('show'); }, 6000); }
+      loadBackupList();
+    } else {
+      if (el) el.classList.remove('show');
+      showError(data.error || 'Delete failed');
+    }
+  } catch(e) {
+    if (el) el.classList.remove('show');
+    showError(e.message);
   }
 }
 

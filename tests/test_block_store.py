@@ -4889,5 +4889,62 @@ class TestSweepImplausibleSubBlocks(unittest.TestCase):
         self.assertAlmostEqual(r["carbon_g"], round(2.5 * 140.0, 4))  # grid × intensity
 
 
+class TestRecorderAttributionStore(unittest.TestCase):
+    """The reversible device-attribution layer: recorder_attributed device rows are
+    identifiable, scoped-deletable, and NEVER touch live/imported house totals."""
+
+    def _store(self):
+        s = BlockStore(":memory:")
+        with s._conn:
+            cp = s._conn.execute(
+                "INSERT INTO config_periods (effective_from, billing_day, block_minutes, "
+                "timezone, currency_symbol, currency_code) "
+                "VALUES ('2025-01-01T00:00:00',1,30,'UTC','£','GBP')").lastrowid
+            s._conn.execute(
+                "INSERT INTO meters (config_period_id, meter_id, is_sub_meter) "
+                "VALUES (?, 'electricity_main', 0)", (cp,))
+            s._conn.execute(
+                "INSERT INTO meters (config_period_id, meter_id, is_sub_meter, parent_meter_id) "
+                "VALUES (?, 'ev_charger', 1, 'electricity_main')", (cp,))
+            for bs, meter, kwh, src in (
+                    ("2025-03-01T00:00:00", "electricity_main", 1.0, "imported_api"),
+                    ("2025-03-01T00:30:00", "electricity_main", 1.0, "kraken_api"),
+                    ("2025-03-01T00:00:00", "ev_charger", 0.5, "recorder_attributed"),
+                    ("2025-03-01T00:30:00", "ev_charger", 0.5, "recorder_attributed")):
+                s._conn.execute(
+                    "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                    "imp_kwh, source) VALUES (?,?,?,?,?,?)", (bs, bs, meter, cp, kwh, src))
+        return s
+
+    def test_count_and_scoped_delete_resolves_parent(self):
+        s = self._store()
+        c = s.count_recorder_attributed()
+        self.assertEqual(c["total"], 2)
+        self.assertEqual(c["meters"][0]["meter_id"], "ev_charger")
+        res = s.delete_recorder_attributed(meter_id="ev_charger")
+        self.assertEqual(res["deleted"], 2)
+        self.assertIn("electricity_main", res["parents"])           # parent resolved
+        self.assertEqual(res["from"], "2025-03-01T00:00:00")
+        self.assertEqual(s.count_recorder_attributed()["total"], 0)
+
+    def test_delete_never_touches_live_or_imported(self):
+        s = self._store()
+        s.delete_recorder_attributed()                              # all attributed
+        srcs = [r["source"] for r in s._conn.execute(
+            "SELECT DISTINCT source FROM blocks").fetchall()]
+        self.assertNotIn("recorder_attributed", srcs)
+        self.assertIn("imported_api", srcs)
+        self.assertIn("kraken_api", srcs)                           # live untouched
+
+    def test_run_ledger_add_and_remove(self):
+        s = self._store()
+        s.record_attribution_run({"run_id": "r1", "meter_id": "ev_charger",
+                                  "sensor_ids": ["sensor.ev"]})
+        s.record_attribution_run({"run_id": "r2", "meter_id": "house_battery"})
+        self.assertEqual([r["run_id"] for r in s.get_attribution_runs()], ["r1", "r2"])
+        s.remove_attribution_run("r1")
+        self.assertEqual([r["run_id"] for r in s.get_attribution_runs()], ["r2"])
+
+
 if __name__ == "__main__":
     unittest.main()

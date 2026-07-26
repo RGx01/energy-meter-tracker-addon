@@ -131,6 +131,7 @@ class TestHistoricalCarbonBackfill(unittest.TestCase):
         engine._store = self._orig_store
         engine._fetch_carbon_intensity_range = self._orig_fetch
         engine.generate_charts = self._orig_gc
+        engine.set_delete_active(False)
 
     def test_attributes_historical_blocks(self):
         _insert_null_block(self.st, "2026-05-01T10:00:00", 2.0, self.cp)
@@ -352,6 +353,26 @@ class TestHistoricalCarbonBackfill(unittest.TestCase):
                          "unfilled_from": "2026-05-01T10:00:00", "retry_after": past})
         engine._maybe_backfill_historical_carbon()
         self.assertFalse(self.st.get_meta(self.MARKER)["done"])  # cool-down elapsed → re-arm
+
+    def test_delete_active_flag_toggles(self):
+        engine.set_delete_active(True)
+        self.assertTrue(engine.delete_in_progress())
+        engine.set_delete_active(False)
+        self.assertFalse(engine.delete_in_progress())
+
+    def test_backfill_defers_while_delete_active(self):
+        # A delete/purge job is mutating blocks → the backfill must NOT kick off new
+        # work (both share the one SQLite connection). It re-arms once the delete ends.
+        engine._api_import_job = {"status": "idle"}
+        _insert_null_block(self.st, "2026-05-01T10:00:00", 2.0, self.cp)
+        self.st.set_meta(self.MARKER,
+                         {"done": True, "unfilled_from": "2026-05-01T10:00:00"})
+        engine.set_delete_active(True)
+        engine._maybe_backfill_historical_carbon()
+        self.assertTrue(self.st.get_meta(self.MARKER)["done"])   # deferred → not re-armed
+        engine.set_delete_active(False)
+        engine._maybe_backfill_historical_carbon()
+        self.assertFalse(self.st.get_meta(self.MARKER)["done"])  # delete done → re-arms
 
     def test_default_window_under_api_cap(self):
         # The Carbon Intensity API rejects >=14-day ranges (HTTP 400 — observed in
