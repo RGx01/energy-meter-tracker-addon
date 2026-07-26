@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import shutil
+import threading
 from datetime import datetime, timedelta, timezone
 
 from energy_engine_io import (
@@ -184,6 +185,10 @@ _BL19_GRID_SWEEP_DONE_KEY = "bl19_grid_invariant_sweep_done"
 # #307: run-once marker for the lost-opener device-spike self-heal. The write-point
 # guard prevents NEW spikes, so this only needs to clean pre-guard history once.
 _SPIKE_SWEEP_DONE_KEY = "implausible_sub_block_sweep_done"
+# Run-once marker for the register dip-and-recover self-heal (stale-boundary phantom
+# deltas, e.g. house_battery 48.93 kWh on 2026-07-21). The gap-boundary guard stops
+# NEW ones, so this only cleans pre-guard history once.
+_REGISTER_GLITCH_SWEEP_DONE_KEY = "register_glitch_sweep_done"
 # Chunk 5: cached rate schedules for reconcile-time rate repair. Built once per
 # poll cycle by the (async) poll task; read by the (sync) drain via the resolver
 # below. Rates stored as £/kWh (converted from the API's pence at build time).
@@ -1068,11 +1073,14 @@ def read_sensor(ha: HAClient, entity_id: str, use_cache: bool = True) -> float |
     try:
         val = ha.get_state(entity_id)
         if val in ("unknown", "unavailable", None):
-            if use_cache and entity_id in _last_known_sensor_values:
-                cached = _last_known_sensor_values[entity_id]
-                logger.warning("read_sensor: %s='%s', using cached %s", entity_id, val, cached)
-                return cached
-            logger.warning("read_sensor: %s='%s', no cache", entity_id, val)
+            # An unavailable/unknown sensor is a GAP, not a value. Never substitute a
+            # cached number for a cumulative register: the cache can be stale (a
+            # dropped/restarting integration briefly surfaces an old state), and a
+            # stale-low register read is booked as a phantom delta downstream — the
+            # cause of the 2026-07-21 house_battery 48.93 kWh half-hour, where a
+            # 4-day-old reading (6259.77) resurfaced during a sensor dropout. Return
+            # None so the gap machinery brackets and interpolates it honestly.
+            logger.warning("read_sensor: %s='%s' — no reading (gap)", entity_id, val)
             return None
         val = float(val)
         _last_known_sensor_values[entity_id] = val
@@ -1529,17 +1537,35 @@ def build_gap_blocks(
                                 meter_name, channel_name,
                                 pre_read["value"], post_read["value"]
                             )
-                        elif post_read["value"] < pre_read["value"]:
-                            # Genuine reset — the register dropped. Use post_read
-                            # value directly as kWh accumulated since the reset
-                            # (handles daily-reset sensors and any other cumulative
-                            # sensor that resets mid-block).
+                        elif post_read["value"] < pre_read["value"] * 0.5:
+                            # Genuine reset — the register COLLAPSED to a small
+                            # fraction of its prior level (daily-reset sensor, device
+                            # swap). Use post_read value directly as kWh accumulated
+                            # since the reset.
                             sub_kwh = max(round(post_read["value"], 6), 0.0)
+                            sub_end = sub_kwh
                             logger.info(
                                 "build_gap_blocks: %s/%s reset detected (%.4f → %.4f) "
                                 "using post-reset value %.4f kWh",
                                 meter_name, channel_name,
                                 pre_read["value"], post_read["value"], sub_kwh
+                            )
+                        elif post_read["value"] < pre_read["value"]:
+                            # Register stepped BACKWARD but did not collapse — a
+                            # cumulative counter can't do that for real, so this is a
+                            # glitch / stale read (a dropped sensor briefly surfacing an
+                            # old value), NOT a reset. Booking the post value (or, worse,
+                            # the later climb back up) manufactures phantom energy — the
+                            # 2026-07-21 house_battery 6259.77 case. Zero the delta and
+                            # carry the pre-gap register forward so continuity holds.
+                            sub_kwh   = 0.0
+                            sub_start = sub_end = pre_read["value"]
+                            logger.warning(
+                                "build_gap_blocks: %s/%s register dipped backward "
+                                "(%.4f → %.4f) without collapsing — glitch/stale read; "
+                                "zero delta, register carried forward",
+                                meter_name, channel_name,
+                                pre_read["value"], post_read["value"]
                             )
                         else:
                             opener   = interpolate_value(pre_read, post_read, window_start)
@@ -2414,6 +2440,19 @@ def recompute_remainders_for_window(parent_meter_id: str, utc_start: str,
     return done
 
 
+_backout_job: dict = {"status": "idle"}
+_backout_lock = threading.Lock()   # atomic single-flight guard (endpoint runs on a Flask worker thread)
+
+
+def api_backout_status() -> dict:
+    """JSON-safe snapshot of the back-out job (for the UI to disable/poll)."""
+    return dict(_backout_job)
+
+
+def backout_running() -> bool:
+    return _backout_job.get("status") == "running"
+
+
 def backout_recorder_attribution(*, run_id=None, meter_id=None,
                                   from_date=None, to_date=None) -> dict:
     """Undo a recorder-attribution run (or an explicit device + range): delete the
@@ -2421,38 +2460,63 @@ def backout_recorder_attribution(*, run_id=None, meter_id=None,
     meter's remainder over the span, and drop the run from the ledger. The reversible
     safety net — fast, surgical, and it never touches live or imported house totals
     (only the additive device layer is removed; the remainder is re-derived from the
-    surviving sub-meters). Returns {ok, deleted, parents, recomputed, from, to}."""
+    surviving sub-meters). Returns {ok, deleted, parents, recomputed, from, to}.
+
+    Guarded two ways so a stray double-click can't misfire:
+      • only ONE back-out runs at a time — a second call while one is in flight
+        returns {ok:False, error:'backout_in_progress'} rather than racing it;
+      • a run_id that isn't (or is no longer) in the ledger returns
+        {ok:False, error:'run_not_found'} instead of falling through to an
+        all-None delete that would wipe the whole attributed layer."""
     from datetime import datetime as _dt, timedelta as _td
-    store = get_store()
-    from_iso = from_date
-    to_iso = to_date
-    if run_id:
-        for r in store.get_attribution_runs():
-            if r.get("run_id") == run_id:
-                meter_id = meter_id or r.get("meter_id")
-                from_iso = from_iso or r.get("from")
-                to_iso = to_iso or r.get("to")
-                break
-    res = store.delete_recorder_attributed(
-        meter_id=meter_id, from_iso=from_iso, to_iso=to_iso)
-    lo, hi = res.get("from"), res.get("to")
-    recomputed = 0
-    if lo and hi:
-        try:
-            hi_excl = (_dt.fromisoformat(hi)
-                       + _td(minutes=int(get_block_minutes() or 30))).isoformat()
-        except Exception:
-            hi_excl = hi
-        for parent in (res.get("parents") or []):
-            recomputed += recompute_remainders_for_window(parent, lo, hi_excl)
-    if run_id:
-        store.remove_attribution_run(run_id)
-    logger.info("backout_recorder_attribution: deleted %d device block(s), "
-                "recomputed %d parent block(s) (run=%s meter=%s)",
-                res.get("deleted"), recomputed, run_id, meter_id)
-    return {"ok": True, "deleted": res.get("deleted", 0),
-            "parents": res.get("parents") or [], "recomputed": recomputed,
-            "from": lo, "to": hi}
+    # Atomic single-flight: if a back-out is already running, refuse rather than
+    # race it on the store's single DB connection (the exact double-undo crash).
+    if not _backout_lock.acquire(blocking=False):
+        return {"ok": False, "error": "backout_in_progress",
+                "in_progress": dict(_backout_job)}
+    try:
+        store = get_store()
+        from_iso = from_date
+        to_iso = to_date
+        if run_id:
+            matched = next((r for r in store.get_attribution_runs()
+                            if r.get("run_id") == run_id), None)
+            if matched is None:
+                # Already undone, or never existed — do NOT proceed with empty filters.
+                return {"ok": False, "error": "run_not_found", "run_id": run_id}
+            meter_id = meter_id or matched.get("meter_id")
+            from_iso = from_iso or matched.get("from")
+            to_iso = to_iso or matched.get("to")
+        _backout_job.clear()
+        _backout_job.update({"status": "running", "run_id": run_id,
+                             "meter_id": meter_id, "started_at": _dt_now_iso_safe()})
+        res = store.delete_recorder_attributed(
+            meter_id=meter_id, from_iso=from_iso, to_iso=to_iso)
+        lo, hi = res.get("from"), res.get("to")
+        recomputed = 0
+        if lo and hi:
+            try:
+                hi_excl = (_dt.fromisoformat(hi)
+                           + _td(minutes=int(get_block_minutes() or 30))).isoformat()
+            except Exception:
+                hi_excl = hi
+            for parent in (res.get("parents") or []):
+                recomputed += recompute_remainders_for_window(parent, lo, hi_excl)
+        if run_id:
+            store.remove_attribution_run(run_id)
+        logger.info("backout_recorder_attribution: deleted %d device block(s), "
+                    "recomputed %d parent block(s) (run=%s meter=%s)",
+                    res.get("deleted"), recomputed, run_id, meter_id)
+        return {"ok": True, "deleted": res.get("deleted", 0),
+                "parents": res.get("parents") or [], "recomputed": recomputed,
+                "from": lo, "to": hi}
+    except Exception as e:
+        logger.warning("backout_recorder_attribution failed (run=%s): %s", run_id, e)
+        return {"ok": False, "error": str(e)}
+    finally:
+        _backout_job.clear()
+        _backout_job.update({"status": "idle"})
+        _backout_lock.release()
 
 
 def _stitch_hourly_energy(series_by_sensor: dict, priority: list) -> dict:
@@ -2515,6 +2579,27 @@ def _split_hour_to_blocks(hour_kwh, house_imports: list) -> list:
     return [round(e * ((x or 0.0) / tot), 6) for x in house_imports]
 
 
+def _naive_iso(ts: str) -> str:
+    """Normalise a timestamp to a naive-UTC ISO string for order comparison.
+    Block starts and stitched hour keys are naive UTC already; this just strips
+    any stray timezone so a lexicographic/temporal compare is apples-to-apples."""
+    s = str(ts or "")
+    try:
+        from datetime import datetime as _dt
+        d = _dt.fromisoformat(s)
+        if d.tzinfo is not None:
+            d = d.astimezone(timezone.utc).replace(tzinfo=None)
+        return d.isoformat()
+    except Exception:
+        # Best-effort: drop a trailing 'Z' or '+hh:mm' offset.
+        if s.endswith("Z"):
+            return s[:-1]
+        for i, ch in enumerate(s):
+            if ch == "+" and i > 10:
+                return s[:i]
+        return s
+
+
 def _write_device_into_block(block: dict, device_meter_id: str,
                              parent_meter_id: str, dev_kwh) -> bool:
     """Add a reconstructed device sub-meter to an existing house block and re-run
@@ -2525,11 +2610,20 @@ def _write_device_into_block(block: dict, device_meter_id: str,
     meters = block.get("meters") or {}
     if device_meter_id in meters or parent_meter_id not in meters:
         return False
-    meters[device_meter_id] = {
+    dev_block = {
         "meta": {"sub_meter": True, "parent_meter": parent_meter_id},
         "source": get_store().RECORDER_ATTRIBUTED_SOURCE,
         "channels": {"import": {"kwh": round(float(dev_kwh or 0.0), 6)}},
     }
+    # Carbon: _recompute_block_carbon needs a per-meter carbon_intensity_g to
+    # compute carbon_g at all (it skips meters with no stored intensity). A freshly
+    # reconstructed device row has none, so inherit the intensity persisted on the
+    # parent (house) meter for this same block — the grid CI is per-block, not
+    # per-meter, so the parent's stored value is the correct one to apply.
+    parent_ci = (meters.get(parent_meter_id) or {}).get("carbon_intensity_g")
+    if parent_ci is not None:
+        dev_block["carbon_intensity_g"] = parent_ci
+    meters[device_meter_id] = dev_block
     block["meters"] = meters
     _apply_pass2(block)
     _recompute_pass3_totals(block)
@@ -2597,6 +2691,46 @@ def attribution_control(action: str) -> dict:
     return api_attribution_status()
 
 
+async def attribution_preflight(device_meter_id: str, sensor_ids: list) -> dict:
+    """Sanity-check a device's sensors BEFORE attributing: stitch their history to
+    a total kWh and compare it to the house import over the same window. A device
+    can never draw more than the house it's part of, so device > house means the
+    wrong sensor (or a Wh/kWh unit slip that inflates it ~1000×). Returns
+    {ok, verdict, device_kwh, house_kwh, from, to} — verdict is 'ok',
+    'device_exceeds_house', 'suspiciously_small', or 'no_data'. Never raises."""
+    try:
+        store = get_store()
+        if _engine_ha is None:
+            return {"ok": True, "verdict": "no_ha", "device_kwh": None, "house_kwh": None}
+        parent = store.get_parent_meter_id(device_meter_id) or "electricity_main"
+        now = datetime.now(timezone.utc)
+        start = (now - timedelta(days=3660)).isoformat()
+        series = {}
+        for sid in (sensor_ids or []):
+            try:
+                res = await _engine_ha.get_statistics([sid], start, now.isoformat(),
+                                                      period="hour", timeout=120.0)
+                series[sid] = res.get(sid) or []
+            except Exception:
+                series[sid] = []
+        hourly = _stitch_hourly_energy(series, list(sensor_ids or []))
+        if not hourly:
+            return {"ok": True, "verdict": "no_data", "device_kwh": 0.0, "house_kwh": None}
+        dev_kwh = round(sum(hourly.values()), 2)
+        lo, hi = min(hourly.keys()), max(hourly.keys())
+        house_kwh = round(store.sum_meter_import_kwh(parent, lo, hi), 2)
+        verdict = "ok"
+        if house_kwh > 0 and dev_kwh > house_kwh * 1.05:
+            verdict = "device_exceeds_house"        # wrong sensor / Wh-as-kWh
+        elif house_kwh > 0 and 0 < dev_kwh < house_kwh * 0.0005:
+            verdict = "suspiciously_small"          # possible kWh-as-Wh / wrong sensor
+        return {"ok": True, "verdict": verdict, "device_kwh": dev_kwh,
+                "house_kwh": house_kwh, "from": lo, "to": hi}
+    except Exception as e:
+        logger.warning("attribution_preflight failed: %s", e)
+        return {"ok": True, "verdict": "error", "device_kwh": None, "house_kwh": None}
+
+
 async def run_attribution_job(device_meter_id: str, sensor_ids: list, *,
                               pace_s: float = 0.0) -> dict:
     """Background: attribute a device's HA recorder history onto the house blocks it
@@ -2625,13 +2759,24 @@ async def run_attribution_job(device_meter_id: str, sensor_ids: list, *,
         for sid in (sensor_ids or []):
             try:
                 res = await _engine_ha.get_statistics([sid], start, now.isoformat(),
-                                                      period="hour")
+                                                      period="hour", timeout=180.0)
                 series[sid] = res.get(sid) or []
             except Exception as e:
                 logger.warning("run_attribution_job: stats fetch %s failed: %s", sid, e)
                 series[sid] = []
         hourly = _stitch_hourly_energy(series, list(sensor_ids or []))
         hours = sorted(hourly.keys())          # oldest first
+        # Seam: where this device's REAL (live/imported) history begins in EMT.
+        # Attribution fills up to — but not into — that boundary so the
+        # reconstructed layer butts cleanly against the live one (no overlap, no
+        # gap), and we stop walking at the seam rather than running to 'now'.
+        # When the device has no live history yet (never configured), seam is None
+        # and we fill the full available range.
+        seam = store.get_device_live_coverage_start(device_meter_id)
+        if seam:
+            seam_cmp = _naive_iso(seam)
+            hours = [h for h in hours if _naive_iso(h) < seam_cmp]
+        j["seam"] = seam
         bm = int(get_block_minutes() or 30)
         j.update({"phase": "attributing", "total_hours": len(hours)})
         written = skipped = gaps = 0
@@ -2667,6 +2812,15 @@ async def run_attribution_job(device_meter_id: str, sensor_ids: list, *,
         if j.get("status") != "cancelled":
             j["status"] = "done"
         j["run_id"] = run_id
+        if written:
+            # Attribution rewrote historical blocks (new device rows + re-derived
+            # remainders); regenerate the charts off-loop so the visuals reflect
+            # the newly attributed device. Read-only render, guarded internally.
+            try:
+                j["phase"] = "charts"
+                await _generate_charts_offloaded()
+            except Exception as e:      # never let a chart failure fail the run
+                logger.warning("run_attribution_job: chart regen failed: %s", e)
         logger.info("run_attribution_job: device=%s wrote %d, skipped %d, gaps %d "
                     "(status=%s)", device_meter_id, written, skipped, gaps, j["status"])
         return {"ok": True, "written": written, "skipped": skipped, "gaps": gaps,
@@ -5135,12 +5289,20 @@ async def probe_recorder_statistics(entity_ids: list, days: int = 800) -> dict:
         logger.warning("probe_recorder_statistics: list_statistic_ids failed: %s", e)
         meta_list = []
     meta_by_id = {m.get("statistic_id"): m for m in (meta_list or [])}
-    try:
-        stats = await _engine_ha.get_statistics(ids, start, end, period="hour")
-    except Exception as e:
-        logger.warning("probe_recorder_statistics: statistics_during_period failed: %s", e)
-        return {"ok": False, "reason": "stats_failed", "error": str(e),
-                "window": [start, end], "reports": []}
+    # Fetch PER SENSOR (not all at once): over a multi-year window HA generates an
+    # hourly bucket per sensor across the whole span, so one big multi-sensor call
+    # blows past the WS timeout (blank TimeoutError). Per-sensor keeps each query
+    # small, gets its own budget, and isolates a slow/absent sensor from the rest.
+    stats = {}
+    for eid in ids:
+        try:
+            one = await _engine_ha.get_statistics([eid], start, end, period="hour",
+                                                  timeout=120.0)
+            stats[eid] = one.get(eid) or []
+        except Exception as e:
+            logger.warning("probe_recorder_statistics: %s failed (%s): %s",
+                           eid, type(e).__name__, e or "timeout")
+            stats[eid] = []
     reports = [_sp.build_sensor_probe(eid, stats.get(eid) or [], meta_by_id.get(eid))
                for eid in ids]
     return {"ok": True, "window": [start, end], "reports": reports}
@@ -8795,6 +8957,24 @@ async def engine_startup(ha: HAClient):
                     _sw["count"], _sw.get("ceiling_kwh", 0))
     except Exception as _spe:
         logger.warning("engine_startup: #307 device-spike self-heal failed: %s", _spe)
+
+    # Register dip-and-recover self-heal: a stale/dropout reading (a register briefly
+    # surfacing an old value while a sensor flickered) books the climb back to the
+    # real value as phantom consumption (prod: house_battery 48.93 kWh on 2026-07-21,
+    # under the #307 ceiling so that sweep missed it). The gap-boundary guard stops
+    # NEW ones; this cleans pre-guard history once. Grid/bill untouched; repaired
+    # blocks flagged needs_review.
+    try:
+        if not _store.get_kraken_state(_REGISTER_GLITCH_SWEEP_DONE_KEY):
+            _rg = _store.sweep_register_glitches(dry_run=False)
+            _store.set_kraken_state(_REGISTER_GLITCH_SWEEP_DONE_KEY,
+                                    datetime.now(timezone.utc).isoformat())
+            if _rg.get("count"):
+                logger.warning(
+                    "engine_startup: register dip-and-recover self-heal repaired %d "
+                    "phantom block(s) — flagged for review", _rg["count"])
+    except Exception as _rge:
+        logger.warning("engine_startup: register-glitch self-heal failed: %s", _rge)
 
     if _store.get_current_config_period_id() is None:
         # Fresh DB — check if blocks.json exists to migrate

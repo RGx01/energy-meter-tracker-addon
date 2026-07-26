@@ -7,8 +7,8 @@
       <a href="{{ url_for('data_management_page') }}" style="color:var(--muted);text-decoration:none;">Data Management</a>
       &nbsp;/
     </div>
-    <h2>Recorder History Probe <span style="font-size:12px;color:var(--muted);">(beta · read-only)</span></h2>
-    <div class="sub">Characterise what long-term history HA holds per device — before importing anything</div>
+    <h2>Device History</h2>
+    <div class="sub">Reconstruct a device's past usage from Home Assistant's recorder history</div>
   </div>
   <div style="display:flex;gap:8px;">
     <a href="{{ url_for('data_management_page') }}" class="btn btn-secondary">← Data Management</a>
@@ -19,21 +19,19 @@
 {% block content %}
 <div class="card">
   <div style="font-size:13px;color:var(--muted);line-height:1.7;margin-bottom:16px;">
-    This is a <strong>read-only diagnostic</strong>. It reads Home Assistant's long-term
-    statistics for each device's sensor(s) and reports how far back they go, their cadence,
-    any gaps, whether they're energy or power, and how timestamps behave across DST.
-    <strong>It writes nothing and creates no blocks.</strong>
-    Your devices are listed below, each pre-filled with its currently-assigned sensor.
-    The suggestions are filtered to <strong>energy (kWh)</strong> sensors, but you can
-    <strong>paste any entity</strong> if yours doesn't have the right class or unit.
-    <strong>Add more than one sensor to a device</strong> to stitch history together across
-    a Home Assistant change (a replaced device, a renamed entity, an integration swap).
+    If you added a device to EMT <em>after</em> Home Assistant had already been recording it,
+    its earlier usage is sitting inside your house total with no way to split it out. Pick the
+    sensor that measures each device's <strong>energy (kWh)</strong> below, then
+    <strong>Check sensors</strong> to confirm the history looks right — how far back it goes,
+    its cadence and any gaps — before you attribute anything. Add more than one sensor to a
+    device to <strong>stitch across a Home Assistant change</strong> (a replaced device, a
+    renamed entity, an integration swap). Checking reads only; it writes nothing.
   </div>
 
   <div id="devices"><div style="color:var(--muted);font-size:13px;">Loading your devices…</div></div>
 
   <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px;">
-    <button class="btn" id="btn-run" onclick="_runProbe()">Run probe</button>
+    <button class="btn" id="btn-run" onclick="_runProbe()">Check sensors</button>
     <span id="probe-status" style="font-size:13px;color:var(--muted);"></span>
   </div>
 </div>
@@ -49,8 +47,9 @@
     it wasn't recorded on yet — both pre-EMT history and live periods from before you added the
     device — split into your half-hours by the house import shape, clipped so a device can never
     exceed the metered import. A <strong>backup is taken first</strong>, it runs in the background
-    (pausable), and <strong>every run is reversible</strong> here — if you picked the wrong sensor,
-    undo the run and try again. It never overwrites live-recorded device data.
+    (pausable), and it's <strong>fully reversible</strong> — if you picked the wrong sensor,
+    <strong>Remove</strong> the device's reconstructed history below and try again. It never
+    overwrites live-recorded device data.
   </div>
   <div id="attr-runs"><div style="color:var(--muted);font-size:13px;">Loading…</div></div>
 </div>
@@ -121,18 +120,29 @@ function _addSensor(btn){
 }
 
 function _deviceSection(dev){
-  var sensors = (dev.sensors && dev.sensors.length) ? dev.sensors : [''];
+  // Pre-fill only ENERGY (kWh) sensors — the device's power/SOC/PV assignments aren't
+  // usable for energy attribution (paste one manually if you really want to probe it).
+  var sensors = (dev.sensors || []).filter(function(s){ return _isEnergy(_entityMeta[s]); });
+  if(!sensors.length) sensors = [''];
   var rows = sensors.map(function(s){ return _sensorRow(s); }).join('');
   var tag  = dev.is_sub_meter ? 'sub-meter' : 'main meter';
+  // The main meter is the house control total, not a device — its usage is the
+  // remainder, so it's probe-only (no attribution).
+  var actions = '<button class="btn btn-secondary btn-sm" onclick="_addSensor(this)">+ Add sensor</button>';
+  if(dev.is_sub_meter){
+    actions += ' <button class="btn btn-sm" onclick="_attributeDevice(this)">▶ Attribute history</button>';
+  }
+  var note = dev.is_sub_meter ? '' :
+    '<div style="font-size:12px;color:var(--muted);margin-top:6px;">House usage is billed as the '
+    + '<strong>remainder</strong> (house total − devices), so there\'s nothing to attribute here — '
+    + 'these sensors are for the probe only.</div>';
   return '<div class="probe-device" data-meter="'+_esc(dev.meter_id)+'" data-label="'+_esc(dev.label)+'" '
     +   'style="border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin-bottom:12px;">'
     + '<div style="font-weight:600;margin-bottom:8px;">'+_esc(dev.label)
     +   ' <span style="font-size:12px;color:var(--muted);font-weight:400;">'+tag+' · '+_esc(dev.meter_id)+'</span></div>'
     + '<div class="sensor-rows">'+rows+'</div>'
-    + '<div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap;">'
-    +   '<button class="btn btn-secondary btn-sm" onclick="_addSensor(this)">+ Add sensor</button>'
-    +   '<button class="btn btn-sm" onclick="_attributeDevice(this)">▶ Attribute history</button>'
-    + '</div>'
+    + '<div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap;">'+actions+'</div>'
+    + note
     + '</div>';
 }
 
@@ -160,11 +170,29 @@ function _reportCard(row, rep){
            + ' <span style="color:var(--muted);font-weight:400;font-size:12px;">'+_esc(row.entity)+'</span></div>';
   if(!rep || !rep.found){
     return '<div class="card" style="margin-bottom:12px;">'+head
-      + '<div style="color:var(--danger);font-size:13px;margin-top:6px;">No long-term statistics found for this sensor.'
+      + '<div style="color:var(--danger);font-size:13px;margin-top:6px;">No history found for this sensor in Home Assistant.'
       + (rep && rep.note ? ' '+_esc(rep.note) : '') + '</div></div>';
   }
+  // Friendly one-line verdict — the answer most people need.
+  var isEnergy = rep.value_kind === 'energy_sum';
+  var hourly   = rep.cadence_matches_hourly !== false;
+  var parts = [];
+  parts.push(rep.span_days!=null ? (rep.span_days + ' days') : 'unknown span');
+  if(rep.coverage_pct!=null) parts.push(rep.coverage_pct + '% coverage');
+  parts.push(hourly ? 'hourly' : 'not hourly');
+  if(rep.total_kwh!=null) parts.push('≈ ' + Math.round(rep.total_kwh) + ' kWh total');
+  var ok = isEnergy && hourly;
+  var verdict = ok
+    ? '<span style="color:#15803d;">✓ Looks usable</span>'
+    : (!isEnergy
+        ? '<span style="color:#b45309;">⚠ Not a cumulative-energy sensor — usage would be smeared</span>'
+        : '<span style="color:#b45309;">⚠ Not hourly — timing may be approximate</span>');
+  var summary = '<div style="font-size:13px;margin-top:6px;">' + verdict
+    + ' <span style="color:var(--muted);">· ' + parts.map(_esc).join(' · ') + '</span></div>';
+
+  // Forensic detail — tucked behind a disclosure so the default view stays calm.
   function kv(k,v){ return '<div><span style="color:var(--muted);">'+k+':</span> '+v+'</div>'; }
-  var kind = rep.value_kind==='energy_sum' ? 'energy (cumulative kWh — good)'
+  var kind = isEnergy ? 'energy (cumulative kWh)'
            : rep.value_kind==='power_mean' ? 'power (mean W — energy is smeared)'
            : 'unknown';
   var cad = rep.cadence_seconds ? (Math.round(rep.cadence_seconds/60)+' min'
@@ -173,7 +201,8 @@ function _reportCard(row, rep){
           ? rep.dst_samples.map(function(s){ return s.at_utc+' → offset '+s.local_offset_changed_to
               +' (Δ '+s.delta_from_prev_hours+'h)'; }).join('<br>')
           : 'none in window';
-  var body = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:6px 18px;font-size:13px;margin-top:8px;">'
+  var detail = '<details style="margin-top:8px;"><summary style="cursor:pointer;font-size:12px;color:var(--muted);">Technical details</summary>'
+    + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:6px 18px;font-size:13px;margin-top:8px;">'
     + kv('Type', kind)
     + kv('Unit', _esc(rep.unit||'?'))
     + kv('Earliest', _esc((rep.earliest||'?').substr(0,16)))
@@ -182,10 +211,12 @@ function _reportCard(row, rep){
     + kv('Cadence', cad)
     + kv('Coverage', (rep.coverage_pct!=null?rep.coverage_pct+'%':'?')+' ('+rep.count+' buckets)')
     + kv('Gaps', (rep.gap_count||0))
+    + kv('Total energy', (rep.total_kwh!=null ? (Math.round(rep.total_kwh)+' kWh') : '?'))
     + kv('Timestamp format', _esc(rep.raw_start_kind||'?'))
     + '</div>'
-    + '<div style="font-size:12px;color:var(--muted);margin-top:8px;">DST offset changes: '+dst+'</div>';
-  return '<div class="card" style="margin-bottom:12px;">'+head+body+'</div>';
+    + '<div style="font-size:12px;color:var(--muted);margin-top:8px;">DST offset changes: '+dst+'</div>'
+    + '</details>';
+  return '<div class="card" style="margin-bottom:12px;">'+head+summary+detail+'</div>';
 }
 
 var _lastResult = null;
@@ -258,14 +289,32 @@ function _attributeDevice(btn){
   var ents = [].slice.call(dv.querySelectorAll('.sensor-entity'))
     .map(function(i){ return i.value.trim(); }).filter(Boolean);
   if(!ents.length){ _setAttr('<span style="color:var(--danger);">Add at least one sensor for ' + _esc(label) + ' first.</span>'); return; }
-  if(!window.confirm('Attribute "' + label + '" history from ' + ents.length + ' sensor(s)?\n\n'
-      + 'A backup is taken first, it runs in the background, and it can be undone per run.')) return;
-  _setAttr('⏳ <strong>Starting…</strong>');
+  // Client-side unit guard: flag any chosen sensor that isn't a known energy/kWh entity.
+  var bad = ents.filter(function(e){ var m=_entityMeta[e]; return m && !_isEnergy(m); });
+  var warn = bad.length ? ('⚠ ' + bad.join(', ') + ' is not an energy (kWh) sensor — usage would be smeared.\n\n') : '';
+  if(!window.confirm('Attribute "' + label + '" history from ' + ents.length + ' sensor(s)?\n\n' + warn
+      + 'A backup is taken first, it runs in the background, and you can Remove it here afterwards.')) return;
+  _startAttribute(meter, ents, false);
+}
+
+// Kicks the run; on a server sanity refusal (device > house etc.) it surfaces the
+// warning and lets the user proceed with an explicit override.
+function _startAttribute(meter, ents, override){
+  _setAttr('⏳ <strong>' + (override ? 'Starting (override)…' : 'Checking &amp; starting…') + '</strong>');
   fetch(apiUrl('/api/historical/attribute/start'), {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ meter_id: meter, sensor_ids: ents })
+    body: JSON.stringify({ meter_id: meter, sensor_ids: ents, confirm_override: !!override })
   }).then(function(r){return r.json();}).then(function(d){
-    if(!d.ok){ _setAttr('<span style="color:var(--danger);">' + _esc(d.error||'failed') + '</span>'); return; }
+    if(!d.ok){
+      if(d.sanity){
+        if(window.confirm('⚠ ' + (d.warn || 'This sensor may not be right.') + '\n\nAttribute anyway?')){
+          _startAttribute(meter, ents, true); return;
+        }
+        _setAttr('<span style="color:var(--muted);">Cancelled — pick a different sensor and Check again.</span>');
+        return;
+      }
+      _setAttr('<span style="color:var(--danger);">' + _esc(d.error||'failed') + '</span>'); return;
+    }
     _pollAttr();
   }).catch(function(e){ _setAttr('Request failed: ' + e); });
 }
@@ -306,28 +355,59 @@ function _loadRuns(){
   fetch(apiUrl('/api/historical/attribute/runs')).then(function(r){return r.json();}).then(function(d){
     var el = document.getElementById('attr-runs'); if(!el) return;
     var runs = (d && d.runs) || [];
-    if(!runs.length){ el.innerHTML = '<div style="color:var(--muted);font-size:13px;">No attribution runs yet.</div>'; return; }
-    el.innerHTML = runs.slice().reverse().map(function(r){
-      var span = (r.from ? _esc(r.from.substr(0,10)) : '?') + ' → ' + (r.to ? _esc(r.to.substr(0,10)) : '?');
-      return '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);font-size:13px;">'
-        + '<span>' + _esc(r.meter_id||'?') + ' <span style="color:var(--muted);">' + span + ' · ' + (r.blocks_written||0) + ' blocks · ' + ((r.sensor_ids||[]).length) + ' sensor(s)</span></span>'
-        + '<button class="btn btn-secondary btn-sm" style="color:var(--danger);" onclick="_backoutRun(\'' + _esc(r.run_id) + '\',\'' + _esc(r.meter_id||'') + '\')">↩ Undo</button>'
+    var layer = (d && d.summary && d.summary.meters) || [];   // what's ACTUALLY in the DB, per device
+    // Latest ledger run per device, for the descriptive "from N sensor(s)" line.
+    var runByMeter = {};
+    runs.forEach(function(r){ if(r.meter_id) runByMeter[r.meter_id] = r; });
+
+    // ONE list, keyed on what's really in the database — so there's exactly one
+    // Remove per device, no separate Undo, and orphans (blocks with no ledger run)
+    // are handled the same way as everything else.
+    if(!layer.length){
+      el.innerHTML = '<div style="color:var(--muted);font-size:13px;">No reconstructed device history yet. '
+        + 'Check a device\'s sensors above, then Attribute to build it.</div>';
+      if(_backoutInFlight) _setUndoDisabled(true);
+      return;
+    }
+    el.innerHTML = layer.map(function(m){
+      var span = (m.from ? _esc(m.from.substr(0,10)) : '?') + ' → ' + (m.to ? _esc(m.to.substr(0,10)) : '?');
+      var r = runByMeter[m.meter_id];
+      var extra = r
+        ? (' · from ' + ((r.sensor_ids||[]).length) + ' sensor(s)')
+        : ' · <span style="color:var(--danger);">no run on file</span>';
+      return '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px;">'
+        + '<span>' + _esc(m.meter_id||'?') + ' <span style="color:var(--muted);">' + span + ' · ' + (m.blocks||0) + ' blocks' + extra + '</span></span>'
+        + '<button class="btn btn-secondary btn-sm attr-undo-btn" style="color:var(--danger);" onclick="_removeDeviceLayer(\'' + _esc(m.meter_id||'') + '\')">🗑 Remove</button>'
         + '</div>';
     }).join('');
+    if(_backoutInFlight) _setUndoDisabled(true);   // keep buttons off if a re-render lands mid-remove
   }).catch(function(){});
 }
 
-function _backoutRun(runId, meter){
-  if(!window.confirm('Undo the attribution run for ' + meter + '?\n\nThis removes its reconstructed device blocks and re-derives the house remainder.')) return;
-  _setAttr('⏳ <strong>Undoing…</strong>');
+var _backoutInFlight = false;
+function _setUndoDisabled(off){
+  var btns = document.querySelectorAll('.attr-undo-btn');
+  for(var i=0;i<btns.length;i++){ btns[i].disabled = off; btns[i].style.opacity = off ? '0.5' : ''; }
+}
+
+// Remove a device's ENTIRE reconstructed layer by meter — the single reversal
+// action. Ledger-independent, so it works for a normal device and for an orphan
+// (blocks with no run on file) alike; the house remainder is re-derived.
+function _removeDeviceLayer(meter){
+  if(_backoutInFlight) return;
+  if(!meter) return;
+  if(!window.confirm('Remove the reconstructed history for ' + meter + '?\n\nThis clears its attributed blocks and returns that usage to the house remainder, so you can re-run attribution cleanly. Your live and imported data are untouched.')) return;
+  _backoutInFlight = true; _setUndoDisabled(true);
+  _setAttr('⏳ <strong>Removing ' + _esc(meter) + ' attributed layer…</strong>');
   fetch(apiUrl('/api/historical/attribute/backout'), {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ run_id: runId })
+    body: JSON.stringify({ meter_id: meter })
   }).then(function(r){return r.json();}).then(function(d){
     if(!d.ok){ _setAttr('<span style="color:var(--danger);">' + _esc(d.error||'failed') + '</span>'); return; }
-    _setAttr('✓ Undone — removed ' + (d.deleted||0) + ' block(s), recomputed ' + (d.recomputed||0) + '.');
+    _setAttr('✓ Removed ' + (d.deleted||0) + ' block(s) for ' + _esc(meter) + ', recomputed ' + (d.recomputed||0) + '. You can re-run attribution now.');
     _loadRuns();
-  }).catch(function(e){ _setAttr('Request failed: ' + e); });
+  }).catch(function(e){ _setAttr('Request failed: ' + e); })
+    .then(function(){ _backoutInFlight = false; _setUndoDisabled(false); });
 }
 
 document.addEventListener('DOMContentLoaded', function(){

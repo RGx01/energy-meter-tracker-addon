@@ -118,6 +118,8 @@ eng.attribution_running = lambda: False
 eng.api_attribution_status = lambda: {"status": "idle"}
 eng.attribution_control = lambda a: {"status": "idle", "control": a}
 eng.backout_recorder_attribution = lambda **kw: {"ok": True, "deleted": 0, "parents": [], "recomputed": 0}
+eng.backout_running = lambda: False
+eng.api_backout_status = lambda: {"status": "idle"}
 
 def _load_power_converter_into(mod):
     import re as _re
@@ -4720,11 +4722,10 @@ class TestProbeDevicesEndpoint(unittest.TestCase):
         d = r.get_json()
         self.assertTrue(d["ok"])
         by = {x["meter_id"]: x for x in d["devices"]}
-        self.assertNotIn("old_bat", by)                              # retired skipped
-        self.assertFalse(by["electricity_main"]["is_sub_meter"])
-        self.assertFalse(d["devices"][0]["is_sub_meter"])            # main sorts first
-        for s in ("sensor.grid_import", "sensor.grid_export", "sensor.house_power"):
-            self.assertIn(s, by["electricity_main"]["sensors"])
+        self.assertNotIn("old_bat", by)                     # retired skipped
+        self.assertNotIn("electricity_main", by)            # main meter omitted (control total)
+        self.assertIn("ev_charger", by)
+        self.assertTrue(by["ev_charger"]["is_sub_meter"])
         self.assertIn("sensor.zappi_energy", by["ev_charger"]["sensors"])
         self.assertIn("sensor.zappi_power", by["ev_charger"]["sensors"])
 
@@ -4741,12 +4742,28 @@ class TestAttributionEndpoints(unittest.TestCase):
                                json={"meter_id": "ev", "sensor_ids": []})
         self.assertEqual(r.status_code, 400)
 
+    def test_start_rejects_main_meter(self):
+        # Attribution is for sub-meter devices only — the house total isn't a device.
+        orig = server.load_config
+        server.load_config = lambda: {"meters": {"electricity_main": {"meta": {"sub_meter": False}}}}
+        try:
+            r = make_client().post("/api/historical/attribute/start",
+                                   json={"meter_id": "electricity_main", "sensor_ids": ["sensor.house"]})
+            self.assertEqual(r.status_code, 400)
+        finally:
+            server.load_config = orig
+
     def test_start_409_when_a_run_is_active(self):
         import engine
+        orig = server.load_config
+        server.load_config = lambda: {"meters": {"ev": {"meta": {"sub_meter": True}}}}
         engine.attribution_running = lambda: True
-        r = make_client().post("/api/historical/attribute/start",
-                               json={"meter_id": "ev", "sensor_ids": ["sensor.ev"]})
-        self.assertEqual(r.status_code, 409)
+        try:
+            r = make_client().post("/api/historical/attribute/start",
+                                   json={"meter_id": "ev", "sensor_ids": ["sensor.ev"]})
+            self.assertEqual(r.status_code, 409)
+        finally:
+            server.load_config = orig
 
     def test_status_and_control(self):
         cli = make_client()
@@ -4777,6 +4794,27 @@ class TestAttributionEndpoints(unittest.TestCase):
         engine.attribution_running = lambda: True
         self.assertEqual(make_client().post("/api/historical/attribute/backout",
                                             json={"run_id": "r1"}).status_code, 409)
+        engine.attribution_running = lambda: False
+
+    def test_backout_refused_while_another_backout_in_flight(self):
+        import engine
+        engine.attribution_running = lambda: False
+        engine.backout_running = lambda: True
+        try:
+            r = make_client().post("/api/historical/attribute/backout", json={"run_id": "r1"})
+            self.assertEqual(r.status_code, 409)
+            self.assertIn("undo", r.get_json()["error"])
+        finally:
+            engine.backout_running = lambda: False
+
+    def test_backout_unknown_run_returns_409_not_500(self):
+        import engine
+        engine.attribution_running = lambda: False
+        engine.backout_running = lambda: False
+        engine.backout_recorder_attribution = lambda **kw: {"ok": False, "error": "run_not_found"}
+        r = make_client().post("/api/historical/attribute/backout", json={"run_id": "gone"})
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("already undone", r.get_json()["error"])
 
 
 class TestBackupDownloadDelete(unittest.TestCase):

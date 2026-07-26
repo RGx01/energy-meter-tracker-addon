@@ -997,6 +997,62 @@ class TestBuildGapBlocksSubMeterRate(unittest.TestCase):
                 msg="Sub-meter gap block rate must not be 0.0 when last_known_rates is available")
 
 
+class TestGapBlockBackwardRegister(unittest.TestCase):
+    """A cumulative register can only fall via a genuine reset (collapse to ~0). A
+    small backward step to a value still near the prior level is a glitch/stale read
+    (the 2026-07-21 house_battery 6259.77 case) — gap-fill must book ZERO there and
+    carry the register forward, not treat it as a reset and manufacture kWh."""
+
+    CONFIG = {
+        "meters": {
+            "electricity_main": {
+                "meta": {"sub_meter": False},
+                "channels": {"import": {"read": "sensor.imp", "rate": "sensor.rate"}},
+            },
+            "sub_meter_battery": {
+                "meta": {"sub_meter": True, "parent_meter": "electricity_main"},
+                "channels": {"import": {"read": "sensor.bat", "rate": "sensor.rate"}},
+            },
+        }
+    }
+    WINDOW = [(dt("2026-07-21T09:30:00"), dt("2026-07-21T10:00:00"))]
+    MAIN = {"import": {"ts": "2026-07-21T08:30:00", "value": 0.25}}
+
+    def _run(self, pre_val, post_val):
+        pre = {"electricity_main": {"import": read(1000.0, "2026-07-21T08:45:00")},
+               "sub_meter_battery": {"import": read(pre_val, "2026-07-21T08:45:00")}}
+        post = {"electricity_main": {"import": read(1000.5, "2026-07-21T10:15:00")},
+                "sub_meter_battery": {"import": read(post_val, "2026-07-21T10:15:00")}}
+        blocks = engine.build_gap_blocks(self.WINDOW, pre, post,
+                                         {"electricity_main": self.MAIN,
+                                          "sub_meter_battery": self.MAIN}, self.CONFIG)
+        return blocks[0]["meters"]["sub_meter_battery"]["channels"]["import"]
+
+    def test_backward_glitch_books_zero_and_carries_forward(self):
+        ch = self._run(6309.12, 6259.77)          # dipped ~49 below, not collapsed
+        self.assertEqual(ch["kwh"], 0.0)
+        self.assertEqual(ch["read_start"], 6309.12)   # register carried forward
+        self.assertEqual(ch["read_end"], 6309.12)
+
+    def test_genuine_reset_still_books_post_value(self):
+        ch = self._run(48.0, 2.0)                 # collapsed to <50% → real reset
+        self.assertAlmostEqual(ch["kwh"], 2.0)
+
+
+class TestReadSensorGapNotCache(unittest.TestCase):
+    """read_sensor must treat unavailable/unknown as a GAP (None), never launder a
+    stale cached number into a live reading — the ingress for the phantom battery kWh."""
+
+    def test_unavailable_returns_none_not_cache(self):
+        ha = MagicMock()
+        ha.get_state.return_value = "42.0"
+        self.assertEqual(engine.read_sensor(ha, "sensor.reg"), 42.0)   # good read cached
+        ha.get_state.return_value = "unavailable"
+        self.assertIsNone(engine.read_sensor(ha, "sensor.reg"))        # NOT the cached 42
+        ha.get_state.return_value = None
+        self.assertIsNone(engine.read_sensor(ha, "sensor.reg"))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ensure_correct_block — no first block before sensors configured (2.7.0)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3443,6 +3499,34 @@ class TestWriteDeviceIntoBlock(unittest.TestCase):
         self.assertFalse(engine._write_device_into_block(block, "ev_charger", "electricity_main", 9.0))
         self.assertFalse(engine._write_device_into_block({"meters": {}}, "ev_charger", "electricity_main", 1.0))
 
+    def test_inherits_parent_intensity_so_carbon_computes(self):
+        # Regression: a reconstructed device row has no carbon_intensity_g of its
+        # own, so _recompute_block_carbon would skip it and leave carbon_g NULL
+        # (0/29657 device blocks in the first real run). The write path must copy
+        # the parent block's intensity onto the device so carbon computes.
+        engine.append_block_replace = lambda b: None
+        engine._recompute_block_carbon = self._saved[2]        # use the real recompute
+        block = {"meters": {"electricity_main": {
+            "channels": {"import": {"kwh": 4.0}}, "carbon_intensity_g": 200.0}}}
+        self.assertTrue(engine._write_device_into_block(
+            block, "ev_charger", "electricity_main", 1.0))
+        dev = block["meters"]["ev_charger"]
+        self.assertEqual(dev["carbon_intensity_g"], 200.0)     # inherited
+        self.assertIsNotNone(dev.get("carbon_g"))              # and carbon computed
+        self.assertAlmostEqual(dev["carbon_g"], 1.0 * 200.0)   # kwh * intensity
+
+    def test_no_parent_intensity_leaves_carbon_absent(self):
+        # When the parent block itself carries no intensity, there's nothing to
+        # inherit — the device row is still written, just without carbon.
+        engine.append_block_replace = lambda b: None
+        engine._recompute_block_carbon = self._saved[2]
+        block = {"meters": {"electricity_main": {"channels": {"import": {"kwh": 4.0}}}}}
+        self.assertTrue(engine._write_device_into_block(
+            block, "ev_charger", "electricity_main", 1.0))
+        dev = block["meters"]["ev_charger"]
+        self.assertNotIn("carbon_intensity_g", dev)
+        self.assertIsNone(dev.get("carbon_g"))
+
 
 class TestAttributeHour(unittest.TestCase):
     """Split one hour across its half-hour blocks by house import shape, write where
@@ -3488,17 +3572,19 @@ class TestRunAttributionJob(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         self._saved = (engine._engine_ha, engine.get_store, engine._attribute_hour,
-                       engine.get_block_minutes, engine.delete_in_progress)
+                       engine.get_block_minutes, engine.delete_in_progress,
+                       engine._generate_charts_offloaded)
         self._j = dict(engine._attribution_job)
 
     def tearDown(self):
         (engine._engine_ha, engine.get_store, engine._attribute_hour,
-         engine.get_block_minutes, engine.delete_in_progress) = self._saved
+         engine.get_block_minutes, engine.delete_in_progress,
+         engine._generate_charts_offloaded) = self._saved
         engine._attribution_job.clear(); engine._attribution_job.update(self._j)
 
     async def test_stitches_walks_and_records_run(self):
         ha = MagicMock()
-        async def _stats(ids, s, e, period="hour"):
+        async def _stats(ids, s, e, period="hour", timeout=45.0):
             return {ids[0]: [{"start": "2025-03-01T00:00:00+00:00", "change": 1.0},
                              {"start": "2025-03-01T01:00:00+00:00", "change": 2.0}]}
         ha.get_statistics = _stats
@@ -3506,7 +3592,11 @@ class TestRunAttributionJob(unittest.IsolatedAsyncioTestCase):
         engine.get_block_minutes = lambda: 30
         engine.delete_in_progress = lambda: False
         store = MagicMock(); store.get_parent_meter_id.return_value = "electricity_main"
+        store.get_device_live_coverage_start.return_value = None   # no live history → fill fully
         engine.get_store = lambda: store
+        chart_calls = []
+        async def _charts(): chart_calls.append(True)
+        engine._generate_charts_offloaded = _charts
         calls = []
         engine._attribute_hour = lambda hour, dev, parent, kwh, block_minutes=30: (
             calls.append((hour, kwh)) or (2, 0, 0))
@@ -3515,10 +3605,92 @@ class TestRunAttributionJob(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res["ok"])
         self.assertEqual(res["written"], 4)                     # 2 hours × 2 blocks
         self.assertEqual(engine._attribution_job["status"], "done")
+        self.assertEqual(len(chart_calls), 1)                   # charts regenerated after a real run
         store.record_attribution_run.assert_called_once()
         self.assertEqual([c[0] for c in calls],
                          ["2025-03-01T00:00:00", "2025-03-01T01:00:00"])   # oldest first
         self.assertEqual([c[1] for c in calls], [1.0, 2.0])               # stitched energy
+
+    async def test_stops_at_live_history_seam(self):
+        # The device already has real history from 2025-03-01T01:00:00 onward, so
+        # attribution fills up to (not into) that seam: only the 00:00 hour is
+        # attributed, and the 01:00 hour (which belongs to the live period) is left.
+        ha = MagicMock()
+        async def _stats(ids, s, e, period="hour", timeout=45.0):
+            return {ids[0]: [{"start": "2025-03-01T00:00:00+00:00", "change": 1.0},
+                             {"start": "2025-03-01T01:00:00+00:00", "change": 2.0}]}
+        ha.get_statistics = _stats
+        engine._engine_ha = ha
+        engine.get_block_minutes = lambda: 30
+        engine.delete_in_progress = lambda: False
+        store = MagicMock(); store.get_parent_meter_id.return_value = "electricity_main"
+        store.get_device_live_coverage_start.return_value = "2025-03-01T01:00:00"
+        engine.get_store = lambda: store
+        async def _charts(): pass
+        engine._generate_charts_offloaded = _charts
+        calls = []
+        engine._attribute_hour = lambda hour, dev, parent, kwh, block_minutes=30: (
+            calls.append(hour) or (2, 0, 0))
+
+        res = await engine.run_attribution_job("house_battery", ["sensor.bat"])
+        self.assertTrue(res["ok"])
+        self.assertEqual(calls, ["2025-03-01T00:00:00"])        # only the pre-seam hour
+        self.assertEqual(res["written"], 2)                     # 1 hour × 2 blocks
+        self.assertEqual(engine._attribution_job.get("seam"), "2025-03-01T01:00:00")
+
+
+class TestAttributionPreflight(unittest.IsolatedAsyncioTestCase):
+    """Sanity-check a device's sensors against the house import before attributing:
+    a device can't exceed the house it draws from, and a ~1000× figure is a unit slip."""
+
+    def setUp(self):
+        self._saved = (engine._engine_ha, engine.get_store)
+
+    def tearDown(self):
+        (engine._engine_ha, engine.get_store) = self._saved
+
+    def _ha(self, total_change):
+        ha = MagicMock()
+        async def _stats(ids, s, e, period="hour", timeout=45.0):
+            return {ids[0]: [{"start": "2025-03-01T00:00:00+00:00", "change": total_change}]}
+        ha.get_statistics = _stats
+        return ha
+
+    def _store(self, house_kwh):
+        store = MagicMock()
+        store.get_parent_meter_id.return_value = "electricity_main"
+        store.sum_meter_import_kwh.return_value = house_kwh
+        return store
+
+    async def test_device_exceeds_house_is_flagged(self):
+        engine._engine_ha = self._ha(100.0)
+        engine.get_store = lambda: self._store(50.0)          # house drew less than the device
+        r = await engine.attribution_preflight("ev_charger", ["sensor.ev"])
+        self.assertEqual(r["verdict"], "device_exceeds_house")
+        self.assertEqual(r["device_kwh"], 100.0)
+        self.assertEqual(r["house_kwh"], 50.0)
+
+    async def test_within_house_is_ok(self):
+        engine._engine_ha = self._ha(100.0)
+        engine.get_store = lambda: self._store(200.0)
+        r = await engine.attribution_preflight("ev_charger", ["sensor.ev"])
+        self.assertEqual(r["verdict"], "ok")
+
+    async def test_tiny_device_is_suspicious(self):
+        engine._engine_ha = self._ha(0.01)
+        engine.get_store = lambda: self._store(100.0)         # 0.01 << 100 * 0.0005
+        r = await engine.attribution_preflight("ev_charger", ["sensor.ev"])
+        self.assertEqual(r["verdict"], "suspiciously_small")
+
+    async def test_no_data_verdict(self):
+        ha = MagicMock()
+        async def _stats(ids, s, e, period="hour", timeout=45.0):
+            return {ids[0]: []}
+        ha.get_statistics = _stats
+        engine._engine_ha = ha
+        engine.get_store = lambda: self._store(100.0)
+        r = await engine.attribution_preflight("ev_charger", ["sensor.ev"])
+        self.assertEqual(r["verdict"], "no_data")
 
 
 class TestBackoutRecorderAttribution(unittest.TestCase):
@@ -3554,6 +3726,56 @@ class TestBackoutRecorderAttribution(unittest.TestCase):
         # parent remainder recomputed over the span with an EXCLUSIVE +1-block end
         self.assertEqual(calls, [("electricity_main", "2025-03-01T00:00:00", "2025-03-01T01:00:00")])
         store.remove_attribution_run.assert_called_once_with("r1")
+        self.assertFalse(engine.backout_running())          # job state reset afterwards
+
+    def test_backout_by_meter_needs_no_ledger_run(self):
+        # Orphan-recovery path: remove a device's whole attributed layer by meter_id
+        # with NO run_id — used when the run/Undo was lost (interrupted undo). It must
+        # delete scoped to that meter and recompute the parent, without the ledger.
+        calls = []
+        store = MagicMock()
+        store.delete_recorder_attributed.return_value = {
+            "deleted": 40, "meters": ["ev_charger"], "parents": ["electricity_main"],
+            "from": "2024-07-01T00:00:00", "to": "2026-01-31T23:30:00"}
+        engine.get_store = lambda: store
+        engine.get_block_minutes = lambda: 30
+        engine.recompute_remainders_for_window = lambda p, lo, hi: calls.append((p, lo, hi)) or 40
+        res = engine.backout_recorder_attribution(meter_id="ev_charger")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["deleted"], 40)
+        store.delete_recorder_attributed.assert_called_once_with(
+            meter_id="ev_charger", from_iso=None, to_iso=None)
+        self.assertEqual(calls[0][0], "electricity_main")
+        store.get_attribution_runs.assert_not_called()      # ledger not consulted
+        store.remove_attribution_run.assert_not_called()    # nothing to remove
+
+    def test_unknown_run_id_refused_not_all_none_delete(self):
+        # A run_id that isn't in the ledger (e.g. a double-click after it was already
+        # undone) must be refused — NOT fall through to an all-None delete that would
+        # wipe the whole attributed layer.
+        store = MagicMock()
+        store.get_attribution_runs.return_value = []            # nothing matches
+        engine.get_store = lambda: store
+        engine.get_block_minutes = lambda: 30
+        res = engine.backout_recorder_attribution(run_id="gone")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], "run_not_found")
+        store.delete_recorder_attributed.assert_not_called()   # never touched the DB
+
+    def test_concurrent_backout_refused(self):
+        # While one back-out holds the single-flight lock, a second is refused
+        # (atomically) rather than racing it on the shared DB connection.
+        store = MagicMock()
+        engine.get_store = lambda: store
+        engine.get_block_minutes = lambda: 30
+        self.assertTrue(engine._backout_lock.acquire(blocking=False))   # simulate one in flight
+        try:
+            res = engine.backout_recorder_attribution(meter_id="ev_charger")
+            self.assertFalse(res["ok"])
+            self.assertEqual(res["error"], "backout_in_progress")
+            store.delete_recorder_attributed.assert_not_called()        # never raced the DB
+        finally:
+            engine._backout_lock.release()
 
 
 class TestRepriceSuspect(unittest.TestCase):

@@ -50,11 +50,12 @@
     </div>
   </div>
 
-  <div style="margin-bottom:14px;">
-    <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:6px;">Meter <span style="font-weight:400;">(optional — leave blank to delete all meters)</span></label>
-    <select id="del-meter-id" style="width:100%;">
-      <option value="">All meters</option>
-    </select>
+  <div style="font-size:12px;color:var(--muted);line-height:1.7;margin-bottom:14px;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-radius:6px;">
+    Deletes <strong>whole blocks</strong> in the range — every meter together — so the house
+    and its devices stay consistent. To remove or rebuild a single <strong>device's</strong>
+    usage (with the house remainder re-derived automatically), use
+    <a href="{{ url_for('historical_probe_page') }}" style="color:var(--accent, #2563eb);">Device History</a>
+    instead — deleting one meter's blocks here would leave the house total reading low.
   </div>
 
   <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:14px;cursor:pointer;">
@@ -135,26 +136,12 @@ async function doManualBackup() {
   }
 }
 
-document.addEventListener('DOMContentLoaded', function() {
-  fetch(apiUrl('/api/corrections/meters'))
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      var sel = document.getElementById('del-meter-id');
-      (d.meters || []).forEach(function(m) {
-        var opt = document.createElement('option');
-        opt.value = m; opt.textContent = m;
-        sel.appendChild(opt);
-      });
-    })
-    .catch(function() {});
-});
-
 function deleteBlocksPreview() {
   var fromDate = document.getElementById('del-from-date').value;
   var fromTime = document.getElementById('del-from-time').value || '00:00';
   var toDate   = document.getElementById('del-to-date').value;
   var toTime   = document.getElementById('del-to-time').value || '23:59';
-  var meterId  = document.getElementById('del-meter-id').value || null;
+  var meterId  = null;   // whole-block delete only — per-meter removal lives in Device History
   var errEl    = document.getElementById('del-error');
   var prevEl   = document.getElementById('del-preview');
   var prevText = document.getElementById('del-preview-text');
@@ -190,11 +177,10 @@ function deleteBlocksPreview() {
     }
     prevEl.style.display = 'block';
     if (d.blocks === 0) {
-      prevText.textContent  = 'No blocks found for the selected date range' + (meterId ? ' and meter' : '') + '.';
+      prevText.textContent  = 'No blocks found for the selected date range.';
       confRow.style.display = 'none';
     } else {
-      var meterStr = meterId ? (' for ' + meterId) : ' across all meters';
-      prevText.innerHTML    = '<strong>' + d.blocks + ' blocks</strong> across <strong>' + d.dates + ' day' + (d.dates !== 1 ? 's' : '') + '</strong>' + meterStr + ' will be permanently deleted.';
+      prevText.innerHTML    = '<strong>' + d.blocks + ' blocks</strong> across <strong>' + d.dates + ' day' + (d.dates !== 1 ? 's' : '') + '</strong> across all meters will be permanently deleted.';
       confRow.style.display = 'block';
     }
   })
@@ -210,7 +196,7 @@ function deleteBlocksApply() {
   var fromTime = document.getElementById('del-from-time').value || '00:00';
   var toDate   = document.getElementById('del-to-date').value;
   var toTime   = document.getElementById('del-to-time').value || '23:59';
-  var meterId  = document.getElementById('del-meter-id').value || null;
+  var meterId  = null;   // whole-block delete only — per-meter removal lives in Device History
   var confBtn  = document.getElementById('del-confirm-btn');
   var errEl    = document.getElementById('del-error');
   var succEl   = document.getElementById('del-success');

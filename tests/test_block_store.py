@@ -4945,6 +4945,130 @@ class TestRecorderAttributionStore(unittest.TestCase):
         s.remove_attribution_run("r1")
         self.assertEqual([r["run_id"] for r in s.get_attribution_runs()], ["r2"])
 
+    def test_sum_meter_import_over_window(self):
+        s = self._store()
+        # Two electricity_main imported blocks, 1.0 kWh each, both on 2025-03-01.
+        self.assertAlmostEqual(
+            s.sum_meter_import_kwh("electricity_main",
+                                   "2025-03-01T00:00:00", "2025-03-01T00:30:00"), 2.0)
+        # A window that excludes the second block sums just the first.
+        self.assertAlmostEqual(
+            s.sum_meter_import_kwh("electricity_main",
+                                   "2025-03-01T00:00:00", "2025-03-01T00:00:00"), 1.0)
+
+    def test_live_coverage_seam_ignores_attributed(self):
+        s = self._store()
+        # ev_charger currently only has recorder_attributed rows → no live seam.
+        self.assertIsNone(s.get_device_live_coverage_start("ev_charger"))
+        # Add a real (live) ev_charger block AFTER the attributed ones.
+        cp = s._conn.execute("SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+        with s._conn:
+            s._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                "imp_kwh, source) VALUES (?,?,?,?,?,?)",
+                ("2025-03-02T00:00:00", "2025-03-02T00:00:00", "ev_charger", cp, 0.7, None))
+        # Seam is the earliest NON-attributed block — the live one, not the 2025-03-01 attributed rows.
+        self.assertEqual(s.get_device_live_coverage_start("ev_charger"), "2025-03-02T00:00:00")
+
+
+class TestSweepRegisterGlitches(unittest.TestCase):
+    """Stale-boundary phantom: a register that DIPS below its established level and
+    RECOVERS (a dropout surfacing an old value, e.g. house_battery 6259.77 on
+    2026-07-21) books the climb back as ~49 kWh. The sweep clamps only the
+    provably-recovering dip; a non-recovering drop (possible reset) is left alone."""
+
+    def _store(self):
+        s = BlockStore(":memory:")
+        s.insert_config_period({"meters": {
+            "electricity_main": {"meta": {
+                "billing_day": 1, "block_minutes": 30, "timezone": "Europe/London",
+                "currency_symbol": "£", "currency_code": "GBP", "site": "Home"}},
+            "house_battery": {"meta": {
+                "sub_meter": True, "parent_meter": "electricity_main",
+                "billing_day": 1, "block_minutes": 30, "timezone": "Europe/London",
+                "currency_symbol": "£", "currency_code": "GBP"}},
+        }})
+        cp = s._conn.execute("SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+        return s, cp
+
+    def _ins(self, s, cp, start, imp_kwh, grid, re, carbon=0.0, intensity=142.0):
+        s._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+            "imp_kwh, imp_kwh_grid, imp_read_end, carbon_g, carbon_intensity_g) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (start, start, "house_battery", cp, imp_kwh, grid, re, carbon, intensity))
+        s._conn.commit()
+
+    def test_clamps_dip_and_recover_phantom(self):
+        s, cp = self._store()
+        self._ins(s, cp, "2026-07-21T08:30:00", 0.0, 0.0, 6309.12)   # high-water established
+        self._ins(s, cp, "2026-07-21T09:30:00", 0.0, 0.0, 6259.77)   # dip (already 0 → not flagged)
+        self._ins(s, cp, "2026-07-21T10:00:00", 48.93, 0.0, 6308.70, carbon=6948.0)  # phantom climb-back
+        self._ins(s, cp, "2026-07-21T10:30:00", 0.10, 0.10, 6309.12) # recovery to high-water
+
+        prev = s.sweep_register_glitches(dry_run=True)
+        self.assertEqual(prev["count"], 1)
+        self.assertEqual(prev["blocks"][0]["block_start"], "2026-07-21T10:00:00")
+
+        res = s.sweep_register_glitches(dry_run=False)
+        self.assertTrue(res["applied"])
+        r = s._conn.execute("SELECT imp_kwh, imp_kwh_grid, carbon_g, needs_review "
+                            "FROM blocks WHERE block_start='2026-07-21T10:00:00'").fetchone()
+        self.assertEqual(r["imp_kwh"], 0.0)          # clamped to grid
+        self.assertEqual(r["carbon_g"], 0.0)         # recomputed from 0
+        self.assertEqual(r["needs_review"], 1)
+        self.assertEqual(r["imp_kwh_grid"], 0.0)     # bill side untouched
+        # recovery + normal blocks untouched
+        self.assertAlmostEqual(s._conn.execute(
+            "SELECT imp_kwh FROM blocks WHERE block_start='2026-07-21T10:30:00'").fetchone()[0], 0.10)
+        self.assertEqual(s.sweep_register_glitches(dry_run=False)["count"], 0)   # idempotent
+
+    def test_non_recovering_drop_left_alone(self):
+        # A genuine reset: register drops and never returns to the prior high-water.
+        # The sweep must NOT touch it (it isn't a dip-and-recover glitch).
+        s, cp = self._store()
+        self._ins(s, cp, "2026-06-01T00:00:00", 0.0, 0.0, 6300.0)    # high-water
+        self._ins(s, cp, "2026-06-01T00:30:00", 3.0, 3.0, 3.0)       # reset → climbs fresh from ~0
+        self._ins(s, cp, "2026-06-01T01:00:00", 2.0, 2.0, 5.0)
+        self._ins(s, cp, "2026-06-01T01:30:00", 2.0, 2.0, 7.0)
+        self.assertEqual(s.sweep_register_glitches(dry_run=True)["count"], 0)
+
+
+class TestSourceTagRoundTrip(unittest.TestCase):
+    """Regression: the 'source' provenance tag (imported_api etc.) must survive a
+    read → modify → append_block_replace round-trip. Dropping it re-inserted
+    source=NULL and silently untagged imported history (the carbon-round-trip bug)."""
+
+    def _store(self):
+        s = BlockStore(":memory:")
+        with s._conn:
+            cp = s._conn.execute(
+                "INSERT INTO config_periods (effective_from, billing_day, block_minutes, "
+                "timezone, currency_symbol, currency_code) "
+                "VALUES ('2025-01-01T00:00:00',1,30,'UTC','£','GBP')").lastrowid
+            s._conn.execute(
+                "INSERT INTO meters (config_period_id, meter_id, is_sub_meter) "
+                "VALUES (?, 'electricity_main', 0)", (cp,))
+            s._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                "imp_kwh, source) VALUES ('2025-03-01T00:00:00','2025-03-01T00:30:00',"
+                "'electricity_main',?,2.0,'imported_api')", (cp,))
+        return s, cp
+
+    def test_read_carries_source_onto_dict(self):
+        s, _ = self._store()
+        blk = s.get_block_dict_by_start("2025-03-01T00:00:00")
+        self.assertEqual(blk["meters"]["electricity_main"].get("source"), "imported_api")
+
+    def test_source_survives_read_modify_write(self):
+        s, cp = self._store()
+        blk = s.get_block_dict_by_start("2025-03-01T00:00:00")
+        blk["meters"]["electricity_main"]["carbon_g"] = 123.0        # a carbon-style edit
+        s.append_block_replace(blk, config_period_id=cp)
+        src = s._conn.execute(
+            "SELECT source FROM blocks WHERE meter_id='electricity_main'").fetchone()[0]
+        self.assertEqual(src, "imported_api")                        # NOT wiped to NULL
+
 
 if __name__ == "__main__":
     unittest.main()

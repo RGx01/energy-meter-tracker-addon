@@ -48,7 +48,8 @@ class _FakeHA:
     async def get_statistic_ids(self, statistic_type=None):
         return self._meta
 
-    async def get_statistics(self, ids, start, end, period="hour", types=None):
+    async def get_statistics(self, ids, start, end, period="hour", types=None,
+                             timeout=45.0):
         return {k: v for k, v in self._stats.items() if k in ids}
 
 
@@ -96,14 +97,24 @@ class TestProbeOrchestrator(unittest.TestCase):
         self.assertTrue(r["ok"])
         self.assertFalse(r["reports"][0]["found"])
 
-    def test_stats_failure_is_caught(self):
+    def test_stats_failure_is_isolated_per_sensor(self):
+        # Per-sensor fetch: a failing/absent sensor no longer fails the whole probe —
+        # it just reports 'not found', so the other sensors' reports still come back.
         class _Boom(_FakeHA):
-            async def get_statistics(self, *a, **kw):
-                raise RuntimeError("ws error")
-        engine._engine_ha = _Boom([], {})
-        r = self._run(["sensor.x"])
-        self.assertFalse(r["ok"])
-        self.assertEqual(r["reason"], "stats_failed")
+            async def get_statistics(self, ids, *a, **kw):
+                if ids == ["sensor.bad"]:
+                    raise RuntimeError("ws error")
+                return {k: v for k, v in self._stats.items() if k in ids}
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        rows = [{"start": (t0 + timedelta(hours=i)).timestamp() * 1000.0, "sum": float(i)}
+                for i in range(5)]
+        meta = [{"statistic_id": "sensor.good", "unit_of_measurement": "kWh", "has_sum": True}]
+        engine._engine_ha = _Boom(meta, {"sensor.good": rows})
+        r = self._run(["sensor.bad", "sensor.good"])
+        self.assertTrue(r["ok"])                                  # probe as a whole succeeds
+        by = {rep["statistic_id"]: rep for rep in r["reports"]}
+        self.assertFalse(by["sensor.bad"]["found"])              # bad one isolated
+        self.assertTrue(by["sensor.good"]["found"])              # good one still reported
 
 
 if __name__ == "__main__":

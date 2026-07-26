@@ -430,7 +430,8 @@ class HAClient:
     async def get_statistics(self, statistic_ids: list[str],
                              start_time: str, end_time: str,
                              period: str = "hour",
-                             types: list[str] | None = None) -> dict:
+                             types: list[str] | None = None,
+                             timeout: float = 45.0) -> dict:
         """`recorder/statistics_during_period` — long-term statistics for the
         given sensors over [start_time, end_time). Returns
         {statistic_id: [{start, end, sum?, state?, mean?, ...}]}. Read-only.
@@ -439,7 +440,7 @@ class HAClient:
         'hour'/'day'/'5minute'/'month'. `types` selects the columns
         (default: state, sum, mean, min, max, change)."""
         res = await self.ws_command(
-            "recorder/statistics_during_period",
+            "recorder/statistics_during_period", timeout=timeout,
             start_time=start_time, end_time=end_time,
             statistic_ids=list(statistic_ids), period=period,
             types=types or ["state", "sum", "mean", "min", "max", "change"])
