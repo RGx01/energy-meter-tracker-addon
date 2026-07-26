@@ -2984,6 +2984,49 @@ def api_backup_restore_status():
     return jsonify(_restore_job)
 
 
+def _resolve_backup_zip(zipname: str):
+    """Validate a user-supplied backup zip name and resolve it to an absolute path
+    strictly inside the backups dir. Returns (path, None) or (None, (error, code))."""
+    zipname = os.path.basename(zipname or "")          # strip any path components
+    if not zipname or "/" in zipname or "\\" in zipname or not zipname.endswith(".zip"):
+        return None, ("Invalid backup name", 400)
+    path = os.path.join(_share_backup_dir(), "backups", zipname)
+    if not os.path.exists(path):
+        return None, ("Backup not found", 404)
+    return path, None
+
+
+@app.route("/api/backup/download/<zipname>", methods=["GET"])
+def api_backup_download(zipname):
+    """Download a named backup zip. Path-guarded to the backups dir."""
+    path, err = _resolve_backup_zip(zipname)
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    # octet-stream (not application/zip) so browsers don't treat it as a "safe"
+    # archive and auto-extract it on download (e.g. Safari's "open safe files"),
+    # which would leave a bare blocks.db instead of the .zip.
+    return send_file(path, as_attachment=True,
+                     download_name=os.path.basename(path),
+                     mimetype="application/octet-stream")
+
+
+@app.route("/api/backup/delete", methods=["POST"])
+def api_backup_delete():
+    """Delete a named backup zip (user-initiated from the backup list). Path-guarded
+    to the backups dir; only removes the one requested .zip, nothing else."""
+    try:
+        data = request.get_json(force=True) or {}
+        path, err = _resolve_backup_zip(data.get("zip", ""))
+        if err:
+            return jsonify({"error": err[0]}), err[1]
+        os.remove(path)
+        logger.info("api_backup_delete: removed backup %s", os.path.basename(path))
+        return jsonify({"ok": True, "deleted": os.path.basename(path)})
+    except Exception as e:
+        logger.error("api_backup_delete: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
 def _restore_worker(zipname, selected, from_flat):
     """Background restore worker (runs in its own thread; survives navigation).
     Updates _restore_job at each phase. Restores selected data files from a named
@@ -3672,14 +3715,132 @@ def api_historical_probe():
         entity_ids = [e for e in entity_ids if e]
         if not entity_ids:
             return jsonify({"ok": False, "error": "no sensors selected"}), 400
+        # No look-back control any more — probe the full retained history. HA only
+        # keeps so much, so a generous window == "everything there is". A caller can
+        # still pass days to narrow it.
         try:
-            days = max(1, min(int(body.get("days", 800)), 2000))
+            days = max(1, min(int(body.get("days", 3660)), 3660))
         except (TypeError, ValueError):
-            days = 800
+            days = 3660
         result = _run_on_engine_loop(
             _eng.probe_recorder_statistics(entity_ids, days), timeout=120.0)
         return jsonify(result), (200 if result.get("ok") else 400)
     except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/probe-devices", methods=["GET"])
+def api_probe_devices():
+    """List configured meters/devices with the sensor entities currently assigned to
+    each, so the recorder-history probe can pre-populate itself. Read-only."""
+    try:
+        from datetime import datetime as _dt
+        cfg = load_config()
+        today = _dt.now().strftime("%Y-%m-%d")
+        devices = []
+        for m_id, m_data in (cfg.get("meters") or {}).items():
+            meta = (m_data or {}).get("meta", {}) or {}
+            if meta.get("retired_at") and meta["retired_at"] <= today:
+                continue                       # skip retired sub-meters
+            is_sub = bool(meta.get("sub_meter"))
+            label = meta.get("device") or ("Whole house (main meter)" if not is_sub else m_id)
+            sensors = []
+            for ch in (m_data.get("channels") or {}).values():
+                rd = (ch or {}).get("read")    # per-channel energy read sensor
+                if rd:
+                    sensors.append(rd)
+            for k in ("power_sensor", "device_power_sensor", "soc_sensor",
+                      "inverter_power_sensor", "pv_power_sensor"):
+                v = meta.get(k)
+                if v:
+                    sensors.append(v)
+            seen = set()
+            sensors = [s for s in sensors if not (s in seen or seen.add(s))]
+            devices.append({
+                "meter_id": m_id, "label": label, "is_sub_meter": is_sub,
+                "meter_type": meta.get("meter_type") or ("sub" if is_sub else "main"),
+                "sensors": sensors,
+            })
+        devices.sort(key=lambda d: (d["is_sub_meter"], d["label"].lower()))
+        return jsonify({"ok": True, "devices": devices})
+    except Exception as e:
+        logger.error("api_probe_devices: %s", e)
+        return jsonify({"ok": False, "error": str(e), "devices": []}), 500
+
+
+@app.route("/api/historical/attribute/start", methods=["POST"])
+def api_attribute_start():
+    """Start a recorder device-attribution run as a BACKGROUND job. Body:
+    {meter_id, sensor_ids:[...]}. Takes a backup, schedules the worker on the engine
+    loop, returns at once. Poll /status, drive /control, undo via /backout."""
+    try:
+        import engine as _eng
+        import asyncio as _asyncio
+        body = request.get_json(force=True, silent=True) or {}
+        meter_id = (body.get("meter_id") or "").strip()
+        sensor_ids = [s for s in (body.get("sensor_ids") or []) if s]
+        if not meter_id or not sensor_ids:
+            return jsonify({"ok": False, "error": "meter_id and at least one sensor required"}), 400
+        if _eng.attribution_running():
+            return jsonify({"ok": False, "error": "an attribution run is already active",
+                            "status": _eng.api_attribution_status()}), 409
+        if not (_event_loop and _event_loop.is_running()):
+            return jsonify({"ok": False, "error": "engine loop not running"}), 500
+        backup = None
+        try:
+            backup = os.path.basename(_create_backup_zip(label="pre-attribution"))
+        except Exception as be:
+            logger.warning("attribution: backup failed (continuing): %s", be)
+        _asyncio.run_coroutine_threadsafe(
+            _eng.run_attribution_job(meter_id, sensor_ids, pace_s=0.05), _event_loop)
+        return jsonify({"ok": True, "status": "running", "backup": backup})
+    except Exception as e:
+        logger.error("api_attribute_start: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/attribute/status", methods=["GET"])
+def api_attribute_status():
+    """Poll the background attribution job."""
+    import engine as _eng
+    return jsonify(_eng.api_attribution_status())
+
+
+@app.route("/api/historical/attribute/control", methods=["POST"])
+def api_attribute_control():
+    """pause / resume / cancel the running attribution job."""
+    import engine as _eng
+    action = ((request.get_json(force=True, silent=True) or {}).get("action") or "").lower()
+    if action not in ("pause", "resume", "cancel"):
+        return jsonify({"ok": False, "error": "action must be pause/resume/cancel"}), 400
+    return jsonify({"ok": True, **_eng.attribution_control(action)})
+
+
+@app.route("/api/historical/attribute/runs", methods=["GET"])
+def api_attribute_runs():
+    """The attribution run ledger + a summary of the reconstructed device layer,
+    for the runs/undo list."""
+    store = _get_store()
+    return jsonify({"ok": True, "runs": store.get_attribution_runs(),
+                    "summary": store.count_recorder_attributed()})
+
+
+@app.route("/api/historical/attribute/backout", methods=["POST"])
+def api_attribute_backout():
+    """Undo an attribution run (by run_id) or an explicit device+range: deletes the
+    reconstructed device blocks and re-derives the parent remainder. Refused while a
+    run is active."""
+    try:
+        import engine as _eng
+        if _eng.attribution_running():
+            return jsonify({"ok": False, "error": "stop the running attribution first"}), 409
+        body = request.get_json(force=True, silent=True) or {}
+        res = _eng.backout_recorder_attribution(
+            run_id=body.get("run_id"), meter_id=body.get("meter_id"),
+            from_date=body.get("from"), to_date=body.get("to"))
+        return jsonify(res)
+    except Exception as e:
+        logger.error("api_attribute_backout: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -5552,6 +5713,8 @@ def _delete_worker(from_date, from_time_utc, to_date, to_time_utc,
     Same store access as the old synchronous route (off the engine loop thread),
     just with progress reported into _delete_job."""
     _j = _delete_job
+    import engine as _eng
+    _eng.set_delete_active(True)   # pause the carbon backfill from starting mid-delete
     try:
         _delete_step("deleting blocks")
         store = _get_store()
@@ -5579,12 +5742,16 @@ def _delete_worker(from_date, from_time_utc, to_date, to_time_utc,
     except Exception as e:
         logger.error("_delete_worker: %s", e)
         _j.update({"status": "error", "error": str(e)})
+    finally:
+        _eng.set_delete_active(False)
 
 
 def _purge_worker():
     """Background 'delete all imported data' worker (own thread). Backs up first,
     purges every imported block + derivations + checkpoints, rebuilds charts."""
     _j = _delete_job
+    import engine as _eng
+    _eng.set_delete_active(True)   # pause the carbon backfill from starting mid-purge
     try:
         store = _get_store()
         backup = None
@@ -5605,6 +5772,8 @@ def _purge_worker():
     except Exception as e:
         logger.error("_purge_worker: %s", e)
         _j.update({"status": "error", "error": str(e)})
+    finally:
+        _eng.set_delete_active(False)
 
 
 @app.route("/api/blocks/delete", methods=["POST"])

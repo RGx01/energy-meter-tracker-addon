@@ -1,6 +1,6 @@
 # Pinned for reproducible, cache-stable builds (this is what stops update
 # drift). Bump via Dependabot PRs for security, or alongside an Alpine base
 # bump in build.yaml when the bundled Python version changes.
-aiohttp==3.14.1
+aiohttp==3.14.3
 flask==3.1.3
 waitress==3.0.2

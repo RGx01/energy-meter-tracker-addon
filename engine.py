@@ -2414,6 +2414,269 @@ def recompute_remainders_for_window(parent_meter_id: str, utc_start: str,
     return done
 
 
+def backout_recorder_attribution(*, run_id=None, meter_id=None,
+                                  from_date=None, to_date=None) -> dict:
+    """Undo a recorder-attribution run (or an explicit device + range): delete the
+    reconstructed 'recorder_attributed' device blocks, re-derive each affected parent
+    meter's remainder over the span, and drop the run from the ledger. The reversible
+    safety net — fast, surgical, and it never touches live or imported house totals
+    (only the additive device layer is removed; the remainder is re-derived from the
+    surviving sub-meters). Returns {ok, deleted, parents, recomputed, from, to}."""
+    from datetime import datetime as _dt, timedelta as _td
+    store = get_store()
+    from_iso = from_date
+    to_iso = to_date
+    if run_id:
+        for r in store.get_attribution_runs():
+            if r.get("run_id") == run_id:
+                meter_id = meter_id or r.get("meter_id")
+                from_iso = from_iso or r.get("from")
+                to_iso = to_iso or r.get("to")
+                break
+    res = store.delete_recorder_attributed(
+        meter_id=meter_id, from_iso=from_iso, to_iso=to_iso)
+    lo, hi = res.get("from"), res.get("to")
+    recomputed = 0
+    if lo and hi:
+        try:
+            hi_excl = (_dt.fromisoformat(hi)
+                       + _td(minutes=int(get_block_minutes() or 30))).isoformat()
+        except Exception:
+            hi_excl = hi
+        for parent in (res.get("parents") or []):
+            recomputed += recompute_remainders_for_window(parent, lo, hi_excl)
+    if run_id:
+        store.remove_attribution_run(run_id)
+    logger.info("backout_recorder_attribution: deleted %d device block(s), "
+                "recomputed %d parent block(s) (run=%s meter=%s)",
+                res.get("deleted"), recomputed, run_id, meter_id)
+    return {"ok": True, "deleted": res.get("deleted", 0),
+            "parents": res.get("parents") or [], "recomputed": recomputed,
+            "from": lo, "to": hi}
+
+
+def _stitch_hourly_energy(series_by_sensor: dict, priority: list) -> dict:
+    """Combine one or more cumulative-kWh statistic series into a single hourly
+    ENERGY map {naive-UTC hour ISO: kWh}. Pure.
+
+    Per sensor, the hour energy is the HA `change` if present, else the delta of
+    consecutive `sum` values; a DECREASE in `sum` is a counter reset (device swap /
+    integration reset) → that step is dropped and the series continues. Sensors are
+    tried in `priority` order and the FIRST to supply an hour wins, so listing
+    [new_sensor, old_sensor] stitches a rename: the new sensor owns recent hours,
+    the old fills the earlier ones. Each hour's energy is keyed to the hour it
+    belongs to; alignment to the two half-hour blocks happens in _split_hour_to_blocks."""
+    import statistics_probe as _sp
+    out: dict = {}
+    for sensor in (priority or []):
+        parsed = []
+        for r in (series_by_sensor.get(sensor) or []):
+            t = _sp._to_utc(r.get("start"))
+            if t is None:
+                continue
+            hour = t.replace(minute=0, second=0, microsecond=0, tzinfo=None)
+            parsed.append((hour, r))
+        parsed.sort(key=lambda x: x[0])
+        prev_sum = None
+        for hour, r in parsed:
+            s = r.get("sum")
+            ch = r.get("change")
+            e = None
+            if ch is not None:
+                try:
+                    e = float(ch)
+                except (TypeError, ValueError):
+                    e = None
+            elif s is not None and prev_sum is not None:
+                d = s - prev_sum
+                if d >= 0:
+                    e = d
+            if s is not None:
+                prev_sum = s
+            key = hour.isoformat()
+            if e is not None and e >= 0 and key not in out:
+                out[key] = round(float(e), 6)
+    return out
+
+
+def _split_hour_to_blocks(hour_kwh, house_imports: list) -> list:
+    """Distribute an hour's measured device energy across its constituent blocks in
+    proportion to the house IMPORT shape for those blocks — so a charge burst lands
+    in the half-hour it actually happened, not smeared. `house_imports` = per-block
+    house import kWh for the hour, in order; equal split when the house imported
+    nothing that hour. Returns per-block device kWh, same length/order. Pure."""
+    n = len(house_imports)
+    if n == 0:
+        return []
+    e = float(hour_kwh or 0.0)
+    tot = sum((x or 0.0) for x in house_imports)
+    if tot <= 0:
+        return [round(e / n, 6)] * n
+    return [round(e * ((x or 0.0) / tot), 6) for x in house_imports]
+
+
+def _write_device_into_block(block: dict, device_meter_id: str,
+                             parent_meter_id: str, dev_kwh) -> bool:
+    """Add a reconstructed device sub-meter to an existing house block and re-run
+    PASS 2/3 so the device's grid share is clipped to the parent import and the
+    parent remainder is re-derived. Tags ONLY the device row 'recorder_attributed'.
+    Returns False (no write) when the device is already present (never overwrite a
+    live/attributed row) or the parent isn't in the block."""
+    meters = block.get("meters") or {}
+    if device_meter_id in meters or parent_meter_id not in meters:
+        return False
+    meters[device_meter_id] = {
+        "meta": {"sub_meter": True, "parent_meter": parent_meter_id},
+        "source": get_store().RECORDER_ATTRIBUTED_SOURCE,
+        "channels": {"import": {"kwh": round(float(dev_kwh or 0.0), 6)}},
+    }
+    block["meters"] = meters
+    _apply_pass2(block)
+    _recompute_pass3_totals(block)
+    _recompute_block_carbon(block)
+    append_block_replace(block)
+    return True
+
+
+def _attribute_hour(hour_iso: str, device_meter_id: str, parent_meter_id: str,
+                    hour_kwh, *, block_minutes: int = 30) -> tuple:
+    """Attribute one hour's measured device energy across its half-hour blocks,
+    weighted by the house import shape, writing a recorder_attributed device block
+    wherever one doesn't already exist. Returns (written, skipped, no_house)."""
+    from datetime import datetime as _dt, timedelta as _td
+    store = get_store()
+    try:
+        h0 = _dt.fromisoformat(str(hour_iso))
+    except ValueError:
+        return (0, 0, 0)
+    step = int(block_minutes or 30)
+    nblocks = max(1, 60 // step)
+    starts = [(h0 + _td(minutes=step * i)).isoformat() for i in range(nblocks)]
+    blocks = [store.get_block_dict_by_start(bs) for bs in starts]
+    house = []
+    for b in blocks:
+        pi = 0.0
+        if b:
+            pm = (b.get("meters") or {}).get(parent_meter_id)
+            if pm:
+                pi = ((pm.get("channels") or {}).get("import") or {}).get("kwh") or 0.0
+        house.append(pi)
+    split = _split_hour_to_blocks(hour_kwh, house)
+    written = skipped = no_house = 0
+    for b, dev_kwh in zip(blocks, split):
+        if not b:                       # no house block → no control total
+            no_house += 1
+            continue
+        if _write_device_into_block(b, device_meter_id, parent_meter_id, dev_kwh):
+            written += 1
+        else:
+            skipped += 1                # already attributed / live
+    return (written, skipped, no_house)
+
+
+_attribution_job: dict = {"status": "idle"}
+
+
+def api_attribution_status() -> dict:
+    """JSON-safe snapshot of the recorder-attribution background job."""
+    return {k: v for k, v in _attribution_job.items() if k != "task"}
+
+
+def attribution_running() -> bool:
+    return _attribution_job.get("status") in ("running", "paused")
+
+
+def attribution_control(action: str) -> dict:
+    """pause / resume / cancel the attribution job (mirrors the import controls)."""
+    if action == "pause":
+        _attribution_job["control"] = "pause"
+    elif action == "resume":
+        _attribution_job["control"] = "run"
+    elif action == "cancel":
+        _attribution_job["control"] = "cancel"
+    return api_attribution_status()
+
+
+async def run_attribution_job(device_meter_id: str, sensor_ids: list, *,
+                              pace_s: float = 0.0) -> dict:
+    """Background: attribute a device's HA recorder history onto the house blocks it
+    isn't on yet. Fetch stats (on the loop's WS listener), stitch to hourly energy,
+    walk oldest-first writing recorder_attributed device blocks — skipping any block
+    where the device already has a row (never overwrites live). Cooperative: yields
+    between hours and PAUSES while a delete/purge runs, so it coexists with the live
+    tick and the pass-2 settlement drain. Records a ledger run. Never raises."""
+    import asyncio as _aio
+    j = _attribution_job
+    store = get_store()
+    j.clear()
+    j.update({"status": "running", "phase": "fetching", "control": "run",
+              "device": device_meter_id, "sensors": list(sensor_ids or []),
+              "written": 0, "skipped": 0, "gaps": 0, "done_hours": 0,
+              "total_hours": 0, "started_at": _dt_now_iso_safe()})
+    run_id = _dt_now_iso_safe() + "|" + device_meter_id
+    try:
+        if _engine_ha is None:
+            j.update({"status": "error", "error": "no HA connection"})
+            return {"ok": False, "error": "no HA connection"}
+        parent = store.get_parent_meter_id(device_meter_id) or "electricity_main"
+        now = datetime.now(timezone.utc)
+        start = (now - timedelta(days=3660)).isoformat()
+        series = {}
+        for sid in (sensor_ids or []):
+            try:
+                res = await _engine_ha.get_statistics([sid], start, now.isoformat(),
+                                                      period="hour")
+                series[sid] = res.get(sid) or []
+            except Exception as e:
+                logger.warning("run_attribution_job: stats fetch %s failed: %s", sid, e)
+                series[sid] = []
+        hourly = _stitch_hourly_energy(series, list(sensor_ids or []))
+        hours = sorted(hourly.keys())          # oldest first
+        bm = int(get_block_minutes() or 30)
+        j.update({"phase": "attributing", "total_hours": len(hours)})
+        written = skipped = gaps = 0
+        for i, hour in enumerate(hours):
+            if j.get("control") == "cancel":
+                j["status"] = "cancelled"
+                break
+            while j.get("control") == "pause" or delete_in_progress():
+                j["status"] = "paused"
+                await _aio.sleep(1.0)
+                if j.get("control") == "cancel":
+                    break
+            if j.get("control") == "cancel":
+                j["status"] = "cancelled"
+                break
+            j["status"] = "running"
+            w, s, nh = _attribute_hour(hour, device_meter_id, parent,
+                                       hourly[hour], block_minutes=bm)
+            written += w; skipped += s; gaps += nh
+            if (i % 200) == 0:
+                j.update({"written": written, "skipped": skipped, "gaps": gaps,
+                          "done_hours": i})
+                await _aio.sleep(pace_s)        # yield to the live tick / drain
+        j.update({"written": written, "skipped": skipped, "gaps": gaps,
+                  "done_hours": len(hours)})
+        if written:
+            store.record_attribution_run({
+                "run_id": run_id, "meter_id": device_meter_id,
+                "sensor_ids": list(sensor_ids or []),
+                "from": hours[0] if hours else None,
+                "to": hours[-1] if hours else None,
+                "blocks_written": written, "created_at": _dt_now_iso_safe()})
+        if j.get("status") != "cancelled":
+            j["status"] = "done"
+        j["run_id"] = run_id
+        logger.info("run_attribution_job: device=%s wrote %d, skipped %d, gaps %d "
+                    "(status=%s)", device_meter_id, written, skipped, gaps, j["status"])
+        return {"ok": True, "written": written, "skipped": skipped, "gaps": gaps,
+                "run_id": run_id, "status": j["status"]}
+    except Exception as e:
+        logger.warning("run_attribution_job failed: %s", e)
+        j.update({"status": "error", "error": str(e)})
+        return {"ok": False, "error": str(e)}
+
+
 def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricity_main",
                                    rate_resolver=None, billing_source: str = "dcc",
                                    standing_resolver=None) -> dict:
@@ -3368,6 +3631,20 @@ def _fetch_carbon_intensity(postcode: str) -> list:
 _CARBON_BACKFILL_MARKER = "carbon_backfill_state"   # store_meta key
 _CARBON_RETRY_HOURS = 24                             # cool-down before re-attempting gaps
 _carbon_backfill_running = False                    # in-process re-entry guard
+_delete_active = False                              # a delete/purge job is mutating blocks
+
+
+def set_delete_active(active: bool) -> None:
+    """Flagged by the delete/purge workers around a block-removal job so the carbon
+    backfill won't KICK OFF new work mid-delete (both share the single SQLite
+    connection). An already-running backfill stays safe on its own — it re-reads each
+    block before writing and skips any the delete removed."""
+    global _delete_active
+    _delete_active = bool(active)
+
+
+def delete_in_progress() -> bool:
+    return _delete_active
 
 
 def _fetch_carbon_intensity_range(postcode: str, from_iso: str, to_iso: str) -> dict:
@@ -3672,6 +3949,9 @@ def _maybe_backfill_historical_carbon() -> None:
         # (and the import's completion re-arms the marker anyway).
         if api_import_running():
             logger.info("_maybe_backfill_historical_carbon: import job active — deferring")
+            return
+        if delete_in_progress():
+            logger.info("_maybe_backfill_historical_carbon: delete job active — deferring")
             return
         state = _store.get_meta(_CARBON_BACKFILL_MARKER, {}) or {}
         if state.get("done"):
@@ -5359,18 +5639,25 @@ def _billed_rate(rate_segs, start, off_peak, meas_cost, kwh,
     return sched
 
 
-def _reprice_suspect(channel, row, rate_segs, min_kwh: float) -> bool:
+_PEAK_BAND_FACTOR = 1.5      # a slot priced >1.5x the off-peak floor is "peak band"
+
+
+def _reprice_suspect(channel, row, rate_segs, min_kwh: float,
+                     off_peak_floor=None) -> bool:
     """Cheap LOCAL test the suspect-only reprice uses to decide whether a re-fetch
     could actually improve a block — so it skips slots that are already correct
     instead of re-querying the whole range (the reason the pass ran as long as the
     import). A block is a SUSPECT when:
       - it has no billed cost stored (imp/exp_cost is None) — always re-check; or
-      - it's a BANDED (IOG) day AND priced at the PEAK band with material energy
-        (>= min_kwh) — the signature of an out-of-window smart-charge dispatch the
-        bulk import couldn't label off-peak.
-    Everything else — already-off-peak slots, flat/Agile days (no split to fix),
-    and immaterial (<min_kwh) slots — a re-check can't make more correct, so skip.
-    Missing row ⇒ re-check (be safe). Returns True to re-check."""
+      - it's priced at the PEAK band with material energy (>= min_kwh) — the
+        signature of an out-of-window smart-charge dispatch the bulk import couldn't
+        label off-peak.
+    'Peak band' is decided from the schedule's day bounds when they're banded, else
+    from `off_peak_floor` — the off-peak rate OBSERVED in the imported data itself.
+    That fallback matters because IOG's off-peak is dispatch/label-driven and may not
+    be in the tariff schedule, which would otherwise read flat and blind the filter.
+    Everything else — already-off-peak slots and immaterial (<min_kwh) slots — a
+    re-check can't make more correct, so skip. Missing row ⇒ re-check (be safe)."""
     if row is None:
         return True
     imp = (channel == "import")
@@ -5381,20 +5668,27 @@ def _reprice_suspect(channel, row, rate_segs, min_kwh: float) -> bool:
         return True
     if kwh < min_kwh:
         return False
+    if rate is None:
+        return True
     start = row.get("start")
     lo = hi = None
     for vf, vt, s in rate_segs:
         if s is not None and start >= vf and (vt is None or start < vt):
             try:
-                lo, hi = s.day_rate_bounds(start)
+                lo, hi = s.day_rate_bounds(start)     # PENCE (schedule native units)
             except Exception:
                 lo = hi = None
             break
-    if lo is None or hi is None or lo == hi:
-        return False                      # flat / Agile day → no peak/off-peak split
-    if rate is None:
-        return True
-    return rate > (lo + hi) / 2.0          # priced at the peak band → possible dispatch
+    if lo is not None and hi is not None and lo != hi:
+        # Banded schedule day. day_rate_bounds is in PENCE; imp_rate is in £ — so
+        # convert the midpoint to £ before comparing (the missing /100 was why the
+        # peak-band branch never fired).
+        return rate > (lo + hi) / 200.0
+    # Flat / absent schedule (e.g. IOG whose off-peak isn't in standard-unit-rates):
+    # fall back to the off-peak floor observed in the imported data (already £).
+    if off_peak_floor is not None and off_peak_floor > 0:
+        return rate > off_peak_floor * _PEAK_BAND_FACTOR
+    return False
 
 
 def _import_pricing_flag(channel: str, kwh, meas_cost, buckets,
@@ -5947,6 +6241,7 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                 "mode": ("range" if (from_date or to_date) else "queue")}
 
     recovered = still_missing = checked = windows_done = skipped = 0
+    opportunistic = 0                 # non-target neighbours re-priced from fetched data
     still_missing_starts: list = []   # the actual slots left cost-less (inspectable)
     throttled = False                 # stopped early because the rate-limit ran low
 
@@ -5991,8 +6286,16 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
         # the API only sees the ones a re-fetch could actually fix.
         if suspect_only and (from_date or to_date):
             _before = len(starts)
+            # Off-peak floor OBSERVED in the imported data (the min stored rate for
+            # this channel) — the fallback band discriminator when the tariff schedule
+            # can't tell us the bands (IOG). Robust: computed over the whole repair
+            # range, so a single fully-mislabelled day can't skew it.
+            _rk = "imp_rate" if channel == "import" else "exp_rate"
+            _rvals = [r.get(_rk) for r in suspect_rows.values() if (r.get(_rk) or 0) > 0]
+            _floor = min(_rvals) if _rvals else None
             starts = [st for st in starts
-                      if _reprice_suspect(channel, suspect_rows.get(st), rate_segs, suspect_min_kwh)]
+                      if _reprice_suspect(channel, suspect_rows.get(st), rate_segs,
+                                          suspect_min_kwh, _floor)]
             skipped += (_before - len(starts))
             logger.info("repair_import_pricing[%s]: suspect prefilter %d → %d slot(s)",
                         channel, _before, len(starts))
@@ -6065,6 +6368,41 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                     fixed.append(st)
             if fixed and not (from_date or to_date):
                 _store.clear_reprice_queue_slots(channel, fixed)
+
+            # Opportunistic neighbours (suspect-only): the window we just fetched
+            # already carries Octopus's label for EVERY half-hour in it, not only the
+            # suspects. Re-price any OTHER imported block in the window that the fresh
+            # data shows is mispriced — but ONLY downward (cheaper) or to fill a
+            # missing cost, never off-peak → peak. This mops up the small charge-run
+            # EDGE slots (partial half-hours below the suspect kWh threshold) sitting
+            # next to a material dispatch slot, at ZERO extra API cost. Downward-only
+            # means a bad-weather STANDARD re-fetch can't do collateral damage.
+            if suspect_only:
+                _imp = (channel == "import")
+                grp_set = set(grp)
+                for st, r in by_start.items():
+                    if st in grp_set:
+                        continue
+                    cur = suspect_rows.get(st)
+                    if cur is None:           # not an imported block in range → skip
+                        continue
+                    mc = r.get("cost_incl")
+                    if mc is None:
+                        continue
+                    new_rate = _billed_rate(rate_segs, st, r.get("off_peak"),
+                                            mc, r.get("kwh") or 0)
+                    if new_rate is None:
+                        continue
+                    cur_rate = cur.get("imp_rate") if _imp else cur.get("exp_rate")
+                    cur_cost = cur.get("imp_cost") if _imp else cur.get("exp_cost")
+                    improves = (cur_cost is None) or (
+                        cur_rate is not None and new_rate < cur_rate - 1e-6)
+                    if not improves:
+                        continue
+                    if _store.reprice_imported_block(st, meter_id, channel, new_rate, mc):
+                        recovered += 1
+                        opportunistic += 1
+
             windows_done += 1
             if pace_s:
                 await _asyncio.sleep(pace_s)
@@ -6116,6 +6454,7 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
     return {"ok": True, "recovered": recovered, "still_missing": still_missing,
             "checked": checked, "windows": windows_done, "remaining": remaining,
             "skipped": skipped,       # already-correct slots the suspect prefilter dropped
+            "opportunistic": opportunistic,   # neighbours re-priced from already-fetched data
             "suspect_only": bool(suspect_only),
             "targets": n_targets, "mode": ("range" if (from_date or to_date) else "queue"),
             "throttled": throttled,   # stopped early on low rate-limit headroom

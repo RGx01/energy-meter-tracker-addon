@@ -112,6 +112,12 @@ eng = types.ModuleType("engine")
 eng.pause_engine  = lambda: None
 eng.resume_engine = lambda: None
 eng.engine_startup = MagicMock()
+eng.set_delete_active = lambda _a: None   # delete/purge workers toggle the carbon-backfill guard
+eng.delete_in_progress = lambda: False
+eng.attribution_running = lambda: False
+eng.api_attribution_status = lambda: {"status": "idle"}
+eng.attribution_control = lambda a: {"status": "idle", "control": a}
+eng.backout_recorder_attribution = lambda **kw: {"ok": True, "deleted": 0, "parents": [], "recomputed": 0}
 
 def _load_power_converter_into(mod):
     import re as _re
@@ -4686,6 +4692,141 @@ class TestHistoricalCsvEndpoints(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────────
 
 _MISSING = object()
+
+
+class TestProbeDevicesEndpoint(unittest.TestCase):
+    """The recorder probe pre-populates from configured meters: each device with the
+    sensor entities assigned to it (energy reads + power/device sensors)."""
+
+    def test_lists_meters_with_assigned_sensors(self):
+        cfg = {"meters": {
+            "electricity_main": {"meta": {"device": "Whole house", "sub_meter": False,
+                                          "power_sensor": "sensor.house_power"},
+                                 "channels": {"import": {"read": "sensor.grid_import"},
+                                              "export": {"read": "sensor.grid_export"}}},
+            "ev_charger": {"meta": {"device": "EV charger", "sub_meter": True,
+                                    "device_power_sensor": "sensor.zappi_power"},
+                           "channels": {"import": {"read": "sensor.zappi_energy"}}},
+            "old_bat": {"meta": {"device": "Old battery", "sub_meter": True,
+                                 "retired_at": "2020-01-01"}, "channels": {}},
+        }}
+        orig = server.load_config
+        server.load_config = lambda: cfg
+        try:
+            r = server.app.test_client().get("/api/historical/probe-devices")
+        finally:
+            server.load_config = orig
+        self.assertEqual(r.status_code, 200)
+        d = r.get_json()
+        self.assertTrue(d["ok"])
+        by = {x["meter_id"]: x for x in d["devices"]}
+        self.assertNotIn("old_bat", by)                              # retired skipped
+        self.assertFalse(by["electricity_main"]["is_sub_meter"])
+        self.assertFalse(d["devices"][0]["is_sub_meter"])            # main sorts first
+        for s in ("sensor.grid_import", "sensor.grid_export", "sensor.house_power"):
+            self.assertIn(s, by["electricity_main"]["sensors"])
+        self.assertIn("sensor.zappi_energy", by["ev_charger"]["sensors"])
+        self.assertIn("sensor.zappi_power", by["ev_charger"]["sensors"])
+
+
+class TestAttributionEndpoints(unittest.TestCase):
+    """Recorder device-attribution launch/status/control/runs/back-out endpoints."""
+
+    def tearDown(self):
+        import engine
+        engine.attribution_running = lambda: False
+
+    def test_start_requires_meter_and_sensors(self):
+        r = make_client().post("/api/historical/attribute/start",
+                               json={"meter_id": "ev", "sensor_ids": []})
+        self.assertEqual(r.status_code, 400)
+
+    def test_start_409_when_a_run_is_active(self):
+        import engine
+        engine.attribution_running = lambda: True
+        r = make_client().post("/api/historical/attribute/start",
+                               json={"meter_id": "ev", "sensor_ids": ["sensor.ev"]})
+        self.assertEqual(r.status_code, 409)
+
+    def test_status_and_control(self):
+        cli = make_client()
+        self.assertEqual(cli.get("/api/historical/attribute/status").get_json()["status"], "idle")
+        self.assertEqual(cli.post("/api/historical/attribute/control",
+                                  json={"action": "bad"}).status_code, 400)
+        self.assertTrue(cli.post("/api/historical/attribute/control",
+                                 json={"action": "pause"}).get_json()["ok"])
+
+    def test_runs_returns_ledger_and_summary(self):
+        store = MagicMock()
+        store.get_attribution_runs.return_value = [{"run_id": "r1", "meter_id": "ev", "blocks_written": 10}]
+        store.count_recorder_attributed.return_value = {"total": 10, "meters": []}
+        d = make_client(store=store).get("/api/historical/attribute/runs").get_json()
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["runs"][0]["run_id"], "r1")
+        self.assertEqual(d["summary"]["total"], 10)
+
+    def test_backout_calls_engine_and_refuses_while_running(self):
+        import engine
+        seen = {}
+        engine.backout_recorder_attribution = lambda **kw: (seen.update(kw) or
+            {"ok": True, "deleted": 3, "recomputed": 1, "parents": ["m"]})
+        r = make_client().post("/api/historical/attribute/backout", json={"run_id": "r1"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(seen.get("run_id"), "r1")
+        self.assertEqual(r.get_json()["deleted"], 3)
+        engine.attribution_running = lambda: True
+        self.assertEqual(make_client().post("/api/historical/attribute/backout",
+                                            json={"run_id": "r1"}).status_code, 409)
+
+
+class TestBackupDownloadDelete(unittest.TestCase):
+    """Backup-list Download + Delete: path-guarded endpoints that only ever touch a
+    single .zip inside the backups dir."""
+
+    def _backup_dir(self):
+        import engine, tempfile
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, "backups"), exist_ok=True)
+        engine.SHARE_BACKUP_DIR = tmp
+        return tmp
+
+    def tearDown(self):
+        import engine
+        if hasattr(engine, "SHARE_BACKUP_DIR"):
+            del engine.SHARE_BACKUP_DIR
+
+    def test_endpoints_registered(self):
+        self.assertIn("api_backup_download", server.app.view_functions)
+        self.assertIn("api_backup_delete", server.app.view_functions)
+
+    def test_delete_rejects_path_traversal(self):
+        r = make_client().post("/api/backup/delete", json={"zip": "../../etc/passwd"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_delete_missing_zip_404(self):
+        self._backup_dir()
+        r = make_client().post("/api/backup/delete", json={"zip": "nope.zip"})
+        self.assertEqual(r.status_code, 404)
+
+    def test_download_rejects_non_zip(self):
+        r = make_client().get("/api/backup/download/blocks.db")
+        self.assertEqual(r.status_code, 400)
+
+    def test_download_then_delete_roundtrip(self):
+        tmp = self._backup_dir()
+        name = "20260101T000000_manual.zip"
+        p = os.path.join(tmp, "backups", name)
+        with open(p, "wb") as f:
+            f.write(b"PK\x03\x04 fake zip bytes")
+        cli = make_client()
+        rd = cli.get("/api/backup/download/" + name)
+        self.assertEqual(rd.status_code, 200)
+        self.assertIn(b"fake zip bytes", rd.data)
+        self.assertIn("attachment", rd.headers.get("Content-Disposition", ""))
+        rx = cli.post("/api/backup/delete", json={"zip": name})
+        self.assertEqual(rx.status_code, 200)
+        self.assertTrue(rx.get_json()["ok"])
+        self.assertFalse(os.path.exists(p))     # the file is gone
 
 
 class TestAtomicRestoreWrite(unittest.TestCase):
