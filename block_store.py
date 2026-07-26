@@ -684,6 +684,17 @@ def _row_to_block(rows: list[sqlite3.Row]) -> dict:
             "carbon_g":        row["carbon_g"],  # None when no CI data (pre-2.3.0)
             "channels":       {},
         }
+        # Provenance tag (imported_api / imported_csv / recorder_attributed / …).
+        # MUST be carried onto the dict: any read → modify → append_block_replace
+        # round-trip (remainder recompute, carbon recompute, gap fill, device
+        # attribution) writes meter_block.get("source") back — so if we drop it
+        # here, the write silently re-inserts source = NULL and the block loses its
+        # tag. This was the "carbon round-trip wiped imported_api to NULL" bug.
+        try:
+            if row["source"] is not None:
+                meter_block["source"] = row["source"]
+        except (IndexError, KeyError):
+            pass
         # 3.0.0 columns — surfaced so the DCC re-run can read them. Guarded
         # with try/except for older rows / pre-join fetches lacking the columns.
         try:
@@ -2197,6 +2208,30 @@ class BlockStore:
             "SELECT meter_id FROM meters WHERE is_sub_meter = 0 LIMIT 1").fetchone()
         return main["meter_id"] if main else None
 
+    def get_device_live_coverage_start(self, meter_id: str):
+        """The earliest block_start where *meter_id* has REAL (non-reconstructed)
+        data — i.e. any block whose source is not 'recorder_attributed'. This is
+        the seam where a device's live/imported history begins; recorder
+        attribution fills up to (but not into) it so the reconstructed layer butts
+        cleanly against the real one. Returns None when the device has no live
+        history at all (never configured), in which case attribution may fill the
+        full available range."""
+        r = self._conn.execute(
+            "SELECT MIN(block_start) AS lo FROM blocks "
+            "WHERE meter_id = ? AND COALESCE(source, '') <> ?",
+            (meter_id, self.RECORDER_ATTRIBUTED_SOURCE)).fetchone()
+        return r["lo"] if r and r["lo"] else None
+
+    def sum_meter_import_kwh(self, meter_id: str, from_iso: str, to_iso: str) -> float:
+        """Sum of a meter's raw import kWh over [from_iso, to_iso] (inclusive end).
+        Used to sanity-check an attribution: a device can't consume more than the
+        house drew from the grid over the same window."""
+        r = self._conn.execute(
+            "SELECT COALESCE(SUM(imp_kwh), 0.0) FROM blocks "
+            "WHERE meter_id = ? AND block_start >= ? AND block_start <= ?",
+            (meter_id, from_iso, to_iso)).fetchone()
+        return float(r[0] or 0.0)
+
     def count_recorder_attributed(self) -> dict:
         """Summary of the reconstructed device layer: total rows + per-meter span,
         for the attribution page / back-out UI."""
@@ -2599,6 +2634,76 @@ class BlockStore:
                     len(rows), ceiling, int(max_kw), block_minutes)
         return {"count": len(rows), "ceiling_kwh": ceiling,
                 "applied": bool(not dry_run and rows), "blocks": preview}
+
+    def sweep_register_glitches(self, *, recover_within_blocks: int = 48,
+                                tol: float = 0.02, dry_run: bool = True) -> dict:
+        """Repair phantom sub-meter deltas from a register that DIPPED below its
+        established level and later RECOVERED — a stale/dropout reading (e.g. the
+        2026-07-21 house_battery briefly surfacing a 4-day-old 6259.77 while the true
+        register was ~6309), whose climb back toward the real value was booked as
+        ~49 kWh of consumption.
+
+        A cumulative register can only fall via a genuine reset (to ~0, staying low).
+        A dip that RECOVERS to the prior high-water is therefore a glitch, and any
+        'consumption' recorded while below that high-water is phantom. Conservative:
+        only a dip that provably recovers within `recover_within_blocks` is touched;
+        a drop that never recovers is left alone (it may be a real counter reset).
+
+        For each phantom block: set imp_kwh = imp_kwh_grid (the trustworthy,
+        house-clipped value — usually 0), recompute carbon from it, flag needs_review.
+        LEAVES imp_kwh_grid / imp_cost untouched, so the bill is unaffected. Mirrors
+        the #307 sweep's corrective action; only the detection differs.
+
+        dry_run=True previews only. Returns {count, applied, blocks:[...]}.
+        """
+        subs = [r["meter_id"] for r in self._conn.execute(
+            "SELECT DISTINCT meter_id FROM meters WHERE parent_meter_id IS NOT NULL")]
+        to_fix = []
+        for mid in subs:
+            rows = self._conn.execute(
+                "SELECT block_start, imp_kwh, imp_kwh_grid, imp_read_end, "
+                "carbon_intensity_g FROM blocks WHERE meter_id = ? "
+                "AND imp_read_end IS NOT NULL ORDER BY block_start", (mid,)).fetchall()
+            reads = [r["imp_read_end"] for r in rows]
+            n = len(rows)
+            prior_max = None
+            for i in range(n):
+                re = reads[i]
+                if re is None:
+                    continue
+                if prior_max is None:
+                    prior_max = re
+                    continue
+                if re < prior_max - tol:
+                    # Dip below the established register level. Recovers?
+                    recovered = any(
+                        reads[k] is not None and reads[k] >= prior_max - tol
+                        for k in range(i + 1, min(n, i + 1 + recover_within_blocks)))
+                    if recovered:
+                        r = rows[i]
+                        corr = r["imp_kwh_grid"] or 0.0
+                        if round((r["imp_kwh"] or 0.0) - corr, 6) != 0.0:
+                            to_fix.append({
+                                "meter_id": mid, "block_start": r["block_start"],
+                                "old_kwh": r["imp_kwh"], "corrected_kwh": corr,
+                                "ci": r["carbon_intensity_g"] or 0.0})
+                    # do NOT raise prior_max — re is below it
+                else:
+                    prior_max = max(prior_max, re)
+        if not dry_run and to_fix:
+            with self._conn:
+                for f in to_fix:
+                    self._conn.execute(
+                        "UPDATE blocks SET imp_kwh = ?, imp_kwh_remainder = 0, "
+                        "carbon_g = ROUND(? * ?, 4), needs_review = 1, "
+                        "review_reason = 'register dip-and-recover phantom clamped' "
+                        "WHERE meter_id = ? AND block_start = ?",
+                        (f["corrected_kwh"], f["corrected_kwh"], f["ci"],
+                         f["meter_id"], f["block_start"]))
+        logger.info("sweep_register_glitches: %s %d phantom dip-and-recover block(s)",
+                    "clamped" if (not dry_run and to_fix) else "previewed", len(to_fix))
+        return {"count": len(to_fix), "applied": bool(not dry_run and to_fix),
+                "blocks": to_fix}
 
     def reprice_imported_blocks_from_csv(self, csv_text: str,
                                          meter_id: str = "electricity_main",

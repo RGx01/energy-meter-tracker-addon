@@ -3723,7 +3723,7 @@ def api_historical_probe():
         except (TypeError, ValueError):
             days = 3660
         result = _run_on_engine_loop(
-            _eng.probe_recorder_statistics(entity_ids, days), timeout=120.0)
+            _eng.probe_recorder_statistics(entity_ids, days), timeout=300.0)
         return jsonify(result), (200 if result.get("ok") else 400)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -3740,10 +3740,13 @@ def api_probe_devices():
         devices = []
         for m_id, m_data in (cfg.get("meters") or {}).items():
             meta = (m_data or {}).get("meta", {}) or {}
+            if not meta.get("sub_meter"):
+                continue                       # main meter = the house control total,
+                                               # not an attributable device — omit it
             if meta.get("retired_at") and meta["retired_at"] <= today:
                 continue                       # skip retired sub-meters
-            is_sub = bool(meta.get("sub_meter"))
-            label = meta.get("device") or ("Whole house (main meter)" if not is_sub else m_id)
+            is_sub = True
+            label = meta.get("device") or m_id
             sensors = []
             for ch in (m_data.get("channels") or {}).values():
                 rd = (ch or {}).get("read")    # per-channel energy read sensor
@@ -3781,6 +3784,12 @@ def api_attribute_start():
         sensor_ids = [s for s in (body.get("sensor_ids") or []) if s]
         if not meter_id or not sensor_ids:
             return jsonify({"ok": False, "error": "meter_id and at least one sensor required"}), 400
+        # Attribution is for sub-meter DEVICES only. The main meter is the house
+        # control total — its usage is the remainder, never a reconstructed device.
+        _meta = ((load_config().get("meters") or {}).get(meter_id) or {}).get("meta") or {}
+        if not _meta.get("sub_meter"):
+            return jsonify({"ok": False, "error": "attribution applies to sub-meter "
+                            "devices only; the house total is the control total"}), 400
         if _eng.attribution_running():
             return jsonify({"ok": False, "error": "an attribution run is already active",
                             "status": _eng.api_attribution_status()}), 409
@@ -3829,19 +3838,39 @@ def api_attribute_runs():
 def api_attribute_backout():
     """Undo an attribution run (by run_id) or an explicit device+range: deletes the
     reconstructed device blocks and re-derives the parent remainder. Refused while a
-    run is active."""
+    run is active, while another back-out is already in flight, or for a run that is
+    no longer in the ledger (already undone) — so a double-click can't misfire."""
     try:
         import engine as _eng
         if _eng.attribution_running():
             return jsonify({"ok": False, "error": "stop the running attribution first"}), 409
+        if _eng.backout_running():
+            return jsonify({"ok": False, "error": "an undo is already in progress",
+                            "status": _eng.api_backout_status()}), 409
         body = request.get_json(force=True, silent=True) or {}
         res = _eng.backout_recorder_attribution(
             run_id=body.get("run_id"), meter_id=body.get("meter_id"),
             from_date=body.get("from"), to_date=body.get("to"))
+        if not res.get("ok"):
+            err = res.get("error")
+            if err == "backout_in_progress":
+                return jsonify({"ok": False, "error": "an undo is already in progress",
+                                "status": _eng.api_backout_status()}), 409
+            if err == "run_not_found":
+                return jsonify({"ok": False, "error": "that run was already undone "
+                                "(or no longer exists)"}), 409
+            return jsonify(res), 500
         return jsonify(res)
     except Exception as e:
         logger.error("api_attribute_backout: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/historical/attribute/backout/status", methods=["GET"])
+def api_attribute_backout_status():
+    """Poll whether an undo is in flight (UI disables the undo buttons)."""
+    import engine as _eng
+    return jsonify(_eng.api_backout_status())
 
 
 @app.route("/api/historical/export-probe", methods=["POST"])
