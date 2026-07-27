@@ -454,6 +454,26 @@ class TestReviewFlagsBL18(unittest.TestCase):
         self.assertEqual(rows[0]["block_start"], "2026-07-10T16:30:00")
         self.assertEqual(rows[0]["reason"], "dispatch ambiguous")
 
+    def test_get_review_blocks_excludes_auto_corrections_and_null_rows(self):
+        # The IOG pricing panel is for rate tasks only. Auto-CORRECTION reasons (the
+        # integrity sweeps) and malformed/legacy rows (null-ish block_start) must NOT
+        # appear — they're not rate-actionable.
+        self.store.flag_block_for_review("2026-07-10T16:30:00", "dispatch ambiguous")
+        self.store.append_block(make_block("2026-07-12T00:00:00", imp_kwh=1.0))
+        for reason in BlockStore.AUTO_CORRECTION_REASONS:
+            self.store._conn.execute(
+                "UPDATE blocks SET needs_review=1, review_reason=? "
+                "WHERE block_start='2026-07-12T00:00:00' AND meter_id='electricity_main'",
+                (reason,))
+        # a legacy/malformed flag with an empty block_start
+        self.store._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+            "needs_review, review_reason) VALUES ('', '', 'electricity_main', "
+            "(SELECT id FROM config_periods LIMIT 1), 1, 'flagged')")
+        self.store._conn.commit()
+        rows = self.store.get_review_blocks()
+        self.assertEqual([r["reason"] for r in rows], ["dispatch ambiguous"])  # only the rate task
+
     def test_dismiss_review_blocks_leaves_drift(self):
         self.store.flag_block_for_review("2026-07-10T16:30:00", "dispatch ambiguous")
         self._add_drift_flag("2026-07-11T00:00:00")
@@ -5018,6 +5038,12 @@ class TestSweepRegisterGlitches(unittest.TestCase):
         self.assertEqual(r["carbon_g"], 0.0)         # recomputed from 0
         self.assertEqual(r["needs_review"], 1)
         self.assertEqual(r["imp_kwh_grid"], 0.0)     # bill side untouched
+        # The reason must stay in the shared constant so the IOG pricing panel
+        # filters it out (an auto-correction is not a rate task).
+        rr = s._conn.execute("SELECT review_reason FROM blocks "
+                             "WHERE block_start='2026-07-21T10:00:00'").fetchone()[0]
+        self.assertIn(rr, BlockStore.AUTO_CORRECTION_REASONS)
+        self.assertEqual(s.get_review_blocks(), [])  # not surfaced as a pricing task
         # recovery + normal blocks untouched
         self.assertAlmostEqual(s._conn.execute(
             "SELECT imp_kwh FROM blocks WHERE block_start='2026-07-21T10:30:00'").fetchone()[0], 0.10)
