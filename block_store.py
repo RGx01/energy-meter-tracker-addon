@@ -3616,23 +3616,40 @@ class BlockStore:
             })
         return alerts
 
+    # Auto-CORRECTION review reasons: the integrity sweeps clamp a physically
+    # impossible figure to the trustworthy grid-bounded value deterministically —
+    # there's no second opinion for a user to give and no tool to give it with, so
+    # these are NOT rate-actionable. They stay flagged in the DB as a dormant record
+    # (and in the startup log), but never appear in the IOG pricing correction panel.
+    AUTO_CORRECTION_REASONS = (
+        "implausible sub-meter kWh clamped (#307 lost opener)",
+        "register dip-and-recover phantom clamped",
+    )
+
     def get_review_blocks(self) -> list:
         """BL-18: blocks flagged for review with a stored reason — i.e. the
         rate-actionable dispatch-reconcile ambiguities that the Corrections
         review list surfaces.
 
-        Deliberately EXCLUDES bare needs_review flags with no review_reason
-        (CAD/DCC settlement drift): drift is a kWh disagreement, and the
-        correction tool only edits rates, so there is no action to take on it
-        here. In the default DCC billing mode drift is informational anyway
-        (settlement is authoritative). Those flags stay set as a dormant
-        diagnostic, just not shown as a correction task.
+        Deliberately EXCLUDES:
+          • bare needs_review flags with no review_reason (CAD/DCC settlement
+            drift): drift is a kWh disagreement, and the correction tool only edits
+            rates, so there is no action to take on it here;
+          • auto-CORRECTION reasons (the integrity sweeps): deterministic repairs,
+            not rate tasks — they'd only clutter the IOG pricing panel;
+          • rows with a null/empty block_start (legacy/malformed flags), which can't
+            be located or acted on anyway.
+        Excluded flags stay set as a dormant diagnostic, just not shown as a task.
         """
+        _ph = ",".join("?" * len(self.AUTO_CORRECTION_REASONS))
         rows = self._conn.execute(
-            """SELECT id, block_start, meter_id, review_reason
+            f"""SELECT id, block_start, meter_id, review_reason
                FROM blocks
                WHERE needs_review = 1 AND review_reason IS NOT NULL
-               ORDER BY block_start"""
+                 AND block_start IS NOT NULL AND TRIM(block_start) <> ''
+                 AND review_reason NOT IN ({_ph})
+               ORDER BY block_start""",
+            self.AUTO_CORRECTION_REASONS
         ).fetchall()
         return [{
             "block_id": r["id"],
