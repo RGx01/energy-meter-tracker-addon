@@ -121,6 +121,44 @@ def build_sensor_probe(statistic_id, rows, meta=None, *,
     report["coverage_pct"] = (round(100.0 * len(parsed) / span_buckets, 1)
                               if span_buckets else None)
 
+    # Total energy over the window — surfaced for the friendly summary and, more
+    # importantly, so the caller can sanity-check magnitude before attributing
+    # (a device can't consume more than the house it draws from; a ~1000× figure
+    # usually means Wh vs kWh). For an energy_sum sensor this is the sum of the
+    # per-step increases (dropping counter resets); for power_mean it's mean×hours.
+    total = None
+    if report["value_kind"] == "energy_sum":
+        tot, prev = 0.0, None
+        for _t, r in parsed:
+            ch = r.get("change")
+            if ch is not None:
+                try:
+                    tot += max(0.0, float(ch))
+                except (TypeError, ValueError):
+                    pass
+            else:
+                s = r.get("sum")
+                if s is not None:
+                    try:
+                        s = float(s)
+                        if prev is not None and s - prev > 0:
+                            tot += s - prev
+                        prev = s
+                    except (TypeError, ValueError):
+                        pass
+        total = round(tot, 3)
+    elif report["value_kind"] == "power_mean":
+        tot, ph = 0.0, expected_period_s / 3600.0
+        for _t, r in parsed:
+            m = r.get("mean")
+            if m is not None:
+                try:
+                    tot += max(0.0, float(m)) / 1000.0 * ph
+                except (TypeError, ValueError):
+                    pass
+        total = round(tot, 3)
+    report["total_kwh"] = total
+
     report["dst_samples"] = _dst_samples(parsed)
     return report
 
