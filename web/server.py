@@ -3737,6 +3737,17 @@ def api_probe_devices():
         from datetime import datetime as _dt
         cfg = load_config()
         today = _dt.now().strftime("%Y-%m-%d")
+        # Sensor ledger: if a device still has a reconstructed layer, remember the
+        # sensor(s) that built it (from the run ledger) and pre-populate them until
+        # that layer is removed — so revisiting the page shows what was used.
+        store = _get_store()
+        _latest_run_sensors = {}
+        for _r in (store.get_attribution_runs() or []):
+            _mid = _r.get("meter_id")
+            if _mid and _r.get("sensor_ids"):
+                _latest_run_sensors[_mid] = list(_r["sensor_ids"])   # appended in order → last wins
+        _attributed_meters = {m["meter_id"] for m in
+                              (store.count_recorder_attributed().get("meters") or [])}
         devices = []
         for m_id, m_data in (cfg.get("meters") or {}).items():
             meta = (m_data or {}).get("meta", {}) or {}
@@ -3759,10 +3770,14 @@ def api_probe_devices():
                     sensors.append(v)
             seen = set()
             sensors = [s for s in sensors if not (s in seen or seen.add(s))]
+            # Kept sensors from the last reconstruction, while its layer still exists.
+            history_sensors = (_latest_run_sensors.get(m_id, [])
+                               if m_id in _attributed_meters else [])
             devices.append({
                 "meter_id": m_id, "label": label, "is_sub_meter": is_sub,
                 "meter_type": meta.get("meter_type") or ("sub" if is_sub else "main"),
                 "sensors": sensors,
+                "history_sensors": history_sensors,
             })
         devices.sort(key=lambda d: (d["is_sub_meter"], d["label"].lower()))
         return jsonify({"ok": True, "devices": devices})
@@ -3795,6 +3810,31 @@ def api_attribute_start():
                             "status": _eng.api_attribution_status()}), 409
         if not (_event_loop and _event_loop.is_running()):
             return jsonify({"ok": False, "error": "engine loop not running"}), 500
+        # Sanity-check the chosen sensor(s) against the house import before writing:
+        # a device that totals MORE than the house drew (or is absurdly small) is
+        # almost certainly the wrong sensor or a Wh/kWh mix-up. The user can still
+        # proceed by re-submitting with confirm_override.
+        if not body.get("confirm_override"):
+            try:
+                pf = _asyncio.run_coroutine_threadsafe(
+                    _eng.attribution_preflight(meter_id, sensor_ids), _event_loop
+                ).result(timeout=180)
+            except Exception as _pe:
+                logger.warning("attribution preflight failed (continuing): %s", _pe)
+                pf = {"verdict": "error"}
+            _v = pf.get("verdict")
+            if _v in ("device_exceeds_house", "suspiciously_small"):
+                _dk, _hk = pf.get("device_kwh"), pf.get("house_kwh")
+                _sp = ((pf.get("from") or "")[:10] + " → " + (pf.get("to") or "")[:10])
+                _msg = (("This sensor totals about %s kWh over %s, but the house only "
+                         "imported %s kWh in that time. A device can't exceed the house it "
+                         "draws from — this looks like the wrong sensor, or a Wh/kWh mismatch."
+                         % (_dk, _sp, _hk)) if _v == "device_exceeds_house" else
+                        ("This sensor totals only about %s kWh over %s vs the house's %s kWh — "
+                         "unusually small, which can mean a unit mismatch or the wrong sensor."
+                         % (_dk, _sp, _hk)))
+                return jsonify({"ok": False, "sanity": _v, "warn": _msg,
+                                "device_kwh": _dk, "house_kwh": _hk}), 409
         backup = None
         try:
             backup = os.path.basename(_create_backup_zip(label="pre-attribution"))

@@ -45,6 +45,28 @@ class TestEnergySensor(unittest.TestCase):
         r = sp.build_sensor_probe("sensor.ev_power", rows, meta)
         self.assertEqual(r["value_kind"], "power_mean")
 
+    def test_total_kwh_from_sum_deltas(self):
+        # sum runs 0..47 → 47 increments of 1 kWh = 47 kWh total.
+        rows = _hourly_ms("2026-01-01T00:00:00", 48)
+        r = sp.build_sensor_probe("sensor.ev_energy", rows,
+                                  {"unit_of_measurement": "kWh", "has_sum": True})
+        self.assertAlmostEqual(r["total_kwh"], 47.0, places=3)
+
+    def test_total_kwh_prefers_change_and_drops_resets(self):
+        # 'change' is authoritative per hour; a counter reset (negative delta) is ignored.
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        rows = [{"start": (t0 + timedelta(hours=i)).timestamp() * 1000.0,
+                 "sum": s, "change": c}
+                for i, (s, c) in enumerate([(5.0, 5.0), (7.0, 2.0), (1.0, 1.0)])]
+        r = sp.build_sensor_probe("sensor.x", rows, {"has_sum": True})
+        self.assertAlmostEqual(r["total_kwh"], 8.0, places=3)   # 5 + 2 + 1
+
+    def test_total_kwh_power_mean_times_hours(self):
+        rows = _hourly_ms("2026-01-01T00:00:00", 12, value_key="mean")   # mean 0..11 W
+        r = sp.build_sensor_probe("sensor.ev_power", rows,
+                                  {"unit_of_measurement": "W", "has_sum": False, "has_mean": True})
+        self.assertAlmostEqual(r["total_kwh"], 0.066, places=3)          # sum(0..11)/1000
+
 
 class TestTimestampsAndGaps(unittest.TestCase):
     def test_iso_string_timestamps(self):

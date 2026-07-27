@@ -120,11 +120,19 @@ function _addSensor(btn){
 }
 
 function _deviceSection(dev){
-  // Pre-fill only ENERGY (kWh) sensors — the device's power/SOC/PV assignments aren't
-  // usable for energy attribution (paste one manually if you really want to probe it).
-  var sensors = (dev.sensors || []).filter(function(s){ return _isEnergy(_entityMeta[s]); });
+  // Sensor ledger: if this device still has a reconstructed layer, pre-fill the
+  // sensor(s) that built it (kept until the layer is Removed). Otherwise pre-fill
+  // the ENERGY (kWh) sensors from config — power/SOC/PV assignments aren't usable
+  // for energy attribution (paste one manually if you really want to check it).
+  var hist = dev.history_sensors || [];
+  var sensors = hist.length
+    ? hist.slice()
+    : (dev.sensors || []).filter(function(s){ return _isEnergy(_entityMeta[s]); });
   if(!sensors.length) sensors = [''];
   var rows = sensors.map(function(s){ return _sensorRow(s); }).join('');
+  var ledgerNote = hist.length
+    ? '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">↩ Sensors from your last reconstruction — kept until you Remove its history below.</div>'
+    : '';
   var tag  = dev.is_sub_meter ? 'sub-meter' : 'main meter';
   // The main meter is the house control total, not a device — its usage is the
   // remainder, so it's probe-only (no attribution).
@@ -140,6 +148,7 @@ function _deviceSection(dev){
     +   'style="border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin-bottom:12px;">'
     + '<div style="font-weight:600;margin-bottom:8px;">'+_esc(dev.label)
     +   ' <span style="font-size:12px;color:var(--muted);font-weight:400;">'+tag+' · '+_esc(dev.meter_id)+'</span></div>'
+    + ledgerNote
     + '<div class="sensor-rows">'+rows+'</div>'
     + '<div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap;">'+actions+'</div>'
     + note
@@ -243,7 +252,7 @@ function _runProbe(){
     _lastResult = { window: d.window, devices: devices, reports: d.reports };
     document.getElementById('probe-status').innerHTML =
       'Window: ' + (d.window ? _esc(d.window[0].substr(0,10))+' → now' : 'full history')
-      + ' &nbsp;·&nbsp; <a href="#" onclick="_copyReport();return false;">Copy report (JSON)</a>';
+      + ' &nbsp;·&nbsp; <a href="#" onclick="_copyReport();return false;">Copy JSON to clipboard</a>';
     document.getElementById('probe-results').innerHTML = devices.map(function(dv){
       if(!dv.entities.length) return '';
       var found = dv.entities.map(function(e){ return byId[e]; }).filter(function(r){ return r && r.found; });

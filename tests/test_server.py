@@ -4729,6 +4729,32 @@ class TestProbeDevicesEndpoint(unittest.TestCase):
         self.assertIn("sensor.zappi_energy", by["ev_charger"]["sensors"])
         self.assertIn("sensor.zappi_power", by["ev_charger"]["sensors"])
 
+    def test_history_sensors_prepopulated_while_layer_exists(self):
+        # Sensor ledger: a device that still has a reconstructed layer surfaces the
+        # sensors from its last run; a device with no layer surfaces none.
+        cfg = {"meters": {
+            "ev_charger": {"meta": {"device": "EV", "sub_meter": True},
+                           "channels": {"import": {"read": "sensor.zappi_energy"}}},
+            "house_battery": {"meta": {"device": "Battery", "sub_meter": True},
+                              "channels": {"import": {"read": "sensor.bat_energy"}}},
+        }}
+        store = MagicMock()
+        store.get_attribution_runs.return_value = [
+            {"meter_id": "ev_charger", "sensor_ids": ["sensor.zappi_v1", "sensor.zappi_v2"]}]
+        store.count_recorder_attributed.return_value = {
+            "total": 10, "meters": [{"meter_id": "ev_charger"}]}     # only EV has a layer
+        cli = make_client(store=store)
+        orig = server.load_config
+        server.load_config = lambda: cfg
+        try:
+            d = cli.get("/api/historical/probe-devices").get_json()
+        finally:
+            server.load_config = orig
+        by = {x["meter_id"]: x for x in d["devices"]}
+        self.assertEqual(by["ev_charger"]["history_sensors"],
+                         ["sensor.zappi_v1", "sensor.zappi_v2"])   # kept from the run
+        self.assertEqual(by["house_battery"]["history_sensors"], [])  # no layer → none
+
 
 class TestAttributionEndpoints(unittest.TestCase):
     """Recorder device-attribution launch/status/control/runs/back-out endpoints."""
