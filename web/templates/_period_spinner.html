@@ -1,0 +1,204 @@
+{# Shared period rolodex/spinner. Include once per page, then:
+     PeriodSpinner.attach(labelEl, {
+       getPeriods: function(){ return { list:[{label, value}], curIdx }; },  // newest-first order as displayed
+       onSelect:   function(value){ ...apply + re-render... },
+       // optional per-page tuning (else the global defaults below apply):
+       side, rowPx, settleMs, wheelThreshold, wheelMax, dragStep, hoverMs
+     });
+   Behaviour: wheel/drag spin + auto-settle-commit; click opens a picker that
+   stays open (scroll / edge-hover to bring more dates in) until you click one;
+   Esc closes; click-away commits the centred period. Newest at the top. #}
+<style>
+  .period-rolodex {
+    cursor: ns-resize; user-select: none; touch-action: none;
+    padding: 2px 8px; border-radius: var(--radius);
+    border: 1px solid transparent; transition: border-color .12s, background .12s;
+  }
+  .period-rolodex:hover { border-color: var(--border); background: rgba(127,127,127,0.10); }
+  .period-rolodex::after { content: " \2195"; font-size: 10px; color: var(--muted); opacity: .6; }
+  .period-spin {
+    position: fixed; z-index: 3000; transform: translateX(-50%);
+    background: var(--surface, #1b1f24); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: 0 8px 26px rgba(0,0,0,0.42);
+    padding: 2px 0; min-width: 172px; text-align: center; user-select: none; overflow: hidden;
+  }
+  .period-spin .ps-row { padding: 0 16px; font-size: 13px; white-space: nowrap; cursor: pointer; }
+  .period-spin .ps-cur { font-weight: 600; color: var(--accent, #2563eb); background: rgba(127,127,127,0.14); }
+  /* Touch fallback: a transparent native <select> overlaid on the label so a
+     tap opens the OS period picker (16px font-size prevents the iOS zoom).
+     The select is a CHILD of the label so it survives the host page moving the
+     label element around (e.g. charts.html builds the nav element, attaches,
+     then appends it); a MutationObserver re-attaches it whenever the page
+     rewrites the label via textContent (period sync). */
+  .period-rolodex-native {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    margin: 0; padding: 0; border: 0; background: transparent; color: transparent;
+    opacity: 0; font-size: 16px; -webkit-appearance: none; appearance: none; cursor: pointer;
+  }
+</style>
+<script>
+(function () {
+  // Global defaults (tune once here; a page may override any via its opts).
+  var DEF = { side: 4, rowPx: 30, settleMs: 550, wheelThreshold: 50, wheelMax: 6, dragStep: 44, hoverMs: 110 };
+  var _spin = null, _hoverTimer = null, _wheelAcc = 0, _wheelLast = 0;
+  // Touch-primary devices (phones/tablets): the wheel/drag spinner is a desktop
+  // interaction and was unusable -- and could lock up -- on touch. Detect once.
+  var _isTouch = false;
+  try { _isTouch = window.matchMedia('(hover: none) and (pointer: coarse)').matches; } catch (e) {}
+  function _cfg(k) { return (_spin && _spin.opts && _spin.opts[k] != null) ? _spin.opts[k] : DEF[k]; }
+  function _o(opts, k) { return (opts && opts[k] != null) ? opts[k] : DEF[k]; }
+  function esc(t) { return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+
+  function stopHover() { if (_hoverTimer) { clearInterval(_hoverTimer); _hoverTimer = null; } if (_spin) _spin.hoverDir = 0; }
+  function hover(e) {
+    if (!_spin || !_spin.sticky) return;                       // edge auto-scroll only in the click picker
+    var r = _spin.el.getBoundingClientRect(), y = e.clientY - r.top, edge = _cfg('rowPx');
+    var dir = (y < edge) ? -1 : (y > r.height - edge) ? 1 : 0; // near top/bottom edge -> spin that way
+    if (dir === 0) { stopHover(); return; }
+    if (_spin.hoverDir === dir && _hoverTimer) return;
+    stopHover(); _spin.hoverDir = dir;
+    _hoverTimer = setInterval(function () { if (_spin) by(dir); else stopHover(); }, _cfg('hoverMs'));
+  }
+  function render() {
+    if (!_spin) return;
+    var N = _cfg('side'), h = _cfg('rowPx'), html = '';
+    for (var off = -N; off <= N; off++) {
+      var i = _spin.idx + off, has = (i >= 0 && i < _spin.list.length), txt = has ? _spin.list[i].label : '';
+      var op = has ? Math.max(0.16, 1 - Math.abs(off) * 0.22) : 0;
+      html += '<div class="ps-row' + (off === 0 ? ' ps-cur' : '') + '" data-i="' + i + '"'
+            + ' style="height:' + h + 'px;line-height:' + h + 'px;opacity:' + op + ';">' + esc(txt) + '</div>';
+    }
+    _spin.el.innerHTML = html;
+    // If the anchor label has been detached or collapsed (e.g. the host page
+    // re-rendered its period nav while the picker was open), its rect reads as
+    // (0,0,0,0); positioning against that flings the popup into the top-left
+    // corner. Bail out cleanly instead of jumping off-page.
+    var r = _spin.lbl.getBoundingClientRect();
+    if (!_spin.lbl.isConnected || (r.width === 0 && r.height === 0)) { close(); return; }
+    var totalH = (2 * N + 1) * h;
+    _spin.el.style.left = Math.round(r.left + r.width / 2) + 'px';
+    _spin.el.style.top  = Math.round(r.top + r.height / 2 - totalH / 2) + 'px';
+    Array.prototype.forEach.call(_spin.el.querySelectorAll('.ps-row'), function (row) {
+      row.addEventListener('click', function () {
+        var i = parseInt(row.getAttribute('data-i'), 10);
+        if (i >= 0 && i < _spin.list.length) { _spin.idx = i; commit(); }
+      });
+    });
+  }
+  function by(n) { if (!_spin) return; _spin.idx = Math.min(_spin.list.length - 1, Math.max(0, _spin.idx + n)); render(); }
+  function scheduleSettle() { if (!_spin || _spin.sticky) return; if (_spin.timer) clearTimeout(_spin.timer); _spin.timer = setTimeout(commit, _cfg('settleMs')); }
+  function commit() { if (!_spin) return; var it = _spin.list[_spin.idx], opts = _spin.opts; close(); if (it && opts && opts.onSelect) opts.onSelect(it.value); }
+  function close() {
+    if (!_spin) return;
+    stopHover();
+    if (_spin.timer) clearTimeout(_spin.timer);
+    if (_spin.el) _spin.el.remove();
+    document.removeEventListener('mousedown', away, true);
+    document.removeEventListener('keydown', key, true);
+    _spin = null;
+  }
+  function away(e) { if (_spin && !_spin.el.contains(e.target) && e.target !== _spin.lbl && !_spin.lbl.contains(e.target)) commit(); }
+  function key(e) { if (e.key === 'Escape') close(); else if (e.key === 'Enter') commit(); }
+  function open(lbl, opts, sticky) {
+    if (_spin) return;
+    var pl = opts.getPeriods ? opts.getPeriods() : null;
+    if (!pl || !pl.list || !pl.list.length) return;
+    var el = document.createElement('div');
+    el.className = 'period-spin';
+    el.addEventListener('wheel', function (e) { wheel(e, lbl, opts); }, { passive: false });
+    el.addEventListener('mousemove', hover);
+    el.addEventListener('mouseleave', stopHover);
+    document.body.appendChild(el);
+    _spin = { lbl: lbl, opts: opts, list: pl.list, idx: (pl.curIdx >= 0 ? pl.curIdx : pl.list.length - 1),
+              el: el, timer: null, sticky: !!sticky, hoverDir: 0 };
+    render();
+    setTimeout(function () {
+      document.addEventListener('mousedown', away, true);
+      document.addEventListener('keydown', key, true);
+    }, 0);
+  }
+  function wheel(e, lbl, opts) {
+    e.preventDefault();
+    var now = Date.now(), dy = e.deltaY;
+    if (e.deltaMode === 1) dy *= 16; else if (e.deltaMode === 2) dy *= 100;
+    if ((_wheelAcc > 0) !== (dy > 0) || (now - _wheelLast) > 250) _wheelAcc = 0;
+    _wheelLast = now; _wheelAcc += dy;
+    var th = _o(opts, 'wheelThreshold'), mx = _o(opts, 'wheelMax');
+    var n = Math.trunc(_wheelAcc / th);
+    open(lbl, opts);   // if opened by a prior click it stays sticky (no auto-commit)
+    if (n !== 0) { _wheelAcc -= n * th; if (n > mx) n = mx; if (n < -mx) n = -mx; by(n); }
+    scheduleSettle();
+  }
+  // Touch fallback: overlay a transparent native <select> on the label. A tap
+  // opens the OS picker; options are (re)built from getPeriods() each time so
+  // they always reflect the current list and selection. No wheel/drag/hover.
+  function attachTouch(lbl, opts) {
+    lbl.classList.add('period-rolodex');
+    lbl.title = 'Tap to pick a period';
+    lbl.style.position = 'relative';                 // containing block for the overlay
+    try { if (getComputedStyle(lbl).display === 'inline') lbl.style.display = 'inline-block'; } catch (e) {}
+    var sel = document.createElement('select');
+    sel.className = 'period-rolodex-native';
+    sel.setAttribute('aria-label', 'Select period');
+    function rebuild() {
+      var pl = opts.getPeriods ? opts.getPeriods() : null;
+      sel._pl = pl;
+      sel.innerHTML = '';
+      if (!pl || !pl.list) return;
+      for (var i = 0; i < pl.list.length; i++) {
+        var o = document.createElement('option');
+        o.value = String(i); o.textContent = pl.list[i].label;
+        if (i === pl.curIdx) o.selected = true;
+        sel.appendChild(o);
+      }
+    }
+    sel.addEventListener('pointerdown', rebuild);
+    sel.addEventListener('focus', rebuild);
+    sel.addEventListener('change', function () {
+      var pl = sel._pl, i = parseInt(sel.value, 10);
+      if (pl && pl.list && pl.list[i] && opts.onSelect) opts.onSelect(pl.list[i].value);
+    });
+    rebuild();
+    // Keep the select attached even when the page rewrites the label text
+    // (lbl.textContent wipes children) or attaches while the label is still
+    // detached and inserts it later. A childList observer re-appends it.
+    function ensure() { if (sel.parentNode !== lbl) lbl.appendChild(sel); }
+    ensure();
+    try { new MutationObserver(ensure).observe(lbl, { childList: true }); } catch (e) {}
+  }
+  function attach(lbl, opts) {
+    if (!lbl || lbl._psAttached) return;
+    lbl._psAttached = true;
+    if (_isTouch) { attachTouch(lbl, opts); return; }
+    lbl.classList.add('period-rolodex');
+    lbl.title = 'Scroll or drag to spin, or click to pick a period';
+    lbl.addEventListener('wheel', function (e) { wheel(e, lbl, opts); }, { passive: false });
+    var drag = null, ds = function () { return _o(opts, 'dragStep'); };
+    lbl.addEventListener('pointerdown', function (e) {
+      try { lbl.setPointerCapture(e.pointerId); } catch (err) {}
+      drag = { y0: e.clientY, opened: false, baseIdx: 0 };
+    });
+    lbl.addEventListener('pointermove', function (e) {
+      if (!drag) return;
+      if (!drag.opened) {
+        open(lbl, opts);
+        if (!_spin) { drag = null; return; }
+        _spin.sticky = false;                  // a drag auto-commits on release
+        drag.opened = true; drag.baseIdx = _spin.idx;
+      }
+      var offset = Math.trunc((e.clientY - drag.y0) / ds());
+      var ni = Math.min(_spin.list.length - 1, Math.max(0, drag.baseIdx + offset));
+      if (ni !== _spin.idx) { _spin.idx = ni; render(); }
+    });
+    function end() {
+      if (!drag) return;
+      var wasOpen = drag.opened; drag = null;
+      if (wasOpen) { commit(); return; }        // a drag: commit the centred period
+      if (_spin) close(); else open(lbl, opts, true);   // a tap: toggle the click picker
+    }
+    lbl.addEventListener('pointerup', end);
+    lbl.addEventListener('pointercancel', end);
+  }
+  window.PeriodSpinner = { attach: attach };
+})();
+</script>

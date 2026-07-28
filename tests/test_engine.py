@@ -38,7 +38,7 @@ hc.HAClient = MagicMock
 sys.modules["ha_client"] = hc
 
 # Stub block_store — use real in-memory BlockStore so engine functions work
-from block_store import BlockStore, open_block_store, migrate_json_to_sqlite
+from block_store import BlockStore, open_block_store
 import block_store as _bs_module
 _test_store = BlockStore(":memory:")
 _test_store.insert_config_period({
@@ -51,7 +51,6 @@ _test_store.insert_config_period({
 bs = types.ModuleType("block_store")
 bs.BlockStore              = BlockStore
 bs.open_block_store        = lambda path: _test_store
-bs.migrate_json_to_sqlite  = migrate_json_to_sqlite
 bs.outward_code            = _bs_module.outward_code
 bs.derive_region_periods   = _bs_module.derive_region_periods
 sys.modules["block_store"] = bs

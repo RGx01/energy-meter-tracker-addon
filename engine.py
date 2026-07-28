@@ -29,7 +29,7 @@ from energy_engine_io import (
 )
 import energy_charts
 from ha_client import HAClient
-from block_store import BlockStore, open_block_store, migrate_json_to_sqlite
+from block_store import BlockStore, open_block_store
 
 logger = logging.getLogger("engine")
 
@@ -43,7 +43,7 @@ CONFIG_PATH        = f"{DATA_DIR}/meters_config.json"
 # they are never swept into the DB backups. Entered in-app, read at startup.
 KRAKEN_CREDS_PATH  = f"{DATA_DIR}/kraken_credentials.json"
 # current_block.json removed in 2.1.0 — state stored in DB current_block table
-BLOCKS_PATH        = f"{DATA_DIR}/blocks.json"    # read-only: used only for one-time migration on startup
+BLOCKS_PATH        = f"{DATA_DIR}/blocks.json"    # legacy pre-SQLite store; detected only to warn (no longer auto-migrated)
 BLOCKS_DB_PATH     = f"{DATA_DIR}/blocks.db"
 # cumulative_totals.json removed in 2.1.0 — totals derived from blocks table
 
@@ -8977,65 +8977,36 @@ async def engine_startup(ha: HAClient):
         logger.warning("engine_startup: register-glitch self-heal failed: %s", _rge)
 
     if _store.get_current_config_period_id() is None:
-        # Fresh DB — check if blocks.json exists to migrate
-        # Always try to load config from meters_config.json for migration,
-        # since load_config() returns {} when config_periods is empty.
-        _migration_config = load_json(CONFIG_PATH, {})
-        if not _migration_config.get("meters"):
-            _migration_config = config  # fall back to whatever load_config returned
-        else:
-            logger.info(
-                "engine_startup: loaded meter config from meters_config.json for migration"
-            )
+        # Fresh DB (no config period yet). Automatic migration of the pre-SQLite
+        # JSON stores (blocks.json / current_block.json) was removed in 4.0.0.
+        # If a legacy store is present we do NOT silently import it — we warn
+        # loudly and start as a new install, leaving the JSON file untouched so
+        # it can still be migrated with an earlier release (<= 3.x) if needed.
+        _legacy_json = None
         if os.path.exists(BLOCKS_PATH):
-            logger.info("engine_startup: blocks.json found — running auto-migration to SQLite")
-            migrated = migrate_json_to_sqlite(BLOCKS_PATH, _store, _migration_config)
-            logger.info("engine_startup: migration complete — %d blocks migrated", migrated)
-            # Rename blocks.json so it's preserved but no longer used
-            migrated_path = BLOCKS_PATH + ".migrated"
-            try:
-                os.rename(BLOCKS_PATH, migrated_path)
-                logger.info("engine_startup: blocks.json renamed to %s", migrated_path)
-            except Exception as e:
-                logger.warning("engine_startup: could not rename blocks.json: %s", e)
+            _legacy_json = BLOCKS_PATH
         elif os.path.exists(BLOCKS_PATH + ".migrated"):
-            # DB was deleted but migrated source still exists — re-migrate from it
-            logger.info("engine_startup: blocks.json.migrated found — re-migrating to fresh DB")
-            migrated = migrate_json_to_sqlite(BLOCKS_PATH + ".migrated", _store, _migration_config)
-            logger.info("engine_startup: re-migration complete — %d blocks migrated", migrated)
-        else:
-            # Brand new install — create initial config period starting NOW
-            # Always use now regardless of any date in the config JSON —
-            # using a historical date would trigger gap fill for all missing blocks.
-            _store.insert_config_period(config, effective_from=datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
-            # Clear any stale current_block from a previous session —
-            # if there's no config period, the current_block is invalid.
-            _store.save_current_block({})
-            logger.info("engine_startup: new install — initial config period created")
+            _legacy_json = BLOCKS_PATH + ".migrated"
+        if _legacy_json:
+            logger.error(
+                "engine_startup: found a legacy pre-SQLite block store at %s, but "
+                "automatic JSON->SQLite migration was REMOVED in 4.0.0. Starting as "
+                "a NEW install — your data is NOT being imported, and %s is left "
+                "untouched on disk. To recover it, run an earlier release (3.x or "
+                "older) once to migrate, then upgrade again.",
+                _legacy_json, _legacy_json,
+            )
+        # New install (or unmigrated legacy present) — create initial config
+        # period starting NOW. Always use now regardless of any date in the
+        # config JSON — a historical date would trigger gap fill for all missing
+        # blocks.
+        _store.insert_config_period(config, effective_from=datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
+        # Clear any stale current_block from a previous session — if there's no
+        # config period, the current_block is invalid.
+        _store.save_current_block({})
+        logger.info("engine_startup: new install — initial config period created")
 
     logger.info("engine_startup: %d existing blocks in store", _store.count_blocks())
-
-    # ── Migrate current_block.json → DB (one-time, 2.1.0 upgrade) ───────
-    current_block_json_path = os.path.join(DATA_DIR, "current_block.json")
-    if os.path.exists(current_block_json_path):
-        cb_in_db = _store.load_current_block()
-        if not cb_in_db or not cb_in_db.get("start"):
-            try:
-                cb_from_file = load_json(current_block_json_path, {})
-                if cb_from_file and cb_from_file.get("start"):
-                    _store.save_current_block(cb_from_file)
-                    logger.info(
-                        "engine_startup: current_block.json migrated to DB (start=%s)",
-                        cb_from_file.get("start")
-                    )
-            except Exception as _cbe:
-                logger.warning("engine_startup: current_block.json migration failed: %s", _cbe)
-        # Rename so it's no longer read on subsequent startups
-        try:
-            os.rename(current_block_json_path, current_block_json_path + ".migrated")
-            logger.info("engine_startup: current_block.json renamed to .migrated")
-        except Exception as _cbe:
-            logger.warning("engine_startup: could not rename current_block.json: %s", _cbe)
 
     # ── Session gap detection ────────────────────────────────────────────
     # Use the last block BEFORE current_block.start to avoid zero-rate catch-up

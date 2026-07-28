@@ -5785,65 +5785,6 @@ class BlockStore:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Migration
-# ─────────────────────────────────────────────────────────────────────────────
-
-def migrate_json_to_sqlite(json_path: str,
-                           store: "BlockStore",
-                           config_json: dict,
-                           effective_from: Optional[str] = None) -> int:
-    """
-    One-time migration of blocks.json -> BlockStore.
-
-    Creates a single config_periods row from config_json covering all history,
-    then bulk-inserts all blocks. Idempotent via INSERT OR IGNORE.
-
-    Returns the number of blocks migrated.
-    """
-    import json as _json
-    try:
-        with open(json_path, "r") as f:
-            blocks = _json.load(f)
-    except Exception as e:
-        logger.error("migrate_json_to_sqlite: failed to read %s: %s", json_path, e)
-        return 0
-
-    if not isinstance(blocks, list):
-        logger.error("migrate_json_to_sqlite: blocks.json is not a list")
-        return 0
-
-    # Determine effective_from: oldest block start, or now if no blocks
-    if effective_from is None:
-        starts = [b.get("start") for b in blocks if b.get("start")]
-        effective_from = min(starts) if starts else _utc_now_iso()
-
-    # Create the single historical config period
-    period_id = store.insert_config_period(
-        config_json=config_json,
-        effective_from=effective_from,
-        change_reason="Migrated from blocks.json",
-    )
-
-    # Bulk insert all blocks
-    total = 0
-    batch_size = 500
-    for i in range(0, len(blocks), batch_size):
-        batch = blocks[i:i + batch_size]
-        inserted = store.append_blocks(batch, config_period_id=period_id)
-        total += inserted
-        logger.info(
-            "migrate_json_to_sqlite: %d/%d blocks processed",
-            min(i + batch_size, len(blocks)), len(blocks)
-        )
-
-    logger.info(
-        "migrate_json_to_sqlite: complete — %d blocks, %d meter-rows inserted",
-        len(blocks), total
-    )
-    return len(blocks)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Factory
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -5853,7 +5794,7 @@ def open_block_store(db_path: str) -> "BlockStore":
     applies all PRAGMAs, and ensures the schema exists.
 
     If the DB file is corrupt, renames it to .corrupt and starts fresh
-    so the engine can still start (migration will re-run if blocks.json exists).
+    so the engine can still start.
     """
     import os
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
@@ -5868,5 +5809,5 @@ def open_block_store(db_path: str) -> "BlockStore":
                 logger.warning("open_block_store: renamed corrupt DB to %s", corrupt_path)
             except Exception:
                 pass
-        # Start with a fresh DB — migration will re-run if blocks.json.migrated exists
+        # Start with a fresh DB.
         return BlockStore(db_path)

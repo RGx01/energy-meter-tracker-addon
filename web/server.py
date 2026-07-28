@@ -3146,24 +3146,17 @@ def _restore_worker(zipname, selected, from_flat):
                     restored.append(basename)
             logger.info("api_backup_restore: restored %s from %s", restored, zipname)
 
-        # If a legacy blocks.json was restored from an old backup, auto-migrate it
+        # A legacy pre-SQLite blocks.json restored from an old backup is no
+        # longer auto-migrated (JSON->SQLite migration was removed in 4.0.0).
+        # Warn loudly and leave the file untouched rather than silently importing.
         legacy_json = os.path.join(DATA_DIR, "blocks.json")
         if "blocks.json" in restored and os.path.exists(legacy_json):
-            try:
-                from block_store import migrate_json_to_sqlite
-                from energy_engine_io import load_json as _lj3
-                cfg = _lj3(os.path.join(DATA_DIR, "meters_config.json"), {})
-                db_path = os.path.join(DATA_DIR, "blocks.db")
-                if os.path.exists(db_path):
-                    os.remove(db_path)
-                _store = None
-                store = _get_store()
-                migrated = migrate_json_to_sqlite(legacy_json, store, cfg)
-                os.rename(legacy_json, legacy_json + ".migrated")
-                restored.append("blocks.db (migrated from legacy blocks.json)")
-                logger.info("api_backup_restore: migrated legacy blocks.json -> blocks.db (%d blocks)", migrated)
-            except Exception as _e:
-                logger.warning("api_backup_restore: legacy migration failed: %s", _e)
+            logger.error(
+                "api_backup_restore: restored a legacy blocks.json, but automatic "
+                "JSON->SQLite migration was REMOVED in 4.0.0. It is left untouched "
+                "and NOT imported. To recover it, migrate with an earlier release "
+                "(3.x or older) before upgrading."
+            )
 
         # ── Reset stores and fix WAL before any further DB access ────────────
         _step("reinitialising")

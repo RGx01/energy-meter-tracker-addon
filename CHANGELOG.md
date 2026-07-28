@@ -72,6 +72,10 @@
 
 - **API mode with missing credentials no longer masquerades as "connected".** Backups contain only `blocks.db`; your API key lives in a separate `kraken_credentials.json` that isn't included. So restoring a backup onto a **fresh** install (or any `/data` that lost the credentials file) left the data-source mode reading `api`/`cad+api` with no key actually stored — and Settings showed *"Data source: supplier settlement (DCC)"* with only a **Disconnect** button, hiding the fact that nothing could poll or settle. Settings now checks whether credentials are really present: when they're not, it shows a clear **"API mode is set, but no API credentials are stored"** warning with a **Re-enter API key** button, and the billing badge reads **"⚠ API mode · credentials missing"** instead of *"No API · local billing"*.
 
+### Removed
+
+- **Legacy JSON→SQLite migration shims.** The one-time startup migrations that imported a pre-SQLite `blocks.json` (and the 2.1-era `current_block.json`) into the block store have been retired — anyone on 4.0.x has long since moved to the SQLite store. If an old JSON store is ever found (on startup, or restored from an ancient backup), EMT now logs a loud error and starts as a **new install**, leaving the JSON file **untouched** rather than silently importing it. To recover such data, run an earlier release (3.x or older) once to migrate, then upgrade again. The `migrate_json_to_sqlite` helper and its tests were removed.
+
 ## [3.4.0] - 2026-07-19
  
 ### Added

@@ -163,25 +163,6 @@
     min-width: 110px;
     text-align: center;
   }
-  .bar-period-label.bar-rolodex {
-    cursor: ns-resize;
-    user-select: none;
-    touch-action: none;
-    padding: 2px 8px;
-    border-radius: var(--radius);
-    border: 1px solid transparent;
-    transition: border-color .12s, background .12s;
-  }
-  .bar-period-label.bar-rolodex:hover {
-    border-color: var(--border);
-    background: rgba(255,255,255,0.04);
-  }
-  .bar-period-label.bar-rolodex::after {
-    content: " ⇅";
-    font-size: 10px;
-    color: var(--muted);
-    opacity: .6;
-  }
   .bar-year-btn {
     font-size: 12px;
     padding: 3px 10px;
@@ -646,6 +627,7 @@ window.EMTSpiral=(function(){
 {% endblock %}
 
 {% block scripts %}
+{% include '_period_spinner.html' %}
 <script>
 var chartsLoaded = {};
 var _activeChart = 'daily';
@@ -2185,80 +2167,30 @@ var _barWheelLast = 0;     // timestamp of last wheel event (to detect a gesture
 var BAR_WHEEL_THRESHOLD = 50;   // normalized px of scroll per month step (lower = more sensitive)
 var BAR_WHEEL_MAX_STEPS = 6;    // cap months moved by a single event, so a hard flick can't rocket away
 var BAR_DRAG_STEP = 44;         // px of click-drag needed per month step (does NOT affect scrolling)
-function barMakeRolodex(lbl) {
-  lbl.classList.add('bar-rolodex');
-  lbl.title = 'Scroll or drag to change period';
-  lbl.addEventListener('wheel', function(e) {
-    e.preventDefault();
-    var now = Date.now();
-    // Normalize delta to pixels: browsers report wheel in pixels (0), lines (1)
-    // or pages (2). Without this a "line mode" trackpad reports deltaY≈1–3 and
-    // any pixel threshold is meaningless.
-    var dy = e.deltaY;
-    if (e.deltaMode === 1) dy *= 16;        // lines → ~px
-    else if (e.deltaMode === 2) dy *= 100;  // pages → ~px
-    // Reset the accumulator if the direction flipped or the gesture paused.
-    if ((_barWheelAcc > 0) !== (dy > 0) || (now - _barWheelLast) > 250) _barWheelAcc = 0;
-    _barWheelLast = now;
-    _barWheelAcc += dy;
-    var n = Math.trunc(_barWheelAcc / BAR_WHEEL_THRESHOLD);   // whole months this crosses
-    if (n !== 0) {
-      _barWheelAcc -= n * BAR_WHEEL_THRESHOLD;                // carry the remainder
-      if (n >  BAR_WHEEL_MAX_STEPS) n =  BAR_WHEEL_MAX_STEPS;
-      if (n < -BAR_WHEEL_MAX_STEPS) n = -BAR_WHEEL_MAX_STEPS;
-      barStepDaily(n);                                        // one re-render for the whole event
-    }
-  }, { passive: false });
-  // Drag to scrub — the primary interaction on TOUCH (phones/tablets), which
-  // emit no wheel events. During the drag we only update the label TEXT to
-  // preview the target period (months fly by like a rolodex); the chart is
-  // re-rendered once, on release. This avoids the "one month per swipe" trap of
-  // re-rendering mid-gesture (which would replace this element and drop the
-  // pointer capture). A tap that doesn't move commits nothing.
-  var drag = null;
-  lbl.addEventListener('pointerdown', function(e) {
-    if (!barData || !barData.length) return;
-    try { lbl.setPointerCapture(e.pointerId); } catch (err) {}
-    drag = { y0: e.clientY, moved: false };
-    if (!barCalendar) {
-      drag.keys = barDailyKeys();
-      drag.base = drag.keys.indexOf(barDailyMonth);
-      if (drag.base < 0) drag.base = drag.keys.length - 1;
-      drag.tgt = drag.base;
-    } else {
-      var lo = null, hi = null;
-      barData.forEach(function(r){ var ym = r.year*12 + (r.month-1); if (lo===null||ym<lo) lo=ym; if (hi===null||ym>hi) hi=ym; });
-      var cur;
-      if (typeof barDailyMonth === 'object' && barDailyMonth) cur = barDailyMonth.year*12 + (barDailyMonth.month-1);
-      else { var n = new Date(); cur = n.getFullYear()*12 + n.getMonth(); }
-      drag.lo = lo; drag.hi = hi; drag.base = cur; drag.tgt = cur;
-    }
-  });
-  lbl.addEventListener('pointermove', function(e) {
-    if (!drag) return;
-    var offset = Math.trunc((e.clientY - drag.y0) / BAR_DRAG_STEP);  // down = forward, matches wheel
-    if (offset !== 0) drag.moved = true;
-    if (!barCalendar) {
-      drag.tgt = Math.min(drag.keys.length - 1, Math.max(0, drag.base + offset));
-      lbl.textContent = barBillingRangeLabel(drag.keys[drag.tgt]);
-    } else {
-      drag.tgt = Math.min(drag.hi, Math.max(drag.lo, drag.base + offset));
-      lbl.textContent = MONTHS_SHORT[drag.tgt % 12] + ' ' + Math.floor(drag.tgt / 12);
-    }
-  });
-  function _commit() {
-    if (!drag) return;
-    var d = drag; drag = null;
-    if (!d.moved) return;   // a tap, not a scrub — leave selection unchanged
-    if (!barCalendar) {
-      if (d.keys[d.tgt] !== barDailyMonth) { barDailyMonth = d.keys[d.tgt]; barSaveState(); barRender(); }
-    } else {
-      barDailyMonth = { year: Math.floor(d.tgt / 12), month: (d.tgt % 12) + 1 };
-      barSaveState(); barRender();
-    }
+function barGetPeriods() {
+  var list = [], curIdx = -1;
+  if (!barData || !barData.length) return { list: list, curIdx: -1 };
+  if (!barCalendar) {
+    var keys = barDailyKeys();
+    keys.forEach(function (k, i) { if (k === barDailyMonth) curIdx = i; list.push({ label: barBillingRangeLabel(k), value: k }); });
+  } else {
+    var lo = null, hi = null;
+    barData.forEach(function (r) { var ym = r.year * 12 + (r.month - 1); if (lo === null || ym < lo) lo = ym; if (hi === null || ym > hi) hi = ym; });
+    var cur;
+    if (typeof barDailyMonth === 'object' && barDailyMonth) cur = barDailyMonth.year * 12 + (barDailyMonth.month - 1);
+    else { var nn = new Date(); cur = nn.getFullYear() * 12 + nn.getMonth(); }
+    for (var m = lo; m <= hi; m++) { if (m === cur) curIdx = list.length; list.push({ label: MONTHS_SHORT[m % 12] + ' ' + Math.floor(m / 12), value: m }); }
   }
-  lbl.addEventListener('pointerup', _commit);
-  lbl.addEventListener('pointercancel', _commit);
+  if (curIdx < 0) curIdx = list.length - 1;
+  list.reverse(); curIdx = list.length - 1 - curIdx;   // newest first (top of the wheel)
+  return { list: list, curIdx: curIdx };
+}
+function barSelectPeriod(v) {
+  if (!barCalendar) { if (v !== barDailyMonth) { barDailyMonth = v; barSaveState(); barRender(); } }
+  else { barDailyMonth = { year: Math.floor(v / 12), month: (v % 12) + 1 }; barSaveState(); barRender(); }
+}
+function barMakeRolodex(lbl) {
+  PeriodSpinner.attach(lbl, { getPeriods: barGetPeriods, onSelect: barSelectPeriod });
 }
 
 function barBuildSubBar() {

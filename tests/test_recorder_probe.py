@@ -24,7 +24,7 @@ hc = types.ModuleType("ha_client")
 hc.HAClient = MagicMock
 sys.modules["ha_client"] = hc
 
-from block_store import BlockStore, migrate_json_to_sqlite
+from block_store import BlockStore
 _boot = BlockStore(":memory:")
 _boot.insert_config_period({"meters": {"electricity_main": {"meta": {
     "timezone": "UTC", "billing_day": 1, "block_minutes": 30,
@@ -32,7 +32,6 @@ _boot.insert_config_period({"meters": {"electricity_main": {"meta": {
 bs = types.ModuleType("block_store")
 bs.BlockStore = BlockStore
 bs.open_block_store = lambda path: _boot
-bs.migrate_json_to_sqlite = migrate_json_to_sqlite
 sys.modules["block_store"] = bs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

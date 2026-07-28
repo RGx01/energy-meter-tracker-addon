@@ -18,7 +18,7 @@ import unittest
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(__file__))
-from block_store import (BlockStore, open_block_store, migrate_json_to_sqlite,
+from block_store import (BlockStore, open_block_store,
                           local_date_to_utc_bounds, local_date_range_to_utc_bounds)
 
 
@@ -1461,89 +1461,8 @@ class TestReads(unittest.TestCase):
 # Tests: migration
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestMigration(unittest.TestCase):
-
-    def _make_blocks_json(self, n: int, tmp_path: str) -> str:
-        """Write n blocks to a temp JSON file and return the path."""
-        blocks = []
-        for i in range(n):
-            dt = datetime(2026, 1, 1) + timedelta(minutes=30 * i)
-            blocks.append(make_block(dt.isoformat()))
-        path = tmp_path
-        with open(path, "w") as f:
-            json.dump(blocks, f)
-        return path
-
-    def setUp(self):
-        self.store = new_store()
-        import tempfile
-        self.tmp = tempfile.mktemp(suffix=".json")
-
-    def tearDown(self):
-        self.store.close()
-        try:
-            os.remove(self.tmp)
-        except Exception:
-            pass
-
-    def test_migrate_creates_config_period(self):
-        self._make_blocks_json(10, self.tmp)
-        migrate_json_to_sqlite(self.tmp, self.store, EXAMPLE_CONFIG)
-        self.assertIsNotNone(self.store.get_current_config_period_id())
-
-    def test_migrate_inserts_all_blocks(self):
-        self._make_blocks_json(48, self.tmp)
-        count = migrate_json_to_sqlite(self.tmp, self.store, EXAMPLE_CONFIG)
-        self.assertEqual(count, 48)
-        self.assertEqual(self.store.count_blocks(), 48)
-
-    def test_migrate_effective_from_is_oldest_block(self):
-        blocks = [make_block("2025-06-15T00:00:00"),
-                  make_block("2025-06-16T00:00:00"),
-                  make_block("2025-06-14T00:00:00")]
-        with open(self.tmp, "w") as f:
-            json.dump(blocks, f)
-        migrate_json_to_sqlite(self.tmp, self.store, EXAMPLE_CONFIG)
-        cp = self.store.get_config_period(1)
-        # effective_from is snapped to midnight in Europe/London (UTC+1 BST)
-        # so 2025-06-14 00:00 London = 2025-06-13T23:00:00 UTC
-        self.assertIn(cp["effective_from"], ["2025-06-13T23:00:00", "2025-06-14T00:00:00"])
-
-    def test_migrate_idempotent(self):
-        """Running migration twice should not duplicate blocks."""
-        self._make_blocks_json(10, self.tmp)
-        migrate_json_to_sqlite(self.tmp, self.store, EXAMPLE_CONFIG)
-        # Second run: because effective_from will be set to the same oldest block,
-        # but config_period will be a new row. Blocks use INSERT OR IGNORE.
-        migrate_json_to_sqlite(self.tmp, self.store, EXAMPLE_CONFIG)
-        # Still 10 unique block_start values
-        self.assertEqual(self.store.count_blocks(), 10)
-
-    def test_migrate_missing_file(self):
-        count = migrate_json_to_sqlite("/nonexistent/path.json",
-                                       self.store, EXAMPLE_CONFIG)
-        self.assertEqual(count, 0)
-
-    def test_migrate_empty_blocks(self):
-        with open(self.tmp, "w") as f:
-            json.dump([], f)
-        count = migrate_json_to_sqlite(self.tmp, self.store, EXAMPLE_CONFIG)
-        self.assertEqual(count, 0)
-        self.assertEqual(self.store.count_blocks(), 0)
-
-    def test_migrate_change_reason_recorded(self):
-        self._make_blocks_json(5, self.tmp)
-        migrate_json_to_sqlite(self.tmp, self.store, EXAMPLE_CONFIG)
-        cp = self.store.get_config_period(1)
-        self.assertEqual(cp["change_reason"], "Migrated from blocks.json")
-
-    def test_migrate_billing_day_extracted(self):
-        config = json.loads(json.dumps(EXAMPLE_CONFIG))
-        config["meters"]["electricity_main"]["meta"]["billing_day"] = 15
-        self._make_blocks_json(5, self.tmp)
-        migrate_json_to_sqlite(self.tmp, self.store, config)
-        cp = self.store.get_config_period(1)
-        self.assertEqual(cp["billing_day"], 15)
+# TestMigration removed in 4.0.0 — the JSON->SQLite migration shim it exercised
+# (migrate_json_to_sqlite) has been retired.
 
 
 # ─────────────────────────────────────────────────────────────────────────────

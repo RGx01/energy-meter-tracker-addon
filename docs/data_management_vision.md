@@ -43,6 +43,20 @@ Every data tool follows the same spine: **scope → source → preview → apply
   that layer is Removed. New `history_sensors` on `/api/historical/probe-devices`.
 - **De-probe**: page/nav renamed "Device History" (a stray "Recorder Probe" button
   in older builds clears on deploy — no such string remains in source).
+- **Rolodex picker consistency (shared component).** Extracted the period spinner
+  into one shared partial (`_period_spinner.html`) used identically on Usage Stats,
+  Insights, and the Billing charts (inlined into the iframe, driven by a
+  getPeriods/onSelect adapter). Global tuning lives in one `DEF`. Added ‹ › step
+  arrows on Billing; a detached-anchor guard (fixes the popup jumping off-page);
+  and a **native `<select>` fallback on touch devices** (the wheel/drag spinner
+  locked up on mobile).
+- **Billing charts blank-page on year→month** (the bug noted below) — fixed:
+  selection change now resets scroll to the top and shows the floating bill strip
+  immediately instead of gating on a chart entering the viewport.
+- **Dropped the v1 JSON→SQLite migration shims.** Removed `migrate_json_to_sqlite`
+  and the startup auto-migration of `blocks.json` / `current_block.json` (and the
+  backup-restore auto-migration). A legacy JSON store is now met with a loud error
+  and a fresh start rather than a silent import; the file is left untouched.
 
 ### To do
 - **BL — Heal Gaps tool** (rework "Find Missing Data"). Larger item. Unify with the
