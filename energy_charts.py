@@ -5,6 +5,35 @@ except ImportError:
     from backports.zoneinfo import ZoneInfo
 from collections import defaultdict
 import json
+import os
+import re
+
+
+# ─────────────────────────────────────────────────────────────
+# Shared period rolodex/spinner (single source of truth)
+# ─────────────────────────────────────────────────────────────
+# The Billing charts render inside a sandboxed iframe as a self-contained
+# document, so they cannot Jinja-{% include %} the shared partial the way
+# Usage Stats / Insights do. Instead we read that same partial at generate
+# time and inline its <style>+<script> into the page. Reading the one file
+# keeps the spinner behaviour identical across all three pages.
+
+def _load_period_spinner_html() -> str:
+    """Return the shared spinner partial's <style>+<script>, ready to inline.
+
+    Strips the leading Jinja {# ... #} comment (which would otherwise show as
+    literal text in the non-Jinja iframe document). Returns '' if the partial
+    can't be found, in which case the Billing page simply keeps its native
+    <select> dropdowns.
+    """
+    path = os.path.join(os.path.dirname(__file__),
+                        "web", "templates", "_period_spinner.html")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError:
+        return ""
+    return re.sub(r"\{#.*?#\}", "", raw, flags=re.S).strip()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1664,6 +1693,11 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
       <button class="pmode-btn"        data-mode="quarter"  onclick="setPeriodMode('quarter')">Quarter</button>
       <button class="pmode-btn"        data-mode="year"     onclick="setPeriodMode('year')">Year</button>
     </div>
+    <span class="period-stepper">
+      <button class="pstep-btn" title="Older period" onclick="_billStep(1)">&#8249;</button>
+      <span id="period-rolodex-label" title="Scroll or drag to spin, or click to pick a period"></span>
+      <button class="pstep-btn" title="Newer period" onclick="_billStep(-1)">&#8250;</button>
+    </span>
     <div class="period-select-wrap" id="select-month">
       <label for="period-select-month" style="font-size:11px;">Billing Period:</label>
       <select id="period-select-month" onchange="showPeriod(this.value, 'month')">
@@ -1786,7 +1820,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
 </div>"""
 
         sections_html_parts.append(f"""
-<div class="period-section month-section" id="{pid}" style="visibility:hidden;position:absolute;">
+<div class="period-section month-section" id="{pid}" style="display:none;">
   {config_change_banner}
   <details class="bill-toggle" open>
     <summary class="bill-toggle-summary">Bill Summary &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}</summary>
@@ -1852,7 +1886,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         # charts build lazily when the panel is expanded (see _renderSection).
         open_attr    = ""
         return (
-            f'<div class="period-section {pid_prefix}-section" id="{pid}" style="visibility:hidden;position:absolute;">'
+            f'<div class="period-section {pid_prefix}-section" id="{pid}" style="display:none;">'
             f'<details class="bill-toggle" open>'
             f'<summary class="bill-toggle-summary">Bill Summary &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}</summary>'
             f'<div class="bill-toggle-body">'
@@ -1920,6 +1954,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
 
 
     # ── Full HTML ──
+    spinner_html = _load_period_spinner_html()
     html = f"""<!DOCTYPE html>
 <html data-theme="light">
 <head>
@@ -1945,19 +1980,41 @@ function _getThemeColours() {{
 }}
 </script>
 <script src="https://cdn.plot.ly/plotly-3.0.1.min.js"></script>
+{spinner_html}
 <style>
 
 /* ── Theme variables ──────────────────────────── */
 :root {{
   --bg:      #f0f2f5; --surface: #ffffff; --border: #d0d5dd;
   --text:    #1a1d27; --muted:   #555970; --accent: #0a8c6a;
-  --card:    #ffffff; --input-bg:#fafafa;
+  --card:    #ffffff; --input-bg:#fafafa; --radius: 8px;
 }}
 [data-theme="dark"] {{
   --bg:      #0f1117; --surface: #1a1d27; --border: #2a2d3a;
   --text:    #e8eaf0; --muted:   #6b7080; --accent: #00d4aa;
   --card:    #1a1d27; --input-bg:#0f1117;
 }}
+
+/* ── Period rolodex ───────────────────────────── */
+/* The native <select> per mode stays in the DOM as the data source and for
+   programmatic value-setting, but is hidden -- the rolodex label replaces it
+   visually, matching Usage Stats / Insights. */
+.period-select-wrap {{ display: none !important; }}
+.period-stepper {{ display: inline-flex; align-items: center; gap: 2px; }}
+#period-rolodex-label {{
+  font-size: 13px; font-weight: 600; color: var(--text);
+  /* Fixed width (not min-width) so the ‹ › arrows stay put while stepping:
+     proportional-font date labels differ in pixel width between periods even
+     at equal character counts, which would otherwise nudge the right arrow. */
+  width: 210px; display: inline-block; text-align: center;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}}
+.pstep-btn {{
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  border-radius: var(--radius); cursor: pointer; font-size: 15px; line-height: 1;
+  padding: 3px 9px;
+}}
+.pstep-btn:hover {{ background: var(--border); }}
 
 /* ── Base ─────────────────────────────────────── */
 *, *::before, *::after {{ box-sizing: border-box; }}
@@ -2763,7 +2820,7 @@ function _ensureChartObserver() {{
       var el = entry.target;
       _chartObserver.unobserve(el);
       var sec = el.closest('.period-section');
-      if (!sec || sec.style.visibility === 'hidden') return;   // section left the screen
+      if (!sec || sec.style.display === 'none' || sec.style.visibility === 'hidden') return;   // section left the screen
       var chartId = window._pendingCharts && window._pendingCharts[el.id];
       if (chartId) {{
         delete window._pendingCharts[el.id];
@@ -2819,10 +2876,12 @@ function setPeriodMode(mode) {{
     var sv = sessionStorage.getItem('energyView') || 'vanilla';
     if (sv==='vs-year') showView('vanilla');
   }}
-  // Hide all sections, show correct one for mode
-  document.querySelectorAll('.period-section').forEach(function(el) {{ 
-      el.style.visibility='hidden'; 
-      el.style.position='absolute'; 
+  // Hide all sections, show correct one for mode. Use display:none (NOT
+  // visibility:hidden+absolute): an absolutely-positioned hidden section is out
+  // of flow but still EXTENDS the scroll height, so a tall built-out year view
+  // left a huge dead scroll void under a short month. display:none removes it.
+  document.querySelectorAll('.period-section').forEach(function(el) {{
+      el.style.display = 'none';
   }});
   var defaults = {{ month: '{default_period}', quarter: '{default_quarter}', year: '{default_year}' }};
   var savedId  = sessionStorage.getItem('energyPeriod_' + mode);
@@ -2838,11 +2897,61 @@ function setPeriodMode(mode) {{
   var selMap = {{ month:'period-select-month', calmonth:'period-select-calmonth', quarter:'period-select-quarter', year:'period-select-year' }};
   var sel = document.getElementById(selMap[mode]);
   if (sel) sel.value = initial;
+  _syncRolodexLabel();
+}}
+
+// ── Period rolodex adapter (shared PeriodSpinner) ──────────
+// The native <select> per mode is the data source; the rolodex label is the
+// visible control. getPeriods reads the active mode's options (already
+// newest-first); onSelect drives the existing showPeriod() path.
+var _ROLODEX_SEL = {{ month:'period-select-month', calmonth:'period-select-calmonth', quarter:'period-select-quarter', year:'period-select-year' }};
+function _rolodexSelect() {{ return document.getElementById(_ROLODEX_SEL[_currentMode]); }}
+function _rolodexClean(text) {{ return String(text || '').replace(/^★ Current\\s+/, ''); }}
+
+function _billGetPeriods() {{
+  var sel = _rolodexSelect();
+  if (!sel) return {{ list: [], curIdx: -1 }};
+  var list = [];
+  for (var i = 0; i < sel.options.length; i++) {{
+    list.push({{ label: _rolodexClean(sel.options[i].text), value: sel.options[i].value }});
+  }}
+  return {{ list: list, curIdx: sel.selectedIndex }};
+}}
+function _billSelectPeriod(value) {{
+  var sel = _rolodexSelect();
+  if (sel) sel.value = value;
+  showPeriod(value, _currentMode);   // showPeriod() re-syncs the label
+}}
+// ‹ / › arrows: step one period within the current mode. Options are
+// newest-first, so delta +1 = older, -1 = newer.
+function _billStep(delta) {{
+  var sel = _rolodexSelect();
+  if (!sel || !sel.options.length) return;
+  var ni = Math.min(sel.options.length - 1, Math.max(0, sel.selectedIndex + delta));
+  if (ni === sel.selectedIndex) return;
+  _billSelectPeriod(sel.options[ni].value);
+}}
+function _syncRolodexLabel() {{
+  var lbl = document.getElementById('period-rolodex-label');
+  if (!lbl) return;
+  var sel = _rolodexSelect();
+  if (!sel || sel.selectedIndex < 0) {{ lbl.textContent = ''; return; }}
+  var t = _rolodexClean(sel.options[sel.selectedIndex].text);
+  var bar = t.indexOf('  |  ');            // drop the cost tail for the collapsed label
+  lbl.textContent = (bar >= 0 ? t.slice(0, bar) : t).trim();
+}}
+function _initRolodex() {{
+  var lbl = document.getElementById('period-rolodex-label');
+  if (lbl && window.PeriodSpinner) {{
+    PeriodSpinner.attach(lbl, {{ getPeriods: _billGetPeriods, onSelect: _billSelectPeriod }});
+  }}
+  _syncRolodexLabel();
 }}
 
 function _revealSection(id) {{
     var section = document.getElementById(id);
     if (section) {{
+      section.style.display = '';
       section.style.visibility = 'visible';
       section.style.position = 'relative';
     // Restore day-charts-toggle open/closed state
@@ -2880,12 +2989,21 @@ function showPeriod(id, mode) {{
   sessionStorage.setItem('energyPeriod_' + mode, id);
   // Hide all sections belonging to this mode, show only the selected one
   var clsMap = {{ month:'month-section', calmonth:'calmonth-section', quarter:'quarter-section', year:'year-section' }};
-  document.querySelectorAll('.' + clsMap[mode]).forEach(function(el) {{ 
-    el.style.visibility='hidden'; 
-    el.style.position='absolute'; 
+  document.querySelectorAll('.' + clsMap[mode]).forEach(function(el) {{
+    el.style.display = 'none';
   }});
   document.getElementById('sticky-bill-strip').style.visibility = 'hidden';
   _revealSection(id);
+  // A deliberate period change swaps in a section of a completely different
+  // length. Reset the scroll to the top so the new charts are visible at once --
+  // otherwise, coming from a long year view scrolled to the bottom, the shorter
+  // month view shows only blank space until you scroll back up (and the
+  // "Show Bill" strip only appears once a chart re-enters view). Also clear the
+  // saved scroll so a later reload / tab-return doesn't restore the stale deep
+  // position for this shorter section.
+  window.scrollTo(0, 0);
+  try {{ sessionStorage.setItem('energyScroll', '0'); }} catch (e) {{}}
+  _syncRolodexLabel();
 }}
 
 // ── Sticky bill strip ─────────────────────────────────────
@@ -3169,6 +3287,8 @@ function showView(view) {{
   if (_themeBtn) _themeBtn.textContent = document.documentElement.getAttribute('data-theme') === 'light' ? '\u2600' : '\u263e';
   // Activate mode
   setPeriodMode(savedMode);
+  // Attach the shared rolodex spinner to the period label
+  _initRolodex();
   // Render charts in the initially visible section
   var _modeDefaults = {{ month: '{default_period}', calmonth: '{default_calmonth}', quarter: '{default_quarter}', year: '{default_year}' }};
   var _initId = sessionStorage.getItem('energyPeriod_' + savedMode);

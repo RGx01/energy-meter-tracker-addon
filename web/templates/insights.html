@@ -84,8 +84,6 @@
     border: 1px solid transparent;
     transition: border-color .12s, background .12s;
   }
-  #ins-period-label:hover { border-color: var(--border); background: rgba(255,255,255,0.04); }
-  #ins-period-label::after { content: " ⇅"; font-size: 10px; color: var(--muted); opacity: .6; }
   @media (max-width: 768px) {
     .topbar .sub { display: none; }
     .topbar { padding: 8px 12px; gap: 6px; flex-wrap: nowrap; align-items: center; }
@@ -722,6 +720,7 @@
 </div><!-- /tab-usage -->
 
 
+{% include '_period_spinner.html' %}
 <script>
 var _periods    = [];
 var _periodIdx  = 0;
@@ -1760,42 +1759,42 @@ function insStep(delta) {
 
 var _insWheelAcc = 0, _insWheelLast = 0, _insRolodexAttached = false;
 var INS_WHEEL_THRESHOLD = 50, INS_WHEEL_MAX = 6, INS_DRAG_STEP = 44;
+function insGetPeriods() {
+  var list = [], curIdx = -1;
+  var b = insBounds();
+  var earliest = b.earliest ? new Date(b.earliest) : null;
+  var now = new Date();
+  if (_insMode === 'month') {
+    var loIdx = (earliest ? earliest.getFullYear() : now.getFullYear()) * 12 + (earliest ? earliest.getMonth() : 0);
+    var hiIdx = now.getFullYear() * 12 + now.getMonth();          // current month is newest
+    var curAbs = _calYear * 12 + (_calMonth - 1);
+    for (var mi = loIdx; mi <= hiIdx; mi++) {
+      if (mi === curAbs) curIdx = list.length;
+      var yy = Math.floor(mi / 12), mm0 = mi % 12;
+      list.push({ label: new Date(yy, mm0, 1).toLocaleString('default', { month: 'long', year: 'numeric' }), value: { y: yy, m: mm0 + 1 } });
+    }
+  } else {
+    var eY = earliest ? earliest.getFullYear() : now.getFullYear();
+    for (var y = eY; y <= now.getFullYear(); y++) {
+      if (y === _calYear) curIdx = list.length;
+      list.push({ label: String(y), value: { y: y } });
+    }
+  }
+  if (curIdx < 0) curIdx = list.length - 1;
+  list.reverse(); curIdx = list.length - 1 - curIdx;              // newest first (top of the wheel)
+  return { list: list, curIdx: curIdx };
+}
+function insSelectPeriod(v) {
+  if (_insMode === 'month') { _calYear = v.y; _calMonth = v.m; }
+  else { _calYear = v.y; }
+  _insSaveState(); updatePeriodNav(); loadPeriod();
+}
 function insAttachRolodex() {
   if (_insRolodexAttached) return;
   var lbl = document.getElementById('ins-period-label');
   if (!lbl) return;
   _insRolodexAttached = true;
-  lbl.title = 'Scroll or drag to change period';
-  lbl.addEventListener('wheel', function(e) {
-    e.preventDefault();
-    var now = Date.now();
-    var dy = e.deltaY;
-    if (e.deltaMode === 1) dy *= 16; else if (e.deltaMode === 2) dy *= 100;
-    if ((_insWheelAcc > 0) !== (dy > 0) || (now - _insWheelLast) > 250) _insWheelAcc = 0;
-    _insWheelLast = now;
-    _insWheelAcc += dy;
-    var n = Math.trunc(_insWheelAcc / INS_WHEEL_THRESHOLD);
-    if (n !== 0) {
-      _insWheelAcc -= n * INS_WHEEL_THRESHOLD;
-      if (n >  INS_WHEEL_MAX) n =  INS_WHEEL_MAX;
-      if (n < -INS_WHEEL_MAX) n = -INS_WHEEL_MAX;
-      insStep(n);
-    }
-  }, { passive: false });
-  var dragY = null, acc = 0;
-  lbl.addEventListener('pointerdown', function(e) {
-    dragY = e.clientY; acc = 0;
-    try { lbl.setPointerCapture(e.pointerId); } catch (err) {}
-  });
-  lbl.addEventListener('pointermove', function(e) {
-    if (dragY === null) return;
-    acc += (e.clientY - dragY); dragY = e.clientY;
-    while (acc >=  INS_DRAG_STEP) { insStep(1);  acc -= INS_DRAG_STEP; }
-    while (acc <= -INS_DRAG_STEP) { insStep(-1); acc += INS_DRAG_STEP; }
-  });
-  function _end() { dragY = null; }
-  lbl.addEventListener('pointerup', _end);
-  lbl.addEventListener('pointercancel', _end);
+  PeriodSpinner.attach(lbl, { getPeriods: insGetPeriods, onSelect: insSelectPeriod });
 }
 
 function updatePeriodNav() {
