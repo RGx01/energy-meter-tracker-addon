@@ -339,16 +339,37 @@
     #chart-spiral{background:var(--surface)}
     #chart-spiral .sp-board{display:grid;grid-template-columns:1fr 260px;gap:18px;padding:16px}
     @media (max-width:820px){
-      /* Single-column: chart on top, options below. Let the panel grow and the
+      /* Single-column: charts on top, options below. Let the panel grow and the
          page scroll to the options (was clipped by chart-frame-wrap overflow). */
       #chart-spiral{overflow:visible; height:auto;}
       #chart-spiral .sp-board{grid-template-columns:1fr}
-      #chart-spiral .sp-chart{min-height:340px}
+      #chart-spiral .sp-chart{min-height:300px}
       #chart-spiral .sp-side{max-width:none}
     }
+    /* Cost / Usage / Carbon / Standing as equal-size tiles. On desktop cap at 3
+       columns so the 4th (Standing) wraps to its own row and each chart stays big;
+       narrower screens fall back to responsive wrapping. */
+    #chart-spiral .sp-charts{display:flex;flex-direction:column;gap:14px}
+    #chart-spiral .sp-main{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+    @media (min-width:1100px){ #chart-spiral .sp-main{grid-template-columns:repeat(3,1fr)} }
     #chart-spiral .sp-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)}
-    #chart-spiral .sp-chart{padding:12px;position:relative;min-height:480px;display:flex;justify-content:center}
+    #chart-spiral .sp-chart{padding:8px 8px 6px;position:relative;display:flex;flex-direction:column;align-items:center}
+    #chart-spiral .sp-chart svg{max-width:100%}
+    #chart-spiral .sp-ctitle{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);align-self:flex-start;margin:0 0 2px 2px}
+    /* Expand affordance + modal (mirrors the Overview expandable-card pattern). */
+    #chart-spiral .sp-expand{position:absolute;top:8px;right:8px;width:22px;height:22px;border:none;background:none;cursor:pointer;color:var(--muted);border-radius:4px;display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .12s,color .12s,background .12s;z-index:2}
+    #chart-spiral .sp-chart:hover .sp-expand{opacity:1}
+    #chart-spiral .sp-expand:hover{color:var(--text);background:rgba(127,127,127,.14)}
+    #chart-spiral .sp-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:600;backdrop-filter:blur(2px);align-items:center;justify-content:center;padding:20px;box-sizing:border-box}
+    #chart-spiral .sp-backdrop.on{display:flex}
+    #chart-spiral .sp-modal{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px 22px;width:min(680px,96vw);position:relative;box-shadow:0 24px 64px rgba(0,0,0,.7);display:flex;flex-direction:column;align-items:center}
+    #chart-spiral .sp-modal .sp-ctitle{align-self:flex-start}
+    #chart-spiral .sp-modal svg{width:100%;max-width:600px}
+    #chart-spiral .sp-mclose{position:absolute;top:10px;right:12px;width:28px;height:28px;border:none;background:rgba(127,127,127,.12);color:var(--muted);border-radius:6px;cursor:pointer;font-size:15px;line-height:1}
+    #chart-spiral .sp-mclose:hover{background:rgba(127,127,127,.22);color:var(--text)}
     #chart-spiral .sp-side{padding:16px;display:flex;flex-direction:column;gap:18px}
+    #chart-spiral .sp-standing-wrap{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);cursor:pointer}
+    #chart-spiral .sp-standing-wrap input{width:14px;height:14px;accent-color:var(--accent);cursor:pointer}
     #chart-spiral .sp-gl{font-family:var(--mono);font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);opacity:.8;margin:0 0 9px}
     #chart-spiral .sp-seg{display:flex;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:3px}
     #chart-spiral .sp-seg button{flex:1;border:0;background:transparent;color:var(--muted);font:inherit;font-size:12.5px;padding:7px 6px;border-radius:6px;cursor:pointer}
@@ -380,13 +401,15 @@
     #chart-spiral .sp-status{color:var(--muted);font-size:13px;text-align:center;padding:60px 20px}
   </style>
   <div class="sp-board">
-    <div class="sp-card sp-chart">
+    <div class="sp-charts" id="sp-charts">
       <div class="sp-status" id="sp-status">Loading&#8230;</div>
-      <svg id="sp-svg" viewBox="0 0 640 620" style="display:none"></svg>
-      <div class="sp-tip" id="sp-tip"></div>
+      <div class="sp-main" id="sp-main"></div>
     </div>
     <div class="sp-side">
-      <div><p class="sp-gl">Metric</p><div class="sp-seg" id="sp-groups"></div><div class="sp-items" id="sp-items"></div></div>
+      <div><p class="sp-gl">Grouping</p><div class="sp-items" id="sp-items"></div></div>
+      <label class="sp-standing-wrap" id="sp-standing-toggle" style="display:none">
+        <input type="checkbox" id="sp-inc-standing"> Include standing charge in net cost
+      </label>
       <div><p class="sp-gl">Winding</p><div class="sp-seg" id="sp-mode">
         <button data-mode="lifetime" class="on">Lifetime</button><button data-mode="year">Year&#8209;aligned</button>
       </div><div class="sp-hint" id="sp-hint"></div></div>
@@ -397,31 +420,63 @@
 <script>
 window.EMTSpiral=(function(){
   var ENDPOINT="api/charts/blocks-summary";
-  var ROWS=[],YEARS=[],GROUPS={},DEVICE_IDS=[],LABELS={},inited=false,mounted=false;
-  var state={group:"cost",item:"cost_total",mode:"lifetime",hidden:new Set()};
+  var ROWS=[],YEARS=[],DEVICE_IDS=[],LABELS={},inited=false;
+  var HAS_CARBON=false,HAS_EXPORT=false;
+  // One shared grouping (Net / Import / Export / device) + winding + years drives
+  // all spirals at once, so Cost / Usage / Carbon are read side by side.
+  var state={grouping:"net",mode:"lifetime",hidden:new Set(),incStanding:false};
   var YC=["#00d4aa","#7c6af7","#f9a825","#38bdf8","#ef4444","#fb7185"];
-  var NS="http://www.w3.org/2000/svg",CX=320,CY=300,R_IN=54,R_OUT=250,A0=-Math.PI/2;
-  var SVG,TIP,hoverDot=null;
+  var NS="http://www.w3.org/2000/svg",VBW=440,VBH=448,CX=220,CY=212,R_IN=34,R_OUT=184,A0=-Math.PI/2;
+  var CARDS={};   // kind -> {svg, tip}
+  var MODAL=null; // expand overlay: {backdrop, title, card:{svg,tip}, spec}
 
-  function buildGroupsFrom(meters,rows){
+  function buildMetaFrom(meters,rows){
     LABELS={};(meters||[]).forEach(function(m){var id=m.meter_id||m.id;if(id)LABELS[id]=m.label||id;});
     var seen=new Set();rows.forEach(function(r){Object.keys(r.meters||{}).forEach(function(k){if(k!=="electricity_main")seen.add(k);});});
     DEVICE_IDS=Array.from(seen);
-    var dev=DEVICE_IDS.map(function(id){return{key:id,name:LABELS[id]||id,kind:"device"};});
-    GROUPS={
-      cost:{label:"Cost",unit:"\u00a3",items:[{key:"cost_total",name:"Total cost",kind:"net"},{key:"cost_import",name:"Import",kind:"+"},{key:"cost_export",name:"Export credit",kind:"\u2212"},{key:"cost_stand",name:"Standing charge",kind:"+"},{key:"cost_direct",name:"Direct import",kind:"of import"}].concat(dev)},
-      usage:{label:"Usage",unit:"kWh",items:[{key:"import",name:"Import",kind:"total"},{key:"export",name:"Export",kind:""},{key:"direct",name:"Direct import",kind:"of import"}].concat(dev)},
-      carbon:{label:"Carbon",unit:"kg",items:[{key:"carb_total",name:"Net carbon",kind:"net"},{key:"carb_import",name:"Import",kind:"+"},{key:"carb_offset",name:"Offset",kind:"\u2212"}].concat(dev)},
-    };
+    HAS_EXPORT=rows.some(function(r){return (r.exp_kwh||0)>0||(r.exp_cost||0)>0;});
   }
-  function incFor(row,g,it){
-    var M=row.meters||{},main=M.electricity_main||{},dev=M[it]||{};
-    if(g==="usage"){if(it==="import")return row.imp_kwh||0;if(it==="export")return row.exp_kwh||0;if(it==="direct")return main.imp_kwh||0;return dev.imp_kwh||0;}
-    if(g==="cost"){if(it==="cost_total")return row.net_cost||0;if(it==="cost_import")return row.imp_cost||0;if(it==="cost_export")return row.exp_cost||0;if(it==="cost_stand")return row.standing||0;if(it==="cost_direct")return main.imp_cost||0;return dev.imp_cost||0;}
-    if(it==="carb_total")return (row.carbon_g_net||0)/1000;if(it==="carb_import")return (main.carbon_g_imp||0)/1000;if(it==="carb_offset")return (main.carbon_g_exp||0)/1000;return (dev.carbon_g||0)/1000;
+  // Grouping options shared by every spiral: Net, Import, Export (if any), devices.
+  function groupingOptions(){
+    var o=[{key:"net",name:"Net",kind:"import \u2212 export"},{key:"import",name:"Import",kind:"+"}];
+    if(HAS_EXPORT)o.push({key:"export",name:"Export",kind:"\u2212"});
+    DEVICE_IDS.forEach(function(id){o.push({key:id,name:LABELS[id]||id,kind:"device"});});
+    return o;
   }
-  function curUnit(){return GROUPS[state.group].unit;}
-  function curItem(){return GROUPS[state.group].items.find(function(i){return i.key===state.item;})||GROUPS[state.group].items[0];}
+  function isDevice(g){return DEVICE_IDS.indexOf(g)>=0;}
+  // Per-row increment for a given spiral (kind) under the shared grouping. Net is
+  // consistent across all three: import \u2212 export (usage kWh, cost \u00a3, carbon kg),
+  // so the three spirals compare like-for-like. Standing ignores grouping.
+  function incValue(row,kind){
+    var M=row.meters||{},main=M.electricity_main||{},g=state.grouping,dev=M[g]||{};
+    if(kind==="standing")return row.standing||0;
+    if(kind==="cost"){
+      if(isDevice(g))return dev.imp_cost||0;
+      if(g==="net")return (row.net_cost||0)-(state.incStanding?0:(row.standing||0));
+      if(g==="import")return row.imp_cost||0;
+      if(g==="export")return row.exp_cost||0;
+      return 0;
+    }
+    if(kind==="usage"){
+      if(isDevice(g))return dev.imp_kwh||0;
+      if(g==="net")return (row.imp_kwh||0)-(row.exp_kwh||0);
+      if(g==="import")return row.imp_kwh||0;
+      if(g==="export")return row.exp_kwh||0;
+      return 0;
+    }
+    // carbon (kg)
+    if(isDevice(g))return (dev.carbon_g||0)/1000;
+    if(g==="net")return ((main.carbon_g_imp||0)-(main.carbon_g_exp||0))/1000;
+    if(g==="import")return (main.carbon_g_imp||0)/1000;
+    if(g==="export")return (main.carbon_g_exp||0)/1000;
+    return 0;
+  }
+  // Active main spirals (carbon only when carbon data exists); standing is separate.
+  function mainSpirals(){
+    var s=[{kind:"cost",unit:"\u00a3",title:"Cost"},{kind:"usage",unit:"kWh",title:"Usage"}];
+    if(HAS_CARBON)s.push({kind:"carbon",unit:"kg",title:"Carbon"});
+    return s;
+  }
   function fmtS(v){var a=Math.abs(v);if(a>=1000){var t=(v/1000).toFixed(a>=10000?0:1);return (t.indexOf(".")<0?t:t.replace(/\.?0+$/,""))+"k";}if(a>=100)return v.toFixed(0);return v.toFixed(a>=10?0:1);}
   // Auto-scale a base unit up its ladder once a magnitude crosses 1000:
   // kWh -> MWh -> GWh, kg(CO2) -> t -> kt. Other units (e.g. £) unchanged.
@@ -451,16 +506,17 @@ window.EMTSpiral=(function(){
     return nf*Math.pow(10,exp);
   }
 
-  function computeSeries(){
+  // Cumulative series for one spiral (kind), under the shared grouping/mode.
+  function computeSeries(kind){
     var life=0,perYear={};YEARS.forEach(function(y){perYear[y]=0;});
     var pts=[];
-    ROWS.forEach(function(r){var inc=incFor(r,state.group,state.item);life+=inc;perYear[r.year]+=inc;pts.push({r:r,inc:inc,life:life,yearCum:perYear[r.year],frac:dayFrac(r)});});
+    ROWS.forEach(function(r){var inc=incValue(r,kind);life+=inc;perYear[r.year]+=inc;pts.push({r:r,inc:inc,life:life,yearCum:perYear[r.year],frac:dayFrac(r)});});
     var yearTotals={};YEARS.forEach(function(y){yearTotals[y]=perYear[y];});
     // Radial scale spans the cumulative range and always includes 0, so net
     // metrics that go negative map inward toward the centre instead of producing
     // a negative radius (which would flip the point 180deg to the wrong month).
     var vals=pts.map(function(p){return state.mode==="lifetime"?p.life:p.yearCum;});
-    var lo=Math.min.apply(null,vals),hi=Math.max.apply(null,vals);
+    var lo=vals.length?Math.min.apply(null,vals):0,hi=vals.length?Math.max.apply(null,vals):1;
     lo=Math.min(lo,0);hi=Math.max(hi,0);if(hi-lo<1e-9)hi=lo+1;
     // Snap the scale to nice round bounds so the ring labels read cleanly and the
     // outer ring is a round ceiling the cumulative spiral climbs toward.
@@ -474,18 +530,21 @@ window.EMTSpiral=(function(){
     });
     return {pts:pts,yearTotals:yearTotals,lo:lo,hi:hi,step:step};
   }
-  function render(){
-    var unit=curUnit(),item=curItem(),cs=computeSeries(),sc=scaleUnit(unit,cs.hi);
+  // Draw one spiral into its card's SVG. Small enough to sit alongside the others.
+  // cardOverride lets the expand modal render the same spiral into a larger SVG.
+  function renderSpiral(spec,cardOverride){
+    var card=cardOverride||CARDS[spec.kind];if(!card)return;
+    var SVG=card.svg,unit=spec.unit,cs=computeSeries(spec.kind),sc=scaleUnit(unit,Math.max(Math.abs(cs.hi),Math.abs(cs.lo)));
     SVG.textContent="";
     var grid=el("g",{});
     var nring=Math.max(1,Math.round((cs.hi-cs.lo)/cs.step));
     for(var i=1;i<=nring;i++){var rr=R_IN+(R_OUT-R_IN)*i/nring;
       grid.appendChild(el("circle",{cx:CX,cy:CY,r:rr,fill:"none","stroke-width":1,opacity:.5,style:"stroke:var(--muted)"}));
-      var lab=el("text",{x:CX+6,y:CY-rr+15,class:"sp-rl"});lab.textContent=lblV(cs.lo+cs.step*i,unit,sc);grid.appendChild(lab);}
+      var lab=el("text",{x:CX+6,y:CY-rr+13,class:"sp-rl"});lab.textContent=lblV(cs.lo+cs.step*i,unit,sc);grid.appendChild(lab);}
     var MO=["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
     for(var m=0;m<12;m++){var a=A0+(m/12)*2*Math.PI;
-      grid.appendChild(el("line",{x1:CX+(R_IN-6)*Math.cos(a),y1:CY+(R_IN-6)*Math.sin(a),x2:CX+(R_OUT+10)*Math.cos(a),y2:CY+(R_OUT+10)*Math.sin(a),"stroke-width":1,opacity:.3,style:"stroke:var(--muted)"}));
-      var t=el("text",{x:CX+(R_OUT+28)*Math.cos(a),y:CY+(R_OUT+28)*Math.sin(a),"text-anchor":"middle","dominant-baseline":"middle",class:"sp-mo"});t.textContent=MO[m];grid.appendChild(t);}
+      grid.appendChild(el("line",{x1:CX+(R_IN-6)*Math.cos(a),y1:CY+(R_IN-6)*Math.sin(a),x2:CX+(R_OUT+8)*Math.cos(a),y2:CY+(R_OUT+8)*Math.sin(a),"stroke-width":1,opacity:.3,style:"stroke:var(--muted)"}));
+      var t=el("text",{x:CX+(R_OUT+24)*Math.cos(a),y:CY+(R_OUT+24)*Math.sin(a),"text-anchor":"middle","dominant-baseline":"middle",class:"sp-mo"});t.textContent=MO[m];grid.appendChild(t);}
     SVG.appendChild(grid);
     var visible=[];
     YEARS.forEach(function(y,yi){
@@ -494,69 +553,115 @@ window.EMTSpiral=(function(){
       var d="M "+seg[0].x.toFixed(2)+" "+seg[0].y.toFixed(2);
       for(var i=1;i<seg.length;i++)d+=" L "+seg[i].x.toFixed(2)+" "+seg[i].y.toFixed(2);
       var c=YC[yi%YC.length];
-      SVG.appendChild(el("path",{d:d,fill:"none",stroke:c,"stroke-width":3,"stroke-linecap":"round","stroke-linejoin":"round",opacity:.95,style:"filter:drop-shadow(0 0 3px "+c+"55)"}));
-      var L=seg[seg.length-1];SVG.appendChild(el("circle",{cx:L.x,cy:L.y,r:3.4,fill:c}));
+      SVG.appendChild(el("path",{d:d,fill:"none",stroke:c,"stroke-width":2.6,"stroke-linecap":"round","stroke-linejoin":"round",opacity:.95,style:"filter:drop-shadow(0 0 3px "+c+"55)"}));
+      var L=seg[seg.length-1];SVG.appendChild(el("circle",{cx:L.x,cy:L.y,r:3.2,fill:c}));
       seg.forEach(function(p){visible.push(p);});
     });
     var latest=cs.pts[cs.pts.length-1];
-    var cv=state.mode==="lifetime"?latest.life:cs.yearTotals[YEARS[YEARS.length-1]];
+    var cv=!latest?0:(state.mode==="lifetime"?latest.life:cs.yearTotals[YEARS[YEARS.length-1]]);
     var cg=el("g",{});
-    var q1=el("text",{x:CX,y:CY-20,"text-anchor":"middle",class:"sp-cm"});q1.textContent=item.name;
+    var q1=el("text",{x:CX,y:CY-18,"text-anchor":"middle",class:"sp-cm"});q1.textContent=spec.title;
     var q2=el("text",{x:CX,y:CY+10,"text-anchor":"middle",class:"sp-cv"});q2.textContent=lblV(cv,unit,sc);
-    var q3=el("text",{x:CX,y:CY+30,"text-anchor":"middle",class:"sp-cu"});q3.textContent=(state.mode==="lifetime"?"total to date":"latest year")+(unit==="\u00a3"?"":" \u00b7 "+sc.u);
+    var q3=el("text",{x:CX,y:CY+28,"text-anchor":"middle",class:"sp-cu"});q3.textContent=(state.mode==="lifetime"?"total to date":"latest year")+(unit==="\u00a3"?"":" \u00b7 "+sc.u);
     cg.appendChild(q1);cg.appendChild(q2);cg.appendChild(q3);SVG.appendChild(cg);
-    attachHover(visible,unit);buildYears(cs.yearTotals,unit,sc);
+    attachHover(card,visible,unit);
   }
-  function attachHover(points,unit){
-    hoverDot=el("circle",{r:5,opacity:0,"pointer-events":"none",style:"fill:var(--text)"});SVG.appendChild(hoverDot);
+  function attachHover(card,points,unit){
+    var SVG=card.svg,TIP=card.tip;
+    var hoverDot=el("circle",{r:4.5,opacity:0,"pointer-events":"none",style:"fill:var(--text)"});SVG.appendChild(hoverDot);
     SVG.onpointermove=function(ev){
-      var r=SVG.getBoundingClientRect(),pt={x:(ev.clientX-r.left)/r.width*640,y:(ev.clientY-r.top)/r.height*620};
+      var r=SVG.getBoundingClientRect(),pt={x:(ev.clientX-r.left)/r.width*VBW,y:(ev.clientY-r.top)/r.height*VBH};
       var best=null,bd=1e9;points.forEach(function(p){var dx=p.x-pt.x,dy=p.y-pt.y,dd=dx*dx+dy*dy;if(dd<bd){bd=dd;best=p;}});
-      if(!best||bd>26*26){hideTip();return;}
+      if(!best||bd>26*26){TIP.style.opacity=0;hoverDot.setAttribute("opacity",0);return;}
       hoverDot.setAttribute("cx",best.x);hoverDot.setAttribute("cy",best.y);hoverDot.setAttribute("opacity",1);hoverDot.setAttribute("fill",YC[YEARS.indexOf(best.r.year)%YC.length]);
-      var card=SVG.parentElement.getBoundingClientRect();var sx=r.left+(best.x/640)*r.width,sy=r.top+(best.y/620)*r.height;
+      var cardR=SVG.parentElement.getBoundingClientRect();var sx=r.left+(best.x/VBW)*r.width,sy=r.top+(best.y/VBH)*r.height;
       var dstr=new Date(Date.UTC(best.r.year,(best.r.month||1)-1,best.r.day||1)).toLocaleDateString(undefined,{day:"numeric",month:"short",year:"numeric"});
       TIP.innerHTML='<div class="sp-d">'+dstr+'</div><div class="sp-b">'+fmt(best.val,unit)+'</div><div class="sp-i">that day: '+fmt(best.inc,unit)+'</div>';
-      TIP.style.left=(sx-card.left)+"px";TIP.style.top=(sy-card.top)+"px";TIP.style.opacity=1;
+      TIP.style.left=(sx-cardR.left)+"px";TIP.style.top=(sy-cardR.top)+"px";TIP.style.opacity=1;
+      hoverDot.setAttribute("data-x",0);
     };
-    SVG.onpointerleave=hideTip;
+    SVG.onpointerleave=function(){TIP.style.opacity=0;hoverDot.setAttribute("opacity",0);};
   }
-  function hideTip(){TIP.style.opacity=0;if(hoverDot)hoverDot.setAttribute("opacity",0);}
-  function buildGroups(){var h=document.getElementById("sp-groups");h.textContent="";
-    Object.keys(GROUPS).forEach(function(g){var b=document.createElement("button");b.textContent=GROUPS[g].label;if(g===state.group)b.className="on";
-      b.onclick=function(){state.group=g;state.item=GROUPS[g].items[0].key;buildGroups();buildItems();render();};h.appendChild(b);});}
+  // Build a spiral card (title + svg + tooltip + expand button) and register it.
+  function makeCard(container,spec){
+    var card=document.createElement("div");card.className="sp-card sp-chart";
+    var title=document.createElement("p");title.className="sp-ctitle";title.textContent=spec.title;
+    var svg=document.createElementNS(NS,"svg");svg.setAttribute("viewBox","0 0 "+VBW+" "+VBH);svg.setAttribute("class","sp-svg");
+    var tip=document.createElement("div");tip.className="sp-tip";
+    var exp=document.createElement("button");exp.className="sp-expand";exp.title="Expand";
+    exp.innerHTML='<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3H5a2 2 0 0 0-2 2v4M15 3h4a2 2 0 0 1 2 2v4M9 21H5a2 2 0 0 1-2-2v-4M15 21h4a2 2 0 0 0 2-2v-4"/></svg>';
+    exp.onclick=function(ev){ev.stopPropagation();openExpand(spec);};
+    card.appendChild(title);card.appendChild(exp);card.appendChild(svg);card.appendChild(tip);container.appendChild(card);
+    CARDS[spec.kind]={svg:svg,tip:tip};
+  }
+  var SPECS={};   // kind -> spec, so the modal can re-render on state changes
+  function renderAll(){
+    mainSpirals().concat([{kind:"standing",unit:"\u00a3",title:"Standing charges"}]).forEach(function(spec){
+      SPECS[spec.kind]=spec; renderSpiral(spec);
+    });
+    if(MODAL&&MODAL.spec&&MODAL.backdrop.classList.contains("on")) renderSpiral(MODAL.spec,MODAL.card);
+  }
+  function openExpand(spec){
+    if(!MODAL)return;
+    MODAL.spec=spec; MODAL.title.textContent=spec.title;
+    MODAL.backdrop.classList.add("on"); renderSpiral(spec,MODAL.card);
+  }
+  function closeExpand(){ if(MODAL){MODAL.backdrop.classList.remove("on");MODAL.spec=null;} }
+  function buildModal(){
+    var bd=document.createElement("div");bd.className="sp-backdrop";
+    var md=document.createElement("div");md.className="sp-modal";
+    var mclose=document.createElement("button");mclose.className="sp-mclose";mclose.textContent="\u2715";mclose.title="Close";
+    var mtitle=document.createElement("p");mtitle.className="sp-ctitle";
+    var msvg=document.createElementNS(NS,"svg");msvg.setAttribute("viewBox","0 0 "+VBW+" "+VBH);msvg.setAttribute("class","sp-svg");
+    var mtip=document.createElement("div");mtip.className="sp-tip";
+    md.appendChild(mclose);md.appendChild(mtitle);md.appendChild(msvg);md.appendChild(mtip);bd.appendChild(md);
+    document.getElementById("chart-spiral").appendChild(bd);
+    MODAL={backdrop:bd,title:mtitle,card:{svg:msvg,tip:mtip},spec:null};
+    mclose.onclick=closeExpand;
+    bd.onclick=function(e){if(e.target===bd)closeExpand();};
+    document.addEventListener("keydown",function(e){if(e.key==="Escape")closeExpand();});
+  }
+  // Grouping list (shared across spirals). Selecting one re-renders everything.
   function buildItems(){var h=document.getElementById("sp-items");h.textContent="";
-    GROUPS[state.group].items.forEach(function(it,i){var row=document.createElement("div");row.className="sp-metric"+(it.key===state.item?" on":"")+(i===0?" hd":"");
+    groupingOptions().forEach(function(it,i){var row=document.createElement("div");row.className="sp-metric"+(it.key===state.grouping?" on":"")+(i===0?" hd":"");
       row.innerHTML='<span class="sp-nm"></span><span class="sp-kd"></span>';row.children[0].textContent=it.name;row.children[1].textContent=it.kind||"";
-      row.onclick=function(){state.item=it.key;buildItems();render();};h.appendChild(row);});}
-  function buildYears(totals,unit,sc){var h=document.getElementById("sp-years");h.textContent="";
+      row.onclick=function(){state.grouping=it.key;buildItems();syncStandingToggle();renderAll();};h.appendChild(row);});}
+  // The "include standing charge in net cost" toggle only bites on grouping=net.
+  function syncStandingToggle(){var w=document.getElementById("sp-standing-toggle");if(w)w.style.display=(state.grouping==="net")?"flex":"none";}
+  function buildYears(){var h=document.getElementById("sp-years");h.textContent="";
     YEARS.forEach(function(y,i){var row=document.createElement("div");row.className="sp-yr"+(state.hidden.has(y)?" off":"");var partial=(y===YEARS[YEARS.length-1]);
-      row.innerHTML='<span class="sp-sw"></span><span class="sp-yl"></span><span class="sp-yt"></span>';
-      row.children[0].style.background=YC[i%YC.length];row.children[1].textContent=y+(partial?" \u00b7":"");row.children[2].textContent=lblU(totals[y],unit,sc);
-      row.onclick=function(){state.hidden.has(y)?state.hidden.delete(y):state.hidden.add(y);render();};h.appendChild(row);});}
+      row.innerHTML='<span class="sp-sw"></span><span class="sp-yl"></span>';
+      row.children[0].style.background=YC[i%YC.length];row.children[1].textContent=y+(partial?" \u00b7":"");
+      row.onclick=function(){state.hidden.has(y)?state.hidden.delete(y):state.hidden.add(y);buildYears();renderAll();};h.appendChild(row);});}
   function wireMode(){
     Array.prototype.forEach.call(document.querySelectorAll("#sp-mode button"),function(b){b.onclick=function(){
       Array.prototype.forEach.call(document.querySelectorAll("#sp-mode button"),function(x){x.classList.remove("on");});b.classList.add("on");state.mode=b.dataset.mode;
       document.getElementById("sp-hint").textContent=state.mode==="lifetime"?"Radius = running total. One continuous coil; a fatter gap between loops = a heavier year.":"Every year starts from the centre on the same scale, so loops overlay \u2014 an outer loop at any angle used more by that date. Where loops cross, one year overtook another.";
-      render();
+      renderAll();
     };});
   }
-  function fail(msg){var s=document.getElementById("sp-status");if(s){s.style.display="block";s.textContent=msg;}if(SVG)SVG.style.display="none";}
+  function wireStanding(){var cb=document.getElementById("sp-inc-standing");if(cb)cb.onchange=function(){state.incStanding=cb.checked;renderAll();};}
+  function fail(msg){var s=document.getElementById("sp-status");if(s){s.style.display="block";s.textContent=msg;}}
 
   async function init(){
     if(inited)return; inited=true;
-    SVG=document.getElementById("sp-svg");TIP=document.getElementById("sp-tip");
     try{
       var res=await fetch(ENDPOINT,{headers:{Accept:"application/json"}});
       if(!res.ok)throw new Error("HTTP "+res.status);
       var j=await res.json();
-      if(!j.rows||!j.rows.length){fail("No data yet \u2014 the spiral fills in once blocks are recorded.");inited=false;return;}
+      if(!j.rows||!j.rows.length){fail("No data yet \u2014 the spirals fill in once blocks are recorded.");inited=false;return;}
       ROWS=j.rows.slice().sort(function(a,b){return (a.year-b.year)||(a.month-b.month)||(a.day-b.day);});
       YEARS=Array.from(new Set(ROWS.map(function(r){return r.year;}))).sort();
-      buildGroupsFrom(j.meters||[],ROWS);
-      document.getElementById("sp-status").style.display="none";SVG.style.display="block";
+      buildMetaFrom(j.meters||[],ROWS);
+      HAS_CARBON=!!j.has_postcode||ROWS.some(function(r){return r.carbon_g_net!=null;});
+      // Build equal-size spiral cards: Cost / Usage / (Carbon) / Standing charges.
+      var mainEl=document.getElementById("sp-main");mainEl.textContent="";
+      mainSpirals().forEach(function(spec){makeCard(mainEl,spec);});
+      makeCard(mainEl,{kind:"standing",unit:"\u00a3",title:"Standing charges"});
+      if(!MODAL)buildModal();
+      document.getElementById("sp-status").style.display="none";
       document.getElementById("sp-hint").textContent="Radius = running total. One continuous coil; a fatter gap between loops = a heavier year.";
-      buildGroups();buildItems();wireMode();render();
+      buildItems();syncStandingToggle();buildYears();wireMode();wireStanding();renderAll();
     }catch(e){inited=false;fail("Couldn't load chart data \u2014 "+(e&&e.message?e.message:e));}
   }
   return { init: init };
@@ -570,6 +675,7 @@ window.EMTSpiral=(function(){
   <div class="bar-toolbar" style="flex-shrink:0;">
     <div class="bar-toolbar-left">
       <div class="bar-seg" id="bar-period-seg">
+        <button class="bar-seg-btn"        onclick="barSetPeriod('hh',this)" title="Half-hourly breakdown of a single day">HH</button>
         <button class="bar-seg-btn active" onclick="barSetPeriod('daily',this)">Daily</button>
         <button class="bar-seg-btn"        onclick="barSetPeriod('monthly',this)">Monthly</button>
         <button class="bar-seg-btn"        onclick="barSetPeriod('yearly',this)">Yearly</button>
@@ -1373,40 +1479,29 @@ function _doPdfExport(win, iconSrc) {
   } else if (_activeChart === 'spiral') {
     // Spiral is an inline SVG using CSS-var colours; inject a light-theme
     // stylesheet so it renders on white in the PDF (issue #250).
-    var spSvg = document.getElementById('sp-svg');
-    var svgHtml = '<p style="color:#888;">Spiral chart not available.</p>';
-    if (spSvg) {
-      var sclone = spSvg.cloneNode(true);
-      sclone.setAttribute('style', 'display:block;width:100%;max-width:560px;height:auto;');
-      svgHtml = sclone.outerHTML;
-    }
-    // Year totals (the SVG centre already shows the selected metric + running total)
-    var yearsEl = document.getElementById('sp-years');
-    var yearsHtml = '';
-    if (yearsEl && yearsEl.querySelectorAll('.sp-yr').length) {
-      yearsHtml = '<h3 class="sp-h">Years</h3><table class="sp-yt-tbl">';
-      Array.prototype.forEach.call(yearsEl.querySelectorAll('.sp-yr'), function(row) {
-        var yl = row.querySelector('.sp-yl'), yt = row.querySelector('.sp-yt'),
-            sw = row.querySelector('.sp-sw');
-        var col = sw ? getComputedStyle(sw).backgroundColor : '#00a080';
-        var off = row.classList.contains('off');
-        yearsHtml += '<tr style="' + (off ? 'opacity:.4;' : '') + '">' +
-          '<td><span style="display:inline-block;width:14px;height:3px;border-radius:2px;background:' +
-            col + ';vertical-align:middle;"></span></td>' +
-          '<td style="padding:0 14px 0 6px;">' + (yl ? yl.textContent : '') + '</td>' +
-          '<td style="text-align:right;">' + (yt ? yt.textContent : '') + '</td></tr>';
-      });
-      yearsHtml += '</table>';
-    }
+    // Capture every spiral card (Cost / Usage / Carbon / Standing) with its title.
+    var spCards = document.querySelectorAll('#chart-spiral .sp-chart');
+    var cardsHtml = '';
+    Array.prototype.forEach.call(spCards, function(card) {
+      var svg = card.querySelector('svg.sp-svg');
+      if (!svg) return;
+      var titleEl = card.querySelector('.sp-ctitle');
+      var title = titleEl ? titleEl.textContent : '';
+      var sclone = svg.cloneNode(true);
+      sclone.setAttribute('style', 'display:block;width:100%;max-width:300px;height:auto;');
+      cardsHtml += '<div class="pdf-sp-card">' +
+        (title ? '<div class="sp-h">' + title + '</div>' : '') + sclone.outerHTML + '</div>';
+    });
+    var svgHtml = cardsHtml || '<p style="color:#888;">Spiral chart not available.</p>';
     var spiralStyles =
       ':root{--text:#1a1a1a;--muted:#8a8f98;--accent:#00a080;--mono:ui-monospace,monospace;}' +
       '.sp-mo{font-family:var(--mono);font-size:15px;letter-spacing:.06em;fill:var(--text);opacity:.72;font-weight:600;}' +
       '.sp-rl{font-family:var(--mono);font-size:15px;fill:var(--text);opacity:.6;font-weight:500;}' +
       '.sp-cm{font-family:var(--mono);font-size:11px;fill:var(--muted);letter-spacing:.08em;}' +
       '.sp-cv{font-size:29px;font-weight:650;fill:var(--text);} .sp-cu{font-size:12px;fill:var(--muted);}' +
-      '#pdf-sp{display:flex;gap:28px;align-items:flex-start;flex-wrap:wrap;}' +
-      '.sp-h{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#888;margin:0 0 8px;}' +
-      '.sp-yt-tbl{font-family:var(--mono);font-size:12px;border-collapse:collapse;} .sp-yt-tbl td{padding:2px 0;}';
+      '#pdf-sp{display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap;justify-content:center;}' +
+      '.pdf-sp-card{flex:0 0 auto;break-inside:avoid;text-align:center;}' +
+      '.sp-h{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#888;margin:0 0 8px;}';
     win.document.open();
     win.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8">' +
       '<title>EMT \u2014 ' + tabLabel + '</title>' +
@@ -1414,8 +1509,7 @@ function _doPdfExport(win, iconSrc) {
       // Replacing (not adding) avoids Chrome honouring the first @page it sees.
       '<style>' + commonStyles.replace('size:A4 landscape', 'size:A4 portrait') + spiralStyles + '</style></head><body>' +
       header +
-      '<div id="pdf-sp"><div style="flex:1 1 520px;min-width:320px;">' + svgHtml + '</div>' +
-      '<div style="flex:0 0 auto;">' + yearsHtml + '</div></div>' +
+      '<div id="pdf-sp">' + svgHtml + '</div>' +
       '</body></html>');
     win.document.close();
   }
@@ -1432,6 +1526,13 @@ var barMonthOrder = 'date';  // monthly bar ordering: 'date' (chronological) or 
 var barCalendar = false;   // false = billing periods, true = calendar periods
 var barBillingDay = 1;
 var barDailyMonth = null;  // now a bKey string e.g. "2026-04-15"
+function barTodayStr() {
+  var n = new Date();
+  return n.getFullYear() + '-' + String(n.getMonth()+1).padStart(2,'0') + '-' + String(n.getDate()).padStart(2,'0');
+}
+var barHHDate = barTodayStr();   // HH view: local day being viewed (YYYY-MM-DD), default today
+var barHHRows = null;            // cached 48-slot rows for barHHDataDate
+var barHHDataDate = null;        // date barHHRows currently holds
 var barActiveYears = null;
 var barChartInstance = null;
 var barInited = false;
@@ -1457,6 +1558,7 @@ function barSaveState() {
       view:     barView,
       order:    barMonthOrder,
       calendar: barCalendar,
+      hhDate:   barHHDate,
       bKey:     typeof barDailyMonth === 'string' ? barDailyMonth : (barDailyMonth ? (barDailyMonth.year + '-' + String(barDailyMonth.month).padStart(2,'0') + '-01') : null),
       years:    barActiveYears ? [...barActiveYears] : [],
       standing: cb ? cb.checked : false,
@@ -1469,11 +1571,15 @@ function barLoadState(availableYears) {
     var raw = localStorage.getItem(EMT.lsKey('emt_bar_state'));
     if (!raw) return;
     var st = JSON.parse(raw);
-    if (['daily','monthly','yearly'].indexOf(st.period) !== -1) barPeriod = st.period;
+    if (['daily','monthly','yearly','hh'].indexOf(st.period) !== -1) barPeriod = st.period;
     if (['kwh','cost','co2'].indexOf(st.metric) !== -1)       barMetric = st.metric;
     if (['totals','net'].indexOf(st.view) !== -1)              barView   = st.view;
     if (['date','month'].indexOf(st.order) !== -1)             barMonthOrder = st.order;
     if (typeof st.calendar === 'boolean')                      barCalendar = st.calendar;
+    // HH day: restore, but never a future day (default today).
+    if (typeof st.hhDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(st.hhDate)) {
+      barHHDate = st.hhDate > barTodayStr() ? barTodayStr() : st.hhDate;
+    }
     // Restore billing period selection (bKey e.g. "2026-04-15")
     if (st.bKey) {
       var hasData = barData.some(function(r){ return barBillingKey(r).bKey === st.bKey; });
@@ -1542,11 +1648,14 @@ async function barInit() {
 
 function barSyncUI() {
   // Sync period/metric/view segment buttons to current state vars
-  ['daily','monthly','yearly'].forEach(function(v) {
+  ['hh','daily','monthly','yearly'].forEach(function(v) {
     document.querySelectorAll('#bar-period-seg .bar-seg-btn').forEach(function(b){
       if (b.textContent.toLowerCase() === v) b.classList.toggle('active', barPeriod === v);
     });
   });
+  // Billing/Calendar toggle is meaningless for the HH (single-day) view — hide it.
+  var calSeg = document.getElementById('bar-cal-seg');
+  if (calSeg) calSeg.style.display = (barPeriod === 'hh') ? 'none' : '';
   document.querySelectorAll('#bar-cal-seg .bar-seg-btn').forEach(function(b){
     var isCal = b.getAttribute('onclick') && b.getAttribute('onclick').indexOf('true') !== -1;
     b.classList.toggle('active', isCal === barCalendar);
@@ -1746,6 +1855,16 @@ function barBillingKey(r) {
 }
 
 function barGetDataForPeriod() {
+  if (barPeriod === 'hh') {
+    // 48 (or n) half-hour slots for one local day. Rows come pre-aggregated from
+    // /api/charts/blocks-day in exactly the barAggRows shape, so no re-aggregation.
+    var rows = barHHRows || [];
+    return {
+      labels:  rows.map(function(r){ return r.label; }),
+      aggList: rows,
+      isHH:    true
+    };
+  }
   if (barPeriod === 'daily') {
     var filtered;
     if (barCalendar) {
@@ -1894,6 +2013,16 @@ function barYLabel(v) {
 
 function barRender() {
   if (!barData) return;
+  // HH (single-day) view: Billing/Calendar toggle is irrelevant — hide it. If the
+  // cached day doesn't match the selected day, fetch it first (async), then this
+  // function is re-entered with data ready.
+  var _calSeg = document.getElementById('bar-cal-seg');
+  if (barPeriod === 'hh') {
+    if (_calSeg) _calSeg.style.display = 'none';
+    if (barHHDataDate !== barHHDate) { barLoadHH(); return; }
+  } else if (_calSeg) {
+    _calSeg.style.display = '';
+  }
   // Order toggle (Date/Month) is only meaningful for the monthly view
   var _orderSeg = document.getElementById('bar-order-seg');
   if (_orderSeg) _orderSeg.style.display = (barPeriod === 'monthly') ? 'inline-flex' : 'none';
@@ -2111,6 +2240,72 @@ function barStepDaily(delta) {
     }
   }
 }
+// ── HH (half-hour) single-day view ──────────────────────────────────────────
+// Short date label for the day rolodex, e.g. "Sun, 2 Aug 2026".
+function barHHLabel(ds) {
+  try { return new Date(ds + 'T00:00:00').toLocaleDateString(undefined,
+    { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' }); }
+  catch(e) { return ds; }
+}
+// Day list for the shared rolodex: every day from the earliest data day (or the
+// selected day, whichever is older) up to today, newest at the top — mirroring
+// barGetPeriods so PeriodSpinner behaves identically to the other periods.
+function barHHGetPeriods() {
+  var today = barTodayStr(), earliest = today;
+  if (barData && barData.length) {
+    earliest = barData.reduce(function(a, r) {
+      var s = r.year + '-' + String(r.month).padStart(2,'0') + '-' + String(r.day).padStart(2,'0');
+      return s < a ? s : a;
+    }, today);
+  }
+  if (barHHDate < earliest) earliest = barHHDate;
+  var list = [], curIdx = -1;
+  var d = new Date(earliest + 'T00:00:00'), end = new Date(today + 'T00:00:00');
+  while (d <= end) {
+    var ds = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+    if (ds === barHHDate) curIdx = list.length;
+    list.push({ label: barHHLabel(ds), value: ds });
+    d.setDate(d.getDate() + 1);
+  }
+  if (curIdx < 0) curIdx = list.length - 1;
+  list.reverse(); curIdx = list.length - 1 - curIdx;   // newest first (top of the wheel)
+  return { list: list, curIdx: curIdx };
+}
+function barHHSelect(v) { if (v && v !== barHHDate) { barHHDate = v; barSaveState(); barLoadHH(); } }
+function barMakeHHRolodex(lbl) { PeriodSpinner.attach(lbl, { getPeriods: barHHGetPeriods, onSelect: barHHSelect }); }
+// Step the HH day by ±delta days (clamped so we never view a future day).
+function barStepHH(delta) {
+  if (!delta) return;
+  var d = new Date(barHHDate + 'T00:00:00');
+  d.setDate(d.getDate() + delta);
+  var ns = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+  var today = barTodayStr();
+  if (ns > today) ns = today;
+  if (ns === barHHDate) return;
+  barHHDate = ns; barSaveState(); barLoadHH();
+}
+// Fetch the 48-slot breakdown for barHHDate, then render. Uses the same
+// billing-accurate endpoint the daily/monthly/yearly views roll up from.
+async function barLoadHH() {
+  try {
+    var r = await fetch(apiUrl('/api/charts/blocks-day?date=' + encodeURIComponent(barHHDate)));
+    var j = await r.json();
+    if (j.error) throw new Error(j.error);
+    barHHRows     = j.rows || [];
+    barHHDataDate = barHHDate;
+    if (j.currency) barCurrency = j.currency;
+    if (j.block_minutes) barBlockMinutes = j.block_minutes;
+    var _prevErr = document.getElementById('bar-load-error');
+    if (_prevErr) _prevErr.remove();
+    barRender();
+  } catch(e) {
+    var _errDiv = document.getElementById('bar-load-error') || document.createElement('div');
+    _errDiv.id = 'bar-load-error';
+    _errDiv.style.cssText = 'color:var(--danger);padding:20px;';
+    _errDiv.textContent = 'Failed to load half-hourly data: ' + e.message;
+    document.getElementById('chart-bar').appendChild(_errDiv);
+  }
+}
 // Sorted list of billing-period keys present in the data.
 function barDailyKeys() {
   return [...new Set(barData.map(function(r){ return barBillingKey(r).bKey; }))].sort();
@@ -2196,6 +2391,52 @@ function barMakeRolodex(lbl) {
 function barBuildSubBar() {
   var bar = document.getElementById('bar-sub-bar');
   bar.innerHTML = '';
+  if (barPeriod === 'hh') {
+    // Day navigator using the SAME shared rolodex (PeriodSpinner) as the other
+    // periods — so hover-scroll shows the ±4-day preview and scrolls in the same
+    // direction. Arrows step a day; a calendar button jumps to any date.
+    var today = barTodayStr();
+    var prev = document.createElement('button');
+    prev.className = 'bar-nav-btn'; prev.textContent = '←';
+    prev.title = 'Previous day';
+    prev.onclick = function() { barStepHH(-1); };
+
+    var lbl = document.createElement('span');
+    lbl.className = 'bar-period-label';
+    lbl.textContent = barHHLabel(barHHDate) + (barHHDate === today ? ' · today' : '');
+    barMakeHHRolodex(lbl);
+
+    var next = document.createElement('button');
+    next.className = 'bar-nav-btn'; next.textContent = '→';
+    next.title = 'Next day';
+    next.disabled = (barHHDate >= today);
+    next.onclick = function() { barStepHH(1); };
+
+    // Calendar jump: a small button that opens the native date picker for
+    // arbitrary dates (scrolling day-by-day through months would be tedious).
+    var calWrap = document.createElement('span');
+    calWrap.style.cssText = 'position:relative;display:inline-flex;';
+    var calBtn = document.createElement('button');
+    calBtn.className = 'bar-nav-btn'; calBtn.textContent = '📅';
+    calBtn.title = 'Jump to a date';
+    var calInp = document.createElement('input');
+    calInp.type = 'date'; calInp.value = barHHDate; calInp.max = today;
+    calInp.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;opacity:0;pointer-events:none;';
+    calBtn.onclick = function() {
+      calInp.value = barHHDate;
+      if (calInp.showPicker) { try { calInp.showPicker(); return; } catch(e) {} }
+      calInp.style.pointerEvents = 'auto'; calInp.focus(); calInp.click();
+    };
+    calInp.onchange = function() {
+      if (!calInp.value) return;
+      barHHDate = calInp.value > today ? today : calInp.value;
+      barSaveState(); barLoadHH();
+    };
+    calWrap.appendChild(calBtn); calWrap.appendChild(calInp);
+
+    bar.appendChild(prev); bar.appendChild(lbl); bar.appendChild(next); bar.appendChild(calWrap);
+    return;
+  }
   if (barPeriod === 'daily') {
     if (!barCalendar) {
       // Billing mode: navigate between bKey values (billing period start dates)
@@ -2309,6 +2550,11 @@ function barFmt(v, forCopy) {
 }
 
 function barPeriodLabel(lbl, idx, pd) {
+  if (barPeriod === 'hh') {
+    // Slot label is the half-hour start time (e.g. "14:30"); show it as a range.
+    if (pd && pd.aggList && pd.aggList[idx] && pd.aggList[idx].label) return pd.aggList[idx].label;
+    return lbl;
+  }
   if (barPeriod === 'daily') {
     var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
     // Use rawDates if available (billing mode may span multiple calendar months)

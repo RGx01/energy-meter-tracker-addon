@@ -4,14 +4,13 @@
 <div class="topbar">
   <div>
     <h2>Data Management</h2>
-    <div class="sub">Backups, restore, imports and historical corrections</div>
+    <div class="sub">Bring data in · correct &amp; review · safety &amp; housekeeping</div>
   </div>
   <div style="display:flex;gap:8px;flex-wrap:wrap;">
     <button class="btn btn-secondary" id="btn-backup" onclick="doManualBackup()">💾 Backup Now</button>
-    <a href="{{ url_for('delete_blocks_page') }}" class="btn btn-secondary">🗑️ Delete Blocks</a>
-    <a href="{{ url_for('corrections_page') }}" class="btn btn-secondary">🔧 Corrections</a>
-    <a href="{{ url_for('historical_probe_page') }}" class="btn btn-secondary">📊 Device History <span style="font-size:10px;opacity:0.7;">beta</span></a>
-    <a href="{{ url_for('historical_import_page') }}" class="btn btn-secondary">📥 Historical Import <span style="font-size:10px;opacity:0.7;">beta</span></a>
+    <a href="{{ url_for('fill_history_page') }}" class="btn btn-secondary">📥 Fill History &amp; Gaps</a>
+    <a href="{{ url_for('corrections_page') }}" class="btn btn-secondary">🔧 Cost Corrections</a>
+    <a href="{{ url_for('delete_blocks_page') }}" class="btn btn-secondary" style="color:var(--danger);">🗑️ Delete Blocks</a>
   </div>
 </div>
 {% endblock %}
@@ -94,16 +93,33 @@
   </div>
 </div>
 
-<!-- ── Backups ──────────────────────────────────────────────────────────────── -->
-<div class="card">
-  <div class="card-title">💾 Backups</div>
-  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;line-height:1.7;">
-    A backup zip is created automatically before every config save. Backups are stored in
-    <code id="backup-path-display" style="font-family:var(--mono);font-size:12px;">/share/energy_meter_tracker_backup/backups/</code>
-    and the 20 most recent are kept.
-  </p>
-  <button class="btn btn-secondary" onclick="doManualBackup()" id="btn-backup2" style="margin-bottom:16px;">💾 Create Backup Now</button>
-  <div id="backup-list" style="font-size:13px;color:var(--muted);">Loading...</div>
+<style>
+  .dm-group-head { margin: 30px 0 12px; }
+  .dm-group-head.first { margin-top: 4px; }
+  .dm-group-head h3 { margin: 0 0 4px; font-size: 15px; font-weight: 600; color: var(--text); }
+  .dm-group-head p  { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.6; }
+  .dm-links { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+</style>
+
+<!-- Bring-data-in tools (Historical Import + Device History) now live on the
+     "Fill History & Gaps" landing page, linked from the topbar. -->
+
+<!-- ── Missing-data nudge (deep-links to the unified backfill flow) ─────────────
+     The full find/fill flow now lives on Historical Import (scope → source →
+     preview → apply). Here we only surface a nudge WHEN gaps exist; loadGapNudge()
+     reveals it. When history is continuous the card stays hidden. -->
+<div class="card" id="gap-nudge" style="display:none;">
+  <div class="card-title">🕳️ Missing Data</div>
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+    <span id="gap-nudge-text" style="font-size:13px;color:var(--muted);line-height:1.6;"></span>
+    <a href="{{ url_for('historical_import_page') }}" class="btn btn-primary" style="white-space:nowrap;">🩹 Fill gaps →</a>
+  </div>
+</div>
+
+<!-- ═══ Intent 2: Correct & review ════════════════════════════════════════════ -->
+<div class="dm-group-head first">
+  <h3>🔧 Correct &amp; review</h3>
+  <p>Fix historical rates and costs (Cost Corrections, above), and review blocks still awaiting settlement.</p>
 </div>
 
 <!-- ── Settlement Source (supplier-API only) ───────────────────────────────────
@@ -144,29 +160,29 @@
   <div id="unsettled-list" style="font-size:13px;color:var(--muted);margin-top:14px;"></div>
 </div>
 
-<!-- ── Missing data (outage gaps) ──────────────────────────────────────────── -->
-<div class="card">
-  <div class="card-title">🕳️ Missing Data</div>
-  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;line-height:1.7;">
-    If the add-on was offline for longer than 12 hours, those half-hour blocks were
-    never recorded and the routine settlement poll will not go back for them. Your
-    supplier still holds the settled readings, so they can be recovered.
-    <br><br>
-    Recovered blocks use the authoritative half-hourly figures and are priced at the
-    rates in force at the time, but they carry <strong>no per-device breakdown</strong>
-    — EMT was not running, so no device readings exist for that period.
-    <br><br>
-    <strong>Blocks you deleted on purpose will also be restored.</strong> This is why
-    recovery is a manual action: EMT cannot tell a deliberate deletion from an outage.
-  </p>
-  <button class="btn btn-secondary" onclick="loadGaps()" id="btn-find-gaps">🔍 Find missing data</button>
-  <button class="btn btn-primary" onclick="resolveGaps()" id="btn-resolve-gaps" style="display:none;margin-left:8px;">🩹 Recover missing data</button>
-  <div id="gaps-list" style="font-size:13px;color:var(--muted);margin-top:14px;"></div>
+<!-- ═══ Intent 3: Safety & housekeeping ═══════════════════════════════════════ -->
+<div class="dm-group-head">
+  <h3>🧰 Safety &amp; housekeeping</h3>
+  <p>Create and restore backups, delete data, and keep the database healthy.</p>
 </div>
 
-<!-- ── Import ───────────────────────────────────────────────────────────────── -->
+<!-- ── Backups ──────────────────────────────────────────────────────────────── -->
 <div class="card">
-  <div class="card-title">📥 Import Data Files</div>
+  <div class="card-title">💾 Backups</div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;line-height:1.7;">
+    A backup zip is created automatically before every config save. Backups are stored in
+    <code id="backup-path-display" style="font-family:var(--mono);font-size:12px;">/share/energy_meter_tracker_backup/backups/</code>
+    and the 20 most recent are kept.
+  </p>
+  <button class="btn btn-secondary" onclick="doManualBackup()" id="btn-backup2" style="margin-bottom:16px;">💾 Create Backup Now</button>
+  <div id="backup-list" style="font-size:13px;color:var(--muted);">Loading...</div>
+</div>
+
+<!-- Delete Blocks now lives in the topbar. -->
+
+<!-- ── Import DB (restore from a .db / backup zip) ──────────────────────────── -->
+<div class="card">
+  <div class="card-title">📥 Import DB</div>
   <p style="color:var(--muted);font-size:13px;margin-bottom:20px;line-height:1.7;">
     Drag in a <strong>backup zip</strong> or <strong>blocks.db</strong> file to restore data.
     <strong style="color:var(--warning);">Warning:</strong> importing will overwrite existing data.
@@ -195,29 +211,6 @@
   <button class="btn btn-primary" onclick="doImport()" id="import-btn" disabled>
     📥 Import Selected Files
   </button>
-</div>
-
-<!-- ── File reference ───────────────────────────────────────────────────────── -->
-<div class="card">
-  <div class="card-title">ℹ️ File Reference</div>
-  <table style="width:100%;border-collapse:collapse;font-size:13px;">
-    <thead>
-      <tr style="border-bottom:1px solid var(--border);">
-        <th style="text-align:left;padding:8px 0;color:var(--muted);font-weight:500;">File</th>
-        <th style="text-align:left;padding:8px 0;color:var(--muted);font-weight:500;">Contains</th>
-        <th style="text-align:left;padding:8px 0;color:var(--muted);font-weight:500;">Restore risk</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr style="border-bottom:1px solid var(--border);">
-        <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">blocks.db</td>
-        <td style="padding:10px 0;color:var(--text);">Everything — blocks, config history, current block state. This is the only file you need to back up or restore.</td>
-        <td style="padding:10px 0;color:var(--success);font-size:12px;">Safe alone — self-contained</td>
-      </tr>
-      
-
-    </tbody>
-  </table>
 </div>
 
 
@@ -961,85 +954,26 @@ function loadUnsettled() {
     .catch(function(e) { btn.disabled = false; el.textContent = 'Error: ' + e; });
 }
 
-function loadGaps() {
-  var btn  = document.getElementById('btn-find-gaps');
-  var list = document.getElementById('gaps-list');
-  var act  = document.getElementById('btn-resolve-gaps');
-  btn.disabled = true;
-  list.innerHTML = 'Searching\u2026';
+// Missing-data nudge: reveal the gap-nudge card only when gaps actually exist,
+// deep-linking to the unified backfill flow on Historical Import (the full
+// find/preview/fill flow lives there now: scope → source → preview → apply).
+function loadGapNudge() {
+  var card = document.getElementById('gap-nudge');
+  if (!card) return;
   fetch(apiUrl('/api/history-gaps'))
     .then(function (r) { return r.json(); })
     .then(function (d) {
-      btn.disabled = false;
-      if (!d.ok) { list.textContent = 'Error: ' + (d.error || 'unknown'); return; }
-      if (!d.gaps.length) {
-        list.innerHTML = '\u2713 No missing data found.';
-        act.style.display = 'none';
-        return;
-      }
-      var html = '<strong>' + d.total_slots + ' missing block(s)</strong> across '
-               + d.gaps.length + ' period(s):<ul style="margin:8px 0 0 18px;">';
-      d.gaps.slice(0, 20).forEach(function (g) {
-        var hrs = (g.slots / 2).toFixed(1);
-        html += '<li>' + g.start.replace('T', ' ') + ' \u2192 '
-             + g.end.replace('T', ' ') + ' (' + hrs + ' h)</li>';
-      });
-      if (d.gaps.length > 20) html += '<li>\u2026 and ' + (d.gaps.length - 20) + ' more</li>';
-      html += '</ul>';
-      // Finding gaps is a local database question and always works. RECOVERING
-      // them needs the supplier API — the missing readings can only come from
-      // the supplier. Say so, rather than hiding the button and leaving the user
-      // told they have a problem with no path forward.
-      if (d.api_available) {
-        act.style.display = '';
-      } else {
-        act.style.display = 'none';
-        html += '<p style="margin-top:10px;">\u2139\ufe0f Recovering this data needs a supplier '
-             + 'API connection \u2014 the missing readings can only come from your supplier. '
-             + 'Configure one in the Setup Wizard to enable recovery.</p>';
-      }
-      list.innerHTML = html;
+      if (!d.ok || !d.gaps || !d.gaps.length) return;      // continuous history -> stay hidden
+      var hrs = (d.total_slots / 2).toFixed(1);
+      document.getElementById('gap-nudge-text').innerHTML =
+        '<strong>' + d.gaps.length + '</strong> gap' + (d.gaps.length > 1 ? 's' : '')
+        + ' · <strong>' + hrs + ' h</strong> of missing half-hourly data'
+        + (d.api_available ? '' : ' — no supplier API, fill from a CSV') + '.';
+      card.style.display = '';
     })
-    .catch(function (e) { btn.disabled = false; list.textContent = 'Error: ' + e; });
+    .catch(function () {});
 }
-
-function resolveGaps() {
-  if (!window._apiAvailable) return;
-  showConfirm({
-    title: 'Recover missing data',
-    message: 'Fetch the settled readings for every missing block from your supplier '
-      + 'and rebuild them?<br><br>Recovered blocks carry <strong>no per-device '
-      + 'breakdown</strong>, and any blocks you deleted on purpose <strong>will be '
-      + 'restored</strong>. This may take a moment.',
-    okLabel: '\ud83e\ude79 Recover',
-    onConfirm: _doResolveGaps
-  });
-}
-
-function _doResolveGaps() {
-  var btn = document.getElementById('btn-resolve-gaps');
-  var list = document.getElementById('gaps-list');
-  hideAlerts();
-  btn.disabled = true;
-  var orig = btn.textContent;
-  btn.textContent = 'Recovering\u2026';
-  fetch(apiUrl('/api/resolve-gaps'), { method: 'POST' })
-    .then(function (r) { return r.json(); })
-    .then(function (d) {
-      btn.disabled = false; btn.textContent = orig;
-      if (!d.ok) {
-        list.innerHTML = 'Error: ' + (d.error || d.reason || 'unknown');
-        return;
-      }
-      list.innerHTML = '\u2713 Recovered <strong>' + d.backfilled + '</strong> block(s) across '
-                     + d.gaps + ' period(s). Charts have been regenerated.';
-      btn.style.display = 'none';
-    })
-    .catch(function (e) {
-      btn.disabled = false; btn.textContent = orig;
-      list.textContent = 'Error: ' + e;
-    });
-}
+document.addEventListener('DOMContentLoaded', loadGapNudge);
 
 function retrySettlement() {
   if (!window._apiAvailable) return;

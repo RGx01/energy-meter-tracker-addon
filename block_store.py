@@ -2708,48 +2708,46 @@ class BlockStore:
     def reprice_imported_blocks_from_csv(self, csv_text: str,
                                          meter_id: str = "electricity_main",
                                          channel: str = "import") -> dict:
-        """Overlay EXACT billed cost + rate onto imported blocks from an Octopus
-        CSV export — the billing source of truth. For dispatch slots Octopus's
-        Measurements API returns with NO cost/label (so they can't be priced via
-        the API, only via the bill), this is the only way to match the bill: for
-        every CSV half-hour, set the block's cost = the CSV cost and rate =
-        cost/kWh. The CSV 'Estimated Cost Inc. Tax' column is pence inc-VAT, which
-        is exactly EMT's stored convention (£ inc-VAT). Only imported blocks are
-        touched, only where the value differs. Returns {checked, changed, from, to}.
+        """Overlay EXACT billed cost + rate onto imported blocks from a filled CSV —
+        the billing source of truth. For dispatch slots Octopus's Measurements API
+        returns with NO cost/label (so they can't be priced via the API, only via
+        the bill), this is the only way to match the bill.
+
+        Shares the SAME name-matched parser as the main CSV import
+        (csv_import.parse_octopus_csv), so this path accepts the exact same
+        template — including the rate-first cost derivation (a Unit Rate column
+        wins over an explicit Cost column). Columns are matched by header name, not
+        position, so column order doesn't matter. The block's rate is then stored as
+        cost ÷ kWh. Only imported blocks are touched, only where the value differs.
+        Returns {checked, changed, from, to}.
         """
-        import csv as _csv
-        import io as _io
-        from datetime import datetime as _dt, timezone as _tz
+        import csv_import as _ci
         rcol, ccol = (("imp_rate", "imp_cost") if channel == "import"
                       else ("exp_rate", "exp_cost"))
+        parsed = _ci.parse_octopus_csv(csv_text, channel)
         checked = changed = 0
         lo = hi = None
         changed_starts = []
-        reader = _csv.reader(_io.StringIO(csv_text))
-        next(reader, None)                        # header
         with self._conn:
-            for row in reader:
-                if not row or not str(row[0]).strip():
+            for b in (parsed.get("blocks") or []):
+                start = b.get("block_start")
+                kwh = b.get("kwh")
+                cost = b.get("cost")
+                if not start or cost is None:     # a row with neither rate nor cost
                     continue
-                try:
-                    kwh = float(row[0]); cost_p = float(row[1]); start_local = str(row[3]).strip()
-                    utc = (_dt.fromisoformat(start_local).astimezone(_tz.utc)
-                           .strftime("%Y-%m-%dT%H:%M:%S"))
-                except (IndexError, ValueError):
-                    continue
-                cost = round(cost_p / 100.0, 6)
-                rate = round(cost / kwh, 6) if kwh > 0 else None
+                cost = round(float(cost), 6)
+                rate = round(cost / kwh, 6) if (kwh and kwh > 0) else None
                 checked += 1
-                lo = utc if (lo is None or utc < lo) else lo
-                hi = utc if (hi is None or utc > hi) else hi
+                lo = start if (lo is None or start < lo) else lo
+                hi = start if (hi is None or start > hi) else hi
                 cur = self._conn.execute(
                     f"UPDATE blocks SET {rcol} = ?, {ccol} = ? "
                     f"WHERE block_start = ? AND meter_id = ? AND source LIKE 'imported%' "
                     f"AND (COALESCE({rcol}, -1) != ? OR COALESCE({ccol}, -1) != ?)",
-                    (rate, cost, utc, meter_id, rate, cost))
+                    (rate, cost, start, meter_id, rate, cost))
                 if cur.rowcount > 0:
                     changed += 1
-                    changed_starts.append(utc)
+                    changed_starts.append(start)
         if changed_starts:
             self.clear_reprice_queue_slots(channel, changed_starts)
         logger.info("reprice_imported_blocks_from_csv[%s]: %d changed of %d (%s..%s)",
@@ -3455,9 +3453,23 @@ class BlockStore:
     # EMT — DCC will NEVER settle it, so it must be excluded or every imported
     # block (imp_kwh_api NULL) is counted "awaiting DCC settlement" and chased by
     # the settlement sweep forever.
-    _UNSETTLED_WHERE = ("(imp_kwh_api IS NULL "
-                        "OR (exp_kwh_api IS NULL AND exp_kwh IS NOT NULL AND exp_kwh > 0)) "
-                        "AND (source IS NULL OR source NOT LIKE 'imported%')")
+    # A block is "awaiting DCC settlement" if its import is unsettled, OR its export
+    # is unsettled AND the meter demonstrably EXPORTS. The export test used to be
+    # `exp_kwh IS NOT NULL AND exp_kwh > 0` — i.e. only chase export when a POSITIVE
+    # live/CAD figure is already present. That silently strands DCC-export-only
+    # meters, whose daytime export lands only via settlement: those slots carry
+    # exp_kwh = 0 or NULL (no live figure), fail the guard, and are never re-fetched
+    # (blocks-4.db: 245 stuck daytime slots). Instead: chase whenever exp_kwh_api is
+    # NULL and the meter has EVER shown export (a live or settled positive anywhere)
+    # — value-agnostic on the row, so 0/NULL placeholders are still corrected, while
+    # a true import-only meter (never any export) is left alone. Bounded by the
+    # settlement horizon + finalise-from-CAD so it can't chase forever.
+    _UNSETTLED_WHERE = (
+        "(imp_kwh_api IS NULL "
+        " OR (exp_kwh_api IS NULL AND EXISTS ("
+        "        SELECT 1 FROM blocks b2 WHERE b2.meter_id = blocks.meter_id "
+        "        AND (b2.exp_kwh > 0 OR b2.exp_kwh_api > 0)))) "
+        "AND (source IS NULL OR source NOT LIKE 'imported%')")
 
     def get_unsettled_blocks(self, main_meter_id: str = "electricity_main",
                              limit: Optional[int] = None,

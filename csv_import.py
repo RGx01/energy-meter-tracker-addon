@@ -61,6 +61,7 @@ def parse_octopus_csv(text: str, channel: str) -> dict:
     reader = _csv.DictReader(io.StringIO(text))
     fn = reader.fieldnames
     col_kwh   = _find_col(fn, "consumption")
+    col_rate  = _find_col(fn, "rate")           # optional "Unit Rate (p/kWh)"
     col_cost  = _find_col(fn, "cost")
     col_stand = _find_col(fn, "standing")
     col_start = _find_col(fn, "start")
@@ -83,14 +84,26 @@ def parse_octopus_csv(text: str, channel: str) -> dict:
         except (TypeError, ValueError):
             errors.append({"row": i, "reason": "unparseable consumption"})
             continue
+        rate_p = _num(row.get(col_rate)) if col_rate else None
         cost_p = _num(row.get(col_cost)) if col_cost else None
+        # Rate-first: if the row gives a unit rate (p/kWh) — the easy path for a
+        # manual fill from a flat tariff — derive cost = rate × kWh. Only when no
+        # rate is supplied do we fall back to the explicit cost column (which is
+        # what an Octopus website export provides). Both are inc-VAT; pence → £.
+        if rate_p is not None:
+            cost = round((rate_p / 100.0) * kwh, 6)
+        elif cost_p is not None:
+            cost = cost_p / 100.0
+        else:
+            cost = None
         stand_p = _num(row.get(col_stand)) if col_stand else None
         blocks.append({
             "channel": channel,
             "block_start": start,
             "block_end": end,
             "kwh": kwh,
-            "cost": (cost_p / 100.0) if cost_p is not None else None,      # pence → £
+            "rate": (rate_p / 100.0) if rate_p is not None else None,      # £/kWh, if given
+            "cost": cost,
             "standing": (stand_p / 100.0) if stand_p is not None else None,
         })
     blocks.sort(key=lambda b: b["block_start"])
@@ -108,10 +121,12 @@ def _num(v):
 # ── template / gap-fill CSV generation ───────────────────────────────────────
 
 # Headers match parse_octopus_csv's case/space-insensitive column detection
-# (substrings: start, end, consumption, cost, standing) and read like a real
-# Octopus website export, so a filled template imports with no mapping.
+# (substrings: start, end, consumption, rate, cost, standing) and read like a real
+# Octopus website export (plus an optional Unit Rate column), so a filled template
+# imports with no mapping. Supply EITHER a unit rate (preferred, rate × kWh → cost)
+# OR the estimated cost — leave the other blank.
 TEMPLATE_HEADERS = [
-    "Start", "End", "Consumption (kWh)",
+    "Start", "End", "Consumption (kWh)", "Unit Rate (p/kWh)",
     "Estimated Cost Inc. Tax (p)", "Standing Charge Inc. Tax (p)",
 ]
 
@@ -145,7 +160,33 @@ def gap_template_csv(from_iso, to_iso, *, block_minutes=30, tz_name="Europe/Lond
     w = _csv.writer(buf)
     w.writerow(TEMPLATE_HEADERS)
     for (a, b) in _iter_slots(from_iso, to_iso, block_minutes, tz_name):
-        w.writerow([a.isoformat(), b.isoformat(), "", "", ""])
+        w.writerow([a.isoformat(), b.isoformat(), "", "", "", ""])
+    return buf.getvalue()
+
+
+def slots_template_csv(starts, *, block_minutes=30, tz_name="Europe/London") -> str:
+    """Template pre-filled with Start/End for an ARBITRARY (possibly non-contiguous)
+    set of slots — used by the pricing-health escape hatch to hand the user exactly
+    the half-hours the API couldn't price, ready to fill from their bill and run
+    through the CSV reprice path. `starts` are naive-UTC ISO (the reprice queue's
+    format); timestamps render LOCAL with DST-correct offsets, matching the other
+    templates. Blank/unparseable starts are skipped."""
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(tz_name or "UTC")
+    step = timedelta(minutes=int(block_minutes or 30))
+    buf = io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(TEMPLATE_HEADERS)
+    for s in starts or []:
+        try:
+            raw = str(s).replace("Z", "").split("+")[0].replace(" ", "T").split(".")[0]
+            dt = datetime.fromisoformat(raw).replace(tzinfo=timezone.utc)
+        except (ValueError, AttributeError):
+            continue
+        a = dt.astimezone(tz)
+        b = (dt + step).astimezone(tz)
+        w.writerow([a.isoformat(), b.isoformat(), "", "", "", ""])
     return buf.getvalue()
 
 
@@ -160,13 +201,15 @@ def blank_template_csv(*, block_minutes=30, rows=4,
     w.writerow(TEMPLATE_HEADERS)
     base = datetime.fromisoformat(start_iso)          # keeps the example offset
     step = timedelta(minutes=int(block_minutes or 30))
-    samples = [(0.42, 10.5), (0.38, 9.6), (0.51, 12.8), (0.29, 7.3)]
+    # (kWh, unit-rate p/kWh) — the preferred path: fill a rate, leave Cost blank,
+    # and EMT computes cost = rate × kWh. Rates shown as peak / off-peak examples.
+    samples = [(0.42, 24.5), (0.38, 24.5), (0.51, 7.5), (0.29, 7.5)]
     for i in range(max(1, int(rows))):
         a = base + step * i
         b = a + step
-        kwh, cost = samples[i % len(samples)]
+        kwh, rate = samples[i % len(samples)]
         stand = "42.0" if i == 0 else ""            # standing is once-per-day
-        w.writerow([a.isoformat(), b.isoformat(), kwh, cost, stand])
+        w.writerow([a.isoformat(), b.isoformat(), kwh, rate, "", stand])
     return buf.getvalue()
 
 

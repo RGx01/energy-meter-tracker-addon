@@ -1225,6 +1225,9 @@ function loadChargeSessions(){
     .catch(function(){ card.style.display='none'; });
 }
 document.addEventListener('DOMContentLoaded', loadChargeSessions);
+// Auto-refresh so a revised IOG plan (or a newly-completed charge) shows without a
+// page reload — dispatches poll ~5-minutely, so a 60s card refresh is ample.
+setInterval(loadChargeSessions, 60000);
 </script>
 <script>
 // ── Server-provided gauge config ──

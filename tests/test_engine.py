@@ -3150,6 +3150,53 @@ class TestRepairImportPricing(unittest.TestCase):
         self.assertEqual(res["recovered"], 0)
         self.assertEqual(res["windows"], 0)
 
+    def test_queue_mode_clears_already_correct_slots(self):
+        # Regression: in QUEUE mode (the pricing-health "Retry N" button) a slot
+        # whose refetch confirms the SAME, already-correct cost must STILL be
+        # cleared from the reprice queue. Previously only slots whose value CHANGED
+        # were cleared (reprice_imported_block returns False when unchanged), so an
+        # already-correct slot lingered forever as "N still need a retry" and the
+        # Retry button appeared to do nothing.
+        import asyncio
+        store = self._store()          # imported blocks at 18:30 + 19:00, cost 0.945
+        engine._store = store
+        engine._kraken_discovery = {"import": {"mpan": "M"}, "export": {}}
+        engine.kraken_available = lambda: True
+        engine._hist_rate_segs_cache.clear()
+        engine._hist_rate_segs_cache["import"] = [("2000-01-01T00:00:00", None, None)]
+
+        async def _noop_charts():
+            return None
+        engine._generate_charts_offloaded = _noop_charts
+
+        # Force the computed rate to equal the stored rate so the reprice is a
+        # genuine no-op (value unchanged → reprice_imported_block returns False).
+        _saved_br = engine._billed_rate
+        engine._billed_rate = lambda segs, st, ofp, mc, kwh: 0.28124
+        self.addCleanup(lambda: setattr(engine, "_billed_rate", _saved_br))
+
+        client = MagicMock()
+
+        async def _meas(mpan, start, end, *, direction="CONSUMPTION"):
+            # Refetch returns the SAME cost that's already stored (0.945).
+            return [
+                {"start": "2025-10-21T18:30:00", "kwh": 3.0, "cost_incl": 0.945, "off_peak": False},
+                {"start": "2025-10-21T19:00:00", "kwh": 3.0, "cost_incl": 0.945, "off_peak": False},
+            ]
+        client.get_measurements = _meas
+        engine._kraken_client = client
+
+        store.add_reprice_queue("import", ["2025-10-21T18:30:00", "2025-10-21T19:00:00"])
+        self.assertEqual(store.reprice_queue_count(), 2)
+
+        res = asyncio.run(engine.repair_import_pricing(pace_s=0))   # queue mode: no dates
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["mode"], "queue")
+        self.assertEqual(res["recovered"], 0)        # nothing changed (already correct)
+        self.assertEqual(res["still_missing"], 0)    # nothing is actually missing
+        self.assertEqual(res["remaining"], 0)        # ← the fix: queue is now clear
+        self.assertEqual(store.reprice_queue_count(), 0)
+
 
 class TestFinalRecoveryPass(unittest.TestCase):
     """Auto final calm recovery: when a bulk import finishes, drain the reprice queue

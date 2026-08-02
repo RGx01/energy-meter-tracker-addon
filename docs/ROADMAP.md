@@ -6,6 +6,14 @@ Newest at the top. **Upcoming work (ranked by priority) first, then release hist
 
 ## Upcoming — ranked by priority
 
+### 4.1.0 — Unify the billing / usage-stats aggregation onto one endpoint
+
+*Consolidation, deferred out of 4.0.x deliberately because it touches billing.* There are today **three** independent implementations that aggregate the same per-block data: the **Billing chart** (`calculate_billing_summary_for_period` in `energy_charts.py`, server-rendered into `daily_usage.html`), **Usage Stats daily/monthly/yearly** (`/api/charts/blocks-summary`), and **Usage Stats HH** (`/api/charts/blocks-day`). The 4.0.x HH work already collapsed the *two Usage Stats endpoints* onto shared helpers (`_aggregate_block_rows` + `_bucket_to_row_values` in `server.py`) — proven byte-identical by a golden-output capture and kept honest by `test_usage_stats_vs_billing.py`. **What remains is the harder unification: fold the Billing chart's aggregation and the Usage Stats endpoints onto a single source of truth**, so "billing" and "usage stats" can never drift apart by construction rather than by a cross-check test.
+
+**Hard constraint (non-negotiable, carried from the 4.0.x work):** the results must not change. A great deal of effort has gone into making billing as accurate as possible and into making every other aggregation *align* with billing. Any refactor here MUST be pure code-motion — identical outputs — or it doesn't ship. Method to follow (the one used for the HH refactor): capture the current Billing-chart and endpoint JSON as a **golden baseline**, refactor, assert **byte-identical** output, run `test_usage_stats_vs_billing` + `test_server` + the billing-chart render smoke test; ship only if the diff is empty, otherwise revert.
+
+**Shape of work (to be spec'd):** (1) decide the single home for the block→period aggregation — most likely `calculate_billing_summary_for_period` becomes the canonical primitive and the two endpoints call *it* (rather than the reverse), since billing is the authoritative one; (2) reconcile the row/column shapes the three consumers expect (the endpoints emit a per-bucket JSON shape with rate-keyed sub-meter subtraction, carbon split, avg-intensity; the billing chart consumes a summary object) behind one core with thin per-consumer adapters; (3) golden-proof each consumer independently before deleting any duplicated code. *Medium–large; gated on a design spike, not a quick win — the value is eliminating drift risk, so correctness proof is the whole job.*
+
 ### 3.5.1 — Historical-import correctness + block-guard hardening
 
 *Follow-ups from the 3.5.0 historical-import work (API backfill with GraphQL Measurements + REST export fallback, contiguity-halt removal, gap surfacing), found in live use on the 3.2-test instance and a 2026-07 power-cut incident on prod.*

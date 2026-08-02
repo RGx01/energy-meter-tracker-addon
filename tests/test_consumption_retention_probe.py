@@ -206,10 +206,15 @@ class TestApiImportPlan(unittest.TestCase):
     def setUp(self):
         self._c, self._d, self._s = (engine._kraken_client,
                                      engine._kraken_discovery, engine._store)
+        # Fixtures use fixed 2024/2026 dates; neutralise the wall-clock retention
+        # cap so they stay stable (the cap has its own dedicated tests).
+        self._ret = engine._API_RETENTION_DAYS
+        engine._API_RETENTION_DAYS = 36500  # ~100y: disables the cap for fixed-date fixtures
 
     def tearDown(self):
         (engine._kraken_client, engine._kraken_discovery,
          engine._store) = self._c, self._d, self._s
+        engine._API_RETENTION_DAYS = self._ret
 
     def _run(self, **kw):
         return asyncio.run(engine.plan_api_import(**kw))
@@ -250,6 +255,25 @@ class TestApiImportPlan(unittest.TestCase):
             get_oldest_block_start=lambda *a, **k: "2026-07-01T00:00:00")
         r = self._run(requested_from="2025-01-01T00:00:00")
         self.assertEqual(r["channels"]["import"]["window"]["from"], "2025-01-01T00:00:00")
+
+    def test_window_capped_at_retention_wall(self):
+        # An agreement older than the API's rolling retention must NOT be advertised:
+        # the window floor is clamped to the retention wall and retention_capped is
+        # flagged so the UI can point pre-retention history at the CSV route.
+        engine._kraken_client = object()
+        engine._kraken_discovery = {"import": {
+            "mpan": "IM", "serial": "IMPS",
+            "agreements": [{"valid_from": "2023-06-01T00:00:00Z"}]}}   # pre-retention
+        engine._store = types.SimpleNamespace(
+            get_oldest_block_start=lambda *a, **k: "2026-08-01T00:00:00")
+        _orig_rf = engine._retention_floor_iso
+        self.addCleanup(lambda: setattr(engine, "_retention_floor_iso", _orig_rf))
+        engine._retention_floor_iso = lambda: "2024-08-01T00:00:00"    # fixed wall
+        r = self._run()
+        self.assertTrue(r["retention_capped"])
+        self.assertEqual(r["retention_floor"], "2024-08-01T00:00:00")
+        # Floor clamped up to the wall, not the 2023 agreement.
+        self.assertEqual(r["channels"]["import"]["window"]["from"], "2024-08-01T00:00:00")
 
 
 import api_import as _ai
@@ -310,6 +334,8 @@ class TestApiImportApply(unittest.TestCase):
     def setUp(self):
         self._c, self._d, self._s = (engine._kraken_client,
                                      engine._kraken_discovery, engine._store)
+        self._ret = engine._API_RETENTION_DAYS       # neutralise wall-clock cap
+        engine._API_RETENTION_DAYS = 36500  # ~100y: disables the cap for fixed-date fixtures
         self.store = BlockStore(":memory:")
         self.store.insert_config_period({"meters": {"electricity_main": {"meta": {
             "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
@@ -333,6 +359,7 @@ class TestApiImportApply(unittest.TestCase):
     def tearDown(self):
         (engine._kraken_client, engine._kraken_discovery,
          engine._store) = self._c, self._d, self._s
+        engine._API_RETENTION_DAYS = self._ret
         engine._hist_rate_segs_cache.clear()
         engine._hist_standing_segs_cache.clear()
         engine._hist_floor_cache.clear()
@@ -358,6 +385,27 @@ class TestApiImportApply(unittest.TestCase):
         self.assertEqual(len(rows), 4)
         self.assertAlmostEqual(rows[0]["imp_cost"], 0.007560378, places=7)  # billed cost £
         self.assertAlmostEqual(rows[0]["imp_rate"], 0.07, places=3)         # cost÷kWh
+
+    def test_bounded_window_fills_without_advancing_import_state(self):
+        # fetch_api_window([00:00 → 02:00]) writes those blocks but must NOT touch
+        # the full-import checkpoint / done flag — it's a one-shot gap/period fill.
+        engine._kraken_client = _FakeMeasClient(self._contig())
+        r = asyncio.run(engine.fetch_api_window(
+            "2024-07-01T00:00:00", "2024-07-01T02:00:00", pace_s=0))
+        self.assertTrue(r["ok"])
+        self.assertGreaterEqual(r["channels"]["import"]["written"], 4)
+        ck_key = engine._API_IMPORT_CHECKPOINT + "_import"
+        self.assertIn(self.store.get_kraken_state(ck_key) or "", ("", None))
+        self.assertNotEqual(self.store.get_kraken_state("api_import_done_import"), "1")
+        n = self.store._conn.execute(
+            "SELECT COUNT(*) FROM blocks WHERE source='imported_api'").fetchone()[0]
+        self.assertGreaterEqual(n, 4)
+
+    def test_bounded_requires_from(self):
+        engine._kraken_client = _FakeMeasClient(self._contig())
+        r = asyncio.run(engine.import_api_history(until_ts="2024-07-01T02:00:00"))
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["reason"], "no_from")
 
     def test_standing_charge_from_tariff_schedule(self):
         # Standing charge must come from the tariff standing-charge schedule
@@ -562,6 +610,8 @@ class TestExportRestFallback(unittest.TestCase):
     def setUp(self):
         self._c, self._d, self._s = (engine._kraken_client,
                                      engine._kraken_discovery, engine._store)
+        self._ret = engine._API_RETENTION_DAYS       # neutralise wall-clock cap
+        engine._API_RETENTION_DAYS = 36500  # ~100y: disables the cap for fixed-date fixtures
         self.store = BlockStore(":memory:")
         self.store.insert_config_period({"meters": {"electricity_main": {"meta": {
             "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
@@ -586,6 +636,7 @@ class TestExportRestFallback(unittest.TestCase):
     def tearDown(self):
         (engine._kraken_client, engine._kraken_discovery,
          engine._store) = self._c, self._d, self._s
+        engine._API_RETENTION_DAYS = self._ret
         engine._hist_rate_segs_cache.clear()
         engine._hist_standing_segs_cache.clear()
         engine._hist_floor_cache.clear()
@@ -629,6 +680,8 @@ class TestApiImportJob(unittest.TestCase):
         self._c, self._d, self._s = (engine._kraken_client,
                                      engine._kraken_discovery, engine._store)
         self._job = engine._api_import_job
+        self._ret = engine._API_RETENTION_DAYS       # neutralise wall-clock cap
+        engine._API_RETENTION_DAYS = 36500  # ~100y: disables the cap for fixed-date fixtures
         self.store = BlockStore(":memory:")
         self.store.insert_config_period({"meters": {"electricity_main": {"meta": {
             "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
@@ -653,6 +706,7 @@ class TestApiImportJob(unittest.TestCase):
         (engine._kraken_client, engine._kraken_discovery,
          engine._store) = self._c, self._d, self._s
         engine._api_import_job = self._job
+        engine._API_RETENTION_DAYS = self._ret
         engine._hist_rate_segs_cache.clear()
         engine._hist_standing_segs_cache.clear()
         engine._hist_floor_cache.clear()
