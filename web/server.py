@@ -1915,6 +1915,14 @@ def corrections_page():
     return render_template("corrections.html", active="data_management")
 
 
+@app.route("/fill-history")
+def fill_history_page():
+    """Landing hub for the two 'bring data in / fill gaps' tools — Historical
+    Import (supplier API / CSV backfill + gap fill) and Device History (recorder
+    attribution). Reached from the Data Management topbar."""
+    return render_template("fill_history.html", active="data_management")
+
+
 # ── Chart file serving ────────────────────────────────────────────────────────
 
 @app.route("/charts/net_heatmap.html")
@@ -1985,6 +1993,175 @@ def lovelace_billing():
 def lovelace_heatmap():
     """Net energy heatmap — Lovelace-friendly URL with auto-refresh."""
     return _serve_lovelace_chart("net_heatmap.html")
+
+
+def _aggregate_block_rows(raw_rows, bucket_of, standing_scope="bucket",
+                          billing_day_fallback=1):
+    """Billing-accurate per-block aggregation shared by the Usage Stats endpoints
+    (/blocks-summary buckets by local day; /blocks-day by half-hour slot). Buckets
+    by ``bucket_of(block_start)`` and applies the SAME rate-keyed direct-cost
+    subtraction, sub-meter split and carbon apportioning as before — this is a pure
+    extraction, so the day path is byte-identical (guarded by a golden-output check
+    + test_usage_stats_vs_billing).
+
+    ``standing_scope='bucket'`` books the standing charge as the first non-zero
+    within EACH bucket (the daily rule). ``'global'`` books it once across ALL rows
+    (used by the HH view, whose buckets are slots of one day, so the day's single
+    standing charge lands on one slot and the slots still sum to it).
+
+    Returns ``{bucket_key: agg}`` with main ``imp_cost`` already resolved. Row rows
+    must carry: block_start, meter_id, is_sub_meter, imp_kwh, imp_kwh_grid,
+    imp_kwh_remainder, imp_rate, imp_cost, exp_kwh, exp_cost, standing_charge,
+    carbon_g (and optionally billing_day)."""
+    _day_data = {}
+    _global_sc_done = False
+    for _r in raw_rows:
+        _bk = bucket_of(_r["block_start"])
+        if _bk not in _day_data:
+            try:
+                _bd_val = _r["billing_day"] if "billing_day" in _r.keys() else None
+            except Exception:
+                _bd_val = None
+            _day_data[_bk] = {
+                "main":        {"imp_kwh": 0.0, "imp_cost": 0.0, "exp_kwh": 0.0, "exp_cost": 0.0,
+                                "carbon_g": None, "cg_imp": None, "cg_exp": None,
+                                "ci_abs_carbon": 0.0, "ci_abs_net_kwh": 0.0,
+                                "_main_by_rate": {}, "_sub_by_rate": {}},
+                "subs":        {},
+                "standing":    0.0,
+                "billing_day": int(_bd_val or billing_day_fallback),
+            }
+        _dd = _day_data[_bk]
+        _is_sub = bool(_r["is_sub_meter"])
+        _imp = float(_r["imp_kwh"] or 0)
+        _exp = float(_r["exp_kwh"] or 0)
+        _cost_imp = float(_r["imp_cost"] or 0)
+        _cost_exp = float(_r["exp_cost"] or 0)
+        _sc = float(_r["standing_charge"] or 0)
+        _cg = float(_r["carbon_g"]) if _r["carbon_g"] is not None else None
+        if not _is_sub:
+            _m = _dd["main"]
+            _rate = round(float(_r["imp_rate"] or 0), 6)
+            if _r["imp_kwh_remainder"] is not None:
+                _m_imp = float(_r["imp_kwh_remainder"])
+            elif _r["imp_kwh_grid"] is not None:
+                _m_imp = float(_r["imp_kwh_grid"])
+            else:
+                _m_imp = _imp
+            if _rate not in _dd["main"]["_main_by_rate"]:
+                _dd["main"]["_main_by_rate"][_rate] = {"kwh": 0.0, "cost": 0.0}
+            _dd["main"]["_main_by_rate"][_rate]["kwh"]  += _m_imp
+            _dd["main"]["_main_by_rate"][_rate]["cost"] += _cost_imp
+            _m["imp_kwh"] += _m_imp
+            _m["exp_kwh"]  += _exp
+            _m["exp_cost"] += _cost_exp
+            if _sc > 0:
+                if standing_scope == "global":
+                    if not _global_sc_done:
+                        _dd["standing"] = _sc
+                        _global_sc_done = True
+                elif not _dd["standing"]:
+                    _dd["standing"] = _sc
+            if _cg is not None:
+                _m["carbon_g"] = (_m["carbon_g"] or 0.0) + _cg
+                _b_net = _imp - _exp
+                if _b_net != 0:
+                    _b_int = abs(_cg / _b_net)
+                    _m["cg_imp"] = (_m["cg_imp"] or 0.0) + _imp * _b_int
+                    _m["cg_exp"] = (_m["cg_exp"] or 0.0) + _exp * _b_int
+                    _m["ci_abs_carbon"]  += abs(_cg)
+                    _m["ci_abs_net_kwh"] += abs(_b_net)
+                elif _exp == 0:
+                    _m["cg_imp"] = (_m["cg_imp"] or 0.0) + abs(_cg)
+                    _m["ci_abs_carbon"]  += abs(_cg)
+                    _m["ci_abs_net_kwh"] += _imp
+                else:
+                    _m["cg_exp"] = (_m["cg_exp"] or 0.0) + abs(_cg)
+                    _m["ci_abs_carbon"]  += abs(_cg)
+                    _m["ci_abs_net_kwh"] += _exp
+        else:
+            _mid = _r["meter_id"]
+            if _mid not in _dd["subs"]:
+                _dd["subs"][_mid] = {"imp_kwh": 0.0, "imp_cost": 0.0, "exp_kwh": 0.0, "exp_cost": 0.0, "carbon_g": None}
+            _s = _dd["subs"][_mid]
+            _sub_imp = float(_r["imp_kwh_grid"] or _imp)
+            _s["imp_kwh"]  += _sub_imp
+            _s["imp_cost"] += _cost_imp
+            _s["exp_kwh"]  += _exp
+            _s["exp_cost"] += _cost_exp
+            if _cg is not None:
+                _s["carbon_g"] = (_s["carbon_g"] or 0.0) + _cg
+            _rate = round(float(_r["imp_rate"] or 0), 6)
+            if _rate not in _dd["main"]["_sub_by_rate"]:
+                _dd["main"]["_sub_by_rate"][_rate] = {"kwh": 0.0, "cost": 0.0}
+            _dd["main"]["_sub_by_rate"][_rate]["kwh"]  += _sub_imp
+            _dd["main"]["_sub_by_rate"][_rate]["cost"] += _cost_imp
+
+    for _ld, _dd in _day_data.items():
+        _m = _dd["main"]
+        _direct_cost = 0.0
+        for _rate, _mv in (_m.get("_main_by_rate") or {}).items():
+            _sv = (_m.get("_sub_by_rate") or {}).get(_rate, {"kwh": 0.0, "cost": 0.0})
+            _direct_cost += max(0.0, _mv["cost"] - _sv["cost"])
+        _m["imp_cost"] = _direct_cost
+    return _day_data
+
+
+def _bucket_to_row_values(_dd):
+    """The value fields of one aggregated bucket (from _aggregate_block_rows), in the
+    shape barAggRows consumes. Pure extraction of the /blocks-summary row build, so
+    it's byte-identical; each endpoint merges these with its own identity fields
+    (year/month/day for the day view, slot/label for HH)."""
+    _m = _dd["main"]
+    _avg_intensity = (round(_m["ci_abs_carbon"] / _m["ci_abs_net_kwh"], 1)
+                      if _m["ci_abs_net_kwh"] > 0 else None)
+    _sub_carbon_for_remainder = sum(
+        float(st["carbon_g"]) for st in _dd["subs"].values()
+        if st["carbon_g"] is not None and st["carbon_g"] != 0.0)
+    _cg_imp = _m["cg_imp"]
+    _main_carbon_remainder = (round(_cg_imp - _sub_carbon_for_remainder, 4)
+                              if _cg_imp is not None else None)
+    meters_out = {"electricity_main": {
+        "imp_kwh":      round(_m["imp_kwh"],  4),
+        "imp_cost":     round(_m["imp_cost"], 4),
+        "exp_kwh":      round(_m["exp_kwh"],  4),
+        "exp_cost":     round(_m["exp_cost"], 4),
+        "carbon_g":     _main_carbon_remainder,
+        "carbon_g_imp":  round(_cg_imp, 4) if _cg_imp is not None else None,
+        "carbon_g_exp":  round(_m["cg_exp"], 4) if _m["cg_exp"] is not None else None,
+    }}
+    for _mid, _st in _dd["subs"].items():
+        meters_out[_mid] = {
+            "imp_kwh":  round(_st["imp_kwh"],  3),
+            "imp_cost": round(_st["imp_cost"], 4),
+            "exp_kwh":  round(_st["exp_kwh"],  3),
+            "exp_cost": round(_st["exp_cost"], 4),
+            "carbon_g": round(_st["carbon_g"], 4) if _st["carbon_g"] is not None and _st["carbon_g"] != 0.0 else None,
+        }
+    _main_imp_kwh  = round(_m["imp_kwh"],  4)
+    _main_imp_cost = round(_m["imp_cost"], 4)
+    _main_exp_kwh  = round(_m["exp_kwh"],  4)
+    _main_exp_cost = round(_m["exp_cost"], 4)
+    meters_out["electricity_main"]["imp_kwh"]  = _main_imp_kwh
+    meters_out["electricity_main"]["imp_cost"] = _main_imp_cost
+    meters_out["electricity_main"]["exp_kwh"]  = _main_exp_kwh
+    meters_out["electricity_main"]["exp_cost"] = _main_exp_cost
+    return {
+        "standing":  round(_dd["standing"], 4),
+        "meters":    meters_out,
+        "imp_kwh":  round(_main_imp_kwh  + sum(m["imp_kwh"]  for mid, m in meters_out.items() if mid != "electricity_main"), 4),
+        "exp_kwh":  round(_main_exp_kwh,  4),
+        "imp_cost": round(_main_imp_cost + sum(m["imp_cost"] for mid, m in meters_out.items() if mid != "electricity_main"), 4),
+        "exp_cost": round(_main_exp_cost, 4),
+        "net_cost": round(
+            round(_main_imp_cost + sum(m["imp_cost"] for mid, m in meters_out.items() if mid != "electricity_main"), 4)
+            + round(_dd["standing"], 4)
+            - round(_main_exp_cost, 4),
+            2),
+        "carbon_g_net":   round(_m["carbon_g"], 4) if _m["carbon_g"] is not None else None,
+        "carbon_g_total": round(_m["carbon_g"], 4) if _m["carbon_g"] is not None else None,
+        "avg_intensity":  _avg_intensity,
+    }
 
 
 @app.route("/api/charts/blocks-summary")
@@ -2077,106 +2254,20 @@ def api_blocks_summary():
             ORDER BY b.block_start
         """, (_all_utc_s2, _all_utc_e2)).fetchall()
 
-        # Group rows by local date
+        # Group rows by local date and aggregate (shared billing-accurate helper —
+        # bucket = local day, standing = first non-zero within each day).
         _tz_obj = _ZI(tz_name)
-        _day_data = {}   # date_str → {main: {...}, subs: {mid: {...}}, standing, billing_day}
+        _utc_zi = _ZI("UTC")
 
-        for _r in _raw_rows:
-            _local_d = (datetime.fromisoformat(_r["block_start"])
-                        .replace(tzinfo=_ZI("UTC"))
-                        .astimezone(_tz_obj)
-                        .strftime("%Y-%m-%d"))
-            if _local_d not in _day_data:
-                _day_data[_local_d] = {
-                    "main":        {"imp_kwh": 0.0, "imp_cost": 0.0, "exp_kwh": 0.0, "exp_cost": 0.0,
-                                    "carbon_g": None, "cg_imp": None, "cg_exp": None,
-                                    "ci_abs_carbon": 0.0, "ci_abs_net_kwh": 0.0,
-                                    # Rate-keyed accumulators for billing-accurate subtraction
-                                    "_main_by_rate": {},   # rate → {kwh, cost}
-                                    "_sub_by_rate":  {}},  # rate → {kwh, cost}
-                    "subs":        {},
-                    "standing":    0.0,
-                    "billing_day": int(_r["billing_day"] or billing_day),
-                }
-            _dd = _day_data[_local_d]
-            _is_sub = bool(_r["is_sub_meter"])
-            _imp = float(_r["imp_kwh"] or 0)
-            _exp = float(_r["exp_kwh"] or 0)
-            _cost_imp = float(_r["imp_cost"] or 0)
-            _cost_exp = float(_r["exp_cost"] or 0)
-            _sc  = float(_r["standing_charge"] or 0)
-            _cg  = float(_r["carbon_g"]) if _r["carbon_g"] is not None else None
+        def _bucket_local_day(_bs):
+            return (datetime.fromisoformat(_bs)
+                    .replace(tzinfo=_utc_zi)
+                    .astimezone(_tz_obj)
+                    .strftime("%Y-%m-%d"))
 
-            if not _is_sub:
-                # Main meter — accumulate raw cost by rate for billing-accurate subtraction.
-                # Direct import cost = main_cost[rate] - sub_cost[rate] per rate tier,
-                # matching calculate_billing_summary_for_period (2.7.1 behaviour).
-                _m = _dd["main"]
-                _rate = round(float(_r["imp_rate"] or 0), 6)
-                if _r["imp_kwh_remainder"] is not None:
-                    _m_imp = float(_r["imp_kwh_remainder"])
-                elif _r["imp_kwh_grid"] is not None:
-                    _m_imp = float(_r["imp_kwh_grid"])
-                else:
-                    _m_imp = _imp
-                # Accumulate raw main cost by rate (sub subtraction happens after loop)
-                if _rate not in _dd["main"]["_main_by_rate"]:
-                    _dd["main"]["_main_by_rate"][_rate] = {"kwh": 0.0, "cost": 0.0}
-                _dd["main"]["_main_by_rate"][_rate]["kwh"]  += _m_imp
-                _dd["main"]["_main_by_rate"][_rate]["cost"] += _cost_imp
-                _m["imp_kwh"] += _m_imp  # kwh accumulates normally
-                _m["exp_kwh"]  += _exp
-                _m["exp_cost"] += _cost_exp
-                # Start-of-day standing charge: first non-zero of the day
-                # (rows ascending). Not MAX (over-bills when charge decreases).
-                if _sc > 0 and not _dd["standing"]:
-                    _dd["standing"] = _sc
-                if _cg is not None:
-                    _m["carbon_g"] = (_m["carbon_g"] or 0.0) + _cg
-                    _b_net = _imp - _exp
-                    if _b_net != 0:
-                        _b_int = abs(_cg / _b_net)
-                        _m["cg_imp"] = (_m["cg_imp"] or 0.0) + _imp * _b_int
-                        _m["cg_exp"] = (_m["cg_exp"] or 0.0) + _exp * _b_int
-                        _m["ci_abs_carbon"]  += abs(_cg)
-                        _m["ci_abs_net_kwh"] += abs(_b_net)
-                    elif _exp == 0:
-                        _m["cg_imp"] = (_m["cg_imp"] or 0.0) + abs(_cg)
-                        _m["ci_abs_carbon"]  += abs(_cg)
-                        _m["ci_abs_net_kwh"] += _imp
-                    else:
-                        _m["cg_exp"] = (_m["cg_exp"] or 0.0) + abs(_cg)
-                        _m["ci_abs_carbon"]  += abs(_cg)
-                        _m["ci_abs_net_kwh"] += _exp
-            else:
-                # Sub-meter — accumulate by rate for main meter cost subtraction
-                _mid = _r["meter_id"]
-                if _mid not in _dd["subs"]:
-                    _dd["subs"][_mid] = {"imp_kwh":0.0,"imp_cost":0.0,"exp_kwh":0.0,"exp_cost":0.0,"carbon_g":None}
-                _s = _dd["subs"][_mid]
-                _sub_imp = float(_r["imp_kwh_grid"] or _imp)
-                _s["imp_kwh"]  += _sub_imp
-                _s["imp_cost"] += _cost_imp
-                _s["exp_kwh"]  += _exp
-                _s["exp_cost"] += _cost_exp
-                if _cg is not None:
-                    _s["carbon_g"] = (_s["carbon_g"] or 0.0) + _cg
-                # Also accumulate sub cost by rate for main meter subtraction
-                _rate = round(float(_r["imp_rate"] or 0), 6)
-                if _rate not in _dd["main"]["_sub_by_rate"]:
-                    _dd["main"]["_sub_by_rate"][_rate] = {"kwh": 0.0, "cost": 0.0}
-                _dd["main"]["_sub_by_rate"][_rate]["kwh"]  += _sub_imp
-                _dd["main"]["_sub_by_rate"][_rate]["cost"] += _cost_imp
-
-        # ── Compute main meter imp_cost via rate-based subtraction ─────────────
-        # This matches calculate_billing_summary_for_period exactly (2.7.1 behaviour).
-        for _ld, _dd in _day_data.items():
-            _m = _dd["main"]
-            _direct_cost = 0.0
-            for _rate, _mv in (_m.get("_main_by_rate") or {}).items():
-                _sv = (_m.get("_sub_by_rate") or {}).get(_rate, {"kwh": 0.0, "cost": 0.0})
-                _direct_cost += max(0.0, _mv["cost"] - _sv["cost"])
-            _m["imp_cost"] = _direct_cost
+        _day_data = _aggregate_block_rows(
+            _raw_rows, _bucket_local_day,
+            standing_scope="bucket", billing_day_fallback=billing_day)
 
         # Pre-compute billing periods
         _bp_start_by_date = {}
@@ -2203,71 +2294,21 @@ def api_blocks_summary():
             if _ds not in _day_data:
                 continue
             _dd = _day_data[_ds]
-            _m  = _dd["main"]
-
-            _avg_intensity = (round(_m["ci_abs_carbon"] / _m["ci_abs_net_kwh"], 1)
-                              if _m["ci_abs_net_kwh"] > 0 else None)
-
-            _sub_carbon_for_remainder = sum(
-                float(st["carbon_g"]) for st in _dd["subs"].values()
-                if st["carbon_g"] is not None and st["carbon_g"] != 0.0
-            )
-            _cg_imp = _m["cg_imp"]
-            _main_carbon_remainder = (round(_cg_imp - _sub_carbon_for_remainder, 4)
-                                      if _cg_imp is not None else None)
-
-            meters_out = {"electricity_main": {
-                "imp_kwh":     round(_m["imp_kwh"],  4),
-                "imp_cost":    round(_m["imp_cost"], 4),
-                "exp_kwh":     round(_m["exp_kwh"],  4),
-                "exp_cost":    round(_m["exp_cost"], 4),
-                "carbon_g":    _main_carbon_remainder,
-                "carbon_g_imp": round(_cg_imp, 4) if _cg_imp is not None else None,
-                "carbon_g_exp": round(_m["cg_exp"], 4) if _m["cg_exp"] is not None else None,
-            }}
-            for _mid, _st in _dd["subs"].items():
-                meters_out[_mid] = {
-                    "imp_kwh":  round(_st["imp_kwh"],  3),
-                    "imp_cost": round(_st["imp_cost"], 4),
-                    "exp_kwh":  round(_st["exp_kwh"],  3),
-                    "exp_cost": round(_st["exp_cost"], 4),
-                    "carbon_g": round(_st["carbon_g"], 4) if _st["carbon_g"] is not None and _st["carbon_g"] != 0.0 else None,
-                }
 
             _bp_entry = _bp_start_by_date.get(_ds)
             # Keep all values at 4dp so the JS can sum across days without
             # accumulating per-day rounding error. Display rounding (2dp)
             # happens in the JS via .toFixed(2) at render time.
-            _main_imp_kwh  = round(_m["imp_kwh"],  4)
-            _main_imp_cost = round(_m["imp_cost"], 4)
-            _main_exp_kwh  = round(_m["exp_kwh"],  4)
-            _main_exp_cost = round(_m["exp_cost"], 4)
-            meters_out["electricity_main"]["imp_kwh"]  = _main_imp_kwh
-            meters_out["electricity_main"]["imp_cost"] = _main_imp_cost
-            meters_out["electricity_main"]["exp_kwh"]  = _main_exp_kwh
-            meters_out["electricity_main"]["exp_cost"] = _main_exp_cost
-            rows.append({
+            _row = {
                 "year":                  d.year,
                 "month":                 d.month,
                 "day":                   d.day,
                 "billing_day":           _dd["billing_day"],
                 "billing_period_start":  _bp_entry[0] if _bp_entry else _ds,
                 "billing_period_end":    _bp_entry[1] if _bp_entry else None,
-                "standing":     round(_dd["standing"], 4),
-                "meters":       meters_out,
-                "imp_kwh":  round(_main_imp_kwh  + sum(m["imp_kwh"]  for mid,m in meters_out.items() if mid != "electricity_main"), 4),
-                "exp_kwh":  round(_main_exp_kwh,  4),
-                "imp_cost": round(_main_imp_cost + sum(m["imp_cost"] for mid,m in meters_out.items() if mid != "electricity_main"), 4),
-                "exp_cost": round(_main_exp_cost, 4),
-                "net_cost": round(
-                    round(_main_imp_cost + sum(m["imp_cost"] for mid,m in meters_out.items() if mid != "electricity_main"), 4)
-                    + round(_dd["standing"], 4)
-                    - round(_main_exp_cost, 4),
-                    2),
-                "carbon_g_net":   round(_m["carbon_g"], 4) if _m["carbon_g"] is not None else None,
-                "carbon_g_total": round(_m["carbon_g"], 4) if _m["carbon_g"] is not None else None,
-                "avg_intensity":  _avg_intensity,
-            })
+            }
+            _row.update(_bucket_to_row_values(_dd))
+            rows.append(_row)
 
         all_meter_ids = [m for m in meter_colors if m != "electricity_main_export"]
         meters_list = [{
@@ -2297,6 +2338,114 @@ def api_blocks_summary():
     except Exception as e:
         logger.error("api_blocks_summary: %s", e)
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/charts/blocks-day")
+def api_blocks_day():
+    """Per-half-hour breakdown for ONE local day — the Usage Stats 'HH' granularity.
+
+    Same billing-accurate aggregation as /blocks-summary (rate-keyed direct-cost
+    subtraction, sub-meters, carbon split, export), but bucketed by half-hour SLOT
+    instead of by day, and ALWAYS returning a full day of slots (zero-filled), so
+    the chart shows 48 bars even for slots that aren't populated yet.
+    Query: date=YYYY-MM-DD (local; default today). Rows match barAggRows' shape."""
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        from datetime import datetime as _dt, timedelta as _td
+        import energy_charts as _ec
+        from block_store import local_date_to_utc_bounds as _ldtub
+
+        cfg = load_config()
+        store = _get_store()
+        main_meta = {}
+        for md in cfg.get("meters", {}).values():
+            if not (md.get("meta") or {}).get("sub_meter"):
+                main_meta = md.get("meta") or {}
+                break
+        tz_name = main_meta.get("timezone", "UTC")
+        currency = main_meta.get("currency_symbol", "£")
+        bm = int(main_meta.get("block_minutes") or 30)
+        billing_day = int(main_meta.get("billing_day") or 1)
+        _tz = _ZI(tz_name)
+        _utc = _ZI("UTC")
+
+        date_str = (request.args.get("date") or "").strip()
+        if not date_str:
+            date_str = _dt.now(_tz).strftime("%Y-%m-%d")
+        try:
+            _day = _dt.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            return jsonify({"error": "bad date (want YYYY-MM-DD)"}), 400
+
+        _u_s, _u_e = _ldtub(date_str, tz_name)          # UTC bounds for the local day
+        active_pid_sq = ("SELECT id FROM config_periods "
+                         "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1")
+        _raw = store._conn.execute(f"""
+            SELECT b.block_start, b.meter_id, m.is_sub_meter,
+                   b.imp_kwh, b.imp_kwh_grid, b.imp_kwh_remainder,
+                   b.imp_rate, b.imp_cost, b.exp_kwh, b.exp_cost,
+                   b.standing_charge, b.carbon_g
+            FROM blocks b
+            JOIN config_periods cp ON b.config_period_id = cp.id
+            LEFT JOIN meters m ON m.meter_id = b.meter_id
+              AND m.config_period_id = ({active_pid_sq})
+            WHERE b.block_start >= ? AND b.block_start < ?
+            ORDER BY b.block_start
+        """, (_u_s, _u_e)).fetchall()
+
+        def _slot_of(bs):
+            return (_dt.fromisoformat(bs).replace(tzinfo=_utc)
+                    .astimezone(_tz).strftime("%H:%M"))
+
+        # Same billing-accurate aggregation as /blocks-summary, bucketed by slot.
+        # standing_scope='global' books the day's single standing charge on the
+        # first slot that carries one, so the 48 bars sum to exactly one day.
+        slots = _aggregate_block_rows(
+            _raw, _slot_of, standing_scope="global", billing_day_fallback=billing_day)
+
+        n_slots = int(round(24 * 60 / max(1, bm)))
+        _base = _dt(_day.year, _day.month, _day.day)
+        rows = []
+        for i in range(n_slots):
+            sk = (_base + _td(minutes=bm * i)).strftime("%H:%M")
+            _s = slots.get(sk)
+            if not _s:
+                rows.append({"slot": sk, "label": sk, "standing": 0,
+                             "imp_kwh": 0, "exp_kwh": 0, "imp_cost": 0, "exp_cost": 0,
+                             "net_cost": 0, "carbon_g_net": None, "carbon_g_total": None,
+                             "avg_intensity": None,
+                             "meters": {"electricity_main": {"imp_kwh": 0, "imp_cost": 0,
+                                        "exp_kwh": 0, "exp_cost": 0, "carbon_g": None,
+                                        "carbon_g_imp": None, "carbon_g_exp": None}}})
+                continue
+            _row = {"slot": sk, "label": sk}
+            _row.update(_bucket_to_row_values(_s))
+            rows.append(_row)
+
+        meter_colors = _ec.build_meter_colors_from_config(cfg)
+        meter_labels = {}
+        for mid, mc in cfg.get("meters", {}).items():
+            meta = (mc.get("meta") or {})
+            meter_labels[mid] = ((meta.get("device") or meta.get("site") or mid)
+                                 if meta.get("sub_meter") else "Direct")
+        all_meter_ids = [m for m in meter_colors if m != "electricity_main_export"]
+        meters_list = [{"id": mid, "label": meter_labels.get(mid, mid),
+                        "color": meter_colors[mid], "is_sub": mid != "electricity_main"}
+                       for mid in all_meter_ids]
+        _postcode = ""
+        for _md in cfg.get("meters", {}).values():
+            _postcode = (_md.get("meta") or {}).get("postcode_prefix", "").strip()
+            if _postcode:
+                break
+        return jsonify({"currency": currency, "billing_day": billing_day,
+                        "block_minutes": bm, "date": date_str, "rows": rows,
+                        "meters": meters_list,
+                        "export_color": meter_colors.get("electricity_main_export", "#ff7f0e"),
+                        "has_postcode": bool(_postcode)})
+    except Exception as e:
+        logger.error("api_blocks_day: %s", e)
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/charts/heatmap")
 def api_chart_heatmap():
@@ -3634,6 +3783,271 @@ def api_unsettled_blocks():
         return jsonify({"error": str(e)}), 500
 
 
+# ── Unified backfill (Heal Gaps + Historical Import) ────────────────────────
+def _bf_step_minutes(store) -> int:
+    """Block length in minutes from the earliest config period (fallback 30)."""
+    try:
+        row = store._conn.execute(
+            "SELECT block_start FROM blocks ORDER BY block_start LIMIT 1").fetchone()
+        if row:
+            cp = store.get_config_period_for_date(row[0]) or {}
+            return int(cp.get("block_minutes") or 30)
+    except Exception:
+        pass
+    return 30
+
+
+def _bf_flatten_gap_starts(gaps, step_min, cap=20000):
+    """Expand [{start,end,slots}] runs into individual half-hour start ISO strings."""
+    from datetime import datetime as _dt, timedelta as _td
+    out, step = [], _td(minutes=step_min)
+    for g in gaps:
+        try:
+            t = _dt.fromisoformat(g["start"]); end = _dt.fromisoformat(g["end"])
+        except Exception:
+            continue
+        while t <= end and len(out) < cap:
+            out.append(t.isoformat()); t += step
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _bf_range_starts(from_iso, to_iso, step_min, cap=20000):
+    """Every block start in [from, to) as ISO strings (capped)."""
+    from datetime import datetime as _dt, timedelta as _td
+    out = []
+    try:
+        t = _dt.fromisoformat(from_iso); end = _dt.fromisoformat(to_iso)
+    except Exception:
+        return out
+    step = _td(minutes=step_min)
+    while t < end and len(out) < cap:
+        out.append(t.isoformat()); t += step
+    return out
+
+
+@app.route("/api/backfill/plan", methods=["POST"])
+def api_backfill_plan():
+    """Preview a unified backfill: gate + dispatch + window classification.
+
+    Body: {scope: whole_history|gaps|range, source: api|csv, from?, to?}.
+    Read-only — computes what WOULD happen, performs no writes. Delegates the
+    decision logic to backfill.plan_backfill; this endpoint only gathers the live
+    state (API availability, gaps, occupied windows) it needs.
+    """
+    try:
+        import engine as _eng
+        import backfill as _bf
+        body   = request.get_json(silent=True) or {}
+        scope  = body.get("scope")
+        source = body.get("source")
+        store  = _get_store()
+        api_available = _eng.kraken_available()
+        has_blocks    = bool(store.count_blocks())
+        gaps          = store.find_block_gaps()
+
+        target_starts = occupied_starts = None
+        if scope == "gaps":
+            target_starts = _bf_flatten_gap_starts(gaps, _bf_step_minutes(store))
+            occupied_starts = []                     # gaps are empty by definition
+        elif scope == "range":
+            _from, _to = body.get("from"), body.get("to")
+            if not _from or not _to:
+                return jsonify({"ok": False, "reason": "bad_range",
+                                "message": "A start and end date are required."}), 400
+            occupied_starts = [r[0] for r in store._conn.execute(
+                "SELECT block_start FROM blocks WHERE meter_id='electricity_main' "
+                "AND block_start >= ? AND block_start < ? ORDER BY block_start",
+                (_from, _to))]
+            target_starts = _bf_range_starts(_from, _to, _bf_step_minutes(store))
+
+        plan = _bf.plan_backfill(
+            scope=scope, source=source, api_available=api_available,
+            has_blocks=has_blocks, gaps=gaps,
+            target_starts=target_starts, occupied_starts=occupied_starts)
+        plan.update({"api_available": api_available, "has_blocks": has_blocks,
+                     "gaps_present": bool(gaps),
+                     "gap_slots_total": sum(g.get("slots", 0) for g in gaps)})
+        return jsonify(plan), (200 if plan.get("ok") else 400)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/backfill/run", methods=["POST"])
+def api_backfill_run():
+    """Execute a unified backfill after a preview.
+
+    Re-checks the gate server-side (never trusts the client's earlier preview),
+    requires `confirmed`, then dispatches on the plan's action:
+
+      resolve_history_gaps -> run inline on the engine loop  (gaps + API)
+      run_api_import_job   -> DEFER to /api/historical/api-import/start, the
+                              dedicated background controller (owns backup +
+                              pause/resume/cancel).
+      apply_csv_import     -> apply here if a full `channel_csvs` dict is supplied;
+                              otherwise DEFER to the CSV import wizard (which owns
+                              rate/period confirmation).
+
+    A 'deferred' response tells the caller which existing controller to drive.
+    """
+    try:
+        import engine as _eng
+        import backfill as _bf
+        body   = request.get_json(silent=True) or {}
+        scope  = body.get("scope")
+        source = body.get("source")
+        store  = _get_store()
+        api_available = _eng.kraken_available()
+        has_blocks    = bool(store.count_blocks())
+        gaps          = store.find_block_gaps()
+
+        gate = _bf.evaluate_gates(scope, source, api_available=api_available,
+                                  has_blocks=has_blocks, gaps_present=bool(gaps))
+        if not gate["allowed"]:
+            return jsonify({"ok": False, "reason": gate["reason"],
+                            "message": gate["message"]}), 400
+        if not body.get("confirmed"):
+            return jsonify({"ok": False, "reason": "unconfirmed",
+                            "message": "Confirmation required before writing."}), 400
+
+        action = _bf.dispatch_action(scope, source)["action"]
+
+        if action == "resolve_history_gaps":
+            result = _run_on_engine_loop(_eng.resolve_history_gaps(), timeout=300.0) or {}
+            return jsonify({"ok": bool(result.get("ok", True)),
+                            "action": action, **result}), 200
+
+        if action == "apply_csv_import":
+            channel_csvs = body.get("channel_csvs")
+            if not channel_csvs and body.get("csv"):
+                channel_csvs = {"import": body["csv"]}
+            if not channel_csvs:
+                return jsonify({"ok": True, "action": action, "deferred": True,
+                                "use_endpoint": "/api/historical/import-csv",
+                                "message": "Upload the CSV via the import wizard "
+                                           "(rate/period confirmation happens there)."}), 200
+            res = store.apply_csv_import(channel_csvs)
+            return jsonify({"ok": True, "action": action, "result": res}), 200
+
+        if action == "run_api_import_job":
+            return jsonify({"ok": True, "action": action, "deferred": True,
+                            "use_endpoint": "/api/historical/api-import/start",
+                            "message": "Start the background API import via its "
+                                       "controller (backup + pause/resume/cancel)."}), 200
+
+        return jsonify({"ok": False, "message": "no runner for action '%s'" % action}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/backfill/reach")
+def api_backfill_reach():
+    """How far back the supplier API can provide data, and the point it fills up to
+    (your oldest existing block), for the Import-history 'how far back' display.
+    Read-only; flattens plan_api_import. Returns ok:False (not an error) when no API."""
+    try:
+        import engine as _eng
+        if not _eng.kraken_available():
+            return jsonify({"ok": False, "reason": "no_api", "available": False}), 200
+        plan = _run_on_engine_loop(_eng.plan_api_import(), timeout=60.0) or {}
+        if not plan.get("ok"):
+            return jsonify({"ok": False, "reason": plan.get("reason") or "unavailable",
+                            "note": plan.get("note")}), 200
+        chans = plan.get("channels") or {}
+        froms = [c["window"]["from"] for c in chans.values()
+                 if c.get("ok") and (c.get("window") or {}).get("from")]
+        chunks = [c.get("chunk_count", 0) for c in chans.values() if c.get("ok")]
+        return jsonify({"ok": True, "available": True,
+                        "reach_from": (min(froms) if froms else None),
+                        "up_to": plan.get("go_live"),
+                        "chunk_estimate": (max(chunks) if chunks else 0)}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/backfill/fill-gap", methods=["POST"])
+def api_backfill_fill_gap():
+    """Fill ONE gap window via the supplier API — as a BACKGROUND job, identical in
+    behaviour to the whole/date import but bounded to [from → to] on the gap's
+    channel: in-pass price recovery, the verify pass, carbon re-arm, chart rebuild,
+    pause/resume — all tracked in the shared import status + pricing-health panel.
+    Channel-scoped so a missing-export gap doesn't overwrite present live import
+    data. Body: {from, to, channel?, confirmed}. Requires API + confirmation."""
+    try:
+        import engine as _eng
+        import asyncio as _asyncio
+        if not _eng.kraken_available():
+            return jsonify({"ok": False, "reason": "no_api",
+                            "message": "No supplier API configured."}), 400
+        body = request.get_json(silent=True) or {}
+        frm, to = body.get("from"), body.get("to")
+        if not frm or not to:
+            return jsonify({"ok": False, "reason": "bad_range",
+                            "message": "from and to are required."}), 400
+        if not body.get("confirmed"):
+            return jsonify({"ok": False, "reason": "unconfirmed",
+                            "message": "Confirmation required before writing."}), 400
+        if _eng.api_import_running():
+            return jsonify({"ok": False, "reason": "busy",
+                            "message": "An import is already running.",
+                            "status": _eng.api_import_status()}), 409
+        if not (_event_loop and _event_loop.is_running()):
+            return jsonify({"ok": False, "reason": "no_loop",
+                            "message": "engine loop not running"}), 500
+        ch = body.get("channel")
+        channels = (ch,) if ch in ("import", "export") else ("import", "export")
+        _asyncio.run_coroutine_threadsafe(
+            _eng.run_gap_fill_job(frm, to, channels=channels), _event_loop)
+        return jsonify({"ok": True, "status": "running"}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/backfill/gaps")
+def api_backfill_gaps():
+    """Unified "what's missing" for the heal UI. The user doesn't distinguish, so
+    we merge two kinds into one labelled list:
+
+      * missing BLOCK rows  — find_block_gaps() (import channel, interior holes).
+      * missing per-channel DATA — the import's own self-clearing record for the
+        import AND export channels (engine.api_import_gaps): windows where blocks
+        exist but that channel's data is absent (e.g. a settlement/DCC outage).
+
+    Each entry carries channel + kind so the fill can pick the right template.
+    `fetchable` marks entries an API can (re)fetch. Read-only."""
+    try:
+        import engine as _eng
+        store = _get_store()
+        api_available = _eng.kraken_available()
+        gaps = []
+        # (1) Missing block rows — import channel.
+        for g in store.find_block_gaps():
+            slots = int(g.get("slots") or 0)
+            gaps.append({"start": g.get("start"), "end": g.get("end"), "slots": slots,
+                         "hours": round(slots / 2.0, 1), "channel": "import",
+                         "kind": "missing_blocks", "fetchable": True})
+        # (2) Missing per-channel data recorded by the import (import + export).
+        imp = _eng.api_import_gaps() or {}
+        for ch, cd in (imp.get("channels") or {}).items():
+            for g in (cd.get("gaps") or []):
+                cnt = int(g.get("count") or 0)
+                if not g.get("from"):
+                    continue
+                gaps.append({"start": g.get("from"), "end": g.get("to") or g.get("from"),
+                             "slots": cnt, "hours": round(cnt / 2.0, 1), "channel": ch,
+                             "kind": "missing_data", "fetchable": api_available})
+        gaps.sort(key=lambda x: (x.get("start") or ""), reverse=True)
+        return jsonify({
+            "ok": True, "gaps": gaps,
+            "total_slots": sum(g["slots"] for g in gaps),
+            "fetchable_slots": sum(g["slots"] for g in gaps if g["fetchable"]),
+            "api_available": api_available,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/history-gaps")
 def api_history_gaps():
     """Review: missing half-hour slots in the block history (outage holes).
@@ -3685,6 +4099,15 @@ def api_retry_settlement():
                             "error": "No supplier API configured"}), 400
         result = _run_on_engine_loop(_eng.retry_settlement_for_unsettled(),
                                      timeout=120.0)
+        # Settlement rewrote block figures (e.g. late export finally landing) — the
+        # pre-built charts still show the pre-settlement values until regenerated.
+        # Rebuild off the loop, but only when something actually changed.
+        if result.get("ok") and (result.get("settled_import")
+                                 or result.get("settled_export")):
+            try:
+                _run_on_engine_loop(_eng._generate_charts_offloaded(), timeout=300.0)
+            except Exception as _e:
+                logger.warning("retry-settlement: chart regen failed: %s", _e)
         status = 200 if result.get("ok") else 400
         return jsonify(result), status
     except Exception as e:
@@ -4437,6 +4860,30 @@ def api_historical_gap_template():
                         headers={"Content-Disposition": f'attachment; filename="{fname}"'})
     except Exception as e:
         logger.error("api_historical_gap_template: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/historical/slots-template", methods=["POST"])
+def api_historical_slots_template():
+    """Pre-filled CSV for an ARBITRARY set of slots — the pricing-health escape
+    hatch: hand the user exactly the half-hours the API couldn't price so they can
+    fill them from their bill and run them through the CSV reprice path.
+    Body: {starts: [naive-UTC iso...], channel}."""
+    try:
+        from flask import Response
+        import csv_import as _ci
+        body = request.get_json(silent=True) or {}
+        starts = body.get("starts") or []
+        channel = (body.get("channel") or "import").strip().lower()
+        if not starts:
+            return jsonify({"error": "no slots"}), 400
+        bm, tz = _period_block_minutes_tz(_get_store(), starts[0])
+        csv_text = _ci.slots_template_csv(starts, block_minutes=bm, tz_name=tz)
+        fname = f"emt-slots-{channel}-{len(starts)}.csv"
+        return Response(csv_text, mimetype="text/csv",
+                        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+    except Exception as e:
+        logger.error("api_historical_slots_template: %s", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -6054,6 +6501,14 @@ def _corrections_unreconciled_count(store, from_date, to_date, channel,
 
 
 _CHARGE_SESSION_BRIDGE_MIN = 180  # minutes; merge bursts within one plug-in period
+# The "upcoming" plan is a live forecast that IOG revises. dispatch_history keeps
+# every planned slot it ever saw (so absent stays meaningful for *completed*), but
+# a slot dropped from a revised plan must not keep inflating the upcoming total.
+# So an upcoming planned slot only counts if it was re-seen in (or very near) the
+# most-recent planned observation — dispatches are polled ≥5 min apart, so a
+# superseded slot's last_seen falls a full poll behind the current plan's.
+_UPCOMING_BATCH_SEC = 150   # slots within this of the freshest plan = the current plan
+_UPCOMING_STALE_MIN = 20    # if the freshest plan itself is older than this, no live plan
 
 
 def _slot_is_off_peak(rate, peak_r):
@@ -6184,11 +6639,13 @@ def _build_upcoming_dispatches(history, rates, day_peak, now_iso,
     slots = {}
     for r in history:
         s = slots.setdefault(r["slot_start"], {
-            "planned": None, "completed": None,
+            "planned": None, "completed": None, "planned_seen": None,
             "raw_start": None, "raw_end": None, "provider": r.get("provider")})
         k = r.get("kind")
         if k == "planned" and r.get("energy_kwh") is not None:
             s["planned"] = r.get("energy_kwh")
+            if r.get("last_seen"):
+                s["planned_seen"] = r["last_seen"]
         elif k == "completed" and r.get("energy_kwh") is not None:
             s["completed"] = r.get("energy_kwh")
         if r.get("raw_start"):
@@ -6196,10 +6653,30 @@ def _build_upcoming_dispatches(history, rates, day_peak, now_iso,
         if r.get("raw_end"):
             s["raw_end"] = r["raw_end"]
 
+    # Only the *current* plan is upcoming: keep planned slots re-seen in (or within
+    # _UPCOMING_BATCH_SEC of) the freshest planned observation, so slots a revised
+    # plan dropped don't linger and inflate the total. If the freshest plan itself
+    # is older than _UPCOMING_STALE_MIN, there's no live plan → nothing upcoming.
+    # When last_seen is absent (older data / unit tests), skip this filter.
+    _seens = [v["planned_seen"] for v in slots.values()
+              if v["planned"] is not None and v["planned_seen"]]
+    _batch_cutoff = None
+    if _seens:
+        _newest = max(_dt.fromisoformat(s) for s in _seens)
+        if (now - _newest) > _td(minutes=_UPCOMING_STALE_MIN):
+            return []
+        _batch_cutoff = _newest - _td(seconds=_UPCOMING_BATCH_SEC)
+
+    def _is_current(v):
+        if _batch_cutoff is None or not v["planned_seen"]:
+            return True
+        return _dt.fromisoformat(v["planned_seen"]) >= _batch_cutoff
+
     upcoming = sorted(
         k for k, v in slots.items()
         if v["planned"] is not None and v["completed"] is None
-        and _dt.fromisoformat(k) + _td(minutes=30) > now)
+        and _dt.fromisoformat(k) + _td(minutes=30) > now
+        and _is_current(v))
     if not upcoming:
         return []
 

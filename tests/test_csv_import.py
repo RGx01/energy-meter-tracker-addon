@@ -52,6 +52,32 @@ class TestParse(unittest.TestCase):
         r = ci.parse_octopus_csv("Foo,Bar\n1,2\n", "import")
         self.assertFalse(r["ok"])
 
+    def test_rate_column_derives_cost(self):
+        # Unit Rate (p/kWh) present → cost = rate × kWh (pence → £).
+        csv = ("Start,End,Consumption (kWh),Unit Rate (p/kWh)\n"
+               "2024-07-01T01:00:00+01:00,2024-07-01T01:30:00+01:00,2.0,24.5\n")
+        r = ci.parse_octopus_csv(csv, "import")
+        b = r["blocks"][0]
+        self.assertAlmostEqual(b["rate"], 0.245, places=6)          # £/kWh
+        self.assertAlmostEqual(b["cost"], 0.49, places=6)           # 0.245 × 2.0
+
+    def test_rate_takes_priority_over_cost(self):
+        # Both columns present → rate wins (cost = rate × kWh, not the cost column).
+        csv = ("Start,End,Consumption (kWh),Unit Rate (p/kWh),Estimated Cost Inc. Tax (p)\n"
+               "2024-07-01T01:00:00+01:00,2024-07-01T01:30:00+01:00,2.0,10.0,999.0\n")
+        r = ci.parse_octopus_csv(csv, "import")
+        b = r["blocks"][0]
+        self.assertAlmostEqual(b["cost"], 0.20, places=6)          # 0.10 × 2.0, NOT 9.99
+
+    def test_cost_used_when_no_rate(self):
+        # No rate column → fall back to the explicit cost column (Octopus export).
+        csv = ("Start,End,Consumption (kWh),Estimated Cost Inc. Tax (p)\n"
+               "2024-07-01T01:00:00+01:00,2024-07-01T01:30:00+01:00,2.0,49.0\n")
+        r = ci.parse_octopus_csv(csv, "import")
+        b = r["blocks"][0]
+        self.assertIsNone(b["rate"])
+        self.assertAlmostEqual(b["cost"], 0.49, places=6)
+
 
 class TestDeriveBanded(unittest.TestCase):
     def _banded(self):
@@ -156,8 +182,9 @@ class TestTemplateGeneration(unittest.TestCase):
         lines = text.strip().splitlines()
         self.assertEqual(
             lines[0],
-            "Start,End,Consumption (kWh),Estimated Cost Inc. Tax (p),Standing Charge Inc. Tax (p)")
-        self.assertTrue(lines[1].endswith(",,,"))   # three blank data columns
+            "Start,End,Consumption (kWh),Unit Rate (p/kWh),"
+            "Estimated Cost Inc. Tax (p),Standing Charge Inc. Tax (p)")
+        self.assertTrue(lines[1].endswith(",,,,"))   # four blank data columns
 
     def test_gap_template_local_offsets_track_dst(self):
         summer = ci.gap_template_csv("2024-07-01T00:00:00", "2024-07-01T00:30:00", tz_name="Europe/London")
@@ -171,6 +198,23 @@ class TestTemplateGeneration(unittest.TestCase):
         self.assertEqual(len(parsed["blocks"]), 4)
         self.assertGreater(parsed["blocks"][0]["kwh"], 0)
         self.assertIsNotNone(parsed["blocks"][0]["cost"])
+
+    def test_slots_template_arbitrary_slots(self):
+        # Non-contiguous slots (the escape hatch): one row per start, blank data,
+        # local DST-correct offsets, round-trips back through the parser to UTC.
+        starts = ["2025-03-05T00:00:00", "2025-03-05T00:30:00", "2025-07-01T13:00:00"]
+        text = ci.slots_template_csv(starts, block_minutes=30, tz_name="Europe/London")
+        lines = text.strip().splitlines()
+        self.assertEqual(len(lines), 1 + len(starts))               # header + 3 rows
+        self.assertTrue(lines[1].endswith(",,,,"))                  # four blank data cols
+        self.assertIn("+00:00", text)                              # GMT (March 5)
+        self.assertIn("+01:00", text)                              # BST (July 1)
+        parsed = ci.parse_octopus_csv(text, "import")
+        self.assertEqual([b["block_start"] for b in parsed["blocks"]], starts)
+
+    def test_slots_template_skips_unparseable(self):
+        text = ci.slots_template_csv(["", None, "not-a-date", "2025-03-05T00:00:00"])
+        self.assertEqual(len(text.strip().splitlines()), 2)         # header + 1 valid
 
 
 if __name__ == "__main__":

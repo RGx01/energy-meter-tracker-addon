@@ -324,6 +324,20 @@ class TestImportRepriceQueue(unittest.TestCase):
                              "WHERE block_start='2026-06-05T18:30:00'").fetchone()
         self.assertAlmostEqual(r2["imp_rate"], 0.28)               # live row untouched
 
+    def test_reprice_from_csv_rate_first_and_column_order_agnostic(self):
+        # Shares the name-matched parser now, so (a) a Unit Rate column drives cost
+        # = rate × kWh (no explicit cost needed), and (b) column ORDER doesn't
+        # matter — the old positional reader would have misread this layout.
+        s = self._store()
+        csv = ("Start,Consumption (kWh),Unit Rate (p/kWh),End\n"
+               "2025-10-21T19:30:00+01:00,4.0,7.5,2025-10-21T20:00:00+01:00\n")
+        res = s.reprice_imported_blocks_from_csv(csv)
+        self.assertEqual(res["changed"], 1)
+        r = s._conn.execute("SELECT imp_rate, imp_cost FROM blocks "
+                            "WHERE block_start='2025-10-21T18:30:00'").fetchone()
+        self.assertAlmostEqual(r["imp_cost"], 0.30)                # 0.075 × 4.0
+        self.assertAlmostEqual(r["imp_rate"], 0.075)               # cost / kWh
+
     def test_get_imported_block_starts_range(self):
         s = self._store()
         got = s.get_imported_block_starts("2025-10-01T00:00:00", "2025-11-01T00:00:00")
@@ -918,6 +932,23 @@ class TestExportSettlementUnsettled303(unittest.TestCase):
         self.assertEqual(self.store.count_unsettled_blocks(), 1)
         self._settle(s, 15.9, "export")
         self.assertEqual(self.store.count_unsettled_blocks(), 0)
+
+    def test_zero_live_export_on_exporting_meter_is_chased(self):
+        # blocks-4.db regression: a DCC-export-only meter carries NO live/CAD
+        # daytime export, so an un-settled daytime slot has exp_kwh = 0 (or NULL)
+        # with exp_kwh_api NULL. The old `exp_kwh > 0` guard skipped it, stranding
+        # real solar export (245 slots). It must now be chased because the meter
+        # DEMONSTRABLY exports (another slot has settled export > 0) — the fix is
+        # value-agnostic on the row, keyed on whether the meter exports at all.
+        evening = "2026-07-25T18:00:00"     # export DID settle here (> 0)
+        daytime = "2026-07-25T12:00:00"     # import settled, live export 0, DCC not yet in
+        self.store.append_block(make_block(evening, imp_kwh=0.1, exp_kwh=0.5))
+        self._settle(evening, 0.1, "import")
+        self._settle(evening, 0.5, "export")            # meter has real settled export
+        self.store.append_block(make_block(daytime, imp_kwh=0.2, exp_kwh=0.0))
+        self._settle(daytime, 0.2, "import")            # import settled, export absent
+        self.assertEqual(self.store.count_unsettled_blocks(), 1)   # was 0 under the old guard
+        self.assertEqual(self.store.get_oldest_unsettled_block_start(), daytime)
 
     def test_imported_history_not_counted_unsettled(self):
         # 3.5.0: a reconstructed block (imp_kwh set, imp_kwh_api NULL, and it did

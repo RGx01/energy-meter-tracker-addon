@@ -1303,6 +1303,22 @@ class TestApiCsvTemplates(unittest.TestCase):
         self.assertIn("text/csv", r.headers.get("Content-Type", ""))
         self.assertIn("Start", r.data.decode())
 
+    def test_slots_template_downloads_named_rows(self):
+        # Escape-hatch template: one row per requested slot, channel in the filename.
+        client = make_client()
+        r = client.post("/api/historical/slots-template",
+                        json={"starts": ["2025-03-05T00:00:00", "2025-03-05T00:30:00"],
+                              "channel": "export"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("text/csv", r.headers.get("Content-Type", ""))
+        self.assertIn("slots-export", r.headers.get("Content-Disposition", ""))
+        self.assertEqual(len(r.data.decode().strip().splitlines()), 3)   # header + 2
+
+    def test_slots_template_requires_slots(self):
+        client = make_client()
+        r = client.post("/api/historical/slots-template", json={"starts": []})
+        self.assertEqual(r.status_code, 400)
+
     def test_csv_apply_stashes_region_prompt(self):
         client = make_client()
         csv = ("Consumption (kWh),Estimated Cost Inc. Tax (p),Start,End\n"
@@ -4348,9 +4364,10 @@ class TestChargeSessionsBuilder(unittest.TestCase):
 class TestUpcomingDispatches(unittest.TestCase):
     """BL-10 — _build_upcoming_dispatches surfaces future planned dispatches."""
 
-    def _h(self, slot, kind, e=None, raw_start=None, raw_end=None):
+    def _h(self, slot, kind, e=None, raw_start=None, raw_end=None, last_seen=None):
         return {"slot_start": slot, "kind": kind, "energy_kwh": e,
-                "provider": "Ohme", "raw_start": raw_start, "raw_end": raw_end}
+                "provider": "Ohme", "raw_start": raw_start, "raw_end": raw_end,
+                "last_seen": last_seen}
 
     NOW = "2026-07-18T20:00:00"
 
@@ -4389,6 +4406,37 @@ class TestUpcomingDispatches(unittest.TestCase):
             [self._h("2026-07-18T23:30:00", "planned", -3.4),
              self._h("2026-07-19T05:00:00", "planned", -3.4)], {}, {}, self.NOW)
         self.assertEqual(len(s), 2)
+
+    def test_superseded_plan_slots_dropped(self):
+        # A revised plan: the 02:00 slot is the current plan (re-seen 2 min ago);
+        # the 23:30 slot was dropped from the plan and last seen a full poll+ ago,
+        # so it must NOT keep counting toward the upcoming total.
+        hist = [self._h("2026-07-18T23:30:00", "planned", -3.4,
+                        last_seen="2026-07-18T19:30:00"),   # stale — superseded
+                self._h("2026-07-19T02:00:00", "planned", -3.4,
+                        last_seen="2026-07-18T19:58:00")]   # fresh — current plan
+        s = server._build_upcoming_dispatches(hist, {}, {}, self.NOW)
+        self.assertEqual(len(s), 1)
+        self.assertEqual(s[0]["start"], "2026-07-19T02:00:00")
+        self.assertAlmostEqual(s[0]["kwh"], 3.4, places=3)
+
+    def test_stale_plan_shows_nothing(self):
+        # No plan re-confirmed recently (freshest planned observation > 20 min old)
+        # → the forecast is stale, so nothing is upcoming.
+        hist = [self._h("2026-07-18T23:30:00", "planned", -3.4,
+                        last_seen="2026-07-18T19:30:00")]   # 30 min before NOW
+        self.assertEqual(
+            server._build_upcoming_dispatches(hist, {}, {}, self.NOW), [])
+
+    def test_current_plan_all_fresh_kept(self):
+        # Both slots re-seen in the same recent poll → both current, both kept.
+        hist = [self._h("2026-07-18T23:30:00", "planned", -3.4,
+                        last_seen="2026-07-18T19:58:00"),
+                self._h("2026-07-19T00:00:00", "planned", -3.4,
+                        last_seen="2026-07-18T19:58:00")]
+        s = server._build_upcoming_dispatches(hist, {}, {}, self.NOW)
+        self.assertEqual(len(s), 1)
+        self.assertAlmostEqual(s[0]["kwh"], 6.8, places=3)
 
 
 class TestChargeSessionsAPI(unittest.TestCase):
@@ -5135,6 +5183,334 @@ class TestSweepImplausibleEndpoint(unittest.TestCase):
         self.assertEqual(row["imp_kwh"], 0.0)
         self.assertEqual(row["carbon_g"], 0.0)
         self.assertEqual(row["needs_review"], 1)
+
+
+class TestBackfillPlan(unittest.TestCase):
+    """Preview endpoint /api/backfill/plan — gate wiring + window classification."""
+
+    def setUp(self):
+        self.client = make_client()
+        import engine
+        self._orig = getattr(engine, "kraken_available", None)
+
+    def tearDown(self):
+        import engine
+        if self._orig is not None:
+            engine.kraken_available = self._orig
+
+    def _set_api(self, avail):
+        import engine
+        engine.kraken_available = lambda: avail
+
+    def _plan(self, **body):
+        return self.client.post("/api/backfill/plan", json=body)
+
+    def test_api_source_blocked_without_api(self):
+        self._set_api(False)
+        r = self._plan(scope="whole_history", source="api")
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "no_api")
+
+    def test_api_whole_history_ok(self):
+        self._set_api(True)
+        r = self._plan(scope="whole_history", source="api")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["action"], "run_api_import_job")
+
+    def test_csv_whole_history_ok_without_api(self):
+        self._set_api(False)
+        r = self._plan(scope="whole_history", source="csv")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["action"], "apply_csv_import")
+
+    def test_gaps_blocked_when_no_gaps(self):
+        self._set_api(True)
+        r = self._plan(scope="gaps", source="csv")
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "no_gaps")
+
+    def test_range_requires_dates(self):
+        self._set_api(True)
+        r = self._plan(scope="range", source="csv")
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "bad_range")
+
+    def test_range_classifies_occupied_vs_fill(self):
+        self._set_api(True)
+        # MINIMAL_BLOCKS has a block at 2026-01-15T00:00:00; a 1-hour range = 2 slots.
+        r = self._plan(scope="range", source="csv",
+                       **{"from": "2026-01-15T00:00:00", "to": "2026-01-15T01:00:00"})
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertTrue(j["ok"])
+        self.assertEqual(j["windows"]["occupied_count"], 1)
+        self.assertEqual(j["windows"]["fill_count"], 1)          # 00:30 slot is empty
+        self.assertIn("2026-01-15T00:00:00", j["handoff_to_corrections"])
+
+
+class TestBackfillRun(unittest.TestCase):
+    """Dispatch endpoint /api/backfill/run — re-gate, confirm, route to runners."""
+
+    def setUp(self):
+        self.client = make_client()
+        import engine, server
+        self._orig_ka   = getattr(engine, "kraken_available", None)
+        self._orig_rhg  = getattr(engine, "resolve_history_gaps", None)
+        self._orig_loop = server._run_on_engine_loop
+        self._orig_csv  = getattr(server._store, "apply_csv_import", None)
+        self._orig_gaps = server._store.find_block_gaps
+
+    def tearDown(self):
+        import engine, server
+        if self._orig_ka is not None:
+            engine.kraken_available = self._orig_ka
+        if self._orig_rhg is not None:
+            engine.resolve_history_gaps = self._orig_rhg
+        server._run_on_engine_loop = self._orig_loop
+        if self._orig_csv is not None:
+            server._store.apply_csv_import = self._orig_csv
+        server._store.find_block_gaps = self._orig_gaps
+
+    def _api(self, avail):
+        import engine
+        engine.kraken_available = lambda: avail
+
+    def _run(self, **b):
+        return self.client.post("/api/backfill/run", json=b)
+
+    def test_unconfirmed_rejected(self):
+        self._api(True)
+        r = self._run(scope="whole_history", source="api")
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "unconfirmed")
+
+    def test_gate_rejected_no_api(self):
+        self._api(False)
+        r = self._run(scope="whole_history", source="api", confirmed=True)
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "no_api")
+
+    def test_api_whole_history_defers_to_controller(self):
+        self._api(True)
+        r = self._run(scope="whole_history", source="api", confirmed=True)
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertTrue(j["deferred"])
+        self.assertEqual(j["use_endpoint"], "/api/historical/api-import/start")
+
+    def test_csv_without_content_defers_to_wizard(self):
+        self._api(False)
+        r = self._run(scope="whole_history", source="csv", confirmed=True)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("import-csv", r.get_json()["use_endpoint"])
+
+    def test_csv_with_content_applies(self):
+        import server
+        server._store.apply_csv_import = lambda cc, **k: {"import": {"written": 2}}
+        self._api(False)
+        r = self._run(scope="whole_history", source="csv", confirmed=True,
+                      channel_csvs={"import": "ts,kwh,cost\n"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["result"]["import"]["written"], 2)
+
+    def test_gaps_api_runs_inline(self):
+        import engine, server
+        server._store.find_block_gaps = lambda **k: [
+            {"start": "2026-01-10T00:00:00", "end": "2026-01-10T00:00:00", "slots": 1}]
+        engine.resolve_history_gaps = lambda: "CORO"            # non-coroutine sentinel
+        server._run_on_engine_loop = lambda coro, **k: {"ok": True, "filled": 5}
+        self._api(True)
+        r = self._run(scope="gaps", source="api", confirmed=True)
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertTrue(j["ok"])
+        self.assertEqual(j["action"], "resolve_history_gaps")
+        self.assertEqual(j["filled"], 5)
+
+
+class TestBackfillGaps(unittest.TestCase):
+    """/api/backfill/gaps — unified list: missing block rows + per-channel data gaps."""
+
+    def setUp(self):
+        self.client = make_client()
+        import engine
+        self._ka  = getattr(engine, "kraken_available", None)
+        self._aig = getattr(engine, "api_import_gaps", None)
+
+    def tearDown(self):
+        import engine
+        if self._ka is not None:
+            engine.kraken_available = self._ka
+        if self._aig is not None:
+            engine.api_import_gaps = self._aig
+
+    def test_merges_block_holes_and_channel_data_gaps(self):
+        import server, engine
+        engine.kraken_available = lambda: True
+        # a missing block-row hole (import) ...
+        server._store.find_block_gaps = lambda **k: [
+            {"start": "2026-05-01T00:00:00", "end": "2026-05-01T00:30:00", "slots": 2}]
+        # ... and a persisted EXPORT-channel data gap (blocks exist, export absent)
+        engine.api_import_gaps = lambda: {"channels": {
+            "export": {"gaps": [{"from": "2025-03-05T00:00:00",
+                                 "to": "2025-03-07T23:30:00", "count": 144}]},
+            "import": {"gaps": []}}}
+        r = self.client.get("/api/backfill/gaps")
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertTrue(j["ok"])
+        self.assertEqual(len(j["gaps"]), 2)
+        tags = {g["channel"] + ":" + g["kind"] for g in j["gaps"]}
+        self.assertIn("import:missing_blocks", tags)
+        self.assertIn("export:missing_data", tags)
+        self.assertEqual(j["total_slots"], 146)          # 2 + 144
+        self.assertTrue(j["api_available"])
+
+
+class TestBackfillFillGap(unittest.TestCase):
+    """/api/backfill/fill-gap — launches a BACKGROUND, channel-scoped gap fill
+    (run_gap_fill_job) on the engine loop, mirroring whole/date import. We assert
+    the gate ladder and that the coroutine is scheduled with the right window +
+    channel scoping — not a synchronous result."""
+
+    def setUp(self):
+        self.client = make_client()
+        import engine, server
+        import asyncio
+        self._ka    = getattr(engine, "kraken_available", None)
+        self._run   = getattr(engine, "api_import_running", None)
+        self._job   = getattr(engine, "run_gap_fill_job", None)
+        self._loop  = getattr(server, "_event_loop", None)
+        self._rct   = asyncio.run_coroutine_threadsafe
+
+    def tearDown(self):
+        import engine, server
+        import asyncio
+        if self._ka  is not None: engine.kraken_available = self._ka
+        if self._run is not None: engine.api_import_running = self._run
+        if self._job is not None: engine.run_gap_fill_job = self._job
+        server._event_loop = self._loop
+        asyncio.run_coroutine_threadsafe = self._rct
+
+    class _FakeLoop:
+        def is_running(self):
+            return True
+
+    def _post(self, **b):
+        return self.client.post("/api/backfill/fill-gap", json=b)
+
+    def test_no_api_rejected(self):
+        import engine
+        engine.kraken_available = lambda: False
+        r = self._post(**{"from": "2025-03-05T00:00:00", "to": "2025-03-07T23:30:00", "confirmed": True})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "no_api")
+
+    def test_requires_range(self):
+        import engine
+        engine.kraken_available = lambda: True
+        r = self._post(confirmed=True)
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "bad_range")
+
+    def test_requires_confirm(self):
+        import engine
+        engine.kraken_available = lambda: True
+        r = self._post(**{"from": "x", "to": "y"})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "unconfirmed")
+
+    def test_busy_returns_409(self):
+        import engine, server
+        engine.kraken_available = lambda: True
+        engine.api_import_running = lambda: True
+        engine.api_import_status = lambda: {"phase": "importing"}
+        server._event_loop = self._FakeLoop()
+        r = self._post(**{"from": "2025-03-05T00:00:00", "to": "2025-03-07T23:30:00", "confirmed": True})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.get_json()["reason"], "busy")
+
+    def test_launches_channel_scoped(self):
+        import engine, server
+        import asyncio
+        engine.kraken_available = lambda: True
+        engine.api_import_running = lambda: False
+        server._event_loop = self._FakeLoop()
+        captured = {}
+        def _job(frm, to, *, channels=("import", "export"), **k):
+            captured.update(frm=frm, to=to, channels=channels)
+            return "CORO"
+        engine.run_gap_fill_job = _job
+        scheduled = {}
+        def _rct(coro, loop=None, *a, **k):
+            scheduled["coro"] = coro
+            scheduled["loop"] = loop
+            return object()
+        asyncio.run_coroutine_threadsafe = _rct
+        r = self._post(**{"from": "2025-03-05T00:00:00", "to": "2025-03-07T23:30:00",
+                          "channel": "export", "confirmed": True})
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertTrue(j["ok"])
+        self.assertEqual(j["status"], "running")
+        self.assertEqual(captured["frm"], "2025-03-05T00:00:00")
+        self.assertEqual(captured["to"], "2025-03-07T23:30:00")
+        self.assertEqual(captured["channels"], ("export",))     # channel-scoped, not both
+        self.assertEqual(scheduled["coro"], "CORO")             # background-launched
+
+    def test_launches_both_channels_when_unspecified(self):
+        import engine, server
+        import asyncio
+        engine.kraken_available = lambda: True
+        engine.api_import_running = lambda: False
+        server._event_loop = self._FakeLoop()
+        captured = {}
+        engine.run_gap_fill_job = (lambda frm, to, *, channels=("import", "export"), **k:
+                                   captured.update(channels=channels) or "CORO")
+        asyncio.run_coroutine_threadsafe = lambda *a, **k: object()
+        r = self._post(**{"from": "2025-03-05T00:00:00", "to": "2025-03-07T23:30:00", "confirmed": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(captured["channels"], ("import", "export"))
+
+
+class TestBackfillReach(unittest.TestCase):
+    """/api/backfill/reach — flattened 'how far back can the API go' for Import task."""
+
+    def setUp(self):
+        self.client = make_client()
+        import engine, server
+        self._ka   = getattr(engine, "kraken_available", None)
+        self._pl   = getattr(engine, "plan_api_import", None)
+        self._loop = server._run_on_engine_loop
+
+    def tearDown(self):
+        import engine, server
+        if self._ka is not None: engine.kraken_available = self._ka
+        if self._pl is not None: engine.plan_api_import = self._pl
+        server._run_on_engine_loop = self._loop
+
+    def test_no_api(self):
+        import engine
+        engine.kraken_available = lambda: False
+        j = self.client.get("/api/backfill/reach").get_json()
+        self.assertFalse(j["ok"])
+        self.assertEqual(j["reason"], "no_api")
+
+    def test_flattens_plan(self):
+        import engine, server
+        engine.kraken_available = lambda: True
+        engine.plan_api_import = lambda **k: "CORO"
+        server._run_on_engine_loop = lambda coro, **k: {
+            "ok": True, "go_live": "2024-07-01T00:00:00", "channels": {
+                "import": {"ok": True, "chunk_count": 12,
+                           "window": {"from": "2022-01-01T00:00:00", "to": "2024-07-01T00:00:00"}},
+                "export": {"ok": True, "chunk_count": 10,
+                           "window": {"from": "2023-03-01T00:00:00", "to": "2024-07-01T00:00:00"}}}}
+        j = self.client.get("/api/backfill/reach").get_json()
+        self.assertTrue(j["ok"])
+        self.assertEqual(j["reach_from"], "2022-01-01T00:00:00")   # min across channels
+        self.assertEqual(j["up_to"], "2024-07-01T00:00:00")
+        self.assertEqual(j["chunk_estimate"], 12)                  # max chunk_count
 
 
 if __name__ == "__main__":

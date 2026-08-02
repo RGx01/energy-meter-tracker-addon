@@ -14,56 +14,69 @@
 {% endblock %}
 
 {% block content %}
-<!-- Step 1 — intro + API coverage -->
-<div class="card" id="step-intro">
-  <div style="font-size:13px;color:var(--muted);line-height:1.7;margin-bottom:14px;">
-    Import half-hourly history from your supplier. This is a <strong>best-endeavours
-    reconstruction</strong>: imported blocks are flagged and can be removed at any time
-    (Delete Blocks → reconstructed history). Two routes:
-    the <strong>API</strong> (Octopus) fetches each half-hour's kWh together with
-    Octopus's own <strong>billed cost and off-peak/peak label</strong> — so it's
-    <strong>exact and dispatch-aware, including IOG</strong>, and reaches your
-    <strong>full history</strong>. The <strong>CSV</strong> route is for non-Octopus
-    suppliers or an offline website export.
+<!-- Guided backfill (unified front door: scope -> source -> preview -> apply) -->
+<div class="card" id="bf-card">
+  <div style="font-weight:600;margin-bottom:2px;">Fill missing data</div>
+  <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:12px;">
+    One place to backfill your history or fill gaps. Pick what's missing and where the data
+    should come from — you'll see exactly what will happen before anything is written.
+    Backfilled blocks have no per-device breakdown, and filling gaps can restore blocks you
+    deleted on purpose.
   </div>
 
-  <!-- API import (primary, Octopus) -->
-  <div id="api-import-panel" style="border-top:1px solid var(--border);padding-top:12px;">
-    <div style="font-weight:600;margin-bottom:4px;">API import — Octopus, full history</div>
-    <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:8px;">
-      Each half-hour comes with Octopus's <strong>billed cost + OFF_PEAK/STANDARD_RATE
-      label</strong>, so the rate and off/peak split are exact — a smart-charged evening
-      slot is correctly priced off-peak (no tariff lookup, IOG included). If a slot comes
-      back without its cost (Octopus can drop it when the connection is busy), the import
-      quietly re-fetches that slot on its own and prices it from the real figure.
-      Reversible via Delete Blocks → reconstructed history.
+  <div style="font-size:12px;color:var(--muted);margin-bottom:4px;">1 · Where should the data come from?</div>
+  <div id="bf-source" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+    <button class="btn btn-secondary bf-source-btn" data-source="api" onclick="bfPickSource(this)">API</button>
+    <button class="btn btn-secondary bf-source-btn" data-source="csv" onclick="bfPickSource(this)">CSV</button>
+  </div>
+
+  <div id="bf-task-label" style="display:none;font-size:12px;color:var(--muted);margin-bottom:4px;">2 · What do you want to fill?</div>
+  <div id="bf-task" style="display:none;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+    <!-- API tasks: whole history · date range · gap fill -->
+    <button class="btn btn-secondary bf-scope-btn bf-task-api" data-scope="whole_history" onclick="bfPickScope(this)">Whole history</button>
+    <button class="btn btn-secondary bf-scope-btn bf-task-api" data-scope="range" onclick="bfPickScope(this)">Date range</button>
+    <button class="btn btn-secondary bf-scope-btn bf-task-api" data-scope="gaps" onclick="bfPickScope(this)">Gap fill</button>
+    <!-- CSV tasks: fill gaps · date range (whole-history is an API-only capability) -->
+    <button class="btn btn-secondary bf-scope-btn bf-task-csv" data-scope="gaps" style="display:none;" onclick="bfPickScope(this)">Fill gaps</button>
+    <button class="btn btn-secondary bf-scope-btn bf-task-csv" data-scope="range" style="display:none;" onclick="bfPickScope(this)">Date range</button>
+  </div>
+
+  <div id="bf-range-row" style="display:none;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px;margin-bottom:12px;">
+    <label>Go back to <input type="date" id="bf-from" style="font-size:13px;" oninput="if(_bfSource==='csv'&&_bfScope==='range')bfPreview();"></label>
+    <span id="bf-range-end" style="color:var(--muted);"></span>
+  </div>
+
+  <button class="btn btn-secondary" id="bf-preview-btn" onclick="bfPreview()" style="display:none;" disabled>Preview plan</button>
+  <div id="bf-out" style="margin-top:12px;font-size:13px;"></div>
+</div>
+
+<!-- Step 1 — API import panel (driven by the guided picker above: Preview plan,
+     Date range and Gap fill all land here) -->
+<div class="card" id="step-intro">
+  <div id="api-import-panel">
+    <div style="font-weight:600;margin-bottom:4px;">API import</div>
+    <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:10px;">
+      Fetches each half-hour's kWh with its exact billed cost and off-peak/peak label —
+      dispatch-aware, IOG included, reaching your full history. Imported blocks are flagged
+      and reversible (Delete Blocks → reconstructed history).
+      <details style="margin-top:6px;">
+        <summary style="cursor:pointer;">How it works &amp; timing</summary>
+        <div style="margin-top:8px;line-height:1.6;">
+          If a slot comes back without its cost (the supplier can drop it under load), the
+          import quietly re-fetches and prices it from the real figure. <strong>It can take a
+          while:</strong> the API is rate-limited and gets stricter the harder it's pushed, so
+          the import runs in paced, resumable steps and eases off when the hourly allowance
+          runs low — pausing and resuming on its own. <strong>Other apps on the same account
+          share that allowance</strong> (the supplier's own app, the Home Assistant
+          integration, any other API tool), so it may slow or pause while one of those is busy.
+          Just leave it running. <strong>Afterwards a background pricing check</strong> gives
+          the smart-charge (IOG) half-hours their exact off-peak price — rate-limited the same
+          way, self-paced; the pricing-health panel below shows its progress.
+        </div>
+      </details>
     </div>
-    <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:8px;padding:8px 10px;background:var(--bg-subtle,rgba(127,127,127,0.08));border-radius:6px;">
-      <strong>This can take a while.</strong> Octopus rate-limits the API and gets
-      progressively stricter the harder it's pushed, so the import runs in paced, resumable
-      steps and eases off automatically when the hourly allowance runs low (it pauses and
-      resumes on its own — leaving budget for your live readings). <strong>Other apps on the
-      same Octopus account share that allowance</strong> — the Octopus app, the Home
-      Assistant Octopus (BottlecapDave) integration, or any other API tool — so if one of
-      those is busy at the same time, the import will slow down or pause until the budget
-      recovers. That's expected; just leave it running.
-      <div style="margin-top:6px;">
-        <strong>After the import, a background pricing check runs</strong> to give the
-        smart-charge (IOG) half-hours their exact off-peak price. It's rate-limited the
-        same way, so on a <strong>large multi-year history</strong> — or while other apps
-        are using the account — it can take a good while and will pause and resume on its
-        own. You don't need to wait or do anything; the pricing-health panel below shows
-        its progress and updates when it's done.
-      </div>
-    </div>
-    <button class="btn btn-secondary" id="btn-api-plan" onclick="planApi()">Preview plan</button>
-    <button class="btn btn-secondary" id="btn-range-diag" onclick="diagnoseRange()">Check start dates</button>
-    <button class="btn btn-secondary" id="btn-meter-hist" onclick="meterHistory()">Meter history</button>
-    <span id="api-plan-status" style="font-size:13px;color:var(--muted);margin-left:8px;"></span>
+    <span id="api-plan-status" style="font-size:13px;color:var(--muted);"></span>
     <div id="api-plan-out" style="margin-top:8px;font-size:13px;"></div>
-    <span id="range-diag-status" style="font-size:13px;color:var(--muted);"></span>
-    <div id="range-diag-out" style="margin-top:8px;font-size:13px;"></div>
-    <div id="meter-hist-out" style="margin-top:8px;font-size:13px;"></div>
     <div id="api-apply-row" style="display:none;margin-top:10px;">
       <div id="site-plan-block" style="display:none;margin-bottom:12px;padding:10px;border:1px solid var(--border);border-radius:8px;">
         <div style="font-weight:600;margin-bottom:4px;">Confirm your sites</div>
@@ -92,6 +105,9 @@
     <!-- Persistent pricing-health panel: raised / auto-recovered / still remaining.
          Reads /api-import/health on every load, not just right after an import. -->
     <div id="import-health" style="margin-top:12px;"></div>
+    <!-- Result of the pricing-health "Retry N" button — rendered HERE (visible,
+         beside the panel) rather than inside the collapsed Repair tools below. -->
+    <div id="health-retry-out" style="margin-top:6px;font-size:13px;"></div>
 
     <!-- Live status of the deferred pricing-verification pass (runs after an import,
          paced + rate-limit-gated). Self-heals the off-peak/peak split with no manual
@@ -100,93 +116,53 @@
 
     <div id="api-gaps-out" style="margin-top:10px;font-size:13px;"></div>
 
-    <!-- Repair tools: collapsed by default — a healthy import needs none of these -->
+    <!-- Reprice from CSV: last-resort manual price fix, collapsed by default. The
+         old unbounded date-range reprice was removed — the verify pass + the
+         pricing-health retry (and its per-slot CSV escape hatch) cover recovery. -->
     <details style="margin-top:14px;border-top:1px solid var(--border);padding-top:12px;">
-      <summary style="cursor:pointer;font-weight:600;">Repair tools
-        <span style="font-weight:400;font-size:12px;color:var(--muted);">— only if a rate still looks wrong</span>
+      <summary style="cursor:pointer;font-weight:600;">Reprice from CSV
+        <span style="font-weight:400;font-size:12px;color:var(--muted);">— last resort, if a price still won't fix</span>
       </summary>
       <div style="font-size:12px;color:var(--muted);line-height:1.6;margin:8px 0 10px;">
-        A healthy import needs none of these — the pricing health panel above shows if anything's
-        outstanding, and offers a one-click retry for any flagged slots. This re-fetches half-hours
-        with a <strong>calm</strong> query and re-prices them from Octopus's real billed figures.
+        Almost every slot is fixed automatically by the verify pass or the pricing-health retry
+        above. Only if a handful <em>still</em> won't price: download the consumption CSV for the
+        affected period from your account, add each half-hour's <strong>unit rate (p/kWh)</strong>
+        or cost, and upload it here to set the price straight from your bill — it corrects the
+        existing blocks in place.
       </div>
-
-      <!-- Date-range mode (every block, flagged or not) -->
-      <div style="margin-bottom:10px;">
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px;">
-          <label>From <input type="date" id="reprice-from" value="2025-10-18" style="font-size:13px;"></label>
-          <label>To <input type="date" id="reprice-to" value="2025-10-25" style="font-size:13px;"></label>
-          <label style="font-size:13px;"><input type="checkbox" id="reprice-include-export"> also fix export</label>
-          <button class="btn btn-secondary" id="btn-reprice" onclick="repricePricing()">Fix a date range</button>
-          <span id="reprice-status" style="color:var(--muted);"></span>
-        </div>
-        <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-top:4px;">
-          Re-checks <strong>every imported half-hour</strong> in the range — flagged or not — and re-prices
-          each. Use when a <strong>rate looks wrong on a slot that already has a cost</strong> (e.g. after a
-          tariff or price-cap change, where the rate no longer matches the cost). Flagged-slot mode can't
-          reach these — they were never flagged. By default it fixes <strong>import</strong> only; tick
-          <strong>also fix export</strong> to collapse a fragmented flat/Agile export rate back to its clean
-          scheduled value. It tells you how many blocks it will touch and asks you to confirm first. Start
-          with a <strong>narrow</strong> range (a week), then widen.
-        </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px;">
+        <input type="file" id="reprice-csv-file" accept=".csv,text/csv" style="font-size:13px;">
+        <button class="btn btn-secondary" id="btn-reprice-csv" onclick="repriceFromCsv()">Reprice from CSV</button>
+        <span id="reprice-csv-status" style="color:var(--muted);"></span>
       </div>
-
-      <div style="font-size:12px;color:var(--muted);line-height:1.5;margin-bottom:4px;">
-        In the results: <em>re-priced</em> = slots corrected · <em>not recovered</em> = Octopus didn't
-        return a cost this pass (usually a busy connection — re-run to retry).
-      </div>
-      <div id="reprice-out" style="margin-top:8px;font-size:13px;"></div>
-
-      <div style="margin-top:12px;padding-top:10px;border-top:1px dashed var(--border);">
-        <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:6px;">
-          <strong>Match the bill exactly (from CSV) — last resort.</strong> Almost every slot can be
-          fixed by the automatic verify pass, the health-panel retry, or the date-range tool above.
-          Only if a handful <em>still</em> won't price after repeated
-          repair, download the Octopus consumption CSV for the affected period and upload it here to
-          set each half-hour's cost straight from your bill.
-        </div>
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px;">
-          <input type="file" id="reprice-csv-file" accept=".csv,text/csv" style="font-size:13px;">
-          <button class="btn btn-secondary" id="btn-reprice-csv" onclick="repriceFromCsv()">Reprice from CSV</button>
-          <span id="reprice-csv-status" style="color:var(--muted);"></span>
-        </div>
-        <div id="reprice-csv-out" style="margin-top:6px;font-size:13px;"></div>
-      </div>
+      <div id="reprice-csv-out" style="margin-top:6px;font-size:13px;"></div>
     </details>
-  </div>
-
-  <!-- CSV import (secondary) -->
-  <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:12px;">
-    <div style="font-size:13px;color:var(--muted);margin-bottom:8px;">
-      Not on Octopus, or importing an offline/older export? Use the CSV route
-      (rate derived from the export's per-block cost).
-    </div>
-    <button class="btn btn-secondary" onclick="goStep('upload')">Start CSV import →</button>
   </div>
 </div>
 
-<!-- Step 2 — upload -->
+<!-- Step 2 — CSV panel: fill the pre-filled per-channel templates, then upload -->
 <div class="card" id="step-upload" style="display:none;">
-  <div style="font-weight:600;margin-bottom:4px;">1 · Upload your Octopus CSV export</div>
+  <div style="font-weight:600;margin-bottom:4px;">Fill from CSV</div>
+  <div id="csv-window-note" style="font-size:13px;color:var(--muted);margin-bottom:8px;"></div>
   <div style="font-size:13px;color:var(--muted);line-height:1.7;margin-bottom:14px;">
-    Export "Consumption" from your Octopus account (per meter). Add the export/outgoing
-    file too if you have one. Columns expected: Consumption (kWh), Estimated Cost Inc. Tax,
-    Standing Charge Inc. Tax, Start, End.
+    Download the pre-filled template for each channel — every half-hour's Start/End is
+    already in it for this window. Add your figures (a <strong>unit rate (p/kWh)</strong> is
+    easiest — we compute the cost from it; or enter the cost per half-hour instead), then
+    upload the filled file. Imported blocks are flagged and reversible any time.
   </div>
-  <div style="display:grid;grid-template-columns:120px 1fr;gap:10px 14px;align-items:center;font-size:13px;">
-    <label>Import CSV</label>
-    <input type="file" id="import-file" accept=".csv,text/csv">
-    <label>Export CSV <span style="color:var(--muted);">(optional)</span></label>
-    <input type="file" id="export-file" accept=".csv,text/csv">
-  </div>
-  <div style="margin-top:8px;font-size:12px;color:var(--muted);">
-    Need the format? <a href="#"
-      onclick="event.preventDefault(); window.location = apiUrl('/api/historical/csv-template');"
-      style="color:var(--accent);">⬇ Download a blank CSV template</a>
-    — the required columns and the exact date/time format, with example rows.
+  <div style="display:flex;flex-direction:column;gap:12px;">
+    <div id="csv-row-import" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:13px;">
+      <span style="min-width:70px;font-weight:600;">Import</span>
+      <a id="csv-tpl-import" class="btn btn-secondary" href="#">⬇ Template</a>
+      <input type="file" id="import-file" accept=".csv,text/csv">
+    </div>
+    <div id="csv-row-export" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:13px;">
+      <span style="min-width:70px;font-weight:600;">Export</span>
+      <a id="csv-tpl-export" class="btn btn-secondary" href="#">⬇ Template</a>
+      <input type="file" id="export-file" accept=".csv,text/csv">
+    </div>
   </div>
   <div style="margin-top:14px;display:flex;gap:10px;align-items:center;">
-    <button class="btn btn-secondary" onclick="goStep('intro')">← Back</button>
     <button class="btn" id="btn-preview" onclick="doPreview()">Preview rates →</button>
     <span id="preview-status" style="font-size:13px;color:var(--muted);"></span>
   </div>
@@ -227,6 +203,336 @@
 {% block scripts %}
 <script>
 var STATE = { import_csv: null, export_csv: null, preview: null };
+// Import floor: null = whole history (earliest the API has); an ISO string =
+// "import back to this date". Both drive the SAME background job — date-bound is
+// just whole-history with a start. Set by the guided picker (bfGoApi).
+var IMPORT_FROM = null;
+
+// CSV panel window: the contiguous span (and optional single channel) the pre-filled
+// templates + upload apply to. Set by the CSV tasks (date range / a chosen gap).
+var CSV_WINDOW = { from: null, to: null, channel: null, inclusive: false };
+
+function csvTemplateUrl(channel) {
+  if (CSV_WINDOW.from && CSV_WINDOW.to) {
+    return apiUrl('/api/historical/gap-template?channel=' + encodeURIComponent(channel)
+      + '&from=' + encodeURIComponent(CSV_WINDOW.from)
+      + '&to=' + encodeURIComponent(CSV_WINDOW.to)
+      + (CSV_WINDOW.inclusive ? '&inclusive=1' : ''));
+  }
+  return apiUrl('/api/historical/csv-template');   // fallback: blank illustrative template
+}
+function csvRenderTemplates() {
+  var only = CSV_WINDOW.channel;                   // null = both channels
+  ['import', 'export'].forEach(function (ch) {
+    var row = document.getElementById('csv-row-' + ch);
+    var tpl = document.getElementById('csv-tpl-' + ch);
+    var show = (!only || only === ch);
+    if (row) row.style.display = show ? 'flex' : 'none';
+    if (tpl) tpl.setAttribute('href', csvTemplateUrl(ch));
+  });
+  var note = document.getElementById('csv-window-note');
+  if (note) {
+    note.innerHTML = (CSV_WINDOW.from && CSV_WINDOW.to)
+      ? ('Filling <strong>' + _esc(CSV_WINDOW.from.slice(0, 10)) + '</strong> → <strong>'
+         + _esc(CSV_WINDOW.to.slice(0, 10)) + '</strong>'
+         + (only ? (' · ' + _esc(only) + ' only') : ' · import & export'))
+      : '';
+  }
+}
+function csvOpen(win) {
+  CSV_WINDOW = { from: (win && win.from) || null, to: (win && win.to) || null,
+                 channel: (win && win.channel) || null, inclusive: !!(win && win.inclusive) };
+  var imp = document.getElementById('import-file'); if (imp) imp.value = '';
+  var exp = document.getElementById('export-file'); if (exp) exp.value = '';
+  var ps = document.getElementById('preview-status'); if (ps) ps.textContent = '';
+  csvRenderTemplates();
+  goStep('upload');
+  var el = document.getElementById('step-upload');
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+// ── Guided backfill (source -> task -> preview -> apply) ────────────────────
+var _bfScope = null, _bfSource = null, _bfApi = false, _bfGaps = false;
+
+function bfHighlight(sel, chosen) {
+  document.querySelectorAll(sel).forEach(function (b) {
+    var on = (b === chosen);
+    b.style.borderColor = on ? 'var(--accent)' : '';
+    b.style.background  = on ? 'rgba(127,127,127,0.12)' : '';
+    b.style.fontWeight  = on ? '600' : '';
+  });
+}
+// Source-first: choose API vs CSV, THEN the task. The available tasks differ by
+// source — API can extend Whole history / Date range / Gap fill; CSV (supplier-
+// agnostic, template-driven) can Fill gaps / Date range but not whole-history
+// (a backward reconstruction only the API can reach).
+function bfPickSource(el) {
+  if (el.disabled) return;
+  _bfSource = el.dataset.source; _bfScope = null;
+  bfHighlight('.bf-source-btn', el);
+  bfHighlight('.bf-scope-btn', null);            // clear any prior task highlight
+  var isApi = (_bfSource === 'api');
+  document.querySelectorAll('.bf-task-api').forEach(function (b) { b.style.display = isApi ? '' : 'none'; });
+  document.querySelectorAll('.bf-task-csv').forEach(function (b) { b.style.display = isApi ? 'none' : ''; });
+  document.getElementById('bf-task-label').style.display = '';
+  document.getElementById('bf-task').style.display = 'flex';
+  document.getElementById('bf-range-row').style.display = 'none';
+  document.getElementById('bf-out').innerHTML = '';
+  // API tasks live in the panel below (#step-intro); CSV tasks open their own panel
+  // (#step-upload) when a task is chosen. Show the right one for this source.
+  if (isApi && typeof goStep === 'function') goStep('intro');
+  bfSyncPreviewBtn();
+}
+function bfPickScope(el) {
+  _bfScope = el.dataset.scope; bfHighlight('.bf-scope-btn', el);
+  var isGaps = (_bfScope === 'gaps'), isRange = (_bfScope === 'range');
+  document.getElementById('bf-range-row').style.display = isRange ? 'flex' : 'none';
+  document.getElementById('bf-out').innerHTML = '';
+  if (isRange) bfSetRangeEnd();
+  bfSyncPreviewBtn();
+  // Gaps = its own click-driven list (find → per-gap fill), under either source.
+  if (isGaps) { bfLoadGaps(); return; }
+  // CSV + date range shows its template inline once a date is entered (the
+  // #bf-from oninput re-runs bfPreview); prompt for the date meanwhile.
+  if (_bfSource === 'csv' && isRange) {
+    document.getElementById('bf-out').innerHTML =
+      '<span style="color:var(--muted);">Pick how far back to go, then download the '
+      + 'pre-filled CSV template below.</span>';
+  }
+  // API tasks (whole history / date range) wait for the Preview plan button.
+}
+function bfSyncPreviewBtn() {
+  // "Preview plan" is the API route's review-before-run step, for Whole history or
+  // a Date range. CSV shows its template inline; gaps list themselves.
+  var btn = document.getElementById('bf-preview-btn');
+  var show = (_bfSource === 'api' && (_bfScope === 'whole_history' || _bfScope === 'range'));
+  btn.style.display = show ? '' : 'none';
+  btn.disabled = !show;
+}
+function bfApplyGates() {
+  var apiBtn = document.querySelector('.bf-source-btn[data-source="api"]');
+  if (apiBtn) {
+    apiBtn.disabled = !_bfApi;
+    apiBtn.style.opacity = _bfApi ? '' : '0.5';
+    apiBtn.title = _bfApi ? '' : 'No supplier API configured — add a key in Settings, or use CSV.';
+  }
+  // Fill gaps is always clickable — clicking it finds and lists the gaps
+  // (or reports none), rather than pre-greying on a silent probe.
+}
+async function bfProbe() {
+  // One probe (CSV is always allowed) to learn api_available + gaps_present for gating.
+  try {
+    var r = await fetch(apiUrl('/api/backfill/plan'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: 'whole_history', source: 'csv' }) });
+    var j = await r.json();
+    _bfApi = !!j.api_available; _bfGaps = !!j.gaps_present;
+    bfApplyGates();
+  } catch (e) {}
+}
+async function bfSetRangeEnd() {
+  var el = document.getElementById('bf-range-end'); if (!el) return;
+  el.textContent = '';
+  try {
+    var j = await (await fetch(apiUrl('/api/backfill/reach'))).json();
+    if (j.up_to) el.textContent = '→ up to your earliest data (' + j.up_to.slice(0, 10) + ')';
+  } catch (e) {}
+}
+async function bfRangePreview(fromTs) {
+  var out = document.getElementById('bf-out'); out.innerHTML = 'Checking…';
+  var upTo = null;
+  try { upTo = (await (await fetch(apiUrl('/api/backfill/reach'))).json()).up_to; } catch (e) {}
+  if (!upTo) { out.innerHTML = '<span style="color:var(--warning);">Couldn\'t find your earliest data — you need existing data to extend back from.</span>'; return; }
+  if (fromTs >= upTo) { out.innerHTML = '<span style="color:var(--warning);">Pick a date before your earliest data (' + upTo.slice(0, 10) + ').</span>'; return; }
+  var html = '<div>Import <strong>' + _esc(fromTs.slice(0, 10)) + '</strong> → your earliest data <strong>'
+           + _esc(upTo.slice(0, 10)) + '</strong>, as one contiguous run.</div>';
+  if (_bfSource === 'api') {
+    html += '<div style="font-size:12px;color:var(--muted);margin:6px 0 10px;">Runs as a background import (identical to whole-history — with pricing recovery, verify and carbon fill), just starting from your chosen date. You review the plan and start it below.</div>'
+          + '<button class="btn" onclick="bfGoApi(\'' + fromTs + '\')">Continue to import back to ' + _esc(fromTs.slice(0, 10)) + ' ↓</button>';
+  } else {
+    html += '<div style="font-size:12px;color:var(--muted);margin:6px 0 10px;">Fill this window from CSV — grab the pre-filled Import and Export templates, add your figures, then upload.</div>'
+          + '<button class="btn" onclick="csvOpen({from:\'' + fromTs + '\',to:\'' + upTo + '\'})">Fill from CSV →</button>';
+  }
+  out.innerHTML = html;
+}
+async function bfPreview() {
+  var out = document.getElementById('bf-out'); out.innerHTML = 'Checking…';
+  // Date-range = "import history back to a date"; the END is always your oldest
+  // block (contiguity), so the user only picks how far back.
+  if (_bfScope === 'range') {
+    var f = document.getElementById('bf-from').value;
+    if (!f) { out.innerHTML = '<span style="color:var(--warning);">Pick a date to go back to.</span>'; return; }
+    return bfRangePreview(f + 'T00:00:00');
+  }
+  // Whole-history + API: the API import panel below IS the plan (tiles, chunk
+  // counts, backup + Start), so go straight there instead of showing a redundant
+  // summary with a "Continue to full API import" button.
+  if (_bfScope === 'whole_history' && _bfSource === 'api') {
+    out.innerHTML = '';
+    return bfGoApi();
+  }
+  var body = { scope: _bfScope, source: _bfSource };
+  try {
+    var r = await fetch(apiUrl('/api/backfill/plan'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body) });
+    var j = await r.json();
+    if (!j.ok) { out.innerHTML = '<div style="color:var(--warning);">' + _esc(j.message || j.reason || 'Not available') + '</div>'; return; }
+    bfRenderPlan(j);
+  } catch (e) { out.innerHTML = '<span style="color:var(--danger);">' + _esc(e) + '</span>'; }
+}
+function bfRenderPlan(j) {
+  var w = j.windows || {}, html = '';
+  if (j.scope === 'gaps') {
+    html += '<div>Found <strong>' + (j.gap_slots_total || 0) + '</strong> missing half-hour(s) across '
+          + ((j.gap_runs || []).length) + ' gap(s).</div>';
+  } else if (j.scope === 'range') {
+    html += '<div><strong>' + (w.fill_count || 0) + '</strong> empty slot(s) to fill'
+          + (w.occupied_count ? (', ' + w.occupied_count + ' already have data (left untouched)') : '') + '.</div>';
+  } else {
+    html += '<div>Whole-history backfill from the supplier API (fills only windows with no block yet).</div>';
+  }
+  (j.warnings || []).forEach(function (m) { html += '<div style="color:var(--muted);margin-top:4px;">⚠ ' + _esc(m) + '</div>'; });
+  if ((j.handoff_to_corrections || []).length) {
+    html += '<div style="color:var(--muted);margin-top:4px;">' + j.handoff_to_corrections.length
+          + ' slot(s) already hold data — backfill leaves those alone; use Cost Corrections to change them.</div>';
+  }
+  if (j.note) html += '<div style="color:var(--muted);margin-top:4px;">' + _esc(j.note) + '</div>';
+  if (j.action === 'run_api_import_job') {
+    // Import-history: show how far back the supplier API can reach before starting.
+    html += '<div id="bf-reach-note" style="color:var(--muted);font-size:12px;margin-top:6px;">Checking how far back the API can reach…</div>';
+  }
+  html += '<div style="margin-top:10px;">';
+  if (j.action === 'resolve_history_gaps') {
+    html += '<button class="btn" onclick="bfRun()">🩹 Recover ' + (j.gap_slots_total || '') + ' missing slot(s)</button>';
+  } else if (j.action === 'run_api_import_job') {
+    html += '<button class="btn" onclick="bfGoApi()">Continue to full API import ↓</button>';
+  } else if (j.action === 'apply_csv_import') {
+    html += '<button class="btn" onclick="bfGoCsv()">Continue to CSV import ↓</button>';
+  }
+  html += '</div>';
+  document.getElementById('bf-out').innerHTML = html;
+  if (j.action === 'run_api_import_job') bfFillReach();
+}
+async function bfFillReach() {
+  var el = document.getElementById('bf-reach-note');
+  if (!el) return;
+  try {
+    var j = await (await fetch(apiUrl('/api/backfill/reach'))).json();
+    if (j.ok && j.reach_from) {
+      el.innerHTML = 'The supplier API can provide data back to <strong>' + _esc(j.reach_from.slice(0, 10))
+        + '</strong>, filling up to your oldest block <strong>' + _esc((j.up_to || '').slice(0, 10)) + '</strong>'
+        + (j.chunk_estimate ? ' (~' + j.chunk_estimate + ' fetch chunks)' : '') + '.';
+    } else {
+      el.textContent = j.note || 'Imports as far back as the API allows.';
+    }
+  } catch (e) { el.textContent = ''; }
+}
+async function bfRun() {
+  if (!window.confirm('Recover missing data now?\n\nThis writes settled/interpolated blocks for the gaps. Blocks you deleted on purpose can also be restored.')) return;
+  var out = document.getElementById('bf-out'); out.innerHTML = 'Recovering…';
+  try {
+    var r = await fetch(apiUrl('/api/backfill/run'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: _bfScope, source: _bfSource, confirmed: true }) });
+    var j = await r.json();
+    out.innerHTML = j.ok
+      ? '<div style="color:var(--success);">Done — ' + (j.filled != null ? j.filled + ' slot(s) filled.' : 'complete.') + '</div>'
+      : '<div style="color:var(--danger);">' + _esc(j.message || j.error || 'Failed') + '</div>';
+    bfProbe();   // refresh gates (gaps may now be gone)
+  } catch (e) { out.innerHTML = '<span style="color:var(--danger);">' + _esc(e) + '</span>'; }
+}
+function bfGoApi(fromTs) {
+  // Both whole-history (fromTs null) and date-bound (fromTs set) drive the SAME
+  // background import — just a different floor. Set it, reveal the panel, and
+  // plan so the user reviews/starts there (site-plan, verify, carbon, pause/resume
+  // all run in that flow).
+  IMPORT_FROM = fromTs || null;
+  if (typeof goStep === 'function') goStep('intro');   // ensure the API panel is visible
+  var el = document.getElementById('api-import-panel');
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  if (typeof planApi === 'function') planApi();
+}
+function bfGoCsv() {
+  if (typeof goStep === 'function') goStep('upload');
+  var el = document.getElementById('step-upload');
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+// Click-driven gaps flow: find → labelled list → recover-all (API) / per-gap CSV.
+async function bfLoadGaps() {
+  var out = document.getElementById('bf-out'); out.innerHTML = 'Finding gaps…';
+  try {
+    var r = await fetch(apiUrl('/api/backfill/gaps'));
+    var j = await r.json();
+    if (!j.ok) { out.innerHTML = '<span style="color:var(--danger);">' + _esc(j.error || 'failed') + '</span>'; return; }
+    if (!j.gaps.length) {
+      out.innerHTML = '<div style="color:var(--success);">✓ No gaps found — your history is continuous (recent slots within the last ~12h fill themselves).</div>';
+      return;
+    }
+    var totalH = (j.total_slots / 2).toFixed(1);
+    var hasBlockHoles = j.gaps.some(function (g) { return g.kind === 'missing_blocks'; });
+    var html = '<div style="margin-bottom:8px;"><strong>' + j.gaps.length + '</strong> gap'
+             + (j.gaps.length > 1 ? 's' : '') + ' · <strong>' + totalH + ' h</strong> of missing data.</div>';
+    var csvSrc = (_bfSource === 'csv');
+    html += '<div style="font-size:12px;color:var(--muted);margin-bottom:10px;">'
+          + (csvSrc
+             ? 'Fill each gap from CSV — grab its pre-filled template, add your figures, then upload.'
+             : 'Fill each gap straight from the API (background job — price recovery, verify and carbon).')
+          + '</div>';
+    html += '<div style="display:flex;flex-direction:column;gap:6px;">';
+    j.gaps.forEach(function (g) {
+      var kindTxt = (g.kind === 'missing_blocks') ? 'blocks' : 'data';
+      var col = g.fetchable ? 'var(--accent)' : 'var(--warning)';
+      var btns = '';
+      if (csvSrc) {
+        // CSV route: open the panel scoped to this gap's channel + window.
+        btns += '<button class="btn" onclick="csvOpen({from:\'' + g.start + '\',to:\'' + g.end
+             + '\',channel:\'' + g.channel + '\',inclusive:true})">Fill from CSV →</button>';
+      } else if (j.api_available && g.fetchable) {
+        btns += '<button class="btn" onclick="bfFillGap(this,\'' + g.start
+             + '\',\'' + g.end + '\',\'' + g.channel + '\')">🩹 API</button>';
+      } else {
+        var url = apiUrl('/api/historical/gap-template?inclusive=1&channel=' + encodeURIComponent(g.channel)
+                + '&from=' + encodeURIComponent(g.start) + '&to=' + encodeURIComponent(g.end));
+        btns += '<a class="btn btn-secondary" href="' + url + '">⬇ CSV</a>';
+      }
+      html += '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;'
+            + 'border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px;">'
+            + '<span><span style="color:' + col + ';font-weight:600;">' + _esc(g.channel) + ' · ' + kindTxt + '</span> · '
+            + _esc(g.start.replace('T', ' ')) + ' → ' + _esc(g.end.replace('T', ' ')) + ' · ' + g.hours + ' h</span>'
+            + '<span style="white-space:nowrap;">' + btns + '</span></div>';
+    });
+    html += '</div>';
+    out.innerHTML = html;
+  } catch (e) { out.innerHTML = '<span style="color:var(--danger);">' + _esc(e) + '</span>'; }
+}
+async function bfFillGap(btn, from, to, channel) {
+  if (!window.confirm('Fill this ' + channel + ' gap from the supplier API?\n\n'
+      + from.replace('T', ' ') + '  →  ' + to.replace('T', ' ')
+      + '\n\nRuns as a background import (identical to whole-history — price recovery, '
+      + 'verify and carbon fill), just bounded to this gap. Watch progress in the import '
+      + 'panel below. Blocks you deleted on purpose can be restored.')) return;
+  var orig = btn.textContent; btn.disabled = true; btn.textContent = 'Starting…';
+  try {
+    var r = await fetch(apiUrl('/api/backfill/fill-gap'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: from, to: to, channel: channel, confirmed: true }) });
+    var j = await r.json();
+    if (j.ok) {
+      document.getElementById('bf-out').innerHTML =
+        '<div style="color:var(--success);">Gap fill started — watch progress in the import panel below. '
+        + 'This gap clears from the list once it completes.</div>';
+      if (typeof pollStatus === 'function') pollStatus();
+      var el = document.getElementById('api-import-panel');
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else {
+      btn.disabled = false; btn.textContent = orig;
+      window.alert(j.message || j.error || 'Could not start gap fill');
+    }
+  } catch (e) { btn.disabled = false; btn.textContent = orig; window.alert('' + e); }
+}
+document.addEventListener('DOMContentLoaded', bfProbe);
 
 function goStep(s){
   ["intro","upload","review","done"].forEach(function(k){
@@ -253,7 +559,7 @@ function planApi(){
   var out = document.getElementById('api-plan-out');
   st.textContent = 'Planning…'; out.innerHTML = '';
   document.getElementById('api-apply-row').style.display = 'none';
-  fetch(apiUrl('/api/historical/api-import/plan'), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+  fetch(apiUrl('/api/historical/api-import/plan'), {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ from: IMPORT_FROM })})
     .then(function(r){return r.json();}).then(function(d){
       st.textContent = '';
       if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(d.error||d.reason||'failed')+'</span>'; return; }
@@ -264,6 +570,15 @@ function planApi(){
         html += '<div style="text-transform:capitalize;">'+chn+': <strong>'+_esc(c.window.from.substr(0,10))+'</strong> → '
           + _esc(c.window.to.substr(0,10))+' · '+c.chunk_count+' chunks</div>';
       });
+      if(d.retention_capped){
+        var yrs = d.retention_days ? (Math.round(d.retention_days/365*10)/10) : 2;
+        html += '<div style="margin-top:8px;padding:8px 10px;background:rgba(180,83,9,0.08);'
+          + 'border-radius:6px;font-size:12px;color:#b45309;line-height:1.6;">⚠ The supplier API only '
+          + 'keeps about <strong>'+yrs+' years</strong> of half-hourly data — this import reaches back to '
+          + '<strong>'+_esc((d.retention_floor||'').substr(0,10))+'</strong>. Older history (an earlier '
+          + 'tariff/trial) has aged out of the API and can only be added from your <strong>bill via the '
+          + 'CSV route</strong> (choose CSV above, or Reprice from CSV below).</div>';
+      }
       out.innerHTML = html;
       document.getElementById('api-confirm').checked = false;
       document.getElementById('btn-api-start').disabled = true;
@@ -432,8 +747,18 @@ function pollStatus(){
     var active = d && (d.status==='running' || d.status==='paused'
       || d.status==='rate_limited' || d.status==='finalising');
     if(_statusTimer) clearTimeout(_statusTimer);
-    if(active){ _statusTimer = setTimeout(pollStatus, 3000); }
-    else { loadImportGaps(); loadPricingHealth(); }   // refresh once it settles
+    // Hide the pricing-health panel while an import is in progress — it shows the
+    // PREVIOUS run's figures and a "Retry N" button that would fire a competing
+    // API re-fetch against the same rate-limit allowance. It reappears (refreshed)
+    // once the import settles, when the post-import verify has run.
+    var _health = document.getElementById('import-health');
+    if(active){
+      if(_health) _health.style.display = 'none';
+      _statusTimer = setTimeout(pollStatus, 3000);
+    } else {
+      if(_health) _health.style.display = '';
+      loadImportGaps(); loadPricingHealth();          // refresh once it settles
+    }
   }).catch(function(){});
 }
 
@@ -513,6 +838,7 @@ function loadPricingHealth(){
     fetch(apiUrl('/api/historical/api-import/verify-status')).then(function(r){return r.json();}).catch(function(){return null;})
   ]).then(function(res){
     var d = res[0] || {}, v = res[1] || {};
+    _HEALTH_QUEUE = d.queue || { import: [], export: [] };   // slots for the CSV escape hatch
     var vst = v && v.status;
     var vActive = (vst==='running' || vst==='waiting' || vst==='paused');
     var haveHealth = !!(d && d.have);
@@ -560,6 +886,7 @@ function loadPricingHealth(){
             + '<span style="font-size:13px;color:#b45309;">'+rem+' still need a retry</span>'
             + '<button class="btn btn-secondary" style="margin-left:auto;font-size:12px;padding:2px 10px;" '
             + 'onclick="repriceQueue(this)">Retry '+rem+'</button></div>';
+          body += _healthEscapeHatch();      // last resort: fill these slots from CSV
         } else {
           body += _healthRow('check','#15803d','All prices recovered \u2014 nothing outstanding', '', 'rgba(21,128,61,0.08)');
         }
@@ -610,8 +937,18 @@ function loadPricingHealth(){
         + 'its progress will appear here.</div>';
     }
 
+    // Idle + nothing outstanding = a settled PREVIOUS import. Keep just the header
+    // + "Up to date" badge; tuck the run's detail behind "Show details" so a
+    // months-old import isn't a wall of persisted figures. While the verify pass
+    // is active (or slots still need a retry) keep it fully expanded.
+    var collapse = (!vActive && rem === 0);
+    var inner = collapse
+      ? (head + '<details style="margin-top:2px;">'
+         + '<summary style="cursor:pointer;font-size:12px;color:var(--muted);">Show details</summary>'
+         + '<div style="margin-top:8px;">' + intro + body + '</div></details>')
+      : (head + intro + body);
     el.innerHTML = '<div style="border:1px solid var(--border);border-radius:8px;padding:12px 14px;">'
-      + head + intro + body + '</div>';
+      + inner + '</div>';
 
     if(_verifyTimer){ clearTimeout(_verifyTimer); _verifyTimer = null; }
     if(vActive){ _verifyTimer = setTimeout(loadPricingHealth, 4000); }
@@ -620,6 +957,69 @@ function loadPricingHealth(){
 // Back-compat aliases (older call sites / post-action refreshes).
 function loadImportHealth(){ loadPricingHealth(); }
 function loadVerifyStatus(){ loadPricingHealth(); }
+
+// Pricing-health CSV escape hatch: the slots the API couldn't price, offered as a
+// pre-filled per-channel template the user fills from their bill and runs through
+// the CSV reprice path (reprice-from-csv updates the block cost in place + clears
+// the slot from the queue). Set from /health on each render.
+var _HEALTH_QUEUE = { import: [], export: [] };
+function _healthEscapeHatch(){
+  var q = _HEALTH_QUEUE || {};
+  var chans = ['import','export'].filter(function(c){ return (q[c]||[]).length; });
+  if(!chans.length) return '';
+  var html = '<details style="margin-top:8px;"><summary style="cursor:pointer;font-size:12px;color:var(--muted);">'
+    + 'Still won’t clear? Show the slots &amp; fill them from CSV</summary>'
+    + '<div style="margin-top:8px;font-size:12px;color:var(--muted);line-height:1.5;">'
+    + 'These half-hours came back with no cost the API can recover (usually a settlement gap). '
+    + 'Grab the pre-filled template for the channel, add each slot’s unit rate (p/kWh) or cost '
+    + 'from your bill, then upload it here — it prices those blocks in place.</div>';
+  chans.forEach(function(c){
+    var slots = q[c]; var id = 'slots-csv-'+c;
+    html += '<div style="margin-top:10px;border:1px solid var(--border);border-radius:6px;padding:8px 10px;">'
+      + '<div style="font-size:13px;font-weight:600;text-transform:capitalize;margin-bottom:6px;">'+c+' · '+slots.length+' slot'+(slots.length===1?'':'s')+'</div>'
+      + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px;">'
+      + '<button class="btn btn-secondary" onclick="dlSlotsCsv(\''+c+'\')">⬇ Template</button>'
+      + '<input type="file" id="'+id+'" accept=".csv,text/csv">'
+      + '<button class="btn btn-secondary" onclick="applySlotsCsv(\''+c+'\',\''+id+'\')">Apply from CSV</button>'
+      + '<span id="'+id+'-status" style="color:var(--muted);"></span></div>'
+      + '<details style="margin-top:6px;"><summary style="cursor:pointer;font-size:12px;color:var(--muted);">List slots</summary>'
+      + '<div style="font-family:monospace;font-size:12px;margin-top:4px;line-height:1.5;max-height:160px;overflow:auto;">'
+      + slots.map(function(s){return _esc(String(s).replace('T',' '));}).join('<br>')
+      + '</div></details></div>';
+  });
+  return html + '</details>';
+}
+function dlSlotsCsv(channel){
+  var starts = (_HEALTH_QUEUE||{})[channel]||[];
+  if(!starts.length) return;
+  fetch(apiUrl('/api/historical/slots-template'), {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ starts: starts, channel: channel })})
+    .then(function(r){ return r.text(); }).then(function(txt){
+      var blob = new Blob([txt], {type:'text/csv'});
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a'); a.href = url;
+      a.download = 'emt-slots-'+channel+'-'+starts.length+'.csv';
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }).catch(function(){});
+}
+function applySlotsCsv(channel, inputId){
+  var st = document.getElementById(inputId+'-status');
+  var f = document.getElementById(inputId).files[0];
+  if(!f){ if(st) st.textContent = 'Choose a filled CSV first.'; return; }
+  if(st) st.textContent = 'Applying…';
+  var r = new FileReader();
+  r.onload = function(){
+    fetch(apiUrl('/api/historical/reprice-from-csv'), {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ csv: r.result, channel: channel })})
+      .then(function(x){return x.json();}).then(function(d){
+        if(!d.ok){ if(st) st.textContent = 'Error: '+(d.error||'failed'); return; }
+        if(st) st.textContent = d.changed+' block(s) re-priced.';
+        loadPricingHealth();     // re-priced slots clear from the queue → count drops
+      }).catch(function(e){ if(st) st.textContent = 'Request failed: '+e; });
+  };
+  r.readAsText(f);
+}
 
 function _healthRow(icon, color, text, tag, bg){
   var mark = icon==='check' ? '✓' : '⚑';
@@ -672,25 +1072,27 @@ function _doStart(){
   document.getElementById('api-apply-status').textContent = 'Backing up & starting…';
   fetch(apiUrl('/api/historical/api-import/start'), {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ confirmed: true })
+    body: JSON.stringify({ confirmed: true, from: IMPORT_FROM })
   }).then(function(r){return r.json();}).then(function(d){
     if(!d.ok){ document.getElementById('api-apply-status').textContent = 'Error: '+_esc(d.error||'failed'); _apiButtons('idle'); return; }
     pollStatus();
   }).catch(function(e){ document.getElementById('api-apply-status').textContent = 'Request failed: '+e; });
 }
 
-function _repriceRun(body, btn){
-  var st = document.getElementById('reprice-status');
-  var out = document.getElementById('reprice-out');
+function _repriceRun(body, btn, opts){
+  opts = opts || {};
+  var st = document.getElementById(opts.statusId || 'reprice-status');
+  var out = document.getElementById(opts.outId || 'reprice-out');
   if(btn) btn.disabled = true;
-  st.textContent = 'Re-fetching (calm, one window at a time)…'; out.innerHTML = '';
+  if(st) st.textContent = 'Re-fetching (calm, one window at a time)…';
+  if(out) out.innerHTML = '<span style="color:var(--muted);">Re-fetching (calm, one window at a time)…</span>';
   fetch(apiUrl('/api/historical/reprice-repair'), {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify(body)
   }).then(function(r){return r.json();}).then(function(d){
     if(btn) btn.disabled = false;
-    st.textContent = '';
-    if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(d.error||'failed')+'</span>'; return; }
+    if(st) st.textContent = '';
+    if(!d.ok){ if(out) out.innerHTML = '<span style="color:var(--danger);">'+_esc(d.error||'failed')+'</span>'; return; }
     var totalTxt = (d.imported_blocks!=null)
       ? (d.imported_blocks+' imported block(s)'
          + (d.imported_from?(' spanning '+_esc((d.imported_from||'').substr(0,10))+' → '+_esc((d.imported_to||'').substr(0,10))):''))
@@ -721,43 +1123,22 @@ function _repriceRun(body, btn){
         + d.missing.map(function(s){return _esc(String(s).replace('T',' '));}).join('<br>')
         + '</div></details>';
     }
-    out.innerHTML = html;
-  }).catch(function(e){ if(btn) btn.disabled = false; st.textContent = 'Request failed: '+e; });
-}
-
-function repricePricing(){
-  var st = document.getElementById('reprice-status');
-  var from = document.getElementById('reprice-from').value;
-  var to = document.getElementById('reprice-to').value;
-  if(!from || !to){ st.textContent = 'Pick a from and to date.'; return; }
-  if(to < from){ st.textContent = 'The “to” date can’t be before the “from” date.'; return; }
-  var inclExport = document.getElementById('reprice-include-export').checked;
-  var btn = document.getElementById('btn-reprice');
-  btn.disabled = true; st.textContent = 'Counting blocks…';
-  // Preview first: how many blocks will this touch? Confirm before running.
-  fetch(apiUrl('/api/historical/reprice-repair'), {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ from_date: from, to_date: to, preview: true, include_export: inclExport })
-  }).then(function(r){return r.json();}).then(function(d){
-    btn.disabled = false; st.textContent = '';
-    if(!d.ok){ document.getElementById('reprice-out').innerHTML =
-      '<span style="color:var(--danger);">'+_esc(d.error||'failed')+'</span>'; return; }
-    if(!d.count){ document.getElementById('reprice-out').innerHTML =
-      '<div style="color:var(--muted);">No imported blocks fall in '+_esc(from)+' → '+_esc(to)+'. Check the dates (including the year).</div>'; return; }
-    if(!window.confirm('This will re-check '+d.count+' '+(inclExport?'import + export':'import')+' block(s) between '
-        + from + ' and ' + to + ', re-pricing any that are wrong.\n\n'
-        + (inclExport?'Export is included.':'Export blocks are not touched.')+' Proceed?')){
-      st.textContent = 'Cancelled.'; return;
-    }
-    _repriceRun({ from_date: from, to_date: to, include_export: inclExport }, btn);
-  }).catch(function(e){ btn.disabled = false; st.textContent = 'Request failed: '+e; });
+    if(out) out.innerHTML = html;
+    if(opts.onDone) opts.onDone(d);
+  }).catch(function(e){ if(btn) btn.disabled = false; if(st) st.textContent = 'Request failed: '+e;
+    if(out) out.innerHTML = '<span style="color:var(--danger);">Request failed: '+_esc(e)+'</span>'; });
 }
 
 function repriceQueue(btn){
   // Queue mode (no dates). Triggered from the Pricing-health panel's "Retry N"
   // button, which passes itself as `btn`. The old standalone "Fix flagged slots"
   // button was retired (the verify pass + this contextual retry cover it).
-  _repriceRun({}, btn || null);
+  // Render the result BESIDE the health panel (visible), and refresh the panel
+  // afterwards so the "N still need a retry" count reflects what just cleared.
+  _repriceRun({}, btn || null, {
+    outId: 'health-retry-out',
+    onDone: function(){ loadPricingHealth(); }
+  });
 }
 
 function repriceFromCsv(){

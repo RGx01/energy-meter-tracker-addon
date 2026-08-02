@@ -5456,16 +5456,26 @@ async def plan_api_import(requested_from=None, *, chunk_days: int = 60) -> dict:
     if not kraken_available():
         return {"ok": False, "reason": "no_api", "channels": {}}
     try:
-        # Ceiling = oldest LIVE block, ignoring reconstructed/imported blocks — so
-        # a previous partial import doesn't lower the ceiling below its own gap.
-        go_live = _store.get_oldest_block_start(exclude_imported=True)
+        # Ceiling = oldest EXISTING block of ANY source (contiguity rule). A new
+        # backward import must stop at the oldest block we already have — including
+        # blocks a previous import wrote — so it only fills the remaining gap below
+        # them rather than re-fetching a range that's already present. Interior
+        # holes are handled separately by the gap-fill flow, so an earlier import
+        # can't leave a gap this ceiling would wall off.
+        go_live = _store.get_oldest_block_start()
     except Exception:
         go_live = None
     if not go_live:
         return {"ok": False, "reason": "no_go_live", "channels": {},
                 "note": "no existing blocks to tile up to yet"}
     disc = _kraken_discovery or {}
-    out: dict = {"ok": True, "go_live": go_live, "channels": {}}
+    # The Measurements API is a rolling ~2-year window; older data has aged out and
+    # is only reachable via CSV. Cap the advertised floor there so the preview never
+    # promises phantom pre-retention chunks (e.g. from an agreement that predates it).
+    retention_floor = _retention_floor_iso()
+    out: dict = {"ok": True, "go_live": go_live, "channels": {},
+                 "retention_floor": retention_floor,
+                 "retention_days": _API_RETENTION_DAYS, "retention_capped": False}
     for name in ("import", "export"):
         info = disc.get(name) or {}
         if not info.get("mpan"):
@@ -5481,6 +5491,9 @@ async def plan_api_import(requested_from=None, *, chunk_days: int = 60) -> dict:
         if not floor:
             gl_dt = _ai._naive_utc(go_live)
             floor = _ai._iso(gl_dt - timedelta(days=1100)) if gl_dt else None
+        if floor and floor < retention_floor:      # older than the API keeps
+            floor = retention_floor
+            out["retention_capped"] = True
         window = _ai.clamp_window(floor, go_live)
         if not window.get("ok"):
             out["channels"][name] = {"ok": False, "available": True,
@@ -5494,6 +5507,22 @@ async def plan_api_import(requested_from=None, *, chunk_days: int = 60) -> dict:
 
 
 _API_IMPORT_CHECKPOINT = "api_import_oldest"   # kraken_state key (per channel suffix)
+# The supplier's half-hourly Measurements API is a ROLLING window — it only returns
+# roughly the last N days, then drops older data. Older history (e.g. an earlier
+# tariff trial) genuinely isn't reachable via the API and must come from the CSV
+# route (the bill). Cap the import/plan floor here so we don't advertise or fetch
+# phantom chunks below the wall. Approximate; the real wall is where the API starts
+# returning empty, which the import also stops at.
+_API_RETENTION_DAYS = 730                       # ~2 years
+
+
+def _retention_floor_iso():
+    """Earliest half-hour the rolling ~2-year Measurements window can still return
+    (naive-UTC iso). Anything older has aged out of the API — reachable only via the
+    CSV route (the bill)."""
+    from datetime import datetime, timedelta
+    return (datetime.utcnow() - timedelta(days=_API_RETENTION_DAYS)
+            ).replace(microsecond=0).isoformat()
 
 
 def _earliest_agreement_from(info: dict):
@@ -5955,7 +5984,9 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
                              headroom_frac: float = 0.25, dry_run: bool = False,
                              restart: bool = False, recover_costs: bool = True,
                              recover_pace_s: float = 0.4,
-                             meter_id: str = "electricity_main") -> dict:
+                             meter_id: str = "electricity_main",
+                             until_ts=None,
+                             channels=("import", "export")) -> dict:
     """API import route apply — INCREMENTAL and rate-limit-aware.
 
     Fetches half-hourly GraphQL Measurements (kWh + billed cost + Octopus's own
@@ -5977,18 +6008,27 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
         return {"ok": False, "reason": "no_api", "channels": {}}
     if _store is None:      # e.g. a restore closed the store — never write to it
         return {"ok": False, "reason": "no_store", "channels": {}}
+    # BOUNDED mode: fetch just [requested_from → until_ts] and write those blocks,
+    # WITHOUT touching the full-import resume state (checkpoint / done flag / gap
+    # record). This is the "fill this gap / this contiguous period" primitive the
+    # two task flows use. A missing block has nothing to settle; a bounded run just
+    # (re)fetches the supplier's data for the window and upserts it.
+    bounded = until_ts is not None
+    if bounded and not requested_from:
+        return {"ok": False, "reason": "no_from", "channels": {}}
     try:
-        # Oldest LIVE block (ignore reconstructed/imported) so a prior partial
-        # import doesn't wall off its own gap — see plan_api_import.
-        go_live = _store.get_oldest_block_start(exclude_imported=True)
+        # Ceiling = oldest EXISTING block of ANY source (contiguity rule) so a new
+        # backward import stops at the oldest block we already have and only fills
+        # the remaining gap below it — see plan_api_import.
+        go_live = _store.get_oldest_block_start()
     except Exception:
         go_live = None
-    if not go_live:
+    if not go_live and not bounded:
         return {"ok": False, "reason": "no_go_live", "channels": {}}
     disc = _kraken_discovery or {}
     out: dict = {"ok": True, "go_live": go_live, "dry_run": dry_run, "channels": {}}
     all_done = True
-    for channel in ("import", "export"):
+    for channel in channels:
         info = disc.get(channel) or {}
         mpan = info.get("mpan")
         if not mpan:
@@ -5997,7 +6037,7 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
         ck_key = _API_IMPORT_CHECKPOINT + "_" + channel
         done_key = "api_import_done_" + channel
         gaps_key = "import_gaps_" + channel
-        if restart and not dry_run:
+        if restart and not dry_run and not bounded:
             _store.set_kraken_state(ck_key, "")
             _store.set_kraken_state(done_key, "")
             _store.set_kraken_state(gaps_key, "")
@@ -6009,7 +6049,7 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
                     channel, _store.get_reprice_queue().get(channel) or [])
             except Exception:
                 pass
-        if not dry_run and _store.get_kraken_state(done_key) == "1":
+        if not dry_run and not bounded and _store.get_kraken_state(done_key) == "1":
             out["channels"][channel] = {"ok": True, "done": True,
                                         "reason": "already_done", "written": 0}
             continue
@@ -6035,8 +6075,14 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
         if not floor:
             gl_dt = _ai._naive_utc(go_live)
             floor = _ai._iso(gl_dt - timedelta(days=1100)) if gl_dt else None
-        checkpoint = (_store.get_kraken_state(ck_key) or None) if not dry_run else None
-        hi = checkpoint or go_live
+        # Don't fetch below the rolling ~2-year retention wall — the API returns
+        # empty there, so it's wasted rate-limit budget. Older history is CSV-only.
+        if floor and not bounded:
+            _rf = _retention_floor_iso()
+            if floor < _rf:
+                floor = _rf
+        checkpoint = (_store.get_kraken_state(ck_key) or None) if (not dry_run and not bounded) else None
+        hi = until_ts if bounded else (checkpoint or go_live)
         window = _ai.clamp_window(floor, hi)
         if not window.get("ok"):
             if not dry_run:
@@ -6128,7 +6174,7 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
         # under-reporting a bill period. Zero-export nights come back as zero-value
         # rows (not omitted), so a gap here is a genuine hole — a DCC/settlement
         # outage. Persisted per channel; survives reload without re-querying.
-        if not dry_run:
+        if not dry_run and not bounded:
             _record_import_gaps(channel, gaps_key, checkpoint, imported)
 
         # Standing charge per day. PREFER the tariff standing-charge schedule
@@ -6292,7 +6338,7 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
             written = _store.upsert_imported_blocks(
                 rows_to_write, meter_id, channel, source=IMPORTED_SOURCE_API)
             await _asyncio.sleep(0)      # yield the loop after the batch write
-        if not dry_run and imported:
+        if not dry_run and not bounded and imported:
             _store.set_kraken_state(ck_key, imported[-1])
 
         # Done when: gap-halt, or this slice reached the floor (all chunks fit),
@@ -6305,7 +6351,7 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
         reason = ("halted" if halted_at else "rate_limit" if paused
                   else "fetch_error" if fetch_error
                   else "completed" if done else "more")
-        if done and not dry_run:
+        if done and not dry_run and not bounded:
             _store.set_kraken_state(done_key, "1")
         if not done:
             all_done = False
@@ -6322,6 +6368,27 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
         }
     out["done"] = all_done
     return out
+
+
+async def fetch_api_window(from_ts, to_ts, *, chunk_days: int = 60,
+                           max_chunks: int = 24, pace_s: float = 0.0,
+                           dry_run: bool = False,
+                           meter_id: str = "electricity_main",
+                           channels=("import", "export")) -> dict:
+    """Bounded, contiguous API fetch — the keystone for gap-fill and single-period
+    import. Fetches the supplier's Measurements for exactly [from_ts → to_ts] and
+    upserts `imported_api` blocks for that window, WITHOUT advancing the full-import
+    resume state (checkpoint / done flag / gap record). `to_ts` should be the gap's
+    end, or (for a backward extend) the oldest existing block, so history stays
+    contiguous. Thin wrapper over import_api_history's bounded mode.
+
+    max_chunks defaults high enough to complete a multi-month window in one call
+    (24 × 60d ≈ 4y); callers pass a smaller window for a gap.
+    """
+    return await import_api_history(
+        requested_from=from_ts, until_ts=to_ts, restart=False,
+        chunk_days=chunk_days, max_chunks=max_chunks, pace_s=pace_s,
+        dry_run=dry_run, meter_id=meter_id, channels=channels)
 
 
 async def repair_import_pricing(from_date=None, to_date=None, *,
@@ -6513,6 +6580,7 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                 continue
             by_start = {r["start"]: r for r in (rows or []) if r.get("start")}
             fixed = []
+            confirmed = []    # queue mode: the refetch returned a cost (fixed OR already-correct)
             for st in grp:
                 r = by_start.get(st)
                 if not r:
@@ -6522,14 +6590,19 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                 if mc is None:            # window still no cost → try single-slot below
                     sm_starts.append(st)
                     continue
+                confirmed.append(st)
                 ofp = r.get("off_peak")
                 kwh = r.get("kwh") or 0
                 rate = _billed_rate(rate_segs, st, ofp, mc, kwh)
                 if _store.reprice_imported_block(st, meter_id, channel, rate, mc):
                     recovered += 1
                     fixed.append(st)
-            if fixed and not (from_date or to_date):
-                _store.clear_reprice_queue_slots(channel, fixed)
+            # Queue mode: a slot the API returns a cost for is DONE — whether we
+            # corrected it or it was already right. Clearing only CHANGED slots
+            # leaves already-correct ones stuck in the queue forever (each retry
+            # re-confirms the same cost, reprice returns False, they never clear).
+            if confirmed and not (from_date or to_date):
+                _store.clear_reprice_queue_slots(channel, confirmed)
 
             # Opportunistic neighbours (suspect-only): the window we just fetched
             # already carries Octopus's label for EVERY half-hour in it, not only the
@@ -6581,6 +6654,7 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                 _rec = {}
                 logger.info("repair_import_pricing: single-slot pass failed: %s", e)
             fixed_ss = []
+            confirmed_ss = []      # queue mode: single-slot pass returned a cost
             for st in sm_starts:
                 node = _rec.get(st)
                 mc = node.get("cost_incl") if node else None
@@ -6588,13 +6662,16 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                     still_missing += 1
                     still_missing_starts.append(st)
                     continue
+                confirmed_ss.append(st)
                 ofp = node.get("off_peak")
                 rate = _billed_rate(rate_segs, st, ofp, mc, node.get("kwh") or 0)
                 if _store.reprice_imported_block(st, meter_id, channel, rate, mc):
                     recovered += 1
                     fixed_ss.append(st)
-            if fixed_ss and not (from_date or to_date):
-                _store.clear_reprice_queue_slots(channel, fixed_ss)
+            # Same as the window pass: clear every slot now confirmed to hold a cost,
+            # not just the ones whose value changed (see above).
+            if confirmed_ss and not (from_date or to_date):
+                _store.clear_reprice_queue_slots(channel, confirmed_ss)
 
     if recovered:
         await _regen_charts_after_import_async({"written": {"import": recovered}})
@@ -7064,6 +7141,17 @@ def api_import_health() -> dict:
         out["remaining"] = int(_store.reprice_queue_count())
     except Exception:
         pass
+    # The actual queued slots (per channel), so the panel can list "which slots
+    # still need a retry" and offer a pre-filled CSV of exactly those to run
+    # through the CSV path when the API can't recover them. Capped for payload size.
+    try:
+        q = _store.get_reprice_queue() or {}
+        out["queue"] = {
+            "import": sorted(q.get("import") or [])[:500],
+            "export": sorted(q.get("export") or [])[:500],
+        }
+    except Exception:
+        out["queue"] = {"import": [], "export": []}
     return out
 
 
@@ -7149,6 +7237,92 @@ async def _probe_and_apply_region_periods() -> dict | None:
     except Exception as e:
         logger.warning("_probe_and_apply_region_periods: %s", e)
         return None
+
+
+async def run_gap_fill_job(from_ts, to_ts, *, channels=("import", "export"),
+                           chunk_days: int = 60, max_chunks: int = 6,
+                           pace_s: float = 1.5,
+                           meter_id: str = "electricity_main") -> None:
+    """Background worker: fill ONE gap window [from_ts → to_ts] via the API, then
+    the SAME finish as the full import — calm price-recovery verify pass, carbon
+    re-arm, chart rebuild. Reuses `_api_import_job` so the shared status +
+    pricing-health panel tracks it, and honours pause/cancel between chunks.
+
+    Drives its own newest→oldest frontier (each slice's 'oldest') across iterations
+    rather than the full-import checkpoint, so a bounded gap fill never disturbs a
+    full-import resume point. One contiguous span; never raises."""
+    j = _api_import_job
+    j.clear()
+    j.update({"status": "running", "phase": "importing", "control": "run",
+              "started_at": _dt_now_iso_safe(),
+              "written": {"import": 0, "export": 0}, "oldest": {},
+              "flags_raised": 0, "auto_recovered": 0,
+              "reason": None, "error": None, "done": False, "go_live": None,
+              "gap": {"from": from_ts, "to": to_ts}})
+    _reset_pricing_health()
+    hi = to_ts
+    try:
+        while True:
+            ctl = j.get("control")
+            if ctl == "cancel":
+                j["status"] = "cancelled"
+                await _regen_charts_after_import_async(j)
+                return
+            if ctl == "pause":
+                j["status"] = "paused"
+                await asyncio.sleep(1.0)
+                continue
+            j["status"] = "running"; j["phase"] = "importing"
+            res = await import_api_history(
+                from_ts, until_ts=hi, channels=tuple(channels),
+                chunk_days=chunk_days, max_chunks=max_chunks, pace_s=pace_s,
+                restart=False, meter_id=meter_id)
+            if not res.get("ok"):
+                j["status"] = "error"; j["error"] = res.get("reason") or "failed"
+                return
+            frontier = None; rate_limited = False
+            for ch, c in (res.get("channels") or {}).items():
+                if not isinstance(c, dict):
+                    continue
+                j["written"][ch] = j["written"].get(ch, 0) + (c.get("written") or 0)
+                j["flags_raised"] = j.get("flags_raised", 0) + (c.get("flags_raised") or 0)
+                j["auto_recovered"] = j.get("auto_recovered", 0) + (c.get("healed_in_pass") or 0)
+                o = c.get("oldest")
+                if o:
+                    j["oldest"][ch] = o
+                    if frontier is None or o < frontier:
+                        frontier = o
+                if c.get("reason") == "rate_limit":
+                    rate_limited = True
+            if rate_limited:
+                j["status"] = "rate_limited"
+                await asyncio.sleep(30)          # cool-down, then retry the same frontier
+                continue
+            # Done when the fetch says so, the frontier reached the floor, or it
+            # stopped advancing (no more supplier data in the window).
+            if res.get("done") or (not frontier) or frontier <= from_ts:
+                break
+            hi = frontier                          # continue newest→oldest below
+
+        # ── Same finish as the full import (bar the region/period extend, which an
+        #     interior gap doesn't need): verify pricing, re-arm carbon, rebuild. ──
+        j["done"] = True; j["status"] = "finalising"; j["phase"] = "finalising"
+        try:
+            if _store is not None:
+                _store.rearm_carbon_backfill()
+        except Exception as _ce:
+            logger.warning("run_gap_fill_job: carbon re-arm failed: %s", _ce)
+        try:
+            j["phase"] = "recovering_prices"
+            await repair_import_pricing()
+        except Exception as _ve:
+            logger.warning("run_gap_fill_job: verify pass failed: %s", _ve)
+        j["phase"] = "rebuilding_charts"
+        await _regen_charts_after_import_async(j)
+        j["status"] = "done"; j["phase"] = "done"
+    except Exception as e:
+        logger.warning("run_gap_fill_job: %s", e)
+        j["status"] = "error"; j["error"] = str(e)
 
 
 async def run_api_import_job(requested_from=None, *, chunk_days: int = 60,
