@@ -99,58 +99,32 @@ Full documentation is on the **[GitHub Wiki](https://github.com/RGx01/energy-met
 | [Charts](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Charts) | Billing chart, heatmap, usage stats |
 | [Insights](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Insights) | Carbon and Usage analysis, PDF export |
 | [Data Management](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Data-Management) | Backups, restore, corrections |
+| [Historical Import](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Historical-Import) | Backfill from API/CSV, fill gaps *(new in 4.0)* |
+| [Device History](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Device-History) | Reconstruct a device's past usage from HA recorder *(new in 4.0)* |
 | [Sensor Requirements](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Sensor-Requirements-and-Known-Limitations) | Sensor types, units, known limitations |
 | [Carbon Intensity](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Carbon-Intensity) | How carbon data is fetched and used |
 
 ---
 
-## What's new in 3.4
+## What's new in 4.0
 
-- **🚗 Smart-charging card (Intelligent Octopus)** — the Overview page now shows your recent smart charges: energy delivered, when it charged and for how long, off-peak vs peak, and roughly what smart charging saved versus peak. Expandable over **7, 30 or 90 days**, each session showing its per-slot fill curve and scheduled window, with upcoming (scheduled-but-not-yet-charged) dispatches listed separately. Works for every IOG setup — including API-only accounts with no EV or power sensor, and **Ohme**. It shows the car's charge from the dispatch data, so solar offset and house load aren't reflected.
-- **🧾 Standing charge folded into the import charge** — the bill summary now reads like a real supplier bill: the standing charge sits inside the "Import — total grid" section with a new **Total incl. standing charge** subtotal, instead of stranded at the bottom. Display only — totals are unchanged. (VAT still isn't modelled.)
-- **⚡ Much faster billing charts** — the daily chart is now gzip-compressed on the direct `:8099` port and in Lovelace cards (~12× smaller, so it no longer sits blank for 15–20s), and the **Quarter**/**Year** views render per-day charts only as they scroll into view instead of all ~90/365 at once — so switching period modes stays responsive.
-- **🔌 Deprecations sensor removed** — `sensor.energy_meter_tracker_api_deprecations` and the `publish_ha_sensors` option are gone, so **EMT now publishes no Home Assistant entities at all**. **Breaking** only if you referenced that sensor or set the option.
+EMT 4.0 is a **major-additive** release — like 3.0 it's a drop-in upgrade: nothing breaks, existing installs keep working, and the new tools are opt-in.
 
-See the [full changelog](CHANGELOG.md) for the complete list.
+- **📥 Historical Import — backfill your full history.** Pull your past half-hourly data straight from Octopus (GraphQL Measurements API, a rolling ~2 years) or import a consumption **CSV** — kWh, exact billed cost, and the off-peak/standard label, so Intelligent Octopus smart charges price correctly rather than being guessed. Runs as a background job (**pause / resume / cancel**), rate-limit-polite so it won't starve live polling, with a self-healing pricing check afterwards. Fully reversible.
+- **🩹 Fill History & Gaps.** When a settlement outage leaves holes, each gap offers a **pre-filled CSV to complete from your bill**, or an API fill — all through one guided flow. Delete and backup now run as background jobs with live progress.
+- **🌍 Region-aware historical carbon.** The carbon backfill now extends across your imported history, resolving the correct DNO region **per billing period** (only the outward part of your postcode is ever stored), so Carbon/Insights and the heatmaps reach back years instead of stopping where carbon recording began. A house move is handled as a region boundary.
+- **📊 Device History (recorder attribution).** Added a device — EV charger, battery, heat pump — to EMT *after* it was already recording in Home Assistant? Reconstruct its earlier usage from HA's recorder, split across the half-hours and clipped so it never exceeds what the house drew. One-click reversible.
+- **🌀 Usage Stats HH view + reworked Spiral.** A new **HH** breakdown shows a single day as its 48 half-hour blocks; the **Spiral** now shows **Cost, Usage and Carbon side by side** with one shared grouping (Net / Import / Export / device) and a separate standing-charge spiral, each expandable.
+- **🧹 Data Management reorganised** into clear sections, with a **Fill History & Gaps** landing page for the backfill/repair tools.
+- **🛡️ Reliability** — a physical-plausibility guard stops impossible device spikes from a sensor glitch, plus fixes for post-outage settlement freezes, carbon-backfill retries, and the reconnect storms a large history could trigger.
 
----
-
-## What's new in 3.2
-
-- **🩹 Outage recovery** — if the add-on was offline longer than the 12-hour gap-fill limit, those blocks were lost for good: the settlement poll only ever looks forward. **Data Management → Missing Data** now finds the holes and rebuilds them from your supplier's settled readings. Manual on purpose — EMT can't tell an outage from blocks you deleted deliberately.
-- **⚡ Settlement no longer freezes after an outage** — a gap marker was wrongly gating the step that applies settled figures to billing, so *every* block's costs stayed on pre-settlement estimates until the marker cleared.
-- **🔔 Global notification region** — messages now appear between the topbar and the page instead of floating over it, so they no longer overlap the page content ([#219](https://github.com/RGx01/energy-meter-tracker-addon/issues/219)). Includes an **update-available** notice for standalone users, who get no Supervisor badge. Dismissal sticks per version.
-- **🗂️ Backups isolated per site** — supervised backups live in `/share`, which HA shares across *all* add-ons, so two EMT instances could list and restore each other's backups. The directory is now namespaced by site name.
-- **🔌 Four unused sensors removed** — `sensor.energy_meter_import_kwh`, `_export_kwh`, `_import_cost`, `_export_credit`. They published live per-block figures that settlement later corrects, so they disagreed with EMT's own billing. **Breaking** if you referenced them.
-
-Earlier 3.x releases added Intelligent Octopus dispatch-lifecycle pricing (smart charges billed from the dispatch data rather than the meter, so solar-supplied charges price correctly), support for the new IOG 6-hour-cap tariff, and the Spiral chart.
-
-See the [full changelog](CHANGELOG.md) for the complete list.
+See the **[Historical Import](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Historical-Import)** and **[Device History](https://github.com/RGx01/energy-meter-tracker-addon/wiki/Device-History)** wiki guides for how to use the new tools, or the [full changelog](CHANGELOG.md) for everything in 4.0.
 
 ---
 
-## What's new in 3.0
+## Upgrading
 
-EMT 3.0 is the largest release so far — and a **major-additive one: nothing breaks**. Existing installs upgrade in place, keep working exactly as before, and switch the new things on when ready. Everything new is opt-in through the Setup Wizard.
-
-- **🔌 Supplier settlement (Octopus / Kraken DCC)** — reconcile every block against the settled half-hourly data your supplier actually bills from. A billing-source toggle chooses whether your bill is driven by your meter sensor or the supplier API; credentials are entered in-app (no YAML), and corrections are gated until a block is settled. Opt-in.
-- **🧙 Supplier-first Setup Wizard & data-source modes** — setup now starts from your supplier and meter situation and configures the right path: **`cad`** (local sensor only, as in 2.x) or **`cad+api`** (local readings plus supplier settlement). A **Change Setup** launcher lets you switch later.
-- **🚗 Intelligent Octopus Go awareness** — EMT captures IOG smart-charge dispatch slots and prices the affected blocks at the off-peak rate you were actually charged, at both finalise and settlement. Per-device "use dispatch overlay" rates let your EV bill at the dispatch rate while the house stays on the standard tariff.
-- **📡 Octopus Home Mini live power** — use a Home Mini's real-time demand feed for the gauges and 48-hour history without a separate CAD sensor.
-- **🌍 Grid carbon intensity everywhere** — gCO₂/kWh recorded on every block, with a Carbon Insights page, CO₂ columns and charts in Usage Stats, and a gCO₂/kWh heatmap mode. A one-time backfill fills carbon data for your existing 2.x history.
-- **🔁 Per-channel rate source** — each channel can take its unit rate from the API or a sensor independently (mix as needed).
-- **🔧 Power-sensor invert & unit override** — fix sensors that read reversed or 1000× wrong (sign convention or a mis-declared W/kW unit) on the main, EV, heat pump or battery.
-- **🔋 Ohme EV charger support** — detection-aware, preferring the charger's own session sensor. Ships conservatively, with an in-app feedback path.
-- **Renamed for clarity** — "sub-meters" are now **Devices**; the **Live Power** page is now **Overview** and works even without a live-power sensor.
-- **EV grid attribution fix (#212)** — when an EV and a battery charge at once and solar covers part of it, the EV now claims grid import first, so a cheap smart-charge no longer disappears behind a charging battery. Bill totals unchanged.
-
-See the [full changelog](CHANGELOG.md) for the complete list.
-
----
-
-## Upgrading from 2.x
-
-**3.0 is a drop-in upgrade. Nothing you have changes, and nothing new is forced on you.**
+**Every major version has been a drop-in upgrade — including 4.0. Nothing you have changes, and nothing new is forced on you.** The notes below cover the jump from 2.x (the biggest step); a 3.x → 4.0 upgrade is smaller still and needs nothing from you.
 
 - **Your data is preserved.** Blocks, configuration, billing periods and history all carry over. Schema migrations run automatically on first start.
 - **Carbon backfill runs once, in the background.** UK postcode installs get a one-time pass that fills gCO₂/kWh for your existing 2.x blocks. It self-heals if interrupted by a restart — no action needed.
@@ -158,6 +132,7 @@ See the [full changelog](CHANGELOG.md) for the complete list.
 - **The supplier features are opt-in.** When you're ready, open the **Setup Wizard** (or **Change Setup**) to add Octopus/Kraken DCC settlement, Home Mini live power, or Intelligent Octopus Go dispatch pricing. Switching modes is gated behind a confirmation because it can trigger a full recalculation.
 - **Already had the Octopus API configured?** EMT infers your supplier from the existing credentials — no re-entry needed.
 - **Restoring an old backup?** A v2-era backup with no supplier field restores cleanly as local-metering-only.
+- **Coming from 3.x?** 4.0 adds Historical Import, Device History and the reworked charts — all **opt-in**, changing nothing until you use them. Historical import and device attribution each take an automatic backup first and are one-click reversible, so you can try them without risk. (The only removal in 4.0 is an internal pre-2.0 JSON migration shim that hasn't been needed for years.)
 
 If anything looks off after upgrading, your previous data is untouched and you can review it in **Data Management** → backups.
 

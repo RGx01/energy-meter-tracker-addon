@@ -4020,12 +4020,25 @@ def api_backfill_gaps():
         import engine as _eng
         store = _get_store()
         api_available = _eng.kraken_available()
+        # Does the main meter export? A whole missing BLOCK then needs BOTH channels
+        # filled (import AND export), not just import — otherwise the CSV template and
+        # the API fill silently omit export for that window.
+        try:
+            _cfg = load_config()
+            _main = next((m for m in _cfg.get("meters", {}).values()
+                          if not (m.get("meta") or {}).get("sub_meter")), {})
+            has_export = "export" in (_main.get("channels") or {})
+        except Exception:
+            has_export = False
+        block_channels = ["import", "export"] if has_export else ["import"]
         gaps = []
-        # (1) Missing block rows — import channel.
+        # (1) Missing block rows — the whole block is absent, so it needs every
+        # configured channel (import, and export where the meter exports).
         for g in store.find_block_gaps():
             slots = int(g.get("slots") or 0)
             gaps.append({"start": g.get("start"), "end": g.get("end"), "slots": slots,
                          "hours": round(slots / 2.0, 1), "channel": "import",
+                         "channels": list(block_channels),
                          "kind": "missing_blocks", "fetchable": True})
         # (2) Missing per-channel data recorded by the import (import + export).
         imp = _eng.api_import_gaps() or {}
@@ -4036,6 +4049,7 @@ def api_backfill_gaps():
                     continue
                 gaps.append({"start": g.get("from"), "end": g.get("to") or g.get("from"),
                              "slots": cnt, "hours": round(cnt / 2.0, 1), "channel": ch,
+                             "channels": [ch],
                              "kind": "missing_data", "fetchable": api_available})
         gaps.sort(key=lambda x: (x.get("start") or ""), reverse=True)
         return jsonify({

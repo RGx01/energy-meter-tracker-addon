@@ -5366,6 +5366,33 @@ class TestBackfillGaps(unittest.TestCase):
         self.assertEqual(j["total_slots"], 146)          # 2 + 144
         self.assertTrue(j["api_available"])
 
+    def _block_hole_channels(self, main_channels):
+        """Run the endpoint with a single block-hole gap and a main meter whose
+        channels are `main_channels`; return that gap's `channels` list."""
+        import server, engine
+        engine.kraken_available = lambda: True
+        engine.api_import_gaps = lambda: {"channels": {}}
+        server._store.find_block_gaps = lambda **k: [
+            {"start": "2026-05-01T00:00:00", "end": "2026-05-01T00:30:00", "slots": 2}]
+        _orig = server.load_config
+        server.load_config = lambda: {"meters": {"electricity_main": {
+            "meta": {}, "channels": {c: {} for c in main_channels}}}}
+        try:
+            j = self.client.get("/api/backfill/gaps").get_json()
+        finally:
+            server.load_config = _orig
+        hole = [g for g in j["gaps"] if g["kind"] == "missing_blocks"][0]
+        return hole["channels"]
+
+    def test_block_hole_needs_both_channels_when_meter_exports(self):
+        # A whole missing block on an exporting meter must offer import AND export,
+        # so neither the CSV template nor the API fill silently omits export.
+        self.assertEqual(self._block_hole_channels(["import", "export"]),
+                         ["import", "export"])
+
+    def test_block_hole_import_only_when_no_export(self):
+        self.assertEqual(self._block_hole_channels(["import"]), ["import"])
+
 
 class TestBackfillFillGap(unittest.TestCase):
     """/api/backfill/fill-gap — launches a BACKGROUND, channel-scoped gap fill

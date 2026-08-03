@@ -484,22 +484,34 @@ async function bfLoadGaps() {
     j.gaps.forEach(function (g) {
       var kindTxt = (g.kind === 'missing_blocks') ? 'blocks' : 'data';
       var col = g.fetchable ? 'var(--accent)' : 'var(--warning)';
+      // A missing BLOCK needs every configured channel (import, and export where the
+      // meter exports); a missing-DATA gap is a single channel. The endpoint sends
+      // the channel set in `channels`.
+      var chs = (g.channels && g.channels.length) ? g.channels : [g.channel];
+      var both = chs.length > 1;
+      var chLabel = chs.join(' + ');
       var btns = '';
       if (csvSrc) {
-        // CSV route: open the panel scoped to this gap's channel + window.
+        // CSV route: open the panel scoped to this gap's window. `channel:null`
+        // shows BOTH pre-filled templates so a block hole fills import + export.
+        var csvChArg = both ? 'null' : ('\'' + chs[0] + '\'');
         btns += '<button class="btn" onclick="csvOpen({from:\'' + g.start + '\',to:\'' + g.end
-             + '\',channel:\'' + g.channel + '\',inclusive:true})">Fill from CSV →</button>';
+             + '\',channel:' + csvChArg + ',inclusive:true})">Fill from CSV →</button>';
       } else if (j.api_available && g.fetchable) {
+        var apiCh = both ? 'both' : chs[0];
         btns += '<button class="btn" onclick="bfFillGap(this,\'' + g.start
-             + '\',\'' + g.end + '\',\'' + g.channel + '\')">🩹 API</button>';
+             + '\',\'' + g.end + '\',\'' + apiCh + '\')">🩹 API</button>';
       } else {
-        var url = apiUrl('/api/historical/gap-template?inclusive=1&channel=' + encodeURIComponent(g.channel)
-                + '&from=' + encodeURIComponent(g.start) + '&to=' + encodeURIComponent(g.end));
-        btns += '<a class="btn btn-secondary" href="' + url + '">⬇ CSV</a>';
+        // Offline CSV fallback: one download link per channel the gap needs.
+        chs.forEach(function (ch) {
+          var url = apiUrl('/api/historical/gap-template?inclusive=1&channel=' + encodeURIComponent(ch)
+                  + '&from=' + encodeURIComponent(g.start) + '&to=' + encodeURIComponent(g.end));
+          btns += '<a class="btn btn-secondary" href="' + url + '">⬇ ' + _esc(ch) + ' CSV</a> ';
+        });
       }
       html += '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;'
             + 'border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px;">'
-            + '<span><span style="color:' + col + ';font-weight:600;">' + _esc(g.channel) + ' · ' + kindTxt + '</span> · '
+            + '<span><span style="color:' + col + ';font-weight:600;">' + _esc(chLabel) + ' · ' + kindTxt + '</span> · '
             + _esc(g.start.replace('T', ' ')) + ' → ' + _esc(g.end.replace('T', ' ')) + ' · ' + g.hours + ' h</span>'
             + '<span style="white-space:nowrap;">' + btns + '</span></div>';
     });
@@ -508,7 +520,8 @@ async function bfLoadGaps() {
   } catch (e) { out.innerHTML = '<span style="color:var(--danger);">' + _esc(e) + '</span>'; }
 }
 async function bfFillGap(btn, from, to, channel) {
-  if (!window.confirm('Fill this ' + channel + ' gap from the supplier API?\n\n'
+  var chWord = (channel === 'both') ? 'import & export' : channel;
+  if (!window.confirm('Fill this ' + chWord + ' gap from the supplier API?\n\n'
       + from.replace('T', ' ') + '  →  ' + to.replace('T', ' ')
       + '\n\nRuns as a background import (identical to whole-history — price recovery, '
       + 'verify and carbon fill), just bounded to this gap. Watch progress in the import '
@@ -690,6 +703,7 @@ function meterHistory(){
 }
 
 var _statusTimer = null;
+var _apiTermHandled = false;   // guards against an accidental repeat run after completion
 var STATUS_LABEL = {
   running: 'Importing…', finalising: 'Finishing up…', paused: 'Paused',
   rate_limited: 'Paused (API rate limit — resumes automatically)',
@@ -719,6 +733,15 @@ function _renderApiStatus(d){
   var out = document.getElementById('api-apply-out');
   var st  = document.getElementById('api-apply-status');
   var status = d.status || 'idle';
+  // Prevent an accidental repeat run: once an import reaches a terminal state,
+  // clear the "confirm" tick so Start greys out until the user deliberately
+  // re-confirms (arming a fresh run). Reset the guard while a run is active.
+  if (status==='running' || status==='rate_limited' || status==='finalising' || status==='paused') {
+    _apiTermHandled = false;
+  } else if ((status==='done' || status==='cancelled' || status==='error') && !_apiTermHandled) {
+    _apiTermHandled = true;
+    var _cb = document.getElementById('api-confirm'); if (_cb) _cb.checked = false;
+  }
   st.textContent = STATUS_LABEL[status] || status;
   // During the post-import tail, show the live phase so it doesn't look stalled.
   if(status==='finalising' && PHASE_LABEL[d.phase]) st.textContent = PHASE_LABEL[d.phase];

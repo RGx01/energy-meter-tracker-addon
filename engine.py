@@ -7319,6 +7319,17 @@ async def run_gap_fill_job(from_ts, to_ts, *, channels=("import", "export"),
             logger.warning("run_gap_fill_job: verify pass failed: %s", _ve)
         j["phase"] = "rebuilding_charts"
         await _regen_charts_after_import_async(j)
+        # Same finish as the full import: persist the pricing-health summary and
+        # launch the DETACHED deferred verification pass, so a gap fill shows the
+        # off-peak/peak verification in the panel exactly as a whole/date import does.
+        try:
+            _persist_import_health(j)
+        except Exception as _e:
+            logger.warning("run_gap_fill_job: health persist failed: %s", _e)
+        try:
+            asyncio.create_task(run_deferred_verify_pricing())
+        except Exception as _e:
+            logger.warning("run_gap_fill_job: verify launch failed: %s", _e)
         j["status"] = "done"; j["phase"] = "done"
     except Exception as e:
         logger.warning("run_gap_fill_job: %s", e)
