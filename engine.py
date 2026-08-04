@@ -5769,6 +5769,14 @@ def _tariff_rate_for(rate_segs, start, off_peak):
                 v = hi
             else:
                 v = sched.resolve(start)
+            # Uncovered sliver inside a matched agreement window — the tariff-
+            # transition seam where a new tariff's published unit rates start
+            # AFTER its valid_from. For a FLAT tariff the rate is the same
+            # everywhere, so back-fill it rather than returning None (which drops
+            # pricing to a fragmenting cost÷kWh). flat_rate() is None for a banded
+            # tariff, so IOG import keeps its exact per-slot rate untouched.
+            if v is None:
+                v = sched.flat_rate()
             return round(v / 100.0, 6) if v is not None else None
     return None
 
@@ -5818,6 +5826,13 @@ def _billed_rate(rate_segs, start, off_peak, meas_cost, kwh,
         lo = hi = None
         for vf, vt, s in rate_segs:
             if s is not None and start >= vf and (vt is None or start < vt):
+                # A FLAT agreement (single rate throughout) is the published truth
+                # even where day_rate_bounds(start) reads (None,None) — the tariff-
+                # transition seam whose early days precede the new tariff's first
+                # published unit rate. Without this, those days fall to the tol
+                # check below and a flat rate fragments into cost÷kWh jitter.
+                if s.flat_rate() is not None:
+                    return sched
                 lo, hi = s.day_rate_bounds(start)
                 break
         if lo is not None and lo == hi:      # flat tariff that day → schedule is truth
@@ -6711,7 +6726,21 @@ _api_import_job: dict = {"status": "idle"}
 
 
 def api_import_status() -> dict:
-    """JSON-safe snapshot of the background import job."""
+    """JSON-safe snapshot of the background import job. When nothing is live in
+    memory (idle — e.g. an add-on restart, or a page reloaded after a gap fill
+    finished) fall back to the persisted summary of the LAST completed run, so the
+    import panel shows accurate 'N blocks imported' + status on ANY load instead of
+    a blank/zero panel. (Poll-on-load, like the gaps + pricing-health panels.)"""
+    if _api_import_job.get("status") in (None, "idle") and _store is not None:
+        try:
+            import json as _json
+            raw = _store.get_kraken_state(_IMPORT_RUN_KEY)
+            if raw:
+                d = _json.loads(raw)
+                d["persisted"] = True
+                return d
+        except Exception:
+            pass
     return {k: v for k, v in _api_import_job.items() if k != "task"}
 
 
@@ -7067,6 +7096,32 @@ async def run_deferred_verify_pricing(*, chunk_days: int = 30, headroom_frac: fl
 
 
 _IMPORT_HEALTH_KEY = "import_health_summary"
+_IMPORT_RUN_KEY = "import_run_status"   # kraken_state: last completed import/gap-fill run
+
+
+def _persist_run_status(j: dict) -> None:
+    """Persist a compact snapshot of the LAST completed import/gap-fill run so the
+    import panel renders accurate 'N blocks imported' + status/window on any page
+    load, not only from the ephemeral in-memory job (api_import_status reads this
+    when nothing is live). Overwritten by the next run."""
+    if _store is None:
+        return
+    import json as _json
+    try:
+        snap = {
+            "status": j.get("status") or "done",
+            "phase": "done",
+            "written": j.get("written") or {},
+            "oldest": j.get("oldest") or {},
+            "gap": j.get("gap"),
+            "go_live": j.get("go_live"),
+            "flags_raised": int(j.get("flags_raised") or 0),
+            "auto_recovered": int(j.get("auto_recovered") or 0),
+            "finished_at": _dt_now_iso_safe(),
+        }
+        _store.set_kraken_state(_IMPORT_RUN_KEY, _json.dumps(snap))
+    except Exception as e:
+        logger.warning("_persist_run_status: %s", e)
 
 
 def _reset_pricing_health() -> None:
@@ -7331,6 +7386,7 @@ async def run_gap_fill_job(from_ts, to_ts, *, channels=("import", "export"),
         except Exception as _e:
             logger.warning("run_gap_fill_job: verify launch failed: %s", _e)
         j["status"] = "done"; j["phase"] = "done"
+        _persist_run_status(j)     # durable summary for reload (poll-on-load)
     except Exception as e:
         logger.warning("run_gap_fill_job: %s", e)
         j["status"] = "error"; j["error"] = str(e)
@@ -7426,6 +7482,7 @@ async def run_api_import_job(requested_from=None, *, chunk_days: int = 60,
                 await _regen_charts_after_import_async(j)
                 try:
                     _persist_import_health(j)
+                    _persist_run_status(j)     # durable status for reload (poll-on-load)
                 except Exception as _e:
                     logger.warning("run_api_import_job: health persist failed: %s", _e)
                 # Deferred, rate-limit-gated pricing verification: re-check the whole

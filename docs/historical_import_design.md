@@ -252,6 +252,13 @@ configured in EMT)` and re-runs PASS-2 on those blocks. Rules:
 - **23-/25-hour transition days** — the API offset disambiguates the repeated
   autumn hour (first pass `+01:00`, second `Z`); tiles correctly if the offset is
   trusted. Explicit tests on both transition dates.
+- **Bill/PDF path (as shipped):** a PDF gives **local wall-clock** times with no
+  offset, so `bill_parser` must add it. The autumn day lists `01:00`/`01:30` twice
+  (BST then GMT); the transcriber stamps the first `+01:00` and the second `+00:00`
+  by detecting the point where wall-clock time steps **backwards** on the page —
+  otherwise the two collapse onto one UTC slot and a half-hour is lost as a phantom
+  gap. Spring-forward needs nothing (the skipped hour is simply absent; UTC stays
+  contiguous). Regression-tested on both transition dates.
 - **Recorder LTS** is UTC-stored (confirm in the spike), but it only drives the
   approximate **device** layer — so any recorder timezone/DST quirk can perturb
   device attribution but **cannot corrupt the exact house/bill figure**. Keep
@@ -314,7 +321,12 @@ across setups (power sensors, older cores, shorter retention) before committing.
 
 ## Relation to prior designs
 
-- **Supersedes** the PDF-bill import idea — API + CSV only.
+- **Incorporates** the PDF-bill import (shipped in 4.0.0): `bill_parser.py` reads
+  Octopus PDFs and emits the per-channel CSVs, which flow through the **CSV** route
+  — so there are two *sources* (API, CSV) and the bill parser is strictly upstream
+  of the CSV path (see `bill_to_csv_import_spec.md`). (An earlier draft dropped PDF
+  bills entirely; that was reversed once the guarded `pypdf` import + reconciliation
+  gate made in-EMT parsing safe.)
 - **Reuses** BL-12 (`historical_attribution_design.md`) for device attribution;
   the retro back-fill generalises it from outage/pre-EMT gaps to the
   "device configured late" gap.

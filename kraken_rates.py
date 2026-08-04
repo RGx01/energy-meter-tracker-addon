@@ -122,6 +122,26 @@ class RateSchedule:
                 rates.append(rate)
         return (min(rates), max(rates)) if rates else (None, None)
 
+    def flat_rate(self, tol: float = 1e-6):
+        """The single rate if this schedule is FLAT — every period carries the
+        same value (a fixed-price tariff, e.g. a flat OUTGOING export). None if
+        the schedule is empty OR carries more than one distinct rate (a banded
+        tariff like IOG, or a rate that changed mid-agreement).
+
+        Used to keep a flat tariff's schedule authoritative even at a tariff-
+        TRANSITION seam: a new agreement's published unit rates can begin AFTER
+        its valid_from, leaving the early days uncovered, so resolve() /
+        day_rate_bounds() read None for them and pricing would drop to a jittery
+        cost÷kWh that fragments the one flat rate. A flat schedule has the same
+        rate everywhere, so those uncovered days take it too. Returning None for
+        any non-flat schedule keeps banded (IOG) pricing on its exact per-slot
+        path — this can never stamp a wrong band."""
+        if not self._periods:
+            return None
+        rates = [r for (_vf, _vt, r) in self._periods]
+        lo, hi = min(rates), max(rates)
+        return lo if (hi - lo) <= tol else None
+
     @classmethod
     def from_api_records(cls, records: list[dict]) -> "RateSchedule":
         """Build from raw standard-unit-rates results, choosing one payment

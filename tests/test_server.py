@@ -5408,7 +5408,12 @@ class TestBackfillFillGap(unittest.TestCase):
         self._run   = getattr(engine, "api_import_running", None)
         self._job   = getattr(engine, "run_gap_fill_job", None)
         self._loop  = getattr(server, "_event_loop", None)
+        self._gs    = getattr(server, "_get_store", None)
         self._rct   = asyncio.run_coroutine_threadsafe
+        # Deterministic 30-min block store so the inclusive-`to` extension is exact.
+        server._get_store = lambda: type("S", (), {
+            "get_config_period_for_date": lambda self, d: {
+                "block_minutes": 30, "timezone": "Europe/London"}})()
 
     def tearDown(self):
         import engine, server
@@ -5416,6 +5421,7 @@ class TestBackfillFillGap(unittest.TestCase):
         if self._ka  is not None: engine.kraken_available = self._ka
         if self._run is not None: engine.api_import_running = self._run
         if self._job is not None: engine.run_gap_fill_job = self._job
+        if self._gs  is not None: server._get_store = self._gs
         server._event_loop = self._loop
         asyncio.run_coroutine_threadsafe = self._rct
 
@@ -5481,7 +5487,9 @@ class TestBackfillFillGap(unittest.TestCase):
         self.assertTrue(j["ok"])
         self.assertEqual(j["status"], "running")
         self.assertEqual(captured["frm"], "2025-03-05T00:00:00")
-        self.assertEqual(captured["to"], "2025-03-07T23:30:00")
+        # `to` is the last missing slot's start (inclusive) → extended by one 30-min
+        # block so the fill's half-open window actually includes that final slot.
+        self.assertEqual(captured["to"], "2025-03-08T00:00:00")
         self.assertEqual(captured["channels"], ("export",))     # channel-scoped, not both
         self.assertEqual(scheduled["coro"], "CORO")             # background-launched
 
@@ -5538,6 +5546,174 @@ class TestBackfillReach(unittest.TestCase):
         self.assertEqual(j["reach_from"], "2022-01-01T00:00:00")   # min across channels
         self.assertEqual(j["up_to"], "2024-07-01T00:00:00")
         self.assertEqual(j["chunk_estimate"], 12)                  # max chunk_count
+
+
+class TestRepriceRepairVerifyGuard(unittest.TestCase):
+    """/api/historical/reprice-repair must refuse while the verify-pricing pass is
+    live — both hit Octopus on the shared rate-limit allowance, so a concurrent
+    manual reprice would compete for the same budget (and re-check the same slots)."""
+
+    def setUp(self):
+        self.client = make_client()
+
+    def _post(self, verify_status):
+        import engine, server
+        engine.kraken_available = lambda: True
+        engine.api_verify_pricing_status = lambda: {"status": verify_status}
+        # If the guard DOESN'T fire, the endpoint reaches the engine loop — stub
+        # those so the non-guarded path returns cleanly rather than erroring.
+        engine.repair_import_pricing = lambda *a, **k: "CORO"
+        server._run_on_engine_loop = lambda coro, **k: {"ok": True, "recovered": 0,
+                                                        "still_missing": 0, "checked": 0,
+                                                        "windows": 0, "mode": "queue"}
+        return self.client.post("/api/historical/reprice-repair", json={})
+
+    def test_refused_while_verify_running(self):
+        r = self._post("running")
+        self.assertEqual(r.status_code, 409)
+        j = r.get_json()
+        self.assertFalse(j["ok"])
+        self.assertEqual(j["reason"], "verify_active")
+
+    def test_refused_while_verify_waiting_or_paused(self):
+        for st in ("waiting", "paused"):
+            r = self._post(st)
+            self.assertEqual(r.status_code, 409, st)
+            self.assertEqual(r.get_json()["reason"], "verify_active")
+
+    def test_allowed_when_verify_idle(self):
+        r = self._post("idle")
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json()["ok"])
+
+    def test_allowed_when_verify_done(self):
+        r = self._post("done")
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json()["ok"])
+
+
+class TestStartLockedWhileVerifyActive(unittest.TestCase):
+    """A backfill RUN isn't finished until its post-import verify pass completes, so
+    the start endpoints refuse a new run (409 verify_active) while verify is live —
+    the server half of the picker lock, so a refresh / direct call can't get round it."""
+
+    def setUp(self):
+        self.client = make_client()
+        import engine
+        engine.kraken_available = lambda: True
+        engine.api_import_running = lambda: False       # no import in flight
+
+    def _verify(self, status):
+        import engine
+        engine.api_verify_pricing_status = lambda: {"status": status}
+
+    def test_whole_history_start_refused_during_verify(self):
+        self._verify("running")
+        r = self.client.post("/api/historical/api-import/start", json={"confirmed": True})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.get_json().get("reason"), "verify_active")
+
+    def test_fill_gap_refused_during_verify(self):
+        self._verify("waiting")
+        r = self.client.post("/api/backfill/fill-gap", json={
+            "from": "2026-03-01T00:00:00", "to": "2026-03-02T00:00:00", "confirmed": True})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.get_json().get("reason"), "verify_active")
+
+    def test_fill_gap_allowed_when_verify_idle(self):
+        # Past the verify guard it reaches the loop check; with no loop wired in the
+        # test that returns 500 no_loop — the point is it is NOT the 409 verify block.
+        self._verify("idle")
+        r = self.client.post("/api/backfill/fill-gap", json={
+            "from": "2026-03-01T00:00:00", "to": "2026-03-02T00:00:00", "confirmed": True})
+        self.assertNotEqual(r.status_code, 409)
+
+
+class TestBillsBuild(unittest.TestCase):
+    """/api/historical/bills/build — uploaded Octopus PDFs → per-(MPAN, channel) CSV
+    text. The parser is stubbed (no real PDF); the endpoint's grouping + CSV assembly
+    + reconciliation report are exercised with the REAL bill_parser CSV builders."""
+
+    def setUp(self):
+        self.client = make_client()
+        import bill_parser as bp
+        from datetime import date
+        self._ps, self._pb = bp.pdf_support, bp.parse_bill
+        bp.pdf_support = lambda: True
+
+        def _fake(data, source_name=""):
+            d = date(2024, 12, 3)
+            b = bp.Bill(source=source_name, mpan_import="2600000000001",
+                        mpan_export="2600000000002", vat_import=0.05, vat_export=0.0)
+            b.hh_days = [[bp.HHSlot(d, 0, 0, 0, 30, 6.67, 1.0, 6.67),
+                          bp.HHSlot(d, 0, 30, 1, 0, 6.67, 1.0, 6.67)]]
+            b.import_periods = [bp.ImportPeriod(d, d, [(6.67, 2.0, 0.13)], 2.0, 1, 52.24)]
+            b.export_periods = [bp.ExportPeriod(d, d, 5.0, 15.0, 0.75)]
+            b.reconciliation = {"days": [{"date": "2024-12-03", "ok": True}],
+                                "import_periods": [], "ok": True}
+            return b
+        bp.parse_bill = _fake
+
+    def tearDown(self):
+        import bill_parser as bp
+        bp.pdf_support, bp.parse_bill = self._ps, self._pb
+
+    def _post(self, *names):
+        import io
+        data = {"files": [(io.BytesIO(b"%PDF-1.4 fake"), n) for n in names]} if len(names) > 1 \
+            else {"files": (io.BytesIO(b"%PDF-1.4 fake"), names[0])}
+        return self.client.post("/api/historical/bills/build", data=data,
+                                content_type="multipart/form-data")
+
+    def test_builds_per_channel_csv(self):
+        r = self._post("bill.pdf")
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertTrue(j["ok"])
+        self.assertEqual(len(j["groups"]), 1)
+        g = j["groups"][0]
+        self.assertEqual(g["mpan_import"], "2600000000001")
+        self.assertEqual(g["mpan_export"], "2600000000002")
+        self.assertEqual(g["import_rows"], 2)               # two HH slots
+        self.assertGreater(g["export_rows"], 0)
+        self.assertTrue(g["import_csv"].startswith("Start,End,Consumption"))
+        self.assertTrue(g["reconciliation"]["ok"])
+
+    def test_rejects_non_pdf(self):
+        r = self._post("notes.txt")
+        self.assertEqual(r.status_code, 400)
+
+    def test_no_pdf_support(self):
+        import bill_parser as bp
+        bp.pdf_support = lambda: False
+        r = self._post("bill.pdf")
+        self.assertEqual(r.status_code, 400)
+
+
+class TestGapEndInclusive(unittest.TestCase):
+    """A gap's `to` is the last missing slot's START (inclusive), but the fill window
+    is half-open — so the final half-hour was left unfilled ("1 block still missing
+    after a gap fill"). _gap_end_inclusive extends `to` by one block to include it."""
+
+    class _Store:
+        def __init__(self, bm=30):
+            self._bm = bm
+        def get_config_period_for_date(self, d):
+            return {"block_minutes": self._bm, "timezone": "Europe/London"}
+
+    def test_extends_by_one_block_30min(self):
+        import server
+        out = server._gap_end_inclusive(self._Store(30), "2026-03-01T00:00:00", "2026-04-30T22:30:00")
+        self.assertEqual(out, "2026-04-30T23:00:00")
+
+    def test_extends_by_one_block_15min(self):
+        import server
+        out = server._gap_end_inclusive(self._Store(15), "2026-03-01T00:00:00", "2026-04-30T22:30:00")
+        self.assertEqual(out, "2026-04-30T22:45:00")
+
+    def test_bad_date_returns_original(self):
+        import server
+        self.assertEqual(server._gap_end_inclusive(self._Store(), "x", "not-a-date"), "not-a-date")
 
 
 if __name__ == "__main__":
