@@ -2699,10 +2699,12 @@ async def attribution_preflight(device_meter_id: str, sensor_ids: list) -> dict:
     {ok, verdict, device_kwh, house_kwh, from, to} — verdict is 'ok',
     'device_exceeds_house', 'suspiciously_small', or 'no_data'. Never raises."""
     try:
-        store = get_store()
+        # Fetch the store fresh at each use — never hold a handle across the recorder
+        # fetch below: a config save / HA reconnect reopens _store mid-await and would
+        # leave a captured handle closed ("Cannot operate on a closed database").
         if _engine_ha is None:
             return {"ok": True, "verdict": "no_ha", "device_kwh": None, "house_kwh": None}
-        parent = store.get_parent_meter_id(device_meter_id) or "electricity_main"
+        parent = get_store().get_parent_meter_id(device_meter_id) or "electricity_main"
         now = datetime.now(timezone.utc)
         start = (now - timedelta(days=3660)).isoformat()
         series = {}
@@ -2718,7 +2720,7 @@ async def attribution_preflight(device_meter_id: str, sensor_ids: list) -> dict:
             return {"ok": True, "verdict": "no_data", "device_kwh": 0.0, "house_kwh": None}
         dev_kwh = round(sum(hourly.values()), 2)
         lo, hi = min(hourly.keys()), max(hourly.keys())
-        house_kwh = round(store.sum_meter_import_kwh(parent, lo, hi), 2)
+        house_kwh = round(get_store().sum_meter_import_kwh(parent, lo, hi), 2)
         verdict = "ok"
         if house_kwh > 0 and dev_kwh > house_kwh * 1.05:
             verdict = "device_exceeds_house"        # wrong sensor / Wh-as-kWh
@@ -2741,7 +2743,10 @@ async def run_attribution_job(device_meter_id: str, sensor_ids: list, *,
     tick and the pass-2 settlement drain. Records a ledger run. Never raises."""
     import asyncio as _aio
     j = _attribution_job
-    store = get_store()
+    # NB: always fetch the store fresh via get_store() at each use — never capture it
+    # across an `await`. engine_startup (a config save OR an HA WebSocket reconnect)
+    # closes and reopens _store, so a handle captured before the long recorder fetch
+    # would be closed by the time we used it → "Cannot operate on a closed database".
     j.clear()
     j.update({"status": "running", "phase": "fetching", "control": "run",
               "device": device_meter_id, "sensors": list(sensor_ids or []),
@@ -2752,7 +2757,7 @@ async def run_attribution_job(device_meter_id: str, sensor_ids: list, *,
         if _engine_ha is None:
             j.update({"status": "error", "error": "no HA connection"})
             return {"ok": False, "error": "no HA connection"}
-        parent = store.get_parent_meter_id(device_meter_id) or "electricity_main"
+        parent = get_store().get_parent_meter_id(device_meter_id) or "electricity_main"
         now = datetime.now(timezone.utc)
         start = (now - timedelta(days=3660)).isoformat()
         series = {}
@@ -2772,7 +2777,7 @@ async def run_attribution_job(device_meter_id: str, sensor_ids: list, *,
         # gap), and we stop walking at the seam rather than running to 'now'.
         # When the device has no live history yet (never configured), seam is None
         # and we fill the full available range.
-        seam = store.get_device_live_coverage_start(device_meter_id)
+        seam = get_store().get_device_live_coverage_start(device_meter_id)
         if seam:
             seam_cmp = _naive_iso(seam)
             hours = [h for h in hours if _naive_iso(h) < seam_cmp]
@@ -2803,7 +2808,7 @@ async def run_attribution_job(device_meter_id: str, sensor_ids: list, *,
         j.update({"written": written, "skipped": skipped, "gaps": gaps,
                   "done_hours": len(hours)})
         if written:
-            store.record_attribution_run({
+            get_store().record_attribution_run({
                 "run_id": run_id, "meter_id": device_meter_id,
                 "sensor_ids": list(sensor_ids or []),
                 "from": hours[0] if hours else None,
