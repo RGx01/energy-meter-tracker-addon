@@ -246,6 +246,9 @@ class TestRouteRegistration(unittest.TestCase):
     def test_api_blocks_summary_registered(self):
         self.assertTrue(self._registered("api_blocks_summary"))
 
+    def test_api_charts_data_version_registered(self):
+        self.assertTrue(self._registered("api_charts_data_version"))
+
     def test_api_billing_source_get_registered(self):
         self.assertTrue(self._registered("api_billing_source_get"))
 

@@ -2164,6 +2164,27 @@ def _bucket_to_row_values(_dd):
     }
 
 
+def _blocks_data_version(store) -> str:
+    """A cheap token that changes whenever the block data changes — COUNT + newest
+    block_start. Lets the Charts UI skip a rebuild on tab-focus/poll when nothing
+    has changed (no needless blank), and refresh promptly when it has (e.g. a new
+    live half-hour finalised). Both parts are index-backed, so this is ~milliseconds.
+    (A value-only edit — reprice/settlement — doesn't move it; the 5-min TTL is the
+    backstop for those.)"""
+    row = store._conn.execute(
+        "SELECT COUNT(*) AS c, MAX(block_start) AS m FROM blocks").fetchone()
+    return f"{row['c']}:{row['m'] or ''}"
+
+
+@app.route("/api/charts/data-version")
+def api_charts_data_version():
+    """Lightweight change token for the Charts UI (see _blocks_data_version)."""
+    try:
+        return jsonify({"version": _blocks_data_version(_get_store())})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/charts/blocks-summary")
 def api_blocks_summary():
     """Return billing-accurate per-period data for the Usage Stats bar chart.
@@ -2334,6 +2355,7 @@ def api_blocks_summary():
             "meters":        meters_list,
             "export_color":  export_color,
             "has_postcode":  bool(_postcode),
+            "data_version":  _blocks_data_version(store),
         })
     except Exception as e:
         logger.error("api_blocks_summary: %s", e)

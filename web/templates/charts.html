@@ -1538,6 +1538,8 @@ var barChartInstance = null;
 var barInited = false;
 var barLastFetch = 0;        // timestamp of last successful fetch
 var BAR_TTL_MS = 5 * 60 * 1000;  // re-fetch if data older than 5 minutes
+var _lastDataVersion = null; // /api/charts/data-version token at last render (gate refreshes)
+var _refreshInFlight = false;
 var barBlockMinutes = 30;    // populated from api/blocks_summary response
 var barMeters = [];       // [{id, label, color, is_sub}]
 var barExportColor = '#ff7f0e';
@@ -1633,6 +1635,7 @@ async function barInit() {
     barBlockMinutes = json.block_minutes || 30;
     barInited = true;
     barLastFetch = Date.now();
+    if (json.data_version) _lastDataVersion = json.data_version;  // gate focus/poll refreshes
     // Clear any previous transient error
     var _prevErr = document.getElementById('bar-load-error');
     if (_prevErr) _prevErr.remove();
@@ -2970,15 +2973,44 @@ function _restoreChartScroll(s) {
   var bw = document.getElementById('bar-table-wrap');
   if (bw && s.bar) bw.scrollTop = s.bar;
 }
+// Lightweight change token; null on failure.
+async function _fetchDataVersion() {
+  try {
+    var r = await fetch(apiUrl('/api/charts/data-version'));
+    var j = await r.json();
+    return (j && j.version) || null;
+  } catch (e) { return null; }
+}
+
+// Rebuild the active chart ONLY when the block data actually changed since the last
+// render (or `force`). A tab-focus or poll on unchanged data is a no-op — so the
+// chart never blanks just because you switched away and back. When data HAS changed
+// (a new live half-hour, an import, settlement) it refetches and re-renders, and
+// clears the HH cache so today's half-hour view tracks live data without a reload.
+async function _refreshIfChanged(force) {
+  if (_refreshInFlight) return false;
+  var v = await _fetchDataVersion();
+  if (!force) {
+    if (!v) return false;
+    if (_lastDataVersion === null) { _lastDataVersion = v; return false; }  // seed only
+    if (v === _lastDataVersion) return false;                               // unchanged → no-op
+  }
+  _refreshInFlight = true;
+  try {
+    barLastFetch  = 0;      // force barInit past its TTL
+    barHHDataDate = null;   // force today's HH to refetch on next render
+    if (_activeChart === 'bar') { await barInit(); }
+    else if (_activeChart === 'spiral') { if (window.EMTSpiral) EMTSpiral.init(); }
+    else { chartsLoaded = {}; await loadChartContent(_activeChart || 'daily'); }
+    if (v) _lastDataVersion = v;
+    return true;
+  } finally { _refreshInFlight = false; }
+}
+
 document.addEventListener('visibilitychange', async function() {
   if (document.visibilityState !== 'visible') return;
   var _scroll = _captureChartScroll();
-  chartsLoaded = {};
-  try {
-    if (_activeChart === 'bar') { await barInit(); }
-    else if (_activeChart === 'spiral') { if (window.EMTSpiral) EMTSpiral.init(); }
-    else { await loadChartContent(_activeChart || 'daily'); }
-  } catch (e) { /* leave scroll as-is on failure */ }
+  try { await _refreshIfChanged(false); } catch (e) { /* leave scroll as-is on failure */ }
   // Restore after layout settles (rebuild + lazy day-chart render).
   requestAnimationFrame(function() {
     _restoreChartScroll(_scroll);
@@ -2986,6 +3018,13 @@ document.addEventListener('visibilitychange', async function() {
     setTimeout(function() { _restoreChartScroll(_scroll); }, 250);
   });
 });
+
+// While the page is visible, quietly refresh only when new data has landed — keeps
+// the live HH / current-period views fresh without a manual reload and without the
+// periodic blanking the old unconditional rebuild caused.
+setInterval(function() {
+  if (document.visibilityState === 'visible') { _refreshIfChanged(false); }
+}, 60000);
 
 
 function show(id) {
