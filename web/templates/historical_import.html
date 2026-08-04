@@ -24,6 +24,16 @@
     deleted on purpose.
   </div>
 
+  <!-- Server-driven lock: while a backfill run (import/fill THROUGH its background
+       pricing verification) is in progress, starting a new one is blocked. Shown/
+       hidden from the live job state on every poll + on load, so a page refresh
+       can't get round it. -->
+  <div id="bf-lock" style="display:none;margin-bottom:12px;padding:10px 12px;border:1px solid #b45309;
+       border-radius:6px;background:rgba(180,83,9,0.08);font-size:13px;color:#b45309;">
+    ⏳ <strong>A backfill is running.</strong> <span id="bf-lock-detail"></span>
+    You can start a new one once it finishes — watch its progress in the panel below.
+  </div>
+
   <div style="font-size:12px;color:var(--muted);margin-bottom:4px;">1 · Where should the data come from?</div>
   <div id="bf-source" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
     <button class="btn btn-secondary bf-source-btn" data-source="api" onclick="bfPickSource(this)">API</button>
@@ -36,9 +46,11 @@
     <button class="btn btn-secondary bf-scope-btn bf-task-api" data-scope="whole_history" onclick="bfPickScope(this)">Whole history</button>
     <button class="btn btn-secondary bf-scope-btn bf-task-api" data-scope="range" onclick="bfPickScope(this)">Date range</button>
     <button class="btn btn-secondary bf-scope-btn bf-task-api" data-scope="gaps" onclick="bfPickScope(this)">Gap fill</button>
-    <!-- CSV tasks: fill gaps · date range (whole-history is an API-only capability) -->
+    <!-- CSV tasks: fill gaps · date range · build a CSV from Octopus PDF bills
+         (whole-history is an API-only capability) -->
     <button class="btn btn-secondary bf-scope-btn bf-task-csv" data-scope="gaps" style="display:none;" onclick="bfPickScope(this)">Fill gaps</button>
     <button class="btn btn-secondary bf-scope-btn bf-task-csv" data-scope="range" style="display:none;" onclick="bfPickScope(this)">Date range</button>
+    <button class="btn btn-secondary bf-scope-btn bf-task-csv" data-scope="bills" style="display:none;" onclick="bfPickScope(this)">🧾 From Octopus bills</button>
   </div>
 
   <div id="bf-range-row" style="display:none;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px;margin-bottom:12px;">
@@ -163,15 +175,38 @@
     </div>
   </div>
   <div style="margin-top:14px;display:flex;gap:10px;align-items:center;">
-    <button class="btn" id="btn-preview" onclick="doPreview()">Preview rates →</button>
+    <button class="btn" id="btn-preview" onclick="doPreview()">Review &amp; import →</button>
     <span id="preview-status" style="font-size:13px;color:var(--muted);"></span>
   </div>
 </div>
 
+<!-- Step 2b — build a CSV from Octopus PDF bills (feeds the same review→apply flow) -->
+<div class="card" id="step-bills" style="display:none;">
+  <div style="font-weight:600;margin-bottom:4px;">Build a CSV from your Octopus bills</div>
+  <div style="font-size:13px;color:var(--muted);line-height:1.7;margin-bottom:12px;">
+    For history older than the API can reach, EMT can reconstruct it from your Octopus
+    <strong>PDF bills</strong>. Select the bill PDFs on <em>your</em> computer — EMT reads them,
+    builds an Import and Export CSV, and imports them. Intelligent Octopus half-hour pages are
+    transcribed exactly; flat/older tariffs and export are reconstructed from the bill totals
+    (flagged). Each bill is checked against its own printed totals, so a bad read is caught, not
+    silently imported.
+  </div>
+  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:13px;">
+    <input type="file" id="bills-files" accept="application/pdf,.pdf" multiple>
+    <button class="btn" id="btn-bills-build" onclick="bfBuildFromBills()">Build CSVs →</button>
+    <span id="bills-status" style="color:var(--muted);"></span>
+  </div>
+  <div style="font-size:12px;color:var(--muted);margin-top:6px;">
+    Tip: select bills for a single meter/MPAN at a time. If your selection spans a house move
+    (a different MPAN) it's split out and flagged — import one MPAN at a time.
+  </div>
+  <div id="bills-out" style="margin-top:12px;font-size:13px;"></div>
+</div>
+
 <!-- Step 3 — review + confirm -->
 <div class="card" id="step-review" style="display:none;">
-  <div style="font-weight:600;margin-bottom:4px;">2 · Review &amp; confirm rates</div>
-  <div style="font-size:13px;color:var(--muted);line-height:1.7;margin-bottom:14px;">
+  <div id="review-title" style="font-weight:600;margin-bottom:4px;">2 · Review &amp; confirm rates</div>
+  <div id="review-blurb" style="font-size:13px;color:var(--muted);line-height:1.7;margin-bottom:14px;">
     Rates below are derived from the CSV cost (aggregated across each period so rounding
     cancels). Adjust any that look off — the confidence hints where to look. Off-peak is the
     lower tier; dispatched charging is counted off-peak automatically.
@@ -203,10 +238,16 @@
 {% block scripts %}
 <script>
 var STATE = { import_csv: null, export_csv: null, preview: null };
+var _billsMode = false;   // review came from "build from bills" → rates are the bill's, so skip the noisy tier/confidence editor and just confirm
 // Import floor: null = whole history (earliest the API has); an ISO string =
 // "import back to this date". Both drive the SAME background job — date-bound is
 // just whole-history with a start. Set by the guided picker (bfGoApi).
 var IMPORT_FROM = null;
+// When a gap-fill is armed, holds {from,to,channel}; the SAME Start-import button
+// then routes to /api/backfill/fill-gap instead of the whole/date import — so gap
+// fill uses the identical review→confirm→Start panel as whole history (no dialog,
+// no start-without-confirming). Null = a normal whole/date import.
+var PENDING_GAP = null;
 
 // CSV panel window: the contiguous span (and optional single channel) the pre-filled
 // templates + upload apply to. Set by the CSV tasks (date range / a chosen gap).
@@ -266,9 +307,38 @@ function bfHighlight(sel, chosen) {
 // source — API can extend Whole history / Date range / Gap fill; CSV (supplier-
 // agnostic, template-driven) can Fill gaps / Date range but not whole-history
 // (a backward reconstruction only the API can reach).
+// Picking a source starts a FRESH fill, so tear the whole previous run's panel
+// down — the import summary, the pricing-health panel AND the deferred verify
+// display — and SUPPRESS them from re-appearing. Without this, a lingering poll/
+// verify timer (or the poll-on-settle refresh, or the DOM-load poll) resurrects a
+// previous run's verify mid-new-flow: the "panel in a twist, doing a verify from a
+// previous run" bug. The panels come back only when THIS flow explicitly kicks a
+// job off (pollStatus(true) lifts _freshFlow). A page reload is a clean slate and
+// shows the persisted last run as before. A genuinely LIVE import is left alone —
+// it manages its own panels; the user shouldn't be starting a new flow over it.
+function bfClearStaleRun() {
+  var live = (_lastImportStatus === 'running' || _lastImportStatus === 'paused'
+    || _lastImportStatus === 'rate_limited' || _lastImportStatus === 'finalising');
+  if (live) return;
+  _freshFlow = true;
+  PENDING_GAP = null;              // drop any armed-but-unstarted gap fill
+  if (_statusTimer) { clearTimeout(_statusTimer); _statusTimer = null; }
+  if (_verifyTimer) { clearTimeout(_verifyTimer); _verifyTimer = null; }
+  _pollExpectUntil = 0;
+  _lastImportStatus = 'idle';
+  var row = document.getElementById('api-apply-row');
+  if (row) row.style.display = 'none';
+  ['api-apply-out', 'api-apply-status', 'import-health', 'health-retry-out',
+   'verify-status', 'api-gaps-out'].forEach(function (id) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    if (id === 'api-apply-status') el.textContent = ''; else el.innerHTML = '';
+  });
+}
 function bfPickSource(el) {
   if (el.disabled) return;
   _bfSource = el.dataset.source; _bfScope = null;
+  bfClearStaleRun();
   bfHighlight('.bf-source-btn', el);
   bfHighlight('.bf-scope-btn', null);            // clear any prior task highlight
   var isApi = (_bfSource === 'api');
@@ -290,6 +360,9 @@ function bfPickScope(el) {
   document.getElementById('bf-out').innerHTML = '';
   if (isRange) bfSetRangeEnd();
   bfSyncPreviewBtn();
+  // CSV → "From Octopus bills": open the build panel (produces the CSVs, then the
+  // same review→apply flow as any CSV).
+  if (_bfScope === 'bills') { if (typeof goStep === 'function') goStep('bills'); return; }
   // Gaps = its own click-driven list (find → per-gap fill), under either source.
   if (isGaps) { bfLoadGaps(); return; }
   // CSV + date range shows its template inline once a date is entered (the
@@ -344,15 +417,14 @@ async function bfRangePreview(fromTs) {
   try { upTo = (await (await fetch(apiUrl('/api/backfill/reach'))).json()).up_to; } catch (e) {}
   if (!upTo) { out.innerHTML = '<span style="color:var(--warning);">Couldn\'t find your earliest data — you need existing data to extend back from.</span>'; return; }
   if (fromTs >= upTo) { out.innerHTML = '<span style="color:var(--warning);">Pick a date before your earliest data (' + upTo.slice(0, 10) + ').</span>'; return; }
+  // API date-range mirrors whole-history: go straight to the import panel with the
+  // plan + confirm + Start (the plan tiles + reach note there already show the
+  // window), rather than an intermediate summary + "Continue" button.
+  if (_bfSource === 'api') { out.innerHTML = ''; return bfGoApi(fromTs); }
   var html = '<div>Import <strong>' + _esc(fromTs.slice(0, 10)) + '</strong> → your earliest data <strong>'
-           + _esc(upTo.slice(0, 10)) + '</strong>, as one contiguous run.</div>';
-  if (_bfSource === 'api') {
-    html += '<div style="font-size:12px;color:var(--muted);margin:6px 0 10px;">Runs as a background import (identical to whole-history — with pricing recovery, verify and carbon fill), just starting from your chosen date. You review the plan and start it below.</div>'
-          + '<button class="btn" onclick="bfGoApi(\'' + fromTs + '\')">Continue to import back to ' + _esc(fromTs.slice(0, 10)) + ' ↓</button>';
-  } else {
-    html += '<div style="font-size:12px;color:var(--muted);margin:6px 0 10px;">Fill this window from CSV — grab the pre-filled Import and Export templates, add your figures, then upload.</div>'
-          + '<button class="btn" onclick="csvOpen({from:\'' + fromTs + '\',to:\'' + upTo + '\'})">Fill from CSV →</button>';
-  }
+           + _esc(upTo.slice(0, 10)) + '</strong>, as one contiguous run.</div>'
+           + '<div style="font-size:12px;color:var(--muted);margin:6px 0 10px;">Fill this window from CSV — grab the pre-filled Import and Export templates, add your figures, then upload.</div>'
+           + '<button class="btn" onclick="csvOpen({from:\'' + fromTs + '\',to:\'' + upTo + '\'})">Fill from CSV →</button>';
   out.innerHTML = html;
 }
 async function bfPreview() {
@@ -447,6 +519,7 @@ function bfGoApi(fromTs) {
   // background import — just a different floor. Set it, reveal the panel, and
   // plan so the user reviews/starts there (site-plan, verify, carbon, pause/resume
   // all run in that flow).
+  PENDING_GAP = null;                    // this is a whole/date import, not a gap fill
   IMPORT_FROM = fromTs || null;
   if (typeof goStep === 'function') goStep('intro');   // ensure the API panel is visible
   var el = document.getElementById('api-import-panel');
@@ -484,22 +557,34 @@ async function bfLoadGaps() {
     j.gaps.forEach(function (g) {
       var kindTxt = (g.kind === 'missing_blocks') ? 'blocks' : 'data';
       var col = g.fetchable ? 'var(--accent)' : 'var(--warning)';
+      // A missing BLOCK needs every configured channel (import, and export where the
+      // meter exports); a missing-DATA gap is a single channel. The endpoint sends
+      // the channel set in `channels`.
+      var chs = (g.channels && g.channels.length) ? g.channels : [g.channel];
+      var both = chs.length > 1;
+      var chLabel = chs.join(' + ');
       var btns = '';
       if (csvSrc) {
-        // CSV route: open the panel scoped to this gap's channel + window.
+        // CSV route: open the panel scoped to this gap's window. `channel:null`
+        // shows BOTH pre-filled templates so a block hole fills import + export.
+        var csvChArg = both ? 'null' : ('\'' + chs[0] + '\'');
         btns += '<button class="btn" onclick="csvOpen({from:\'' + g.start + '\',to:\'' + g.end
-             + '\',channel:\'' + g.channel + '\',inclusive:true})">Fill from CSV →</button>';
+             + '\',channel:' + csvChArg + ',inclusive:true})">Fill from CSV →</button>';
       } else if (j.api_available && g.fetchable) {
-        btns += '<button class="btn" onclick="bfFillGap(this,\'' + g.start
-             + '\',\'' + g.end + '\',\'' + g.channel + '\')">🩹 API</button>';
+        var apiCh = both ? 'both' : chs[0];
+        btns += '<button class="btn" onclick="bfArmGap(\'' + g.start
+             + '\',\'' + g.end + '\',\'' + apiCh + '\')">🩹 API →</button>';
       } else {
-        var url = apiUrl('/api/historical/gap-template?inclusive=1&channel=' + encodeURIComponent(g.channel)
-                + '&from=' + encodeURIComponent(g.start) + '&to=' + encodeURIComponent(g.end));
-        btns += '<a class="btn btn-secondary" href="' + url + '">⬇ CSV</a>';
+        // Offline CSV fallback: one download link per channel the gap needs.
+        chs.forEach(function (ch) {
+          var url = apiUrl('/api/historical/gap-template?inclusive=1&channel=' + encodeURIComponent(ch)
+                  + '&from=' + encodeURIComponent(g.start) + '&to=' + encodeURIComponent(g.end));
+          btns += '<a class="btn btn-secondary" href="' + url + '">⬇ ' + _esc(ch) + ' CSV</a> ';
+        });
       }
       html += '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;'
             + 'border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px;">'
-            + '<span><span style="color:' + col + ';font-weight:600;">' + _esc(g.channel) + ' · ' + kindTxt + '</span> · '
+            + '<span><span style="color:' + col + ';font-weight:600;">' + _esc(chLabel) + ' · ' + kindTxt + '</span> · '
             + _esc(g.start.replace('T', ' ')) + ' → ' + _esc(g.end.replace('T', ' ')) + ' · ' + g.hours + ' h</span>'
             + '<span style="white-space:nowrap;">' + btns + '</span></div>';
     });
@@ -507,36 +592,45 @@ async function bfLoadGaps() {
     out.innerHTML = html;
   } catch (e) { out.innerHTML = '<span style="color:var(--danger);">' + _esc(e) + '</span>'; }
 }
-async function bfFillGap(btn, from, to, channel) {
-  if (!window.confirm('Fill this ' + channel + ' gap from the supplier API?\n\n'
-      + from.replace('T', ' ') + '  →  ' + to.replace('T', ' ')
-      + '\n\nRuns as a background import (identical to whole-history — price recovery, '
-      + 'verify and carbon fill), just bounded to this gap. Watch progress in the import '
-      + 'panel below. Blocks you deleted on purpose can be restored.')) return;
-  var orig = btn.textContent; btn.disabled = true; btn.textContent = 'Starting…';
-  try {
-    var r = await fetch(apiUrl('/api/backfill/fill-gap'), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: from, to: to, channel: channel, confirmed: true }) });
-    var j = await r.json();
-    if (j.ok) {
-      document.getElementById('bf-out').innerHTML =
-        '<div style="color:var(--success);">Gap fill started — watch progress in the import panel below. '
-        + 'This gap clears from the list once it completes.</div>';
-      if (typeof pollStatus === 'function') pollStatus();
-      var el = document.getElementById('api-import-panel');
-      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    } else {
-      btn.disabled = false; btn.textContent = orig;
-      window.alert(j.message || j.error || 'Could not start gap fill');
-    }
-  } catch (e) { btn.disabled = false; btn.textContent = orig; window.alert('' + e); }
+// Gap fill uses the SAME review→confirm→Start panel as whole history: clicking a
+// gap's "API" button ARMS the import panel (shows the plan for that gap window +
+// the "Import these blocks" checkbox + Start), rather than a confirm() dialog that
+// starts immediately. Start then routes to the gap-fill endpoint via PENDING_GAP.
+function bfArmGap(from, to, channel) {
+  PENDING_GAP = { from: from, to: to, channel: channel };
+  IMPORT_FROM = null;
+  if (typeof goStep === 'function') goStep('intro');   // reveal the API import panel
+  var chWord = (channel === 'both') ? 'import + export' : channel;
+  var slots = null;
+  try { slots = Math.max(1, Math.round((new Date(to) - new Date(from)) / 1800000)); } catch (e) {}
+  var ps = document.getElementById('api-plan-status'); if (ps) ps.textContent = '';
+  var plan = document.getElementById('api-plan-out');
+  if (plan) plan.innerHTML =
+    '<div>Fill this <strong style="text-transform:capitalize;">' + _esc(chWord) + '</strong> gap from the supplier API'
+    + (slots ? (' (<strong>' + slots + '</strong> half-hour' + (slots === 1 ? '' : 's') + ')') : '') + ':</div>'
+    + '<div style="margin-top:4px;"><strong>' + _esc(from.replace('T', ' ')) + '</strong> → <strong>'
+    + _esc(to.replace('T', ' ')) + '</strong></div>'
+    + '<div style="font-size:12px;color:var(--muted);margin-top:6px;line-height:1.6;">Runs as a background import '
+    + '(identical to whole-history — price recovery, verify and carbon fill), bounded to this gap. Blocks you '
+    + 'deleted on purpose can be restored.</div>';
+  // Arm the confirm + Start row. A bounded gap fill needs no site-plan step.
+  SITE_PLAN = { needs: false, applied: false, sites: [] };
+  var sb = document.getElementById('site-plan-block'); if (sb) sb.style.display = 'none';
+  var cb = document.getElementById('api-confirm'); if (cb) cb.checked = false;
+  var start = document.getElementById('btn-api-start');
+  if (start) { start.disabled = true; start.textContent = 'Start gap fill'; }
+  document.getElementById('api-apply-status').textContent = '';
+  document.getElementById('api-apply-out').innerHTML = '';
+  document.getElementById('api-apply-row').style.display = 'block';
+  var el = document.getElementById('api-import-panel');
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 document.addEventListener('DOMContentLoaded', bfProbe);
 
 function goStep(s){
-  ["intro","upload","review","done"].forEach(function(k){
-    document.getElementById("step-"+k).style.display = (k===s) ? "block" : "none";
+  ["intro","upload","review","done","bills"].forEach(function(k){
+    var el = document.getElementById("step-"+k);
+    if(el) el.style.display = (k===s) ? "block" : "none";
   });
 }
 function _esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){
@@ -690,6 +784,39 @@ function meterHistory(){
 }
 
 var _statusTimer = null;
+var _apiTermHandled = false;   // guards against an accidental repeat run after completion
+var _lastImportStatus = 'idle';  // last status seen, so we know if a live run is in flight
+var _pollExpectUntil = 0;        // while > now, a just-started job may not have flipped to 'running' yet
+var _freshFlow = false;          // user picked a source to start fresh → suppress the previous run's panels until a new job is kicked off
+var _importActive = false, _verifyActive = false;   // live server-side job state → drives the start lock
+var _prevImportActive = false;   // to detect the import→verify handoff
+var _settling = false;           // import just finished; hold the lock until verify's state is confirmed (no unlock flicker)
+var _importChecked = false, _verifyChecked = false;   // until BOTH statuses are read once, keep the picker disabled (no click-before-known race on load/refresh)
+
+// Server-driven lock: while a backfill run is in progress — the import/fill AND
+// its background pricing-verification pass, per the user's "whole run" choice —
+// the source picker is disabled so no second run can be started. Driven purely by
+// the live job state polled from the server (pollStatus + loadPricingHealth), so a
+// page refresh re-reads it and can't get round the lock.
+function applyRunLock(){
+  var running = _importActive || _verifyActive || _settling;
+  // Disable the picker while a run is live OR until we've confirmed BOTH statuses
+  // once (so a click can't slip in on load before the state is known). The scary
+  // banner, though, only shows for a REAL run — not the brief load-time check.
+  var locked = running || !(_importChecked && _verifyChecked);
+  var lock = document.getElementById('bf-lock');
+  if(lock) lock.style.display = running ? 'block' : 'none';
+  var det = document.getElementById('bf-lock-detail');
+  if(det) det.textContent = _importActive ? 'Importing your data now.'
+        : ((_verifyActive || _settling) ? 'Finishing up — verifying pricing across your history.' : '');
+  document.querySelectorAll('.bf-source-btn, .bf-scope-btn').forEach(function(b){
+    if(locked){ b.disabled = true; b.style.opacity = '0.5'; b.style.cursor = 'not-allowed'; }
+    else { b.disabled = false; b.style.opacity = ''; b.style.cursor = ''; }
+  });
+  var pv = document.getElementById('bf-preview-btn'); if(pv && locked) pv.disabled = true;
+  // When unlocking, restore the API-vs-CSV availability gating (API greyed if no key).
+  if(!locked && typeof bfApplyGates === 'function') bfApplyGates();
+}
 var STATUS_LABEL = {
   running: 'Importing…', finalising: 'Finishing up…', paused: 'Paused',
   rate_limited: 'Paused (API rate limit — resumes automatically)',
@@ -719,6 +846,16 @@ function _renderApiStatus(d){
   var out = document.getElementById('api-apply-out');
   var st  = document.getElementById('api-apply-status');
   var status = d.status || 'idle';
+  _lastImportStatus = status;
+  // Prevent an accidental repeat run: once an import reaches a terminal state,
+  // clear the "confirm" tick so Start greys out until the user deliberately
+  // re-confirms (arming a fresh run). Reset the guard while a run is active.
+  if (status==='running' || status==='rate_limited' || status==='finalising' || status==='paused') {
+    _apiTermHandled = false;
+  } else if ((status==='done' || status==='cancelled' || status==='error') && !_apiTermHandled) {
+    _apiTermHandled = true;
+    var _cb = document.getElementById('api-confirm'); if (_cb) _cb.checked = false;
+  }
   st.textContent = STATUS_LABEL[status] || status;
   // During the post-import tail, show the live phase so it doesn't look stalled.
   if(status==='finalising' && PHASE_LABEL[d.phase]) st.textContent = PHASE_LABEL[d.phase];
@@ -736,16 +873,61 @@ function _renderApiStatus(d){
   _apiButtons(status);
 }
 
-function pollStatus(){
+// pollStatus(expectStart): pass expectStart=true right after kicking a job off.
+// The background import/gap-fill is scheduled on the engine loop and doesn't flip
+// _api_import_job to 'running' until it actually starts, so a naive single poll can
+// see 'idle' first, decide "nothing's running", and stop — leaving the panel blank.
+// The expect window keeps the panel up and fast-polls for a few seconds until the
+// job appears. With expectStart falsy (page-load poll, pause/cancel) behaviour is
+// unchanged.
+function pollStatus(expectStart){
+  if(expectStart){
+    // A new job is being kicked off in THIS flow → panels are allowed again.
+    _freshFlow = false;
+    _pollExpectUntil = Date.now() + 12000;
+    var _r0 = document.getElementById('api-apply-row'); if(_r0) _r0.style.display = 'block';
+    var _s0 = document.getElementById('api-apply-status'); if(_s0) _s0.textContent = 'Starting…';
+  }
   fetch(apiUrl('/api/historical/api-import/status')).then(function(r){return r.json();}).then(function(d){
-    if(d && d.status && d.status !== 'idle'){
-      document.getElementById('api-apply-row').style.display = 'block';
-      _renderApiStatus(d);
-    }
+    var status = (d && d.status) || 'idle';
     // Keep polling through the post-import tail (finalising) too, so the phase
     // updates instead of the UI sitting on a frozen block count.
-    var active = d && (d.status==='running' || d.status==='paused'
-      || d.status==='rate_limited' || d.status==='finalising');
+    var active = (status==='running' || status==='paused'
+      || status==='rate_limited' || status==='finalising');
+    if(active) _pollExpectUntil = 0;                 // the job has appeared; stop waiting
+    var awaiting = !active && (Date.now() < _pollExpectUntil);
+    var nowActive = active || awaiting;
+    // Import just finished writing → the background verify launches server-side
+    // immediately. Hold the lock ("settling") until loadPricingHealth confirms the
+    // verify state, so the lock never drops in the handoff gap.
+    if(_prevImportActive && !nowActive) _settling = true;
+    _prevImportActive = nowActive;
+    _importActive = nowActive;                       // feed the start lock
+    _importChecked = true;
+    applyRunLock();
+    // While a fresh flow is armed (source picked, nothing kicked off yet) never
+    // resurrect the previous run's status — the panel must stay torn down.
+    if(_freshFlow && !active && !awaiting) return;
+    var row = document.getElementById('api-apply-row');
+    if(active){
+      // Live import → show the row so Pause/Cancel are reachable.
+      if(row) row.style.display = 'block';
+      _renderApiStatus(d);
+    } else if(awaiting){
+      // Job kicked off but not yet flipped to 'running'. Show a starting state
+      // (not the previous run's stale summary) and keep the panel up.
+      if(row) row.style.display = 'block';
+      var st = document.getElementById('api-apply-status'); if(st) st.textContent = 'Starting…';
+      var out = document.getElementById('api-apply-out'); if(out) out.innerHTML = '';
+    } else if(status !== 'idle'){
+      // Terminal / persisted run (done / cancelled / error). Show the SUMMARY only,
+      // never the arm/Start control — that must come from the deliberate picker →
+      // Preview-plan flow (which sets the import window). Otherwise a poll-on-load of
+      // a PREVIOUS run's 'done' presents a "Start import" the user could fire with no
+      // whole-history / gap / date-range scope chosen.
+      if(row) row.style.display = 'none';
+      _renderApiStatus(d);
+    }
     if(_statusTimer) clearTimeout(_statusTimer);
     // Hide the pricing-health panel while an import is in progress — it shows the
     // PREVIOUS run's figures and a "Retry N" button that would fire a competing
@@ -755,11 +937,20 @@ function pollStatus(){
     if(active){
       if(_health) _health.style.display = 'none';
       _statusTimer = setTimeout(pollStatus, 3000);
+    } else if(awaiting){
+      if(_health) _health.style.display = 'none';
+      _statusTimer = setTimeout(pollStatus, 1000);   // fast poll until the job appears
     } else {
       if(_health) _health.style.display = '';
       loadImportGaps(); loadPricingHealth();          // refresh once it settles
     }
-  }).catch(function(){});
+  }).catch(function(){
+    // A transient error mid-startup shouldn't abandon the wait.
+    if(Date.now() < _pollExpectUntil){
+      if(_statusTimer) clearTimeout(_statusTimer);
+      _statusTimer = setTimeout(pollStatus, 1000);
+    }
+  });
 }
 
 // Reconstruction gaps (missing half-hour runs, e.g. a DCC/settlement outage) are
@@ -832,6 +1023,15 @@ function _corrHtml(list){
 }
 function loadPricingHealth(){
   var el = document.getElementById('import-health'); if(!el) return;
+  // Fresh flow armed → the previous run's pricing-health / verify must stay gone.
+  // (Also cancels the verify re-poll timer so it can't resurrect the panel.)
+  if(_freshFlow){
+    el.innerHTML = '';
+    var _v = document.getElementById('verify-status'); if(_v) _v.innerHTML = '';
+    var _hr = document.getElementById('health-retry-out'); if(_hr) _hr.innerHTML = '';
+    if(_verifyTimer){ clearTimeout(_verifyTimer); _verifyTimer = null; }
+    return;
+  }
   var vs = document.getElementById('verify-status'); if(vs) vs.innerHTML = '';  // merged in here now
   Promise.all([
     fetch(apiUrl('/api/historical/api-import/health')).then(function(r){return r.json();}).catch(function(){return null;}),
@@ -841,6 +1041,10 @@ function loadPricingHealth(){
     _HEALTH_QUEUE = d.queue || { import: [], export: [] };   // slots for the CSV escape hatch
     var vst = v && v.status;
     var vActive = (vst==='running' || vst==='waiting' || vst==='paused');
+    _verifyActive = vActive;              // feed the start lock (run isn't "finished" until verify is)
+    _verifyChecked = true;
+    _settling = false;                    // verify state is now known → release the handoff hold
+    applyRunLock();
     var haveHealth = !!(d && d.have);
     if(!haveHealth && !vActive && vst!=='done'){ el.innerHTML = ''; if(_verifyTimer){clearTimeout(_verifyTimer);_verifyTimer=null;} return; }
 
@@ -880,12 +1084,25 @@ function loadPricingHealth(){
         if(rec > 0) body += _healthRow('check','#15803d',
           rec + ' auto-recovered on the calm retry', 'recovered', 'rgba(21,128,61,0.08)');
         if(rem > 0){
+          // Guard: while the verify pass is live it's already fetching from Octopus
+          // on the shared rate-limit allowance. A manual Retry would launch a SECOND
+          // concurrent API pass competing for the same budget, so defer it until
+          // verify settles (it re-enables automatically on the next health refresh).
+          var retryBtn = vActive
+            ? '<button class="btn btn-secondary" disabled title="A pricing check is running \u2014 retry becomes available once it finishes." '
+              + 'style="margin-left:auto;font-size:12px;padding:2px 10px;opacity:0.5;cursor:not-allowed;">Retry after verify</button>'
+            : '<button class="btn btn-secondary" style="margin-left:auto;font-size:12px;padding:2px 10px;" '
+              + 'onclick="repriceQueue(this)">Retry '+rem+'</button>';
           body += '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;'
             + 'background:rgba(180,83,9,0.08);border-radius:6px;margin-top:6px;">'
             + '<span style="color:#b45309;">\u25cf</span>'
             + '<span style="font-size:13px;color:#b45309;">'+rem+' still need a retry</span>'
-            + '<button class="btn btn-secondary" style="margin-left:auto;font-size:12px;padding:2px 10px;" '
-            + 'onclick="repriceQueue(this)">Retry '+rem+'</button></div>';
+            + retryBtn + '</div>';
+          if(vActive){
+            body += '<div style="font-size:12px;color:var(--muted);margin:4px 0 0 12px;">'
+              + 'These will be picked up by the pricing check that\u2019s running now; the manual '
+              + 'retry re-enables once it finishes, if any still need it.</div>';
+          }
           body += _healthEscapeHatch();      // last resort: fill these slots from CSV
         } else {
           body += _healthRow('check','#15803d','All prices recovered \u2014 nothing outstanding', '', 'rgba(21,128,61,0.08)');
@@ -1070,12 +1287,23 @@ function applySitesThenStart(){
 function _doStart(){
   document.getElementById('btn-api-start').disabled = true;
   document.getElementById('api-apply-status').textContent = 'Backing up & starting…';
-  fetch(apiUrl('/api/historical/api-import/start'), {
+  // Route by what's armed: a gap fill (bounded window + channel) → the fill-gap
+  // endpoint; otherwise the whole/date import. Same panel, same confirm+Start.
+  var url = PENDING_GAP ? '/api/backfill/fill-gap' : '/api/historical/api-import/start';
+  var body = PENDING_GAP
+    ? { from: PENDING_GAP.from, to: PENDING_GAP.to, channel: PENDING_GAP.channel, confirmed: true }
+    : { confirmed: true, from: IMPORT_FROM };
+  fetch(apiUrl(url), {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ confirmed: true, from: IMPORT_FROM })
+    body: JSON.stringify(body)
   }).then(function(r){return r.json();}).then(function(d){
-    if(!d.ok){ document.getElementById('api-apply-status').textContent = 'Error: '+_esc(d.error||'failed'); _apiButtons('idle'); return; }
-    pollStatus();
+    if(!d.ok){ document.getElementById('api-apply-status').textContent = 'Error: '+_esc(d.error||d.message||'failed'); _apiButtons('idle'); return; }
+    PENDING_GAP = null;      // consumed
+    if(typeof bfLoadGaps === 'function' && document.getElementById('bf-out')) {
+      var _b = document.getElementById('bf-out');
+      if(_b) _b.innerHTML = '<div style="color:var(--success);">Started — watch progress in the import panel below. A filled gap clears from the list once it completes.</div>';
+    }
+    pollStatus(true);
   }).catch(function(e){ document.getElementById('api-apply-status').textContent = 'Request failed: '+e; });
 }
 
@@ -1173,7 +1401,102 @@ function controlApi(action){
   }).then(function(r){return r.json();}).then(function(){ pollStatus(); }).catch(function(){});
 }
 
+// ── Build a CSV from Octopus PDF bills ───────────────────────────────────────
+// Bills live on the USER's machine, so the browser uploads the chosen folder/files
+// to EMT; the server parses them into per-(MPAN, channel) CSV text and returns it,
+// and we hand that straight into the SAME review→apply flow as any CSV.
+function bfBuildFromBills(){
+  var inp = document.getElementById('bills-files');
+  var st = document.getElementById('bills-status');
+  var out = document.getElementById('bills-out');
+  var files = inp && inp.files ? Array.prototype.slice.call(inp.files) : [];
+  var pdfs = files.filter(function(f){ return /\.pdf$/i.test(f.name); });
+  if(!pdfs.length){ st.textContent = 'Choose a folder of bills (or PDFs) first.'; return; }
+  st.textContent = 'Uploading & reading '+pdfs.length+' bill'+(pdfs.length===1?'':'s')+'…';
+  out.innerHTML = '';
+  document.getElementById('btn-bills-build').disabled = true;
+  var fd = new FormData();
+  pdfs.forEach(function(f){ fd.append('files', f, f.name); });
+  fetch(apiUrl('/api/historical/bills/build'), { method:'POST', body: fd })
+    .then(function(r){return r.json();}).then(function(d){
+      document.getElementById('btn-bills-build').disabled = false;
+      st.textContent = '';
+      if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(d.error||'failed')+'</span>'; return; }
+      bfRenderBills(d);
+    }).catch(function(e){
+      document.getElementById('btn-bills-build').disabled = false;
+      st.textContent = 'Request failed: '+e;
+    });
+}
+function bfRenderBills(d){
+  var out = document.getElementById('bills-out');
+  var html = '<div style="margin-bottom:8px;">Read <strong>'+d.files+'</strong> bill(s) → '
+           + '<strong>'+d.groups.length+'</strong> meter/MPAN group(s).</div>';
+  (d.warnings||[]).forEach(function(w){
+    html += '<div style="color:#b45309;margin:4px 0;">⚠ '+_esc(w)+'</div>'; });
+  d.groups.forEach(function(g, i){
+    var recon = g.reconciliation||{};
+    var badge = recon.ok
+      ? '<span style="color:var(--success);">✓ reconciled</span>'
+      : '<span style="color:#b45309;">⚠ check reconciliation</span>';
+    html += '<div style="border:1px solid var(--border);border-radius:6px;padding:8px 12px;margin-top:8px;">'
+      + '<div><strong>MPAN '+_esc(g.mpan_import)+'</strong>'
+      + (g.mpan_export?(' · export '+_esc(g.mpan_export)):'')+' · '+badge+'</div>'
+      + '<div style="font-size:12px;color:var(--muted);margin-top:2px;">'
+      + g.import_rows+' import + '+g.export_rows+' export half-hours</div>';
+    if((g.warnings||[]).length){
+      html += '<details style="margin-top:4px;"><summary style="cursor:pointer;font-size:12px;color:var(--muted);">'
+        + (g.warnings.length)+' note(s) (reconstructed / synthesised shapes)</summary>'
+        + '<div style="font-size:12px;color:var(--muted);margin-top:4px;">'
+        + g.warnings.map(function(w){return _esc(w);}).join('<br>')+'</div></details>';
+    }
+    html += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">'
+      + '<button class="btn" onclick="bfUseBills('+i+')">Import this history →</button>'
+      + '<a class="btn btn-secondary" onclick="bfDownloadCsv('+i+',\'import\')">⬇ Download import CSV</a>'
+      + (g.export_rows ? '<a class="btn btn-secondary" onclick="bfDownloadCsv('+i+',\'export\')">⬇ Download export CSV</a>' : '')
+      + '<span style="font-size:12px;color:var(--muted);">download to inspect before importing</span>'
+      + '</div></div>';
+  });
+  window._BILLS = d;
+  out.innerHTML = html;
+}
+// The generated CSV lives only in this response (the container can't write to the
+// folder on your machine the PDFs came from), so offer it as a browser download —
+// that's how you inspect exactly what will be imported.
+function bfDownloadCsv(i, channel){
+  var g = (window._BILLS && window._BILLS.groups) ? window._BILLS.groups[i] : null;
+  if(!g) return;
+  var txt = (channel === 'export') ? g.export_csv : g.import_csv;
+  if(!txt){ window.alert('This group has no '+channel+' rows.'); return; }
+  var blob = new Blob([txt], { type: 'text/csv' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = 'emt-bill-' + channel + '-' + (g.mpan_import || 'mpan') + '.csv';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+}
+function bfUseBills(i){
+  var g = (window._BILLS && window._BILLS.groups) ? window._BILLS.groups[i] : null;
+  if(!g) return;
+  // Hand the generated CSV text into the SAME preview→review→apply flow as an uploaded CSV.
+  STATE.import_csv = g.import_csv || null;
+  STATE.export_csv = g.export_csv || null;
+  if(!STATE.import_csv && !STATE.export_csv){ window.alert('This group produced no rows.'); return; }
+  _billsMode = true;
+  var st = document.getElementById('bills-status'); if(st) st.textContent = 'Preparing…';
+  fetch(apiUrl('/api/historical/csv/preview'), {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({import_csv: STATE.import_csv, export_csv: STATE.export_csv})
+  }).then(function(r){return r.json();}).then(function(d){
+    if(st) st.textContent = '';
+    if(!d.ok){ window.alert('Preview failed: '+(d.error||'')); return; }
+    STATE.preview = d; renderReview(d); goStep('review');
+  }).catch(function(e){ if(st) st.textContent = 'Request failed: '+e; });
+}
+
 function doPreview(){
+  _billsMode = false;
   var st = document.getElementById('preview-status');
   st.textContent = 'Reading…';
   Promise.all([_readFile('import-file'), _readFile('export-file')]).then(function(vals){
@@ -1193,41 +1516,35 @@ function doPreview(){
   });
 }
 
+// Every CSV (hand-made or built from bills) is RATE-FIRST — it carries its own
+// per-slot Unit Rate, which EMT stores verbatim. So the review is a plain "here's
+// what will be written" summary + a confirm; there's no rate to derive or adjust.
+function _setReviewChrome(){
+  var title = document.getElementById('review-title');
+  var blurb = document.getElementById('review-blurb');
+  if(title) title.textContent = 'Review & import';
+  if(blurb) blurb.textContent = 'Here’s what will be written from your CSV. The rates come from '
+    + 'the CSV’s Unit Rate column, so there’s nothing to adjust — check the figures below and confirm.';
+}
 function renderReview(d){
+  _setReviewChrome();
   var html = '';
   ["import","export"].forEach(function(channel){
-    var c = (d.channels||{})[channel];
-    if(!c) return;
-    html += '<div style="font-weight:600;text-transform:capitalize;margin-top:12px;">'+channel+'</div>';
-    if(!c.ok){ html += '<div style="color:var(--danger);font-size:13px;">Parse failed: '
-      + _esc((c.errors&&c.errors[0]&&c.errors[0].reason)||'unknown')+'</div>'; return; }
+    var c = (d.channels||{})[channel]; if(!c) return;
+    html += '<div style="font-weight:600;text-transform:capitalize;margin-top:10px;">'+channel+'</div>';
+    if(!c.ok){ html += '<div style="color:var(--danger);font-size:13px;">Couldn’t read this channel: '
+      + _esc((c.errors&&c.errors[0]&&c.errors[0].reason)||'parse error')+'</div>'; return; }
     var rec = c.reconcile||{};
     var recBadge = rec.ok
       ? '<span style="color:var(--success,green);">reconciles ('+rec.pct_diff+'%)</span>'
-      : '<span style="color:var(--danger);">off by '+_gbp(rec.abs_diff)+' ('+rec.pct_diff+'%) — check rates</span>';
-    html += '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">'
-      + c.block_count+' blocks · off-peak '+(c.off_peak_kwh||0).toFixed(1)+' kWh · peak '
-      + (c.peak_kwh||0).toFixed(1)+' kWh · re-price vs CSV cost: '+recBadge
+      : '<span style="color:var(--danger);">off by '+_gbp(rec.abs_diff)+' ('+rec.pct_diff+'%)</span>';
+    var span = (c.periods&&c.periods.length)
+      ? (_esc((c.periods[0].from||'').substr(0,10))+' → '
+         + _esc((c.periods[c.periods.length-1].to||'').substr(0,10))) : '';
+    html += '<div style="font-size:13px;color:var(--muted);margin:2px 0 4px;">'
+      + '<strong>'+c.block_count+'</strong> half-hours' + (span?(' · '+span):'')
+      + ' · '+recBadge
       + ((c.parse_errors&&c.parse_errors.length)?(' · '+c.parse_errors.length+' skipped rows'):'')+'</div>';
-    (c.periods||[]).forEach(function(p, pi){
-      html += '<div style="font-size:12px;color:var(--muted);margin:8px 0 3px;">Period '
-        + _esc((p.from||'').substr(0,10))+' → '+_esc((p.to||'').substr(0,10))
-        + ' · '+_esc(p.kind)+' · standing '+_p(p.standing_daily)+'/day</div>';
-      html += '<table style="font-size:13px;border-collapse:collapse;"><tr style="color:var(--muted);text-align:left;">'
-        + '<th style="padding:0 12px 3px 0;">Tier</th><th style="padding:0 12px 3px 0;">Rate (p/kWh)</th>'
-        + '<th style="padding:0 12px 3px 0;">kWh</th><th style="padding:0 12px 3px 0;">Confidence</th></tr>';
-      (p.tiers||[]).forEach(function(t){
-        var pval = (t.rate!=null)?(t.rate*100).toFixed(2):'';
-        var conf = Math.round((t.confidence||0)*100);
-        html += '<tr><td style="padding:2px 12px 2px 0;">'+_esc(t.label)+'</td>'
-          + '<td style="padding:2px 12px 2px 0;"><input type="number" step="0.01" value="'+pval+'"'
-          + ' data-ch="'+channel+'" data-pi="'+pi+'" data-tier="'+_esc(t.label)+'"'
-          + ' style="width:90px;"></td>'
-          + '<td style="padding:2px 12px 2px 0;">'+(t.kwh!=null?t.kwh.toFixed(1):'—')+'</td>'
-          + '<td style="padding:2px 12px 2px 0;color:'+(conf<50?'var(--danger)':'var(--muted)')+';">'+conf+'%</td></tr>';
-      });
-      html += '</table>';
-    });
   });
   document.getElementById('review-out').innerHTML = html || '<div style="color:var(--muted);">Nothing to import.</div>';
   document.getElementById('confirm-check').checked = false;
@@ -1248,25 +1565,43 @@ function collectOverrides(){
 
 function doApply(){
   var st = document.getElementById('apply-status');
+  // The confirm box is the real gate — read it here, don't just trust the button's
+  // disabled state (which can be bypassed / not stick). No tick → nothing is written.
+  var ack = document.getElementById('confirm-check');
+  if(!ack || !ack.checked){
+    if(st) st.textContent = 'Tick the box to confirm before importing.';
+    document.getElementById('btn-apply').disabled = true;
+    return;
+  }
   document.getElementById('btn-apply').disabled = true;
   st.textContent = 'Backing up & importing…';
   fetch(apiUrl('/api/historical/csv/apply'), {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({
       import_csv: STATE.import_csv, export_csv: STATE.export_csv,
-      overrides: collectOverrides(), confirmed: true })
+      overrides: collectOverrides(), confirmed: ack.checked })
   }).then(function(r){return r.json();}).then(function(d){
     if(!d.ok){ st.textContent = 'Error: '+(d.error||'failed'); document.getElementById('btn-apply').disabled=false; return; }
     st.textContent = '';
     var html = '';
     ["import","export"].forEach(function(ch){
       var c = (d.channels||{})[ch]; if(!c||!c.ok) return;
+      var skip = c.blocks_skipped||0;
       html += '<div><strong style="text-transform:capitalize;">'+ch+'</strong>: '
-        + c.blocks_written+' blocks written · reconciles '
+        + c.blocks_written+' blocks written'
+        + (skip? ' · '+skip+' left as-is' : '')
+        + ' · reconciles '
         + (c.reconcile&&c.reconcile.ok?'✓':'⚠ ('+(c.reconcile?c.reconcile.pct_diff:'?')+'%)')+'</div>';
     });
+    if(d.blocks_skipped){
+      html += '<div style="color:var(--muted);margin-top:6px;">'
+        + d.blocks_skipped+' slot(s) already held data and were left untouched '
+        + '(first-in wins — an import never overwrites an existing block). '
+        + 'To replace them, Delete Blocks for that span first, then re-import.</div>';
+    }
     html += '<div style="color:var(--muted);margin-top:6px;">Backup: '+_esc(d.backup||'(none)')
-      + '. Regenerate charts to see the imported history. To undo: Delete Blocks → reconstructed history.</div>';
+      + '. '+(d.charts_regenerated?'Charts are rebuilding to include the imported history':'Charts will refresh shortly')
+      + '. To undo: Delete Blocks → reconstructed history.</div>';
     document.getElementById('done-out').innerHTML = html;
     goStep('done');
   }).catch(function(e){ st.textContent = 'Request failed: '+e; document.getElementById('btn-apply').disabled=false; });

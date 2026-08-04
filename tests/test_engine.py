@@ -108,6 +108,46 @@ class TestImportExtendFloor(unittest.TestCase):
             "2023-03-01T00:00:00")
 
 
+class TestImportRunStatusPersist(unittest.TestCase):
+    """A finished import/gap-fill persists a run summary so the panel shows accurate
+    'N blocks imported' + window on reload, not a blank/zero panel from the lost
+    in-memory job. A live job still takes precedence."""
+
+    def setUp(self):
+        self._store = engine._store
+        engine._store = BlockStore(":memory:")
+        self._job = dict(engine._api_import_job)
+        engine._api_import_job.clear()
+        engine._api_import_job.update({"status": "idle"})
+
+    def tearDown(self):
+        engine._store = self._store
+        engine._api_import_job.clear()
+        engine._api_import_job.update(self._job)
+
+    def test_reload_when_idle_returns_persisted_run(self):
+        engine._persist_run_status({
+            "status": "done", "written": {"import": 3, "export": 3},
+            "gap": {"from": "2025-06-01T00:00:00", "to": "2025-06-03T00:30:00"},
+            "auto_recovered": 1})
+        s = engine.api_import_status()          # in-memory is idle → falls back
+        self.assertTrue(s.get("persisted"))
+        self.assertEqual(s["status"], "done")
+        self.assertEqual(s["written"], {"import": 3, "export": 3})
+        self.assertEqual(s["gap"]["from"], "2025-06-01T00:00:00")
+
+    def test_live_job_takes_precedence_over_persisted(self):
+        engine._persist_run_status({"status": "done", "written": {"import": 3}})
+        engine._api_import_job.update({"status": "running", "written": {"import": 9}})
+        s = engine.api_import_status()
+        self.assertEqual(s["status"], "running")
+        self.assertEqual(s["written"], {"import": 9})
+        self.assertIsNone(s.get("persisted"))
+
+    def test_no_run_ever_stays_idle(self):
+        self.assertEqual(engine.api_import_status().get("status"), "idle")
+
+
 class TestDiscoverPreImportSites(unittest.TestCase):
     """Pre-import site discovery coro: reads the account, derives tenancy spans,
     and delegates to BlockStore.plan_pre_import_sites (read-only)."""
@@ -3065,6 +3105,8 @@ class TestRepairImportPricing(unittest.TestCase):
         class _Seg:
             def day_rate_bounds(self, _s):
                 return (7.0, 28.12)       # banded day, PENCE (schedule native units)
+            def flat_rate(self, tol=1e-6):
+                return None               # banded (two rates) → never flat
         engine._hist_rate_segs_cache.clear()
         engine._hist_rate_segs_cache["import"] = [("2000-01-01T00:00:00", None, _Seg())]
         engine._tariff_rate_for = lambda segs, st, ofp: (0.07 if ofp else 0.28)
@@ -3899,6 +3941,9 @@ class TestBilledRate(unittest.TestCase):
         def resolve(self, ts):
             return self.hi_p
 
+        def flat_rate(self, tol=1e-6):
+            return self.lo_p if abs(self.hi_p - self.lo_p) <= tol else None
+
     def _segs(self, lo_p, hi_p):
         return [("2000-01-01T00:00:00", None, self._Sched(lo_p, hi_p))]
 
@@ -3964,6 +4009,71 @@ class TestBilledRate(unittest.TestCase):
         # even for a continuous/unlabelled slot.
         r = engine._billed_rate([], "2025-09-15T14:00:00", None, 0.15, 1.0)
         self.assertEqual(r, 0.15)
+
+
+class TestFlatExportTransitionSeam(unittest.TestCase):
+    """A flat OUTGOING tariff must stay clean across the tariff-TRANSITION seam:
+    a new agreement is active from its valid_from, but its published unit rates can
+    begin LATER, so the early days are an uncovered sliver. Without back-fill those
+    days drop to cost÷kWh and a flat 0.12 fragments into hundreds of near-identical
+    rates (the March-2026 export bug). Uses the REAL RateSchedule (the stub can't
+    model an uncovered day)."""
+
+    def _segs(self):
+        from kraken_rates import RateSchedule
+        old = RateSchedule([("2024-06-03T00:00:00", "2026-03-01T00:00:00", 15.0)])
+        # New 12p agreement active 1 Mar, but its unit-rate records start 1 Apr.
+        new = RateSchedule([("2026-04-01T00:00:00", None, 12.0)])
+        return [("2024-06-03T00:00:00", "2026-03-01T00:00:00", old),
+                ("2026-03-01T00:00:00", None, new)]
+
+    def test_flat_rate_helper(self):
+        from kraken_rates import RateSchedule
+        self.assertEqual(RateSchedule([("2026-04-01T00:00:00", None, 12.0)]).flat_rate(), 12.0)
+        self.assertIsNone(RateSchedule([]).flat_rate())
+        # Banded (two distinct rates) → None, so IOG import keeps its per-slot path.
+        banded = RateSchedule([("2026-03-01T00:00:00", None, 7.0),
+                               ("2026-03-01T00:00:00", None, 30.0)])
+        self.assertIsNone(banded.flat_rate())
+
+    def test_march_seam_small_slot_snaps_to_flat_rate(self):
+        # 0.016 kWh billed 0.0019 → cost÷kWh = 0.11875 (>0.1p from 0.12). Before the
+        # fix this fragmented; now it back-fills the flat 0.12 from the new agreement.
+        for ofp in (False, None):
+            r = engine._billed_rate(self._segs(), "2026-03-15T05:30:00", ofp, 0.0019, 0.016)
+            self.assertEqual(r, 0.12, ofp)
+
+    def test_march_seam_large_slot_also_clean(self):
+        for ofp in (False, None):
+            r = engine._billed_rate(self._segs(), "2026-03-15T11:00:00", ofp, 0.1229, 1.024)
+            self.assertEqual(r, 0.12, ofp)
+
+    def test_feb_still_old_rate(self):
+        # Before the transition → old 15p agreement, fully covered → unchanged.
+        r = engine._billed_rate(self._segs(), "2026-02-10T12:00:00", False, 0.30, 2.0)
+        self.assertEqual(r, 0.15)
+
+    def test_april_covered_unchanged(self):
+        r = engine._billed_rate(self._segs(), "2026-04-10T12:00:00", False, 0.24, 2.0)
+        self.assertEqual(r, 0.12)
+
+    def test_tariff_rate_for_backfills_uncovered_flat(self):
+        # Direct check of the resolver: March is uncovered by the new schedule's
+        # records but the agreement is flat → back-fill 0.12, not None.
+        self.assertEqual(engine._tariff_rate_for(self._segs(), "2026-03-15T05:30:00", False), 0.12)
+        self.assertEqual(engine._tariff_rate_for(self._segs(), "2026-03-15T05:30:00", None), 0.12)
+
+    def test_banded_seam_not_backfilled(self):
+        # A BANDED agreement across the same seam must NOT back-fill (flat_rate None):
+        # an uncovered banded day stays None → billed cost÷kWh (dispatch-accurate).
+        from kraken_rates import RateSchedule
+        banded_new = RateSchedule([("2026-04-01T00:00:00", None, 7.0),
+                                   ("2026-04-01T00:00:00", None, 30.0)])
+        segs = [("2026-03-01T00:00:00", None, banded_new)]
+        self.assertIsNone(engine._tariff_rate_for(segs, "2026-03-15T02:00:00", True))
+        # billed wins for the uncovered banded slot
+        r = engine._billed_rate(segs, "2026-03-15T02:00:00", True, 0.09, 1.0)
+        self.assertAlmostEqual(r, 0.09)
 
 
 class TestImportPricingFlag(unittest.TestCase):

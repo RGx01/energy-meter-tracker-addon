@@ -121,6 +121,44 @@
   <div id="corr-preview" style="display:none;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px 16px;font-size:13px;margin-bottom:12px;"></div>
   <div id="corr-result"  style="display:none;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px 16px;font-size:13px;"></div>
 </div>
+
+<!-- ── Billing Settlement Source (cad+api only) ─────────────────────────────────
+     Revealed by loadBillingSource() only when mode === 'cad+api' — the user has
+     BOTH a local sensor (CAD) and a supplier API. Pure-API has no CAD to fall back
+     to; pure-CAD has no DCC settlement — so the DCC/CAD choice is meaningless and
+     the card stays hidden. -->
+<div class="card" id="settlement-source-card" style="display:none;">
+  <div class="card-title">⚖️ Billing Settlement Source</div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;line-height:1.7;">
+    Choose which figures drive your billing. <strong>DCC</strong> uses Octopus's
+    settled half-hourly data (what your bill is based on), falling back to local
+    CAD readings only where settlement hasn't arrived yet.
+    <strong>CAD</strong> uses your live meter readings throughout, ignoring DCC.
+    Changing this re-calculates your whole history and can take a few minutes.
+  </p>
+  <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;">
+    <label style="font-size:13px;font-weight:600;">Source:</label>
+    <select id="billing-source-select" style="padding:6px 10px;font-size:13px;">
+      <option value="dcc">DCC settlement (recommended)</option>
+      <option value="cad">CAD readings only</option>
+    </select>
+    <button class="btn btn-primary" id="btn-apply-source" onclick="applyBillingSource()">Apply</button>
+  </div>
+  <div id="billing-source-status" style="font-size:13px;color:var(--muted);">Loading…</div>
+</div>
+
+<!-- ── Review Unsettled Blocks (cad+api, DCC mode only) ─────────────────────────── -->
+<div class="card" id="unsettled-card" style="display:none;">
+  <div class="card-title">🔍 Review Unsettled Blocks</div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;line-height:1.7;">
+    These half-hour blocks have no DCC settlement yet, so they're billed using
+    your local CAD readings as a fallback. Recent blocks normally settle within
+    a day or two; older ones may indicate a genuine gap.
+  </p>
+  <button class="btn btn-secondary" onclick="loadUnsettled()" id="btn-unsettled">🔍 Review unsettled blocks</button>
+  <button class="btn btn-primary" onclick="retrySettlement()" id="btn-retry-settle" style="display:none;margin-left:8px;">♻️ Retry settlement</button>
+  <div id="unsettled-list" style="font-size:13px;color:var(--muted);margin-top:14px;"></div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -167,6 +205,7 @@ document.addEventListener('DOMContentLoaded', function() {
     })
     .catch(function() {});
   loadReviewBlocks();
+  loadBillingSource();
   // #270: refresh the nearby-rate picker whenever the date range changes.
   ['corr-from', 'corr-to'].forEach(function(id) {
     var el = document.getElementById(id);
@@ -447,6 +486,122 @@ function corrApply() {
     applyBtn.disabled = false;
     result.innerHTML = '<span style="color:var(--danger);">Error: ' + escHtml(e.message) + '</span>';
   });
+}
+
+// ── Billing settlement source (cad+api only) ─────────────────────────────────
+function _billAlert(id, msg) {
+  var el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(function() { el.classList.remove('show'); }, 8000);
+}
+
+function loadBillingSource() {
+  fetch(apiUrl('/api/billing-source'))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.error) return;
+      window._apiAvailable = !!d.api_available;
+      // Settlement SOURCE (the DCC/CAD choice) is only meaningful with BOTH a
+      // local sensor (CAD) and a supplier API — a pure-API setup has no CAD to
+      // fall back to, a pure-CAD setup has no DCC.
+      var bothCadApi = (d.mode === 'cad+api');
+      var sc = document.getElementById('settlement-source-card');
+      if (sc) sc.style.display = bothCadApi ? '' : 'none';
+      if (bothCadApi) {
+        var sel = document.getElementById('billing-source-select');
+        if (sel) sel.value = d.source;
+        var st = document.getElementById('billing-source-status');
+        if (st) st.textContent = 'Currently using ' + (d.source === 'dcc'
+          ? 'DCC settlement' : 'CAD readings') + '. '
+          + (d.unsettled || 0) + ' block(s) awaiting DCC settlement.';
+      }
+      // Unsettled-blocks review (and Retry) are relevant whenever a supplier API
+      // is present and billing runs on DCC — including a pure-API setup; no CAD
+      // is required here.
+      var showUnsettled = (d.api_available && d.source === 'dcc');
+      var uc = document.getElementById('unsettled-card');
+      if (uc) uc.style.display = showUnsettled ? '' : 'none';
+      var rb = document.getElementById('btn-retry-settle');
+      if (rb) rb.style.display = showUnsettled ? '' : 'none';
+    })
+    .catch(function() {});
+}
+
+function applyBillingSource() {
+  var sel = document.getElementById('billing-source-select');
+  if (!sel) return;
+  var source = sel.value;
+  var label = (source === 'dcc' ? 'DCC settlement' : 'CAD readings');
+  if (!confirm('Switch billing to ' + label + '?\n\nThis re-calculates your entire '
+    + 'history and can take a few minutes to complete in the background.')) return;
+  var btn = document.getElementById('btn-apply-source');
+  btn.disabled = true; btn.textContent = 'Applying…';
+  fetch(apiUrl('/api/billing-source'), {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({source: source})
+  })
+    .then(function(r) { return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+    .then(function(res) {
+      btn.disabled = false; btn.textContent = 'Apply';
+      if (!res.ok || res.j.error) { _billAlert('alert-error', res.j.error || 'Failed to change billing source'); return; }
+      _billAlert('alert-success', res.j.changed
+        ? ('✓ Billing source set to ' + res.j.source.toUpperCase() + '. ' + res.j.flagged
+           + ' blocks queued for recalculation — totals will update over the next few minutes.')
+        : ('✓ Already using ' + res.j.source.toUpperCase() + ' — no change.'));
+      loadBillingSource();
+    })
+    .catch(function(e) { btn.disabled = false; btn.textContent = 'Apply'; _billAlert('alert-error', 'Failed to change billing source: ' + e); });
+}
+
+function loadUnsettled() {
+  var el = document.getElementById('unsettled-list');
+  var btn = document.getElementById('btn-unsettled');
+  btn.disabled = true;
+  el.textContent = 'Loading…';
+  fetch(apiUrl('/api/unsettled-blocks?limit=500'))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      btn.disabled = false;
+      if (d.error) { el.textContent = 'Error: ' + d.error; return; }
+      if (!d.count) { el.innerHTML = '<span style="color:var(--ok,green);">✓ All blocks are DCC-settled.</span>'; return; }
+      var shown = d.blocks.length;
+      var html = '<div style="margin-bottom:8px;font-weight:600;">'
+        + d.count + ' unsettled block(s)'
+        + (shown < d.count ? ' (showing newest ' + shown + ')' : '') + ':</div>';
+      html += '<div style="max-height:320px;overflow:auto;font-family:var(--mono);font-size:12px;">';
+      d.blocks.forEach(function(b) {
+        html += '<div>' + b.block_start
+          + ' &nbsp; import ' + (b.imp_kwh == null ? '–' : Number(b.imp_kwh).toFixed(3))
+          + ' kWh &nbsp; export ' + (b.exp_kwh == null ? '–' : Number(b.exp_kwh).toFixed(3))
+          + ' kWh' + (b.is_provisional ? ' &nbsp;⏳' : '') + '</div>';
+      });
+      html += '</div>';
+      el.innerHTML = html;
+    })
+    .catch(function(e) { btn.disabled = false; el.textContent = 'Error: ' + e; });
+}
+
+function retrySettlement() {
+  if (!window._apiAvailable) return;
+  if (!confirm('Re-fetch settlement data from your supplier for all unsettled blocks '
+    + '(oldest to now)?\n\nThis settles any gaps your supplier has since filled. It may take a moment.')) return;
+  var btn = document.getElementById('btn-retry-settle');
+  btn.disabled = true; var orig = btn.textContent; btn.textContent = 'Retrying…';
+  fetch(apiUrl('/api/retry-settlement'), {method: 'POST'})
+    .then(function(r) { return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+    .then(function(res) {
+      btn.disabled = false; btn.textContent = orig;
+      if (!res.ok || res.j.error) { _billAlert('alert-error', res.j.error || 'Retry failed'); return; }
+      var settled = (res.j.unsettled_before || 0) - (res.j.unsettled_after || 0);
+      _billAlert('alert-success', settled > 0
+        ? ('✓ Settled ' + settled + ' previously-unsettled block(s). ' + (res.j.unsettled_after || 0) + ' still awaiting supplier data.')
+        : ('✓ No new settlement available yet — ' + (res.j.unsettled_after || 0) + ' block(s) still unsettled.'));
+      loadBillingSource();
+      loadUnsettled();
+    })
+    .catch(function(e) { btn.disabled = false; btn.textContent = orig; _billAlert('alert-error', 'Retry failed: ' + e); });
 }
 </script>
 {% endblock %}

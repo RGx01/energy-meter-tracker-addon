@@ -103,7 +103,14 @@ A CSV is bare kWh/£: no MPAN, no address, possibly spanning a move — so there
 
 ## Backfill re-arm interaction
 
-The stale-`done` behaviour we found (marker `done:true` from before the import, never re-armed because imported blocks were excluded) is resolved by the gating swap: once region-resolvable imported blocks count as "missing carbon", `get_missing_carbon_date_range()` returns a range again and `_maybe_backfill_historical_carbon()` re-arms normally. Clearing the marker at end of import is then belt-and-braces.
+The stale-`done` behaviour we found (marker `done:true` from before the import, never re-armed because imported blocks were excluded) is resolved by the gating swap: once region-resolvable imported blocks count as "missing carbon", `get_missing_carbon_date_range()` returns a range again.
+
+**As shipped, clearing the marker is *necessary*, not belt-and-braces.** `_run_historical_carbon_backfill()` short-circuits on `state.done` *before* it ever calls `get_missing_carbon_date_range()`, so a stale `done:true` blocks the re-scan even when freshly-eligible blocks exist. Therefore anything that adds NULL-carbon history must **re-arm** (`rearm_carbon_backfill()` → `set_meta("carbon_backfill_state", {})`):
+
+- **API import** re-arms on completion (and extends the earliest period back over the imported span, move-aware).
+- **CSV / bill import** re-arms whenever it writes any block — critical for same-MPAN history, which shares the current (already-regioned) period, so it's eligible immediately and only the marker was holding it back.
+- **Assigning/correcting a region** (per-period Postcode field, reconcile panel, one-time probe) re-arms so newly-region-known blocks get picked up.
+- **Delete / purge of imported history** also re-arms so the remaining range re-sweeps.
 
 ## Edge cases / open questions
 

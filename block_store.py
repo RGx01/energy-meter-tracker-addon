@@ -2368,28 +2368,41 @@ class BlockStore:
         self, block_start: str, meter_id: str, channel: str, *,
         kwh: float, rate: float | None, cost: float | None,
         standing: float | None = None, source: str = IMPORTED_SOURCE_CSV,
-        derivation_id: int | None = None,
-    ) -> Optional[int]:
-        """Insert-or-merge one reconstructed block for a single channel.
+        derivation_id: int | None = None, overwrite: bool = False,
+    ) -> tuple[Optional[int], bool]:
+        """Insert one reconstructed block for a single channel — FIRST-MAN-WINS.
 
-        Import and export for the same (block_start, meter_id) share ONE row
-        (UNIQUE constraint); each call fills only its channel's columns, so a
-        second-channel call never clears the first. `cost` is stored inc-VAT in £
-        (billing sums it directly), `rate` is £/kWh, `standing` is the day's
-        charge (once-per-day billing picks the start-of-day value). `interpolated`
-        stays 0 — the CSV house figure is exact, not approximate; `source` marks
-        it reconstructed. Returns the block id."""
+        A CSV/bill import must never clobber a block that already exists: the user
+        can't tell exactly where their CSV butts up against data EMT already holds,
+        so the rule is that whoever wrote a channel first keeps it. If this
+        (block_start, meter_id) already carries data for `channel`, it is LEFT
+        UNTOUCHED (this protects live/settled readings AND a previous import). Only a
+        channel that's currently empty is filled — so import + export of a genuinely
+        new block both land, and a later export CSV can still fill the export column
+        of an import-only row. To change an existing block, delete it first (Delete
+        Blocks) and re-fill from any source. Pass `overwrite=True` to force replace.
+
+        Import and export share ONE row; `cost` is inc-VAT £ (billing sums it), `rate`
+        is £/kWh, `standing` is the day's charge. Returns (block_id, wrote) — wrote is
+        False when the slot already held data and was left as-is."""
         kcol, rcol, ccol = (("imp_kwh", "imp_rate", "imp_cost") if channel == "import"
                             else ("exp_kwh", "exp_rate", "exp_cost"))
         cp_id, bm = self._imported_config_period_id(block_start)
         if cp_id is None:
-            return None
+            return None, False
         try:
             block_end = (datetime.fromisoformat(block_start)
                          + timedelta(minutes=bm)).isoformat()
         except ValueError:
-            return None
+            return None, False
         with self._conn:
+            if not overwrite:
+                ex = self._conn.execute(
+                    f"SELECT id, {kcol} AS v FROM blocks "
+                    "WHERE block_start = ? AND meter_id = ?",
+                    (block_start, meter_id)).fetchone()
+                if ex is not None and ex["v"] is not None:
+                    return ex["id"], False        # first-man wins: leave it as-is
             cur = self._conn.execute(
                 f"""INSERT INTO blocks
                       (block_start, block_end, meter_id, config_period_id,
@@ -2404,18 +2417,16 @@ class BlockStore:
                            WHEN excluded.standing_charge IS NULL
                                 OR excluded.standing_charge = 0
                                 THEN blocks.standing_charge   -- export (0) never clobbers
-                           WHEN blocks.source LIKE 'imported%'
-                                OR blocks.standing_charge IS NULL
+                           WHEN blocks.standing_charge IS NULL
                                 OR blocks.standing_charge = 0
                            THEN excluded.standing_charge ELSE blocks.standing_charge END,
-                       source = excluded.source,
                        derivation_id = COALESCE(blocks.derivation_id, excluded.derivation_id)""",
                 (block_start, block_end, meter_id, cp_id,
                  kwh, rate, cost, (standing or 0.0), source, derivation_id))
             row = self._conn.execute(
                 "SELECT id FROM blocks WHERE block_start = ? AND meter_id = ?",
                 (block_start, meter_id)).fetchone()
-        return row["id"] if row else cur.lastrowid
+        return (row["id"] if row else cur.lastrowid), True
 
     def upsert_imported_blocks(
         self, rows: list, meter_id: str, channel: str, *,
@@ -2427,8 +2438,10 @@ class BlockStore:
         This is the hot path for the API import: committing per block (thousands
         of fsyncs) blocks the async event loop long enough to starve the HA
         WebSocket heartbeat → reconnect storm. One transaction per chunk fixes it.
-        `rows`: list of {start, kwh, rate, cost, standing}. Same per-channel merge
-        semantics as upsert_imported_block; config-period id is cached per day."""
+        `rows`: list of {start, kwh, rate, cost, standing}. This is the API hot path
+        and OVERWRITES on conflict (re-fetch corrects prices) — unlike the singular
+        upsert_imported_block, which is first-man-wins for CSV/bill imports.
+        Config-period id is cached per day."""
         kcol, rcol, ccol = (("imp_kwh", "imp_rate", "imp_cost") if channel == "import"
                             else ("exp_kwh", "exp_rate", "exp_cost"))
         sql = (f"""INSERT INTO blocks
@@ -2801,6 +2814,7 @@ class BlockStore:
         periods_by_channel = periods_by_channel or {}
         overrides = overrides or {}
         out: dict = {"ok": True, "meter_id": meter_id, "channels": {},
+                     "blocks_written": 0, "blocks_skipped": 0,
                      "span": {"from": None, "to": None}}
         # Import first (house figure) so export merges onto existing rows.
         for channel in ("import", "export"):
@@ -2854,27 +2868,54 @@ class BlockStore:
                     day_standing.get(b["block_start"][:10], 0.0) + (b.get("standing") or 0.0))
 
             written = 0
+            skipped = 0                 # first-man-wins: slot already held data
             eff_flags: dict = {}        # for reconciliation with confirmed rates
             for b in blocks:
                 flag = deriv["flags"].get(b["block_start"]) or {}
                 did, ov = _period_for(b["block_start"])
-                rate = ov.get(flag.get("tier"), flag.get("rate"))
-                eff_flags[b["block_start"]] = {"tier": flag.get("tier"), "rate": rate}
-                bid = self.upsert_imported_block(
+                tier = flag.get("tier")
+                # Rate precedence — RATE-FIRST. A user override for this tier wins;
+                # otherwise, if the CSV row carried an explicit unit rate (an Octopus
+                # HH bill table transcribed exactly, or any rate-first CSV) store THAT
+                # exact per-slot rate — do NOT flatten it to the period's tier average.
+                # Only a cost-only CSV (no rate column) falls back to the derived
+                # aggregate. Cost is already per-slot (rate×kWh), so this makes the
+                # stored rate consistent with cost and preserves the off-peak/peak
+                # split instead of blending a whole tariff period into one rate.
+                if ov and tier in ov:
+                    rate = ov[tier]
+                elif b.get("rate") is not None:
+                    rate = b["rate"]
+                else:
+                    rate = flag.get("rate")
+                eff_flags[b["block_start"]] = {"tier": tier, "rate": rate}
+                bid, wrote = self.upsert_imported_block(
                     b["block_start"], meter_id, channel,
                     kwh=b["kwh"], rate=rate, cost=b.get("cost"),
                     standing=day_standing.get(b["block_start"][:10]),
                     derivation_id=did)
-                if bid is not None:
+                if wrote:
                     written += 1
+                elif bid is not None:
+                    skipped += 1        # a block already existed here — left as-is
 
             out["channels"][channel] = {
-                "ok": True, "blocks_written": written,
+                "ok": True, "blocks_written": written, "blocks_skipped": skipped,
                 "period_derivations": [d for _f, _t, d, _o in period_meta],
                 "off_peak_kwh": deriv["off_peak_kwh"], "peak_kwh": deriv["peak_kwh"],
                 "reconcile": _ci.reconcile(blocks, eff_flags),
                 "parse_errors": parsed["errors"],
             }
+            out["blocks_written"] += written
+            out["blocks_skipped"] += skipped
+        if out["blocks_written"]:
+            # Freshly-imported history carries NULL carbon_intensity. The historical
+            # carbon backfill sets a "done" marker once it has swept the then-known
+            # span and won't revisit on its own — so a later import would sit at 0%
+            # carbon forever. Clear the marker so the next scheduler tick re-scans and
+            # fills the added span (region-eligible blocks inherit their period's
+            # postcode; same-MPAN history needs no region change).
+            self.rearm_carbon_backfill()
         return out
 
     def backup(self, dst_path: str) -> None:

@@ -3735,6 +3735,10 @@ def api_billing_source_get():
         _has_creds = _eng.has_kraken_credentials()
         return jsonify({"source": source, "unsettled": unsettled,
                         "api_available": _eng.kraken_available(),
+                        # The DCC/CAD settlement choice only makes sense with BOTH a
+                        # local sensor (CAD) AND a supplier API — i.e. mode 'cad+api'.
+                        # Pure-API has no CAD to fall back to; pure-CAD has no DCC.
+                        "mode": _eng.get_data_source_mode(),
                         # API/DCC mode is selected but the stored API key is gone
                         # (typically after restoring a backup onto a fresh install
                         # — creds aren't in the backup). Distinct from "no API".
@@ -3928,6 +3932,11 @@ def api_backfill_run():
                                 "message": "Upload the CSV via the import wizard "
                                            "(rate/period confirmation happens there)."}), 200
             res = store.apply_csv_import(channel_csvs)
+            if isinstance(res, dict) and res.get("blocks_written"):
+                try:
+                    _regen_charts_safely()   # imported span shows in billing/usage now
+                except Exception as _ce:
+                    logger.warning("apply_csv_import dispatch: chart regen failed: %s", _ce)
             return jsonify({"ok": True, "action": action, "result": res}), 200
 
         if action == "run_api_import_job":
@@ -3966,6 +3975,35 @@ def api_backfill_reach():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+def _gap_end_inclusive(store, frm, to):
+    """A gap's `to` is the LAST missing slot's START (inclusive), but the fill window
+    (run_gap_fill_job → import_api_history's until_ts) is HALF-OPEN, so passing `to`
+    as-is fetches [from, to) and leaves the final missing half-hour unfilled — the
+    "1 block still missing after a gap fill" off-by-one. Extend `to` by one block so
+    the last slot is included, mirroring the CSV gap-template's own inclusive step.
+    Returns the extended ISO string (or the original `to` unchanged on any failure)."""
+    try:
+        bm, _tz = _period_block_minutes_tz(store, frm)
+        from datetime import datetime as _dt, timedelta as _td
+        t = _dt.fromisoformat(str(to).replace("Z", "").split("+")[0])
+        return (t + _td(minutes=bm)).isoformat()
+    except Exception:
+        return to
+
+
+def _backfill_verify_active(_eng) -> bool:
+    """True while the deferred pricing-verification pass is running/waiting/paused.
+    A backfill RUN isn't finished until this post-import pass completes, so the
+    start endpoints treat it as 'still busy' — no second run can begin until the
+    current one (import THROUGH verify) is done. Server-enforced so a page refresh
+    or a direct API call can't get round the UI lock."""
+    try:
+        return (_eng.api_verify_pricing_status() or {}).get("status") in (
+            "running", "waiting", "paused")
+    except Exception:
+        return False
+
+
 @app.route("/api/backfill/fill-gap", methods=["POST"])
 def api_backfill_fill_gap():
     """Fill ONE gap window via the supplier API — as a BACKGROUND job, identical in
@@ -3992,11 +4030,18 @@ def api_backfill_fill_gap():
             return jsonify({"ok": False, "reason": "busy",
                             "message": "An import is already running.",
                             "status": _eng.api_import_status()}), 409
+        if _backfill_verify_active(_eng):
+            return jsonify({"ok": False, "reason": "verify_active",
+                            "message": "The previous backfill's pricing-verification pass is still "
+                                       "finishing. Wait for it to complete before starting another."}), 409
         if not (_event_loop and _event_loop.is_running()):
             return jsonify({"ok": False, "reason": "no_loop",
                             "message": "engine loop not running"}), 500
         ch = body.get("channel")
         channels = (ch,) if ch in ("import", "export") else ("import", "export")
+        # Include the gap's final half-hour: `to` is the last missing slot's start
+        # (inclusive) but the fill window is half-open — extend by one block.
+        to = _gap_end_inclusive(_get_store(), frm, to)
         _asyncio.run_coroutine_threadsafe(
             _eng.run_gap_fill_job(frm, to, channels=channels), _event_loop)
         return jsonify({"ok": True, "status": "running"}), 200
@@ -4020,12 +4065,25 @@ def api_backfill_gaps():
         import engine as _eng
         store = _get_store()
         api_available = _eng.kraken_available()
+        # Does the main meter export? A whole missing BLOCK then needs BOTH channels
+        # filled (import AND export), not just import — otherwise the CSV template and
+        # the API fill silently omit export for that window.
+        try:
+            _cfg = load_config()
+            _main = next((m for m in _cfg.get("meters", {}).values()
+                          if not (m.get("meta") or {}).get("sub_meter")), {})
+            has_export = "export" in (_main.get("channels") or {})
+        except Exception:
+            has_export = False
+        block_channels = ["import", "export"] if has_export else ["import"]
         gaps = []
-        # (1) Missing block rows — import channel.
+        # (1) Missing block rows — the whole block is absent, so it needs every
+        # configured channel (import, and export where the meter exports).
         for g in store.find_block_gaps():
             slots = int(g.get("slots") or 0)
             gaps.append({"start": g.get("start"), "end": g.get("end"), "slots": slots,
                          "hours": round(slots / 2.0, 1), "channel": "import",
+                         "channels": list(block_channels),
                          "kind": "missing_blocks", "fetchable": True})
         # (2) Missing per-channel data recorded by the import (import + export).
         imp = _eng.api_import_gaps() or {}
@@ -4036,6 +4094,7 @@ def api_backfill_gaps():
                     continue
                 gaps.append({"start": g.get("from"), "end": g.get("to") or g.get("from"),
                              "slots": cnt, "hours": round(cnt / 2.0, 1), "channel": ch,
+                             "channels": [ch],
                              "kind": "missing_data", "fetchable": api_available})
         gaps.sort(key=lambda x: (x.get("start") or ""), reverse=True)
         return jsonify({
@@ -4511,6 +4570,10 @@ def api_historical_api_start():
         if _eng.api_import_running():
             return jsonify({"ok": False, "error": "an import is already running",
                             "status": _eng.api_import_status()}), 409
+        if _backfill_verify_active(_eng):
+            return jsonify({"ok": False, "reason": "verify_active",
+                            "error": "The previous backfill's pricing-verification pass is still "
+                                     "finishing. Wait for it to complete before starting another."}), 409
         if not (_event_loop and _event_loop.is_running()):
             return jsonify({"ok": False, "error": "engine loop not running"}), 500
         try:
@@ -4614,6 +4677,21 @@ def api_historical_reprice_repair():
         import engine as _eng
         if not _eng.kraken_available():
             return jsonify({"ok": False, "error": "no API connected"}), 400
+        # Guard against a concurrent API pass: the deferred verify-pricing pass
+        # fetches from Octopus on the shared rate-limit allowance. Running a reprice
+        # at the same time would compete for the same budget (and re-check the same
+        # slots), so refuse while verify is live — the UI greys the Retry button to
+        # match, and the verify pass covers these slots anyway.
+        try:
+            _vs = _eng.api_verify_pricing_status() or {}
+        except Exception:
+            _vs = {}
+        if _vs.get("status") in ("running", "waiting", "paused"):
+            return jsonify({"ok": False, "reason": "verify_active",
+                            "error": "A pricing verification pass is running. It shares the "
+                                     "Octopus rate-limit allowance and already re-checks these "
+                                     "slots — please wait for it to finish, then retry if any "
+                                     "still need it."}), 409
         body = request.get_json(force=True, silent=True) or {}
         from_date = (body.get("from_date") or "").strip() or None
         to_date = (body.get("to_date") or "").strip() or None
@@ -4741,6 +4819,89 @@ def _csv_channel_texts(body):
     return texts
 
 
+@app.route("/api/historical/bills/build", methods=["POST"])
+def api_historical_bills_build():
+    """Parse uploaded Octopus PDF bills → per-(MPAN, channel) CSV TEXT, ready to feed
+    the normal CSV preview/apply. Multipart form: `files` (one or more PDFs, the
+    user's local folder uploaded by the browser). Groups by import MPAN — a folder
+    can span a house move — and each group yields import + export CSV plus a
+    reconciliation report and any shape-approximation warnings.
+
+    Strictly upstream of block-writing: nothing is imported here. The generated CSV
+    is returned to the client for review, then flows through the existing CSV path."""
+    try:
+        import bill_parser as _bp
+        if not _bp.pdf_support():
+            return jsonify({"ok": False,
+                            "error": "PDF support (pypdf) isn't available in this build."}), 400
+        files = request.files.getlist("files") or []
+        # Only consider PDFs (a folder upload may include other files).
+        pdfs = [f for f in files if (f.filename or "").lower().endswith(".pdf")]
+        if not pdfs:
+            return jsonify({"ok": False, "error": "No PDF files were uploaded."}), 400
+
+        parsed, failed = [], []
+        for f in pdfs:
+            try:
+                b = _bp.parse_bill(f.read(), source_name=f.filename or "bill.pdf")
+                parsed.append(b)
+            except Exception as e:
+                failed.append({"file": f.filename, "error": str(e)})
+
+        groups = {}
+        for b in parsed:
+            groups.setdefault(b.mpan_import or "unknown", []).append(b)
+
+        def _dedupe(rows):        # later bill wins on overlap / re-issue (§6)
+            by = {}
+            for r in rows:
+                by[r["Start"]] = r
+            return [by[k] for k in sorted(by)]
+
+        out_groups = []
+        for mpan, blist in sorted(groups.items()):
+            imp_rows, exp_rows, days, periods, gwarn = [], [], [], [], []
+            mpan_export = None
+            for b in blist:
+                mpan_export = mpan_export or b.mpan_export
+                try:
+                    rows = _bp.build_csv_rows(b)
+                except Exception as _be:      # one odd bill mustn't 500 the batch
+                    gwarn.append(f"{b.source}: could not build CSV rows ({_be}).")
+                    logger.warning("bills_build: %s CSV build failed: %s", b.source, _be)
+                    rows = {"import": [], "export": []}
+                imp_rows += rows["import"]
+                exp_rows += rows["export"]
+                days += b.reconciliation.get("days", [])
+                periods += b.reconciliation.get("import_periods", [])
+                gwarn += b.warnings
+            imp_rows, exp_rows = _dedupe(imp_rows), _dedupe(exp_rows)
+            recon_ok = (all(d.get("ok") for d in days) and all(p.get("ok") for p in periods))
+            out_groups.append({
+                "mpan_import": mpan, "mpan_export": mpan_export,
+                "sources": [b.source for b in blist],
+                "import_csv": _bp.rows_to_csv(imp_rows) if imp_rows else "",
+                "export_csv": _bp.rows_to_csv(exp_rows) if exp_rows else "",
+                "import_rows": len(imp_rows), "export_rows": len(exp_rows),
+                "reconciliation": {"ok": recon_ok, "days": days, "import_periods": periods},
+                "warnings": gwarn,
+            })
+
+        warnings = []
+        if len([g for g in groups if g != "unknown"]) > 1:
+            warnings.append(
+                "More than one electricity import MPAN was found across these bills "
+                "(a house move). Each is a separate site — import them one MPAN at a time.")
+        if failed:
+            warnings.append(f"{len(failed)} file(s) could not be parsed: "
+                            + ", ".join(x['file'] or '?' for x in failed))
+        return jsonify({"ok": True, "files": len(pdfs), "groups": out_groups,
+                        "failed": failed, "warnings": warnings})
+    except Exception as e:
+        logger.error("api_historical_bills_build: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/historical/csv/preview", methods=["POST"])
 def api_historical_csv_preview():
     """Parse + derive rates from the Octopus CSV(s) WITHOUT writing — the wizard's
@@ -4806,6 +4967,15 @@ def api_historical_csv_apply():
                     result["region_reconcile"] = True
         except Exception as _re:
             logger.warning("csv apply: region plan failed: %s", _re)
+        # Rebuild the pre-rendered billing/usage charts so the imported span shows
+        # up immediately — the API import path already does this; the CSV/bill path
+        # previously left the charts stale until the next startup/live-block regen.
+        if result.get("blocks_written"):
+            try:
+                _regen_charts_safely()
+                result["charts_regenerated"] = True
+            except Exception as _ce:
+                logger.warning("csv apply: chart regen failed: %s", _ce)
         return jsonify(result)
     except Exception as e:
         logger.error("api_historical_csv_apply: %s", e)
