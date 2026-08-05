@@ -641,6 +641,42 @@ class TestBillSummaryMainImportRaw(unittest.TestCase):
         self.assertAlmostEqual(raw_kwh, sub_kwh + rem_kwh, places=4,
             msg="main_import_raw must equal sub-meter sum + remainder")
 
+    def test_submeter_breakdown_uses_grid_share_not_total(self):
+        """When a device draws part of its energy from battery/solar (kwh_grid <
+        kwh total), the breakdown must show the GRID share — so it reconciles to
+        the grid import total and matches Usage Stats — not the larger total
+        consumption. Regression for the billing-vs-usage-stats device drift."""
+        def ins(meter_id, imp_kwh, grid, cost, rem=None):
+            self.store._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, "
+                "config_period_id, interpolated, imp_kwh, imp_kwh_grid, "
+                "imp_kwh_remainder, imp_rate, imp_cost, standing_charge) "
+                "VALUES ('2026-03-01T00:00:00','2026-03-01T00:00:00',?,?,0,?,?,?,0.10,?,0.50)",
+                (meter_id, self.cp, imp_kwh, grid, rem, cost))
+        ins("electricity_main", 10.0, None, 1.00, rem=3.0)  # 3 kWh direct grid
+        ins("ev_charger",        5.0,  4.0, 0.40)            # 1 kWh from battery
+        ins("house_battery",     4.0,  3.0, 0.30)            # 1 kWh from solar
+        self.store._conn.commit()
+        s = self._summary()
+        tot = s["totals"]
+
+        def kwh_of(dev):
+            return next(t["kwh"] for k, t in tot.items()
+                        if t.get("is_submeter") and dev in k)
+        self.assertAlmostEqual(kwh_of("Zappi"), 4.0, places=4,
+            msg="EV breakdown must show grid share 4.0, not total consumption 5.0")
+        self.assertAlmostEqual(kwh_of("Solax"), 3.0, places=4,
+            msg="Battery breakdown must show grid share 3.0, not total 4.0")
+
+        sub = sum(t["kwh"] for k, t in tot.items()
+                  if t.get("is_submeter") and "import" in k.lower())
+        rem = sum(t["kwh"] for k, t in tot.items()
+                  if not t.get("is_submeter") and "import" in k.lower())
+        raw = sum(d["kwh"] for d in s["main_import_raw"].values())
+        self.assertAlmostEqual(sub + rem, raw, places=4,
+            msg="breakdown (grid shares + remainder) must reconcile to grid total")
+        self.assertAlmostEqual(sub + rem, 10.0, places=4)
+
     def test_raw_total_matches_main_meter_blocks(self):
         """main_import_raw kWh must match the raw sum of electricity_main imp_kwh from DB."""
         self._insert("2026-03-01T00:00:00", main_imp=6.35, ev_imp=2.1, bat_imp=1.5)
