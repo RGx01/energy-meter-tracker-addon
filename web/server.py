@@ -2179,17 +2179,21 @@ def _blocks_data_version(store) -> str:
     device attribution that rewrites historical blocks (e.g. healing a sub-meter
     zero-hole moves energy off the house remainder onto the device). Without it,
     those edits were invisible to the token and the client kept serving its stale
-    cache until the TTL expired. Every summed column lives in idx_blocks_insights,
-    so this stays a single index-only scan (~20ms over ~130k rows)."""
+    cache until the TTL expired. It sums **both import and export** kWh + cost (plus
+    carbon) — export settles later than import, so an export-only DCC settlement
+    moves exp_kwh/exp_cost but not the import figures, and must still bust the cache.
+    Every summed column lives in idx_blocks_insights, so this stays a single
+    index-only scan (~20ms over ~130k rows)."""
     row = store._conn.execute(
         "SELECT COUNT(*) AS c, MAX(block_start) AS m, "
         "ROUND(COALESCE(SUM(imp_kwh),  0), 3) AS ik, "
         "ROUND(COALESCE(SUM(imp_cost), 0), 2) AS ic, "
+        "ROUND(COALESCE(SUM(exp_kwh),  0), 3) AS ek, "
         "ROUND(COALESCE(SUM(exp_cost), 0), 2) AS ec, "
         "ROUND(COALESCE(SUM(carbon_g), 0), 0) AS cg "
         "FROM blocks").fetchone()
     return (f"{row['c']}:{row['m'] or ''}:"
-            f"{row['ik']}:{row['ic']}:{row['ec']}:{row['cg']}")
+            f"{row['ik']}:{row['ic']}:{row['ek']}:{row['ec']}:{row['cg']}")
 
 
 @app.route("/api/charts/data-version")

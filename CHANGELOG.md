@@ -12,6 +12,8 @@
 
 - **Usage Stats no longer over-counts a device that charged from solar/battery (grid share of exactly 0).** The per-device import used `imp_kwh_grid or imp` — Python truthiness, so a legitimate grid share of **0** (a block where the device charged entirely from solar/battery, drawing nothing from the grid) was treated as "missing" and fell back to **total** consumption. This inflated devices that self-consume — the **house battery** most of all (in one year, 81 solar-charged blocks added ~2.4 kWh). Fixed to distinguish a real 0 from NULL (`imp_kwh_grid if not None else imp`), in both `_aggregate_usage` and `api_blocks_summary`, so device import counts the grid share and now matches the Billing breakdown exactly. (The Insights page's separate total-consumption view is unchanged.)
 
+- **Usage Stats now refreshes on an export-only settlement too.** The change token's value fingerprint (added in 4.0.1) summed import kWh/cost and carbon but not **export** kWh. Since export settles later than import via DCC, a settlement batch that moved only `exp_kwh` left the token unchanged, so the Charts/Usage-Stats client kept a stale export figure until the 5-minute TTL (Billing, server-rendered, updated immediately — hence a transient export mismatch between the two views). The fingerprint now also sums `exp_kwh` (still a single index-only scan), so any export change refreshes the views promptly.
+
 ## [4.0.1] — 2026-08-05
 
 ### Fixed
