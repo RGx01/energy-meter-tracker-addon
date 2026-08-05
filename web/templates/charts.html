@@ -716,6 +716,9 @@ window.EMTSpiral=(function(){
   <!-- Chart canvas -->
   <div id="bar-chart-wrap" style="position:relative; width:100%; max-width:100%; overflow:hidden; height:300px; padding: 0 24px; box-sizing:border-box; flex-shrink:0;">
     <canvas id="barChart" style="max-width:100%;"></canvas>
+    <!-- Shown while the first fetch/build runs (no cached data to paint) — matches the
+         "Loading chart..." placeholder the daily/heatmap/spiral tabs use. -->
+    <div id="bar-loading" style="position:absolute; inset:0; display:none; align-items:center; justify-content:center; color:var(--muted); font-size:14px; background:var(--surface);">Loading chart…</div>
   </div>
 
   <!-- Tabular view -->
@@ -1598,55 +1601,95 @@ function barLoadState(availableYears) {
   } catch(e) {}
 }
 
-async function barInit() {
-  var now = Date.now();
-  if (barInited && barData && (now - barLastFetch) < BAR_TTL_MS) { barRender(); return; }
+// Per-instance cache of the last blocks-summary payload, so returning to the Charts
+// page (a full navigation from Overview etc.) can paint instantly from the last
+// result instead of showing a blank chart while the fresh fetch runs.
+function _barCacheKey() { try { return EMT.lsKey('emt_bar_summary'); } catch(e) { return 'emt_bar_summary'; } }
+function _loadBarCache() {
+  try { var raw = localStorage.getItem(_barCacheKey()); return raw ? JSON.parse(raw) : null; }
+  catch(e) { return null; }
+}
+function _saveBarCache(json) {
+  try { localStorage.setItem(_barCacheKey(), JSON.stringify(json)); } catch(e) { /* quota — non-fatal */ }
+}
+
+// Apply a blocks-summary JSON (fresh or cached) into the bar-chart state.
+function _applyBarJson(json) {
+  barData        = json.rows || [];
+  barCurrency    = json.currency || '£';
+  barBillingDay  = json.billing_day || 1;
+  barMeters      = json.meters  || [];
+  barExportColor = json.export_color || '#ff7f0e';  // palette colour for export/credit bars
+  var costBtn = document.getElementById('bar-cost-btn');
+  if (costBtn) costBtn.textContent = barCurrency + ' Cost';
+  var co2Btn = document.getElementById('bar-co2-btn');
+  if (co2Btn) co2Btn.style.display = json.has_postcode ? '' : 'none';
+  if (barMetric === 'co2' && !json.has_postcode) barMetric = 'kwh';
+  var years = [...new Set(barData.map(r => r.year))].sort();
+  if (barData.length > 0) {
+    barDailyMonth = barBillingKey(barData[barData.length - 1]).bKey;
+  } else {
+    barDailyMonth = null;
+  }
+  barActiveYears = new Set(years);
+  barLoadState(years);          // restore saved view state (validated against data)
+  barSyncUI();
+  barBlockMinutes = json.block_minutes || 30;
+  barInited = true;
+  if (json.data_version) _lastDataVersion = json.data_version;
+  var _prevErr = document.getElementById('bar-load-error');
+  if (_prevErr) _prevErr.remove();
+}
+
+function _setBarLoading(show) {
+  var el = document.getElementById('bar-loading');
+  if (el) el.style.display = show ? 'flex' : 'none';
+}
+
+async function _barFetchFresh() {
+  // Only show the "Loading…" overlay when there's nothing on screen yet (fresh build,
+  // no cached paint) — a background refresh of an already-drawn chart shouldn't flash it.
+  if (!barInited || !barData || !barData.length) _setBarLoading(true);
   try {
     var r = await fetch(apiUrl('/api/charts/blocks-summary'));
     var json = await r.json();
     if (json.error) throw new Error(json.error);
-    barData        = json.rows || [];
-    barCurrency    = json.currency || '£';
-    barBillingDay  = json.billing_day || 1;
-    barMeters      = json.meters  || [];
-    barExportColor = json.export_color || '#ff7f0e';  // palette colour for export/credit bars
-    document.getElementById('bar-cost-btn').textContent = barCurrency + ' Cost';
-    // Show CO2 toggle only when a postcode is configured (CI data available)
-    var co2Btn = document.getElementById('bar-co2-btn');
-    if (co2Btn) co2Btn.style.display = json.has_postcode ? '' : 'none';
-    // If CO2 was saved but postcode no longer configured, fall back to kWh
-    if (barMetric === 'co2' && !json.has_postcode) barMetric = 'kwh';
-    var now   = new Date();
-    var years = [...new Set(barData.map(r => r.year))].sort();
-    // Set defaults before loading saved state
-    // For billing mode, find the billing month containing the most recent data row
-    if (barData.length > 0) {
-      var lastRow = barData[barData.length - 1];
-      var k = barBillingKey(lastRow);
-      barDailyMonth = k.bKey;
-    } else {
-      barDailyMonth  = null;
-    }
-    barActiveYears = new Set(years);
-    // Restore saved state (validated against available data)
-    barLoadState(years);
-    // Sync control UI to restored state
-    barSyncUI();
-    barBlockMinutes = json.block_minutes || 30;
-    barInited = true;
+    _applyBarJson(json);
     barLastFetch = Date.now();
-    if (json.data_version) _lastDataVersion = json.data_version;  // gate focus/poll refreshes
-    // Clear any previous transient error
-    var _prevErr = document.getElementById('bar-load-error');
-    if (_prevErr) _prevErr.remove();
+    _saveBarCache(json);
     barRender();
   } catch(e) {
-    var _errDiv = document.createElement('div');
+    _setBarLoading(false);
+    var _errDiv = document.getElementById('bar-load-error') || document.createElement('div');
     _errDiv.id = 'bar-load-error';
     _errDiv.style.cssText = 'color:var(--danger);padding:20px;';
     _errDiv.textContent = 'Failed to load data: ' + e.message;
-    document.getElementById('chart-bar').appendChild(_errDiv);
+    var host = document.getElementById('chart-bar');
+    if (host && !host.contains(_errDiv)) host.appendChild(_errDiv);
   }
+}
+
+async function barInit() {
+  var now = Date.now();
+  if (barInited && barData && (now - barLastFetch) < BAR_TTL_MS) { barRender(); return; }
+  // Fresh page load: paint from the cached payload immediately (no blank chart),
+  // then confirm freshness against the tiny data-version token — only re-fetching
+  // the full summary if the data actually changed.
+  if (!barInited) {
+    var cached = _loadBarCache();
+    if (cached && cached.rows) {
+      _applyBarJson(cached);
+      barLastFetch = Date.now();   // treat cache as fresh for TTL; version check corrects it
+      barRender();                 // instant
+      var cv = cached.data_version;
+      _fetchDataVersion().then(function(v) {
+        if (v && cv && v === cv) { _lastDataVersion = v; return; }   // unchanged → keep cache
+        _barFetchFresh();          // changed / unknown → refresh in the background
+      });
+      return;
+    }
+  }
+  await _barFetchFresh();
 }
 
 function barSyncUI() {
@@ -2016,6 +2059,7 @@ function barYLabel(v) {
 
 function barRender() {
   if (!barData) return;
+  _setBarLoading(false);   // data's here — clear any "Loading…" overlay
   // HH (single-day) view: Billing/Calendar toggle is irrelevant — hide it. If the
   // cached day doesn't match the selected day, fetch it first (async), then this
   // function is re-entered with data ready.
