@@ -465,25 +465,37 @@ async function restoreFromFlat() {
 
 async function restoreFromZip(zipName) {
   _restoreZip   = zipName;
+  _restoreFlat  = false;
   _restoreFiles = {};
 
-  // Extract zip contents via server
+  // Open the dialog IMMEDIATELY with a loading state, so pressing Restore feels
+  // instant. We only need the file LIST from the zip (names + sizes) — cheap, no
+  // decompression — not the whole blocks.db base64-encoded as before (which stalled
+  // the dialog for seconds on a large DB). The restore itself re-extracts server-side.
+  const listEl = document.getElementById('restore-file-list');
+  listEl.textContent = 'Reading backup…';
+  listEl.style.color = 'var(--muted)';
+  document.getElementById('restore-mismatch-warn').style.display = 'none';
+  document.getElementById('restore-confirm-btn').disabled = true;
+  document.getElementById('restore-overlay').style.display = 'block';
+
   try {
-    const form = new FormData();
-    const r    = await fetch(apiUrl('/api/import/extract-zip-by-name'), {
+    const r    = await fetch(apiUrl('/api/backup/zip-entries'), {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ zip: zipName })
     });
     const data = await r.json();
     if (data.files) {
-      _restoreFiles = data.files;  // { filename: base64 }
+      _restoreFiles = data.files;  // { filename: {size_kb} }
     } else {
-      showError(data.error || 'Could not read backup');
+      listEl.style.color = 'var(--danger)';
+      listEl.textContent = data.error || 'Could not read backup';
       return;
     }
   } catch(e) {
-    showError('Failed to read backup: ' + e.message);
+    listEl.style.color = 'var(--danger)';
+    listEl.textContent = 'Failed to read backup: ' + e.message;
     return;
   }
 
@@ -496,9 +508,11 @@ async function restoreFromZip(zipName) {
     'cumulative_totals.json': { risk: 'muted',   note: 'No longer used — will be ignored (totals derived from blocks)' },
   };
 
-  const listEl = document.getElementById('restore-file-list');
+  listEl.style.color = '';
   listEl.innerHTML = Object.keys(_restoreFiles).map(function(name) {
     const info = riskMap[name] || { risk: 'muted', note: '' };
+    const sz   = (_restoreFiles[name] && _restoreFiles[name].size_kb != null)
+      ? (' · ' + _restoreFiles[name].size_kb + ' KB') : '';
     return `<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;
                            background:var(--bg);border-radius:var(--radius);
                            border:1px solid var(--border);margin-bottom:6px;cursor:pointer;">
@@ -507,7 +521,7 @@ async function restoreFromZip(zipName) {
              style="margin-top:2px;width:15px;height:15px;accent-color:var(--accent);"
              onchange="checkRestoreMismatch()">
       <div>
-        <div style="font-family:var(--mono);font-size:13px;">${name}</div>
+        <div style="font-family:var(--mono);font-size:13px;">${name}${sz}</div>
         <div style="font-size:11px;color:var(--${info.risk});margin-top:2px;">${info.note}</div>
       </div>
     </label>`;

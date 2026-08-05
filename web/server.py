@@ -5998,6 +5998,37 @@ def api_import_extract_zip_by_name():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/backup/zip-entries", methods=["POST"])
+def api_backup_zip_entries():
+    """List the recognised files inside a named backup zip — names + sizes ONLY, no
+    decompression of the bodies. This is what the Restore dialog needs to build its
+    file picker; the old path base64-encoded the whole blocks.db (tens of MB) just to
+    read the filenames, which stalled the dialog. The actual restore re-extracts the
+    zip server-side, so nothing else needs the contents here."""
+    import zipfile
+    try:
+        data = request.get_json(force=True) or {}
+        zipname = data.get("zip", "")
+        if not zipname or "/" in zipname or "\\" in zipname:
+            return jsonify({"error": "Invalid zip name"}), 400
+        zip_path = f"{_share_backup_dir()}/backups/{zipname}"
+        if not os.path.exists(zip_path):
+            return jsonify({"error": "Backup not found"}), 404
+        known = {"blocks.db", "blocks.json"}
+        entries = {}
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for info in zf.infolist():
+                base = os.path.basename(info.filename)
+                if base in known:
+                    entries[base] = {"size_kb": round(info.file_size / 1024.0, 1)}
+        if not entries:
+            return jsonify({"error": "No recognised files found in backup"}), 400
+        return jsonify({"files": entries})
+    except Exception as e:
+        logger.error("api_backup_zip_entries: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
 def _create_backup_zip(label="backup"):
     """Zip all data files into /share/energy_meter_tracker_backup/backups/."""
     import zipfile
