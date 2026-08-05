@@ -63,8 +63,10 @@
 </div>
 
 <!-- Step 1 — API import panel (driven by the guided picker above: Preview plan,
-     Date range and Gap fill all land here) -->
-<div class="card" id="step-intro">
+     Date range and Gap fill all land here). Hidden by default: it's revealed only
+     when the API source is picked, or when a live/persisted API import has something
+     to show (poll-on-load). Selecting CSV hides it — it's an API-only panel. -->
+<div class="card" id="step-intro" style="display:none;">
   <div id="api-import-panel">
     <div style="font-weight:600;margin-bottom:4px;">API import</div>
     <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:10px;">
@@ -349,8 +351,11 @@ function bfPickSource(el) {
   document.getElementById('bf-range-row').style.display = 'none';
   document.getElementById('bf-out').innerHTML = '';
   // API tasks live in the panel below (#step-intro); CSV tasks open their own panel
-  // (#step-upload) when a task is chosen. Show the right one for this source.
-  if (isApi && typeof goStep === 'function') goStep('intro');
+  // (#step-upload / #step-bills) when a task is chosen. The API panel is API-only, so
+  // reveal it for API and HIDE it for CSV (otherwise its stale "API import" header
+  // lingers through the CSV flow — the confusing bit).
+  if (isApi) { if (typeof goStep === 'function') goStep('intro'); }
+  else { var _si = document.getElementById('step-intro'); if (_si) _si.style.display = 'none'; }
   bfSyncPreviewBtn();
 }
 function bfPickScope(el) {
@@ -633,6 +638,10 @@ function goStep(s){
     if(el) el.style.display = (k===s) ? "block" : "none";
   });
 }
+// The API panel (#step-intro) is API-only. Show it while an API import is live or has
+// a persisted last-run to display (poll-on-load), or when the user picks the API
+// source; hide it otherwise (fresh load with no API run, or CSV selected).
+function _setApiPanel(show){ var el=document.getElementById("step-intro"); if(el) el.style.display = show ? "block" : "none"; }
 function _esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
 function _p(v){ return (v==null)?'—':(v*100).toFixed(2)+'p'; }     // £/kWh → p/kWh
@@ -910,12 +919,14 @@ function pollStatus(expectStart){
     if(_freshFlow && !active && !awaiting) return;
     var row = document.getElementById('api-apply-row');
     if(active){
-      // Live import → show the row so Pause/Cancel are reachable.
+      // Live import → reveal the API panel and show the row (Pause/Cancel reachable).
+      _setApiPanel(true);
       if(row) row.style.display = 'block';
       _renderApiStatus(d);
     } else if(awaiting){
       // Job kicked off but not yet flipped to 'running'. Show a starting state
       // (not the previous run's stale summary) and keep the panel up.
+      _setApiPanel(true);
       if(row) row.style.display = 'block';
       var st = document.getElementById('api-apply-status'); if(st) st.textContent = 'Starting…';
       var out = document.getElementById('api-apply-out'); if(out) out.innerHTML = '';
@@ -925,8 +936,13 @@ function pollStatus(expectStart){
       // Preview-plan flow (which sets the import window). Otherwise a poll-on-load of
       // a PREVIOUS run's 'done' presents a "Start import" the user could fire with no
       // whole-history / gap / date-range scope chosen.
+      _setApiPanel(true);
       if(row) row.style.display = 'none';
       _renderApiStatus(d);
+    } else {
+      // Idle with nothing to show — hide the API-only panel, unless the user has just
+      // picked the API source (mid-flow, about to Preview plan).
+      if(_bfSource !== 'api') _setApiPanel(false);
     }
     if(_statusTimer) clearTimeout(_statusTimer);
     // Hide the pricing-health panel while an import is in progress — it shows the

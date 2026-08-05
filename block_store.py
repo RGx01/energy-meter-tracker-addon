@@ -1025,6 +1025,10 @@ class BlockStore:
             ("needs_review",       "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
             # ── 3.3.0 BL-18: why a block was flagged for review (drift vs dispatch)
             ("review_reason",      "blocks",        "TEXT",                       _b_cols),
+            # ── #322: sticky "user dismissed this review" marker. Cleared review flags
+            # were re-set every reconcile run (no memory of the dismissal), so the same
+            # ambiguous dispatch blocks kept reappearing. Once dismissed, don't re-flag.
+            ("review_dismissed",   "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
             ("carbon_intensity_g", "blocks",        "REAL",                       _b_cols),
             ("rate_corrected",     "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
             ("rate_reconciled",    "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
@@ -3716,16 +3720,18 @@ class BlockStore:
         dispatch-origin flags (review_reason present) so a 'dismiss all' never
         silently touches the dormant drift diagnostics. Returns rows affected.
         """
+        # #322: mark the block DISMISSED (sticky) as well as clearing the live flag,
+        # so the dispatch reconcile can't resurrect it on the next re-scan.
         if block_ids is None:
             cur = self._conn.execute(
-                "UPDATE blocks SET needs_review = 0, review_reason = NULL "
+                "UPDATE blocks SET needs_review = 0, review_reason = NULL, review_dismissed = 1 "
                 "WHERE needs_review = 1 AND review_reason IS NOT NULL")
         elif not block_ids:
             return 0
         else:
             placeholders = ",".join("?" for _ in block_ids)
             cur = self._conn.execute(
-                "UPDATE blocks SET needs_review = 0, review_reason = NULL "
+                "UPDATE blocks SET needs_review = 0, review_reason = NULL, review_dismissed = 1 "
                 f"WHERE id IN ({placeholders}) AND review_reason IS NOT NULL",
                 tuple(block_ids))
         self._conn.commit()
@@ -3738,10 +3744,16 @@ class BlockStore:
         Used by the dispatch reconciliation when a block is genuinely ambiguous
         (substantial completed energy without a `started` signal). Idempotent —
         re-flagging refreshes the reason. Returns rows affected.
+
+        #322: NEVER re-flags a block the user has already dismissed
+        (`review_dismissed = 1`) — otherwise every reconcile re-scan resurrected the
+        same ambiguous blocks (typically Ohme replan-without-charge slots), asking the
+        user to review them again and again. Repricing is unaffected — only the review
+        prompt is suppressed. To surface it again, the user re-flags via a correction.
         """
         cur = self._conn.execute(
             "UPDATE blocks SET needs_review = 1, review_reason = ? "
-            "WHERE block_start = ? AND meter_id = ?",
+            "WHERE block_start = ? AND meter_id = ? AND review_dismissed = 0",
             (reason, block_start, meter_id))
         self._conn.commit()
         return cur.rowcount
