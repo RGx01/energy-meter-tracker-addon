@@ -2084,7 +2084,10 @@ def _aggregate_block_rows(raw_rows, bucket_of, standing_scope="bucket",
             if _mid not in _dd["subs"]:
                 _dd["subs"][_mid] = {"imp_kwh": 0.0, "imp_cost": 0.0, "exp_kwh": 0.0, "exp_cost": 0.0, "carbon_g": None}
             _s = _dd["subs"][_mid]
-            _sub_imp = float(_r["imp_kwh_grid"] or _imp)
+            # Grid portion only; a real 0 (fully solar/battery-charged block) must
+            # stay 0, not fall back to total consumption (see _aggregate_usage).
+            _grid = _r["imp_kwh_grid"]
+            _sub_imp = float(_grid) if _grid is not None else _imp
             _s["imp_kwh"]  += _sub_imp
             _s["imp_cost"] += _cost_imp
             _s["exp_kwh"]  += _exp
@@ -5602,8 +5605,13 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
                     # rate tier breakdown per sub-meter
                     "rate_tiers": defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "blocks": 0}),
                 }
-            # Use imp_kwh_grid for sub-meters (grid portion only)
-            sub_grid_kwh = float(row["imp_kwh_grid"] or imp)
+            # Use imp_kwh_grid for sub-meters (grid portion only). Distinguish a
+            # real 0 (device charged entirely from battery/solar this block — no
+            # grid) from NULL (not computed): `or imp` would treat 0 as missing and
+            # fall back to TOTAL consumption, over-stating the device (bites the
+            # battery hardest). Mirrors the remainder handling below (`is not None`).
+            _grid = row["imp_kwh_grid"]
+            sub_grid_kwh = float(_grid) if _grid is not None else imp
             sub_totals[mid]["imp_kwh"]  += sub_grid_kwh
             sub_totals[mid]["imp_cost"] += imp_cost
             sub_totals[mid]["exp_kwh"]  += exp

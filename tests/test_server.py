@@ -5763,5 +5763,49 @@ class TestBlocksDataVersion(unittest.TestCase):
                          server._blocks_data_version(st))
 
 
+class TestUsageSubMeterGridShare(unittest.TestCase):
+    """_aggregate_usage must count a sub-meter's GRID share (imp_kwh_grid). A real
+    0 (device charged entirely from solar/battery) must stay 0 — not fall back to
+    total consumption via `grid or imp`. This is what made Usage Stats disagree
+    with the (grid-share) Billing breakdown, worst on the house battery."""
+
+    def _store(self):
+        store = BlockStore(":memory:")
+        store.insert_config_period({"meters": {
+            "electricity_main": {"meta": {"block_minutes": 30, "timezone": "UTC",
+                "currency_symbol": "£", "currency_code": "GBP"}},
+            "house_battery": {"meta": {"sub_meter": True,
+                "parent_meter": "electricity_main", "device": "Solax Battery",
+                "block_minutes": 30, "timezone": "UTC"}},
+        }})
+        cp = store._conn.execute(
+            "SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+        # Main import 2 kWh; battery charged 3 kWh but ALL from solar → grid share 0.
+        store._conn.execute(
+            "INSERT INTO blocks (block_start,block_end,meter_id,config_period_id,"
+            "interpolated,imp_kwh,imp_kwh_grid,imp_kwh_remainder,imp_rate,imp_cost,"
+            "standing_charge) VALUES ('2026-06-01T12:00:00','2026-06-01T12:30:00',"
+            "'electricity_main',?,0,2.0,NULL,2.0,0.10,0.20,0.50)", (cp,))
+        store._conn.execute(
+            "INSERT INTO blocks (block_start,block_end,meter_id,config_period_id,"
+            "interpolated,imp_kwh,imp_kwh_grid,imp_rate,imp_cost,standing_charge) "
+            "VALUES ('2026-06-01T12:00:00','2026-06-01T12:30:00','house_battery',"
+            "?,0,3.0,0.0,0.10,0.0,0.0)", (cp,))
+        store._conn.commit()
+        return store
+
+    def test_zero_grid_share_counts_zero_not_total(self):
+        import server
+        cfg = {"meters": {
+            "electricity_main": {"meta": {"block_minutes": 30}},
+            "house_battery": {"meta": {"sub_meter": True, "device": "Solax Battery"}},
+        }}
+        out = server._aggregate_usage(
+            self._store(), cfg, "2026-06-01T00:00:00", "2026-06-02T00:00:00", "UTC")
+        self.assertAlmostEqual(
+            out["sub_meters"]["house_battery"]["imp_kwh"], 0.0, places=6,
+            msg="solar-charged block (grid share 0) must count 0, not total 3.0")
+
+
 if __name__ == "__main__":
     unittest.main()
