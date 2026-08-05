@@ -697,7 +697,19 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
                     channel = channel or {}
                     channel_m = (channel.get("meta", {}) or {})
 
-                    kwh  = float(channel.get("kwh_total", channel.get("kwh")) or 0.0)
+                    # Sub-meter rows show the device's GRID-attributed share
+                    # (kwh_grid), NOT its total consumption (kwh_total). Total would
+                    # include energy the device drew from battery/solar, which never
+                    # touched the grid — so the breakdown would overshoot the grid
+                    # import total and the kWh would no longer correspond to the
+                    # grid-based cost. This mirrors the sub_by_rate reconciliation
+                    # above and the Usage-Stats aggregation. The main meter keeps its
+                    # total (grid) figure. (Total_cost is unaffected — see note at top.)
+                    if is_sub:
+                        kwh = float(channel.get("kwh_grid",
+                                    channel.get("kwh_total", channel.get("kwh"))) or 0.0)
+                    else:
+                        kwh = float(channel.get("kwh_total", channel.get("kwh")) or 0.0)
                     cost = float(channel.get("cost") or 0.0)
                     rate = round(float(channel.get("rate_used", channel.get("rate")) or 0.0), 4)
                     is_export = channel_name.lower().endswith("export")

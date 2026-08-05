@@ -168,6 +168,21 @@ class TestOhmeDispatchHistory(unittest.TestCase):
         self.assertIn("completed", by_kind)
         self.assertEqual(by_kind["planned"][0]["slot_start"], "2026-07-18T23:30:00")
         self.assertEqual(by_kind["completed"][0]["slot_start"], "2026-07-18T20:00:00")
+        # The completed row must now carry the ACTUAL dispatch window (was NULL).
+        self.assertEqual(by_kind["completed"][0]["raw_start"], "2026-07-18T20:00:00")
+        self.assertEqual(by_kind["completed"][0]["raw_end"], "2026-07-18T20:30:00")
+
+    def test_completed_records_sub_slot_window(self):
+        # A completed dispatch that ran a fraction of its slot keeps its real,
+        # to-the-minute window rather than being flattened to the 30-min block.
+        completed = [{"source": "unknown", "start": "2026-07-18T15:27:00Z",
+                      "end": "2026-07-18T15:30:00Z", "delta": -0.09}]
+        engine._record_ohme_dispatch_history("OHME", [], completed)
+        row = next(r for r in self.store.get_dispatch_history(
+            "2026-07-18T00:00:00", "2026-07-20T00:00:00") if r["kind"] == "completed")
+        self.assertEqual(row["slot_start"], "2026-07-18T15:00:00")   # slotted
+        self.assertEqual(row["raw_start"], "2026-07-18T15:27:00")    # but window is 3 min
+        self.assertEqual(row["raw_end"], "2026-07-18T15:30:00")
 
     def test_no_store_is_safe(self):
         engine._store = None
@@ -188,6 +203,33 @@ class TestPlannedSlotIncludeAll(unittest.TestCase):
         self.assertIn("2026-07-18T23:30:00", out)
         b = engine._planned_dispatch_slot_bounds(self.P, include_all=True)
         self.assertIn("2026-07-18T23:30:00", b)
+
+
+class TestCompletedSlotBounds(unittest.TestCase):
+    """_completed_dispatch_slot_bounds: retain the real completed window per slot,
+    no source filter (completed dispatches come back source='unknown')."""
+
+    def test_sub_slot_window_kept(self):
+        b = engine._completed_dispatch_slot_bounds(
+            [{"source": "unknown", "start": "2026-07-18T15:27:00Z",
+              "end": "2026-07-18T15:30:00Z", "delta": -0.09}])
+        self.assertEqual(b, {"2026-07-18T15:00:00":
+                             ("2026-07-18T15:27:00", "2026-07-18T15:30:00")})
+
+    def test_multi_slot_dispatch_spreads_full_window_to_each_slot(self):
+        # A dispatch spanning 01:30–03:00 tags every covered slot with the whole
+        # (start, end); a session's true window is then min(start)/max(end).
+        b = engine._completed_dispatch_slot_bounds(
+            [{"source": "unknown", "start": "2026-07-19T01:30:00Z",
+              "end": "2026-07-19T03:00:00Z", "delta": -9.0}])
+        self.assertEqual(sorted(b), ["2026-07-19T01:30:00", "2026-07-19T02:00:00",
+                                     "2026-07-19T02:30:00"])
+        for win in b.values():
+            self.assertEqual(win, ("2026-07-19T01:30:00", "2026-07-19T03:00:00"))
+
+    def test_missing_bounds_skipped(self):
+        self.assertEqual(engine._completed_dispatch_slot_bounds(
+            [{"source": "unknown", "delta": -1.0}]), {})
 
 
 if __name__ == "__main__":

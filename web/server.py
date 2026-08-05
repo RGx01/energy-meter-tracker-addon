@@ -2084,7 +2084,10 @@ def _aggregate_block_rows(raw_rows, bucket_of, standing_scope="bucket",
             if _mid not in _dd["subs"]:
                 _dd["subs"][_mid] = {"imp_kwh": 0.0, "imp_cost": 0.0, "exp_kwh": 0.0, "exp_cost": 0.0, "carbon_g": None}
             _s = _dd["subs"][_mid]
-            _sub_imp = float(_r["imp_kwh_grid"] or _imp)
+            # Grid portion only; a real 0 (fully solar/battery-charged block) must
+            # stay 0, not fall back to total consumption (see _aggregate_usage).
+            _grid = _r["imp_kwh_grid"]
+            _sub_imp = float(_grid) if _grid is not None else _imp
             _s["imp_kwh"]  += _sub_imp
             _s["imp_cost"] += _cost_imp
             _s["exp_kwh"]  += _exp
@@ -2176,17 +2179,21 @@ def _blocks_data_version(store) -> str:
     device attribution that rewrites historical blocks (e.g. healing a sub-meter
     zero-hole moves energy off the house remainder onto the device). Without it,
     those edits were invisible to the token and the client kept serving its stale
-    cache until the TTL expired. Every summed column lives in idx_blocks_insights,
-    so this stays a single index-only scan (~20ms over ~130k rows)."""
+    cache until the TTL expired. It sums **both import and export** kWh + cost (plus
+    carbon) — export settles later than import, so an export-only DCC settlement
+    moves exp_kwh/exp_cost but not the import figures, and must still bust the cache.
+    Every summed column lives in idx_blocks_insights, so this stays a single
+    index-only scan (~20ms over ~130k rows)."""
     row = store._conn.execute(
         "SELECT COUNT(*) AS c, MAX(block_start) AS m, "
         "ROUND(COALESCE(SUM(imp_kwh),  0), 3) AS ik, "
         "ROUND(COALESCE(SUM(imp_cost), 0), 2) AS ic, "
+        "ROUND(COALESCE(SUM(exp_kwh),  0), 3) AS ek, "
         "ROUND(COALESCE(SUM(exp_cost), 0), 2) AS ec, "
         "ROUND(COALESCE(SUM(carbon_g), 0), 0) AS cg "
         "FROM blocks").fetchone()
     return (f"{row['c']}:{row['m'] or ''}:"
-            f"{row['ik']}:{row['ic']}:{row['ec']}:{row['cg']}")
+            f"{row['ik']}:{row['ic']}:{row['ek']}:{row['ec']}:{row['cg']}")
 
 
 @app.route("/api/charts/data-version")
@@ -5602,8 +5609,13 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
                     # rate tier breakdown per sub-meter
                     "rate_tiers": defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "blocks": 0}),
                 }
-            # Use imp_kwh_grid for sub-meters (grid portion only)
-            sub_grid_kwh = float(row["imp_kwh_grid"] or imp)
+            # Use imp_kwh_grid for sub-meters (grid portion only). Distinguish a
+            # real 0 (device charged entirely from battery/solar this block — no
+            # grid) from NULL (not computed): `or imp` would treat 0 as missing and
+            # fall back to TOTAL consumption, over-stating the device (bites the
+            # battery hardest). Mirrors the remainder handling below (`is not None`).
+            _grid = row["imp_kwh_grid"]
+            sub_grid_kwh = float(_grid) if _grid is not None else imp
             sub_totals[mid]["imp_kwh"]  += sub_grid_kwh
             sub_totals[mid]["imp_cost"] += imp_cost
             sub_totals[mid]["exp_kwh"]  += exp

@@ -1,5 +1,19 @@
 # Changelog
  
+## [4.1.0] — 2026-08-05
+
+### Changed
+
+- **Dispatch history now retains the *actual* charge window, not just the plan (observe-only).** EMT recorded the precise `start`/`end` for **planned** Intelligent dispatches but discarded them for **completed** ones — so a `completed` dispatch that ran only part of a slot (a short top-up, or a charge that ended mid-slot) was stored with no window and looked identical to a full planned half-hour block. `dispatch_history` completed rows now carry the real to-the-minute window (`_completed_dispatch_slot_bounds`), giving genuine per-dispatch charge time. This is groundwork (the ledger is observe-only and not read for billing; the billing `dispatch_slots` row and its planned window are unchanged), and it's the prerequisite for the IOG 6-hour-cap work (BL-9) — the cap is reckoned on completed-dispatch time, which EMT can now measure.
+
+### Fixed
+
+- **Billing chart's per-device breakdown now shows each device's grid share, so it reconciles with the grid import total and with Usage Stats.** The "Breakdown by meter" rows displayed each sub-meter's **total consumption** (`imp_kwh`) — which includes energy the device drew from your **battery/solar**, not the grid — while the rest of the billing summary (and Usage Stats) uses the device's **grid-attributed** share (`imp_kwh_grid`). So a device that charged partly off-battery/solar was over-stated: the breakdown summed to **more** than "Import — total grid" (in one year, Direct + Zappi + Solax = 7212.0 kWh against a 7172.8 kWh grid total — a 39 kWh overshoot, exactly the self-consumed energy), and its kWh no longer matched its grid-based cost. Sub-meter rows now use the grid share, so Direct import + devices = grid import total exactly and the two views agree. **The Total Bill is unchanged** — it's computed from the main meter alone and never used these sub-meter figures.
+
+- **Usage Stats no longer over-counts a device that charged from solar/battery (grid share of exactly 0).** The per-device import used `imp_kwh_grid or imp` — Python truthiness, so a legitimate grid share of **0** (a block where the device charged entirely from solar/battery, drawing nothing from the grid) was treated as "missing" and fell back to **total** consumption. This inflated devices that self-consume — the **house battery** most of all (in one year, 81 solar-charged blocks added ~2.4 kWh). Fixed to distinguish a real 0 from NULL (`imp_kwh_grid if not None else imp`), in both `_aggregate_usage` and `api_blocks_summary`, so device import counts the grid share and now matches the Billing breakdown exactly. (The Insights page's separate total-consumption view is unchanged.)
+
+- **Usage Stats now refreshes on an export-only settlement too.** The change token's value fingerprint (added in 4.0.1) summed import kWh/cost and carbon but not **export** kWh. Since export settles later than import via DCC, a settlement batch that moved only `exp_kwh` left the token unchanged, so the Charts/Usage-Stats client kept a stale export figure until the 5-minute TTL (Billing, server-rendered, updated immediately — hence a transient export mismatch between the two views). The fingerprint now also sums `exp_kwh` (still a single index-only scan), so any export change refreshes the views promptly.
+
 ## [4.0.1] — 2026-08-05
 
 ### Fixed
