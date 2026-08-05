@@ -5722,5 +5722,46 @@ class TestGapEndInclusive(unittest.TestCase):
         self.assertEqual(server._gap_end_inclusive(self._Store(), "x", "not-a-date"), "not-a-date")
 
 
+class TestBlocksDataVersion(unittest.TestCase):
+    """The Charts / Usage-Stats change token must move on an IN-PLACE value edit
+    (attribution / reprice / carbon) that leaves row count + newest block_start
+    unchanged — otherwise the client keeps serving a stale cache."""
+
+    def _store(self):
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE blocks (block_start TEXT, imp_kwh REAL, imp_cost REAL, "
+            "exp_cost REAL, carbon_g REAL)")
+        conn.executemany(
+            "INSERT INTO blocks VALUES (?,?,?,?,?)",
+            [("2026-02-12T00:00:00", 0.0, 0.0, 0.0, 0.0),
+             ("2026-02-12T00:30:00", 1.0, 20.0, 0.0, 150.0)])
+        conn.commit()
+        return types.SimpleNamespace(_conn=conn)
+
+    def test_inplace_value_edit_moves_token(self):
+        import server
+        st = self._store()
+        before = server._blocks_data_version(st)
+        # Heal a zero-hole: overwrite a row's kWh in place — count and MAX(start)
+        # are untouched, so the OLD token (count:max only) would not have moved.
+        st._conn.execute(
+            "UPDATE blocks SET imp_kwh = 24.0 WHERE block_start = '2026-02-12T00:00:00'")
+        st._conn.commit()
+        after = server._blocks_data_version(st)
+        self.assertNotEqual(before, after)
+        # The count:max prefix is identical — proving it's the value fingerprint,
+        # not the row shape, that changed.
+        self.assertEqual(before.split(":")[:2], after.split(":")[:2])
+
+    def test_no_change_keeps_token_stable(self):
+        import server
+        st = self._store()
+        self.assertEqual(server._blocks_data_version(st),
+                         server._blocks_data_version(st))
+
+
 if __name__ == "__main__":
     unittest.main()
