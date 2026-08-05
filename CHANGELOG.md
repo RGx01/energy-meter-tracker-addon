@@ -1,5 +1,12 @@
 # Changelog
  
+## [4.0.1] — 2026-08-05
+
+### Fixed
+
+- **Device attribution now heals a sub-meter that flat-lined at zero.** If a device's own sensor recorded **zero for a stretch at the start of its live period** while the device was really drawing power (the load then sat unsplit in the house remainder), attribution used to stop dead at that zero: it treated the first live block — even a zero one — as the boundary where reconstruction must hand over to real data, so re-running Attribute rebuilt only up to the gap and never filled it. Attribution now recognises a **zero-valued live block as a hole, not coverage**: the join seam advances to the first block with **real** import, and the reconstruction fills the zero slots from the recorder (clipped to house import, house remainder re-derived, as always). Real (non-zero) device readings are still **never** overwritten, and a genuinely-zero slot with no recorder energy behind it is left untouched — so healing a dropout no longer needs a manual delete of the empty blocks first. Grid/billing totals are unaffected; only the device split changes.
+ 
+
 ## [4.0.0] — 2026-08-05
  
 ### Added

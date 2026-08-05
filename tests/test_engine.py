@@ -3615,6 +3615,46 @@ class TestWriteDeviceIntoBlock(unittest.TestCase):
         self.assertNotIn("carbon_intensity_g", dev)
         self.assertIsNone(dev.get("carbon_g"))
 
+    def test_overwrites_zero_hole_with_real_energy(self):
+        # A live device row that recorded ~0 import is a hole: when the recorder
+        # says the device really drew energy here, overwrite it (heal a sub-meter
+        # dropout) and tag it recorder_attributed.
+        written = []
+        engine.append_block_replace = lambda b: written.append(b)
+        block = {"meters": {
+            "electricity_main": {"channels": {"import": {"kwh": 4.0}}},
+            "ev_charger": {"source": None, "channels": {"import": {"kwh": 0.0}}}}}
+        self.assertTrue(engine._write_device_into_block(
+            block, "ev_charger", "electricity_main", 3.0))
+        dev = block["meters"]["ev_charger"]
+        self.assertEqual(dev["source"], "recorder_attributed")
+        self.assertAlmostEqual(dev["channels"]["import"]["kwh"], 3.0)
+        self.assertEqual(len(written), 1)
+
+    def test_does_not_overwrite_real_device_reading(self):
+        # A non-zero device row is real consumption → never clobber it.
+        engine.append_block_replace = lambda b: (_ for _ in ()).throw(
+            AssertionError("must not write over a real reading"))
+        block = {"meters": {
+            "electricity_main": {"channels": {"import": {"kwh": 4.0}}},
+            "ev_charger": {"source": None, "channels": {"import": {"kwh": 2.0}}}}}
+        self.assertFalse(engine._write_device_into_block(
+            block, "ev_charger", "electricity_main", 5.0))
+        self.assertAlmostEqual(
+            block["meters"]["ev_charger"]["channels"]["import"]["kwh"], 2.0)
+
+    def test_leaves_genuine_zero_when_no_recorder_energy(self):
+        # Zero device row AND zero recorder energy → nothing to heal; leave the
+        # genuine zero (and its live source) untouched rather than churning it.
+        engine.append_block_replace = lambda b: (_ for _ in ()).throw(
+            AssertionError("must not rewrite a genuine zero"))
+        block = {"meters": {
+            "electricity_main": {"channels": {"import": {"kwh": 4.0}}},
+            "ev_charger": {"source": None, "channels": {"import": {"kwh": 0.0}}}}}
+        self.assertFalse(engine._write_device_into_block(
+            block, "ev_charger", "electricity_main", 0.0))
+        self.assertIsNone(block["meters"]["ev_charger"]["source"])
+
 
 class TestAttributeHour(unittest.TestCase):
     """Split one hour across its half-hour blocks by house import shape, write where
