@@ -1,6 +1,6 @@
 # Changelog
  
-## [4.1.0] — not releaased
+## [4.1.0] — 2026-08-05
 
 ### Changed
 
