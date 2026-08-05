@@ -1,5 +1,11 @@
 # Changelog
  
+## [4.1.0] — 2026-08-05
+
+### Changed
+
+- **Dispatch history now retains the *actual* charge window, not just the plan (observe-only).** EMT recorded the precise `start`/`end` for **planned** Intelligent dispatches but discarded them for **completed** ones — so a `completed` dispatch that ran only part of a slot (a short top-up, or a charge that ended mid-slot) was stored with no window and looked identical to a full planned half-hour block. `dispatch_history` completed rows now carry the real to-the-minute window (`_completed_dispatch_slot_bounds`), giving genuine per-dispatch charge time. This is groundwork (the ledger is observe-only and not read for billing; the billing `dispatch_slots` row and its planned window are unchanged), and it's the prerequisite for the IOG 6-hour-cap work (BL-9) — the cap is reckoned on completed-dispatch time, which EMT can now measure.
+
 ## [4.0.1] — 2026-08-05
 
 ### Fixed

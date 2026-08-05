@@ -7926,10 +7926,12 @@ def _record_ohme_dispatch_history(provider, planned, completed) -> int:
             slot_start, "planned", provider=provider, source="ohme",
             energy_kwh=slot_energy.get(slot_start), raw_start=rb[0], raw_end=rb[1])
         n += 1
+    comp_bounds = _completed_dispatch_slot_bounds(completed)  # actual window
     for slot_start, e_comp in _completed_dispatch_slot_energy(completed).items():
+        rb = comp_bounds.get(slot_start) or (None, None)
         _store.record_dispatch_history(
             slot_start, "completed", provider=provider, source="unknown",
-            energy_kwh=e_comp)
+            energy_kwh=e_comp, raw_start=rb[0], raw_end=rb[1])
         n += 1
     return n
 
@@ -8043,10 +8045,13 @@ async def _capture_dispatch_slots() -> int:
                 slot_start, "planned", provider=provider,
                 source="smart-charge", energy_kwh=slot_energy.get(slot_start),
                 raw_start=_rb[0], raw_end=_rb[1])
+        _comp_bounds = _completed_dispatch_slot_bounds(completed)  # actual window
         for slot_start, e_comp in _completed_dispatch_slot_energy(completed).items():
+            _cb = _comp_bounds.get(slot_start) or (None, None)
             _store.record_dispatch_history(
                 slot_start, "completed", provider=provider,
-                source="unknown", energy_kwh=e_comp)
+                source="unknown", energy_kwh=e_comp,
+                raw_start=_cb[0], raw_end=_cb[1])
     except Exception as e:
         logger.warning("_capture_dispatch_slots: history accumulation failed: %s", e)
 
@@ -8323,6 +8328,44 @@ def _completed_dispatch_slot_energy(completed: list) -> dict:
                 out.setdefault(k, None)
             else:
                 out[k] = round((out.get(k) or 0.0) + per, 4)
+    return out
+
+
+def _completed_dispatch_slot_bounds(completed: list) -> dict:
+    """Map COMPLETED dispatches to the EXACT (second-precision) raw window each
+    slot belongs to — the completed twin of _planned_dispatch_slot_bounds.
+
+    `completed` is what Octopus ACTUALLY dispatched (start/end to the second); the
+    per-slot capture otherwise keeps only energy and the *planned* window, so a
+    charge that ran a fraction of a slot (e.g. a 3-min top-up, or the tail of a
+    dispatch that ended mid-slot) is indistinguishable from a full planned block.
+    Retaining the real completed bounds gives the actual dispatch/charge window.
+    No source filter (completed dispatches come back source='unknown', matching
+    _completed_dispatch_slot_energy). Every 30-min slot the dispatch covers carries
+    that dispatch's (start, end) as naive-UTC ISO, so a session's exact window is
+    min(raw_start) / max(raw_end) over its slots. OBSERVE-ONLY.
+    Returns {slot_start_iso: (raw_start_iso, raw_end_iso)}.
+    """
+    out: dict = {}
+    for d in completed or []:
+        start = d.get("start"); end = d.get("end")
+        if not start or not end:
+            continue
+        try:
+            s = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+            e = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if s.tzinfo is not None:
+            s = s.astimezone(timezone.utc).replace(tzinfo=None)
+        if e.tzinfo is not None:
+            e = e.astimezone(timezone.utc).replace(tzinfo=None)
+        raw = (s.isoformat(), e.isoformat())
+        slot = s.replace(minute=(0 if s.minute < 30 else 30),
+                         second=0, microsecond=0)
+        while slot < e:
+            out[slot.isoformat()] = raw   # last dispatch wins on the rare overlap
+            slot = slot + timedelta(minutes=30)
     return out
 
 
