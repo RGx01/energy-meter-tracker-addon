@@ -229,5 +229,45 @@ class TestStoreMiniImport(unittest.TestCase):
         self.assertEqual(res["status"], "missing_block")
 
 
+class _TeleClient:
+    """get_telemetry stub that can raise (optionally a specific exception)."""
+
+    def __init__(self, raise_=False, rows=None, exc=None):
+        self.raise_ = raise_
+        self.rows = rows or []
+        self.exc = exc or RuntimeError("telemetry down")
+
+    async def get_telemetry(self, device_id, start_iso, end_iso):
+        if self.raise_:
+            raise self.exc
+        return self.rows
+
+
+class TestMiniFetchDedupe(unittest.TestCase):
+    """A persistent telemetry failure (e.g. GraphQL 403) must not flood the log:
+    the reader flags the failure once and clears on recovery."""
+
+    _D0 = datetime(2026, 7, 1, 0, 0, 0)
+    _D1 = datetime(2026, 7, 1, 0, 2, 0)
+
+    def test_failure_sets_flag_then_recovers(self):
+        c = _TeleClient(raise_=True)
+        r = MiniBoundaryReader(c, "dev0")
+        self.assertEqual(run(r._fetch(self._D0, self._D1)), [])
+        self.assertTrue(r._fetch_failing)
+        self.assertEqual(run(r._fetch(self._D0, self._D1)), [])   # still failing
+        self.assertTrue(r._fetch_failing)
+        c.raise_ = False                                          # recover
+        self.assertEqual(run(r._fetch(self._D0, self._D1)), [])
+        self.assertFalse(r._fetch_failing)
+
+    def test_cooldown_error_flags_quietly(self):
+        from kraken_api_client import KrakenCooldownError
+        c = _TeleClient(raise_=True, exc=KrakenCooldownError("cooldown", status=403))
+        r = MiniBoundaryReader(c, "dev0")
+        self.assertEqual(run(r._fetch(self._D0, self._D1)), [])
+        self.assertTrue(r._fetch_failing)
+
+
 if __name__ == "__main__":
     unittest.main()

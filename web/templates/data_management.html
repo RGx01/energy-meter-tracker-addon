@@ -4,12 +4,13 @@
 <div class="topbar">
   <div>
     <h2>Data Management</h2>
-    <div class="sub">Backups, restore, imports and historical corrections</div>
+    <div class="sub">Bring data in · safety &amp; housekeeping</div>
   </div>
   <div style="display:flex;gap:8px;flex-wrap:wrap;">
     <button class="btn btn-secondary" id="btn-backup" onclick="doManualBackup()">💾 Backup Now</button>
-    <a href="{{ url_for('delete_blocks_page') }}" class="btn btn-secondary">🗑️ Delete Blocks</a>
-    <a href="{{ url_for('corrections_page') }}" class="btn btn-secondary">🔧 Corrections</a>
+    <a href="{{ url_for('fill_history_page') }}" class="btn btn-secondary">📥 Fill History &amp; Gaps</a>
+    <a href="{{ url_for('corrections_page') }}" class="btn btn-secondary">🔧 Cost Corrections</a>
+    <a href="{{ url_for('delete_blocks_page') }}" class="btn btn-secondary" style="color:var(--danger);">🗑️ Delete Blocks</a>
   </div>
 </div>
 {% endblock %}
@@ -92,6 +93,42 @@
   </div>
 </div>
 
+<style>
+  .dm-group-head { margin: 30px 0 12px; }
+  .dm-group-head.first { margin-top: 4px; }
+  .dm-group-head h3 { margin: 0 0 4px; font-size: 15px; font-weight: 600; color: var(--text); }
+  .dm-group-head p  { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.6; }
+  .dm-links { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+</style>
+
+<!-- Bring-data-in tools (Historical Import + Device History) now live on the
+     "Fill History & Gaps" landing page, linked from the topbar. -->
+
+<!-- ── Missing-data nudge (deep-links to the unified backfill flow) ─────────────
+     The full find/fill flow now lives on Historical Import (scope → source →
+     preview → apply). Here we only surface a nudge WHEN gaps exist; loadGapNudge()
+     reveals it. When history is continuous the card stays hidden. -->
+<div class="card" id="gap-nudge" style="display:none;">
+  <div class="card-title">🕳️ Missing Data</div>
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+    <span id="gap-nudge-text" style="font-size:13px;color:var(--muted);line-height:1.6;"></span>
+    <a href="{{ url_for('historical_import_page') }}" class="btn btn-primary" style="white-space:nowrap;">🩹 Fill gaps →</a>
+  </div>
+</div>
+
+<!-- Correct & review (settlement source + unsettled blocks) moved to the Cost
+     Corrections page — they belong with the other billing/cost tools and only
+     apply to a cad+api setup. -->
+
+<!-- ═══ Intent 3: Safety & housekeeping ═══════════════════════════════════════
+     Marked `first` because the earlier groups (Bring data in, Correct & review)
+     moved to their own pages — so this is now the first content and shouldn't carry
+     the large inter-group top margin (which read as a gap under the top bar). -->
+<div class="dm-group-head first">
+  <h3>🧰 Safety &amp; housekeeping</h3>
+  <p>Create and restore backups, delete data, and keep the database healthy.</p>
+</div>
+
 <!-- ── Backups ──────────────────────────────────────────────────────────────── -->
 <div class="card">
   <div class="card-title">💾 Backups</div>
@@ -104,67 +141,11 @@
   <div id="backup-list" style="font-size:13px;color:var(--muted);">Loading...</div>
 </div>
 
-<!-- ── Settlement Source (supplier-API only) ───────────────────────────────────
-     Hidden by default; loadBillingSource() reveals it only when a supplier API
-     is configured (valid key + verified account). Without one, DCC settlement
-     can never arrive, so the DCC/CAD toggle and the "awaiting DCC settlement"
-     count would be meaningless. -->
-<div class="card" id="settlement-source-card" style="display:none;">
-  <div class="card-title">⚖️ Billing Settlement Source</div>
-  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;line-height:1.7;">
-    Choose which figures drive your billing. <strong>DCC</strong> uses Octopus's
-    settled half-hourly data (what your bill is based on), falling back to local
-    CAD readings only where settlement hasn't arrived yet.
-    <strong>CAD</strong> uses your live meter readings throughout, ignoring DCC.
-    Changing this re-calculates your whole history and can take a few minutes.
-  </p>
-  <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
-    <label style="font-size:13px;font-weight:600;">Source:</label>
-    <select id="billing-source-select" style="padding:6px 10px;font-size:13px;">
-      <option value="dcc">DCC settlement (recommended)</option>
-      <option value="cad">CAD readings only</option>
-    </select>
-    <button class="btn btn-primary" id="btn-apply-source" onclick="applyBillingSource()">Apply</button>
-  </div>
-  <div id="billing-source-status" style="font-size:13px;color:var(--muted);">Loading…</div>
-</div>
+<!-- Delete Blocks now lives in the topbar. -->
 
-<!-- ── Unsettled blocks (DCC mode only) ─────────────────────────────────────── -->
-<div class="card" id="unsettled-card" style="display:none;">
-  <div class="card-title">🔍 Review Unsettled Blocks</div>
-  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;line-height:1.7;">
-    These half-hour blocks have no DCC settlement yet, so they're billed using
-    your local CAD readings as a fallback. Recent blocks normally settle within
-    a day or two; older ones may indicate a genuine gap.
-  </p>
-  <button class="btn btn-secondary" onclick="loadUnsettled()" id="btn-unsettled">🔍 Review unsettled blocks</button>
-  <button class="btn btn-primary" onclick="retrySettlement()" id="btn-retry-settle" style="display:none;margin-left:8px;">♻️ Retry settlement</button>
-  <div id="unsettled-list" style="font-size:13px;color:var(--muted);margin-top:14px;"></div>
-</div>
-
-<!-- ── Missing data (outage gaps) ──────────────────────────────────────────── -->
+<!-- ── Import DB (restore from a .db / backup zip) ──────────────────────────── -->
 <div class="card">
-  <div class="card-title">🕳️ Missing Data</div>
-  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;line-height:1.7;">
-    If the add-on was offline for longer than 12 hours, those half-hour blocks were
-    never recorded and the routine settlement poll will not go back for them. Your
-    supplier still holds the settled readings, so they can be recovered.
-    <br><br>
-    Recovered blocks use the authoritative half-hourly figures and are priced at the
-    rates in force at the time, but they carry <strong>no per-device breakdown</strong>
-    — EMT was not running, so no device readings exist for that period.
-    <br><br>
-    <strong>Blocks you deleted on purpose will also be restored.</strong> This is why
-    recovery is a manual action: EMT cannot tell a deliberate deletion from an outage.
-  </p>
-  <button class="btn btn-secondary" onclick="loadGaps()" id="btn-find-gaps">🔍 Find missing data</button>
-  <button class="btn btn-primary" onclick="resolveGaps()" id="btn-resolve-gaps" style="display:none;margin-left:8px;">🩹 Recover missing data</button>
-  <div id="gaps-list" style="font-size:13px;color:var(--muted);margin-top:14px;"></div>
-</div>
-
-<!-- ── Import ───────────────────────────────────────────────────────────────── -->
-<div class="card">
-  <div class="card-title">📥 Import Data Files</div>
+  <div class="card-title">📥 Import DB</div>
   <p style="color:var(--muted);font-size:13px;margin-bottom:20px;line-height:1.7;">
     Drag in a <strong>backup zip</strong> or <strong>blocks.db</strong> file to restore data.
     <strong style="color:var(--warning);">Warning:</strong> importing will overwrite existing data.
@@ -193,29 +174,6 @@
   <button class="btn btn-primary" onclick="doImport()" id="import-btn" disabled>
     📥 Import Selected Files
   </button>
-</div>
-
-<!-- ── File reference ───────────────────────────────────────────────────────── -->
-<div class="card">
-  <div class="card-title">ℹ️ File Reference</div>
-  <table style="width:100%;border-collapse:collapse;font-size:13px;">
-    <thead>
-      <tr style="border-bottom:1px solid var(--border);">
-        <th style="text-align:left;padding:8px 0;color:var(--muted);font-weight:500;">File</th>
-        <th style="text-align:left;padding:8px 0;color:var(--muted);font-weight:500;">Contains</th>
-        <th style="text-align:left;padding:8px 0;color:var(--muted);font-weight:500;">Restore risk</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr style="border-bottom:1px solid var(--border);">
-        <td style="padding:10px 0;font-family:var(--mono);color:var(--accent);">blocks.db</td>
-        <td style="padding:10px 0;color:var(--text);">Everything — blocks, config history, current block state. This is the only file you need to back up or restore.</td>
-        <td style="padding:10px 0;color:var(--success);font-size:12px;">Safe alone — self-contained</td>
-      </tr>
-      
-
-    </tbody>
-  </table>
 </div>
 
 
@@ -510,25 +468,37 @@ async function restoreFromFlat() {
 
 async function restoreFromZip(zipName) {
   _restoreZip   = zipName;
+  _restoreFlat  = false;
   _restoreFiles = {};
 
-  // Extract zip contents via server
+  // Open the dialog IMMEDIATELY with a loading state, so pressing Restore feels
+  // instant. We only need the file LIST from the zip (names + sizes) — cheap, no
+  // decompression — not the whole blocks.db base64-encoded as before (which stalled
+  // the dialog for seconds on a large DB). The restore itself re-extracts server-side.
+  const listEl = document.getElementById('restore-file-list');
+  listEl.textContent = 'Reading backup…';
+  listEl.style.color = 'var(--muted)';
+  document.getElementById('restore-mismatch-warn').style.display = 'none';
+  document.getElementById('restore-confirm-btn').disabled = true;
+  document.getElementById('restore-overlay').style.display = 'block';
+
   try {
-    const form = new FormData();
-    const r    = await fetch(apiUrl('/api/import/extract-zip-by-name'), {
+    const r    = await fetch(apiUrl('/api/backup/zip-entries'), {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ zip: zipName })
     });
     const data = await r.json();
     if (data.files) {
-      _restoreFiles = data.files;  // { filename: base64 }
+      _restoreFiles = data.files;  // { filename: {size_kb} }
     } else {
-      showError(data.error || 'Could not read backup');
+      listEl.style.color = 'var(--danger)';
+      listEl.textContent = data.error || 'Could not read backup';
       return;
     }
   } catch(e) {
-    showError('Failed to read backup: ' + e.message);
+    listEl.style.color = 'var(--danger)';
+    listEl.textContent = 'Failed to read backup: ' + e.message;
     return;
   }
 
@@ -541,9 +511,11 @@ async function restoreFromZip(zipName) {
     'cumulative_totals.json': { risk: 'muted',   note: 'No longer used — will be ignored (totals derived from blocks)' },
   };
 
-  const listEl = document.getElementById('restore-file-list');
+  listEl.style.color = '';
   listEl.innerHTML = Object.keys(_restoreFiles).map(function(name) {
     const info = riskMap[name] || { risk: 'muted', note: '' };
+    const sz   = (_restoreFiles[name] && _restoreFiles[name].size_kb != null)
+      ? (' · ' + _restoreFiles[name].size_kb + ' KB') : '';
     return `<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;
                            background:var(--bg);border-radius:var(--radius);
                            border:1px solid var(--border);margin-bottom:6px;cursor:pointer;">
@@ -552,7 +524,7 @@ async function restoreFromZip(zipName) {
              style="margin-top:2px;width:15px;height:15px;accent-color:var(--accent);"
              onchange="checkRestoreMismatch()">
       <div>
-        <div style="font-family:var(--mono);font-size:13px;">${name}</div>
+        <div style="font-family:var(--mono);font-size:13px;">${name}${sz}</div>
         <div style="font-size:11px;color:var(--${info.risk});margin-top:2px;">${info.note}</div>
       </div>
     </label>`;
@@ -595,10 +567,8 @@ async function confirmRestore() {
     });
     const data = await r.json();
     if (data.ok) {
-      const el = document.getElementById('alert-success');
-      el.textContent = '✓ Restored: ' + checked.join(', ') + '. Reloading…';
-      setTimeout(function() { sessionStorage.setItem('emt_db_restored', Date.now()); window.location.reload(); }, 2500);
-      el.classList.add('show');
+      _restoreWasRunning = true;   // a restore we started → reload when it finishes
+      pollRestoreStatus();
     } else {
       showError(data.error || 'Restore failed');
     }
@@ -607,23 +577,67 @@ async function confirmRestore() {
   }
 }
 
+// The restore runs in the background (survives navigation). Poll its status and
+// reflect it in the banner; reload once it completes so the UI shows fresh data.
+var _restoreWasRunning = false;
+var _restoreTimer = null;
+function pollRestoreStatus() {
+  fetch(apiUrl('/api/backup/restore/status')).then(function(r){ return r.json(); }).then(function(d) {
+    var el = document.getElementById('alert-success');
+    if (d.status === 'running') {
+      _restoreWasRunning = true;
+      // Safe to navigate away in the browser — but the DB is being rewritten, so
+      // rebuilding or restarting the ADD-ON now can interrupt the write. Say so.
+      var _stepTxt = String(d.step || '').replace(/[<>&]/g, function(c){
+        return c === '<' ? '&lt;' : c === '>' ? '&gt;' : '&amp;'; });
+      el.innerHTML = '⏳ <strong>Restoring…</strong> ' + _stepTxt +
+        ' — safe to leave this page. <strong>Do not rebuild or restart the ' +
+        'add-on until this finishes</strong> (it would interrupt the restore).';
+      el.classList.add('show');
+      if (_restoreTimer) clearTimeout(_restoreTimer);
+      _restoreTimer = setTimeout(pollRestoreStatus, 1500);
+    } else if (d.status === 'done' && _restoreWasRunning) {
+      el.textContent = '✓ Restored: ' + ((d.restored || []).join(', ') || 'complete') + '. Reloading…';
+      el.classList.add('show');
+      setTimeout(function() { sessionStorage.setItem('emt_db_restored', Date.now()); window.location.reload(); }, 1800);
+    } else if (d.status === 'error' && _restoreWasRunning) {
+      el.classList.remove('show');
+      showError(d.error || 'Restore failed');
+    }
+    // idle / stale-done from a prior session → do nothing (no reload loop)
+  }).catch(function() {
+    if (_restoreTimer) clearTimeout(_restoreTimer);
+    _restoreTimer = setTimeout(pollRestoreStatus, 3000);
+  });
+}
+// On load: if a restore is already running (e.g. you navigated away and back),
+// pick it up and reflect progress.
+document.addEventListener('DOMContentLoaded', pollRestoreStatus);
+
 // ── Backup ────────────────────────────────────────────────────────────────────
 async function doManualBackup() {
   var btn = document.getElementById('btn-backup') || document.getElementById('btn-backup2');
+  var el  = document.getElementById('alert-success');
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Backing up...'; }
+  // In-flight banner, same style as restore/delete — so the user sees it working,
+  // not just the result. (Backup is a quick synchronous copy, so no polling needed.)
+  if (el) { el.innerHTML = '⏳ <strong>Creating backup…</strong> copying the database — this only takes a moment.'; el.classList.add('show'); }
   try {
     var r    = await fetch(apiUrl('/api/backup'), { method: 'POST' });
     var data = await r.json();
     if (data.ok) {
-      const el = document.getElementById('alert-success');
-      el.textContent = '✓ Backup created: ' + data.path;
-      el.classList.add('show');
-      setTimeout(function() { el.classList.remove('show'); }, 6000);
+      if (el) {
+        el.textContent = '✓ Backup ready: ' + data.path + (data.size ? ' (' + EMT.fmtBytes(data.size) + ')' : '');
+        el.classList.add('show');
+        setTimeout(function() { el.classList.remove('show'); }, 8000);
+      }
       loadBackupList();
     } else {
+      if (el) el.classList.remove('show');
       showError(data.error || 'Backup failed');
     }
   } catch(e) {
+    if (el) el.classList.remove('show');
     showError(e.message);
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '💾 Backup Now'; }
@@ -694,7 +708,14 @@ async function loadBackupList() {
       html += '<div style="color:var(--muted);font-size:13px;">No zip backups yet.</div>';
     } else {
       var rows = zips.map(function(z) {
-        return '<div style="display:flex;align-items:center;justify-content:space-between;font-family:var(--mono);font-size:12px;padding:6px 0;border-bottom:1px solid var(--border);"><span>' + z + '</span><button class="btn btn-secondary btn-sm" onclick="restoreFromZip(\'' + z + '\')">↩ Restore</button></div>';
+        var zq = z.replace(/'/g, "\\'");
+        return '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;font-family:var(--mono);font-size:12px;padding:6px 0;border-bottom:1px solid var(--border);">'
+          + '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + z + '</span>'
+          + '<span style="display:flex;gap:6px;flex:none;">'
+          + '<button class="btn btn-secondary btn-sm" onclick="downloadBackup(\'' + zq + '\')">⬇ Download</button>'
+          + '<button class="btn btn-secondary btn-sm" onclick="restoreFromZip(\'' + zq + '\')">↩ Restore</button>'
+          + '<button class="btn btn-secondary btn-sm" style="color:var(--danger);" onclick="deleteBackup(\'' + zq + '\')">🗑 Delete</button>'
+          + '</span></div>';
       }).join('');
       var needsScroll = zips.length > 5;
       html += '<div style="' + (needsScroll ? 'max-height:196px;overflow-y:auto;' : '') + '">' + rows + '</div>' +
@@ -705,6 +726,38 @@ async function loadBackupList() {
   } catch(e) {
     var el = document.getElementById('backup-list');
     if (el) el.innerHTML = '<div style="color:var(--danger);font-size:13px;">Failed to load backups: ' + e.message + '</div>';
+  }
+}
+
+// Download a backup zip — the browser handles the file; a brief banner confirms it.
+function downloadBackup(z) {
+  var el = document.getElementById('alert-success');
+  if (el) { el.textContent = '⬇ Downloading ' + z + '…'; el.classList.add('show'); setTimeout(function() { el.classList.remove('show'); }, 5000); }
+  window.location.href = apiUrl('/api/backup/download/' + encodeURIComponent(z));
+}
+
+// Delete a backup zip — same in-flight banner pattern as restore/create, with a
+// confirm first (it removes the file permanently).
+async function deleteBackup(z) {
+  if (!window.confirm('Delete backup "' + z + '"?\n\nThis permanently removes the file and cannot be undone.')) return;
+  var el = document.getElementById('alert-success');
+  if (el) { el.innerHTML = '⏳ <strong>Deleting backup…</strong> ' + z; el.classList.add('show'); }
+  try {
+    var r    = await fetch(apiUrl('/api/backup/delete'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ zip: z })
+    });
+    var data = await r.json();
+    if (data.ok) {
+      if (el) { el.textContent = '✓ Backup deleted: ' + z; el.classList.add('show'); setTimeout(function() { el.classList.remove('show'); }, 6000); }
+      loadBackupList();
+    } else {
+      if (el) el.classList.remove('show');
+      showError(data.error || 'Delete failed');
+    }
+  } catch(e) {
+    if (el) el.classList.remove('show');
+    showError(e.message);
   }
 }
 
@@ -725,7 +778,6 @@ function showError(msg) {
 
 document.addEventListener('DOMContentLoaded', function() {
   loadBackupList();
-  loadBillingSource();
   // Corrections and Delete Blocks moved to sub-pages
   // Update backup path display
   fetch(apiUrl('/api/backup/info'))
@@ -768,241 +820,26 @@ document.addEventListener('keydown', function(e) {
 });
 
 // ── Billing settlement source ────────────────────────────────────────────────
-function loadBillingSource() {
-  fetch(apiUrl('/api/billing-source'))
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      if (d.error) return;
-      var sel = document.getElementById('billing-source-select');
-      if (sel) sel.value = d.source;
-      var st = document.getElementById('billing-source-status');
-      if (st) {
-        st.textContent = 'Currently using ' + (d.source === 'dcc'
-          ? 'DCC settlement' : 'CAD readings') + '. '
-          + (d.unsettled || 0) + ' block(s) awaiting DCC settlement.';
-      }
-      // The settlement-source control only makes sense with a supplier API
-      // configured (valid key + verified account). Without one, DCC settlement
-      // can never arrive — hide the whole card rather than offer a meaningless
-      // DCC/CAD toggle and a misleading "awaiting DCC settlement" count.
-      window._apiAvailable = !!d.api_available;
-      var sc = document.getElementById('settlement-source-card');
-      if (sc) sc.style.display = d.api_available ? '' : 'none';
-      // Show the unsettled-review card only in DCC mode AND with an API present.
-      var uc = document.getElementById('unsettled-card');
-      if (uc) uc.style.display = (d.source === 'dcc' && d.api_available) ? '' : 'none';
-      var rb = document.getElementById('btn-retry-settle');
-      if (rb) rb.style.display = (d.source === 'dcc' && d.api_available) ? '' : 'none';
-    })
-    .catch(function() {});
-}
-
-function applyBillingSource() {
-  var sel = document.getElementById('billing-source-select');
-  if (!sel) return;
-  var source = sel.value;
-  var label = (source === 'dcc' ? 'DCC settlement' : 'CAD readings');
-  showConfirm({
-    title: 'Change billing source',
-    message: 'Switch billing to <strong>' + label + '</strong>?<br><br>'
-      + 'This re-calculates your entire history and can take a few minutes '
-      + 'to complete in the background.',
-    okLabel: 'Switch to ' + (source === 'dcc' ? 'DCC' : 'CAD'),
-    onConfirm: function() { _doApplyBillingSource(source); }
-  });
-}
-
-function _doApplyBillingSource(source) {
-  var btn = document.getElementById('btn-apply-source');
-  hideAlerts();
-  btn.disabled = true;
-  btn.textContent = 'Applying…';
-  fetch(apiUrl('/api/billing-source'), {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({source: source})
-  })
-    .then(function(r) { return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
-    .then(function(res) {
-      btn.disabled = false;
-      btn.textContent = 'Apply';
-      if (!res.ok || res.j.error) {
-        showError(res.j.error || 'Failed to change billing source');
-        return;
-      }
-      if (res.j.changed) {
-        document.getElementById('alert-success').textContent =
-          '✓ Billing source set to ' + res.j.source.toUpperCase() + '. '
-          + res.j.flagged + ' blocks queued for recalculation — '
-          + 'totals will update over the next few minutes.';
-        show('alert-success');
-      } else {
-        document.getElementById('alert-success').textContent =
-          '✓ Already using ' + res.j.source.toUpperCase() + ' — no change.';
-        show('alert-success');
-      }
-      loadBillingSource();
-    })
-    .catch(function(e) {
-      btn.disabled = false;
-      btn.textContent = 'Apply';
-      showError('Failed to change billing source: ' + e);
-    });
-}
-
-function loadUnsettled() {
-  var el = document.getElementById('unsettled-list');
-  var btn = document.getElementById('btn-unsettled');
-  btn.disabled = true;
-  el.textContent = 'Loading…';
-  fetch(apiUrl('/api/unsettled-blocks?limit=500'))
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      btn.disabled = false;
-      if (d.error) { el.textContent = 'Error: ' + d.error; return; }
-      if (!d.count) { el.innerHTML = '<span style="color:var(--ok,green);">✓ All blocks are DCC-settled.</span>'; return; }
-      var shown = d.blocks.length;
-      var html = '<div style="margin-bottom:8px;font-weight:600;">'
-        + d.count + ' unsettled block(s)'
-        + (shown < d.count ? ' (showing newest ' + shown + ')' : '') + ':</div>';
-      html += '<div style="max-height:320px;overflow:auto;font-family:var(--mono);font-size:12px;">';
-      d.blocks.forEach(function(b) {
-        html += '<div>' + b.block_start
-          + ' &nbsp; import ' + (b.imp_kwh == null ? '–' : Number(b.imp_kwh).toFixed(3))
-          + ' kWh &nbsp; export ' + (b.exp_kwh == null ? '–' : Number(b.exp_kwh).toFixed(3))
-          + ' kWh' + (b.is_provisional ? ' &nbsp;⏳' : '') + '</div>';
-      });
-      html += '</div>';
-      el.innerHTML = html;
-    })
-    .catch(function(e) { btn.disabled = false; el.textContent = 'Error: ' + e; });
-}
-
-function loadGaps() {
-  var btn  = document.getElementById('btn-find-gaps');
-  var list = document.getElementById('gaps-list');
-  var act  = document.getElementById('btn-resolve-gaps');
-  btn.disabled = true;
-  list.innerHTML = 'Searching\u2026';
+// Missing-data nudge: reveal the gap-nudge card only when gaps actually exist,
+// deep-linking to the unified backfill flow on Historical Import (the full
+// find/preview/fill flow lives there now: scope → source → preview → apply).
+function loadGapNudge() {
+  var card = document.getElementById('gap-nudge');
+  if (!card) return;
   fetch(apiUrl('/api/history-gaps'))
     .then(function (r) { return r.json(); })
     .then(function (d) {
-      btn.disabled = false;
-      if (!d.ok) { list.textContent = 'Error: ' + (d.error || 'unknown'); return; }
-      if (!d.gaps.length) {
-        list.innerHTML = '\u2713 No missing data found.';
-        act.style.display = 'none';
-        return;
-      }
-      var html = '<strong>' + d.total_slots + ' missing block(s)</strong> across '
-               + d.gaps.length + ' period(s):<ul style="margin:8px 0 0 18px;">';
-      d.gaps.slice(0, 20).forEach(function (g) {
-        var hrs = (g.slots / 2).toFixed(1);
-        html += '<li>' + g.start.replace('T', ' ') + ' \u2192 '
-             + g.end.replace('T', ' ') + ' (' + hrs + ' h)</li>';
-      });
-      if (d.gaps.length > 20) html += '<li>\u2026 and ' + (d.gaps.length - 20) + ' more</li>';
-      html += '</ul>';
-      // Finding gaps is a local database question and always works. RECOVERING
-      // them needs the supplier API — the missing readings can only come from
-      // the supplier. Say so, rather than hiding the button and leaving the user
-      // told they have a problem with no path forward.
-      if (d.api_available) {
-        act.style.display = '';
-      } else {
-        act.style.display = 'none';
-        html += '<p style="margin-top:10px;">\u2139\ufe0f Recovering this data needs a supplier '
-             + 'API connection \u2014 the missing readings can only come from your supplier. '
-             + 'Configure one in the Setup Wizard to enable recovery.</p>';
-      }
-      list.innerHTML = html;
+      if (!d.ok || !d.gaps || !d.gaps.length) return;      // continuous history -> stay hidden
+      var hrs = (d.total_slots / 2).toFixed(1);
+      document.getElementById('gap-nudge-text').innerHTML =
+        '<strong>' + d.gaps.length + '</strong> gap' + (d.gaps.length > 1 ? 's' : '')
+        + ' · <strong>' + hrs + ' h</strong> of missing half-hourly data'
+        + (d.api_available ? '' : ' — no supplier API, fill from a CSV') + '.';
+      card.style.display = '';
     })
-    .catch(function (e) { btn.disabled = false; list.textContent = 'Error: ' + e; });
+    .catch(function () {});
 }
-
-function resolveGaps() {
-  if (!window._apiAvailable) return;
-  showConfirm({
-    title: 'Recover missing data',
-    message: 'Fetch the settled readings for every missing block from your supplier '
-      + 'and rebuild them?<br><br>Recovered blocks carry <strong>no per-device '
-      + 'breakdown</strong>, and any blocks you deleted on purpose <strong>will be '
-      + 'restored</strong>. This may take a moment.',
-    okLabel: '\ud83e\ude79 Recover',
-    onConfirm: _doResolveGaps
-  });
-}
-
-function _doResolveGaps() {
-  var btn = document.getElementById('btn-resolve-gaps');
-  var list = document.getElementById('gaps-list');
-  hideAlerts();
-  btn.disabled = true;
-  var orig = btn.textContent;
-  btn.textContent = 'Recovering\u2026';
-  fetch(apiUrl('/api/resolve-gaps'), { method: 'POST' })
-    .then(function (r) { return r.json(); })
-    .then(function (d) {
-      btn.disabled = false; btn.textContent = orig;
-      if (!d.ok) {
-        list.innerHTML = 'Error: ' + (d.error || d.reason || 'unknown');
-        return;
-      }
-      list.innerHTML = '\u2713 Recovered <strong>' + d.backfilled + '</strong> block(s) across '
-                     + d.gaps + ' period(s). Charts have been regenerated.';
-      btn.style.display = 'none';
-    })
-    .catch(function (e) {
-      btn.disabled = false; btn.textContent = orig;
-      list.textContent = 'Error: ' + e;
-    });
-}
-
-function retrySettlement() {
-  if (!window._apiAvailable) return;
-  showConfirm({
-    title: 'Retry settlement',
-    message: 'Re-fetch settlement data from your supplier for all unsettled '
-      + 'blocks (oldest to now)?<br><br>This settles any gaps your supplier '
-      + 'has since filled. It may take a moment.',
-    okLabel: '♻️ Retry',
-    onConfirm: _doRetrySettlement
-  });
-}
-
-function _doRetrySettlement() {
-  var btn = document.getElementById('btn-retry-settle');
-  hideAlerts();
-  btn.disabled = true;
-  var orig = btn.textContent;
-  btn.textContent = 'Retrying…';
-  fetch(apiUrl('/api/retry-settlement'), {method: 'POST'})
-    .then(function(r) { return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
-    .then(function(res) {
-      btn.disabled = false;
-      btn.textContent = orig;
-      if (!res.ok || res.j.error) {
-        showError(res.j.error || 'Retry failed');
-        return;
-      }
-      var settled = (res.j.unsettled_before || 0) - (res.j.unsettled_after || 0);
-      document.getElementById('alert-success').textContent =
-        settled > 0
-          ? '✓ Settled ' + settled + ' previously-unsettled block(s). '
-            + (res.j.unsettled_after || 0) + ' still awaiting supplier data.'
-          : '✓ No new settlement available yet — '
-            + (res.j.unsettled_after || 0) + ' block(s) still unsettled.';
-      show('alert-success');
-      loadBillingSource();
-      loadUnsettled();
-    })
-    .catch(function(e) {
-      btn.disabled = false;
-      btn.textContent = orig;
-      showError('Retry failed: ' + e);
-    });
-}
-
+document.addEventListener('DOMContentLoaded', loadGapNudge);
 
 // ── Historical Corrections ─────────────────────────────────────────────────
 

@@ -875,6 +875,24 @@ class TestOldestBlockStart(_StoreBase):
         self.assertEqual(self.store.get_oldest_block_start(),
                          "2026-05-01T00:00:00")
 
+    def test_exclude_imported(self):
+        # A live block (source NULL) plus an OLDER reconstructed/imported block.
+        # exclude_imported must return the live one — so a partial import can't
+        # lower the historical-import ceiling below its own gap.
+        for bs, src in (("2026-05-10T00:00:00", None),
+                        ("2024-07-01T00:00:00", "imported_api")):
+            end = (datetime.fromisoformat(bs) + timedelta(minutes=30)).isoformat()
+            self.store._conn.execute(
+                """INSERT INTO blocks (block_start, block_end, meter_id,
+                     config_period_id, source) VALUES (?,?,?,?,?)""",
+                (bs, end, "electricity_main", self.pid, src))
+        self.store._conn.commit()
+        self.assertEqual(self.store.get_oldest_block_start(),
+                         "2024-07-01T00:00:00")
+        self.assertEqual(
+            self.store.get_oldest_block_start(exclude_imported=True),
+            "2026-05-10T00:00:00")
+
 
 class TestExportReRun(unittest.TestCase):
     """Engine re-run applies exp_kwh_api to the export channel."""

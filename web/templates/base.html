@@ -461,6 +461,23 @@
     // Ingress-aware base path — all fetch() calls should use this prefix
     var BASE_PATH = "{{ request.environ.get('SCRIPT_NAME', '') }}";
     function apiUrl(path) { return BASE_PATH + path; }
+    // Per-instance localStorage namespace (defined here in <head> so it exists
+    // before any page script runs). Multiple EMT instances in one browser share
+    // an origin, so a plain view-state key like 'emt_bar_state' collides across
+    // them — switching browser tabs made each instance adopt the last one's chart
+    // + scroll position. Suffixing view-state keys with a STABLE per-instance id
+    // keeps each instance's view its own. Browser-wide prefs (theme) stay global.
+    window.EMT = window.EMT || {};
+    EMT.instanceKey = ({{ instance_label|tojson }} || 'default')
+      .replace(/[^A-Za-z0-9_-]/g, '_') || 'default';
+    EMT.lsKey = function (name) { return name + '::' + EMT.instanceKey; };
+    // Human-readable byte size (shared: backup-ready confirmations, file lists).
+    EMT.fmtBytes = function (b) {
+      if (b == null) return '';
+      if (b >= 1048576) return (b / 1048576).toFixed(2) + ' MB';
+      if (b >= 1024)    return (b / 1024).toFixed(1) + ' KB';
+      return b + ' B';
+    };
   </script>
 </head>
 <body>

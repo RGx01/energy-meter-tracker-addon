@@ -105,6 +105,43 @@ class RateSchedule:
                 rates.append(rate)
         return min(rates) if rates else None
 
+    def day_rate_bounds(self, ts: str):
+        """(min_rate, max_rate) over the calendar day of ts — i.e. (off-peak,
+        peak) for a banded tariff, or (r, r) for a flat one. (None, None) if the
+        day isn't covered. Used to give imported blocks a CLEAN tariff rate keyed
+        by their OFF_PEAK/STANDARD label instead of a jittery cost÷kWh."""
+        if not self._periods:
+            return (None, None)
+        day = str(ts)[:10]
+        day_start, day_end = day + "T00:00:00", day + "T23:59:59"
+        rates = []
+        for vfrom, vto, rate in self._periods:
+            if vfrom > day_end:
+                break
+            if vto is None or vto > day_start:
+                rates.append(rate)
+        return (min(rates), max(rates)) if rates else (None, None)
+
+    def flat_rate(self, tol: float = 1e-6):
+        """The single rate if this schedule is FLAT — every period carries the
+        same value (a fixed-price tariff, e.g. a flat OUTGOING export). None if
+        the schedule is empty OR carries more than one distinct rate (a banded
+        tariff like IOG, or a rate that changed mid-agreement).
+
+        Used to keep a flat tariff's schedule authoritative even at a tariff-
+        TRANSITION seam: a new agreement's published unit rates can begin AFTER
+        its valid_from, leaving the early days uncovered, so resolve() /
+        day_rate_bounds() read None for them and pricing would drop to a jittery
+        cost÷kWh that fragments the one flat rate. A flat schedule has the same
+        rate everywhere, so those uncovered days take it too. Returning None for
+        any non-flat schedule keeps banded (IOG) pricing on its exact per-slot
+        path — this can never stamp a wrong band."""
+        if not self._periods:
+            return None
+        rates = [r for (_vf, _vt, r) in self._periods]
+        lo, hi = min(rates), max(rates)
+        return lo if (hi - lo) <= tol else None
+
     @classmethod
     def from_api_records(cls, records: list[dict]) -> "RateSchedule":
         """Build from raw standard-unit-rates results, choosing one payment
@@ -172,11 +209,12 @@ async def build_rate_schedule(
             product_code, tariff_code,
             period_from=period_from, period_to=period_to)
     except Exception as e:
+        _msg = str(e) or type(e).__name__   # timeouts can stringify empty
         logger.warning("build_rate_schedule: fetch failed for %s/%s: %s",
-                       product_code, tariff_code, e)
+                       product_code, tariff_code, _msg)
         if raise_on_error:
             raise RateFetchError(
-                f"unit-rate fetch failed for {product_code}/{tariff_code}: {e}"
+                f"unit-rate fetch failed for {product_code}/{tariff_code}: {_msg}"
             ) from e
         return RateSchedule([])
     if not records:
@@ -257,7 +295,7 @@ async def build_standing_charge_schedule(
             period_from=period_from, period_to=period_to)
     except Exception as e:
         logger.warning("build_standing_charge_schedule: fetch failed for %s/%s: %s",
-                       product_code, tariff_code, e)
+                       product_code, tariff_code, str(e) or type(e).__name__)
         return RateSchedule([])
     sched = RateSchedule.from_api_records(records)
     logger.info("build_standing_charge_schedule: %s/%s → %d periods",

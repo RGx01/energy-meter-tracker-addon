@@ -98,6 +98,8 @@ bs_mod.BlockStore       = BlockStore
 bs_mod.open_block_store = lambda path: _make_test_store()
 bs_mod.local_date_to_utc_bounds        = _ldtub
 bs_mod.local_date_range_to_utc_bounds  = _ldrtub
+bs_mod.outward_code          = _bs_real.outward_code
+bs_mod.derive_region_periods = _bs_real.derive_region_periods
 sys.modules["block_store"] = bs_mod
 
 # Stub engine (pause/resume only) — plus the pure power converter that the
@@ -110,6 +112,14 @@ eng = types.ModuleType("engine")
 eng.pause_engine  = lambda: None
 eng.resume_engine = lambda: None
 eng.engine_startup = MagicMock()
+eng.set_delete_active = lambda _a: None   # delete/purge workers toggle the carbon-backfill guard
+eng.delete_in_progress = lambda: False
+eng.attribution_running = lambda: False
+eng.api_attribution_status = lambda: {"status": "idle"}
+eng.attribution_control = lambda a: {"status": "idle", "control": a}
+eng.backout_recorder_attribution = lambda **kw: {"ok": True, "deleted": 0, "parents": [], "recomputed": 0}
+eng.backout_running = lambda: False
+eng.api_backout_status = lambda: {"status": "idle"}
 
 def _load_power_converter_into(mod):
     import re as _re
@@ -235,6 +245,12 @@ class TestRouteRegistration(unittest.TestCase):
 
     def test_api_blocks_summary_registered(self):
         self.assertTrue(self._registered("api_blocks_summary"))
+
+    def test_api_charts_data_version_registered(self):
+        self.assertTrue(self._registered("api_charts_data_version"))
+
+    def test_api_backup_zip_entries_registered(self):
+        self.assertTrue(self._registered("api_backup_zip_entries"))
 
     def test_api_billing_source_get_registered(self):
         self.assertTrue(self._registered("api_billing_source_get"))
@@ -1220,6 +1236,341 @@ class TestCorrectionsApiGate(unittest.TestCase):
             self.assertEqual(d["skipped_unreconciled"], 1)
         finally:
             server._corrections_api_gate_active = orig
+
+
+class TestApiConfigHistoryPostcode(unittest.TestCase):
+    """Postcode edit on a config period writes to the MAIN meter (outward code
+    only, provenance 'user') and is exposed by the history endpoint."""
+
+    def _store(self):
+        store = BlockStore(":memory:")
+        cfg = {"meters": {"electricity_main": {"meta": {
+            "billing_day": 3, "block_minutes": 30, "timezone": "Europe/London",
+            "currency_symbol": "£", "currency_code": "GBP", "site": "Highgrove",
+        }}}}
+        store.insert_config_period(cfg, effective_from="2026-02-11T00:00:00")
+        return store
+
+    def test_edit_stores_outward_code_and_user_source(self):
+        store = self._store()
+        client = make_client(store=store)
+        pid = store._conn.execute(
+            "SELECT id FROM config_periods WHERE effective_to IS NULL").fetchone()["id"]
+        with patch("server.load_config", return_value={"meters": {}}), \
+             patch("server._rebuild_config_period_chain", return_value=None):
+            r = client.put(f"/api/config/history/{pid}",
+                           json={"postcode": "DE65 6GG"})   # full postcode slips in
+        self.assertEqual(r.status_code, 200)
+        # Only the outward code is stored, tagged as a user value
+        self.assertEqual(store.get_postcode_prefix_at("2026-03-01"), ("DE65", "user"))
+
+    def test_history_endpoint_exposes_postcode(self):
+        store = self._store()
+        store.set_period_postcode(store.get_current_config_period_id(), "DE65", "user")
+        client = make_client(store=store)
+        with patch("server.load_config", return_value={"meters": {}}):
+            r = client.get("/api/config/history")
+        d = json.loads(r.data)
+        self.assertEqual(d["periods"][0]["postcode_prefix"], "DE65")
+
+
+class TestApiCsvTemplates(unittest.TestCase):
+    """Gap + blank CSV template downloads."""
+
+    def test_gap_template_downloads_csv(self):
+        client = make_client()
+        r = client.get("/api/historical/gap-template"
+                       "?from=2024-07-01T00:00:00&to=2024-07-01T01:00:00&channel=import")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("text/csv", r.headers.get("Content-Type", ""))
+        self.assertIn("attachment", r.headers.get("Content-Disposition", ""))
+        body = r.data.decode()
+        self.assertIn("Consumption (kWh)", body)
+        # header + two 30-min slots in the 1-hour gap
+        self.assertEqual(len(body.strip().splitlines()), 3)
+
+    def test_gap_template_requires_params(self):
+        client = make_client()
+        r = client.get("/api/historical/gap-template")
+        self.assertEqual(r.status_code, 400)
+
+    def test_gap_template_inclusive_includes_last_slot(self):
+        # A persisted gap's `to` is the last slot's start; inclusive=1 must cover it.
+        client = make_client()
+        r = client.get("/api/historical/gap-template"
+                       "?from=2024-07-01T00:00:00&to=2024-07-01T00:30:00&inclusive=1")
+        # header + the 00:00 slot + the 00:30 slot = 3 lines
+        self.assertEqual(len(r.data.decode().strip().splitlines()), 3)
+
+    def test_blank_template_downloads_csv(self):
+        client = make_client()
+        r = client.get("/api/historical/csv-template")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("text/csv", r.headers.get("Content-Type", ""))
+        self.assertIn("Start", r.data.decode())
+
+    def test_slots_template_downloads_named_rows(self):
+        # Escape-hatch template: one row per requested slot, channel in the filename.
+        client = make_client()
+        r = client.post("/api/historical/slots-template",
+                        json={"starts": ["2025-03-05T00:00:00", "2025-03-05T00:30:00"],
+                              "channel": "export"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("text/csv", r.headers.get("Content-Type", ""))
+        self.assertIn("slots-export", r.headers.get("Content-Disposition", ""))
+        self.assertEqual(len(r.data.decode().strip().splitlines()), 3)   # header + 2
+
+    def test_slots_template_requires_slots(self):
+        client = make_client()
+        r = client.post("/api/historical/slots-template", json={"starts": []})
+        self.assertEqual(r.status_code, 400)
+
+    def test_csv_apply_stashes_region_prompt(self):
+        client = make_client()
+        csv = ("Consumption (kWh),Estimated Cost Inc. Tax (p),Start,End\n"
+               "0.5,7.0,2024-07-01T00:00:00+01:00,2024-07-01T00:30:00+01:00\n"
+               "0.4,5.6,2024-07-01T00:30:00+01:00,2024-07-01T01:00:00+01:00\n")
+        with patch("server._create_backup_zip", return_value="/tmp/b.zip"):
+            r = client.post("/api/historical/csv/apply",
+                            json={"import_csv": csv, "confirmed": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(json.loads(r.data).get("region_reconcile"))
+        pend = json.loads(client.get("/api/region/reconcile").data)
+        self.assertTrue(pend["pending"])
+        self.assertEqual(pend["plan"]["source"], "csv")
+        self.assertTrue(pend["plan"]["sites"][0]["region_editable"])
+
+
+class _InlineThread:
+    """threading.Thread stand-in that runs the target synchronously on .start(),
+    so a backgrounded delete/purge completes deterministically within the test."""
+    def __init__(self, target=None, args=(), kwargs=None, **kw):
+        self._target, self._args, self._kwargs = target, args, kwargs or {}
+    def start(self):
+        if self._target:
+            self._target(*self._args, **self._kwargs)
+
+
+class TestApiHistoricalPurge(unittest.TestCase):
+    def setUp(self):
+        server._delete_job = {"status": "idle"}
+
+    def _store(self):
+        store = BlockStore(":memory:")
+        with store._conn:
+            cp = store._conn.execute(
+                "INSERT INTO config_periods (effective_from, billing_day, block_minutes, "
+                "timezone, currency_symbol, currency_code) "
+                "VALUES ('2024-01-01T00:00:00',1,30,'UTC','£','GBP')").lastrowid
+            store._conn.execute(
+                "INSERT INTO meters (config_period_id, meter_id, is_sub_meter) "
+                "VALUES (?, 'electricity_main', 0)", (cp,))
+            store._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, imp_kwh, source) "
+                "VALUES ('2024-03-01T00:00:00','2024-03-01T00:30:00','electricity_main',?,1.0,'imported_api')", (cp,))
+        return store
+
+    def test_purge_requires_confirm(self):
+        client = make_client(store=self._store())
+        r = client.post("/api/historical/purge", json={})
+        self.assertEqual(r.status_code, 400)
+
+    def test_purge_runs_in_background_and_reports_done(self):
+        store = self._store()
+        client = make_client(store=store)
+        self.assertEqual(json.loads(client.get("/api/historical/purge-preview").data)["blocks"], 1)
+        with patch("server.threading.Thread", _InlineThread), \
+             patch("server._create_backup_zip", return_value="/tmp/b.zip"), \
+             patch("server._regen_charts_safely", return_value=None):
+            r = client.post("/api/historical/purge", json={"confirmed": True})
+        # Launch returns immediately with 'running'; the worker (inlined) finished.
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(json.loads(r.data)["status"], "running")
+        st = json.loads(client.get("/api/blocks/delete/status").data)
+        self.assertEqual(st["status"], "done")
+        self.assertEqual(st["kind"], "purge")
+        self.assertEqual(st["result"]["blocks"], 1)
+        # Data actually purged.
+        self.assertEqual(json.loads(client.get("/api/historical/purge-preview").data)["blocks"], 0)
+
+    def test_delete_range_runs_in_background(self):
+        store = self._store()
+        client = make_client(store=store)
+        with patch("server.threading.Thread", _InlineThread), \
+             patch("server._regen_charts_safely", return_value=None):
+            r = client.post("/api/blocks/delete", json={
+                "from_date": "2024-03-01", "to_date": "2024-03-01", "confirmed": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(json.loads(r.data)["status"], "running")
+        st = json.loads(client.get("/api/blocks/delete/status").data)
+        self.assertEqual(st["status"], "done")
+        self.assertEqual(st["kind"], "delete")
+        self.assertEqual(st["result"]["deleted"], 1)
+
+    def test_delete_409_when_already_running(self):
+        client = make_client(store=self._store())
+        server._delete_job = {"status": "running", "kind": "delete", "step": "deleting blocks"}
+        r = client.post("/api/blocks/delete", json={
+            "from_date": "2024-03-01", "to_date": "2024-03-01", "confirmed": True})
+        self.assertEqual(r.status_code, 409)
+        rp = client.post("/api/historical/purge", json={"confirmed": True})
+        self.assertEqual(rp.status_code, 409)
+
+
+class TestApiBackup(unittest.TestCase):
+    """Manual backup returns the filename AND its byte size, so the UI can confirm
+    'Backup ready: <name> (<size>)' (the create-backup feedback BL item)."""
+
+    def test_backup_returns_path_and_size(self):
+        import tempfile
+        client = make_client()
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tf:
+            tf.write(b"x" * 2048)
+            p = tf.name
+        try:
+            with patch("server._create_backup_zip", return_value=p):
+                r = client.post("/api/backup")
+            self.assertEqual(r.status_code, 200)
+            d = json.loads(r.data)
+            self.assertTrue(d["ok"])
+            self.assertEqual(d["path"], os.path.basename(p))
+            self.assertEqual(d["size"], 2048)
+        finally:
+            os.remove(p)
+
+
+class TestApiRegionReconcile(unittest.TestCase):
+    """Post-import region reconciliation endpoints: read the stashed plan, apply
+    it (split + stamp), and clear the pending marker."""
+
+    def _store(self):
+        store = BlockStore(":memory:")
+        with store._conn:
+            cur = store._conn.execute(
+                "INSERT INTO config_periods (effective_from, effective_to, billing_day, "
+                "block_minutes, timezone, currency_symbol, currency_code, site_name) "
+                "VALUES ('2020-01-01T00:00:00', NULL, 1, 30, 'UTC', '£', 'GBP', 'Home')")
+            pid = cur.lastrowid
+            store._conn.execute(
+                "INSERT INTO meters (config_period_id, meter_id, is_sub_meter, postcode_prefix, postcode_source) "
+                "VALUES (?, 'electricity_main', 0, 'M1', 'octopus')", (pid,))
+            for bs in ["2023-03-01T00:00:00", "2023-09-01T00:00:00"]:
+                store._conn.execute(
+                    "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, imp_kwh) "
+                    "VALUES (?, ?, 'electricity_main', ?, 1.0)", (bs, bs, pid))
+        return store
+
+    def test_get_pending_false_when_none(self):
+        client = make_client(store=self._store())
+        r = client.get("/api/region/reconcile")
+        self.assertEqual(json.loads(r.data), {"pending": False})
+
+    def test_get_returns_stashed_plan(self):
+        store = self._store()
+        store.set_meta("region_reconcile_pending", {
+            "needs_confirmation": True,
+            "sites": [{"outcode": "EH8"}], "split_dates": ["2023-06-01"]})
+        client = make_client(store=store)
+        d = json.loads(client.get("/api/region/reconcile").data)
+        self.assertTrue(d["pending"])
+        self.assertEqual(d["plan"]["sites"][0]["outcode"], "EH8")
+
+    def test_apply_splits_stamps_and_clears(self):
+        store = self._store()
+        store.set_meta("region_reconcile_pending", {"needs_confirmation": True, "sites": []})
+        client = make_client(store=store)
+        with patch("server._rebuild_config_period_chain", return_value=None):
+            r = client.post("/api/region/reconcile/apply", json={"sites": [
+                {"outcode": "EH8", "from": "2020-01-01", "to": "2023-06-01", "site_name": "Old"},
+                {"outcode": "M1",  "from": "2023-06-01", "to": None,         "site_name": "New"},
+            ]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(store.get_postcode_prefix_at("2023-03-15"), ("EH8", "octopus"))
+        self.assertEqual(store.get_postcode_prefix_at("2023-09-15"), ("M1", "octopus"))
+        # pending marker cleared
+        d = json.loads(client.get("/api/region/reconcile").data)
+        self.assertFalse(d["pending"])
+
+
+class TestApiPreImportSitePlan(unittest.TestCase):
+    """Pre-import site-confirmation endpoints: discover the account's property
+    history (read-only) and apply confirmed sites by creating covering config
+    periods BEFORE the import runs."""
+
+    def _preimport_store(self, postcode=None, source=None):
+        store = BlockStore(":memory:")
+        with store._conn:
+            cur = store._conn.execute(
+                "INSERT INTO config_periods (effective_from, effective_to, billing_day, "
+                "block_minutes, timezone, currency_symbol, currency_code, site_name) "
+                "VALUES ('2026-06-03T00:00:00', NULL, 1, 30, 'UTC', '£', 'GBP', 'Home')")
+            pid = cur.lastrowid
+            store._conn.execute(
+                "INSERT INTO meters (config_period_id, meter_id, is_sub_meter, "
+                "postcode_prefix, postcode_source) "
+                "VALUES (?, 'electricity_main', 0, ?, ?)", (pid, postcode, source))
+        return store
+
+    def test_discover_no_api_returns_400(self):
+        import engine
+        engine.kraken_available = lambda: False
+        try:
+            r = make_client().get("/api/historical/site-plan")
+            self.assertEqual(r.status_code, 400)
+            self.assertFalse(r.get_json()["ok"])
+        finally:
+            del engine.kraken_available
+
+    def test_discover_returns_plan(self):
+        import engine
+        saved_run = server._run_on_engine_loop
+        engine.kraken_available = lambda: True
+        engine.discover_pre_import_sites = lambda: None   # coro not created
+        server._run_on_engine_loop = lambda coro, timeout=None: {
+            "ok": True, "needs_confirmation": True,
+            "sites": [
+                {"outcode": "EH8", "from": "2018-01-01", "to": "2023-06-01",
+                 "is_current": False, "site_name": None, "needs_name": True},
+                {"outcode": "M1", "from": "2023-06-01", "to": None,
+                 "is_current": True, "site_name": "Home", "needs_name": False}]}
+        try:
+            r = make_client().get("/api/historical/site-plan")
+            self.assertEqual(r.status_code, 200)
+            body = r.get_json()
+            self.assertTrue(body["needs_confirmation"])
+            self.assertEqual(len(body["sites"]), 2)
+        finally:
+            server._run_on_engine_loop = saved_run
+            del engine.kraken_available
+            del engine.discover_pre_import_sites
+
+    def test_apply_creates_past_period_and_sets_marker(self):
+        store = self._preimport_store()
+        client = make_client(store=store)
+        with patch("server._create_backup_zip", return_value="/tmp/b.zip"), \
+             patch("server._rebuild_config_period_chain", return_value=None):
+            r = client.post("/api/historical/site-plan/apply", json={"sites": [
+                {"outcode": "EH8", "from": "2018-01-01", "to": "2023-06-01", "site_name": "Old Flat"},
+                {"outcode": "M1",  "from": "2023-06-01", "to": None},
+            ]})
+        self.assertEqual(r.status_code, 200)
+        d = r.get_json()
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["created"], 1)
+        # regions resolve per period, active never renamed
+        self.assertEqual(store.get_postcode_prefix_at("2019-01-01"), ("EH8", "octopus"))
+        self.assertEqual(store.get_postcode_prefix_at("2024-01-01"), ("M1", "octopus"))
+        active = store._conn.execute(
+            "SELECT site_name FROM config_periods WHERE effective_to IS NULL").fetchone()
+        self.assertEqual(active["site_name"], "Home")
+        # marker set so the post-import probe stands down
+        self.assertTrue(store.get_meta("preimport_sites_applied", None))
+
+    def test_apply_no_sites_400(self):
+        client = make_client(store=self._preimport_store())
+        r = client.post("/api/historical/site-plan/apply", json={"sites": []})
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse(r.get_json()["ok"])
 
 
 class TestApiConfigHistoryDelete(unittest.TestCase):
@@ -2429,6 +2780,32 @@ class TestNewRoutesRegistered270(unittest.TestCase):
 # 2.7.0 — api_meter_delete_data
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TestDeleteWindowToUtcTimes(unittest.TestCase):
+    """Regression: a whole-day delete (00:00–23:59) must NOT be converted to a UTC
+    time-of-day filter. Under BST that turned 23:59 local into 22:59 UTC →
+    TIME(block_start) <= '22:59', leaving the 23:00/23:30 UTC (local-midnight)
+    blocks — 2 per day — undeleted every time."""
+
+    def test_whole_day_passes_through_unchanged(self):
+        # Even on a BST date, the full-day window must stay 00:00–23:59 (no filter).
+        self.assertEqual(
+            server._delete_window_to_utc_times("00:00", "23:59",
+                                               "Europe/London", "2026-06-04", "2026-06-04"),
+            ("00:00", "23:59"))
+
+    def test_whole_day_passes_through_in_utc_too(self):
+        self.assertEqual(
+            server._delete_window_to_utc_times("00:00", "23:59",
+                                               "UTC", "2026-01-01", "2026-01-01"),
+            ("00:00", "23:59"))
+
+    def test_partial_window_is_converted(self):
+        # An explicit partial window IS converted to UTC (BST −1h), so it differs.
+        f, t = server._delete_window_to_utc_times(
+            "01:00", "03:00", "Europe/London", "2026-06-04", "2026-06-04")
+        self.assertEqual((f, t), ("00:00", "02:00"))
+
+
 class TestApiMeterDeleteData(unittest.TestCase):
     """Tests for the atomic cascade delete endpoint."""
 
@@ -2721,6 +3098,54 @@ class TestApiInsightsDataBounds(unittest.TestCase):
         d = json.loads(r.data)
         self.assertIsNone(d["earliest"])
         self.assertIsNone(d["latest"])
+
+
+class TestApiInsightsDataBoundsCarbonVsUsage(unittest.TestCase):
+    """Carbon-gated bounds must not shrink the Usage-tab range.
+
+    Imported history (kWh/cost, no carbon) predates carbon recording, so the
+    endpoint returns a carbon range (earliest/latest) AND a full energy range
+    (usage_earliest/usage_latest). The Usage tab gates its comparison buttons on
+    the latter, so "vs last year" into a backfilled month isn't wrongly disabled.
+    """
+
+    def _store_with_split_history(self):
+        import tempfile
+        from block_store import BlockStore
+        store = BlockStore(tempfile.mktemp(suffix=".db"))
+        with store._conn:
+            store._conn.execute(
+                "INSERT INTO config_periods (billing_day, block_minutes, timezone, "
+                "currency_symbol, currency_code, effective_from) "
+                "VALUES (1, 30, 'Europe/London', '£', 'GBP', '2024-01-01')"
+            )
+            cp = store._conn.execute("SELECT id FROM config_periods LIMIT 1").fetchone()[0]
+            # Old imported block: has kWh, NO carbon
+            store._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                "imp_kwh, exp_kwh, carbon_g) VALUES "
+                "('2024-07-01T00:00:00', '2024-07-01T00:30:00', 'electricity_main', ?, 5.0, 0.0, NULL)",
+                (cp,))
+            # Recent block: has carbon
+            store._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                "imp_kwh, exp_kwh, carbon_g) VALUES "
+                "('2026-04-01T00:00:00', '2026-04-01T00:30:00', 'electricity_main', ?, 3.0, 0.0, 400.0)",
+                (cp,))
+        return store
+
+    def test_carbon_range_excludes_precarbon_but_usage_range_includes_it(self):
+        store = self._store_with_split_history()
+        with patch.object(server, "_get_store", return_value=store), \
+             patch.object(server, "load_config", return_value=MINIMAL_CONFIG):
+            r = server.app.test_client().get("/api/insights/data-bounds")
+        d = json.loads(r.data)
+        # Carbon range starts only where carbon exists
+        self.assertEqual(d["earliest"], "2026-04-01")
+        self.assertEqual(d["latest"],   "2026-04-01")
+        # Usage range reaches back to the imported (carbon-less) history
+        self.assertEqual(d["usage_earliest"], "2024-07-01")
+        self.assertEqual(d["usage_latest"],   "2026-04-01")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3945,9 +4370,10 @@ class TestChargeSessionsBuilder(unittest.TestCase):
 class TestUpcomingDispatches(unittest.TestCase):
     """BL-10 — _build_upcoming_dispatches surfaces future planned dispatches."""
 
-    def _h(self, slot, kind, e=None, raw_start=None, raw_end=None):
+    def _h(self, slot, kind, e=None, raw_start=None, raw_end=None, last_seen=None):
         return {"slot_start": slot, "kind": kind, "energy_kwh": e,
-                "provider": "Ohme", "raw_start": raw_start, "raw_end": raw_end}
+                "provider": "Ohme", "raw_start": raw_start, "raw_end": raw_end,
+                "last_seen": last_seen}
 
     NOW = "2026-07-18T20:00:00"
 
@@ -3987,6 +4413,37 @@ class TestUpcomingDispatches(unittest.TestCase):
              self._h("2026-07-19T05:00:00", "planned", -3.4)], {}, {}, self.NOW)
         self.assertEqual(len(s), 2)
 
+    def test_superseded_plan_slots_dropped(self):
+        # A revised plan: the 02:00 slot is the current plan (re-seen 2 min ago);
+        # the 23:30 slot was dropped from the plan and last seen a full poll+ ago,
+        # so it must NOT keep counting toward the upcoming total.
+        hist = [self._h("2026-07-18T23:30:00", "planned", -3.4,
+                        last_seen="2026-07-18T19:30:00"),   # stale — superseded
+                self._h("2026-07-19T02:00:00", "planned", -3.4,
+                        last_seen="2026-07-18T19:58:00")]   # fresh — current plan
+        s = server._build_upcoming_dispatches(hist, {}, {}, self.NOW)
+        self.assertEqual(len(s), 1)
+        self.assertEqual(s[0]["start"], "2026-07-19T02:00:00")
+        self.assertAlmostEqual(s[0]["kwh"], 3.4, places=3)
+
+    def test_stale_plan_shows_nothing(self):
+        # No plan re-confirmed recently (freshest planned observation > 20 min old)
+        # → the forecast is stale, so nothing is upcoming.
+        hist = [self._h("2026-07-18T23:30:00", "planned", -3.4,
+                        last_seen="2026-07-18T19:30:00")]   # 30 min before NOW
+        self.assertEqual(
+            server._build_upcoming_dispatches(hist, {}, {}, self.NOW), [])
+
+    def test_current_plan_all_fresh_kept(self):
+        # Both slots re-seen in the same recent poll → both current, both kept.
+        hist = [self._h("2026-07-18T23:30:00", "planned", -3.4,
+                        last_seen="2026-07-18T19:58:00"),
+                self._h("2026-07-19T00:00:00", "planned", -3.4,
+                        last_seen="2026-07-18T19:58:00")]
+        s = server._build_upcoming_dispatches(hist, {}, {}, self.NOW)
+        self.assertEqual(len(s), 1)
+        self.assertAlmostEqual(s[0]["kwh"], 6.8, places=3)
+
 
 class TestChargeSessionsAPI(unittest.TestCase):
     """BL-10 — /api/charge-sessions gating + shape."""
@@ -4009,7 +4466,7 @@ class TestChargeSessionsAPI(unittest.TestCase):
         s0 = base.replace(hour=2).isoformat()
         s1 = base.replace(hour=2, minute=30).isoformat()
         pk = base.replace(hour=18).isoformat()
-        # Energy comes from the metered block imp_kwh (3.0 each); rates too.
+        # Energy comes from the dispatch figure (3.0 each); blocks supply rates.
         for slot, e in ((s0, -3.0), (s1, -3.0)):
             store.record_dispatch_history(slot, "completed", provider="Myenergi", energy_kwh=e)
             store._conn.execute(
@@ -4066,3 +4523,1204 @@ class TestResponseCompression(unittest.TestCase):
         r = make_client().post("/api/last-page", json={"page": "charts"},
                                headers={"Accept-Encoding": "gzip"})
         self.assertIsNone(r.headers.get("Content-Encoding"))
+
+
+class TestHistoricalProbeEndpoint(unittest.TestCase):
+    """Read-only recorder-statistics probe endpoint (historical-import spike)."""
+
+    def test_registered(self):
+        self.assertIn("api_historical_probe", server.app.view_functions)
+
+    def test_no_sensors_returns_400(self):
+        # Validation happens before touching the engine loop.
+        r = make_client().post("/api/historical/probe", json={"entity_ids": []})
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse(r.get_json()["ok"])
+
+
+class TestExportProbeEndpoint(unittest.TestCase):
+    """Read-only export-retention probe endpoint (historical-import spike)."""
+
+    def test_registered(self):
+        self.assertIn("api_export_probe", server.app.view_functions)
+
+    def test_no_api_returns_400(self):
+        # The stub engine (types.ModuleType) has no kraken_available; set it.
+        import engine
+        engine.kraken_available = lambda: False
+        try:
+            r = make_client().post("/api/historical/export-probe", json={})
+            self.assertEqual(r.status_code, 400)
+            self.assertFalse(r.get_json()["ok"])
+        finally:
+            del engine.kraken_available
+
+    def test_returns_probe_result(self):
+        import engine
+        saved_run = server._run_on_engine_loop
+        engine.kraken_available = lambda: True
+        engine.probe_consumption_retention = lambda: None   # coro not created
+        server._run_on_engine_loop = lambda coro, timeout=None: {
+            "ok": True,
+            "channels": {
+                "import": {"channel": "import", "available": True,
+                           "earliest": "2024-06-12T13:00:00+00:00"},
+                "export": {"channel": "export", "available": True,
+                           "earliest": "2024-06-29T03:00:00+00:00"},
+            },
+            "lag_days": 16,
+        }
+        try:
+            r = make_client().post("/api/historical/export-probe", json={})
+            self.assertEqual(r.status_code, 200)
+            body = r.get_json()
+            self.assertTrue(body["ok"])
+            self.assertEqual(body["lag_days"], 16)
+        finally:
+            server._run_on_engine_loop = saved_run
+            del engine.kraken_available
+            del engine.probe_consumption_retention
+
+    def test_diagnostic_registered(self):
+        self.assertIn("api_consumption_diagnostic", server.app.view_functions)
+
+    def test_diagnostic_no_api_returns_400(self):
+        import engine
+        engine.kraken_available = lambda: False
+        try:
+            r = make_client().post("/api/historical/consumption-diagnostic", json={})
+            self.assertEqual(r.status_code, 400)
+            self.assertFalse(r.get_json()["ok"])
+        finally:
+            del engine.kraken_available
+
+    def test_diagnostic_returns_meter_points(self):
+        import engine
+        saved_run = server._run_on_engine_loop
+        engine.kraken_available = lambda: True
+        engine.diagnose_consumption_retention = lambda: None
+        server._run_on_engine_loop = lambda coro, timeout=None: {
+            "ok": True,
+            "meter_points": [{"mpan_tail": "…000001", "is_export": False,
+                              "meter_count": 2, "meters": [
+                {"serial_tail": "…AAA", "available": True,
+                 "earliest": "2024-07-01T00:00:00+00:00"},
+                {"serial_tail": "…BBB", "available": True,
+                 "earliest": "2024-07-20T00:00:00+00:00"}]}],
+        }
+        try:
+            r = make_client().post("/api/historical/consumption-diagnostic", json={})
+            self.assertEqual(r.status_code, 200)
+            body = r.get_json()
+            self.assertTrue(body["ok"])
+            self.assertEqual(body["meter_points"][0]["meter_count"], 2)
+        finally:
+            server._run_on_engine_loop = saved_run
+            del engine.kraken_available
+            del engine.diagnose_consumption_retention
+
+
+class TestHistoricalCsvEndpoints(unittest.TestCase):
+    """CSV import wizard endpoints (3.5.0). Preview is pure (csv_import); apply is
+    guarded here (its write path is covered by test_csv_import_apply)."""
+
+    _CSV = ("Consumption (kwh),Estimated Cost Inc. Tax (p),"
+            "Standing Charge Inc. Tax (p),Start,End\n"
+            "1.0,7.0,1.12,2024-07-01T00:00:00+00:00,2024-07-01T00:30:00+00:00\n"
+            "1.0,7.0,1.12,2024-07-01T00:30:00+00:00,2024-07-01T01:00:00+00:00\n")
+
+    def test_registered(self):
+        self.assertIn("api_historical_csv_preview", server.app.view_functions)
+        self.assertIn("api_historical_csv_apply", server.app.view_functions)
+        self.assertIn("historical_import_page", server.app.view_functions)
+
+    def test_preview_derives_rates(self):
+        r = make_client().post("/api/historical/csv/preview",
+                               json={"import_csv": self._CSV})
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["channels"]["import"]["block_count"], 2)
+        self.assertTrue(body["channels"]["import"]["periods"])
+
+    def test_preview_no_csv_400(self):
+        r = make_client().post("/api/historical/csv/preview", json={})
+        self.assertEqual(r.status_code, 400)
+
+    def test_apply_requires_confirmation(self):
+        r = make_client().post("/api/historical/csv/apply",
+                               json={"import_csv": self._CSV})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("confirm", r.get_json()["error"].lower())
+
+    def test_apply_no_csv_400(self):
+        r = make_client().post("/api/historical/csv/apply",
+                               json={"confirmed": True})
+        self.assertEqual(r.status_code, 400)
+
+    def test_api_plan_registered_and_gated(self):
+        self.assertIn("api_historical_api_plan", server.app.view_functions)
+        import engine
+        engine.kraken_available = lambda: False
+        try:
+            r = make_client().post("/api/historical/api-import/plan", json={})
+            self.assertEqual(r.status_code, 400)
+        finally:
+            del engine.kraken_available
+
+    def test_api_apply_registered_and_requires_confirmation(self):
+        self.assertIn("api_historical_api_apply", server.app.view_functions)
+        import engine
+        engine.kraken_available = lambda: True
+        try:
+            r = make_client().post("/api/historical/api-import/apply", json={})
+            self.assertEqual(r.status_code, 400)                  # no confirmed, not dry_run
+            self.assertIn("confirm", r.get_json()["error"].lower())
+        finally:
+            del engine.kraken_available
+
+    def test_bg_job_endpoints_registered(self):
+        for name in ("api_historical_api_start", "api_historical_api_control",
+                     "api_historical_api_status"):
+            self.assertIn(name, server.app.view_functions)
+
+    def test_bg_start_requires_confirmation(self):
+        import engine
+        engine.kraken_available = lambda: True
+        engine.api_import_running = lambda: False
+        try:
+            r = make_client().post("/api/historical/api-import/start", json={})
+            self.assertEqual(r.status_code, 400)
+            self.assertIn("confirm", r.get_json()["error"].lower())
+        finally:
+            del engine.kraken_available
+            del engine.api_import_running
+
+    def test_restore_rejects_bad_zip(self):
+        # Path-traversal guard fires before any DB teardown (registration sanity).
+        r = make_client().post("/api/backup/restore", json={"zip": "../etc/passwd"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_restore_status_registered(self):
+        self.assertIn("api_backup_restore_status", server.app.view_functions)
+
+    def test_restore_missing_zip_404(self):
+        # Validated in the launcher, before any background thread is spawned.
+        r = make_client().post("/api/backup/restore",
+                               json={"zip": "definitely_not_a_real_backup.zip"})
+        self.assertEqual(r.status_code, 404)
+
+    def test_restore_rejects_when_already_running(self):
+        server._restore_job = {"status": "running"}
+        try:
+            r = make_client().post("/api/backup/restore", json={"from_flat": True})
+            self.assertEqual(r.status_code, 409)
+        finally:
+            server._restore_job = {"status": "idle"}
+
+    def test_restore_status_returns_job(self):
+        server._restore_job = {"status": "done", "restored": ["blocks.db"]}
+        try:
+            r = make_client().get("/api/backup/restore/status")
+            self.assertEqual(r.get_json()["status"], "done")
+        finally:
+            server._restore_job = {"status": "idle"}
+
+    def test_bg_status_and_control_delegate(self):
+        import engine
+        engine.api_import_status = lambda: {"status": "idle"}
+        engine.api_import_control = lambda a: {"ok": True, "action": a}
+        try:
+            r = make_client().get("/api/historical/api-import/status")
+            self.assertEqual(r.get_json()["status"], "idle")
+            r = make_client().post("/api/historical/api-import/control",
+                                   json={"action": "pause"})
+            self.assertTrue(r.get_json()["ok"])
+            self.assertEqual(r.get_json()["action"], "pause")
+        finally:
+            del engine.api_import_status
+            del engine.api_import_control
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Restore durability + API-credentials-missing surfacing
+#   Regression: a restore→rebuild left an empty DB and a "connected" UI that was
+#   actually credential-less. Atomic writes + a credentials_missing flag fix it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MISSING = object()
+
+
+class TestProbeDevicesEndpoint(unittest.TestCase):
+    """The recorder probe pre-populates from configured meters: each device with the
+    sensor entities assigned to it (energy reads + power/device sensors)."""
+
+    def test_lists_meters_with_assigned_sensors(self):
+        cfg = {"meters": {
+            "electricity_main": {"meta": {"device": "Whole house", "sub_meter": False,
+                                          "power_sensor": "sensor.house_power"},
+                                 "channels": {"import": {"read": "sensor.grid_import"},
+                                              "export": {"read": "sensor.grid_export"}}},
+            "ev_charger": {"meta": {"device": "EV charger", "sub_meter": True,
+                                    "device_power_sensor": "sensor.zappi_power"},
+                           "channels": {"import": {"read": "sensor.zappi_energy"}}},
+            "old_bat": {"meta": {"device": "Old battery", "sub_meter": True,
+                                 "retired_at": "2020-01-01"}, "channels": {}},
+        }}
+        orig = server.load_config
+        server.load_config = lambda: cfg
+        try:
+            r = server.app.test_client().get("/api/historical/probe-devices")
+        finally:
+            server.load_config = orig
+        self.assertEqual(r.status_code, 200)
+        d = r.get_json()
+        self.assertTrue(d["ok"])
+        by = {x["meter_id"]: x for x in d["devices"]}
+        self.assertNotIn("old_bat", by)                     # retired skipped
+        self.assertNotIn("electricity_main", by)            # main meter omitted (control total)
+        self.assertIn("ev_charger", by)
+        self.assertTrue(by["ev_charger"]["is_sub_meter"])
+        self.assertIn("sensor.zappi_energy", by["ev_charger"]["sensors"])
+        self.assertIn("sensor.zappi_power", by["ev_charger"]["sensors"])
+
+    def test_history_sensors_prepopulated_while_layer_exists(self):
+        # Sensor ledger: a device that still has a reconstructed layer surfaces the
+        # sensors from its last run; a device with no layer surfaces none.
+        cfg = {"meters": {
+            "ev_charger": {"meta": {"device": "EV", "sub_meter": True},
+                           "channels": {"import": {"read": "sensor.zappi_energy"}}},
+            "house_battery": {"meta": {"device": "Battery", "sub_meter": True},
+                              "channels": {"import": {"read": "sensor.bat_energy"}}},
+        }}
+        store = MagicMock()
+        store.get_attribution_runs.return_value = [
+            {"meter_id": "ev_charger", "sensor_ids": ["sensor.zappi_v1", "sensor.zappi_v2"]}]
+        store.count_recorder_attributed.return_value = {
+            "total": 10, "meters": [{"meter_id": "ev_charger"}]}     # only EV has a layer
+        cli = make_client(store=store)
+        orig = server.load_config
+        server.load_config = lambda: cfg
+        try:
+            d = cli.get("/api/historical/probe-devices").get_json()
+        finally:
+            server.load_config = orig
+        by = {x["meter_id"]: x for x in d["devices"]}
+        self.assertEqual(by["ev_charger"]["history_sensors"],
+                         ["sensor.zappi_v1", "sensor.zappi_v2"])   # kept from the run
+        self.assertEqual(by["house_battery"]["history_sensors"], [])  # no layer → none
+
+
+class TestAttributionEndpoints(unittest.TestCase):
+    """Recorder device-attribution launch/status/control/runs/back-out endpoints."""
+
+    def tearDown(self):
+        import engine
+        engine.attribution_running = lambda: False
+
+    def test_start_requires_meter_and_sensors(self):
+        r = make_client().post("/api/historical/attribute/start",
+                               json={"meter_id": "ev", "sensor_ids": []})
+        self.assertEqual(r.status_code, 400)
+
+    def test_start_rejects_main_meter(self):
+        # Attribution is for sub-meter devices only — the house total isn't a device.
+        orig = server.load_config
+        server.load_config = lambda: {"meters": {"electricity_main": {"meta": {"sub_meter": False}}}}
+        try:
+            r = make_client().post("/api/historical/attribute/start",
+                                   json={"meter_id": "electricity_main", "sensor_ids": ["sensor.house"]})
+            self.assertEqual(r.status_code, 400)
+        finally:
+            server.load_config = orig
+
+    def test_start_409_when_a_run_is_active(self):
+        import engine
+        orig = server.load_config
+        server.load_config = lambda: {"meters": {"ev": {"meta": {"sub_meter": True}}}}
+        engine.attribution_running = lambda: True
+        try:
+            r = make_client().post("/api/historical/attribute/start",
+                                   json={"meter_id": "ev", "sensor_ids": ["sensor.ev"]})
+            self.assertEqual(r.status_code, 409)
+        finally:
+            server.load_config = orig
+
+    def test_status_and_control(self):
+        cli = make_client()
+        self.assertEqual(cli.get("/api/historical/attribute/status").get_json()["status"], "idle")
+        self.assertEqual(cli.post("/api/historical/attribute/control",
+                                  json={"action": "bad"}).status_code, 400)
+        self.assertTrue(cli.post("/api/historical/attribute/control",
+                                 json={"action": "pause"}).get_json()["ok"])
+
+    def test_runs_returns_ledger_and_summary(self):
+        store = MagicMock()
+        store.get_attribution_runs.return_value = [{"run_id": "r1", "meter_id": "ev", "blocks_written": 10}]
+        store.count_recorder_attributed.return_value = {"total": 10, "meters": []}
+        d = make_client(store=store).get("/api/historical/attribute/runs").get_json()
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["runs"][0]["run_id"], "r1")
+        self.assertEqual(d["summary"]["total"], 10)
+
+    def test_backout_calls_engine_and_refuses_while_running(self):
+        import engine
+        seen = {}
+        engine.backout_recorder_attribution = lambda **kw: (seen.update(kw) or
+            {"ok": True, "deleted": 3, "recomputed": 1, "parents": ["m"]})
+        r = make_client().post("/api/historical/attribute/backout", json={"run_id": "r1"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(seen.get("run_id"), "r1")
+        self.assertEqual(r.get_json()["deleted"], 3)
+        engine.attribution_running = lambda: True
+        self.assertEqual(make_client().post("/api/historical/attribute/backout",
+                                            json={"run_id": "r1"}).status_code, 409)
+        engine.attribution_running = lambda: False
+
+    def test_backout_refused_while_another_backout_in_flight(self):
+        import engine
+        engine.attribution_running = lambda: False
+        engine.backout_running = lambda: True
+        try:
+            r = make_client().post("/api/historical/attribute/backout", json={"run_id": "r1"})
+            self.assertEqual(r.status_code, 409)
+            self.assertIn("undo", r.get_json()["error"])
+        finally:
+            engine.backout_running = lambda: False
+
+    def test_backout_unknown_run_returns_409_not_500(self):
+        import engine
+        engine.attribution_running = lambda: False
+        engine.backout_running = lambda: False
+        engine.backout_recorder_attribution = lambda **kw: {"ok": False, "error": "run_not_found"}
+        r = make_client().post("/api/historical/attribute/backout", json={"run_id": "gone"})
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("already undone", r.get_json()["error"])
+
+
+class TestBackupDownloadDelete(unittest.TestCase):
+    """Backup-list Download + Delete: path-guarded endpoints that only ever touch a
+    single .zip inside the backups dir."""
+
+    def _backup_dir(self):
+        import engine, tempfile
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, "backups"), exist_ok=True)
+        engine.SHARE_BACKUP_DIR = tmp
+        return tmp
+
+    def tearDown(self):
+        import engine
+        if hasattr(engine, "SHARE_BACKUP_DIR"):
+            del engine.SHARE_BACKUP_DIR
+
+    def test_endpoints_registered(self):
+        self.assertIn("api_backup_download", server.app.view_functions)
+        self.assertIn("api_backup_delete", server.app.view_functions)
+
+    def test_delete_rejects_path_traversal(self):
+        r = make_client().post("/api/backup/delete", json={"zip": "../../etc/passwd"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_delete_missing_zip_404(self):
+        self._backup_dir()
+        r = make_client().post("/api/backup/delete", json={"zip": "nope.zip"})
+        self.assertEqual(r.status_code, 404)
+
+    def test_download_rejects_non_zip(self):
+        r = make_client().get("/api/backup/download/blocks.db")
+        self.assertEqual(r.status_code, 400)
+
+    def test_download_then_delete_roundtrip(self):
+        tmp = self._backup_dir()
+        name = "20260101T000000_manual.zip"
+        p = os.path.join(tmp, "backups", name)
+        with open(p, "wb") as f:
+            f.write(b"PK\x03\x04 fake zip bytes")
+        cli = make_client()
+        rd = cli.get("/api/backup/download/" + name)
+        self.assertEqual(rd.status_code, 200)
+        self.assertIn(b"fake zip bytes", rd.data)
+        self.assertIn("attachment", rd.headers.get("Content-Disposition", ""))
+        rx = cli.post("/api/backup/delete", json={"zip": name})
+        self.assertEqual(rx.status_code, 200)
+        self.assertTrue(rx.get_json()["ok"])
+        self.assertFalse(os.path.exists(p))     # the file is gone
+
+
+class TestAtomicRestoreWrite(unittest.TestCase):
+    """_atomic_restore_write must never leave a truncated/zero-length target: an
+    interrupted restore leaves either the OLD file or the COMPLETE new one."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="emt_atomic_")
+        self.dest = os.path.join(self.dir, "blocks.db")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_writes_new_content(self):
+        with open(self.dest, "wb") as f:
+            f.write(b"OLD")
+        server._atomic_restore_write(
+            self.dest, lambda fh: fh.write(b"NEW-CONTENT"))
+        with open(self.dest, "rb") as f:
+            self.assertEqual(f.read(), b"NEW-CONTENT")
+
+    def test_preserves_original_when_fill_raises(self):
+        # The dangerous window: an in-place "wb" open would truncate first. The
+        # atomic helper must leave the original intact if the write blows up.
+        with open(self.dest, "wb") as f:
+            f.write(b"ORIGINAL-DB")
+
+        def _boom(fh):
+            fh.write(b"partial")
+            raise RuntimeError("interrupted mid-write")
+
+        with self.assertRaises(RuntimeError):
+            server._atomic_restore_write(self.dest, _boom)
+        with open(self.dest, "rb") as f:
+            self.assertEqual(f.read(), b"ORIGINAL-DB")
+
+    def test_no_tmp_leftover(self):
+        server._atomic_restore_write(self.dest, lambda fh: fh.write(b"x"))
+        self.assertFalse(os.path.exists(self.dest + ".restore-tmp"))
+
+    def test_no_tmp_leftover_on_failure(self):
+        try:
+            server._atomic_restore_write(
+                self.dest, lambda fh: (_ for _ in ()).throw(ValueError("x")))
+        except ValueError:
+            pass
+        self.assertFalse(os.path.exists(self.dest + ".restore-tmp"))
+
+
+class TestCredentialsMissingSurfacing(unittest.TestCase):
+    """mode=api with no stored key must read as 'credentials missing', not as a
+    normal 'no API / local billing' state, so the UI can prompt a re-entry."""
+
+    def setUp(self):
+        self.client = make_client()
+        self._eng = sys.modules["engine"]
+        self._keys = ("mode_uses_api", "has_kraken_credentials",
+                      "kraken_available", "_get_billing_source",
+                      "_rate_schedule_unsupported", "get_data_source_mode",
+                      "mode_uses_mini")
+        self._saved = {k: getattr(self._eng, k, _MISSING) for k in self._keys}
+        self._eng._get_billing_source = lambda: "dcc"
+        self._eng.kraken_available = lambda: False
+        self._eng._rate_schedule_unsupported = None
+        self._eng.get_data_source_mode = lambda: "api"
+        self._eng.mode_uses_mini = lambda m=None: False
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is _MISSING:
+                if hasattr(self._eng, k):
+                    delattr(self._eng, k)
+            else:
+                setattr(self._eng, k, v)
+
+    # ── /api/billing-source ──────────────────────────────────────────────────
+    def test_billing_source_flags_missing(self):
+        self._eng.mode_uses_api = lambda m=None: True
+        self._eng.has_kraken_credentials = lambda: False
+        j = self.client.get("/api/billing-source").get_json()
+        self.assertTrue(j["credentials_missing"])
+
+    def test_billing_source_not_missing_when_creds_present(self):
+        self._eng.mode_uses_api = lambda m=None: True
+        self._eng.has_kraken_credentials = lambda: True
+        j = self.client.get("/api/billing-source").get_json()
+        self.assertFalse(j["credentials_missing"])
+
+    def test_billing_source_not_missing_in_local_mode(self):
+        self._eng.mode_uses_api = lambda m=None: False
+        self._eng.has_kraken_credentials = lambda: False
+        j = self.client.get("/api/billing-source").get_json()
+        self.assertFalse(j["credentials_missing"])
+
+    # ── /api/data-source-mode ────────────────────────────────────────────────
+    def test_data_source_mode_flags_missing(self):
+        self._eng.mode_uses_api = lambda m=None: True
+        self._eng.has_kraken_credentials = lambda: False
+        j = self.client.get("/api/data-source-mode").get_json()
+        self.assertTrue(j["credentials_missing"])
+        self.assertFalse(j["has_credentials"])
+
+    def test_data_source_mode_ok_with_creds(self):
+        self._eng.mode_uses_api = lambda m=None: True
+        self._eng.has_kraken_credentials = lambda: True
+        j = self.client.get("/api/data-source-mode").get_json()
+        self.assertFalse(j["credentials_missing"])
+        self.assertTrue(j["has_credentials"])
+
+
+class TestSettingsPageCredentialsFlag(unittest.TestCase):
+    """The Settings page must expose HAS_CREDENTIALS so the client can render the
+    'Re-enter API key' path instead of a false 'connected' state."""
+
+    def _render(self, mode, has_creds):
+        eng = sys.modules["engine"]
+        saved = (getattr(eng, "get_data_source_mode", _MISSING),
+                 getattr(eng, "has_kraken_credentials", _MISSING))
+        eng.get_data_source_mode = lambda: mode
+        eng.has_kraken_credentials = lambda: has_creds
+        try:
+            r = make_client().get("/settings")
+            return r
+        finally:
+            for name, v in zip(("get_data_source_mode", "has_kraken_credentials"),
+                               saved):
+                if v is _MISSING:
+                    if hasattr(eng, name): delattr(eng, name)
+                else:
+                    setattr(eng, name, v)
+
+    def test_flag_false_when_creds_missing(self):
+        r = self._render("api", False)
+        self.assertEqual(r.status_code, 200)
+        html = r.get_data(as_text=True)
+        self.assertIn("var HAS_CREDENTIALS = false", html)
+        # the re-enter path is present in the shipped JS
+        self.assertIn("js-reconnect-octopus", html)
+
+    def test_flag_true_when_creds_present(self):
+        r = self._render("api", True)
+        html = r.get_data(as_text=True)
+        self.assertIn("var HAS_CREDENTIALS = true", html)
+
+
+class TestImportRangeDiagnosticEndpoint(unittest.TestCase):
+    """The import-range diagnostic route is registered and gated on an API."""
+
+    def test_registered(self):
+        self.assertIn("api_import_range_diagnostic", server.app.view_functions)
+
+    def test_gated_without_api(self):
+        import engine
+        engine.kraken_available = lambda: False
+        try:
+            r = make_client().post("/api/historical/import-range-diagnostic")
+            self.assertEqual(r.status_code, 400)
+        finally:
+            del engine.kraken_available
+
+
+class TestImportGapsEndpoint(unittest.TestCase):
+    """The persisted-gaps endpoint is registered and returns per-channel data."""
+
+    def test_registered(self):
+        self.assertIn("api_historical_api_gaps", server.app.view_functions)
+
+    def test_returns_channels(self):
+        import engine
+        engine.api_import_gaps = lambda: {"channels": {
+            "import": {"gaps": [], "missing": 0, "gap_count": 0},
+            "export": {"gaps": [{"from": "2025-02-05T00:00:00",
+                                 "to": "2025-02-07T23:30:00", "count": 144}],
+                       "missing": 144, "gap_count": 1}}}
+        try:
+            r = make_client().get("/api/historical/api-import/gaps")
+            self.assertEqual(r.status_code, 200)
+            j = r.get_json()
+            self.assertEqual(j["channels"]["export"]["missing"], 144)
+        finally:
+            del engine.api_import_gaps
+
+
+class TestSweepImplausibleEndpoint(unittest.TestCase):
+    """#307: GET previews lost-opener device spikes (dry-run, no writes); POST
+    applies the clamp and regenerates charts."""
+
+    def setUp(self):
+        import tempfile
+        from block_store import BlockStore
+        self.tmp = tempfile.mktemp(suffix=".db")
+        s = BlockStore(self.tmp)
+        s.insert_config_period({"meters": {
+            "electricity_main": {"meta": {
+                "billing_day": 1, "block_minutes": 30, "timezone": "Europe/London",
+                "currency_symbol": "£", "currency_code": "GBP", "site": "Home"}},
+            "house_battery": {"meta": {
+                "sub_meter": True, "parent_meter": "electricity_main",
+                "device": "Solax Battery", "billing_day": 1, "block_minutes": 30,
+                "timezone": "Europe/London", "currency_symbol": "£",
+                "currency_code": "GBP"}},
+        }})
+        cp = s._conn.execute("SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+        s._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+            "imp_kwh, imp_kwh_grid, imp_cost, imp_read_start, imp_read_end, carbon_g, "
+            "carbon_intensity_g) VALUES "
+            "('2026-07-21T09:30:00','2026-07-21T10:00:00','house_battery',?,"
+            "6137.592,0.0,0.0,0.0,6137.592,859262.88,140.0)", (cp,))
+        s._conn.commit()
+        self.store = s
+        self.client = server.app.test_client()
+
+    def tearDown(self):
+        import os
+        self.store._conn.close()
+        if os.path.exists(self.tmp):
+            os.remove(self.tmp)
+
+    def test_get_previews_without_writing(self):
+        with patch.object(server, "_get_store", return_value=self.store):
+            r = self.client.get("/api/blocks/sweep-implausible")
+        d = json.loads(r.data)
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["count"], 1)
+        self.assertFalse(d["applied"])
+        self.assertAlmostEqual(self.store._conn.execute(
+            "SELECT imp_kwh FROM blocks WHERE block_start='2026-07-21T09:30:00'"
+        ).fetchone()[0], 6137.592)                       # dry-run wrote nothing
+
+    def test_post_applies_and_clamps(self):
+        with patch.object(server, "_get_store", return_value=self.store), \
+             patch.object(server, "_regen_charts_safely", return_value=None):
+            r = self.client.post("/api/blocks/sweep-implausible")
+        d = json.loads(r.data)
+        self.assertTrue(d["ok"] and d["applied"])
+        row = self.store._conn.execute(
+            "SELECT imp_kwh, carbon_g, needs_review FROM blocks "
+            "WHERE block_start='2026-07-21T09:30:00'").fetchone()
+        self.assertEqual(row["imp_kwh"], 0.0)
+        self.assertEqual(row["carbon_g"], 0.0)
+        self.assertEqual(row["needs_review"], 1)
+
+
+class TestBackfillPlan(unittest.TestCase):
+    """Preview endpoint /api/backfill/plan — gate wiring + window classification."""
+
+    def setUp(self):
+        self.client = make_client()
+        import engine
+        self._orig = getattr(engine, "kraken_available", None)
+
+    def tearDown(self):
+        import engine
+        if self._orig is not None:
+            engine.kraken_available = self._orig
+
+    def _set_api(self, avail):
+        import engine
+        engine.kraken_available = lambda: avail
+
+    def _plan(self, **body):
+        return self.client.post("/api/backfill/plan", json=body)
+
+    def test_api_source_blocked_without_api(self):
+        self._set_api(False)
+        r = self._plan(scope="whole_history", source="api")
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "no_api")
+
+    def test_api_whole_history_ok(self):
+        self._set_api(True)
+        r = self._plan(scope="whole_history", source="api")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["action"], "run_api_import_job")
+
+    def test_csv_whole_history_ok_without_api(self):
+        self._set_api(False)
+        r = self._plan(scope="whole_history", source="csv")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["action"], "apply_csv_import")
+
+    def test_gaps_blocked_when_no_gaps(self):
+        self._set_api(True)
+        r = self._plan(scope="gaps", source="csv")
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "no_gaps")
+
+    def test_range_requires_dates(self):
+        self._set_api(True)
+        r = self._plan(scope="range", source="csv")
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "bad_range")
+
+    def test_range_classifies_occupied_vs_fill(self):
+        self._set_api(True)
+        # MINIMAL_BLOCKS has a block at 2026-01-15T00:00:00; a 1-hour range = 2 slots.
+        r = self._plan(scope="range", source="csv",
+                       **{"from": "2026-01-15T00:00:00", "to": "2026-01-15T01:00:00"})
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertTrue(j["ok"])
+        self.assertEqual(j["windows"]["occupied_count"], 1)
+        self.assertEqual(j["windows"]["fill_count"], 1)          # 00:30 slot is empty
+        self.assertIn("2026-01-15T00:00:00", j["handoff_to_corrections"])
+
+
+class TestBackfillRun(unittest.TestCase):
+    """Dispatch endpoint /api/backfill/run — re-gate, confirm, route to runners."""
+
+    def setUp(self):
+        self.client = make_client()
+        import engine, server
+        self._orig_ka   = getattr(engine, "kraken_available", None)
+        self._orig_rhg  = getattr(engine, "resolve_history_gaps", None)
+        self._orig_loop = server._run_on_engine_loop
+        self._orig_csv  = getattr(server._store, "apply_csv_import", None)
+        self._orig_gaps = server._store.find_block_gaps
+
+    def tearDown(self):
+        import engine, server
+        if self._orig_ka is not None:
+            engine.kraken_available = self._orig_ka
+        if self._orig_rhg is not None:
+            engine.resolve_history_gaps = self._orig_rhg
+        server._run_on_engine_loop = self._orig_loop
+        if self._orig_csv is not None:
+            server._store.apply_csv_import = self._orig_csv
+        server._store.find_block_gaps = self._orig_gaps
+
+    def _api(self, avail):
+        import engine
+        engine.kraken_available = lambda: avail
+
+    def _run(self, **b):
+        return self.client.post("/api/backfill/run", json=b)
+
+    def test_unconfirmed_rejected(self):
+        self._api(True)
+        r = self._run(scope="whole_history", source="api")
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "unconfirmed")
+
+    def test_gate_rejected_no_api(self):
+        self._api(False)
+        r = self._run(scope="whole_history", source="api", confirmed=True)
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "no_api")
+
+    def test_api_whole_history_defers_to_controller(self):
+        self._api(True)
+        r = self._run(scope="whole_history", source="api", confirmed=True)
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertTrue(j["deferred"])
+        self.assertEqual(j["use_endpoint"], "/api/historical/api-import/start")
+
+    def test_csv_without_content_defers_to_wizard(self):
+        self._api(False)
+        r = self._run(scope="whole_history", source="csv", confirmed=True)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("import-csv", r.get_json()["use_endpoint"])
+
+    def test_csv_with_content_applies(self):
+        import server
+        server._store.apply_csv_import = lambda cc, **k: {"import": {"written": 2}}
+        self._api(False)
+        r = self._run(scope="whole_history", source="csv", confirmed=True,
+                      channel_csvs={"import": "ts,kwh,cost\n"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["result"]["import"]["written"], 2)
+
+    def test_gaps_api_runs_inline(self):
+        import engine, server
+        server._store.find_block_gaps = lambda **k: [
+            {"start": "2026-01-10T00:00:00", "end": "2026-01-10T00:00:00", "slots": 1}]
+        engine.resolve_history_gaps = lambda: "CORO"            # non-coroutine sentinel
+        server._run_on_engine_loop = lambda coro, **k: {"ok": True, "filled": 5}
+        self._api(True)
+        r = self._run(scope="gaps", source="api", confirmed=True)
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertTrue(j["ok"])
+        self.assertEqual(j["action"], "resolve_history_gaps")
+        self.assertEqual(j["filled"], 5)
+
+
+class TestBackfillGaps(unittest.TestCase):
+    """/api/backfill/gaps — unified list: missing block rows + per-channel data gaps."""
+
+    def setUp(self):
+        self.client = make_client()
+        import engine
+        self._ka  = getattr(engine, "kraken_available", None)
+        self._aig = getattr(engine, "api_import_gaps", None)
+
+    def tearDown(self):
+        import engine
+        if self._ka is not None:
+            engine.kraken_available = self._ka
+        if self._aig is not None:
+            engine.api_import_gaps = self._aig
+
+    def test_merges_block_holes_and_channel_data_gaps(self):
+        import server, engine
+        engine.kraken_available = lambda: True
+        # a missing block-row hole (import) ...
+        server._store.find_block_gaps = lambda **k: [
+            {"start": "2026-05-01T00:00:00", "end": "2026-05-01T00:30:00", "slots": 2}]
+        # ... and a persisted EXPORT-channel data gap (blocks exist, export absent)
+        engine.api_import_gaps = lambda: {"channels": {
+            "export": {"gaps": [{"from": "2025-03-05T00:00:00",
+                                 "to": "2025-03-07T23:30:00", "count": 144}]},
+            "import": {"gaps": []}}}
+        r = self.client.get("/api/backfill/gaps")
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertTrue(j["ok"])
+        self.assertEqual(len(j["gaps"]), 2)
+        tags = {g["channel"] + ":" + g["kind"] for g in j["gaps"]}
+        self.assertIn("import:missing_blocks", tags)
+        self.assertIn("export:missing_data", tags)
+        self.assertEqual(j["total_slots"], 146)          # 2 + 144
+        self.assertTrue(j["api_available"])
+
+    def _block_hole_channels(self, main_channels):
+        """Run the endpoint with a single block-hole gap and a main meter whose
+        channels are `main_channels`; return that gap's `channels` list."""
+        import server, engine
+        engine.kraken_available = lambda: True
+        engine.api_import_gaps = lambda: {"channels": {}}
+        server._store.find_block_gaps = lambda **k: [
+            {"start": "2026-05-01T00:00:00", "end": "2026-05-01T00:30:00", "slots": 2}]
+        _orig = server.load_config
+        server.load_config = lambda: {"meters": {"electricity_main": {
+            "meta": {}, "channels": {c: {} for c in main_channels}}}}
+        try:
+            j = self.client.get("/api/backfill/gaps").get_json()
+        finally:
+            server.load_config = _orig
+        hole = [g for g in j["gaps"] if g["kind"] == "missing_blocks"][0]
+        return hole["channels"]
+
+    def test_block_hole_needs_both_channels_when_meter_exports(self):
+        # A whole missing block on an exporting meter must offer import AND export,
+        # so neither the CSV template nor the API fill silently omits export.
+        self.assertEqual(self._block_hole_channels(["import", "export"]),
+                         ["import", "export"])
+
+    def test_block_hole_import_only_when_no_export(self):
+        self.assertEqual(self._block_hole_channels(["import"]), ["import"])
+
+
+class TestBackfillFillGap(unittest.TestCase):
+    """/api/backfill/fill-gap — launches a BACKGROUND, channel-scoped gap fill
+    (run_gap_fill_job) on the engine loop, mirroring whole/date import. We assert
+    the gate ladder and that the coroutine is scheduled with the right window +
+    channel scoping — not a synchronous result."""
+
+    def setUp(self):
+        self.client = make_client()
+        import engine, server
+        import asyncio
+        self._ka    = getattr(engine, "kraken_available", None)
+        self._run   = getattr(engine, "api_import_running", None)
+        self._job   = getattr(engine, "run_gap_fill_job", None)
+        self._loop  = getattr(server, "_event_loop", None)
+        self._gs    = getattr(server, "_get_store", None)
+        self._rct   = asyncio.run_coroutine_threadsafe
+        # Deterministic 30-min block store so the inclusive-`to` extension is exact.
+        server._get_store = lambda: type("S", (), {
+            "get_config_period_for_date": lambda self, d: {
+                "block_minutes": 30, "timezone": "Europe/London"}})()
+
+    def tearDown(self):
+        import engine, server
+        import asyncio
+        if self._ka  is not None: engine.kraken_available = self._ka
+        if self._run is not None: engine.api_import_running = self._run
+        if self._job is not None: engine.run_gap_fill_job = self._job
+        if self._gs  is not None: server._get_store = self._gs
+        server._event_loop = self._loop
+        asyncio.run_coroutine_threadsafe = self._rct
+
+    class _FakeLoop:
+        def is_running(self):
+            return True
+
+    def _post(self, **b):
+        return self.client.post("/api/backfill/fill-gap", json=b)
+
+    def test_no_api_rejected(self):
+        import engine
+        engine.kraken_available = lambda: False
+        r = self._post(**{"from": "2025-03-05T00:00:00", "to": "2025-03-07T23:30:00", "confirmed": True})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "no_api")
+
+    def test_requires_range(self):
+        import engine
+        engine.kraken_available = lambda: True
+        r = self._post(confirmed=True)
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "bad_range")
+
+    def test_requires_confirm(self):
+        import engine
+        engine.kraken_available = lambda: True
+        r = self._post(**{"from": "x", "to": "y"})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "unconfirmed")
+
+    def test_busy_returns_409(self):
+        import engine, server
+        engine.kraken_available = lambda: True
+        engine.api_import_running = lambda: True
+        engine.api_import_status = lambda: {"phase": "importing"}
+        server._event_loop = self._FakeLoop()
+        r = self._post(**{"from": "2025-03-05T00:00:00", "to": "2025-03-07T23:30:00", "confirmed": True})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.get_json()["reason"], "busy")
+
+    def test_launches_channel_scoped(self):
+        import engine, server
+        import asyncio
+        engine.kraken_available = lambda: True
+        engine.api_import_running = lambda: False
+        server._event_loop = self._FakeLoop()
+        captured = {}
+        def _job(frm, to, *, channels=("import", "export"), **k):
+            captured.update(frm=frm, to=to, channels=channels)
+            return "CORO"
+        engine.run_gap_fill_job = _job
+        scheduled = {}
+        def _rct(coro, loop=None, *a, **k):
+            scheduled["coro"] = coro
+            scheduled["loop"] = loop
+            return object()
+        asyncio.run_coroutine_threadsafe = _rct
+        r = self._post(**{"from": "2025-03-05T00:00:00", "to": "2025-03-07T23:30:00",
+                          "channel": "export", "confirmed": True})
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertTrue(j["ok"])
+        self.assertEqual(j["status"], "running")
+        self.assertEqual(captured["frm"], "2025-03-05T00:00:00")
+        # `to` is the last missing slot's start (inclusive) → extended by one 30-min
+        # block so the fill's half-open window actually includes that final slot.
+        self.assertEqual(captured["to"], "2025-03-08T00:00:00")
+        self.assertEqual(captured["channels"], ("export",))     # channel-scoped, not both
+        self.assertEqual(scheduled["coro"], "CORO")             # background-launched
+
+    def test_launches_both_channels_when_unspecified(self):
+        import engine, server
+        import asyncio
+        engine.kraken_available = lambda: True
+        engine.api_import_running = lambda: False
+        server._event_loop = self._FakeLoop()
+        captured = {}
+        engine.run_gap_fill_job = (lambda frm, to, *, channels=("import", "export"), **k:
+                                   captured.update(channels=channels) or "CORO")
+        asyncio.run_coroutine_threadsafe = lambda *a, **k: object()
+        r = self._post(**{"from": "2025-03-05T00:00:00", "to": "2025-03-07T23:30:00", "confirmed": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(captured["channels"], ("import", "export"))
+
+
+class TestBackfillReach(unittest.TestCase):
+    """/api/backfill/reach — flattened 'how far back can the API go' for Import task."""
+
+    def setUp(self):
+        self.client = make_client()
+        import engine, server
+        self._ka   = getattr(engine, "kraken_available", None)
+        self._pl   = getattr(engine, "plan_api_import", None)
+        self._loop = server._run_on_engine_loop
+
+    def tearDown(self):
+        import engine, server
+        if self._ka is not None: engine.kraken_available = self._ka
+        if self._pl is not None: engine.plan_api_import = self._pl
+        server._run_on_engine_loop = self._loop
+
+    def test_no_api(self):
+        import engine
+        engine.kraken_available = lambda: False
+        j = self.client.get("/api/backfill/reach").get_json()
+        self.assertFalse(j["ok"])
+        self.assertEqual(j["reason"], "no_api")
+
+    def test_flattens_plan(self):
+        import engine, server
+        engine.kraken_available = lambda: True
+        engine.plan_api_import = lambda **k: "CORO"
+        server._run_on_engine_loop = lambda coro, **k: {
+            "ok": True, "go_live": "2024-07-01T00:00:00", "channels": {
+                "import": {"ok": True, "chunk_count": 12,
+                           "window": {"from": "2022-01-01T00:00:00", "to": "2024-07-01T00:00:00"}},
+                "export": {"ok": True, "chunk_count": 10,
+                           "window": {"from": "2023-03-01T00:00:00", "to": "2024-07-01T00:00:00"}}}}
+        j = self.client.get("/api/backfill/reach").get_json()
+        self.assertTrue(j["ok"])
+        self.assertEqual(j["reach_from"], "2022-01-01T00:00:00")   # min across channels
+        self.assertEqual(j["up_to"], "2024-07-01T00:00:00")
+        self.assertEqual(j["chunk_estimate"], 12)                  # max chunk_count
+
+
+class TestRepriceRepairVerifyGuard(unittest.TestCase):
+    """/api/historical/reprice-repair must refuse while the verify-pricing pass is
+    live — both hit Octopus on the shared rate-limit allowance, so a concurrent
+    manual reprice would compete for the same budget (and re-check the same slots)."""
+
+    def setUp(self):
+        self.client = make_client()
+
+    def _post(self, verify_status):
+        import engine, server
+        engine.kraken_available = lambda: True
+        engine.api_verify_pricing_status = lambda: {"status": verify_status}
+        # If the guard DOESN'T fire, the endpoint reaches the engine loop — stub
+        # those so the non-guarded path returns cleanly rather than erroring.
+        engine.repair_import_pricing = lambda *a, **k: "CORO"
+        server._run_on_engine_loop = lambda coro, **k: {"ok": True, "recovered": 0,
+                                                        "still_missing": 0, "checked": 0,
+                                                        "windows": 0, "mode": "queue"}
+        return self.client.post("/api/historical/reprice-repair", json={})
+
+    def test_refused_while_verify_running(self):
+        r = self._post("running")
+        self.assertEqual(r.status_code, 409)
+        j = r.get_json()
+        self.assertFalse(j["ok"])
+        self.assertEqual(j["reason"], "verify_active")
+
+    def test_refused_while_verify_waiting_or_paused(self):
+        for st in ("waiting", "paused"):
+            r = self._post(st)
+            self.assertEqual(r.status_code, 409, st)
+            self.assertEqual(r.get_json()["reason"], "verify_active")
+
+    def test_allowed_when_verify_idle(self):
+        r = self._post("idle")
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json()["ok"])
+
+    def test_allowed_when_verify_done(self):
+        r = self._post("done")
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json()["ok"])
+
+
+class TestStartLockedWhileVerifyActive(unittest.TestCase):
+    """A backfill RUN isn't finished until its post-import verify pass completes, so
+    the start endpoints refuse a new run (409 verify_active) while verify is live —
+    the server half of the picker lock, so a refresh / direct call can't get round it."""
+
+    def setUp(self):
+        self.client = make_client()
+        import engine
+        engine.kraken_available = lambda: True
+        engine.api_import_running = lambda: False       # no import in flight
+
+    def _verify(self, status):
+        import engine
+        engine.api_verify_pricing_status = lambda: {"status": status}
+
+    def test_whole_history_start_refused_during_verify(self):
+        self._verify("running")
+        r = self.client.post("/api/historical/api-import/start", json={"confirmed": True})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.get_json().get("reason"), "verify_active")
+
+    def test_fill_gap_refused_during_verify(self):
+        self._verify("waiting")
+        r = self.client.post("/api/backfill/fill-gap", json={
+            "from": "2026-03-01T00:00:00", "to": "2026-03-02T00:00:00", "confirmed": True})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.get_json().get("reason"), "verify_active")
+
+    def test_fill_gap_allowed_when_verify_idle(self):
+        # Past the verify guard it reaches the loop check; with no loop wired in the
+        # test that returns 500 no_loop — the point is it is NOT the 409 verify block.
+        self._verify("idle")
+        r = self.client.post("/api/backfill/fill-gap", json={
+            "from": "2026-03-01T00:00:00", "to": "2026-03-02T00:00:00", "confirmed": True})
+        self.assertNotEqual(r.status_code, 409)
+
+
+class TestBillsBuild(unittest.TestCase):
+    """/api/historical/bills/build — uploaded Octopus PDFs → per-(MPAN, channel) CSV
+    text. The parser is stubbed (no real PDF); the endpoint's grouping + CSV assembly
+    + reconciliation report are exercised with the REAL bill_parser CSV builders."""
+
+    def setUp(self):
+        self.client = make_client()
+        import bill_parser as bp
+        from datetime import date
+        self._ps, self._pb = bp.pdf_support, bp.parse_bill
+        bp.pdf_support = lambda: True
+
+        def _fake(data, source_name=""):
+            d = date(2024, 12, 3)
+            b = bp.Bill(source=source_name, mpan_import="2600000000001",
+                        mpan_export="2600000000002", vat_import=0.05, vat_export=0.0)
+            b.hh_days = [[bp.HHSlot(d, 0, 0, 0, 30, 6.67, 1.0, 6.67),
+                          bp.HHSlot(d, 0, 30, 1, 0, 6.67, 1.0, 6.67)]]
+            b.import_periods = [bp.ImportPeriod(d, d, [(6.67, 2.0, 0.13)], 2.0, 1, 52.24)]
+            b.export_periods = [bp.ExportPeriod(d, d, 5.0, 15.0, 0.75)]
+            b.reconciliation = {"days": [{"date": "2024-12-03", "ok": True}],
+                                "import_periods": [], "ok": True}
+            return b
+        bp.parse_bill = _fake
+
+    def tearDown(self):
+        import bill_parser as bp
+        bp.pdf_support, bp.parse_bill = self._ps, self._pb
+
+    def _post(self, *names):
+        import io
+        data = {"files": [(io.BytesIO(b"%PDF-1.4 fake"), n) for n in names]} if len(names) > 1 \
+            else {"files": (io.BytesIO(b"%PDF-1.4 fake"), names[0])}
+        return self.client.post("/api/historical/bills/build", data=data,
+                                content_type="multipart/form-data")
+
+    def test_builds_per_channel_csv(self):
+        r = self._post("bill.pdf")
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertTrue(j["ok"])
+        self.assertEqual(len(j["groups"]), 1)
+        g = j["groups"][0]
+        self.assertEqual(g["mpan_import"], "2600000000001")
+        self.assertEqual(g["mpan_export"], "2600000000002")
+        self.assertEqual(g["import_rows"], 2)               # two HH slots
+        self.assertGreater(g["export_rows"], 0)
+        self.assertTrue(g["import_csv"].startswith("Start,End,Consumption"))
+        self.assertTrue(g["reconciliation"]["ok"])
+
+    def test_rejects_non_pdf(self):
+        r = self._post("notes.txt")
+        self.assertEqual(r.status_code, 400)
+
+    def test_no_pdf_support(self):
+        import bill_parser as bp
+        bp.pdf_support = lambda: False
+        r = self._post("bill.pdf")
+        self.assertEqual(r.status_code, 400)
+
+
+class TestGapEndInclusive(unittest.TestCase):
+    """A gap's `to` is the last missing slot's START (inclusive), but the fill window
+    is half-open — so the final half-hour was left unfilled ("1 block still missing
+    after a gap fill"). _gap_end_inclusive extends `to` by one block to include it."""
+
+    class _Store:
+        def __init__(self, bm=30):
+            self._bm = bm
+        def get_config_period_for_date(self, d):
+            return {"block_minutes": self._bm, "timezone": "Europe/London"}
+
+    def test_extends_by_one_block_30min(self):
+        import server
+        out = server._gap_end_inclusive(self._Store(30), "2026-03-01T00:00:00", "2026-04-30T22:30:00")
+        self.assertEqual(out, "2026-04-30T23:00:00")
+
+    def test_extends_by_one_block_15min(self):
+        import server
+        out = server._gap_end_inclusive(self._Store(15), "2026-03-01T00:00:00", "2026-04-30T22:30:00")
+        self.assertEqual(out, "2026-04-30T22:45:00")
+
+    def test_bad_date_returns_original(self):
+        import server
+        self.assertEqual(server._gap_end_inclusive(self._Store(), "x", "not-a-date"), "not-a-date")
+
+
+if __name__ == "__main__":
+    unittest.main()

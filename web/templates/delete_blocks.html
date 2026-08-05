@@ -21,6 +21,10 @@
 <div id="alert-success" class="alert alert-success"></div>
 <div id="alert-error"   class="alert alert-danger"></div>
 
+<!-- Persistent delete/purge progress banner (mirrors the restore banner): survives
+     navigation via poll-on-load, and warns not to rebuild/restart mid-delete. -->
+<div id="del-progress" style="display:none;border:1px solid var(--danger);border-radius:var(--radius);padding:12px 14px;margin-bottom:14px;font-size:13px;line-height:1.7;background:rgba(240,82,82,0.06);"></div>
+
 <div class="card">
   <div style="font-size:13px;color:var(--muted);margin-bottom:20px;line-height:1.7;">
     Permanently delete blocks for a date range from the live database.
@@ -46,12 +50,18 @@
     </div>
   </div>
 
-  <div style="margin-bottom:14px;">
-    <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:6px;">Meter <span style="font-weight:400;">(optional — leave blank to delete all meters)</span></label>
-    <select id="del-meter-id" style="width:100%;">
-      <option value="">All meters</option>
-    </select>
+  <div style="font-size:12px;color:var(--muted);line-height:1.7;margin-bottom:14px;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-radius:6px;">
+    Deletes <strong>whole blocks</strong> in the range — every meter together — so the house
+    and its devices stay consistent. To remove or rebuild a single <strong>device's</strong>
+    usage (with the house remainder re-derived automatically), use
+    <a href="{{ url_for('historical_probe_page') }}" style="color:var(--accent, #2563eb);">Device History</a>
+    instead — deleting one meter's blocks here would leave the house total reading low.
   </div>
+
+  <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:14px;cursor:pointer;">
+    <input type="checkbox" id="del-reconstructed">
+    Only historical imports in this range (leave live / CAD / settled data intact)
+  </label>
 
   <button class="btn btn-secondary" onclick="deleteBlocksPreview()" style="margin-bottom:12px;">Preview</button>
 
@@ -69,24 +79,56 @@
   <div id="del-success" class="alert alert-success" style="display:none;"></div>
   <div id="del-error"   class="alert alert-danger"  style="display:none;"></div>
 </div>
+
+<!-- Get-out clause: wipe all historical imports -->
+<div class="card" style="border-color:var(--danger);">
+  <div style="font-weight:600;margin-bottom:6px;">Delete all historical imported data</div>
+  <div style="font-size:13px;color:var(--muted);margin-bottom:14px;line-height:1.7;">
+    Removes <strong>every</strong> block created by a historical import (API or CSV) and everything derived from it —
+    rate derivations, import checkpoints and gap records — returning your account to its live-only state so you can
+    re-import cleanly. Your live / CAD / settled data is <strong>untouched</strong>. A backup is taken automatically first.
+    Use this if an import went wrong and you don't have a backup to restore.
+  </div>
+
+  <button class="btn btn-secondary" onclick="purgePreview()" style="margin-bottom:12px;">Preview</button>
+
+  <div id="purge-preview" style="display:none;margin-bottom:12px;">
+    <div id="purge-preview-text" style="font-size:13px;padding:10px 14px;background:var(--surface);border:1px solid var(--border);border-radius:6px;margin-bottom:10px;"></div>
+    <div id="purge-confirm-row" style="display:none;">
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px;cursor:pointer;">
+        <input type="checkbox" id="purge-confirm-check" onchange="document.getElementById('purge-confirm-btn').disabled=!this.checked;">
+        I understand this removes all imported history (a backup will be taken first)
+      </label>
+      <button class="btn btn-danger" id="purge-confirm-btn" onclick="purgeApply()" disabled>Delete all imported data</button>
+    </div>
+  </div>
+
+  <div id="purge-success" class="alert alert-success" style="display:none;"></div>
+  <div id="purge-error"   class="alert alert-danger"  style="display:none;"></div>
+</div>
 {% endblock %}
 
 {% block scripts %}
 <script>
 async function doManualBackup() {
   var btn = document.getElementById('btn-backup');
+  var sEl = document.getElementById('alert-success');
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Backing up...'; }
+  // In-flight banner, matching restore/delete — visible progress, not just a result.
+  if (sEl) { sEl.innerHTML = '⏳ <strong>Creating backup…</strong> copying the database — this only takes a moment.'; sEl.classList.add('show'); }
   try {
     var r    = await fetch(apiUrl('/api/backup'), { method: 'POST' });
     var data = await r.json();
     if (data.ok) {
       var el = document.getElementById('alert-success');
-      if (el) { el.textContent = '✓ Backup created: ' + data.path; el.classList.add('show'); setTimeout(function() { el.classList.remove('show'); }, 6000); }
+      if (el) { el.textContent = '✓ Backup ready: ' + data.path + (data.size ? ' (' + EMT.fmtBytes(data.size) + ')' : ''); el.classList.add('show'); setTimeout(function() { el.classList.remove('show'); }, 8000); }
     } else {
+      if (sEl) sEl.classList.remove('show');
       var el = document.getElementById('alert-error');
       if (el) { el.textContent = '✕ ' + (data.error || 'Backup failed'); el.classList.add('show'); }
     }
   } catch(e) {
+    if (sEl) sEl.classList.remove('show');
     var el = document.getElementById('alert-error');
     if (el) { el.textContent = '✕ ' + e.message; el.classList.add('show'); }
   } finally {
@@ -94,26 +136,12 @@ async function doManualBackup() {
   }
 }
 
-document.addEventListener('DOMContentLoaded', function() {
-  fetch(apiUrl('/api/corrections/meters'))
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      var sel = document.getElementById('del-meter-id');
-      (d.meters || []).forEach(function(m) {
-        var opt = document.createElement('option');
-        opt.value = m; opt.textContent = m;
-        sel.appendChild(opt);
-      });
-    })
-    .catch(function() {});
-});
-
 function deleteBlocksPreview() {
   var fromDate = document.getElementById('del-from-date').value;
   var fromTime = document.getElementById('del-from-time').value || '00:00';
   var toDate   = document.getElementById('del-to-date').value;
   var toTime   = document.getElementById('del-to-time').value || '23:59';
-  var meterId  = document.getElementById('del-meter-id').value || null;
+  var meterId  = null;   // whole-block delete only — per-meter removal lives in Device History
   var errEl    = document.getElementById('del-error');
   var prevEl   = document.getElementById('del-preview');
   var prevText = document.getElementById('del-preview-text');
@@ -137,7 +165,7 @@ function deleteBlocksPreview() {
   fetch(apiUrl('/api/blocks/delete/preview'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from_date: fromDate, from_time: fromTime, to_date: toDate, to_time: toTime, meter_id: meterId })
+    body: JSON.stringify({ from_date: fromDate, from_time: fromTime, to_date: toDate, to_time: toTime, meter_id: meterId, reconstructed_only: document.getElementById('del-reconstructed').checked })
   })
   .then(function(r) { return r.json(); })
   .then(function(d) {
@@ -149,11 +177,10 @@ function deleteBlocksPreview() {
     }
     prevEl.style.display = 'block';
     if (d.blocks === 0) {
-      prevText.textContent  = 'No blocks found for the selected date range' + (meterId ? ' and meter' : '') + '.';
+      prevText.textContent  = 'No blocks found for the selected date range.';
       confRow.style.display = 'none';
     } else {
-      var meterStr = meterId ? (' for ' + meterId) : ' across all meters';
-      prevText.innerHTML    = '<strong>' + d.blocks + ' blocks</strong> across <strong>' + d.dates + ' day' + (d.dates !== 1 ? 's' : '') + '</strong>' + meterStr + ' will be permanently deleted.';
+      prevText.innerHTML    = '<strong>' + d.blocks + ' blocks</strong> across <strong>' + d.dates + ' day' + (d.dates !== 1 ? 's' : '') + '</strong> across all meters will be permanently deleted.';
       confRow.style.display = 'block';
     }
   })
@@ -169,7 +196,7 @@ function deleteBlocksApply() {
   var fromTime = document.getElementById('del-from-time').value || '00:00';
   var toDate   = document.getElementById('del-to-date').value;
   var toTime   = document.getElementById('del-to-time').value || '23:59';
-  var meterId  = document.getElementById('del-meter-id').value || null;
+  var meterId  = null;   // whole-block delete only — per-meter removal lives in Device History
   var confBtn  = document.getElementById('del-confirm-btn');
   var errEl    = document.getElementById('del-error');
   var succEl   = document.getElementById('del-success');
@@ -178,10 +205,11 @@ function deleteBlocksApply() {
   confBtn.disabled    = true;
   errEl.style.display = 'none';
 
+  succEl.style.display = 'none';
   fetch(apiUrl('/api/blocks/delete'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from_date: fromDate, from_time: fromTime, to_date: toDate, to_time: toTime, meter_id: meterId, confirmed: true })
+    body: JSON.stringify({ from_date: fromDate, from_time: fromTime, to_date: toDate, to_time: toTime, meter_id: meterId, reconstructed_only: document.getElementById('del-reconstructed').checked, confirmed: true })
   })
   .then(function(r) { return r.json(); })
   .then(function(d) {
@@ -191,19 +219,110 @@ function deleteBlocksApply() {
       confBtn.disabled     = false;
       return;
     }
+    // Runs in the background now — the persistent banner tracks it.
     prevEl.style.display  = 'none';
-    succEl.textContent    = 'Deleted ' + d.deleted + ' blocks across ' + d.dates + ' day' + (d.dates !== 1 ? 's' : '') + '. Regenerate charts to reflect the changes.';
-    succEl.style.display  = 'block';
-    document.getElementById('del-from-date').value = '';
-    document.getElementById('del-to-date').value   = '';
-    document.getElementById('del-meter-id').value  = '';
-    document.getElementById('del-confirm-check').checked = false;
+    _deleteWasRunning = true;
+    pollDeleteStatus();
   })
   .catch(function(e) {
     errEl.textContent    = 'Delete failed: ' + e.message;
     errEl.style.display  = 'block';
     confBtn.disabled     = false;
   });
+}
+
+// The delete/purge runs in the background (survives navigation). Poll its status
+// and reflect it in the persistent banner, exactly like the restore flow.
+var _deleteWasRunning = false;
+var _deleteTimer = null;
+function _esc(s){ return String(s == null ? '' : s).replace(/[<>&]/g, function(c){ return c === '<' ? '&lt;' : c === '>' ? '&gt;' : '&amp;'; }); }
+function _delKindLabel(k){ return k === 'purge' ? 'Deleting all imported data' : 'Deleting blocks'; }
+function pollDeleteStatus() {
+  fetch(apiUrl('/api/blocks/delete/status')).then(function(r){ return r.json(); }).then(function(d) {
+    var el = document.getElementById('del-progress'); if (!el) return;
+    if (d.status === 'running') {
+      _deleteWasRunning = true;
+      el.style.borderColor = 'var(--danger)';
+      el.style.background = 'rgba(240,82,82,0.06)';
+      el.innerHTML = '⏳ <strong>' + _delKindLabel(d.kind) + '…</strong> ' + _esc(d.step) +
+        ' — safe to leave this page. <strong>Do not rebuild or restart the add-on until this finishes.</strong>';
+      el.style.display = 'block';
+      ['del-confirm-btn','purge-confirm-btn'].forEach(function(id){ var b = document.getElementById(id); if (b) b.disabled = true; });
+      if (_deleteTimer) clearTimeout(_deleteTimer);
+      _deleteTimer = setTimeout(pollDeleteStatus, 1500);
+    } else if (d.status === 'done' && _deleteWasRunning) {
+      var res = d.result || {};
+      var msg = (d.kind === 'purge')
+        ? '✓ Removed ' + (res.blocks || 0).toLocaleString() + ' imported block' + (res.blocks === 1 ? '' : 's') +
+          (res.backup ? ' (backup: ' + _esc(res.backup) + ')' : '') + '. Charts rebuilt.'
+        : '✓ Deleted ' + (res.deleted || 0) + ' block' + (res.deleted === 1 ? '' : 's') + ' across ' +
+          (res.dates || 0) + ' day' + (res.dates === 1 ? '' : 's') + '. Charts rebuilt.';
+      el.style.borderColor = 'var(--success, #16a34a)';
+      el.style.background = 'rgba(22,163,74,0.06)';
+      el.innerHTML = msg;
+      el.style.display = 'block';
+      _deleteWasRunning = false;
+      // Reset the confirm controls so a fresh action needs a fresh confirm.
+      ['del-confirm-check','purge-confirm-check'].forEach(function(id){ var c = document.getElementById(id); if (c) c.checked = false; });
+    } else if (d.status === 'error' && _deleteWasRunning) {
+      el.style.borderColor = 'var(--danger)';
+      el.style.background = 'rgba(240,82,82,0.06)';
+      el.innerHTML = '⚠ ' + _delKindLabel(d.kind) + ' failed: ' + _esc(d.error || 'unknown error');
+      el.style.display = 'block';
+      _deleteWasRunning = false;
+      ['del-confirm-btn','purge-confirm-btn'].forEach(function(id){ var b = document.getElementById(id); if (b) b.disabled = false; });
+    }
+    // idle / stale-done from a prior session → leave the banner hidden
+  }).catch(function() {
+    if (_deleteTimer) clearTimeout(_deleteTimer);
+    _deleteTimer = setTimeout(pollDeleteStatus, 3000);
+  });
+}
+// On load: if a delete/purge is already running (navigated away and back), pick it up.
+document.addEventListener('DOMContentLoaded', pollDeleteStatus);
+
+// ── Purge ALL historical imports ───────────────────────────────────────────────
+function purgePreview() {
+  var pv  = document.getElementById('purge-preview');
+  var tx  = document.getElementById('purge-preview-text');
+  var row = document.getElementById('purge-confirm-row');
+  var chk = document.getElementById('purge-confirm-check');
+  var btn = document.getElementById('purge-confirm-btn');
+  var err = document.getElementById('purge-error');
+  var succ= document.getElementById('purge-success');
+  err.style.display = 'none'; succ.style.display = 'none';
+  fetch(apiUrl('/api/historical/purge-preview'))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      pv.style.display = 'block'; chk.checked = false; btn.disabled = true;
+      if (d.error) { err.textContent = d.error; err.style.display = 'block'; pv.style.display = 'none'; return; }
+      if (!d.blocks) { tx.textContent = 'No historical imported data found.'; row.style.display = 'none'; return; }
+      var span = d.from ? (' (' + (d.from || '').substr(0,10) + ' → ' + (d.to || '').substr(0,10) + ')') : '';
+      tx.innerHTML = '<strong>' + d.blocks.toLocaleString() + ' imported blocks</strong>' + span +
+        ', plus their rate derivations and import checkpoints, will be permanently deleted.';
+      row.style.display = 'block';
+    })
+    .catch(function(e) { err.textContent = 'Preview failed: ' + e.message; err.style.display = 'block'; });
+}
+function purgeApply() {
+  var btn = document.getElementById('purge-confirm-btn');
+  var err = document.getElementById('purge-error');
+  var succ= document.getElementById('purge-success');
+  var pv  = document.getElementById('purge-preview');
+  btn.disabled = true; err.style.display = 'none'; succ.style.display = 'none';
+  fetch(apiUrl('/api/historical/purge'), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ confirmed: true })
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.error) { err.textContent = d.error; err.style.display = 'block'; btn.disabled = false; return; }
+    // Runs in the background now — the persistent banner tracks it.
+    pv.style.display = 'none';
+    _deleteWasRunning = true;
+    pollDeleteStatus();
+  })
+  .catch(function(e) { err.textContent = 'Delete failed: ' + e.message; err.style.display = 'block'; btn.disabled = false; });
 }
 </script>
 {% endblock %}

@@ -29,7 +29,7 @@ hc = types.ModuleType("ha_client")
 hc.HAClient = MagicMock
 sys.modules["ha_client"] = hc
 
-from block_store import BlockStore, open_block_store, migrate_json_to_sqlite
+from block_store import BlockStore, open_block_store
 _boot_store = BlockStore(":memory:")
 _boot_store.insert_config_period({"meters": {"electricity_main": {"meta": {
     "timezone": "UTC", "billing_day": 1, "block_minutes": 30,
@@ -38,7 +38,6 @@ _boot_store.insert_config_period({"meters": {"electricity_main": {"meta": {
 bs = types.ModuleType("block_store")
 bs.BlockStore = BlockStore
 bs.open_block_store = lambda path: _boot_store
-bs.migrate_json_to_sqlite = migrate_json_to_sqlite
 sys.modules["block_store"] = bs
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -131,6 +130,7 @@ class TestHistoricalCarbonBackfill(unittest.TestCase):
         engine._store = self._orig_store
         engine._fetch_carbon_intensity_range = self._orig_fetch
         engine.generate_charts = self._orig_gc
+        engine.set_delete_active(False)
 
     def test_attributes_historical_blocks(self):
         _insert_null_block(self.st, "2026-05-01T10:00:00", 2.0, self.cp)
@@ -150,6 +150,59 @@ class TestHistoricalCarbonBackfill(unittest.TestCase):
         self.assertEqual(_carbon_of(self.st, "2026-05-02T09:00:00"),
                          (150.0, round(3.0 * 150.0, 4)))
         self.assertTrue(self.st.get_meta(self.MARKER)["done"])
+
+    def test_completion_render_is_offloaded_not_synchronous(self):
+        # Regression: rendering charts synchronously on the loop after a large
+        # backfill stalled the HA heartbeat → reconnect → re-startup → re-render
+        # storm. The completion render must go through the OFF-loop path, never a
+        # direct on-loop generate_charts().
+        _insert_null_block(self.st, "2026-05-01T10:00:00", 2.0, self.cp)
+        engine._fetch_carbon_intensity_range = lambda pc, f, t: {
+            "2026-05-01T10:00": 200.0}
+        sync_calls = {"n": 0}
+        engine.generate_charts = lambda *a, **kw: sync_calls.__setitem__("n", sync_calls["n"] + 1)
+        offloaded = {"n": 0}
+        orig_off = engine._generate_charts_offloaded
+
+        async def _fake_offload():
+            offloaded["n"] += 1
+        engine._generate_charts_offloaded = _fake_offload
+        try:
+            n = asyncio.run(engine._run_historical_carbon_backfill())
+        finally:
+            engine._generate_charts_offloaded = orig_off
+        self.assertEqual(n, 1)
+        self.assertEqual(offloaded["n"], 1, "completion render must be offloaded")
+        self.assertEqual(sync_calls["n"], 0, "must not render synchronously on the loop")
+
+    def test_backfill_preserves_imported_source_tag(self):
+        # THE root-cause regression: the carbon backfill used to round-trip the
+        # whole row (append_block_replace) and silently wipe `source` to NULL,
+        # untagging every imported block it filled. It must now write carbon IN
+        # PLACE and leave the tag intact.
+        self.st._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+            "interpolated, imp_kwh, imp_rate, imp_cost, standing_charge, "
+            "carbon_intensity_g, source) VALUES (?,?,?,?,0,?,?,?,?,NULL,'imported_api')",
+            ("2026-05-01T10:00:00", "2026-05-01T10:00:00", "electricity_main",
+             self.cp, 2.0, 0.30, 0.60, 0.50))
+        self.st._conn.commit()
+        engine._fetch_carbon_intensity_range = lambda pc, f, t: {"2026-05-01T10:00": 200.0}
+        n = asyncio.run(engine._run_historical_carbon_backfill())
+        self.assertEqual(n, 1)
+        r = self.st._conn.execute(
+            "SELECT source, carbon_intensity_g, carbon_g FROM blocks "
+            "WHERE block_start='2026-05-01T10:00:00'").fetchone()
+        self.assertEqual(r["source"], "imported_api")     # tag SURVIVES the carbon fill
+        self.assertAlmostEqual(r["carbon_intensity_g"], 200.0)
+        self.assertAlmostEqual(r["carbon_g"], round(2.0 * 200.0, 4))
+
+    def test_paused_flag_stops_recovery(self):
+        # The kill switch: while carbon_paused, the recovery sweep stands down.
+        _insert_null_block(self.st, "2026-05-01T10:00:00", 2.0, self.cp)
+        self.st.set_meta("carbon_paused", True)
+        self.assertEqual(engine._recover_missing_carbon(), 0)
+        self.assertEqual(_carbon_of(self.st, "2026-05-01T10:00:00"), (None, None))
 
     def test_run_once_marker_short_circuits(self):
         _insert_null_block(self.st, "2026-05-01T10:00:00", 2.0, self.cp)
@@ -219,19 +272,19 @@ class TestHistoricalCarbonBackfill(unittest.TestCase):
         _insert_null_block(self.st, "2026-05-01T10:30:00", 1.0, self.cp)
         engine._fetch_carbon_intensity_range = lambda pc, f, t: {
             "2026-05-01T10:00": 200.0, "2026-05-01T10:30": 210.0}
-        real = engine.append_block_replace
+        real = engine._persist_block_carbon    # carbon now writes IN PLACE (keeps source)
         flaky = {"calls": 0}
 
-        def _flaky(block):
+        def _flaky(block, start):
             flaky["calls"] += 1
             if flaky["calls"] == 1:        # fail the first block of the pass
                 raise RuntimeError("simulated persist failure")
-            return real(block)
-        engine.append_block_replace = _flaky
+            return real(block, start)
+        engine._persist_block_carbon = _flaky
         try:
             n1 = asyncio.run(engine._run_historical_carbon_backfill())
         finally:
-            engine.append_block_replace = real
+            engine._persist_block_carbon = real
         self.assertEqual(n1, 1)                       # one persisted, one failed
         mk = self.st.get_meta(self.MARKER)
         self.assertFalse(mk.get("done"),
@@ -243,6 +296,82 @@ class TestHistoricalCarbonBackfill(unittest.TestCase):
         self.assertEqual(n2, 1)
         self.assertTrue(self.st.get_meta(self.MARKER)["done"])
         self.assertIsNone(self.st.get_missing_carbon_date_range())
+
+    def test_straggler_refetch_fills_thin_wide_window(self):
+        # A thin/empty wide-window CI response must not strand the slot: the narrow
+        # per-day straggler refetch recovers it (the Jan 1-10 gap mechanism).
+        import datetime as _d
+        _insert_null_block(self.st, "2026-05-01T10:00:00", 2.0, self.cp)
+
+        def _fetch(pc, f, t):
+            fa = _d.datetime.fromisoformat(f.replace("Z", ""))
+            ta = _d.datetime.fromisoformat(t.replace("Z", ""))
+            if (ta - fa) <= _d.timedelta(days=1):     # narrow per-day straggler
+                return {"2026-05-01T10:00": 123.0}
+            return {}                                  # wide window comes back thin
+        engine._fetch_carbon_intensity_range = _fetch
+        n = asyncio.run(engine._run_historical_carbon_backfill(window_days=13))
+        self.assertEqual(n, 1)
+        self.assertEqual(_carbon_of(self.st, "2026-05-01T10:00:00"),
+                         (123.0, round(2.0 * 123.0, 4)))
+        self.assertTrue(self.st.get_meta(self.MARKER)["done"])
+
+    def test_unfillable_pass_sets_retry_after_not_permanent(self):
+        # Nothing comes back this pass → the marker must record a retry_after
+        # cool-down (self-healing), NOT a permanent tombstone.
+        _insert_null_block(self.st, "2026-05-01T10:00:00", 2.0, self.cp)
+        engine._fetch_carbon_intensity_range = lambda pc, f, t: {}
+        n = asyncio.run(engine._run_historical_carbon_backfill())
+        self.assertEqual(n, 0)
+        mk = self.st.get_meta(self.MARKER)
+        self.assertTrue(mk["done"])
+        self.assertIn("retry_after", mk)                  # cool-down, not permanent
+        self.assertEqual(mk["unfilled_from"], "2026-05-01T10:00:00")
+
+    def test_stuck_done_marker_rearms_when_gaps_remain(self):
+        # An OLD permanent tombstone (done + unfilled_from, no retry_after) must
+        # re-arm so the gap gets another attempt — the existing-DB self-heal.
+        engine._api_import_job = {"status": "idle"}
+        _insert_null_block(self.st, "2026-05-01T10:00:00", 2.0, self.cp)
+        self.st.set_meta(self.MARKER,
+                         {"done": True, "unfilled_from": "2026-05-01T10:00:00"})
+        engine._maybe_backfill_historical_carbon()        # no running loop → re-arm then return
+        self.assertFalse(self.st.get_meta(self.MARKER)["done"])
+
+    def test_stuck_marker_respects_retry_after_cooldown(self):
+        import datetime as _d
+        engine._api_import_job = {"status": "idle"}
+        _insert_null_block(self.st, "2026-05-01T10:00:00", 2.0, self.cp)
+        future = (_d.datetime.utcnow() + _d.timedelta(hours=6)).isoformat()
+        self.st.set_meta(self.MARKER, {"done": True,
+                         "unfilled_from": "2026-05-01T10:00:00", "retry_after": future})
+        engine._maybe_backfill_historical_carbon()
+        self.assertTrue(self.st.get_meta(self.MARKER)["done"])   # still cooling down
+        past = (_d.datetime.utcnow() - _d.timedelta(hours=1)).isoformat()
+        self.st.set_meta(self.MARKER, {"done": True,
+                         "unfilled_from": "2026-05-01T10:00:00", "retry_after": past})
+        engine._maybe_backfill_historical_carbon()
+        self.assertFalse(self.st.get_meta(self.MARKER)["done"])  # cool-down elapsed → re-arm
+
+    def test_delete_active_flag_toggles(self):
+        engine.set_delete_active(True)
+        self.assertTrue(engine.delete_in_progress())
+        engine.set_delete_active(False)
+        self.assertFalse(engine.delete_in_progress())
+
+    def test_backfill_defers_while_delete_active(self):
+        # A delete/purge job is mutating blocks → the backfill must NOT kick off new
+        # work (both share the one SQLite connection). It re-arms once the delete ends.
+        engine._api_import_job = {"status": "idle"}
+        _insert_null_block(self.st, "2026-05-01T10:00:00", 2.0, self.cp)
+        self.st.set_meta(self.MARKER,
+                         {"done": True, "unfilled_from": "2026-05-01T10:00:00"})
+        engine.set_delete_active(True)
+        engine._maybe_backfill_historical_carbon()
+        self.assertTrue(self.st.get_meta(self.MARKER)["done"])   # deferred → not re-armed
+        engine.set_delete_active(False)
+        engine._maybe_backfill_historical_carbon()
+        self.assertFalse(self.st.get_meta(self.MARKER)["done"])  # delete done → re-arms
 
     def test_default_window_under_api_cap(self):
         # The Carbon Intensity API rejects >=14-day ranges (HTTP 400 — observed in
