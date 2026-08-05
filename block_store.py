@@ -2214,15 +2214,22 @@ class BlockStore:
 
     def get_device_live_coverage_start(self, meter_id: str):
         """The earliest block_start where *meter_id* has REAL (non-reconstructed)
-        data — i.e. any block whose source is not 'recorder_attributed'. This is
-        the seam where a device's live/imported history begins; recorder
-        attribution fills up to (but not into) it so the reconstructed layer butts
-        cleanly against the real one. Returns None when the device has no live
-        history at all (never configured), in which case attribution may fill the
-        full available range."""
+        import data — i.e. any block whose source is not 'recorder_attributed' AND
+        whose import is actually non-zero. This is the seam where a device's
+        live/imported history begins; recorder attribution fills up to (but not
+        into) it so the reconstructed layer butts cleanly against the real one.
+
+        Crucially we require imp_kwh > 0: a *live* block that recorded zero import
+        is a hole, not coverage (e.g. a sub-meter sensor that flat-lined at 0 for a
+        stretch while the device was really drawing — the load then sits unsplit in
+        the house remainder). Treating those leading zeros as 'not yet covered'
+        advances the seam past them so attribution can heal them from the recorder
+        instead of stopping short. Returns None when the device has no non-zero live
+        history at all, in which case attribution may fill the full available range."""
         r = self._conn.execute(
             "SELECT MIN(block_start) AS lo FROM blocks "
-            "WHERE meter_id = ? AND COALESCE(source, '') <> ?",
+            "WHERE meter_id = ? AND COALESCE(source, '') <> ? "
+            "AND COALESCE(imp_kwh, 0) > 0",
             (meter_id, self.RECORDER_ATTRIBUTED_SOURCE)).fetchone()
         return r["lo"] if r and r["lo"] else None
 

@@ -4957,6 +4957,36 @@ class TestRecorderAttributionStore(unittest.TestCase):
         # Seam is the earliest NON-attributed block — the live one, not the 2025-03-01 attributed rows.
         self.assertEqual(s.get_device_live_coverage_start("ev_charger"), "2025-03-02T00:00:00")
 
+    def test_live_coverage_seam_skips_leading_zero_holes(self):
+        s = self._store()
+        cp = s._conn.execute("SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+        # A run of LIVE ev_charger blocks that recorded zero import (a sub-meter
+        # dropout) followed by the first block with real energy. The seam must
+        # advance past the zero holes to the first non-zero live block so
+        # attribution can heal the holes rather than stop short at them.
+        with s._conn:
+            for ds, kwh in (("2026-02-12T00:00:00", 0.0),
+                            ("2026-02-13T00:00:00", 0.0),
+                            ("2026-02-14T00:00:00", 5.5)):
+                s._conn.execute(
+                    "INSERT INTO blocks (block_start, block_end, meter_id, "
+                    "config_period_id, imp_kwh, source) VALUES (?,?,?,?,?,?)",
+                    (ds, ds, "ev_charger", cp, kwh, None))
+        self.assertEqual(s.get_device_live_coverage_start("ev_charger"),
+                         "2026-02-14T00:00:00")
+
+    def test_live_coverage_seam_none_when_only_zero_live(self):
+        s = self._store()
+        cp = s._conn.execute("SELECT id FROM config_periods LIMIT 1").fetchone()["id"]
+        # Only zero-valued live blocks → no real coverage yet → seam is None so
+        # attribution may fill the full available range.
+        with s._conn:
+            s._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, "
+                "config_period_id, imp_kwh, source) VALUES (?,?,?,?,?,?)",
+                ("2026-02-12T00:00:00", "2026-02-12T00:00:00", "ev_charger", cp, 0.0, None))
+        self.assertIsNone(s.get_device_live_coverage_start("ev_charger"))
+
 
 class TestSweepRegisterGlitches(unittest.TestCase):
     """Stale-boundary phantom: a register that DIPS below its established level and
