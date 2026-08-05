@@ -499,6 +499,23 @@ class TestReviewFlagsBL18(unittest.TestCase):
             "AND meter_id='electricity_main'").fetchone()
         self.assertEqual(drift["needs_review"], 1)           # dormant drift survives
 
+    def test_dismissed_block_is_not_reflagged(self):
+        # #322: once dismissed, the dispatch reconcile must not resurrect the same
+        # ambiguous block on its next re-scan.
+        bs = "2026-07-10T16:30:00"
+        self.store.flag_block_for_review(bs, "dispatch ambiguous")
+        self.store.dismiss_review_blocks(None)               # user dismisses
+        self.assertEqual(self.store.get_review_blocks(), [])
+        # A later reconcile pass tries to flag it again — must be a no-op.
+        n = self.store.flag_block_for_review(bs, "completed (3.23 kWh) but not started")
+        self.assertEqual(n, 0)                               # nothing re-flagged
+        self.assertEqual(self.store.get_review_blocks(), []) # stays gone
+        row = self.store._conn.execute(
+            "SELECT needs_review, review_dismissed FROM blocks "
+            "WHERE block_start=? AND meter_id='electricity_main'", (bs,)).fetchone()
+        self.assertEqual(row["needs_review"], 0)
+        self.assertEqual(row["review_dismissed"], 1)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests: schema and setup
