@@ -2165,15 +2165,28 @@ def _bucket_to_row_values(_dd):
 
 
 def _blocks_data_version(store) -> str:
-    """A cheap token that changes whenever the block data changes — COUNT + newest
-    block_start. Lets the Charts UI skip a rebuild on tab-focus/poll when nothing
-    has changed (no needless blank), and refresh promptly when it has (e.g. a new
-    live half-hour finalised). Both parts are index-backed, so this is ~milliseconds.
-    (A value-only edit — reprice/settlement — doesn't move it; the 5-min TTL is the
-    backstop for those.)"""
+    """A cheap token that changes whenever the block data changes — row COUNT +
+    newest block_start + a value fingerprint (summed kWh / cost / carbon). Lets the
+    Charts and Usage-Stats UIs skip a rebuild on tab-focus/poll when nothing has
+    changed (no needless blank) and refresh promptly when it has (e.g. a new live
+    half-hour finalised).
+
+    The value fingerprint is what catches an **in-place** edit that leaves the row
+    count and newest block untouched — a reprice/settlement, a carbon backfill, or a
+    device attribution that rewrites historical blocks (e.g. healing a sub-meter
+    zero-hole moves energy off the house remainder onto the device). Without it,
+    those edits were invisible to the token and the client kept serving its stale
+    cache until the TTL expired. Every summed column lives in idx_blocks_insights,
+    so this stays a single index-only scan (~20ms over ~130k rows)."""
     row = store._conn.execute(
-        "SELECT COUNT(*) AS c, MAX(block_start) AS m FROM blocks").fetchone()
-    return f"{row['c']}:{row['m'] or ''}"
+        "SELECT COUNT(*) AS c, MAX(block_start) AS m, "
+        "ROUND(COALESCE(SUM(imp_kwh),  0), 3) AS ik, "
+        "ROUND(COALESCE(SUM(imp_cost), 0), 2) AS ic, "
+        "ROUND(COALESCE(SUM(exp_cost), 0), 2) AS ec, "
+        "ROUND(COALESCE(SUM(carbon_g), 0), 0) AS cg "
+        "FROM blocks").fetchone()
+    return (f"{row['c']}:{row['m'] or ''}:"
+            f"{row['ik']}:{row['ic']}:{row['ec']}:{row['cg']}")
 
 
 @app.route("/api/charts/data-version")
