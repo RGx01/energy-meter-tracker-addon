@@ -2605,11 +2605,28 @@ def _write_device_into_block(block: dict, device_meter_id: str,
     """Add a reconstructed device sub-meter to an existing house block and re-run
     PASS 2/3 so the device's grid share is clipped to the parent import and the
     parent remainder is re-derived. Tags ONLY the device row 'recorder_attributed'.
-    Returns False (no write) when the device is already present (never overwrite a
-    live/attributed row) or the parent isn't in the block."""
+    Returns False (no write) when the parent isn't in the block, when a *real*
+    (non-zero) device row is already present (never overwrite live/attributed
+    consumption), or when the existing row is an empty hole but there's no recorder
+    energy to put in it (nothing to heal — leave the genuine zero alone).
+
+    A device row that is present but reads ~0 import is treated as a hole, not
+    coverage: if the recorder says the device really drew energy in this slot
+    (dev_kwh > 0) we OVERWRITE the zero with the reconstructed value. This heals
+    sub-meter dropouts — a stretch where the device's own sensor flat-lined at 0
+    while the load actually sat in the house remainder — without ever clobbering a
+    real reading."""
     meters = block.get("meters") or {}
-    if device_meter_id in meters or parent_meter_id not in meters:
+    if parent_meter_id not in meters:
         return False
+    existing = meters.get(device_meter_id)
+    if existing is not None:
+        ex_kwh = ((existing.get("channels") or {}).get("import") or {}).get("kwh") or 0.0
+        if abs(float(ex_kwh)) > 1e-9:
+            return False                # real device reading present → never overwrite
+        if not (dev_kwh and float(dev_kwh) > 1e-9):
+            return False                # empty hole, but nothing to heal into it
+        # else: zero-hole + real recorder energy → fall through and overwrite it
     dev_block = {
         "meta": {"sub_meter": True, "parent_meter": parent_meter_id},
         "source": get_store().RECORDER_ATTRIBUTED_SOURCE,
