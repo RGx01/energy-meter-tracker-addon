@@ -5733,11 +5733,11 @@ class TestBlocksDataVersion(unittest.TestCase):
         conn.row_factory = sqlite3.Row
         conn.execute(
             "CREATE TABLE blocks (block_start TEXT, imp_kwh REAL, imp_cost REAL, "
-            "exp_cost REAL, carbon_g REAL)")
+            "exp_kwh REAL, exp_cost REAL, carbon_g REAL)")
         conn.executemany(
-            "INSERT INTO blocks VALUES (?,?,?,?,?)",
-            [("2026-02-12T00:00:00", 0.0, 0.0, 0.0, 0.0),
-             ("2026-02-12T00:30:00", 1.0, 20.0, 0.0, 150.0)])
+            "INSERT INTO blocks VALUES (?,?,?,?,?,?)",
+            [("2026-02-12T00:00:00", 0.0, 0.0, 0.0, 0.0, 0.0),
+             ("2026-02-12T00:30:00", 1.0, 20.0, 2.0, 0.0, 150.0)])
         conn.commit()
         return types.SimpleNamespace(_conn=conn)
 
@@ -5755,6 +5755,20 @@ class TestBlocksDataVersion(unittest.TestCase):
         # The count:max prefix is identical — proving it's the value fingerprint,
         # not the row shape, that changed.
         self.assertEqual(before.split(":")[:2], after.split(":")[:2])
+
+    def test_export_only_settlement_moves_token(self):
+        # Export settles later than import: an edit that changes ONLY exp_kwh
+        # (a DCC export settlement, no change to import) must still bust the cache,
+        # else Usage Stats keeps a stale export until the TTL.
+        import server
+        st = self._store()
+        before = server._blocks_data_version(st)
+        st._conn.execute(
+            "UPDATE blocks SET exp_kwh = 3.5 WHERE block_start = '2026-02-12T00:30:00'")
+        st._conn.commit()
+        after = server._blocks_data_version(st)
+        self.assertNotEqual(before, after)
+        self.assertEqual(before.split(":")[:2], after.split(":")[:2])  # count:max unchanged
 
     def test_no_change_keeps_token_stable(self):
         import server
