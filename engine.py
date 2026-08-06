@@ -7139,8 +7139,18 @@ def _persist_run_status(j: dict) -> None:
         return
     import json as _json
     try:
+        # The durable snapshot represents the LAST COMPLETED run, so its status
+        # MUST be terminal. The API-import path calls this while j is still
+        # 'finalising' (status flips to 'done' immediately after) — persist 'done'
+        # so a later add-on RESTART, where api_import_status falls back to this
+        # snapshot because nothing is live in memory, doesn't read back a
+        # 'finalising'/'running' status and resurrect a phantom import that locks
+        # the import page indefinitely.
+        _st = j.get("status") or "done"
+        if _st in ("finalising", "running", "rate_limited", "paused"):
+            _st = "done"
         snap = {
-            "status": j.get("status") or "done",
+            "status": _st,
             "phase": "done",
             "written": j.get("written") or {},
             "oldest": j.get("oldest") or {},

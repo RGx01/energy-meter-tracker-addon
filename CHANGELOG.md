@@ -1,5 +1,17 @@
 # Changelog
- 
+
+## [4.1.1] — 2026-08-06
+
+### Fixed
+
+- **The import page no longer gets stuck showing "A backfill is running" after an add-on restart.** When an API import finished, EMT saved a durable summary of the run so the import panel can still show "N blocks imported" on any later page load — but it captured that summary a moment too early, while the job was still in its **finalising** phase (the status flips to *done* immediately after). While the add-on kept running this was invisible, because the panel reads the durable summary *only* when no job is live in memory. After a **restart** — an HA reboot, an add-on update, a host restart, at any time after the import — there was no live job, so the panel fell back to the saved summary, read *finalising*, and (because that's a mid-run status) drew the "A backfill is running / Finishing up…" lock with **no job behind it and no way to cancel**; every reload re-read the same frozen summary, so it looked like an import that had been running for hours. The saved summary now always records a **terminal** status, and the panel **never treats a restored summary as a live run**, so a completed import stays completed across restarts — and anyone already stuck is freed on their next page load. *(Display state only — no effect on imported data or billing.)*
+
+- **Historical carbon backfill no longer stalls when a full postcode was stored.** The Carbon Intensity API accepts only the **outward** part of a postcode (e.g. `CO3`), and EMT is designed to store just that — but if a full postcode (e.g. `CO3 xxx`) reached the backfill (a legacy value, or one that slipped past normalisation), the space in it made every request fail with *"URL can't contain control characters"*, and the backfill retried the same window forever without advancing (seen as repeated "pausing, will resume" in the log). The postcode is now **normalised to the outward code at the point each request is built**, in both the live and the historical carbon paths, so any stored value works and the backfill resumes and completes. *(Carbon only — no effect on billing.)*
+
+### Changed
+
+- **Smart-charging card now shows time spent charging and the number of slots (experimental).** Each charging session gains a **time spent charging** figure and a **slots** count. The duration (`dispatch_minutes`) is the merged union of each delivered slot's **planned dispatch window, clipped to its half-hour** — the wall-clock time the car was actually dispatched, excluding the idle gaps between bursts. Planned windows carry Octopus's real sub-slot bounds where they exist (a dispatch that finished early, a short top-up), which `completedDispatches` don't (they're always 30-min slot-aligned); clipping to the slot stops a multi-hour plan bleeding across a gap. It's **rate-limit-proof** — unlike the previous energy-scaled figure (`30 × kWh ÷ fullest-slot`), which under-reported when an EV drops to a trickle near full charge, this never divides by energy. **This is experimental and still being refined:** where Octopus reports a delivered half-hour as a full 30-minute dispatch (common mid-charge) the figure reads the full slot, so it can over-read the true wall-clock time; the sub-slot *actual* charging duration only exists in the charger's own data, not the dispatch ledger, so treat the figure as "time dispatched", not a precise charge time.
+
 ## [4.1.0] — 2026-08-05
 
 ### Changed
