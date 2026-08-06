@@ -3757,6 +3757,11 @@ def _fetch_carbon_intensity(postcode: str) -> list:
     import urllib.error
     import json as _json
 
+    # Defensive: the API path takes the OUTWARD code only. A full postcode that
+    # slipped past config normalisation (e.g. 'CO3 4SE') would put a space in the
+    # URL -> "URL can't contain control characters". Normalise at the boundary so
+    # every caller is safe regardless of what's stored.
+    postcode = _normalise_postcode(postcode)
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
     url = (f"https://api.carbonintensity.org.uk/regional/intensity"
            f"/{now_iso}/fw48h/postcode/{postcode}")
@@ -3833,6 +3838,10 @@ def _fetch_carbon_intensity_range(postcode: str, from_iso: str, to_iso: str) -> 
     import urllib.request
     import json as _json
 
+    # Defensive: outward code only (see _fetch_carbon_intensity). A stored full
+    # postcode here injects a space and fails every backfill window, looping the
+    # historical backfill forever ("running for hours"). Normalise at the boundary.
+    postcode = _normalise_postcode(postcode)
     url = (f"https://api.carbonintensity.org.uk/regional/intensity"
            f"/{from_iso}/{to_iso}/postcode/{postcode}")
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
@@ -7130,8 +7139,18 @@ def _persist_run_status(j: dict) -> None:
         return
     import json as _json
     try:
+        # The durable snapshot represents the LAST COMPLETED run, so its status
+        # MUST be terminal. The API-import path calls this while j is still
+        # 'finalising' (status flips to 'done' immediately after) — persist 'done'
+        # so a later add-on RESTART, where api_import_status falls back to this
+        # snapshot because nothing is live in memory, doesn't read back a
+        # 'finalising'/'running' status and resurrect a phantom import that locks
+        # the import page indefinitely.
+        _st = j.get("status") or "done"
+        if _st in ("finalising", "running", "rate_limited", "paused"):
+            _st = "done"
         snap = {
-            "status": j.get("status") or "done",
+            "status": _st,
             "phase": "done",
             "written": j.get("written") or {},
             "oldest": j.get("oldest") or {},

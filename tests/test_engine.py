@@ -147,6 +147,32 @@ class TestImportRunStatusPersist(unittest.TestCase):
     def test_no_run_ever_stays_idle(self):
         self.assertEqual(engine.api_import_status().get("status"), "idle")
 
+    def test_finalising_snapshot_persists_as_terminal_done(self):
+        # The API-import path persists the run summary while the job is still
+        # 'finalising' (status flips to 'done' one step later). If that transient
+        # status were stored, a later add-on RESTART would read it back (in-memory
+        # idle → persisted fallback) and the import page would treat 'finalising'
+        # as a live import, locking indefinitely. The snapshot must normalise any
+        # non-terminal status to 'done'.
+        engine._persist_run_status({
+            "status": "finalising", "written": {"import": 1605}})
+        s = engine.api_import_status()
+        self.assertTrue(s.get("persisted"))
+        self.assertEqual(s["status"], "done")
+        self.assertEqual(s["phase"], "done")
+
+    def test_running_and_paused_snapshots_also_normalise(self):
+        for transient in ("running", "rate_limited", "paused"):
+            engine._persist_run_status({"status": transient,
+                                        "written": {"import": 1}})
+            self.assertEqual(engine.api_import_status()["status"], "done",
+                             f"{transient!r} must persist as terminal 'done'")
+
+    def test_terminal_statuses_are_preserved(self):
+        for terminal in ("cancelled", "error"):
+            engine._persist_run_status({"status": terminal})
+            self.assertEqual(engine.api_import_status()["status"], terminal)
+
 
 class TestDiscoverPreImportSites(unittest.TestCase):
     """Pre-import site discovery coro: reads the account, derives tenancy spans,

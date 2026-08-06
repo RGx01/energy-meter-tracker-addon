@@ -1100,6 +1100,17 @@ function _fmtDur(m){
   return r ? (h+'h '+r+'m') : (h+'h');
 }
 
+// Time actually spent charging = merged union of the completed-dispatch windows
+// (dispatch_minutes). Rate-limit-proof; falls back to the older energy-scaled
+// figure only if the newer field isn't present (pre-upgrade data).
+function _chargeTime(s){
+  return _fmtDur(s.dispatch_minutes!=null ? s.dispatch_minutes : s.charge_minutes);
+}
+function _slotsText(s){
+  var n=s.n_slots||0;
+  return n+(n===1?' slot':' slots');
+}
+
 function _chargeSummaryHtml(s){
   var win=(s.local.start.time||'??')+'–'+(s.local.end.time||'??');
   var off = _offText(s);
@@ -1107,8 +1118,8 @@ function _chargeSummaryHtml(s){
            + _chargeCurrency+s.saving.toFixed(2)+'</span>' : '';
   return _statusPill(s.status)
        + ' <strong style="font-size:15px;">'+s.kwh.toFixed(1)+' kWh</strong>'
-       + ' <span style="color:var(--muted);">· '+_cesc(win)+' · '+_fmtDur(s.charge_minutes)
-       + ' · '+off+'</span>'+save;
+       + ' <span style="color:var(--muted);">· '+_cesc(win)+' · '+_chargeTime(s)+' charging · '
+       + _slotsText(s)+' · '+off+'</span>'+save;
 }
 
 function _fillChartSVG(s){
@@ -1146,7 +1157,7 @@ function _sessionRowHtml(s){
     + '<span><strong>'+_cesc(d)+'</strong> <span style="color:var(--muted);">'+_cesc(win)+'</span></span>'
     + '<span>'+s.kwh.toFixed(1)+' kWh '+_statusPill(s.status)+'</span></div>'
     + '<div style="color:var(--muted);font-size:11px;margin-top:2px;">'
-    + _fmtDur(s.charge_minutes)+' charging · '+_offText(s)
+    + _chargeTime(s)+' charging · '+_slotsText(s)+' · '+_offText(s)
     + _cesc(save)+'</div>'
     + _fillChartSVG(s) + '</div>';
 }

@@ -4366,6 +4366,65 @@ class TestChargeSessionsBuilder(unittest.TestCase):
              self._h("2026-07-10T02:30:00", "completed", -1.5)], {}, {})[0]
         self.assertEqual(part["charge_minutes"], 45)
 
+    def test_dispatch_minutes_is_rate_limit_proof(self):
+        # Second slot delivers half the energy (EV rate-limited near full SoC) but
+        # still ran the whole half-hour. charge_minutes (energy-scaled) deflates to
+        # 45; dispatch_minutes (window union) correctly reports 60.
+        s = server._build_charge_sessions(
+            [self._h("2026-07-10T02:00:00", "completed", -3.0),
+             self._h("2026-07-10T02:30:00", "completed", -1.5)], {}, {})[0]
+        self.assertEqual(s["charge_minutes"], 45)     # energy-scaled (deflated)
+        self.assertEqual(s["dispatch_minutes"], 60)   # true wall-clock window
+        self.assertEqual(s["n_slots"], 2)
+
+    def test_dispatch_minutes_uses_planned_sub_slot_window(self):
+        # A 3-minute dispatch: the PLANNED window carries the real sub-slot bounds
+        # (15:27-15:30) while the completed row is slot-aligned. dispatch_minutes
+        # reads the planned window clipped to the slot -> 3 min, not a padded 30.
+        s = server._build_charge_sessions([
+            self._h("2026-07-10T15:00:00", "completed", -0.1),
+            self._h("2026-07-10T15:00:00", "planned", -0.1,
+                    raw_start="2026-07-10T15:27:00", raw_end="2026-07-10T15:30:00"),
+        ], {}, {})[0]
+        self.assertEqual(s["dispatch_minutes"], 3)
+
+    def test_dispatch_minutes_uses_planned_truncated_end(self):
+        # A dispatch that finished early: planned end is 04:48 (18 min into the
+        # 04:30 slot). The first slot is full (30 min), the last trims to 18.
+        s = server._build_charge_sessions([
+            self._h("2026-07-10T04:00:00", "completed", -3.0),
+            self._h("2026-07-10T04:00:00", "planned", -3.0,
+                    raw_start="2026-07-10T04:00:00", raw_end="2026-07-10T04:30:00"),
+            self._h("2026-07-10T04:30:00", "completed", -1.0),
+            self._h("2026-07-10T04:30:00", "planned", -1.0,
+                    raw_start="2026-07-10T04:30:00", raw_end="2026-07-10T04:48:00"),
+        ], {}, {})[0]
+        self.assertEqual(s["n_slots"], 2)
+        self.assertEqual(s["dispatch_minutes"], 48)   # 30 + 18, not 60
+
+    def test_dispatch_minutes_clips_multihour_plan_to_slot(self):
+        # A 2-hour planned window stamped on one delivered slot must NOT bleed past
+        # its own half-hour (the stale-plan pollution case): counts 30, not 120.
+        s = server._build_charge_sessions([
+            self._h("2026-07-10T00:30:00", "completed", -0.2),
+            self._h("2026-07-10T00:30:00", "planned", -3.4,
+                    raw_start="2026-07-10T00:30:00", raw_end="2026-07-10T02:30:00"),
+        ], {}, {})[0]
+        self.assertEqual(s["dispatch_minutes"], 30)
+
+    def test_dispatch_minutes_sums_windows_not_span(self):
+        # Two bursts bridged into one session with an idle gap: dispatch_minutes
+        # counts only the two delivered windows (60), NOT the outer span (120).
+        s = server._build_charge_sessions(
+            [self._h("2026-07-10T02:00:00", "completed", -3.0),
+             self._h("2026-07-10T03:30:00", "completed", -3.0)], {}, {})[0]  # 03:00-03:30 idle
+        self.assertEqual(s["n_slots"], 2)
+        self.assertEqual(s["dispatch_minutes"], 60)   # 2×30, gap not counted
+        from datetime import datetime as _dt
+        span = (_dt.fromisoformat(s["exact_end"])
+                - _dt.fromisoformat(s["exact_start"])).total_seconds() / 60
+        self.assertEqual(span, 120)                   # outer span is longer
+
 
 class TestUpcomingDispatches(unittest.TestCase):
     """BL-10 — _build_upcoming_dispatches surfaces future planned dispatches."""

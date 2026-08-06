@@ -901,7 +901,11 @@ function pollStatus(expectStart){
     var status = (d && d.status) || 'idle';
     // Keep polling through the post-import tail (finalising) too, so the phase
     // updates instead of the UI sitting on a frozen block count.
-    var active = (status==='running' || status==='paused'
+    // A PERSISTED snapshot (d.persisted) is only ever returned when NO job is live
+    // in memory — e.g. after an add-on restart. It must NEVER count as active, or a
+    // stored 'finalising'/'running' status resurrects a phantom lock on load with
+    // no job behind it and no way to cancel. (Un-sticks anyone already frozen.)
+    var active = !d.persisted && (status==='running' || status==='paused'
       || status==='rate_limited' || status==='finalising');
     if(active) _pollExpectUntil = 0;                 // the job has appeared; stop waiting
     var awaiting = !active && (Date.now() < _pollExpectUntil);
