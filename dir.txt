@@ -1,0 +1,18 @@
+completedDispatches for A-42B0BCA7: 11 records (times shown in Europe/London)
+
+start             end                mins     kWh  source
+08-06 00:00:00    08-06 00:30:00       30   -3.12  unknown
+08-06 00:30:00    08-06 01:00:00       30   -0.27  unknown
+08-06 01:00:00    08-06 01:30:00       30   -3.15  unknown
+08-06 01:30:00    08-06 02:00:00       30   -0.15  unknown
+08-06 02:30:00    08-06 03:00:00       30   -3.08  unknown
+08-06 03:00:00    08-06 03:30:00       30   -2.71  unknown
+08-06 03:30:00    08-06 04:00:00       30   -3.09  unknown
+08-06 04:00:00    08-06 04:30:00       30   -2.86  unknown
+08-06 04:30:00    08-06 05:00:00       30   -1.41  unknown
+08-06 05:00:00    08-06 05:30:00       30   -1.42  unknown
+08-06 05:30:00    08-06 06:00:00       30   -0.13  unknown
+
+Total completed-dispatch time on 2026-08-06: 330 min = 5.50 h
+
+Note: completedDispatches is a rolling recent window — if a date is missing, it may have aged out of the API.

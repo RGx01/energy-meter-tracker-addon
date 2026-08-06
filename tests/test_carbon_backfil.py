@@ -431,5 +431,51 @@ class TestEngineModuleSurface(unittest.TestCase):
                          "scheduler must NOT offload the worker to a thread")
 
 
+class TestCarbonUrlPostcodeNormalisation(unittest.TestCase):
+    """Regression: a stored FULL postcode (e.g. 'CO3 4SE') must never reach the
+    Carbon Intensity URL raw — the space breaks the request ("URL can't contain
+    control characters"), which used to loop the historical backfill forever. The
+    fetch functions normalise to the outward code at the URL boundary."""
+
+    def _capture_url(self, call):
+        import urllib.request
+        seen = {}
+
+        class _Resp:
+            def __enter__(self_): return self_
+            def __exit__(self_, *a): return False
+            def read(self_): return b'{"data": []}'
+
+        orig = urllib.request.urlopen
+        def _spy(req, *a, **kw):
+            seen["url"] = req.full_url if hasattr(req, "full_url") else req
+            return _Resp()
+        urllib.request.urlopen = _spy
+        try:
+            call()
+        finally:
+            urllib.request.urlopen = orig
+        return seen.get("url", "")
+
+    def test_range_fetch_strips_full_postcode_to_outward(self):
+        url = self._capture_url(
+            lambda: engine._fetch_carbon_intensity_range(
+                "CO3 4SE", "2026-06-05T00:00Z", "2026-06-18T00:00Z"))
+        self.assertNotIn(" ", url, "URL must not contain a space")
+        self.assertIn("/postcode/CO3", url)
+        self.assertNotIn("4SE", url)
+
+    def test_live_fetch_strips_full_postcode_to_outward(self):
+        url = self._capture_url(lambda: engine._fetch_carbon_intensity("CO3 4SE"))
+        self.assertNotIn(" ", url)
+        self.assertIn("/postcode/CO3", url)
+
+    def test_already_outward_code_unchanged(self):
+        url = self._capture_url(
+            lambda: engine._fetch_carbon_intensity_range(
+                "CO3", "2026-06-05T00:00Z", "2026-06-18T00:00Z"))
+        self.assertTrue(url.endswith("/postcode/CO3"))
+
+
 if __name__ == "__main__":
     unittest.main()
