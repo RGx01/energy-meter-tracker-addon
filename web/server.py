@@ -6797,7 +6797,8 @@ def _build_charge_sessions(history, rates, day_peak, slot_kwh=None,
     for r in history:
         s = slots.setdefault(r["slot_start"], {
             "started": False, "completed": None,
-            "raw_start": None, "raw_end": None, "provider": r.get("provider")})
+            "raw_start": None, "raw_end": None,
+            "pstart": None, "pend": None, "provider": r.get("provider")})
         k = r.get("kind")
         if k == "completed" and r.get("energy_kwh") is not None:
             s["completed"] = r.get("energy_kwh")
@@ -6807,6 +6808,17 @@ def _build_charge_sessions(history, rates, day_peak, slot_kwh=None,
             s["raw_start"] = r["raw_start"]
         if r.get("raw_end"):
             s["raw_end"] = r["raw_end"]
+        # The PLANNED window carries Octopus's real, sub-slot-precise dispatch bounds
+        # (e.g. a dispatch that finished early reads 04:30–04:48, and a short one
+        # 15:27–15:30) — whereas completedDispatches are padded to the 30-min slot.
+        # Octopus re-plans continuously, but once a slot completes its planned row
+        # stops updating, so this is the FROZEN last plan for that slot. Tracked
+        # separately and used (clipped per slot) for dispatch_minutes below.
+        if k == "planned":
+            if r.get("raw_start"):
+                s["pstart"] = r["raw_start"]
+            if r.get("raw_end"):
+                s["pend"] = r["raw_end"]
 
     # Delivered slots only — energy that actually flowed.
     delivered = sorted(k for k, v in slots.items() if v["completed"] is not None)
@@ -6830,6 +6842,35 @@ def _build_charge_sessions(history, rates, day_peak, slot_kwh=None,
         exact_end = max(
             (slots[k]["raw_end"] or (_dt.fromisoformat(k) + _td(minutes=30)).isoformat())
             for k in grp)
+        # Time actually spent charging = the merged UNION of each delivered slot's
+        # PLANNED dispatch window, CLIPPED to that slot. Planned windows carry
+        # Octopus's real sub-slot bounds (a dispatch that finished early reads
+        # 04:30–04:48, not a padded 04:30–05:00; a 3-minute top-up reads 15:27–15:30)
+        # where completedDispatches are always slot-aligned. Clipping to the slot
+        # keeps a multi-hour plan from bleeding across a gap into an un-delivered
+        # half-hour, and only DELIVERED slots are counted, so idle gaps between
+        # bursts are excluded. Rate-limit-proof: never divides by energy. Falls back
+        # to the completed/slot bounds when no planned window was captured.
+        _ivs = []
+        for k in grp:
+            _ks = _dt.fromisoformat(k)
+            _ke = _ks + _td(minutes=30)
+            _a = _dt.fromisoformat(slots[k]["pstart"] or slots[k]["raw_start"] or k)
+            _b = _dt.fromisoformat(
+                slots[k]["pend"] or slots[k]["raw_end"] or _ke.isoformat())
+            _a = max(_a, _ks)   # clip to this half-hour so a long plan can't bleed
+            _b = min(_b, _ke)
+            if _b > _a:
+                _ivs.append((_a, _b))
+        _ivs.sort()
+        _merged = []
+        for _a, _b in _ivs:
+            if _merged and _a <= _merged[-1][1]:
+                _merged[-1] = (_merged[-1][0], max(_merged[-1][1], _b))
+            else:
+                _merged.append((_a, _b))
+        dispatch_minutes = round(
+            sum((_b - _a).total_seconds() for _a, _b in _merged) / 60.0)
         kwh = op = pk = saving = 0.0
         started_slots = 0
         fill = []
@@ -6863,6 +6904,7 @@ def _build_charge_sessions(history, rates, day_peak, slot_kwh=None,
             "started_slots": started_slots, "status": "completed",
             "off_peak_kwh": round(op, 3), "peak_kwh": round(pk, 3),
             "charge_minutes": charge_min,
+            "dispatch_minutes": dispatch_minutes,
             "saving": round(saving, 4) if saving > 1e-9 else None,
             "provider": slots[first]["provider"],
             "fill": fill,
