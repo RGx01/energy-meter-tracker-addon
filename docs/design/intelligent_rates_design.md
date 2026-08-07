@@ -1,5 +1,7 @@
 # EMT — Intelligent Tariff Dispatch-Aware Rates (3.0.0)
 
+> _Status: Shipped — design note kept for rationale; the code is the source of truth._
+
 **Status:** BUILT (compute-and-log), validated live against a real Intelligent
 Octopus Go / myenergi Zappi account. Capture + overlay are deployed and
 exercised; the apply flag is still OFF pending a live soak. Grounded in the

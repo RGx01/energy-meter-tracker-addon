@@ -1,5 +1,7 @@
 # Historical Device Attribution — Design Spike
 
+> _Status: Shipped — design note kept for rationale; the code is the source of truth._
+
 Reconstruct **device-level usage (and, conditionally, cost)** for periods *before*
 EMT was recording — or before a device sensor was configured — by blending three
 data sources EMT can already reach, and reusing EMT's live apportionment so the

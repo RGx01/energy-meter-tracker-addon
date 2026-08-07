@@ -1,5 +1,7 @@
 # Data Management — 4.0.0 vision & roadmap
 
+> _Status: Shipped — design note kept for rationale; the code is the source of truth._
+
 Living doc. Captures the direction for Data Management and the associated chart/UX
 work, so we can sequence it rather than build piecemeal. Add to it freely.
 

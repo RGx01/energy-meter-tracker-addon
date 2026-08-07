@@ -1,5 +1,7 @@
 # Historical Import Wizard — Design
 
+> _Status: Shipped — design note kept for rationale; the code is the source of truth._
+
 A guided, resumable flow that walks the user through reconstructing pre-EMT
 history — mirroring the first-run **setup wizard** pattern. It orchestrates the
 read-only spike primitives (already built) and adds the writes, the CSV

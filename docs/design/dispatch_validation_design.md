@@ -1,5 +1,7 @@
 # Dispatch validation — over-report guard v2 (design note)
 
+> _Status: Shipped — design note kept for rationale; the code is the source of truth._
+
 **Status:** design note, **not yet built**. Captures the decision to validate
 smart-charge slots against the dispatch **lifecycle** (planned → started →
 completed) rather than the meter-draw floor alone. Prompted by a real over-credit

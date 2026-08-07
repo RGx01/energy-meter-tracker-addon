@@ -1,5 +1,7 @@
 # Historical Data Import — Design
 
+> _Status: Shipped — design note kept for rationale; the code is the source of truth._
+
 Import energy history from *before* EMT was recording — and, on top of it,
 reconstruct device attribution for periods before a device was configured —
 from two sources: the **Octopus API** and a **defined CSV**. House consumption
