@@ -4425,6 +4425,39 @@ class TestChargeSessionsBuilder(unittest.TestCase):
                 - _dt.fromisoformat(s["exact_start"])).total_seconds() / 60
         self.assertEqual(span, 120)                   # outer span is longer
 
+    def test_est_charge_minutes_peak_slot_real_charge_2026_08_07(self):
+        # Real prod charge (7 Aug 2026): 5 delivered slots, 11.41 kWh, one 0.26 kWh
+        # trickle slot. Peak slot 3.18 kWh -> 6.36 kW active power; est charge time
+        # = 60 * 11.41 / 6.36 = 108 min (1.79 h), matching the measured 1.77 h — vs
+        # a 150-min dispatched window (01:00-03:00 + 04:30-05:00, gap excluded).
+        s = server._build_charge_sessions([
+            self._h("2026-08-07T01:00:00", "completed", -3.18),
+            self._h("2026-08-07T01:30:00", "completed", -0.26),   # trickle
+            self._h("2026-08-07T02:00:00", "completed", -3.12),
+            self._h("2026-08-07T02:30:00", "completed", -2.15),
+            self._h("2026-08-07T04:30:00", "completed", -2.70),   # 120m gap, bridged
+        ], {}, {})[0]
+        self.assertEqual(s["n_slots"], 5)
+        self.assertEqual(s["dispatch_minutes"], 150)              # windows, gap excluded
+        self.assertEqual(s["active_kw"], 6.36)                    # 2 × fullest slot
+        self.assertEqual(s["est_charge_minutes"], 108)           # ≈1.79 h
+        # Invariant: charging can never exceed time dispatched.
+        self.assertLessEqual(s["est_charge_minutes"], s["dispatch_minutes"])
+
+    def test_est_charge_minutes_none_without_anchor_slot(self):
+        # A trickle-only session has no slot full enough to infer power → no estimate
+        # (the card falls back to showing only the dispatched window).
+        s = server._build_charge_sessions(
+            [self._h("2026-07-10T02:00:00", "completed", -0.2)], {}, {})[0]
+        self.assertIsNone(s["est_charge_minutes"])
+        self.assertIsNone(s["active_kw"])
+
+    def test_est_charge_minutes_never_exceeds_dispatched(self):
+        # Even a single full slot: est is clamped to the dispatched window.
+        s = server._build_charge_sessions(
+            [self._h("2026-07-10T02:00:00", "completed", -3.0)], {}, {})[0]
+        self.assertLessEqual(s["est_charge_minutes"], s["dispatch_minutes"])
+
 
 class TestUpcomingDispatches(unittest.TestCase):
     """BL-10 — _build_upcoming_dispatches surfaces future planned dispatches."""
@@ -4543,6 +4576,28 @@ class TestChargeSessionsAPI(unittest.TestCase):
         self.assertAlmostEqual(s["off_peak_kwh"], 6.0, places=3)
         self.assertIn("local", s)
         self.assertIn("upcoming", d)
+
+    def test_fill_slot_labels_are_wall_clock_not_utc(self):
+        # Each fill slot carries a site-tz `local_time` so the bar-chart labels match
+        # the summary window instead of reading an hour off under BST. Stored slot is
+        # UTC; local_time is the Europe/London conversion.
+        from datetime import datetime, timezone, timedelta
+        from zoneinfo import ZoneInfo
+        store = _make_test_store([])
+        base = (datetime.now(timezone.utc).replace(tzinfo=None)
+                - timedelta(days=1)).replace(hour=1, minute=0, second=0, microsecond=0)
+        slot = base.isoformat()
+        store.record_dispatch_history(slot, "completed", provider="Myenergi", energy_kwh=-3.0)
+        store._conn.execute(
+            "INSERT INTO blocks (block_start,block_end,meter_id,config_period_id,"
+            "imp_kwh,imp_rate) VALUES (?,?,?,1,3.0,0.05)", (slot, slot, "electricity_main"))
+        store._conn.commit()
+        d = make_client(store=store).get("/api/charge-sessions").get_json()
+        f = d["sessions"][0]["fill"][0]
+        exp = (datetime.fromisoformat(slot).replace(tzinfo=ZoneInfo("UTC"))
+               .astimezone(ZoneInfo("Europe/London")).strftime("%H:%M"))
+        self.assertEqual(f["local_time"], exp)          # wall-clock, tz-correct
+        self.assertEqual(f["slot"][11:16], "01:00")     # underlying value stays UTC
 
     def test_returns_upcoming_planned(self):
         from datetime import datetime, timezone, timedelta

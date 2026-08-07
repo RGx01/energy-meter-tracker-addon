@@ -75,7 +75,23 @@ EMT is built on Kraken (Octopus's platform), and other suppliers (EDF, etc.) run
 - The API endpoint is already configurable — `KrakenAPIClient(base_url, graphql_url)`, stored via `save_kraken_credentials(..., base_url)` or the `KRAKEN_BASE_URL` env var.
 - Supplier capability is gated in one place — `engine._API_CAPABLE_SUPPLIERS` / `supplier_is_api_capable()`, mirroring the client `WIZ_SUPPLIERS` registry.
 
-The main things a new supplier needs are a different **auth shape** (Octopus uses an API key; others use email + password with `obtainKrakenToken`), possibly **GraphQL-only** consumption (no Octopus REST `/v1/` surface), and turning off **GB-only** features (DCC settlement, UK carbon) via capability flags. If you want to work on this, open an issue first — a shared `SupplierProfile` seam is the intended approach and worth agreeing before coding.
+The main thing a new supplier needs is a different **auth shape**. Octopus authenticates with an API key; other Kraken suppliers (EDF, etc.) log in with **email + password**:
+
+```graphql
+obtainKrakenToken(input: { email, password }) { token refreshToken refreshExpiresIn }
+obtainKrakenToken(input: { refreshToken })    { token refreshToken refreshExpiresIn }   # refresh before expiry
+```
+
+You don't have to rewrite the rest of the client to support that. After an email/password login you can **mint an API key** and reuse the existing API-key path:
+
+```graphql
+query    { viewer { liveSecretKey } }      # read the account's current key
+mutation { regenerateSecretKey { key } }   # mint one if there isn't one
+```
+
+So the clean approach is an **auth strategy** on the supplier profile (`api_key` vs `email_password`); the `email_password` strategy logs in, mints/reads the key, and hands the rest of the stack the same key Octopus uses. The GraphQL query shapes, the tariff-code grammar (`E-1R-PRODUCT-REGION`) and the Intelligent dispatch model are shared across Kraken suppliers, so they need little or no change. GB-specific features (DCC settlement, UK carbon) should be gated by capability flags for any non-GB supplier.
+
+If you want to work on this, open an issue first — a shared `SupplierProfile` seam is the intended approach and worth agreeing before coding. (Reference: the EDF fork of BottleCapDave's Octopus integration does exactly the email/password + mint-key dance.)
 
 ## Questions
 

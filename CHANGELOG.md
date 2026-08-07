@@ -1,5 +1,13 @@
 # Changelog
 
+## [4.1.2] — 2026-08-07
+
+### Changed
+
+- **Smart-charging card now estimates actual charging time, shown next to the dispatched window (experimental).** The merged dispatch-window figure the card used to label "charging" is now labelled **"dispatched"** (the time the car was dispatched, at half-hour granularity), and a separate **"≈ charging"** estimate sits beside it. The estimate infers the car's active charge power from the *fullest* delivered half-hour and divides total delivered energy by it — a car-agnostic, rate-limit-proof read of how long it actually charged. On a real overnight charge (5 slots, 11.41 kWh, ~6.4 kW) it showed **≈1h 47m against a measured 1h 46m**, where the dispatched window read 2h 30m — the gap being a trickle half-hour that counts as a full 30 minutes dispatched but was only ~2 minutes of real charging. Guards keep it honest: it appears only when a slot was full enough to anchor the power, is clamped to a plausible charger ceiling, and can never exceed the dispatched window. Still **experimental** — a charge that ends on a long low-power taper will read low, so treat it as an estimate, not a meter.
+
+- **Smart-charging card's per-slot chart now shows local time, not UTC.** The expandable half-hour bars (and their tooltips) labelled each slot with the raw UTC time, so under British Summer Time they read an hour behind the session's start/end window (which was already local). They now use the same site-timezone conversion as the rest of the card, so a 02:00 BST slot reads 02:00 everywhere. Display only — stored data is unchanged.
+
 ## [4.1.1] — 2026-08-06
 
 ### Fixed

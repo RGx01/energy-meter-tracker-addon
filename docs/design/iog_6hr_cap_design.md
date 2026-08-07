@@ -1,7 +1,5 @@
 # Intelligent Octopus 6-hour-cap tariff (IOG-SMB-TOU) — design note
 
-> _Status: Draft — not yet built (BL-9)._
-
 ## Background
 Octopus is migrating Intelligent Octopus Go customers to a new time-of-use
 tariff that introduces a **daily 6-hour cap** on off-peak EV charging. The tariff
@@ -204,3 +202,130 @@ estimate, billed cost as the tie-breaker on the boundary slot at settlement.
 - Does EV-peak (beyond cap) still apply inside the standard night window, or does
   night always win?
 - How does this map onto EMT's whole-house main meter vs the EV sub-meter?
+
+---
+
+## Step 2 addendum (2026-08-07) — duration estimator, the user switch, rate-flip & display
+
+Folds in the 4.1.1 charge-duration work and the switch/rate-flip/display thinking.
+**Still unvalidated — this account is not on the capped tariff, so nothing below is
+checked against a real capped bill.** The completed-window capture prerequisite
+(BL-11) is now shipped, so the data is available to build on.
+
+### A. Keep two different "hours" separate
+- **Cap-hours (the £ basis, unchanged):** union of `completed` dispatch windows per noon→noon day. Decides which EV slots bill `ev_device_off_peak` vs `ev_device_peak`.
+- **Actual charging time (display / cross-check only, NOT a billing input):** the new estimator below. It answers "how long did the car actually charge", which is *not* the same as cap-hours and must never be wired into pricing.
+
+### B. Refined actual-charging estimator (validated 7 Aug 2026)
+```
+active_kW = max over delivered slots of (slot_kWh / 0.5h)     # fullest slot ≈ true charge power
+est_charge_hours = total_delivered_kWh / active_kW
+```
+Use the **peak** slot, not an average — a fully-saturated slot yields exactly the
+active power; partial slots read low, so the max is the tightest estimate and an
+average biases the time high. Carries the invariant
+`est_charge_hours ≤ dispatch_minutes ≤ n_slots × 0.5h` (charging can't exceed time
+dispatched) — worth a test assertion.
+
+**7 Aug prod charge (5 slots, 11.41 kWh):** peak slot 6.36 kW → **est 1.79 h** vs a
+**measured 1.77 h** (±1 min). The window figure (`dispatch_minutes`) read 2.50 h —
+a 43% over-read, almost all of it one 0.26 kWh trickle slot counted as a full 30 min.
+Guards: needs one near-full slot to anchor the power; clamp inferred power to a sane
+ceiling (~7.4 kW 1-phase / 22 kW 3-phase) so a spike slot can't collapse the estimate;
+if no slot anchors, fall back to the window figure labelled an **upper bound**.
+
+**Its role in the cap:** it's the honest card figure, and a **cross-check** — a large
+gap between cap-hours (dispatched) and est charging hours is the under-delivery
+signature (OE-acknowledged dispatch the car barely took), exactly the case that can
+spend cap for ~no charging. It doesn't move £; billed cost still does.
+
+### C. No user switch — detect the tariff, let billed cost be the safety net
+EMT already **identifies the capped tariff by signature**: a migrated meter drops
+`standard-unit-rates`, and the `IOG-SMB-TOU-…` product/tariff code is visible on the
+agreement (engine.py). That is a reliable enablement signal, so **no manual
+`enforce_intelligent_cap` toggle is needed** — cap handling turns on automatically
+for periods whose tariff code is the capped product, and stays off for everyone else.
+
+This drops BCD's opt-in, and it's safe to do so because EMT's safety net is different
+from BCD's: **settled billed cost is authoritative**. BCD keeps the switch off
+because a wrong cap *rule* would misprice with nothing to catch it; EMT only uses the
+cap model to **predict live/provisional** prices, and the Measurements billed cost
+re-rates every slot at settlement via the verify pass. So a slightly-wrong live
+estimate self-corrects to the penny — the tariff code is enough to gate it, and the
+bill is the backstop instead of a human toggle.
+
+- **Storage:** the capped-tariff flag is **derived from the config period's tariff
+  code**, not a stored boolean — one source of truth, no drift. Cap params (6 h,
+  noon→noon) stay constants until OE confirms.
+- A tariff change over time is already a new config period, so enablement follows the
+  period timeline for free.
+
+### D. Rate-flip mechanics (capped tariff detected, EV sub-meter only)
+Per noon→noon cap-day, walking the EV sub-meter's dispatched slots in time order:
+1. Accumulate cap-hours = running union of `completed` dispatch windows.
+2. Slot fully **within** 6 h → `ev_device_off_peak`.
+3. Slot fully **beyond** 6 h → `ev_device_peak`.
+4. **Boundary slot** (running total crosses 6 h inside it) → *settled:* the
+   `recover_measurement_costs` billed cost adjudicates; *live:* price off-peak
+   provisionally and correct at settlement.
+The **house remainder stays on day/night general rates** throughout — the cap only
+touches the EV portion. **Settled billed cost is always the final arbiter** (accuracy
+rule): the cap computation is a *predictor* for live/provisional blocks; once
+Measurements returns the real per-slot cost, trust it and reconcile. The existing
+deferred verify pass is the right vehicle.
+
+### E. Display in billing & charts (capped tariff only)
+- **Smart-charging card:** surface cap consumption — e.g. "IOG cap: 4.2 of 6 h used" or "1.1 h over cap → EV-peak" — **paired with the actual-charging estimate** so the user sees dispatched-vs-charged, not one misleading number.
+- **Billing breakdown:** split the EV sub-meter cost into off-peak vs EV-peak portions, with a **distinct line/colour for the capped (peak) kWh**, so a peak-priced *overnight* slot reads as "over the cap", not as an error.
+- **Charts (rate line):** the EV rate line **steps up to `ev_device_peak`** for beyond-cap slots, with a marker on the cap-crossing; the day/night general lines are unaffected.
+- **Provisional marker:** live/pre-settlement capped slots flagged "provisional — may re-rate at settlement", cleared when billed cost lands.
+- When the tariff isn't the capped one, **none of this renders** — the card/charts stay exactly as today.
+
+### E½. The "all-red-until-the-schedule-completes" problem (observed live)
+**Symptom (7 Aug):** during an active charge, before the dispatch schedule was complete, every slot showed **red / priced at peak**, then flipped to off-peak once the schedule resolved. That red→green flash reads as "you're being overcharged" and is the card's worst live behaviour.
+
+**Cause:** pricing **defaults a slot to peak** and only reprices it off-peak once a dispatch is *known* for it (planned/started/completed). At the leading edge of a live charge the dispatch data hasn't landed yet, so the slot sits at the peak default until the overlay catches up — the same leading/edge-slot lag the verify pass fixes at settlement, but here it's visible live on the card.
+
+**Fix — flip the live default to off-peak-provisional inside an active dispatch:**
+- If a slot falls inside an **active planned/started dispatch window** (a smart charge in progress), price/label it **off-peak *provisionally*** rather than peak. On IOG the overwhelming default for a dispatched slot is off-peak — predict that, not the exception.
+- Give provisional slots their **own visual state** — not the red peak colour and not the solid confirmed-off-peak colour (hatched/amber "pending"). **Red must only ever mean a *confirmed* peak / over-cap slot**, never "not known yet".
+- The estimate / `dispatch_minutes` / slot count keep counting **completed** only; provisional in-progress slots are shown but flagged, not folded into totals.
+- At settlement the billed cost confirms each slot → provisional clears to confirmed (off-peak, or EV-peak if genuinely over the 6 h cap).
+
+Net: the card should move **peak → provisional-offpeak (charge starts) → confirmed (settles)**, never **peak → offpeak**. Under the cap, the rare genuine EV-peak slot (beyond 6 h) then becomes the *only* red an overnight charge ever shows — exactly the signal we want it to carry.
+
+### E¾. Billing model confirmed live (2026) — and why it favours EMT
+Verified against Octopus's own 2026 material (Charge Cap live ~March 2026; off-peak
+cuts April 2026):
+- **The 4-rate split is real and live:** house on day/night, EV on
+  `ev_device_off_peak`/`ev_device_peak` — exactly this doc's four buckets. Whole-home
+  off-peak window is 23:30–05:30; the 6 h cap applies to **EV smart-charging only**.
+- **The bill does NOT itemise EV.** Octopus rates the split internally but shows **no
+  separate EV line** on the statement — it tells EV drivers to use their **Ohme app**
+  for charging costs. **This is the gap EMT fills:** reconstruct and display the
+  house-vs-EV breakdown Octopus withholds, for **any** charger, not just Ohme. The
+  split-billing news makes EMT *more* useful, not redundant.
+
+**Boundary-slot mechanics, restated with this in mind.** Because a single HH can carry
+**two rates at once** (house portion at day/night + EV portion at an EV rate), a mixed
+HH is *always* an effective-rate blend — the 6 h-boundary slot is just the one where
+the **EV** rate transitions mid-slot. Consequences for EMT:
+- EMT already prices per-portion (EV grid-share vs house remainder), so mixed/boundary
+  HHs are the same shape it handles today — not a new case.
+- The **settled per-HH cost (Measurements) is authoritative** and encodes whatever OE
+  actually did on the boundary; EMT reads it, never recomputes it.
+- **Display rule:** never snap a mixed/boundary HH to a single rate bucket — show its
+  **effective p/kWh**. Live, predict provisional off-peak for the EV portion and let
+  settlement correct.
+
+**Watch items (unconfirmed):**
+- *"OE stopping PDF bills"* — **not verified** (Aug 2026 search found the split + cap,
+  no PDF-withdrawal). Likely a conflation of "no itemised EV on the bill". If true, it
+  only affects the **historical** bill→CSV reconstruction (`bill_parser`), not live
+  billing. Confirm with a firm source before acting.
+- *EV cost via API* — OE clearly computes the EV split; if it ever surfaces an EV-rated
+  cost field, EMT could read it authoritatively instead of estimating. Opportunity, not
+  threat — watch the schema (the deprecation CI would flag additions).
+
+### F. Updated open question
+- **Dispatched-window hours vs actual-charging hours for the cap?** Today's data shows they diverge materially (2.50 h dispatched vs 1.79 h charged on one charge). The design keys the cap on *completed windows* (dispatched), but the estimator now lets EMT **test which one OE's billed cost actually matches**, the first day this account (or a tester) runs on the capped tariff and exceeds 6 h. Detection is by tariff code; billed cost reconciles live estimates at settlement, so no manual enforcement gate is needed.
