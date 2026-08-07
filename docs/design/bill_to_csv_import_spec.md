@@ -1,5 +1,7 @@
 # Octopus bill → EMT CSV import — spec
 
+> _Status: Shipped — design note kept for rationale; the code is the source of truth._
+
 Reads Octopus PDF bills and produces CSVs EMT imports (Historical Import → CSV).
 
 > **Placement (revised):** the parser now lives **inside EMT** as `bill_parser.py`,

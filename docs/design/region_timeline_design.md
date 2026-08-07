@@ -1,5 +1,7 @@
 # Region timeline for historical carbon — design sketch
 
+> _Status: Shipped — design note kept for rationale; the code is the source of truth._
+
 *Status: design sketch (3.5.1+). Prerequisite for "historical carbon for imported blocks" (see ROADMAP 3.5.1). Written against the 3.5.0 schema.*
 
 ## The 3-stage historical backfill

@@ -1,5 +1,7 @@
 # EMT 3.x — Data-Source Mode & Billing-Source UI Design
 
+> _Status: Shipped — design note kept for rationale; the code is the source of truth._
+
 **Status:** DRAFT for review. No code written yet — this is the spec to refine
 before building next session.
 

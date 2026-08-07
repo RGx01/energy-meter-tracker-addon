@@ -1,5 +1,7 @@
 # EMT V3 Setup Wizard — Survey + BCD Walkthrough Design
 
+> _Status: Shipped — design note kept for rationale; the code is the source of truth._
+
 Status: DESIGN AGREED, build next turn. Foundation (mode storage, routes, Mini
 gating, credential file store, base survey/credentials steps) already built &
 tested (813 green). This document refines the wizard flow per the V3 refinement
