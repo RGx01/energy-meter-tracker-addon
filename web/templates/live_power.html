@@ -1100,11 +1100,27 @@ function _fmtDur(m){
   return r ? (h+'h '+r+'m') : (h+'h');
 }
 
-// Time actually spent charging = merged union of the completed-dispatch windows
+// Time DISPATCHED = merged union of the completed-dispatch windows
 // (dispatch_minutes). Rate-limit-proof; falls back to the older energy-scaled
 // figure only if the newer field isn't present (pre-upgrade data).
 function _chargeTime(s){
   return _fmtDur(s.dispatch_minutes!=null ? s.dispatch_minutes : s.charge_minutes);
+}
+// ≈CHARGING estimate = delivered energy ÷ inferred active power (fullest slot).
+// Present when the session had a slot full enough to anchor the power; else null.
+function _estChargeTime(s){
+  return (s.est_charge_minutes!=null) ? _fmtDur(s.est_charge_minutes) : null;
+}
+// Combined label: "≈1h 47m charging · 2h 30m dispatched", or just the dispatched
+// window when there's no anchor slot to estimate from.
+function _chargeLabel(s){
+  var est=_estChargeTime(s), disp=_chargeTime(s);
+  return est ? ('≈'+est+' charging · '+disp+' dispatched') : (disp+' dispatched');
+}
+// Info affordance explaining the two figures (native tooltip; shown on the summary only).
+var _CHARGE_HELP='Dispatched: the time Octopus had your car in a smart-charge window (recorded at half-hour granularity). ≈ Charging: an estimate of how long it actually drew power — energy delivered ÷ its peak charging rate. The two differ when a slot only charged briefly. As an estimate it assumes steady charging, so a slow low-power top-up near full can read a little low.';
+function _chargeHelp(){
+  return ' <span title="'+_CHARGE_HELP+'" style="cursor:help;opacity:0.55;" aria-label="What do these times mean?">ⓘ</span>';
 }
 function _slotsText(s){
   var n=s.n_slots||0;
@@ -1118,7 +1134,7 @@ function _chargeSummaryHtml(s){
            + _chargeCurrency+s.saving.toFixed(2)+'</span>' : '';
   return _statusPill(s.status)
        + ' <strong style="font-size:15px;">'+s.kwh.toFixed(1)+' kWh</strong>'
-       + ' <span style="color:var(--muted);">· '+_cesc(win)+' · '+_chargeTime(s)+' charging · '
+       + ' <span style="color:var(--muted);">· '+_cesc(win)+' · '+_chargeLabel(s)+_chargeHelp()+' · '
        + _slotsText(s)+' · '+off+'</span>'+save;
 }
 
@@ -1132,7 +1148,8 @@ function _fillChartSVG(s){
     var h=(x.kwh/max)*(base-6);
     var xx=i*step+4, bw=Math.max(step-6,6);
     var col=x.off_peak?'#00d4aa':'#ff6b6b';
-    var t=_cesc(x.slot.substr(11,5));
+    // Wall-clock (site tz) label, server-provided; fall back to UTC for old data.
+    var t=_cesc(x.local_time || x.slot.substr(11,5));
     bars+='<rect x="'+xx.toFixed(1)+'" y="'+(base-h).toFixed(1)+'" width="'+bw.toFixed(1)
         +'" height="'+Math.max(h,1).toFixed(1)+'" rx="2" fill="'+col+'"/>';
     // Full-height, full-width transparent hit target so the tooltip comes up
@@ -1157,7 +1174,7 @@ function _sessionRowHtml(s){
     + '<span><strong>'+_cesc(d)+'</strong> <span style="color:var(--muted);">'+_cesc(win)+'</span></span>'
     + '<span>'+s.kwh.toFixed(1)+' kWh '+_statusPill(s.status)+'</span></div>'
     + '<div style="color:var(--muted);font-size:11px;margin-top:2px;">'
-    + _chargeTime(s)+' charging · '+_slotsText(s)+' · '+_offText(s)
+    + _chargeLabel(s)+' · '+_slotsText(s)+' · '+_offText(s)
     + _cesc(save)+'</div>'
     + _fillChartSVG(s) + '</div>';
 }

@@ -97,6 +97,8 @@ Feed the existing detection into the BL-6 notification region (persistent, `warn
 
 **Bright (Hildebrand / Glow) API as a DCC consumption source** — use `api.glowmarkt.com` as an additional source of DCC half-hourly consumption, giving non-Octopus GB smart-meter owners the same block-resolution data. Pluggable alongside Kraken, feeding the same `imp_kwh_api`/`exp_kwh_api` settlement path (and BL-8 backfill).
 
+**Non-Octopus Kraken suppliers (EDF, etc.)** — EDF runs on Kraken, so an EDF account is reachable through nearly the same GraphQL API. Scoped, shovel-ready plan (auth strategy + consumption route, behind a `SupplierProfile` seam; Octopus unchanged) in **`docs/edf_supplier_support_design.md`**. Blocked only on a real EDF account for bill reconciliation — no EMT tester yet, so unvalidated. Endpoint + auth quirks (email/password → `regenerateSecretKey`, which invalidates existing keys) captured in the note.
+
 **Gas meters** — extend the engine to gas alongside electricity. Needs a design spike: m³/ft³ with calorific-value conversion, different billing periods, slower sensor updates.
 
 ---

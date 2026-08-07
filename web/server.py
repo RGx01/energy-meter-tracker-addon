@@ -6893,10 +6893,25 @@ def _build_charge_sessions(history, rates, day_peak, slot_kwh=None,
             if slots[k]["started"]:
                 started_slots += 1
             fill.append({"slot": k, "kwh": round(v, 3), "off_peak": is_op})
-        # Effective charge time: each half-hour scaled by how full it was vs the
-        # session's fullest (≈ full-power) slot, i.e. 30 * kWh / max_slot_kWh.
+        # ≈charging ESTIMATE: infer the car's active power from the FULLEST
+        # delivered half-hour (a fully-saturated slot ≈ true charge power) and
+        # divide total delivered energy by it — the peak-slot form of energy÷power
+        # (algebraically 30 × kWh ÷ max_slot_kWh). Validated 2026-08-07: 5 slots,
+        # 11.41 kWh, peak 6.36 kW → 1.79 h vs a measured 1.77 h. This is a tighter
+        # "how long did it actually charge" than the dispatched window; the two are
+        # shown side by side (est ≤ dispatched always). Guards: need a real anchor
+        # slot to infer power (else leave None — card shows only the window); clamp
+        # inferred power to a plausible ceiling so a glitch slot can't crash the
+        # time; never exceed the dispatched window.
         max_e = max((f["kwh"] for f in fill), default=0.0)
         charge_min = round(30.0 * kwh / max_e) if max_e > 1e-9 else 0
+        _ANCHOR_KWH = 0.4    # ~0.8 kW half-hour — below this we can't infer power
+        _MAX_KW = 25.0       # plausibility ceiling for a domestic charger
+        active_kw = min(round(2.0 * max_e, 2), _MAX_KW)
+        if max_e >= _ANCHOR_KWH and active_kw > 1e-9:
+            est_charge_minutes = min(round(60.0 * kwh / active_kw), dispatch_minutes)
+        else:
+            active_kw = est_charge_minutes = None
         out.append({
             "start": first, "end": end,
             "exact_start": exact_start, "exact_end": exact_end,
@@ -6905,6 +6920,8 @@ def _build_charge_sessions(history, rates, day_peak, slot_kwh=None,
             "off_peak_kwh": round(op, 3), "peak_kwh": round(pk, 3),
             "charge_minutes": charge_min,
             "dispatch_minutes": dispatch_minutes,
+            "est_charge_minutes": est_charge_minutes,
+            "active_kw": active_kw,
             "saving": round(saving, 4) if saving > 1e-9 else None,
             "provider": slots[first]["provider"],
             "fill": fill,
@@ -7085,6 +7102,10 @@ def api_charge_sessions():
         for s in sessions + upcoming:
             s["local"] = {
                 "start": _loc(s["exact_start"]), "end": _loc(s["exact_end"])}
+            # Localise each per-slot label too (UTC->site tz), so the fill-chart bar
+            # times match the summary window instead of reading an hour off under BST.
+            for f in s.get("fill", []):
+                f["local_time"] = _loc(f["slot"])["time"]
 
         return jsonify({"sessions": sessions, "upcoming": upcoming,
                         "has_data": True, "currency": currency})
