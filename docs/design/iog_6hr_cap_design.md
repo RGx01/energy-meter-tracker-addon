@@ -1,5 +1,7 @@
 # Intelligent Octopus 6-hour-cap tariff (IOG-SMB-TOU) — design note
 
+> _Status: Draft — not yet built (BL-9)._
+
 ## Background
 Octopus is migrating Intelligent Octopus Go customers to a new time-of-use
 tariff that introduces a **daily 6-hour cap** on off-peak EV charging. The tariff

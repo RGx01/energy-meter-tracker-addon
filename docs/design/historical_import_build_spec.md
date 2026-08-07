@@ -1,5 +1,7 @@
 # Historical Import — Build Spec (probe first, then the API route)
 
+> _Status: Shipped — design note kept for rationale; the code is the source of truth._
+
 > ### ⚠️ Superseded in part (2026-07) — read this first
 > This spec's **pricing/fetch strategy for the API route was replaced** after we
 > found the **Kraken GraphQL Measurements API** returns per-half-hour **kWh +

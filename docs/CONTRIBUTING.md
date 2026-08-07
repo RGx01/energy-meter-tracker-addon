@@ -12,7 +12,7 @@ Please open an issue on GitHub with:
 - Relevant log output from the **Logs** page or `docker logs`
 - Whether the issue is consistent or intermittent
 
-For data accuracy issues, include a sample of the affected blocks from `blocks.json` if possible (please censor identifiable info such as names addresses MPANs etc).
+For data accuracy issues, the most useful attachment is your `blocks.db` (the SQLite store — since 4.0.0 there is no `blocks.json`), or an export/screenshot of the affected blocks. Please censor identifiable info such as names, addresses and MPANs.
 
 ## Suggesting Features
 
@@ -39,7 +39,7 @@ Before suggesting a new sub-meter type or sensor, check the [Known Limitations](
 1. Fork the repository
 2. Create a branch from `dev` (not `main`)
 3. Make your changes
-4. Run the unit tests: `python3 -m unittest test_engine -v`
+4. Run the full test suite: `bash run_tests.sh` (runs the whole `tests/` suite — 1,850+ tests). To iterate on one area, `python3 -m pytest tests/test_engine.py -q`
 5. Add tests for any new engine logic
 6. Open a PR targeting `dev`
 
@@ -62,10 +62,20 @@ Before suggesting a new sub-meter type or sensor, check the [Known Limitations](
 
 ### What won't be accepted
 
-- Changes that break backward compatibility with existing `blocks.json` data
+- Changes that alter existing billing results (kWh/cost/carbon for already-stored history). Accuracy is the project's first commitment; `run_tests.sh` guards it.
+- Changes that break reading an existing `blocks.db` (schema migrations must be additive + backward-compatible)
 - New dependencies without a strong justification
 - UI changes that break Safari compatibility
 - Removing the informational disclaimer from charts or help pages
+
+## Adding support for another supplier
+
+EMT is built on Kraken (Octopus's platform), and other suppliers (EDF, etc.) run their own Kraken instances. Support for a second supplier is not built yet, but the seam exists:
+
+- The API endpoint is already configurable — `KrakenAPIClient(base_url, graphql_url)`, stored via `save_kraken_credentials(..., base_url)` or the `KRAKEN_BASE_URL` env var.
+- Supplier capability is gated in one place — `engine._API_CAPABLE_SUPPLIERS` / `supplier_is_api_capable()`, mirroring the client `WIZ_SUPPLIERS` registry.
+
+The main things a new supplier needs are a different **auth shape** (Octopus uses an API key; others use email + password with `obtainKrakenToken`), possibly **GraphQL-only** consumption (no Octopus REST `/v1/` surface), and turning off **GB-only** features (DCC settlement, UK carbon) via capability flags. If you want to work on this, open an issue first — a shared `SupplierProfile` seam is the intended approach and worth agreeing before coding.
 
 ## Questions
 

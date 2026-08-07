@@ -1,5 +1,7 @@
 # Measurements Cost Recovery — Design & Root-Cause Record
 
+> _Status: Shipped — design note kept for rationale; the code is the source of truth._
+
 How the historical import gets the **billed cost** right for every half-hour,
 including the smart-charged (IOG-dispatched) slots — and the investigation that
 proved why a naïve bulk fetch got them wrong.
