@@ -329,3 +329,44 @@ the **EV** rate transitions mid-slot. Consequences for EMT:
 
 ### F. Updated open question
 - **Dispatched-window hours vs actual-charging hours for the cap?** Today's data shows they diverge materially (2.50 h dispatched vs 1.79 h charged on one charge). The design keys the cap on *completed windows* (dispatched), but the estimator now lets EMT **test which one OE's billed cost actually matches**, the first day this account (or a tester) runs on the capped tariff and exceeds 6 h. Detection is by tariff code; billed cost reconciles live estimates at settlement, so no manual enforcement gate is needed.
+
+---
+
+## Dispatch-derived EV sub-meter (no charger sensor) — can ship BEFORE the cap
+
+A completed dispatch's `delta` is Octopus's own per-half-hour EV energy. Summing
+the completed deltas gives an **EV consumption series with no charger sensor at
+all**, from which `house = main grid import − EV`. This is the generic,
+any-charger EV/house split — and it's the same `delta` the cap prices, so it's
+shared groundwork.
+
+### Validated against a real CT-clamp EV meter (prod, 19 days, 2026-07-19→08-07)
+| measure | value |
+|---|---|
+| completed-dispatch EV energy | 299.1 kWh |
+| actual `ev_charger` (Zappi CT clamp) | 302.1 kWh |
+| aggregate coverage | **99.0%** |
+| slots with EV energy but **no** completed dispatch | **0** (0.0 kWh) |
+| per-slot ratio delta ÷ clamp (127 charged slots) | **median 0.9965, mean 1.0004** |
+
+Reading: there was **no non-dispatched charging** in the window, and the per-slot
+ratio straddles 1.0 with no systematic bias — so the ~1% aggregate gap is **CT-clamp
+measurement scatter, not missed energy**. For a user who charges under smart control,
+the dispatch-derived series is as accurate as a CT-clamp sub-meter (and comes off
+Octopus's settled data rather than a clamp). **Behavioural caveat:** a user who
+manual/boost-charges outside smart dispatch *would* show non-dispatched slots (that
+count > 0) and be under-counted — accuracy tracks charging discipline, so surface a
+"charged outside a smart dispatch — not counted here" note when it's non-zero.
+
+### How it fits
+- A **new reversible attribution source** (`dispatch_derived`), exactly like the recorder-based device split: writes an EV sub-meter (+ house remainder), main meter stays authoritative, **billing totals unchanged** — same invariant. Historical backfill runs straight off the stored `dispatch_history` completed rows.
+- **Rules:** completed-only (exclude planned/started phantoms); grid-clip a solar-concurrent dispatch (mostly moot overnight); IOG/dispatch tariffs only.
+- **Why it matters:** OE *rates* the EV/house split (4-rate) but doesn't itemise it — this gives that split to any IOG user with **no charger integration**, which the bill (and the "use your Ohme app" answer) doesn't.
+
+### Sequencing
+**Ships independently of, and before, the cap.** It's attribution + display — it does
+**not** depend on OE confirming the cap rules, and it changes no billing totals. It
+also *de-risks* the cap: the cap prices this exact EV portion, so having the
+dispatch-derived EV device (and its validation harness against a real clamp) in place
+first gives the cap a trusted substrate. Suggested order: this device → then the cap's
+rate-flip on top of it.
