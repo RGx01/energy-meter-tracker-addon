@@ -37,6 +37,9 @@ Cap measurement is now specced and **validated against prod** (BCD source read +
 
 **Still blocked on OE** for final confirmation (that the cap is reckoned on completed-dispatch time as inferred here; boundary-slot treatment; whether EV-peak applies inside the standard night window) — don't ship guessed billing rules; watch OE + BCD's staged releases. But the completed-windows model above is well-grounded and de-risks the build. Resolves **#272**.
 
+#### BL-22 — Dispatch-derived EV sub-meter (no charger sensor)  ·  *ships before, and de-risks, BL-9*
+*Medium — new capability, billing-neutral, no OE dependency.* Reconstruct the EV/house split from completed-dispatch `delta` alone — no charger sensor. A new **reversible attribution source** (`dispatch_derived`) writing an EV sub-meter + house remainder, main meter authoritative, **billing totals unchanged** (same invariant as the recorder attribution); historical backfill runs off stored `dispatch_history`. Gives IOG users the EV/house split OE *rates* (4-rate) but doesn't itemise on the bill — for **any** charger, no HA integration. Validated on prod (19 days): **99.0% vs a real CT-clamp EV meter, 0 non-dispatched slots, per-slot ratio median 0.9965/mean 1.0004** — the residual is clamp scatter, not missed energy. Caveats: completed-only (exclude planned/started phantoms); grid-clip solar-concurrent dispatches; accuracy tracks charging discipline (surface a "charged outside a smart dispatch — not counted" note when non-zero); IOG/dispatch tariffs only. Independent of the cap (attribution + display, no OE confirmation needed) and the trusted EV substrate the cap prices on top of. Full design + validation in `docs/iog_6hr_cap_design.md`.
+
 #### BL-16 — Surface Kraken API deprecations in the UI  ·  *bus-factor insurance*
 *Low urgency, high long-term value. Cheap now; impossible to add later when it's needed.*
 
