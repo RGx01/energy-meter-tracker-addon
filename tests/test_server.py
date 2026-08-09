@@ -4458,6 +4458,42 @@ class TestChargeSessionsBuilder(unittest.TestCase):
             [self._h("2026-07-10T02:00:00", "completed", -3.0)], {}, {})[0]
         self.assertLessEqual(s["est_charge_minutes"], s["dispatch_minutes"])
 
+    def _hs(self, slot, kind, e=None, source=None):
+        return {"slot_start": slot, "kind": kind, "energy_kwh": e,
+                "provider": "Myenergi", "raw_start": None, "raw_end": None,
+                "source": source}
+
+    def test_smart_source_reads_off_peak_despite_peak_rate(self):
+        # Red-flash fix: a completed smart-charge slot still priced at PEAK (the
+        # settlement lag) colours OFF-PEAK from the dispatch source, not red.
+        slot = "2026-07-15T02:00:00"
+        s = server._build_charge_sessions(
+            [self._hs(slot, "completed", -3.0),
+             self._hs(slot, "planned", -3.4, source="smart-charge")],
+            {slot: 0.32}, {"2026-07-15": 0.32})[0]      # rate == peak
+        self.assertTrue(s["fill"][0]["off_peak"])
+        self.assertAlmostEqual(s["off_peak_kwh"], 3.0, places=3)
+
+    def test_bump_source_reads_peak_despite_off_peak_rate(self):
+        # A bump/boost bills at peak even in the off-peak window → red.
+        slot = "2026-07-15T02:00:00"
+        s = server._build_charge_sessions(
+            [self._hs(slot, "completed", -3.0),
+             self._hs(slot, "started", source="bump-charge")],
+            {slot: 0.05}, {"2026-07-15": 0.32})[0]      # rate is off-peak
+        self.assertFalse(s["fill"][0]["off_peak"])
+        self.assertAlmostEqual(s["peak_kwh"], 3.0, places=3)
+
+    def test_unknown_source_follows_billed_rate(self):
+        # No dispatch source → fall back to the settled rate (existing behaviour).
+        slot = "2026-07-15T02:00:00"
+        op = server._build_charge_sessions(
+            [self._hs(slot, "completed", -3.0)], {slot: 0.05}, {"2026-07-15": 0.32})[0]
+        self.assertTrue(op["fill"][0]["off_peak"])
+        pk = server._build_charge_sessions(
+            [self._hs(slot, "completed", -3.0)], {slot: 0.32}, {"2026-07-15": 0.32})[0]
+        self.assertFalse(pk["fill"][0]["off_peak"])
+
 
 class TestUpcomingDispatches(unittest.TestCase):
     """BL-10 — _build_upcoming_dispatches surfaces future planned dispatches."""

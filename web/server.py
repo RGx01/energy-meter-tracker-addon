@@ -6757,6 +6757,12 @@ def _corrections_unreconciled_count(store, from_date, to_date, channel,
 
 
 _CHARGE_SESSION_BRIDGE_MIN = 180  # minutes; merge bursts within one plug-in period
+# Dispatch source vocabulary (mirrors engine._SMART_CHARGE_SOURCES). A smart-charge
+# dispatch bills off-peak; a bump/boost bills at peak; unknown/null can't be confirmed
+# and shows provisional. Used to colour the card by dispatch semantics rather than the
+# settlement-laggy block rate.
+_SMART_SOURCES = {"smart-charge", "smart"}
+_BUMP_SOURCES = {"bump-charge", "boost"}
 # The "upcoming" plan is a live forecast that IOG revises. dispatch_history keeps
 # every planned slot it ever saw (so absent stays meaningful for *completed*), but
 # a slot dropped from a revised plan must not keep inflating the upcoming total.
@@ -6805,13 +6811,18 @@ def _build_charge_sessions(history, rates, day_peak, slot_kwh=None,
     for r in history:
         s = slots.setdefault(r["slot_start"], {
             "started": False, "completed": None,
-            "raw_start": None, "raw_end": None,
+            "raw_start": None, "raw_end": None, "source": None,
             "pstart": None, "pend": None, "provider": r.get("provider")})
         k = r.get("kind")
         if k == "completed" and r.get("energy_kwh") is not None:
             s["completed"] = r.get("energy_kwh")
         elif k == "started":
             s["started"] = True
+        # The smart-charge vs bump/boost signal lives on the PLANNED/started record;
+        # completed dispatches report source=null, so capture the source here (used
+        # to colour the slot by dispatch semantics, not the settlement-laggy rate).
+        if k in ("planned", "started") and r.get("source"):
+            s["source"] = r.get("source")
         if r.get("raw_start"):
             s["raw_start"] = r["raw_start"]
         if r.get("raw_end"):
@@ -6890,10 +6901,22 @@ def _build_charge_sessions(history, rates, day_peak, slot_kwh=None,
             kwh += v
             peak_r = day_peak.get(k[:10])
             rate = rates.get(k)
-            is_op = _slot_is_off_peak(rate, peak_r)
+            # Colour/label from the DISPATCH SEMANTICS where they're known, so a
+            # just-completed smart charge reads off-peak IMMEDIATELY instead of
+            # flashing peak until the overlay reprices it (the "red flash"). On IOG a
+            # smart-charge dispatch is off-peak; a bump/boost bills at peak. When the
+            # source is unknown (e.g. OHME, or a completed-only slot), fall back to the
+            # settled block rate — which is authoritative once it lands.
+            _src = (slots[k].get("source") or "").lower()
+            if _src in _BUMP_SOURCES:            # TODO: or over-6h cap on the cap tariff
+                is_op = False
+            elif _src in _SMART_SOURCES:
+                is_op = True
+            else:
+                is_op = _slot_is_off_peak(rate, peak_r)
             if is_op:
                 op += v
-                # Off-peak benefit vs the day's peak rate.
+                # Off-peak benefit vs the day's peak rate (firms up once settled).
                 if peak_r is not None and rate is not None and peak_r > rate:
                     saving += (peak_r - rate) * v
             else:
