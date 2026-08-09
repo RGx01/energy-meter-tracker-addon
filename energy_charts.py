@@ -727,12 +727,18 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
                         # sub-meters this key is absent (NULL in DB, omitted by
                         # reconstruction), so the raw kwh is kept unchanged —
                         # api+mini blocks are identical to CAD here.
+                        # Floor the sub-meter subtraction only when the main cost is
+                        # >= 0 (kills a power-integration over-subtraction artifact);
+                        # a genuinely negative main cost (Agile plunge-price credit)
+                        # must pass through, not clamp to 0.
                         if "kwh_remainder" in channel:
                             kwh  = float(channel["kwh_remainder"])
-                            cost = max(0.0, cost - sub_by_rate[rate]["cost"])
+                            _c = cost - sub_by_rate[rate]["cost"]
+                            cost = _c if cost < 0 else max(0.0, _c)
                         else:
                             kwh  = max(0.0, kwh  - sub_by_rate[rate]["kwh"])
-                            cost = max(0.0, cost - sub_by_rate[rate]["cost"])
+                            _c = cost - sub_by_rate[rate]["cost"]
+                            cost = _c if cost < 0 else max(0.0, _c)
 
                     key = f"{display_name} / {channel_name.replace('_', ' ').title()}"
                     if key not in meter_meta:
@@ -923,6 +929,182 @@ def _bill_total_row(kwh, cost):
         </tr>"""
 
 
+from decimal import Decimal as _Decimal, ROUND_HALF_EVEN as _ROUND_HALF_EVEN
+
+
+def bankers_round(x, ndigits=0):
+    """Round half-to-even (banker's rounding) — how Octopus rounds a bill (0.015→0.02,
+    0.025→0.02). Uses Decimal(str(x)) so exact decimal halves round correctly, which
+    the float built-in round() cannot (0.015 is 0.01499… in binary). BL-24 groundwork."""
+    q = _Decimal(1).scaleb(-int(ndigits))
+    return float(_Decimal(str(x)).quantize(q, rounding=_ROUND_HALF_EVEN))
+
+
+def octopus_bill_total(slots, vat_rate=0.05):
+    """Octopus's bill-rounding ladder on EXC-VAT figures (see
+    docs/billing_rounding_and_exvat_design.md):
+      1. round each half-hour's consumption to 0.01 kWh (half-even);
+      2. × the exc-VAT unit rate, round the cost to 0.01p (half-even);
+      3. sum, then round the total to the nearest whole penny.
+    VAT sits on top of the exc total. `slots` is an iterable of (kwh, exc_rate) with
+    exc_rate in £/kWh. Returns pence + £ for exc and inc. PURE and wired to nothing —
+    the live billing path stays the exact 6-dp float sum unless a caller opts in, so
+    no existing figure moves. Lets a future 'bill-style rounding' toggle read this."""
+    exc_pence = 0.0
+    for kwh, exc_rate in slots:
+        kwh_r = bankers_round(kwh, 2)                                  # 0.01 kWh
+        exc_pence += bankers_round(kwh_r * float(exc_rate) * 100.0, 2)  # 0.01p
+    exc_pence = bankers_round(exc_pence, 0)                            # whole penny
+    inc_pence = bankers_round(exc_pence * (1.0 + vat_rate), 0)
+    return {"exc_pence": exc_pence, "inc_pence": inc_pence,
+            "exc_gbp": round(exc_pence / 100.0, 2),
+            "inc_gbp": round(inc_pence / 100.0, 2)}
+
+
+def bill_slots_from_blocks(blocks, vat_rate=0.05):
+    """Extract (kwh, exc_rate) main-import slots from block dicts for octopus_bill_total.
+    Uses the stored exc-VAT cost (BL-23 imp_cost_exc → channel 'cost_exc') to derive the
+    exc rate when present; otherwise falls back to the inc rate ÷ (1+VAT) — an
+    approximation until a re-import captures the real exc figure."""
+    slots = []
+    for b in blocks or []:
+        imp = (((b or {}).get("meters") or {}).get("electricity_main") or {})
+        imp = (imp.get("channels") or {}).get("import") or {}
+        kwh = imp.get("kwh")
+        if not kwh:
+            continue
+        cost_exc = imp.get("cost_exc")
+        if cost_exc is not None:
+            exc_rate = float(cost_exc) / float(kwh)
+        else:
+            rate = imp.get("rate")
+            if rate is None:
+                continue
+            exc_rate = float(rate) / (1.0 + vat_rate)
+        slots.append((float(kwh), exc_rate))
+    return slots
+
+
+def _has_sub_meters(cfg):
+    """True if any configured meter is a sub-meter (EV, battery, heat-pump, …). The
+    derived-EV billing breakdown only applies to accounts with NONE, so a real EV meter
+    always wins."""
+    for md in ((cfg or {}).get("meters") or {}).values():
+        if (md.get("meta") or {}).get("sub_meter"):
+            return True
+    return False
+
+
+def _dispatch_ev_slot_map(store, blocks, cfg):
+    """{slot_start(UTC ISO): {"kwh","cost","rate"}} — per-slot EV reconstructed from
+    COMPLETED dispatches (Octopus's own per-slot EV energy), grid-clipped to that slot's
+    main import and cost-apportioned from the slot's import cost. Gated to no-sub-meter
+    accounts. Empty when gated off / no store / no dispatch. This is the display-only
+    source for the derived-EV billing breakdown; it never affects a bill total."""
+    if store is None or _has_sub_meters(cfg) or not blocks:
+        return {}
+    starts = [b["start"] for b in blocks if b and b.get("start")]
+    if not starts:
+        return {}
+    try:
+        drows = store._conn.execute(
+            "SELECT slot_start, energy_kwh FROM dispatch_history "
+            "WHERE kind='completed' AND slot_start >= ? AND slot_start <= ?",
+            (min(starts), max(starts))).fetchall()
+    except Exception:
+        return {}
+    ev_raw = {}
+    for r in drows:
+        e = r["energy_kwh"]
+        if e is None:
+            continue
+        v = abs(float(e))
+        if v > 1e-9:
+            ev_raw[r["slot_start"]] = ev_raw.get(r["slot_start"], 0.0) + v
+    if not ev_raw:
+        return {}
+    out = {}
+    for b in blocks:
+        slot = (b or {}).get("start")
+        if not slot or slot not in ev_raw:
+            continue
+        imp = (((b.get("meters") or {}).get("electricity_main") or {})
+               .get("channels", {}) or {}).get("import", {}) or {}
+        try:
+            mk = float(imp.get("kwh_total", imp.get("kwh")) or 0.0)
+            mc = float(imp.get("cost") or 0.0)
+            rate = round(float(imp.get("rate_used", imp.get("rate")) or 0.0), 4)
+        except Exception:
+            continue
+        if mk <= 0:
+            continue
+        ek = min(ev_raw[slot], mk)
+        if ek <= 1e-9:
+            continue
+        out[slot] = {"kwh": ek, "cost": mc * (ek / mk), "rate": rate}
+    return out
+
+
+def _inject_ev_breakdown_into_summary(summary, period_blocks, ev_slot_map,
+                                      label="EV (from dispatch)"):
+    """Split the 'Direct import' remainder in a billing summary into a reduced house
+    slice + a synthetic '<label> / Import' sub-meter, from ev_slot_map. DISPLAY-ONLY:
+    main_import_raw ('Import — total grid'), standing, and total_cost are untouched, so
+    the bill stays byte-identical — only the 'Breakdown by meter' section subdivides.
+    Whatever EV is added is subtracted from the remainder, so the two always sum back to
+    the original Direct import. No-op if a real sub-meter already exists, there's no
+    remainder key, or there's no EV. Mutates summary in place; returns True if applied."""
+    if not summary or not ev_slot_map:
+        return False
+    totals = summary.get("totals") or {}
+    if any(t.get("is_submeter") for t in totals.values()):
+        return False
+    remainder_key = next((k for k in totals
+                          if k.endswith("/ Import") and not totals[k].get("is_submeter")), None)
+    if not remainder_key:
+        return False
+    ev_by_rate = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0})
+    for b in period_blocks:
+        slot = (b or {}).get("start")
+        ev = ev_slot_map.get(slot) if slot else None
+        if not ev:
+            continue
+        ev_by_rate[ev["rate"]]["kwh"]  += ev["kwh"]
+        ev_by_rate[ev["rate"]]["cost"] += ev["cost"]
+    if not ev_by_rate:
+        return False
+    rem_channels = summary["meters"][remainder_key]
+    ev_channels = {}
+    ev_tot_k = ev_tot_c = 0.0
+    for rate, v in ev_by_rate.items():
+        ek = round(v["kwh"], 3)
+        ec = round(v["cost"], 2)
+        if ek <= 0:
+            continue
+        ev_channels[rate] = {"kwh": ek, "cost": ec, "read_start": None, "read_end": None}
+        ev_tot_k += ek
+        ev_tot_c += ec
+        if rate in rem_channels:
+            _rk = rem_channels[rate]["kwh"] - ek
+            _rc = rem_channels[rate]["cost"] - ec
+            rem_channels[rate]["kwh"]  = round(_rk if rem_channels[rate]["kwh"] < 0 else max(0.0, _rk), 3)
+            rem_channels[rate]["cost"] = round(_rc if rem_channels[rate]["cost"] < 0 else max(0.0, _rc), 2)
+    if not ev_channels:
+        return False
+    ev_key = f"{label} / Import"
+    summary["meters"][ev_key] = ev_channels
+    summary["totals"][ev_key] = {"kwh": round(ev_tot_k, 3), "cost": round(ev_tot_c, 2),
+                                 "is_submeter": True, "read_start": None, "read_end": None}
+    rt = summary["totals"][remainder_key]
+    _rtk = rt["kwh"] - ev_tot_k
+    _rtc = rt["cost"] - ev_tot_c
+    rt["kwh"]  = round(_rtk if rt["kwh"] < 0 else max(0.0, _rtk), 3)
+    rt["cost"] = round(_rtc if rt["cost"] < 0 else max(0.0, _rtc), 2)
+    summary.setdefault("meter_meta", {})[ev_key] = {
+        "site": None, "device": label, "mpan": None, "tariff": None, "is_submeter": True}
+    return True
+
+
 def render_billing_summary(summary, currency='£', site_name=None):
     if not summary:
         return ""
@@ -1104,7 +1286,7 @@ def render_billing_summary(summary, currency='£', site_name=None):
 # Daily chart builder (returns HTML string for one day)
 # ─────────────────────────────────────────────────────────────
 
-def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_minutes=30, currency='£', site_name=None):
+def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_minutes=30, currency='£', site_name=None, ev_slot_map=None):
     slots = 1440 // block_minutes
     meter_kwh    = defaultdict(lambda: [0.0] * slots)
     meter_rate   = defaultdict(lambda: [0.0] * slots)
@@ -1196,6 +1378,33 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
             slot_ti_cost[hh] = ti_cost
             slot_ti_rate[hh] = main_rate
 
+            # ── Derived-EV split (display-only; see _dispatch_ev_slot_map) ──────
+            # Re-partition the house slot into house + EV AFTER the total-import (ti)
+            # figures are set, so the grid total is untouched — this only subdivides
+            # the 'Direct import' segment. No-op unless an ev_slot_map is supplied
+            # (gated to no-sub-meter accounts upstream).
+            if ev_slot_map:
+                _ev = ev_slot_map.get(block.get("start"))
+                _mk = meter_kwh["electricity_main"][hh]
+                if _ev and _mk > 0:
+                    _ek = min(_ev["kwh"], _mk)
+                    if _ek > 1e-9:
+                        _mc = meter_cost["electricity_main"][hh]
+                        _ec = _mc * (_ek / _mk)
+                        _r4 = round(main_rate, 4)
+                        meter_kwh["electricity_main"][hh]  = _mk - _ek
+                        meter_cost["electricity_main"][hh] = _mc - _ec
+                        meter_kwh["ev_dispatch"][hh]  = _ek
+                        meter_cost["ev_dispatch"][hh] = _ec
+                        meter_rate["ev_dispatch"][hh] = main_rate
+                        summary_kwh["electricity_main"]  -= _ek
+                        summary_cost["electricity_main"] -= _ec
+                        summary_kwh["ev_dispatch"]  += _ek
+                        summary_cost["ev_dispatch"] += _ec
+                        summary_rates["electricity_main"][_r4] -= _ek
+                        summary_rates["ev_dispatch"][_r4]      += _ek
+                        meter_display_name.setdefault("ev_dispatch", "EV (from dispatch)")
+
             if main_export:
                 exp_kwh  = abs(_f(main_export.get("kwh")))
                 exp_cost = abs(_f(main_export.get("cost")))
@@ -1264,7 +1473,12 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
     meter_totals = {}
     for meter in meter_kwh:
         kwh_sum  = sum(abs(v) for v in meter_kwh[meter])
-        cost_sum = sum(abs(v) for v in meter_cost[meter])
+        # Import cost is summed SIGNED so an Agile plunge-price credit (negative
+        # cost) reduces the total instead of being flipped positive; export is kept
+        # as a magnitude (its sign is applied at display). No-op on positive days.
+        _is_exp  = str(meter).lower().endswith("export")
+        cost_sum = (sum(abs(v) for v in meter_cost[meter]) if _is_exp
+                    else sum(meter_cost[meter]))
         meter_totals[meter] = {
             "kwh":  round(kwh_sum, 3),
             "cost": round(cost_sum, 4),
@@ -1511,6 +1725,13 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
 
     meter_colors = build_meter_colors_from_config(cfg) if cfg else build_meter_colors(blocks)
 
+    # Derived-EV split (display-only; BL-22): no-op unless this is a no-sub-meter
+    # account with completed dispatches. Gives the Billing tab an "EV (from dispatch)"
+    # breakdown line + per-day trace without moving any bill total.
+    _ev_slot_map = _dispatch_ev_slot_map(store, blocks, cfg)
+    if _ev_slot_map:
+        meter_colors["ev_dispatch"] = "#8b5cf6"
+
     # ── Billing periods ──
     # Use historically correct billing_day per block from config_periods join.
     # Falls back to reading from meters_config.json / block meta for legacy data.
@@ -1554,12 +1775,22 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
             d += _td(days=1)
         return result
 
+    def _summ(_blks_for_calc, _s, _e):
+        """calculate_billing_summary_for_period + the display-only derived-EV split.
+        Injection uses the period's blocks so EV is attributed to the right period; the
+        bill anchors stay byte-identical regardless (see _inject_ev_breakdown_into_summary)."""
+        _sm = calculate_billing_summary_for_period(
+            _blks_for_calc, _s, _e, store=store, tz_name=timezone_name)
+        if _ev_slot_map:
+            _inject_ev_breakdown_into_summary(_sm, _blocks_for_period(_s, _e), _ev_slot_map)
+        return _sm
+
     # ── Build per-period data ──
     period_sections = []   # list of dicts
 
     for i, (p_start, p_end) in enumerate(periods):
         period_blocks = _blocks_for_period(p_start, p_end)
-        summary   = calculate_billing_summary_for_period(period_blocks, p_start, p_end, store=store, tz_name=timezone_name)
+        summary   = _summ(period_blocks, p_start, p_end)
         is_current = p_start.date() <= today < p_end.date()
         is_prev    = (len(periods) > 1) and (i == len(periods) - 2) and not is_current
 
@@ -1602,7 +1833,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     quarter_sections = []
     for i, (q_start, q_end) in enumerate(get_all_quarter_periods(blocks, tz=_tz)):
         quarter_blocks = _blocks_for_period(q_start, q_end)
-        summary    = calculate_billing_summary_for_period(quarter_blocks, q_start, q_end, store=store, tz_name=timezone_name)
+        summary    = _summ(quarter_blocks, q_start, q_end)
         is_current = q_start.date() <= today < q_end.date()
         q_num      = (q_start.month - 1) // 3 + 1
         quarter_sections.append({
@@ -1622,7 +1853,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     # ── Year periods ──
     year_sections = []
     for i, (y_start, y_end) in enumerate(get_all_year_periods(blocks, tz=_tz)):
-        summary    = calculate_billing_summary_for_period(blocks, y_start, y_end, store=store, tz_name=timezone_name)
+        summary    = _summ(blocks, y_start, y_end)
         is_current = y_start.date() <= today < y_end.date()
         year_sections.append({
             "index":      i,
@@ -1641,7 +1872,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     # ── Calendar month periods ──
     calmonth_sections = []
     for i, (cm_start, cm_end) in enumerate(get_all_calmonth_periods(blocks, tz=_tz)):
-        summary    = calculate_billing_summary_for_period(blocks, cm_start, cm_end, store=store, tz_name=timezone_name)
+        summary    = _summ(blocks, cm_start, cm_end)
         is_current = cm_start.date() <= today < cm_end.date()
         calmonth_sections.append({
             "index":      i,
@@ -1817,7 +2048,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         # Daily charts
         day_charts_html = ""
         for day in ps["days"]:
-            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, block_minutes=block_minutes, currency=currency, site_name=site_name)
+            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_slot_map)
 
         open_attr    = "open" if charts_open else ""
         toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}"
@@ -1890,7 +2121,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
 
         day_charts_html = ""
         for day in gs["days"]:
-            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, chart_prefix=f"{pid_prefix}_", block_minutes=block_minutes, currency=currency, site_name=site_name)
+            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, chart_prefix=f"{pid_prefix}_", block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_slot_map)
 
         toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}"
         # Quarter/year sections can hold 90–365 day charts; default the panel

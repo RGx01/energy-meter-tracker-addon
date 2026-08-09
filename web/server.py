@@ -1332,7 +1332,10 @@ def api_billing():
             total_imp_cost = raw_grid_cost
             # Grid Import = raw grid minus sub-meter attributed portion
             grid_imp_kwh   = max(0.0, raw_grid_kwh  - sub_kwh_total)
-            grid_imp_cost  = max(0.0, raw_grid_cost - sub_cost_total)
+            # Preserve a genuinely negative grid cost (Agile plunge-price credit);
+            # only floor the sub-over-subtraction artifact (raw cost >= 0).
+            _gc = raw_grid_cost - sub_cost_total
+            grid_imp_cost  = _gc if raw_grid_cost < 0 else max(0.0, _gc)
 
             total_imp_cost = round(total_imp_cost, 2)
             grid_imp_cost  = round(grid_imp_cost,  2)
@@ -2105,7 +2108,12 @@ def _aggregate_block_rows(raw_rows, bucket_of, standing_scope="bucket",
         _direct_cost = 0.0
         for _rate, _mv in (_m.get("_main_by_rate") or {}).items():
             _sv = (_m.get("_sub_by_rate") or {}).get(_rate, {"kwh": 0.0, "cost": 0.0})
-            _direct_cost += max(0.0, _mv["cost"] - _sv["cost"])
+            # max(0) guards a sub-meter's power-integration cost OVER-subtracting a
+            # NON-negative main into a spurious negative remainder. A genuinely
+            # negative main cost (Agile plunge-price CREDIT) must survive, so only
+            # clamp when the main slot's cost is >= 0.
+            _d = _mv["cost"] - _sv["cost"]
+            _direct_cost += _d if _mv["cost"] < 0 else max(0.0, _d)
         _m["imp_cost"] = _direct_cost
     return _day_data
 
@@ -2366,6 +2374,35 @@ def api_blocks_summary():
             _postcode = (_md.get("meta") or {}).get("postcode_prefix", "").strip()
             if _postcode:
                 break
+
+        # ── Synthetic dispatch-derived EV segment (display-only; BL-22) ──────────
+        # For a no-sub-meter, no-EV account, split the "Direct" import segment into a
+        # derived EV slice + reduced house slice, using completed dispatches (same
+        # logic as the Usage-Insights card). Purely a DISPLAY split: every per-row
+        # total (imp_kwh/imp_cost/net_cost) is left untouched, so the chart totals,
+        # the data-table Totals, and the bill stay byte-identical. Guaranteed no-op
+        # when an EV meter — or any sub-meter — exists.
+        if (_configured_ev_meter_id(cfg) is None
+                and len(meters_list) == 1
+                and meters_list[0]["id"] == "electricity_main"):
+            try:
+                _drows = store._conn.execute(
+                    "SELECT slot_start, kind, energy_kwh FROM dispatch_history "
+                    "WHERE kind='completed' AND slot_start >= ? AND slot_start < ?",
+                    (_all_utc_s2, _all_utc_e2)).fetchall()
+                _ev_slot = _dispatch_derived_ev_kwh(
+                    [{"slot_start": r["slot_start"], "kind": r["kind"],
+                      "energy_kwh": r["energy_kwh"]} for r in _drows])
+                _main_slot = {}
+                for _rr in _raw_rows:
+                    if _rr["is_sub_meter"]:
+                        continue
+                    _main_slot[_rr["block_start"]] = (
+                        float(_rr["imp_kwh"] or 0), float(_rr["imp_cost"] or 0))
+                _ev_day = _dispatch_ev_split_by_bucket(_main_slot, _ev_slot, _bucket_local_day)
+            except Exception:
+                _ev_day = {}
+            _apply_ev_split_to_summary_rows(rows, meters_list, _ev_day)
 
         return jsonify({
             "currency":      currency,
@@ -5524,6 +5561,94 @@ def api_insights_calendar_year():
 # Usage Insights — aggregation + endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _configured_ev_meter_id(cfg):
+    """The configured EV sub-meter id, or None. The dispatch-derived EV device only
+    applies when there's no real EV meter measuring it — so this gates the whole
+    feature: any account WITH an EV sub-meter is unaffected (byte-identical)."""
+    for mid, md in (cfg.get("meters") or {}).items():
+        meta = md.get("meta") or {}
+        if not meta.get("sub_meter"):
+            continue
+        if (meta.get("meter_type") == "ev_charger"
+                or any(kw in mid.lower() for kw in ("ev", "charger"))):
+            return mid
+    return None
+
+
+def _dispatch_derived_ev_kwh(dispatch_rows) -> dict:
+    """EV kWh per half-hour slot reconstructed from COMPLETED dispatch deltas —
+    Octopus's own per-slot EV energy. Excludes planned/started phantoms (a scheduled
+    charge the car never took) and slots with no delivery. Validated ~99% against a
+    real CT-clamp EV meter over 19 days (residual is clamp scatter, not missed
+    energy). Returns {slot_start: kwh}. Pure — takes dispatch_history-shaped rows."""
+    out: dict = {}
+    for r in dispatch_rows:
+        if r.get("kind") != "completed":
+            continue
+        e = r.get("energy_kwh")
+        if e is None:
+            continue
+        v = abs(float(e))
+        if v > 1e-9:
+            out[r["slot_start"]] = out.get(r["slot_start"], 0.0) + v
+    return out
+
+
+def _dispatch_ev_split_by_bucket(main_by_slot, ev_by_slot, bucket_fn) -> dict:
+    """Grid-clip the per-slot dispatch EV to that slot's main import and apportion its
+    cost from the slot's import cost, then bucket to {bucket: {"kwh","cost"}}. Pure —
+    `main_by_slot` is {slot: (imp_kwh, imp_cost)}, `ev_by_slot` is {slot: kwh}. The
+    clip + apportionment guarantee house + EV == the slot's grid import exactly, so a
+    caller can split a chart segment without moving any total."""
+    out: dict = {}
+    for _slot, _e in ev_by_slot.items():
+        _mk, _mc = main_by_slot.get(_slot, (0.0, 0.0))
+        _ek = min(_e, _mk) if _mk > 0 else 0.0        # can't exceed the grid that slot
+        if _ek <= 1e-9:
+            continue
+        _ec = _mc * (_ek / _mk) if _mk > 0 else 0.0   # cost follows the same fraction
+        _b = bucket_fn(_slot)
+        _acc = out.setdefault(_b, {"kwh": 0.0, "cost": 0.0})
+        _acc["kwh"]  += _ek
+        _acc["cost"] += _ec
+    return out
+
+
+def _apply_ev_split_to_summary_rows(rows, meters_list, ev_by_day,
+                                    color="#8b5cf6", label="EV (from dispatch)") -> bool:
+    """Split each row's electricity_main import segment into a derived EV slice + a
+    reduced house slice, per {local_date: {"kwh","cost"}} from _dispatch_ev_split_by_bucket.
+    DISPLAY-ONLY: the row's top-level imp_kwh/imp_cost/net_cost are never touched, so the
+    chart totals, the data-table Totals row, and the bill stay byte-identical — only the
+    'Direct' stack segment is subdivided. Appends an 'ev_dispatch' meter to meters_list
+    when any row splits. Mutates in place; returns True if applied. Pure/testable."""
+    applied = False
+    for _row in rows:
+        _ds = "%04d-%02d-%02d" % (_row["year"], _row["month"], _row["day"])
+        _ev = ev_by_day.get(_ds)
+        _mm = (_row.get("meters") or {}).get("electricity_main")
+        if not _ev or not _mm:
+            continue
+        _evk, _evc = _ev["kwh"], _ev["cost"]
+        if _mm["imp_kwh"] >= 0:            # don't over-split a normal day
+            _evk = min(_evk, _mm["imp_kwh"])
+        if _mm["imp_cost"] >= 0:           # a plunge-price CREDIT keeps its sign
+            _evc = min(_evc, _mm["imp_cost"])
+        if _evk <= 1e-9:
+            continue
+        _mm["imp_kwh"]  = round(_mm["imp_kwh"]  - _evk, 4)
+        _mm["imp_cost"] = round(_mm["imp_cost"] - _evc, 4)
+        _row["meters"]["ev_dispatch"] = {
+            "imp_kwh": round(_evk, 4), "imp_cost": round(_evc, 4),
+            "exp_kwh": 0.0, "exp_cost": 0.0, "carbon_g": None,
+        }
+        applied = True
+    if applied:
+        meters_list.append({"id": "ev_dispatch", "label": label,
+                            "color": color, "is_sub": True})
+    return applied
+
+
 def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
                      tz_name: str = "UTC") -> dict:
     """
@@ -5672,6 +5797,52 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
             hour_kwh[local_hour] += h_imp
         except Exception:
             pass
+
+    # ── Synthetic dispatch-derived EV device (display-only; BL-22) ───────────────
+    # For an account with NO EV sub-meter AND no other sub-meters (a pure-API /
+    # no-HA-sensor setup), reconstruct the EV/house split from the completed-dispatch
+    # delta — Octopus's own per-slot EV energy — so a sensor-less user still sees
+    # car-vs-house. Guaranteed no-op when an EV meter (or any sub-meter) exists.
+    # Grid-clipped per slot (EV can't exceed that slot's grid import) with its cost
+    # apportioned from the slot's import cost, so house + EV == grid import exactly.
+    if _configured_ev_meter_id(cfg) is None and not sub_totals:
+        try:
+            _drows = store._conn.execute(
+                "SELECT slot_start, kind, energy_kwh FROM dispatch_history "
+                "WHERE kind='completed' AND slot_start >= ? AND slot_start < ?",
+                (utc_start, utc_end)).fetchall()
+            _ev_by_slot = _dispatch_derived_ev_kwh(
+                [{"slot_start": r["slot_start"], "kind": r["kind"],
+                  "energy_kwh": r["energy_kwh"]} for r in _drows])
+        except Exception:
+            _ev_by_slot = {}
+        if _ev_by_slot:
+            _main_by_slot = {}
+            for row in rows:                     # no sub-meters here, so all main
+                _main_by_slot[row["block_start"]] = (
+                    float(row["imp_kwh"] or 0), float(row["imp_cost"] or 0),
+                    float(row["imp_rate"] or 0))
+            _ev_kwh = _ev_cost = 0.0
+            _ev_tiers = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "blocks": 0})
+            for _slot, _e in _ev_by_slot.items():
+                _mk, _mc, _mr = _main_by_slot.get(_slot, (0.0, 0.0, 0.0))
+                _ek = min(_e, _mk) if _mk > 0 else 0.0     # grid-clip to the slot
+                if _ek <= 1e-9:
+                    continue
+                _ec = _mc * (_ek / _mk) if _mk > 0 else 0.0   # apportion cost
+                _ev_kwh += _ek
+                _ev_cost += _ec
+                if _mr > 0:
+                    _t = _ev_tiers[round(_mr, 6)]
+                    _t["kwh"] += _ek; _t["cost"] += _ec; _t["blocks"] += 1
+            if _ev_kwh > 1e-9:
+                house_imp_kwh  = max(0.0, house_imp_kwh  - _ev_kwh)
+                house_imp_cost = max(0.0, house_imp_cost - _ev_cost)
+                sub_totals["ev_dispatch"] = {
+                    "imp_kwh": _ev_kwh, "imp_cost": _ev_cost, "exp_kwh": 0.0,
+                    "label": "EV (from dispatch)", "meter_type": "ev_charger",
+                    "derived": True, "rate_tiers": _ev_tiers,
+                }
 
     # ── Derived totals ────────────────────────────────────────────────────────
     total_sc = round(sum(daily_sc.values()), 4)
@@ -6749,6 +6920,12 @@ def _corrections_unreconciled_count(store, from_date, to_date, channel,
 
 
 _CHARGE_SESSION_BRIDGE_MIN = 180  # minutes; merge bursts within one plug-in period
+# Dispatch source vocabulary (mirrors engine._SMART_CHARGE_SOURCES). A smart-charge
+# dispatch bills off-peak; a bump/boost bills at peak; unknown/null can't be confirmed
+# and shows provisional. Used to colour the card by dispatch semantics rather than the
+# settlement-laggy block rate.
+_SMART_SOURCES = {"smart-charge", "smart"}
+_BUMP_SOURCES = {"bump-charge", "boost"}
 # The "upcoming" plan is a live forecast that IOG revises. dispatch_history keeps
 # every planned slot it ever saw (so absent stays meaningful for *completed*), but
 # a slot dropped from a revised plan must not keep inflating the upcoming total.
@@ -6797,13 +6974,18 @@ def _build_charge_sessions(history, rates, day_peak, slot_kwh=None,
     for r in history:
         s = slots.setdefault(r["slot_start"], {
             "started": False, "completed": None,
-            "raw_start": None, "raw_end": None,
+            "raw_start": None, "raw_end": None, "source": None,
             "pstart": None, "pend": None, "provider": r.get("provider")})
         k = r.get("kind")
         if k == "completed" and r.get("energy_kwh") is not None:
             s["completed"] = r.get("energy_kwh")
         elif k == "started":
             s["started"] = True
+        # The smart-charge vs bump/boost signal lives on the PLANNED/started record;
+        # completed dispatches report source=null, so capture the source here (used
+        # to colour the slot by dispatch semantics, not the settlement-laggy rate).
+        if k in ("planned", "started") and r.get("source"):
+            s["source"] = r.get("source")
         if r.get("raw_start"):
             s["raw_start"] = r["raw_start"]
         if r.get("raw_end"):
@@ -6882,10 +7064,22 @@ def _build_charge_sessions(history, rates, day_peak, slot_kwh=None,
             kwh += v
             peak_r = day_peak.get(k[:10])
             rate = rates.get(k)
-            is_op = _slot_is_off_peak(rate, peak_r)
+            # Colour/label from the DISPATCH SEMANTICS where they're known, so a
+            # just-completed smart charge reads off-peak IMMEDIATELY instead of
+            # flashing peak until the overlay reprices it (the "red flash"). On IOG a
+            # smart-charge dispatch is off-peak; a bump/boost bills at peak. When the
+            # source is unknown (e.g. OHME, or a completed-only slot), fall back to the
+            # settled block rate — which is authoritative once it lands.
+            _src = (slots[k].get("source") or "").lower()
+            if _src in _BUMP_SOURCES:            # TODO: or over-6h cap on the cap tariff
+                is_op = False
+            elif _src in _SMART_SOURCES:
+                is_op = True
+            else:
+                is_op = _slot_is_off_peak(rate, peak_r)
             if is_op:
                 op += v
-                # Off-peak benefit vs the day's peak rate.
+                # Off-peak benefit vs the day's peak rate (firms up once settled).
                 if peak_r is not None and rate is not None and peak_r > rate:
                     saving += (peak_r - rate) * v
             else:
