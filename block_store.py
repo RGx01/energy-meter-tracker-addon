@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     imp_rate         REAL,
     imp_cost         REAL,
     imp_cost_remainder REAL,
+    imp_cost_exc     REAL,               -- 4.1.x BL-23: exc-VAT import cost (NULL until captured; inc figures unchanged)
     imp_read_start   REAL,
     imp_read_end     REAL,
     exp_kwh          REAL,
@@ -557,6 +558,9 @@ def _block_rows(block: dict, config_period_id: int, tz_name: str) -> list[dict]:
             "imp_rate":          imp.get("rate"),
             "imp_cost":          imp.get("cost"),
             "imp_cost_remainder":imp.get("cost_remainder"),
+            # BL-23: exc-VAT import cost, when the import channel carries one
+            # (NULL otherwise — inc-VAT figures are unaffected).
+            "imp_cost_exc":      imp.get("cost_exc"),
             "imp_read_start":    imp.get("read_start"),
             "imp_read_end":      imp.get("read_end"),
             # export channel
@@ -731,6 +735,13 @@ def _row_to_block(rows: list[sqlite3.Row]) -> dict:
                 imp_ch["kwh_remainder"] = row["imp_kwh_remainder"]
             if row["imp_cost_remainder"] is not None:
                 imp_ch["cost_remainder"] = row["imp_cost_remainder"]
+            # BL-23 exc-VAT cost — surfaced (and thus preserved on round-trip
+            # rewrite). Guarded for older DBs / pre-join fetches lacking the column.
+            try:
+                if row["imp_cost_exc"] is not None:
+                    imp_ch["cost_exc"] = row["imp_cost_exc"]
+            except (IndexError, KeyError):
+                pass
             # Expose provisional flag so the amendment path can identify blocks
             # written without a post-boundary sub-meter read.
             try:
@@ -1034,6 +1045,8 @@ class BlockStore:
             ("rate_reconciled",    "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
             # ── 3.5.0 historical-import: link a reconstructed block to its derivation
             ("derivation_id",      "blocks",        "INTEGER",                    _b_cols),
+            # ── 4.1.x BL-23: exc-VAT import cost (additive; NULL until captured)
+            ("imp_cost_exc",       "blocks",        "REAL",                       _b_cols),
             ("carbon_gco2_min",  "power_history",   "REAL",              _ph_cols),
             # ── 3.1.x dispatch lifecycle capture (observe-only, no billing effect)
             ("state",            "dispatch_slots", "TEXT",  _ds_cols),
@@ -5351,7 +5364,7 @@ class BlockStore:
                 block_start, block_end,
                 meter_id, config_period_id, interpolated,
                 imp_kwh, imp_kwh_grid, imp_kwh_remainder,
-                imp_rate, imp_cost, imp_cost_remainder,
+                imp_rate, imp_cost, imp_cost_remainder, imp_cost_exc,
                 imp_read_start, imp_read_end,
                 exp_kwh, exp_rate, exp_cost,
                 exp_read_start, exp_read_end,
@@ -5362,7 +5375,7 @@ class BlockStore:
                 :block_start, :block_end,
                 :meter_id, :config_period_id, :interpolated,
                 :imp_kwh, :imp_kwh_grid, :imp_kwh_remainder,
-                :imp_rate, :imp_cost, :imp_cost_remainder,
+                :imp_rate, :imp_cost, :imp_cost_remainder, :imp_cost_exc,
                 :imp_read_start, :imp_read_end,
                 :exp_kwh, :exp_rate, :exp_cost,
                 :exp_read_start, :exp_read_end,
@@ -5384,7 +5397,7 @@ class BlockStore:
                 block_start, block_end,
                 meter_id, config_period_id, interpolated,
                 imp_kwh, imp_kwh_grid, imp_kwh_remainder,
-                imp_rate, imp_cost, imp_cost_remainder,
+                imp_rate, imp_cost, imp_cost_remainder, imp_cost_exc,
                 imp_read_start, imp_read_end,
                 exp_kwh, exp_rate, exp_cost,
                 exp_read_start, exp_read_end,
@@ -5395,7 +5408,7 @@ class BlockStore:
                 :block_start, :block_end,
                 :meter_id, :config_period_id, :interpolated,
                 :imp_kwh, :imp_kwh_grid, :imp_kwh_remainder,
-                :imp_rate, :imp_cost, :imp_cost_remainder,
+                :imp_rate, :imp_cost, :imp_cost_remainder, :imp_cost_exc,
                 :imp_read_start, :imp_read_end,
                 :exp_kwh, :exp_rate, :exp_cost,
                 :exp_read_start, :exp_read_end,

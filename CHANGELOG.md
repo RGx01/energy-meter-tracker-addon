@@ -1,5 +1,20 @@
 # Changelog
 
+## [4.1.3] — 2026-08-09
+ 
+### Added
+ 
+- **See your EV charging split from the rest of the house — even with no charger sensor (Intelligent Octopus).** If you're on Intelligent Octopus but have **no EV sub-meter** configured, EMT now reconstructs the **EV vs house** split from Octopus's own **completed-dispatch** data (the per-slot energy it moved into your smart-charge window) and shows it as an **"EV (from dispatch)"** device across the app: the **Insights → Usage** EV card, the **Charts → Usage Stats** bar chart (its own stacked segment, a new data-table column, and a Spiral grouping), and the **Charts → Billing** tab (an "EV (from dispatch)" line in the bill breakdown, plus a segment on each per-day chart). Each half-hour's EV energy is **grid-clipped** to what the grid actually delivered that slot and its cost **apportioned** from that slot's import cost, so **house + EV always sum back to your grid import exactly** — every chart total, the data-table Totals, and the **Total Bill are byte-identical** to before; only the *breakdown* is subdivided. Validated at **~99% against a real CT-clamp EV meter** over 19 days (the ~1% is clamp measurement scatter, not missed energy). It's **display-only** and a **guaranteed no-op** for anyone who already has a real EV meter (or any sub-meter). *Caveat:* accuracy tracks charging discipline — energy taken **outside** a smart dispatch (a manual/boost charge) isn't dispatch-attributed and won't be counted here.
+
+### Fixed
+ 
+- **Agile plunge-price credits are no longer dropped from the charts.** On Agile, a half-hour can go **negative** (Octopus pays you to use power). The daily/half-hour aggregation and several chart/summary paths floored each slot's cost at zero, so a genuinely-negative import cost was silently discarded and a credit day could even show as a small charge (a real case: a day stored at **−£1.12** displayed as **+£0.22**). Negative import costs now survive aggregation and display in every affected path, so credit slots and credit days show correctly. *(Stored data was always correct — this was a display/aggregation clamp only; the Total Bill is unchanged.)*
+- **The smart-charging card no longer flashes charge slots red before they settle.** Delivered smart-charge slots could briefly draw in the **peak (red)** colour until the billed rate landed, even though they were off-peak dispatched charging. The card now colours a slot from its **dispatch source** — a genuine smart-charge slot shows **off-peak** immediately, and only a true **bump/boost** (or a confirmed over-window slot) shows red — so red once again means "actually peak", not "not known yet".
+
+### Changed
+ 
+- **Groundwork for bill-accurate rounding and ex-VAT figures (no visible change yet).** Two additive, default-off foundations for the 4.2 billing work: (1) a nullable **`imp_cost_exc`** column on the block store that round-trips an ex-VAT import cost when one is present (existing rows stay `NULL`; **every inc-VAT figure is byte-identical** — verified across a full history), and (2) a pure **`octopus_bill_total()`** helper implementing Octopus's rounding ladder (per half-hour: round kWh to 0.01 half-even → × ex-VAT rate → round cost to 0.01p half-even → sum → whole penny, VAT on top), with a Decimal-based `bankers_round()` so exact decimal halves round correctly. Both are **wired to nothing** — the live billing path is unchanged — and exist so **4.2** can add the ex-VAT capture at import and an opt-in "bill-style rounding" totals mode that makes displayed totals match how Octopus builds a bill.
+
 ## [4.1.2] — 2026-08-07
 
 ### Changed
