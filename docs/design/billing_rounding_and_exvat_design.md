@@ -1,9 +1,16 @@
 # Bill-accurate rounding + pre-VAT figures — design note
 
-> _Status: **Draft.** Two linked, billing-neutral features: (A) retain the pre-VAT
-> (exc-VAT) figures Octopus already sends, and (B) an opt-in "round the Octopus way"
-> totals mode that runs on them. Neither mutates stored per-slot data or the inc-VAT
-> figures that drive today's bill/charts._
+> _Status: **Groundwork landed in 4.1.3; full feature targeted for 4.2.** Two linked,
+> billing-neutral features: (A) retain the pre-VAT (exc-VAT) figures Octopus already
+> sends, and (B) an opt-in "round the Octopus way" totals mode that runs on them.
+> Neither mutates stored per-slot data or the inc-VAT figures that drive today's
+> bill/charts._
+>
+> **Shipped in 4.1.3 (additive, default-off — inc-VAT billing byte-identical):**
+> the `imp_cost_exc` column + store round-trip for (A), and the pure
+> `octopus_bill_total()` ladder + Decimal `bankers_round()` for (B), wired to nothing.
+> **Deferred to 4.2:** import-time exc capture + backfill (A), and the opt-in
+> `bill_rounding` toggle + inc/exc display toggle (B).
 
 ## Motivation
 A user on Agile compared a plunge-price day (26 Jul 2026) against Guy Lipman's
@@ -18,8 +25,11 @@ Per half-hour, in order:
 3. **Sum** all half-hours, then round the total to the **nearest whole penny**.
 VAT (5% domestic) sits on top of the exc-VAT figures; the published/display rate is inc-VAT.
 
-**Implementation note:** Python's built-in `round()` is already round-half-to-even,
-so no custom rounding is needed.
+**Implementation note:** use a **Decimal-based** half-even round (`bankers_round()`),
+**not** the float built-in `round()`. Python's `round()` *is* round-half-to-even, but
+only on the actual binary float — an exact decimal half like `0.015` is stored as
+`0.01499…` and rounds to `0.01`, not `0.02`. Rounding `Decimal(str(x))` gives the
+decimal the bill intends. (Shipped this way in 4.1.3.)
 
 Sources: guylipman.com/octopus/api_guide.html; octopus.energy/blog/agile-pricing-explained;
 energy-stats.uk. Held up against real bills for years, but the exact VAT-application
@@ -41,6 +51,14 @@ rounding**, and no rounding setting can remove it:
 Fixing the second is feature (A) below.
 
 ## (A) Retain pre-VAT figures — the data is already in hand
+
+> **Status (4.1.3):** the additive nullable **`imp_cost_exc`** column is added (idempotent
+> migration) and the store **round-trips** it — written by `_block_rows` + both batch
+> INSERTs, surfaced on read by `_row_to_block` as the import channel's `cost_exc`. Verified
+> byte-identical: on a full history the column is `NULL` everywhere and `SUM(imp_cost)` is
+> unchanged. **Still to do (4.2):** actually *populate* it at import (below) + a re-import
+> backfill.
+
 EMT **fetches** exc-VAT on every import and discards it:
 - Unit rates return `value_exc_vat` + `value_inc_vat`; `from_api_records` keeps only inc (kraken_rates.py:168).
 - The Measurements query already selects `costExclTax` + `costInclTax`; `_parse_measurement_node` computes both `cost_excl` + `cost_incl` (kraken_api_client.py:1222–1223). The import reads only `cost_incl`.
@@ -55,6 +73,12 @@ backfills the real exc. Live/settled measurements carry exc, so it's captured fo
 going forward once the columns exist.
 
 ## (B) Opt-in "bill-style rounding" totals mode
+
+> **Status (4.1.3):** the core is shipped and unit-tested but **wired to nothing** — a pure
+> `octopus_bill_total(slots)` implementing the ladder, `bankers_round()` (Decimal half-even),
+> and `bill_slots_from_blocks()` (uses stored exc when present, else `inc ÷ 1.05`). The live
+> billing path is unchanged. **Still to do (4.2):** the opt-in setting + display toggle below.
+
 - Setting `bill_rounding: "exact" (default) | "octopus"` in `store_meta` settings (like the carbon assumptions).
 - Applied **on-read, at the totals layer only** (daily/period/bill totals) — never mutates stored per-slot values, reversible, no reimport. Default `exact` ⇒ nobody's figures move unless they opt in.
 - Core: a pure `octopus_bill_total(blocks)` helper implementing the ladder above, on the **stored exc** (feature A) rather than `inc ÷ 1.05`. Trivially unit-testable.
@@ -62,6 +86,7 @@ going forward once the columns exist.
 - **Bonus:** an inc/exc **display toggle** — once exc is stored, showing ex-VAT totals is a genuine feature for business / reimbursement users.
 
 ## Sequencing & risk
-1. **(A) store exc-VAT** at import — small, additive, billing-neutral; the data's already fetched. Gated on go-ahead (touches the import path + a schema column).
-2. **(B) rounding + display** — a pure helper + an opt-in totals mode reading (A). No store mutation.
-Both leave the current inc-VAT bill/charts byte-identical unless a user opts in.
+0. ✅ **Groundwork (4.1.3):** the `imp_cost_exc` column + store round-trip (A) and the pure `octopus_bill_total()` ladder + `bankers_round()` (B) — both additive/default-off, inc-VAT byte-identical.
+1. **(A) store exc-VAT** at import — the schema column exists; **remaining:** populate it from the already-fetched `cost_excl` across the engine's pricing branches + a re-import backfill. Billing-neutral, but touches billing-critical pricing paths — do with a golden-baseline check.
+2. **(B) rounding + display** — the helper exists; **remaining:** the opt-in `bill_rounding` totals mode reading (A), plus the inc/exc display toggle. No store mutation.
+Both leave the current inc-VAT bill/charts byte-identical unless a user opts in. Steps 1–2 are the **4.2** feature.
