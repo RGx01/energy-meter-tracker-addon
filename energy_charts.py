@@ -727,12 +727,18 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
                         # sub-meters this key is absent (NULL in DB, omitted by
                         # reconstruction), so the raw kwh is kept unchanged —
                         # api+mini blocks are identical to CAD here.
+                        # Floor the sub-meter subtraction only when the main cost is
+                        # >= 0 (kills a power-integration over-subtraction artifact);
+                        # a genuinely negative main cost (Agile plunge-price credit)
+                        # must pass through, not clamp to 0.
                         if "kwh_remainder" in channel:
                             kwh  = float(channel["kwh_remainder"])
-                            cost = max(0.0, cost - sub_by_rate[rate]["cost"])
+                            _c = cost - sub_by_rate[rate]["cost"]
+                            cost = _c if cost < 0 else max(0.0, _c)
                         else:
                             kwh  = max(0.0, kwh  - sub_by_rate[rate]["kwh"])
-                            cost = max(0.0, cost - sub_by_rate[rate]["cost"])
+                            _c = cost - sub_by_rate[rate]["cost"]
+                            cost = _c if cost < 0 else max(0.0, _c)
 
                     key = f"{display_name} / {channel_name.replace('_', ' ').title()}"
                     if key not in meter_meta:
@@ -1264,7 +1270,12 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
     meter_totals = {}
     for meter in meter_kwh:
         kwh_sum  = sum(abs(v) for v in meter_kwh[meter])
-        cost_sum = sum(abs(v) for v in meter_cost[meter])
+        # Import cost is summed SIGNED so an Agile plunge-price credit (negative
+        # cost) reduces the total instead of being flipped positive; export is kept
+        # as a magnitude (its sign is applied at display). No-op on positive days.
+        _is_exp  = str(meter).lower().endswith("export")
+        cost_sum = (sum(abs(v) for v in meter_cost[meter]) if _is_exp
+                    else sum(meter_cost[meter]))
         meter_totals[meter] = {
             "kwh":  round(kwh_sum, 3),
             "cost": round(cost_sum, 4),

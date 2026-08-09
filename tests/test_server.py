@@ -4537,6 +4537,36 @@ class TestUpcomingDispatches(unittest.TestCase):
         self.assertAlmostEqual(s[0]["kwh"], 6.8, places=3)
 
 
+class TestNegativeCostAggregation(unittest.TestCase):
+    """Agile plunge-price days go NEGATIVE (Octopus pays you). The daily/HH
+    aggregation must not floor a genuinely-negative import cost at zero — that
+    dropped the credit and showed a charge instead (real case: 26 Jul 2026,
+    stored −£1.1228, chart showed +£0.22 = positive slots only)."""
+
+    def _row(self, slot, kwh, rate, cost, sub=False, mid="electricity_main"):
+        return {"block_start": slot, "meter_id": mid, "is_sub_meter": sub,
+                "imp_kwh": kwh, "imp_kwh_grid": kwh, "imp_kwh_remainder": kwh,
+                "imp_rate": rate, "imp_cost": cost, "exp_kwh": 0.0, "exp_cost": 0.0,
+                "standing_charge": 0.0, "carbon_g": None}
+
+    def test_negative_import_cost_survives_aggregation(self):
+        # Real slots: a −£0.2204 credit + a small +£0.0024 charge → signed −£0.218,
+        # NOT the floored/positive-only +£0.0024.
+        rows = [self._row("2026-07-26T12:30:00", 2.962, -0.05292, -0.220403),
+                self._row("2026-07-26T15:00:00", 0.019,  0.125055, 0.002376)]
+        agg = server._aggregate_block_rows(rows, lambda bs: bs[:10])
+        cost = agg["2026-07-26"]["main"]["imp_cost"]
+        self.assertAlmostEqual(cost, -0.218027, places=5)
+        self.assertLess(cost, 0.0)   # a credit, not a charge
+
+    def test_positive_day_unchanged(self):
+        # Guard: a normal positive-cost day is byte-identical (the fix is a no-op).
+        rows = [self._row("2026-07-27T18:00:00", 1.0, 0.30, 0.30),
+                self._row("2026-07-27T18:30:00", 2.0, 0.30, 0.60)]
+        agg = server._aggregate_block_rows(rows, lambda bs: bs[:10])
+        self.assertAlmostEqual(agg["2026-07-27"]["main"]["imp_cost"], 0.90, places=5)
+
+
 class TestChargeSessionsAPI(unittest.TestCase):
     """BL-10 — /api/charge-sessions gating + shape."""
 

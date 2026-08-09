@@ -1332,7 +1332,10 @@ def api_billing():
             total_imp_cost = raw_grid_cost
             # Grid Import = raw grid minus sub-meter attributed portion
             grid_imp_kwh   = max(0.0, raw_grid_kwh  - sub_kwh_total)
-            grid_imp_cost  = max(0.0, raw_grid_cost - sub_cost_total)
+            # Preserve a genuinely negative grid cost (Agile plunge-price credit);
+            # only floor the sub-over-subtraction artifact (raw cost >= 0).
+            _gc = raw_grid_cost - sub_cost_total
+            grid_imp_cost  = _gc if raw_grid_cost < 0 else max(0.0, _gc)
 
             total_imp_cost = round(total_imp_cost, 2)
             grid_imp_cost  = round(grid_imp_cost,  2)
@@ -2105,7 +2108,12 @@ def _aggregate_block_rows(raw_rows, bucket_of, standing_scope="bucket",
         _direct_cost = 0.0
         for _rate, _mv in (_m.get("_main_by_rate") or {}).items():
             _sv = (_m.get("_sub_by_rate") or {}).get(_rate, {"kwh": 0.0, "cost": 0.0})
-            _direct_cost += max(0.0, _mv["cost"] - _sv["cost"])
+            # max(0) guards a sub-meter's power-integration cost OVER-subtracting a
+            # NON-negative main into a spurious negative remainder. A genuinely
+            # negative main cost (Agile plunge-price CREDIT) must survive, so only
+            # clamp when the main slot's cost is >= 0.
+            _d = _mv["cost"] - _sv["cost"]
+            _direct_cost += _d if _mv["cost"] < 0 else max(0.0, _d)
         _m["imp_cost"] = _direct_cost
     return _day_data
 
