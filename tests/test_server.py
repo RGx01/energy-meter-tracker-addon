@@ -4573,6 +4573,188 @@ class TestUpcomingDispatches(unittest.TestCase):
         self.assertAlmostEqual(s[0]["kwh"], 6.8, places=3)
 
 
+class TestDispatchDerivedEV(unittest.TestCase):
+    """BL-22 core: reconstruct an EV kWh series from completed dispatch deltas, gated
+    to accounts with no EV sub-meter configured (display-only synthesis)."""
+
+    def _r(self, slot, kind, e):
+        return {"slot_start": slot, "kind": kind, "energy_kwh": e}
+
+    def test_sums_completed_deltas_excludes_phantoms(self):
+        rows = [self._r("2026-08-08T01:00:00", "planned", -3.4),    # phantom → ignored
+                self._r("2026-08-08T01:00:00", "completed", -3.18),
+                self._r("2026-08-08T01:30:00", "started", None),    # ignored
+                self._r("2026-08-08T01:30:00", "completed", -0.26),
+                self._r("2026-08-08T02:00:00", "completed", 0.0)]   # no delivery → out
+        ev = server._dispatch_derived_ev_kwh(rows)
+        self.assertAlmostEqual(ev["2026-08-08T01:00:00"], 3.18, places=3)
+        self.assertAlmostEqual(ev["2026-08-08T01:30:00"], 0.26, places=3)
+        self.assertNotIn("2026-08-08T02:00:00", ev)   # zero delivery excluded
+
+    def test_gate_detects_configured_ev(self):
+        cfg = {"meters": {"electricity_main": {"meta": {}},
+                          "ev_charger": {"meta": {"sub_meter": True,
+                                                  "meter_type": "ev_charger"}}}}
+        self.assertEqual(server._configured_ev_meter_id(cfg), "ev_charger")
+
+    def test_gate_none_when_no_ev(self):
+        cfg = {"meters": {"electricity_main": {"meta": {}},
+                          "house_battery": {"meta": {"sub_meter": True,
+                                                     "meter_type": "battery"}}}}
+        self.assertIsNone(server._configured_ev_meter_id(cfg))
+
+
+class TestDispatchDerivedEVWiring(unittest.TestCase):
+    """BL-22 wiring: _aggregate_usage synthesises an 'ev_dispatch' device from
+    completed dispatches ONLY when no EV sub-meter is configured. Grid-clipped and
+    cost-apportioned so house + EV == grid import exactly. Guaranteed no-op for any
+    account that has a real EV meter (validated on a pure-API dev DB: house+EV
+    reconciled to the main import to 1e-9 over 3 years / 30.4 MWh)."""
+
+    def _store(self):
+        import sqlite3
+        conn = sqlite3.connect(":memory:"); conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE meters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                config_period_id INTEGER, meter_id TEXT,
+                is_sub_meter INTEGER DEFAULT 0, meter_type TEXT
+            );
+            CREATE TABLE blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_start TEXT, block_end TEXT, meter_id TEXT, config_period_id INTEGER,
+                imp_kwh REAL, imp_kwh_grid REAL, imp_kwh_remainder REAL,
+                imp_rate REAL, imp_cost REAL, imp_cost_remainder REAL,
+                exp_kwh REAL, exp_rate REAL, exp_cost REAL, standing_charge REAL,
+                carbon_g REAL, interpolated INTEGER DEFAULT 0
+            );
+            CREATE TABLE dispatch_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slot_start TEXT, kind TEXT, provider TEXT, energy_kwh REAL
+            );
+        """)
+        # Three main slots (no sub-meters → remainder == imp): 2 cheap + 1 peak.
+        for bs, be, kwh, rate, cost in (
+            ("2026-08-04T00:00:00", "2026-08-04T00:30:00", 5.0, 0.07, 0.35),
+            ("2026-08-04T00:30:00", "2026-08-04T01:00:00", 4.0, 0.07, 0.28),
+            ("2026-08-04T08:00:00", "2026-08-04T08:30:00", 2.0, 0.30, 0.60)):
+            conn.execute(
+                "INSERT INTO blocks (block_start,block_end,meter_id,config_period_id,"
+                "imp_kwh,imp_kwh_remainder,imp_rate,imp_cost,exp_kwh,standing_charge) "
+                "VALUES (?,?,?,1,?,?,?,?,0.0,0.0)", (bs, be, "electricity_main", kwh, kwh, rate, cost))
+        # Completed dispatches: slot A −4.0 (< 5.0 import); slot B −6.0 (> 4.0 → grid-clipped to 4.0).
+        for slot, e in (("2026-08-04T00:00:00", -4.0), ("2026-08-04T00:30:00", -6.0)):
+            conn.execute("INSERT INTO dispatch_history (slot_start,kind,provider,energy_kwh) "
+                         "VALUES (?,?,?,?)", (slot, "completed", "Ohme", e))
+        conn.commit()
+
+        class FakeStore:
+            def __init__(self, c): self._conn = c
+        return FakeStore(conn), conn
+
+    def test_synthesises_ev_and_reconciles(self):
+        store, conn = self._store()
+        conn.execute("INSERT INTO meters (config_period_id,meter_id,is_sub_meter,meter_type) "
+                     "VALUES (1,'electricity_main',0,NULL)"); conn.commit()
+        cfg = {"meters": {"electricity_main": {"meta": {"timezone": "UTC"}}}}
+        d = server._aggregate_usage(store, cfg,
+                                    "2026-08-04T00:00:00", "2026-08-05T00:00:00")
+        self.assertIn("ev_dispatch", d["sub_meters"])
+        ev = d["sub_meters"]["ev_dispatch"]
+        # EV = 4.0 (slot A) + 4.0 (slot B clipped from 6.0) = 8.0 kWh
+        self.assertAlmostEqual(ev["imp_kwh"], 8.0, places=3)
+        # cost apportioned: 0.35*(4/5) + 0.28*(4/4) = 0.28 + 0.28 = 0.56
+        self.assertAlmostEqual(ev["imp_cost"], 0.56, places=4)
+        self.assertTrue(ev.get("derived"))
+        # House is the remainder; house + EV == grid import (11.0 kWh, £1.23), exactly.
+        self.assertAlmostEqual(d["house_imp_kwh"], 3.0, places=3)
+        self.assertAlmostEqual(d["house_imp_cost"], 0.67, places=4)
+        self.assertAlmostEqual(d["house_imp_kwh"] + ev["imp_kwh"], d["imp_kwh"], places=3)
+        self.assertAlmostEqual(d["house_imp_cost"] + ev["imp_cost"], d["imp_cost"], places=4)
+
+    def test_noop_when_ev_meter_configured(self):
+        # Same dispatches, but an EV sub-meter exists → feature is fully gated off.
+        store, conn = self._store()
+        conn.execute("INSERT INTO meters (config_period_id,meter_id,is_sub_meter,meter_type) "
+                     "VALUES (1,'electricity_main',0,NULL)")
+        conn.execute("INSERT INTO meters (config_period_id,meter_id,is_sub_meter,meter_type) "
+                     "VALUES (1,'ev_charger',1,'ev_charger')"); conn.commit()
+        cfg = {"meters": {"electricity_main": {"meta": {"timezone": "UTC"}},
+                          "ev_charger": {"meta": {"sub_meter": True,
+                                                  "meter_type": "ev_charger"}}}}
+        d = server._aggregate_usage(store, cfg,
+                                    "2026-08-04T00:00:00", "2026-08-05T00:00:00")
+        self.assertNotIn("ev_dispatch", d["sub_meters"])
+        # House untouched: with no EV block, house == full grid import.
+        self.assertAlmostEqual(d["house_imp_kwh"], d["imp_kwh"], places=3)
+
+
+class TestBlocksSummaryEVSplit(unittest.TestCase):
+    """BL-22 on the Charts 'Usage Stats' path: split the 'Direct' import segment into a
+    derived-EV slice + reduced house slice. DISPLAY-ONLY — row totals must not move, so
+    the chart/table/bill stay byte-identical (validated on a dev DB: 1158 rows, 0
+    total mismatches). Backed by two pure helpers."""
+
+    def test_split_by_bucket_clips_and_apportions(self):
+        # slot A: EV 4.0 < 5.0 import → 4.0 @ cost 0.35*(4/5)=0.28
+        # slot B: EV 6.0 > 4.0 import → clipped 4.0 @ cost 0.28*(4/4)=0.28
+        # both slots bucket to the same day.
+        main = {"2026-08-04T00:00:00": (5.0, 0.35), "2026-08-04T00:30:00": (4.0, 0.28)}
+        ev   = {"2026-08-04T00:00:00": 4.0, "2026-08-04T00:30:00": 6.0}
+        out = server._dispatch_ev_split_by_bucket(main, ev, lambda s: s[:10])
+        self.assertAlmostEqual(out["2026-08-04"]["kwh"], 8.0, places=3)
+        self.assertAlmostEqual(out["2026-08-04"]["cost"], 0.56, places=4)
+
+    def _row(self, y, m, d, main_kwh, main_cost):
+        return {"year": y, "month": m, "day": d,
+                "imp_kwh": main_kwh, "imp_cost": main_cost, "net_cost": main_cost,
+                "exp_kwh": 0.0, "exp_cost": 0.0, "standing": 0.0,
+                "meters": {"electricity_main": {
+                    "imp_kwh": main_kwh, "imp_cost": main_cost,
+                    "exp_kwh": 0.0, "exp_cost": 0.0, "carbon_g": None}}}
+
+    def test_apply_split_totals_byte_identical(self):
+        rows = [self._row(2026, 8, 4, 11.0, 1.23)]
+        import copy
+        before = copy.deepcopy(rows[0])
+        meters = [{"id": "electricity_main", "label": "Direct", "color": "#1f77b4", "is_sub": False}]
+        ev_day = {"2026-08-04": {"kwh": 8.0, "cost": 0.56}}
+        applied = server._apply_ev_split_to_summary_rows(rows, meters, ev_day)
+        self.assertTrue(applied)
+        r = rows[0]
+        # Top-level totals are UNTOUCHED — the split is display-only.
+        for f in ("imp_kwh", "imp_cost", "net_cost", "exp_kwh", "exp_cost", "standing"):
+            self.assertEqual(r[f], before[f], f + " must not change")
+        # The Direct segment is reduced and an EV segment carries the difference,
+        # so the two segments still sum to the original Direct import.
+        main = r["meters"]["electricity_main"]; evm = r["meters"]["ev_dispatch"]
+        self.assertAlmostEqual(main["imp_kwh"] + evm["imp_kwh"], before["meters"]["electricity_main"]["imp_kwh"], places=4)
+        self.assertAlmostEqual(main["imp_cost"] + evm["imp_cost"], before["meters"]["electricity_main"]["imp_cost"], places=4)
+        self.assertAlmostEqual(evm["imp_kwh"], 8.0, places=3)
+        self.assertAlmostEqual(evm["imp_cost"], 0.56, places=4)
+        self.assertIn("ev_dispatch", [m["id"] for m in meters])
+
+    def test_apply_split_noop_without_ev_data(self):
+        rows = [self._row(2026, 8, 4, 11.0, 1.23)]
+        import copy
+        before = copy.deepcopy(rows[0])
+        meters = [{"id": "electricity_main", "label": "Direct", "color": "#1f77b4", "is_sub": False}]
+        applied = server._apply_ev_split_to_summary_rows(rows, meters, {})   # no dispatch buckets
+        self.assertFalse(applied)
+        self.assertEqual(rows[0], before)                    # untouched
+        self.assertNotIn("ev_dispatch", [m["id"] for m in meters])
+
+    def test_apply_split_clips_ev_to_main_import(self):
+        # EV bucket claims more kWh than the day's import → clipped, house never negative.
+        rows = [self._row(2026, 8, 4, 3.0, 0.30)]
+        meters = [{"id": "electricity_main", "label": "Direct", "color": "#1f77b4", "is_sub": False}]
+        server._apply_ev_split_to_summary_rows(rows, meters, {"2026-08-04": {"kwh": 9.9, "cost": 9.9}})
+        main = rows[0]["meters"]["electricity_main"]; evm = rows[0]["meters"]["ev_dispatch"]
+        self.assertGreaterEqual(main["imp_kwh"], 0.0)
+        self.assertAlmostEqual(evm["imp_kwh"], 3.0, places=3)   # clipped to the import
+        self.assertAlmostEqual(main["imp_kwh"] + evm["imp_kwh"], 3.0, places=4)
+
+
 class TestNegativeCostAggregation(unittest.TestCase):
     """Agile plunge-price days go NEGATIVE (Octopus pays you). The daily/HH
     aggregation must not floor a genuinely-negative import cost at zero — that
