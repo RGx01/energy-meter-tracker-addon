@@ -2667,12 +2667,17 @@ class BlockStore:
     def get_import_blocks_missing_exc(self, limit: int = 2000,
                                       after_start: str | None = None) -> list:
         """4.2 exc historical backfill: page IMPORT blocks that carry energy but no
-        ex-VAT cost yet (imp_cost_exc IS NULL, imp_kwh > 0, source LIKE 'imported%').
+        ex-VAT cost yet (imp_cost_exc IS NULL, imp_kwh > 0). Covers both historically
+        IMPORTED blocks (source LIKE 'imported%') AND SETTLED live blocks
+        (imp_kwh_api IS NOT NULL) — the latter were captured live before ex-VAT
+        existed and have already settled via DCC, so settlement capture will never
+        re-stamp them; without this they stay on the inc÷VAT approximation forever.
+        Truly-unsettled live blocks are excluded — they get real exc at settlement.
         Ordered by block_start; pass the last start back as `after_start` to continue.
         Returns [{start, meter_id, kwh, rate}]."""
         sql = ("SELECT block_start, meter_id, imp_kwh, imp_rate FROM blocks "
                "WHERE imp_cost_exc IS NULL AND imp_kwh IS NOT NULL AND imp_kwh > 0 "
-               "AND source LIKE 'imported%'")
+               "AND (source LIKE 'imported%' OR imp_kwh_api IS NOT NULL)")
         params: list = []
         if after_start is not None:
             sql += " AND block_start > ?"
@@ -2685,10 +2690,12 @@ class BlockStore:
 
     def count_import_blocks_missing_exc(self) -> int:
         """Count of import blocks still lacking ex-VAT cost — the backfill's
-        remaining-work signal (0 ⇒ mark the pass done)."""
+        remaining-work signal (0 ⇒ mark the pass done). Same coverage as
+        get_import_blocks_missing_exc: imported OR settled live blocks."""
         row = self._conn.execute(
             "SELECT COUNT(*) AS n FROM blocks WHERE imp_cost_exc IS NULL "
-            "AND imp_kwh IS NOT NULL AND imp_kwh > 0 AND source LIKE 'imported%'"
+            "AND imp_kwh IS NOT NULL AND imp_kwh > 0 "
+            "AND (source LIKE 'imported%' OR imp_kwh_api IS NOT NULL)"
         ).fetchone()
         return int(row["n"]) if row else 0
 
@@ -2704,7 +2711,7 @@ class BlockStore:
             cur = self._conn.execute(
                 "UPDATE blocks SET imp_cost_exc = ?, imp_rate_exc = ?, exc_source = ? "
                 "WHERE block_start = ? AND meter_id = ? AND imp_cost_exc IS NULL "
-                "AND source LIKE 'imported%'",
+                "AND (source LIKE 'imported%' OR imp_kwh_api IS NOT NULL)",
                 (cost_exc, rate_exc, exc_source, block_start, meter_id))
         return cur.rowcount > 0
 
@@ -2713,15 +2720,16 @@ class BlockStore:
         transaction (a single commit/fsync for the whole chunk, not one per block —
         the per-block commit made the historical backfill a minutes-long fsync storm
         that blocked the event loop). `updates` = iterable of
-        (block_start, meter_id, cost_exc, rate_exc, exc_source). Same NULL-only,
-        imported-only guard as set_block_exc. Returns the number of rows changed."""
+        (block_start, meter_id, cost_exc, rate_exc, exc_source). Same NULL-only
+        guard and coverage (imported OR settled live) as set_block_exc. Returns the
+        number of rows changed."""
         changed = 0
         with self._conn:
             for bs, mid, ce, rx, src in updates:
                 cur = self._conn.execute(
                     "UPDATE blocks SET imp_cost_exc = ?, imp_rate_exc = ?, exc_source = ? "
                     "WHERE block_start = ? AND meter_id = ? AND imp_cost_exc IS NULL "
-                    "AND source LIKE 'imported%'",
+                    "AND (source LIKE 'imported%' OR imp_kwh_api IS NOT NULL)",
                     (ce, rx, src, bs, mid))
                 changed += cur.rowcount
         return changed

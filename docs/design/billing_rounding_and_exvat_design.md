@@ -392,11 +392,19 @@ the inc-VAT figures and the **Total Bill** stay byte-identical unless the user o
   the slot — persisted via `append_block_replace` (verified to round-trip the exc columns). **Every
   reconciled block carries real ex-VAT the moment it settles, with no backfill.** The live/
   provisional tail (unsettled `kraken_api`) stays on the fallback until it settles.
-- **One-time historical backfill (`imported%` only):** `_run_historical_exc_backfill` fills
-  imported blocks whose `imp_cost_exc` is NULL via the tariff reconstruction (`_exc_rate_for_block`),
+- **One-time historical backfill (imported + settled-live):** `_run_historical_exc_backfill` fills
+  blocks whose `imp_cost_exc` is NULL via the tariff reconstruction (`_exc_rate_for_block`),
   batched + yielding (one transaction/chunk, `await` between chunks — an earlier per-block-commit
   version blocked the event loop and dropped the HA WebSocket). *A broader "reconciled" self-healing
   variant was built and then **reverted** in favour of settlement capture as the durable path.*
+  Coverage is **versioned** (`_EXC_BACKFILL_SCOPE`): scope 1 = historically-imported blocks
+  (`source LIKE 'imported%'`); **scope 2 also fills settled live blocks** (`imp_kwh_api IS NOT NULL`)
+  captured before ex-VAT existed and already DCC-settled — settlement capture never re-stamps them,
+  so without this they read `≈` forever (see the go-live gap below). Truly-unsettled live blocks are
+  left for settlement capture. The completion marker carries the scope, so an instance already
+  *done* at a narrower scope **re-arms** once for the newly-covered blocks; a fresh install just runs
+  once at the current scope. Sub-meter/`recorder_attributed` blocks stay out of scope (never carried
+  captured exc; the ex-VAT bill total is the main import alone).
 
 **2. The read-path fix that made any of this visible.** `get_blocks_lightweight` (the fetch behind
 the charts **and** the billing summary) selected `imp_rate`/`imp_cost` but **not** the exc columns —
@@ -453,10 +461,13 @@ deliberately unchanged.
 - **Export credit / VAT on export.** Export (SEG/outgoing) is **outside VAT** — customers aren't
   charged VAT on it. It has its own zero-rated section and is netted into the **Total Bill**; the
   ex-VAT block is the *import* total by design. Nothing missing.
-- **The ~189 uncaptured settled `kraken_api` blocks** are a **dev-DB artifact** — live blocks
-  accumulated across many build iterations *before* settlement-capture existed. A clean 4.2 install
-  captures exc at settlement from the start, so there's no backlog. (An upgrade may carry a few weeks
-  of already-settled live blocks; tiny and self-clearing on re-settlement.)
+- **Settled live blocks captured before ex-VAT existed** — an instance that ran live for a while
+  before upgrading has already-DCC-settled `kraken_api` blocks with no captured exc. These do **not**
+  self-clear (settlement capture only stamps a block when it *re-settles*, and they settled long ago),
+  so the whole go-live→upgrade window read `≈` — observed in prod-dev as "exc approximate for every
+  block after go-live", 3,891 blocks over ~6 months. **Now handled** by the scope-2 historical
+  backfill above (imported OR settled-live), which reconstructs their exc from the tariff on the next
+  start. A clean 4.2 install still captures exc at settlement from the start and has no such backlog.
 - **Live/provisional exc is fallback-only, by design.** Unsettled `kraken_api` slots show the
   calendar-VAT fallback (`≈`) until they settle and pick up captured exc.
 - **Usage Stats ex-VAT — intentionally not done** (decision): it already ties to the billing summary

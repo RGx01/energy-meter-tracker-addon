@@ -3080,12 +3080,17 @@ def _drain_pass2_queue(ha: HAClient, limit: int = 50, rate_resolver=None) -> int
                 "for retry): %s", block_start, e)
 
     if done:
-        # Re-priced blocks change the billing/daily charts — regenerate them now
-        # so the UI reflects the reconciled figures immediately. Without this the
-        # charts stay stale until the next block rollover happens to trigger a
-        # chart write, so a user viewing right after a reconcile sees old numbers.
+        # Re-priced blocks change the billing/daily charts — regenerate them so the
+        # UI reflects the reconciled figures. Do it OFF the loop: this drain runs on
+        # the engine loop (via _engine_tick), and an inline render over a large
+        # history (tens of seconds — more since the 4.2 ex-VAT billing path) stalls
+        # the HA WebSocket heartbeat → disconnect → startup re-run → reconnect storm.
+        # This bites harder now that the settlement poll window anchors back to the
+        # oldest unsettled block, so the drain has re-settled blocks (done>0) far more
+        # often. _schedule_chart_regen fires the offloaded, read-only, in-progress-
+        # guarded render as a loop task and only renders inline when there's no loop.
         try:
-            generate_charts(_store)
+            _schedule_chart_regen()
         except Exception as _ce:
             logger.warning("_drain_pass2_queue: chart regen failed: %s", _ce)
 
@@ -4234,8 +4239,14 @@ def _maybe_backfill_historical_exc() -> None:
         if api_import_running() or delete_in_progress():
             logger.info("exc backfill: deferred — import/delete job active; will retry")
             return
-        if (_store.get_meta(_EXC_BACKFILL_MARKER, {}) or {}).get("done"):
-            return   # already complete — silent
+        _m = _store.get_meta(_EXC_BACKFILL_MARKER, {}) or {}
+        # Done ONLY counts if it completed at the current coverage scope. A prior run
+        # done at a narrower scope (e.g. imported-only, before scope 2 added settled
+        # live blocks) must still be scheduled so _run_historical_exc_backfill can
+        # re-arm and fill the newly-covered blocks — otherwise this gate would swallow
+        # the re-arm before it ever runs.
+        if _m.get("done") and int(_m.get("scope") or 1) >= _EXC_BACKFILL_SCOPE:
+            return   # already complete at the current scope — silent
         import asyncio as _aio
         try:
             loop = _aio.get_running_loop()
@@ -5932,6 +5943,13 @@ def _exc_rate_for_block(rate_segs, start, stored_inc_rate):
 
 
 _EXC_BACKFILL_MARKER = "exc_backfill_state"   # store_meta key
+# Coverage-scope version of the exc backfill. Bump when the set of blocks it fills
+# widens, so an instance that already ran (and marked itself done) at a narrower
+# scope re-arms for the new blocks instead of skipping them forever.
+#   1 = historically-imported blocks only (source LIKE 'imported%')
+#   2 = + settled live blocks (imp_kwh_api IS NOT NULL) captured before ex-VAT
+#       existed and already DCC-settled, so settlement capture won't re-stamp them
+_EXC_BACKFILL_SCOPE = 2
 
 
 async def _run_historical_exc_backfill(max_blocks: int = 20000,
@@ -5961,6 +5979,18 @@ async def _run_historical_exc_backfill(max_blocks: int = 20000,
     if _store is None or not kraken_available():
         return 0
     state = _store.get_meta(_EXC_BACKFILL_MARKER, {}) or {}
+    # Re-arm ONLY a PRIOR run that completed at a narrower coverage scope (scope 2
+    # added settled live blocks captured before ex-VAT existed). `state` is truthy
+    # only when a marker already exists, so a fresh install (empty marker) just runs
+    # once at the current scope with no re-arm log. A pre-versioning marker has no
+    # 'scope' key → treated as scope 1 (that's exactly the instance that needs it).
+    # Drop done + cursor (keep the filled tally); the paging query filters
+    # imp_cost_exc IS NULL, so the re-scan only revisits still-missing blocks.
+    if state and int(state.get("scope") or 1) < _EXC_BACKFILL_SCOPE:
+        logger.info("exc backfill: coverage scope widened to %d — re-arming to fill "
+                    "settled live blocks captured before ex-VAT existed",
+                    _EXC_BACKFILL_SCOPE)
+        state = {"filled": int(state.get("filled") or 0)}
     if state.get("done") or delete_in_progress():
         return 0
     try:
@@ -5975,7 +6005,8 @@ async def _run_historical_exc_backfill(max_blocks: int = 20000,
     _remaining0 = _store.count_import_blocks_missing_exc()
     if _remaining0 == 0:
         _store.set_meta(_EXC_BACKFILL_MARKER,
-                        {"done": True, "filled": int(state.get("filled") or 0),
+                        {"done": True, "scope": _EXC_BACKFILL_SCOPE,
+                         "filled": int(state.get("filled") or 0),
                          "uncovered": 0,
                          "completed_at": _dt.now(_tz.utc).replace(tzinfo=None).isoformat()})
         logger.info("exc backfill: nothing to do — all import blocks already carry ex-VAT")
@@ -6010,7 +6041,8 @@ async def _run_historical_exc_backfill(max_blocks: int = 20000,
                 logger.warning("_run_historical_exc_backfill: chunk persist failed "
                                "(cursor=%s): %s", cursor, e)
         _store.set_meta(_EXC_BACKFILL_MARKER,
-                        {"cursor": cursor, "filled": total_filled + filled})
+                        {"cursor": cursor, "scope": _EXC_BACKFILL_SCOPE,
+                         "filled": total_filled + filled})
         if len(rows) < batch:
             reached_end = True
             break
@@ -6018,7 +6050,8 @@ async def _run_historical_exc_backfill(max_blocks: int = 20000,
     total_filled += filled
     if reached_end:
         _store.set_meta(_EXC_BACKFILL_MARKER,
-                        {"done": True, "filled": total_filled,
+                        {"done": True, "scope": _EXC_BACKFILL_SCOPE,
+                         "filled": total_filled,
                          "uncovered": _store.count_import_blocks_missing_exc(),
                          "completed_at": _now_iso()})
     logger.info("exc backfill: filled %d block(s) this pass%s",
@@ -8925,8 +8958,12 @@ async def reconcile_dispatch_overlay() -> dict:
         logger.info("reconcile: %s %s %.5f→%.5f (%s)",
                     target, bs, cur_rate, new_rate, reason)
     if changed:
+        # OFF the loop — reconcile_dispatch_overlay is async and runs on the engine
+        # loop, so an inline render over a large history stalls the HA heartbeat
+        # (reconnect storm). _schedule_chart_regen fires the offloaded read-only
+        # render as a loop task; the reconcile's writes are committed before it runs.
         try:
-            generate_charts(store)
+            _schedule_chart_regen()
         except Exception as e:
             logger.warning("reconcile_dispatch_overlay: chart regen failed: %s", e)
     # Heartbeat every run (even with no changes) so the pass is observable in the
@@ -8989,11 +9026,14 @@ async def resolve_history_gaps(now=None, meter_id: str = "electricity_main",
                     g["start"], g["end"], g["slots"], made)
 
     if total_backfilled:
-        # We are already on the engine loop (called via _run_on_engine_loop), so
-        # regen inline on this thread — never from the Flask thread, which would
-        # use the engine's SQLite connection cross-thread (the 3.1.3 segfault).
+        # We are on the engine loop (called via _run_on_engine_loop). Render OFF the
+        # loop: a large-history render here stalls the HA heartbeat (reconnect storm),
+        # and it must never run on the Flask thread with the engine's writer
+        # connection (the 3.1.3 cross-thread segfault). _schedule_chart_regen fires
+        # the offloaded render (its own read-only connection) as a loop task, which
+        # satisfies both — the backfill writes are committed before it runs.
         try:
-            generate_charts(_store)
+            _schedule_chart_regen()
         except Exception as e:
             logger.warning("resolve_history_gaps: chart regen failed: %s", e)
     logger.info("resolve_history_gaps: %d gap run(s), %d block(s) backfilled",
