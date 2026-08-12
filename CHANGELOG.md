@@ -1,8 +1,8 @@
 # Changelog
  
-## [Unreleased] — 4.2.0 (ex-VAT figures, VAT calendar & settlement/backfill fixes)
+## [4.2.0] — 2026-08-09
 
-### Added
+### Added (ex-VAT figures, VAT calendar & settlement/backfill fixes)
 
 - **Ex-VAT (pre-VAT) figures, retained at source and shown on an opt-in toggle (BL-23).** Octopus returns the exc-VAT unit rate and cost on every import and settlement, and EMT used to keep only the inc-VAT side and reconstruct the rest as `inc ÷ 1.05`. EMT now **stores the real exc figures** — `imp_cost_exc`, the derived `imp_rate_exc`, `standing_charge_exc` and an `exc_source` marker — captured at both **import** and **DCC settlement**, so live and settled history carry the exact pre-VAT numbers for free from here on. A new **ex-VAT display toggle** (for business / reimbursement use) reads them; the lightweight block-fetch that renders the view now surfaces the exc columns rather than silently falling back to `inc ÷ 1.05`. Existing history is filled once by a **one-time backfill** (period tariff rate × stored kWh), written in batched transactions with paced `await`s so it never blocks the Home Assistant event loop the way a naïve per-block backfill did. **Inc-VAT figures are byte-identical** — the ex-VAT side is purely additive, default-off, and never re-prices a stored block. **Note: the ex-VAT view is currently available only on the API path.** It's gated on captured-exc coverage, so CAD/no-API setups keep it hidden — even where **imported (CSV / bill-reconstructed) data already carries the exc information**, the toggle stays off for now; surfacing ex-VAT for imported-only history is a follow-up.
 
