@@ -4861,6 +4861,24 @@ class TestChargeSessionsAPI(unittest.TestCase):
         self.assertIn("local", d["upcoming"][0])
 
 
+class TestBillRoundingPage(unittest.TestCase):
+    """BL-24.2: the Bill Rounding settings page + the bill_rounding_summary setting."""
+
+    def test_page_renders(self):
+        client = make_client(store=_make_test_store([]))
+        r = client.get("/bill-rounding")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b"Guy Lipman", r.data)
+        self.assertIn(b"Bill-style rounding", r.data)
+
+    def test_setting_roundtrips_and_defaults_off(self):
+        client = make_client(store=_make_test_store([]))
+        self.assertFalse(client.get("/api/settings").get_json()["bill_rounding_summary"])  # default off
+        self.assertTrue(client.post("/api/settings",
+                                    json={"bill_rounding_summary": True}).get_json()["ok"])
+        self.assertTrue(client.get("/api/settings").get_json()["bill_rounding_summary"])
+
+
 class TestResponseCompression(unittest.TestCase):
     """gzip after_request — large text bodies are compressed for clients that
     advertise gzip (fixes the uncompressed multi-MB chart transfer on :8099)."""

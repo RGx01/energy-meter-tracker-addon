@@ -66,6 +66,37 @@ class TestRateSchedule(unittest.TestCase):
         ])
         self.assertEqual(len(s), 1)
 
+    def test_exc_sibling_from_api_records(self):
+        # BL-23 (4.2 Slice B): the parallel EX-VAT schedule is exposed as `.exc` and
+        # resolves independently; the inc path is unchanged, and VAT is the pair's ratio.
+        s = RateSchedule.from_api_records([
+            {"value_inc_vat": 26.1537, "value_exc_vat": 24.9083,
+             "valid_from": "2026-02-01T00:00:00Z", "valid_to": None}])
+        self.assertEqual(s.resolve("2026-05-01T00:00:00"), 26.1537)        # inc unchanged
+        self.assertIsNotNone(s.exc)
+        self.assertEqual(s.exc.resolve("2026-05-01T00:00:00"), 24.9083)    # exc series
+        self.assertIsNone(s.exc.exc)                                       # no recursion
+        self.assertAlmostEqual(26.1537 / 24.9083 - 1, 0.05, places=3)      # VAT from pair
+
+    def test_exc_sibling_absent_when_no_exc(self):
+        # inc-only records → no exc sibling (nothing to resolve against).
+        s = RateSchedule.from_api_records([
+            {"value_inc_vat": 12.0, "valid_from": "2026-02-01T00:00:00Z", "valid_to": None}])
+        self.assertIsNone(s.exc)
+
+    def test_exc_sibling_banded_bounds(self):
+        # IOG-style banded tariff: exc day_rate_bounds gives (off-peak-exc, peak-exc),
+        # reusing the inc resolver logic for free.
+        s = RateSchedule.from_api_records([
+            {"value_inc_vat": 5.77, "value_exc_vat": 5.4952,
+             "valid_from": "2026-02-01T00:00:00Z", "valid_to": "2026-02-01T05:00:00Z"},
+            {"value_inc_vat": 33.92, "value_exc_vat": 32.3048,
+             "valid_from": "2026-02-01T05:00:00Z", "valid_to": None},
+        ])
+        lo, hi = s.exc.day_rate_bounds("2026-02-01T12:00:00")
+        self.assertAlmostEqual(lo, 5.4952, places=4)
+        self.assertAlmostEqual(hi, 32.3048, places=4)
+
 
 class _FakeClient:
     def __init__(self, records=None, raise_=False):

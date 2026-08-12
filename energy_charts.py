@@ -941,20 +941,12 @@ def bankers_round(x, ndigits=0):
 
 
 def octopus_bill_total(slots, vat_rate=0.05):
-    """Octopus's bill-rounding ladder on EXC-VAT figures (see
-    docs/billing_rounding_and_exvat_design.md):
-      1. round each half-hour's consumption to 0.01 kWh (half-even);
-      2. × the exc-VAT unit rate, round the cost to 0.01p (half-even);
-      3. sum, then round the total to the nearest whole penny.
-    VAT sits on top of the exc total. `slots` is an iterable of (kwh, exc_rate) with
-    exc_rate in £/kWh. Returns pence + £ for exc and inc. PURE and wired to nothing —
-    the live billing path stays the exact 6-dp float sum unless a caller opts in, so
-    no existing figure moves. Lets a future 'bill-style rounding' toggle read this."""
-    exc_pence = 0.0
-    for kwh, exc_rate in slots:
-        kwh_r = bankers_round(kwh, 2)                                  # 0.01 kWh
-        exc_pence += bankers_round(kwh_r * float(exc_rate) * 100.0, 2)  # 0.01p
-    exc_pence = bankers_round(exc_pence, 0)                            # whole penny
+    """Ex-VAT energy total for a set of (kwh, exc_rate) slots (exc_rate £/kWh), rounding
+    only at the TOTAL (whole penny); VAT on top. Empirically — verified against a real
+    Octopus bill — the per-half-hour figures are summed RAW; Octopus does NOT round each
+    half-hour's kWh/cost (that would zero the many sub-0.01 kWh slots). See
+    _bill_method_breakdown, which is what the Billing summary uses. Returns pence + £."""
+    exc_pence = bankers_round(sum(kwh * float(exc_rate) * 100.0 for kwh, exc_rate in slots), 0)
     inc_pence = bankers_round(exc_pence * (1.0 + vat_rate), 0)
     return {"exc_pence": exc_pence, "inc_pence": inc_pence,
             "exc_gbp": round(exc_pence / 100.0, 2),
@@ -973,9 +965,12 @@ def bill_slots_from_blocks(blocks, vat_rate=0.05):
         kwh = imp.get("kwh")
         if not kwh:
             continue
-        cost_exc = imp.get("cost_exc")
-        if cost_exc is not None:
-            exc_rate = float(cost_exc) / float(kwh)
+        # Prefer the stored published ex-VAT rate, then the ex-VAT cost, then the
+        # inc rate ÷ (1+VAT) approximation (until a re-import captures real exc).
+        if imp.get("rate_exc") is not None:
+            exc_rate = float(imp["rate_exc"])
+        elif imp.get("cost_exc") is not None:
+            exc_rate = float(imp["cost_exc"]) / float(kwh)
         else:
             rate = imp.get("rate")
             if rate is None:
@@ -983,6 +978,139 @@ def bill_slots_from_blocks(blocks, vat_rate=0.05):
             exc_rate = float(rate) / (1.0 + vat_rate)
         slots.append((float(kwh), exc_rate))
     return slots
+
+
+def _bill_method_breakdown(blocks, period_vat=None, standing_inc_by_day=None):
+    """BL-24: ex-VAT bill-method breakdown for a period — import energy by rate band, plus
+    ex-VAT standing, a VAT row and the inc total. Matches how Octopus actually reconciles
+    (verified against a real bill): the per-half-hour figures are summed RAW and rounding
+    happens only at the SUBTOTAL — NOT per half-hour (that destroys the many sub-0.01 kWh
+    peak slots) and NOT the 1dp kWh the bill shows for display. VAT is derived from a real
+    inc/exc pair (snapped 0/5/20%; 0% once VAT is removed), else the default. Ex-VAT cost is
+    the stored exc where captured, else the billed inc ÷ (1+VAT) — same for standing, so the
+    standing charge still lands before ex-VAT capture. Returns a dict or None."""
+    from collections import defaultdict as _dd
+    blocks = list(blocks or [])
+    # ── Pass 1: VAT rate from a real inc/exc pair (else default) ────────────────
+    raw_vat = None
+    for b in blocks:
+        imp = (((b or {}).get("meters") or {}).get("electricity_main") or {})
+        imp = (imp.get("channels") or {}).get("import") or {}
+        c, ce = imp.get("cost"), imp.get("cost_exc")
+        if c and ce and ce != 0:
+            raw_vat = float(c) / float(ce) - 1.0
+            break
+    # VAT rate: derived from a real inc/exc pair where present; else the period's
+    # statutory rate from the VAT calendar (passed in), NOT a hardcoded 5% — so a 0%/20%
+    # period labels + fills correctly. The *amount* is computed as inc − exc below, which
+    # is right regardless of the rate; this `vat` only sets the label and the fallbacks.
+    _default_vat = 0.05 if period_vat is None else float(period_vat)
+    vat = _default_vat if raw_vat is None else min((0.0, 0.05, 0.20),
+                                                   key=lambda x: abs(x - raw_vat))
+    # ── Pass 2: raw ex-VAT sums per band + ex-VAT standing per day ──────────────
+    bands = _dd(lambda: {"kwh": 0.0, "exc": 0.0, "inc": 0.0})
+    tot_kwh = with_exc = 0.0
+    stand_exc_day = {}   # local day → ex-VAT standing (first non-zero; stored else inc/(1+VAT))
+    for b in blocks:
+        m = ((b or {}).get("meters") or {}).get("electricity_main") or {}
+        imp = (m.get("channels") or {}).get("import") or {}
+        d = (b.get("start") or "")[:10]
+        if d and d not in stand_exc_day:
+            se = m.get("standing_charge_exc")
+            if se:
+                stand_exc_day[d] = float(se)
+            else:
+                sc = m.get("standing_charge") or 0
+                if sc:
+                    stand_exc_day[d] = float(sc) / (1.0 + vat)
+        kwh = imp.get("kwh") or 0
+        if not kwh:
+            continue
+        tot_kwh += kwh
+        inc_rate = imp.get("rate")
+        if imp.get("cost_exc") is not None or imp.get("rate_exc") is not None:
+            with_exc += kwh
+        # Raw ex-VAT cost for this half-hour: the billed cost, ex-VAT.
+        if imp.get("cost_exc") is not None:
+            xc = float(imp["cost_exc"])
+        elif imp.get("cost") is not None:
+            xc = float(imp["cost"]) / (1.0 + vat)
+        elif inc_rate is not None:
+            xc = kwh * (float(inc_rate) / (1.0 + vat))
+        else:
+            continue
+        # Inc cost for this slot — paired with xc so the VAT amount is inc − exc (exact
+        # for any mix of rates across a period, e.g. a VAT-holiday boundary).
+        if imp.get("cost") is not None:
+            ic = float(imp["cost"])
+        elif inc_rate is not None:
+            ic = kwh * float(inc_rate)
+        else:
+            ic = xc * (1.0 + vat)
+        # Band by the CLEAN inc-rate tariff band, NOT the per-slot derived exc rate
+        # (cost_exc ÷ kWh). The derived rate jitters with Octopus's per-slot rounding and
+        # shatters the two real bands into many near-duplicates (0.3075/0.3077/0.3078/…);
+        # the stored inc rate is a clean tariff value, so grouping on it reproduces the
+        # bill's band structure. We group on inc (not the exc rate) because Octopus stores
+        # only the exc COST on measurement slots — imp_rate_exc is NULL there — so there's
+        # no reliable exc-rate column to group on; inc↔exc are 1:1 (÷ (1+VAT)) so it's
+        # equivalent. Fall back to an inc-scale key from the exc figures only when a slot
+        # has no inc rate.
+        if inc_rate is not None:
+            band_key = round(float(inc_rate), 6)
+        elif imp.get("rate_exc") is not None:
+            band_key = round(float(imp["rate_exc"]) * (1.0 + vat), 6)
+        else:
+            # No inc rate / stored exc rate — derive an inc-scale key from this slot's
+            # ex-VAT cost so it still bands consistently (xc is always set by here).
+            band_key = round(xc / float(kwh) * (1.0 + vat), 6)
+        band = bands[band_key]
+        band["kwh"] += kwh
+        band["exc"] += xc
+        band["inc"] += ic
+    if not bands:
+        return None
+    rows, energy_raw, energy_inc = [], 0.0, 0.0
+    for key in sorted(bands):
+        bk, be = bands[key]["kwh"], bands[key]["exc"]
+        energy_raw += be
+        energy_inc += bands[key]["inc"]
+        # Displayed exc rate = the band's clean inc-scale key ÷ (1+VAT) — a deterministic
+        # ex-VAT label that matches the bill, NOT a derived effective cost ÷ kWh (which can
+        # land a rounding unit off). Cost to 3dp (mills), like the bill — the 4dp rate × kWh
+        # only reconciles to the cost at finer precision; the summed raw cost is authoritative.
+        rows.append({"rate_exc": round(key / (1.0 + vat), 4),
+                     "kwh": round(bk, 3), "cost_exc": round(be, 3)})
+    # Standing: prefer the summary's per-LOCAL-day inc figure (correct day count across
+    # the BST midnight boundary), ex-VAT via ÷ (1+VAT) — exact-to-the-mill for a flat
+    # charge. Fall back to the block-derived exc standing when no summary is supplied.
+    if standing_inc_by_day:
+        standing_days = len(standing_inc_by_day)
+        standing_inc_raw = sum(standing_inc_by_day.values())
+        standing_raw  = standing_inc_raw / (1.0 + vat)
+    else:
+        standing_days = len(stand_exc_day)
+        standing_raw  = sum(stand_exc_day.values())
+        standing_inc_raw = standing_raw * (1.0 + vat)
+    standing_rate = round(standing_raw / standing_days, 4) if standing_days else 0.0
+    subtotal_raw  = energy_raw + standing_raw            # ex-VAT subtotal
+    inc_raw       = energy_inc + standing_inc_raw        # inc-VAT subtotal
+    subtotal = round(subtotal_raw, 2)
+    # VAT amount as inc − exc (a subtraction) — exact for any mix of rates across the
+    # period, so a VAT-holiday boundary inside a bill period is handled correctly.
+    vat_amount = round(inc_raw - subtotal_raw, 2)
+    return {
+        "rows": rows,
+        "energy_exc":        round(energy_raw, 2),
+        "standing_days":     standing_days,
+        "standing_rate_exc": standing_rate,
+        "standing_exc":      round(standing_raw, 2),
+        "subtotal_exc":      subtotal,
+        "vat_rate":          vat,
+        "vat_amount":        vat_amount,
+        "inc_total":         round(inc_raw, 2),
+        "coverage":          round(with_exc / tot_kwh, 3) if tot_kwh else 0.0,
+    }
 
 
 def _has_sub_meters(cfg):
@@ -1164,6 +1292,10 @@ def render_billing_summary(summary, currency='£', site_name=None):
         </tr>"""
         html += _bill_rate_rows(channels, currency)[0]
         html += _bill_total_row(totals["kwh"], totals["cost"])
+    # BL-24: when "Bill Rounding" is on, the import charge is rendered EX-VAT (the bill
+    # method) IN PLACE OF the inc-VAT display; otherwise the usual inc-VAT rows.
+    _bm = summary.get("bill_method")
+    _exc_lbl = ", exc" if _bm else ""
     if remainder_keys or submeter_keys:
         # Build raw totals from main_import_raw
         raw_kwh  = sum(d["kwh"]  for d in main_import_raw.values())
@@ -1192,31 +1324,49 @@ def render_billing_summary(summary, currency='£', site_name=None):
           <td colspan="4">Import — total grid{mpan_html}{reads_html}</td>
         </tr>
         <tr class="channel-header">
-          <td></td><td>Rate ({currency}/kWh)</td><td>kWh</td><td>Cost ({currency})</td>
+          <td></td><td>Rate ({currency}/kWh{_exc_lbl})</td><td>kWh</td><td>Cost ({currency}{_exc_lbl})</td>
         </tr>"""
-        _rate_html, raw_kwh_r, raw_cost_r = _bill_rate_rows(main_import_raw, currency)
-        html += _rate_html
-        html += _bill_total_row(raw_kwh_r, raw_cost_r)
-
-        # ── Standing charge folded into the import charge (display only) —
-        # mirrors a real bill, where energy + standing make up the import total.
-        # The kWh Total above is unchanged, and summary['total_cost'] (the Total
-        # Bill) plus Usage Stats are computed elsewhere, so nothing here moves a
-        # number — this only adds a cost-inclusive subtotal to the display.
-        if summary["standing"]:
-            _sc_groups = {}
-            for _d, _amt in sorted(summary["standing"].items()):
-                _r = round(_amt, 4)
-                _sc_groups[_r] = _sc_groups.get(_r, 0) + 1
-            for _r, _cnt in sorted(_sc_groups.items()):
+        if _bm:
+            # BL-24: the ex-VAT bill method REPLACES the inc-VAT import display when Bill
+            # Rounding is on — per-rate ex-VAT (3dp, as the bill), Total (exc), the ex-VAT
+            # standing charge, a VAT row, then the inc-VAT total. Octopus builds a bill this
+            # way: sum the raw ex-VAT half-hours, round at the subtotal, then add VAT. The
+            # Total Bill below is UNCHANGED — this only changes how the import is presented.
+            for _r in _bm["rows"]:
                 html += f"""
+        <tr><td></td><td>{_r['rate_exc']:.4f}</td><td>{_r['kwh']:.3f}</td><td>{_r['cost_exc']:.3f}</td></tr>"""
+            html += f"""
+        <tr class="channel-total"><td>Total (exc)</td><td></td><td></td><td>{_bm['energy_exc']:.2f}</td></tr>"""
+            if _bm["standing_days"]:
+                html += f"""
+        <tr class="standing"><td colspan="3">Standing charge (exc): {_bm['standing_days']} days @ {currency}{_bm['standing_rate_exc']:.4f}/day</td><td>{_bm['standing_exc']:.2f}</td></tr>"""
+            html += f"""
+        <tr class="bill-method"><td colspan="3">VAT @ {_bm['vat_rate'] * 100:.0f}%</td><td>{currency}{_bm['vat_amount']:.2f}</td></tr>
+        <tr class="channel-total"><td colspan="3">Total incl. VAT</td><td>{currency}{_bm['inc_total']:.2f}</td></tr>"""
+        else:
+            _rate_html, raw_kwh_r, raw_cost_r = _bill_rate_rows(main_import_raw, currency)
+            html += _rate_html
+            html += _bill_total_row(raw_kwh_r, raw_cost_r)
+
+            # ── Standing charge folded into the import charge (display only) —
+            # mirrors a real bill, where energy + standing make up the import total.
+            # The kWh Total above is unchanged, and summary['total_cost'] (the Total
+            # Bill) plus Usage Stats are computed elsewhere, so nothing here moves a
+            # number — this only adds a cost-inclusive subtotal to the display.
+            if summary["standing"]:
+                _sc_groups = {}
+                for _d, _amt in sorted(summary["standing"].items()):
+                    _r = round(_amt, 4)
+                    _sc_groups[_r] = _sc_groups.get(_r, 0) + 1
+                for _r, _cnt in sorted(_sc_groups.items()):
+                    html += f"""
         <tr class="standing">
           <td colspan="3">Standing charge: {_cnt} days @ {currency}{_r:.4f}/day</td>
           <td>{_r * _cnt:.2f}</td>
         </tr>"""
-            _incl = raw_cost_r + round(sum(summary["standing"].values()), 2)
-            _incl_str = f"({-_incl:.2f})" if _incl < 0 else f"{_incl:.2f}"
-            html += f"""
+                _incl = raw_cost_r + round(sum(summary["standing"].values()), 2)
+                _incl_str = f"({-_incl:.2f})" if _incl < 0 else f"{_incl:.2f}"
+                html += f"""
         <tr class="channel-total">
           <td colspan="3">Total incl. standing charge</td><td>{_incl_str}</td>
         </tr>"""
@@ -1275,7 +1425,9 @@ def render_billing_summary(summary, currency='£', site_name=None):
         <tr class="grand-total">
           <td colspan="3">Total Bill</td>
           <td>{currency}{summary['total_cost']:.2f}</td>
-        </tr>
+        </tr>"""
+
+    html += """
       </table>
     </div>"""
 
@@ -1286,7 +1438,7 @@ def render_billing_summary(summary, currency='£', site_name=None):
 # Daily chart builder (returns HTML string for one day)
 # ─────────────────────────────────────────────────────────────
 
-def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_minutes=30, currency='£', site_name=None, ev_slot_map=None):
+def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_minutes=30, currency='£', site_name=None, ev_slot_map=None, bill_rounding=False, fallback_vat=0.05):
     slots = 1440 // block_minutes
     meter_kwh    = defaultdict(lambda: [0.0] * slots)
     meter_rate   = defaultdict(lambda: [0.0] * slots)
@@ -1294,6 +1446,13 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
     slot_ti_kwh  = [0.0] * slots
     slot_ti_cost = [0.0] * slots
     slot_ti_rate = [0.0] * slots
+    # BL-24 data table (opt-in): a per-slot ex-VAT/inc ratio so every IMPORT column
+    # can show Cost (exc) alongside Cost (inc). Sourced from the block's stored ex-VAT
+    # rate (authoritative for the main import after the 4.2 backfill); a slot with no
+    # captured exc falls back to inc ÷ (1+VAT) and is flagged approximate. Only emitted
+    # when the setting is on, so the default data table JSON is byte-identical.
+    slot_exc_ratio = [None] * slots
+    slot_exc_approx = [False] * slots
     summary_kwh  = defaultdict(float)
     summary_cost = defaultdict(float)
     summary_rates = defaultdict(lambda: defaultdict(float))
@@ -1320,23 +1479,47 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
             if "kwh_remainder" in main_import:
                 main_kwh  = _f(main_import["kwh_remainder"])
                 main_cost = _f(main_import.get("cost"))
+                _raw_main_cost = main_cost   # pre-subtraction, to keep an Agile credit's sign
                 # Cost: subtract sub-meter costs (no cost_remainder stored per-block)
                 for meter_name, meter in meters.items():
                     if (meter or {}).get("meta", {}).get("sub_meter"):
                         sub = ((meter.get("channels", {}) or {}).get("import", {}) or {})
                         main_cost -= _f(sub.get("cost"))
-                main_cost = max(main_cost, 0.0)
+                # Floor only the sub-subtraction artifact (raw >= 0); a genuinely negative
+                # Agile plunge-price cost (a credit) must survive, not clamp to 0.
+                main_cost = main_cost if _raw_main_cost < 0 else max(main_cost, 0.0)
             else:
                 main_kwh  = _f(main_import.get("kwh_total", main_import.get("kwh")))
                 main_cost = _f(main_import.get("cost"))
+                _raw_main_cost = main_cost   # pre-subtraction, to keep an Agile credit's sign
                 for meter_name, meter in meters.items():
                     if (meter or {}).get("meta", {}).get("sub_meter"):
                         sub = ((meter.get("channels", {}) or {}).get("import", {}) or {})
                         main_kwh  -= _f(sub.get("kwh_grid", sub.get("kwh")))
                         main_cost -= _f(sub.get("cost"))
                 main_kwh  = max(main_kwh, 0.0)
-                main_cost = max(main_cost, 0.0)
+                # Floor only the sub-subtraction artifact (raw >= 0); a genuine Agile
+                # plunge-price credit (negative cost) must survive, not clamp to 0.
+                main_cost = main_cost if _raw_main_cost < 0 else max(main_cost, 0.0)
             main_rate = _f(main_import.get("rate_used", main_import.get("rate")))
+
+            # Per-slot ex-VAT ratio for the opt-in data-table Cost (exc) column.
+            if bill_rounding:
+                _exc_r = main_import.get("rate_exc")
+                _ratio = None
+                if _exc_r is not None and main_rate:
+                    _ratio = _f(_exc_r) / main_rate
+                else:
+                    _ce, _ci = main_import.get("cost_exc"), main_import.get("cost")
+                    if _ce is not None and _ci not in (None, 0):
+                        _ratio = _f(_ce) / _f(_ci)
+                if _ratio is None:
+                    # No captured exc → fall back to the period's statutory VAT rate
+                    # (from the calendar), NOT a hardcoded 1.05, so a 0%/20% period is right.
+                    slot_exc_ratio[hh]  = round(1.0 / (1.0 + fallback_vat), 8)
+                    slot_exc_approx[hh] = True
+                else:
+                    slot_exc_ratio[hh]  = round(_ratio, 8)
 
             meter_kwh["electricity_main"][hh]  = main_kwh
             meter_rate["electricity_main"][hh] = main_rate
@@ -1491,11 +1674,22 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
     }
     # Use rounded totals for the import summary line too
     total_import_cost_display = ti_total["cost"]
+    # BL-24 (opt-in): the ex-VAT import total for the side panel, from the same per-slot
+    # exc ratio the data table uses (so the two agree). Only when the setting is on.
+    _import_exc_display = None
+    if bill_rounding:
+        _inv = 1.0 / (1.0 + fallback_vat)
+        _import_exc_display = round(sum(
+            slot_ti_cost[_h] * (slot_exc_ratio[_h] if slot_exc_ratio[_h] is not None else _inv)
+            for _h in range(slots)), 2)
 
     totals_html = ''
     if total_import > 0:
         totals_html += cs(f'Total import: {total_import:.3f} kWh', main_color)
         totals_html += cs(f'Import cost: {currency}{total_import_cost_display:.2f}', main_color)
+        if _import_exc_display is not None:
+            totals_html += cs(f'Import cost (exc VAT): {currency}{_import_exc_display:.2f}',
+                              main_color)
     if exp_kwh > 0:
         totals_html += cs(f'Total export: {exp_kwh:.3f} kWh', export_color)
         totals_html += cs(f'Export credit: {currency}{exp_cost:.2f}', export_color)
@@ -1656,6 +1850,13 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
         "meter_totals":  meter_totals,
         "ti_total":      ti_total,
     }
+    # Opt-in only — keep the default JSON byte-identical for users who haven't
+    # enabled Bill Rounding.
+    if bill_rounding:
+        chart_data["bill_rounding"]  = True
+        chart_data["exc_ratio"]      = slot_exc_ratio
+        chart_data["exc_approx"]     = slot_exc_approx
+        chart_data["fallback_invat"] = round(1.0 / (1.0 + fallback_vat), 8)
     chart_data_json = json.dumps(chart_data, separators=(',', ':'))
 
     chart_id      = f"{chart_prefix}chart_{day.replace('-', '_')}"
@@ -1775,14 +1976,46 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
             d += _td(days=1)
         return result
 
+    # BL-24 (opt-in): show the bill summary with Octopus's rounding method. Read once;
+    # default off ⇒ nothing injected ⇒ the summary is byte-identical to today.
+    _bill_rounding = False
+    _vat_learned = []
+    try:
+        if store is not None:
+            _bill_rounding = bool((store.get_settings() or {}).get("bill_rounding_summary"))
+            _vat_learned = store.get_vat_calendar()
+    except Exception:
+        _bill_rounding = False
+    # Gate on capability: ex-VAT is only meaningful where EMT can capture a real exc
+    # figure (API/tariff). A CAD/cost-sensor-only user has no exc source at all, so we
+    # never show it — the fallback would only ever be inc ÷ (1+VAT), a bare assumption.
+    # Proxy "has API" by "any captured exc present in the data".
+    if _bill_rounding and not any(
+            ((((b or {}).get("meters") or {}).get("electricity_main") or {})
+             .get("channels", {}).get("import", {}) or {}).get("cost_exc") is not None
+            for b in (blocks or [])):
+        _bill_rounding = False
+
+    import vat_calendar as _vc
+    def _vat_at(_when):
+        """Statutory VAT rate at a date from the seed + learned calendar — the fallback
+        rate used where no per-slot inc/exc pair exists (replaces the hardcoded 1.05)."""
+        return _vc.resolve_vat(_when, _vat_learned)
+
     def _summ(_blks_for_calc, _s, _e):
-        """calculate_billing_summary_for_period + the display-only derived-EV split.
-        Injection uses the period's blocks so EV is attributed to the right period; the
-        bill anchors stay byte-identical regardless (see _inject_ev_breakdown_into_summary)."""
+        """calculate_billing_summary_for_period + the display-only derived-EV split, and
+        (opt-in) the bill-method figure. Both are additive: the bill anchors / Total Bill
+        stay byte-identical (see _inject_ev_breakdown_into_summary / _bill_method_summary)."""
         _sm = calculate_billing_summary_for_period(
             _blks_for_calc, _s, _e, store=store, tz_name=timezone_name)
+        _period_blocks = _blocks_for_period(_s, _e)
         if _ev_slot_map:
-            _inject_ev_breakdown_into_summary(_sm, _blocks_for_period(_s, _e), _ev_slot_map)
+            _inject_ev_breakdown_into_summary(_sm, _period_blocks, _ev_slot_map)
+        if _bill_rounding:
+            _bm = _bill_method_breakdown(_period_blocks, period_vat=_vat_at(_s),
+                                         standing_inc_by_day=_sm.get("standing"))
+            if _bm:
+                _sm["bill_method"] = _bm
         return _sm
 
     # ── Build per-period data ──
@@ -2048,7 +2281,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         # Daily charts
         day_charts_html = ""
         for day in ps["days"]:
-            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_slot_map)
+            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_slot_map, bill_rounding=_bill_rounding, fallback_vat=_vat_at(day))
 
         open_attr    = "open" if charts_open else ""
         toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}"
@@ -2121,7 +2354,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
 
         day_charts_html = ""
         for day in gs["days"]:
-            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, chart_prefix=f"{pid_prefix}_", block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_slot_map)
+            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, chart_prefix=f"{pid_prefix}_", block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_slot_map, bill_rounding=_bill_rounding, fallback_vat=_vat_at(day))
 
         toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}"
         # Quarter/year sections can hold 90–365 day charts; default the panel
@@ -3378,30 +3611,70 @@ function _buildTableContent(wrap, jsonText) {{
   var colNames = ['Total Import'].concat(orderedKeys.map(function(k) {{ return d.meters[k].nice_name; }}));
   var numMeters = colNames.length;
 
+  // BL-24 opt-in: ex-VAT columns on IMPORT meters (export is zero-rated → unchanged).
+  var br = !!d.bill_rounding;
+  var ratio  = d.exc_ratio  || [];
+  var approx = d.exc_approx || [];
+  var invat  = d.fallback_invat || (1.0 / 1.05); // period statutory 1/(1+VAT) when a slot has no ratio
+  // is a given column an import meter? Total Import (index 0) always is.
+  function isImp(idx) {{ return idx === 0 ? true : !d.meters[orderedKeys[idx-1]].is_export; }}
+  function money(v) {{ return (Math.abs(v) >= 0.000005) ? (cur + v.toFixed(5)) : '—'; }}
+
   var html = '<div class="day-meter-table"><table><thead>';
   html += '<tr><th rowspan="2">Period</th>';
-  colNames.forEach(function(n) {{ html += '<th colspan="3">' + n + '</th>'; }});
+  colNames.forEach(function(n, idx) {{
+    var span = (br && isImp(idx)) ? 4 : 3;
+    html += '<th colspan="' + span + '">' + n + '</th>';
+  }});
   html += '</tr><tr>';
-  for (var c = 0; c < numMeters; c++) {{ html += '<th>Rate</th><th>kWh</th><th>' + cur + '</th>'; }}
+  for (var c = 0; c < numMeters; c++) {{
+    if (br && isImp(c)) {{
+      html += '<th>Rate (exc)</th><th>kWh</th><th>' + cur + ' exc</th><th>' + cur + ' inc</th>';
+    }} else {{
+      html += '<th>Rate</th><th>kWh</th><th>' + cur + '</th>';
+    }}
+  }}
   html += '</tr></thead><tbody>';
 
+  // Per-column ex-VAT cost accumulators for the footer (import columns only).
+  var excTot = new Array(numMeters); for (var e = 0; e < numMeters; e++) excTot[e] = 0;
+
   for (var i = 0; i < d.slots; i++) {{
+    var rt = (ratio[i] == null) ? invat : ratio[i];
+    var ap = !!approx[i];
     html += '<tr><td>' + d.x_ranges[i].split(' - ')[0] + '</td>';
     var ti_kwh  = parseFloat(Math.abs(d.ti_kwh  ? (d.ti_kwh[i]  || 0) : 0).toFixed(3));
-    var ti_cost = parseFloat(Math.abs(d.ti_cost ? (d.ti_cost[i] || 0) : 0).toFixed(4));
+    var ti_cost = parseFloat(Math.abs(d.ti_cost ? (d.ti_cost[i] || 0) : 0).toFixed(5));
     var ti_rate = d.ti_rate ? (d.ti_rate[i] || 0) : 0;
-    html += '<td>' + (ti_rate ? (cur + ti_rate.toFixed(4)) : '—') + '</td>';
-    html += '<td>' + ti_kwh.toFixed(3) + '</td>';
-    html += '<td>' + (ti_cost >= 0.00005 ? (cur + ti_cost.toFixed(4)) : '—') + '</td>';
-    orderedKeys.forEach(function(k) {{
+    if (br) {{
+      var tiExc = ti_cost * rt; excTot[0] += tiExc;
+      html += '<td>' + (ti_rate ? (cur + (ti_rate * rt).toFixed(4)) : '—') + '</td>';
+      html += '<td>' + ti_kwh.toFixed(3) + '</td>';
+      html += '<td>' + (ti_cost >= 0.000005 ? ((ap ? '≈' : '') + money(tiExc)) : '—') + '</td>';
+      html += '<td>' + (ti_cost >= 0.000005 ? (cur + ti_cost.toFixed(5)) : '—') + '</td>';
+    }} else {{
+      html += '<td>' + (ti_rate ? (cur + ti_rate.toFixed(4)) : '—') + '</td>';
+      html += '<td>' + ti_kwh.toFixed(3) + '</td>';
+      html += '<td>' + (ti_cost >= 0.000005 ? (cur + ti_cost.toFixed(5)) : '—') + '</td>';
+    }}
+    orderedKeys.forEach(function(k, ki) {{
       var m    = d.meters[k];
+      var imp  = !m.is_export;
       var kwh  = parseFloat(Math.abs(m.y[i] || 0).toFixed(3));
-      var cost = parseFloat(Math.abs((m.cost && m.cost[i]) || 0).toFixed(4));
+      var cost = parseFloat(Math.abs((m.cost && m.cost[i]) || 0).toFixed(5));
       var rr   = m.rate;
       var rate = rr[i] !== undefined ? rr[i] : (rr[rr.length-1] || 0);
-      html += '<td>' + (rate ? (cur + rate.toFixed(4)) : '—') + '</td>';
-      html += '<td>' + kwh.toFixed(3) + '</td>';
-      html += '<td>' + (cost >= 0.00005 ? (cur + cost.toFixed(4)) : '—') + '</td>';
+      if (br && imp) {{
+        var exc = cost * rt; excTot[ki + 1] += exc;
+        html += '<td>' + (rate ? (cur + (rate * rt).toFixed(4)) : '—') + '</td>';
+        html += '<td>' + kwh.toFixed(3) + '</td>';
+        html += '<td>' + (cost >= 0.000005 ? ((ap ? '≈' : '') + money(exc)) : '—') + '</td>';
+        html += '<td>' + (cost >= 0.000005 ? (cur + cost.toFixed(5)) : '—') + '</td>';
+      }} else {{
+        html += '<td>' + (rate ? (cur + rate.toFixed(4)) : '—') + '</td>';
+        html += '<td>' + kwh.toFixed(3) + '</td>';
+        html += '<td>' + (cost >= 0.000005 ? (cur + cost.toFixed(5)) : '—') + '</td>';
+      }}
     }});
     html += '</tr>';
   }}
@@ -3412,10 +3685,18 @@ function _buildTableContent(wrap, jsonText) {{
     var t = (d.meter_totals && d.meter_totals[k]) || {{kwh:0,cost:0}};
     if (!d.meters[k].is_export) {{ tot_ti_kwh += t.kwh; tot_ti_cost += t.cost; }}
   }});
-  html += '<td></td><td>' + tot_ti_kwh.toFixed(3) + '</td><td>' + cur + tot_ti_cost.toFixed(2) + '</td>';
-  orderedKeys.forEach(function(k) {{
+  if (br) {{
+    html += '<td></td><td>' + tot_ti_kwh.toFixed(3) + '</td><td>' + cur + excTot[0].toFixed(2) + '</td><td>' + cur + tot_ti_cost.toFixed(2) + '</td>';
+  }} else {{
+    html += '<td></td><td>' + tot_ti_kwh.toFixed(3) + '</td><td>' + cur + tot_ti_cost.toFixed(2) + '</td>';
+  }}
+  orderedKeys.forEach(function(k, ki) {{
     var t = (d.meter_totals && d.meter_totals[k]) || {{kwh:0,cost:0}};
-    html += '<td></td><td>' + t.kwh.toFixed(3) + '</td><td>' + cur + t.cost.toFixed(2) + '</td>';
+    if (br && !d.meters[k].is_export) {{
+      html += '<td></td><td>' + t.kwh.toFixed(3) + '</td><td>' + cur + excTot[ki + 1].toFixed(2) + '</td><td>' + cur + t.cost.toFixed(2) + '</td>';
+    }} else {{
+      html += '<td></td><td>' + t.kwh.toFixed(3) + '</td><td>' + cur + t.cost.toFixed(2) + '</td>';
+    }}
   }});
   html += '</tr></tfoot></table></div>';
   wrap.innerHTML = html;

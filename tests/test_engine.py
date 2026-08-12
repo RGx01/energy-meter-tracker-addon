@@ -787,6 +787,12 @@ class TestBuildGapBlocks(unittest.TestCase):
         blocks = engine.build_gap_blocks(self.window, pre, post, rates, self.config)
         self.assertEqual(len(blocks), 1)
         self.assertEqual(blocks[0]["totals"]["import_kwh"], 0.0)
+        chans = blocks[0]["meters"]["electricity_main"]["channels"]
+        # Import still gets a 0.0 fallback (has a live source), but EXPORT with no reads
+        # is left UNMATERIALISED (no false-0 → awaits DCC settlement, not "zero export").
+        self.assertIn("import", chans)
+        self.assertEqual(chans["import"]["kwh"], 0.0)
+        self.assertNotIn("export", chans)
 
     def test_missing_post_read_uses_last_known_rate(self):
         """If post_read is missing for a channel, the block gets rate from
@@ -2892,6 +2898,48 @@ class TestDrainRegeneratesCharts(unittest.TestCase):
         self.assertEqual(calls["charts"], 0,
             "no re-pricing → no chart regen")
 
+    def test_drain_schedules_offloaded_render_on_loop(self):
+        # Regression: the drain runs on the engine loop (via _engine_tick). It must
+        # NOT render charts inline there — a large-history render (heavier since the
+        # 4.2 ex-VAT billing path) stalls the HA WebSocket heartbeat → disconnect →
+        # startup re-run (reconnect storm, seen in prod on the 4.2.0 upgrade). It must
+        # instead schedule the offloaded read-only render as a loop task.
+        import asyncio
+        self.store._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, "
+            "config_period_id, interpolated, imp_kwh, imp_kwh_api, imp_rate, "
+            "imp_cost, standing_charge, is_provisional, needs_pass2_rerun) "
+            "VALUES (?,?,?,?,0,?,?,?,?,?,1,1)",
+            ("2026-06-05T12:00:00", "2026-06-05T12:30:00", "electricity_main",
+             self.cp, 1.0, 1.2, 0.32309, 0.32309, 0.50))
+        self.store._conn.commit()
+
+        seen = {"inline": 0, "offloaded": 0}
+        orig_gc = engine.generate_charts
+        orig_off = engine._generate_charts_offloaded
+        engine.generate_charts = lambda *a, **kw: seen.__setitem__(
+            "inline", seen["inline"] + 1)
+
+        async def _fake_off():
+            seen["offloaded"] += 1
+        engine._generate_charts_offloaded = _fake_off
+
+        async def _run():
+            done = engine._drain_pass2_queue(MagicMock(), limit=50)
+            await asyncio.sleep(0)   # let the scheduled loop task run
+            return done
+        try:
+            done = asyncio.run(_run())
+        finally:
+            engine.generate_charts = orig_gc
+            engine._generate_charts_offloaded = orig_off
+
+        self.assertEqual(done, 1, "drain should have re-priced the one block")
+        self.assertEqual(seen["offloaded"], 1,
+            "on the loop, the drain must schedule the offloaded render")
+        self.assertEqual(seen["inline"], 0,
+            "on the loop, the drain must NOT render charts inline")
+
 
 class TestCarbonGapRecovery(unittest.TestCase):
     """Carbon attribution for outage gap-fill blocks: prevention (attribute at
@@ -3990,6 +4038,49 @@ class TestRepriceSuspect(unittest.TestCase):
 
     def test_missing_row_is_rechecked(self):
         self.assertTrue(engine._reprice_suspect("import", None, self._segs(5.0, 30.0), 1.0))
+
+
+class TestExcTariffRate(unittest.TestCase):
+    """BL-23 (4.2 Slice C2): the tariff-reconstructed ex-VAT rate reuses _tariff_rate_for
+    on each schedule's .exc sibling (via _exc_segs) — same band selection as the inc rate."""
+
+    class _Sched:
+        def __init__(self, lo_p, hi_p, exc=None):
+            self.lo_p, self.hi_p, self.exc = lo_p, hi_p, exc
+
+        def day_rate_bounds(self, ts):
+            return (self.lo_p, self.hi_p)
+
+        def resolve(self, ts):
+            return self.hi_p
+
+        def flat_rate(self, tol=1e-6):
+            return self.lo_p if abs(self.hi_p - self.lo_p) <= tol else None
+
+    def _segs(self):
+        exc = self._Sched(5.4952, 32.3048)         # ex-VAT bands (native pence)
+        inc = self._Sched(5.77, 33.92, exc=exc)    # inc-VAT bands, carrying the .exc sibling
+        return [("2000-01-01T00:00:00", None, inc)]
+
+    def test_exc_segs_swaps_to_exc_sibling(self):
+        segs = self._segs()
+        exc_segs = engine._exc_segs(segs)
+        self.assertEqual(len(exc_segs), 1)
+        self.assertIs(exc_segs[0][2], segs[0][2].exc)
+
+    def test_exc_segs_empty_when_no_exc(self):
+        inc = self._Sched(5.77, 33.92, exc=None)
+        self.assertEqual(engine._exc_segs([("2000-01-01T00:00:00", None, inc)]), [])
+
+    def test_tariff_exc_rate_off_peak(self):
+        r = engine._tariff_rate_for(engine._exc_segs(self._segs()),
+                                    "2026-02-01T02:00:00", True)
+        self.assertAlmostEqual(r, 0.054952, places=6)   # off-peak exc ÷ 100
+
+    def test_tariff_exc_rate_peak(self):
+        r = engine._tariff_rate_for(engine._exc_segs(self._segs()),
+                                    "2026-02-01T18:00:00", False)
+        self.assertAlmostEqual(r, 0.323048, places=6)   # peak exc ÷ 100
 
 
 class TestBilledRate(unittest.TestCase):
@@ -5222,6 +5313,34 @@ class TestReconciledRateSurvivesPass2(unittest.TestCase):
         self.assertAlmostEqual(rate, 0.323092, places=5,
             msg="reconciled peak rate must survive PASS 2 (overlay not re-applied)")
 
+    def test_settlement_captures_exvat(self):
+        # Durable ex-VAT capture: settling a block computes cost_exc = kWh × exc-rate
+        # (inc rate scaled by the tariff exc/inc ratio) and it PERSISTS via
+        # append_block_replace — so reconciled data carries ex-VAT with no backfill.
+        from kraken_rates import RateSchedule
+        engine._kraken_rate_schedules = {"import": RateSchedule(
+            [("2000-01-01T00:00:00", None, 30.0)],              # inc 30.0p
+            exc_periods=[("2000-01-01T00:00:00", None, 28.5714)])}  # exc ≈ inc/1.05
+        bs = "2026-08-02T20:00:00"
+        self.store._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id,"
+            " interpolated, imp_kwh, imp_rate, imp_cost, imp_kwh_api, standing_charge,"
+            " needs_pass2_rerun, source) VALUES (?,?,?,?,0,?,?,?,?,?,1,'kraken_api')",
+            (bs, bs, "electricity_main", self.cp, 2.0, 0.30,
+             round(2.0 * 0.30, 6), 2.0, 0.5))
+        self.store._conn.commit()
+        block = self.store.get_block_dict_by_start(bs)
+        engine._rerun_pass2_for_settled_block(
+            block, rate_resolver=engine._kraken_rate_resolver, billing_source="dcc")
+        engine.append_block_replace(block)
+        row = self.store._conn.execute(
+            "SELECT imp_cost, imp_cost_exc, imp_rate_exc, exc_source FROM blocks "
+            "WHERE block_start=?", (bs,)).fetchone()
+        self.assertAlmostEqual(row["imp_cost"], 0.60, places=5)          # 2.0 × 0.30 (inc)
+        self.assertAlmostEqual(row["imp_rate_exc"], 0.285714, places=5)  # 0.30 × 28.5714/30
+        self.assertAlmostEqual(row["imp_cost_exc"], 0.571428, places=5)  # 2.0 × 0.285714
+        self.assertEqual(row["exc_source"], "tariff")
+
 
 class TestUnsupportedTariffGuard(unittest.IsolatedAsyncioTestCase):
     """#1708 fail-loud guard: a discovered import tariff that returns NO standard
@@ -5311,3 +5430,236 @@ class TestGapMarkerDoesNotFreezeSettlement(unittest.TestCase):
         self.assertIn("get_blocks_needing_pass2_rerun", src)
         self.assertNotIn("current_block", src)
         self.assertNotIn("_gap_marker", src)
+
+class TestExcHistoricalBackfill(unittest.TestCase):
+    """4.2 ex-VAT historical backfill: fill imp_cost_exc/imp_rate_exc from the tariff's
+    published exc rate × stored kWh, additively (inc figures byte-identical)."""
+
+    def setUp(self):
+        self._saved = (engine._store, engine.kraken_available,
+                       getattr(engine, "_kraken_discovery", None),
+                       engine._build_channel_rate_segs)
+
+    def tearDown(self):
+        (engine._store, engine.kraken_available, engine._kraken_discovery,
+         engine._build_channel_rate_segs) = self._saved
+
+    def _run_scheduler_with_marker(self, marker):
+        # Drive _maybe_backfill_historical_exc once with a given completion marker and
+        # report whether it dispatched the backfill worker. Patches the gating globals
+        # the class tearDown doesn't restore.
+        import asyncio
+        store = self._store_with([
+            dict(start="2026-03-05T00:00:00", kwh=2.0, rate=0.21, cost=0.42)])
+        if marker is not None:
+            store.set_meta(engine._EXC_BACKFILL_MARKER, marker)
+        engine._store = store
+        engine.kraken_available = lambda: True
+        engine._exc_backfill_running = False
+        saved = (engine._run_historical_exc_backfill,
+                 getattr(engine, "api_import_running", None),
+                 getattr(engine, "delete_in_progress", None))
+        ran = {"n": 0}
+
+        async def _fake_run():
+            ran["n"] += 1
+            return 0
+        engine._run_historical_exc_backfill = _fake_run
+        engine.api_import_running = lambda: False
+        engine.delete_in_progress = lambda: False
+        try:
+            async def _drive():
+                engine._maybe_backfill_historical_exc()
+                await asyncio.sleep(0)          # let the scheduled task run
+            asyncio.run(_drive())
+        finally:
+            (engine._run_historical_exc_backfill, engine.api_import_running,
+             engine.delete_in_progress) = saved
+            store.close()
+        return ran["n"]
+
+    def test_scheduler_dispatches_when_done_at_older_scope(self):
+        # Regression: the scheduler's done-gate must NOT swallow a run that completed
+        # at a NARROWER scope — otherwise _run_historical_exc_backfill (where the
+        # scope re-arm lives) never gets called, and the widened coverage never fills
+        # (prod: exc stayed ≈ from 12 Feb after fix6 because this gate short-circuited).
+        # Pre-versioning marker: done, no 'scope' key → treated as scope 1.
+        self.assertEqual(
+            self._run_scheduler_with_marker({"done": True, "filled": 1}), 1)
+
+    def test_scheduler_skips_when_done_at_current_scope(self):
+        # Done at the CURRENT scope → genuinely nothing to do → no dispatch.
+        self.assertEqual(
+            self._run_scheduler_with_marker(
+                {"done": True, "scope": engine._EXC_BACKFILL_SCOPE, "filled": 1}), 0)
+
+    def _store_with(self, blocks):
+        store = BlockStore(":memory:")
+        with store._conn:
+            cp = store._conn.execute(
+                "INSERT INTO config_periods (effective_from, billing_day, block_minutes, "
+                "timezone, currency_symbol, currency_code) "
+                "VALUES ('2026-01-01T00:00:00',1,30,'Europe/London','£','GBP')").lastrowid
+            store._conn.execute(
+                "INSERT INTO meters (config_period_id, meter_id, is_sub_meter) "
+                "VALUES (?, 'electricity_main', 0)", (cp,))
+        store.upsert_imported_blocks(blocks, "electricity_main", "import",
+                                     source="imported_api")
+        return store
+
+    def _flat_segs(self, inc_p=21.0, exc_p=20.0):
+        from kraken_rates import RateSchedule
+        sched = RateSchedule([("2000-01-01T00:00:00", None, inc_p)],
+                             exc_periods=[("2000-01-01T00:00:00", None, exc_p)])
+        return [("2000-01-01T00:00:00", None, sched)]
+
+    def test_exc_rate_for_block_scales_from_stored_inc(self):
+        segs = self._flat_segs(inc_p=21.0, exc_p=20.0)
+        # stored inc 0.21 £/kWh → exc = 0.21 × (20/21) = 0.20
+        self.assertAlmostEqual(
+            engine._exc_rate_for_block(segs, "2026-03-01T00:00:00", 0.21), 0.20, places=6)
+        # uncovered slot (before the segment window) → None
+        self.assertIsNone(
+            engine._exc_rate_for_block(segs, "1999-01-01T00:00:00", 0.21))
+
+    def test_exc_rate_none_when_no_exc_sibling(self):
+        from kraken_rates import RateSchedule
+        sched = RateSchedule([("2000-01-01T00:00:00", None, 21.0)])   # no exc_periods
+        segs = [("2000-01-01T00:00:00", None, sched)]
+        self.assertIsNone(
+            engine._exc_rate_for_block(segs, "2026-03-01T00:00:00", 0.21))
+
+    def test_backfill_fills_missing_and_preserves_inc(self):
+        import asyncio
+        store = self._store_with([
+            dict(start="2026-03-01T00:00:00", kwh=2.0, rate=0.21, cost=0.42),          # NULL exc
+            dict(start="2026-03-01T00:30:00", kwh=1.0, rate=0.21, cost=0.21,
+                 cost_exc=0.19, exc_source="measurement"),                             # keep
+        ])
+        engine._store = store
+        engine.kraken_available = lambda: True
+        engine._kraken_discovery = {"import": {"mpan": "M"}}
+        segs = self._flat_segs()
+
+        async def _fake_segs(ch):
+            return segs
+        engine._build_channel_rate_segs = _fake_segs
+
+        filled = asyncio.run(engine._run_historical_exc_backfill())
+        self.assertEqual(filled, 1)
+        r = store._conn.execute(
+            "SELECT imp_cost, imp_rate, imp_cost_exc, imp_rate_exc, exc_source "
+            "FROM blocks WHERE block_start='2026-03-01T00:00:00'").fetchone()
+        self.assertAlmostEqual(r["imp_cost"], 0.42, places=6)      # inc byte-identical
+        self.assertAlmostEqual(r["imp_rate"], 0.21, places=6)
+        self.assertAlmostEqual(r["imp_cost_exc"], 0.40, places=6)  # 2.0 × 0.20
+        self.assertAlmostEqual(r["imp_rate_exc"], 0.20, places=6)
+        self.assertEqual(r["exc_source"], "tariff")
+        # measurement-sourced exc untouched
+        r2 = store._conn.execute(
+            "SELECT imp_cost_exc, exc_source FROM blocks "
+            "WHERE block_start='2026-03-01T00:30:00'").fetchone()
+        self.assertAlmostEqual(r2["imp_cost_exc"], 0.19, places=6)
+        self.assertEqual(r2["exc_source"], "measurement")
+        # completion marker set at the current scope; nothing left
+        _m = store.get_meta(engine._EXC_BACKFILL_MARKER, {}) or {}
+        self.assertTrue(_m.get("done"))
+        self.assertEqual(_m.get("scope"), engine._EXC_BACKFILL_SCOPE)   # fresh run stamps scope
+        self.assertEqual(store.count_import_blocks_missing_exc(), 0)
+        store.close()
+
+    def test_backfill_noop_without_exc_tariff(self):
+        import asyncio
+        from kraken_rates import RateSchedule
+        store = self._store_with([
+            dict(start="2026-03-02T00:00:00", kwh=2.0, rate=0.21, cost=0.42)])
+        engine._store = store
+        engine.kraken_available = lambda: True
+        engine._kraken_discovery = {"import": {"mpan": "M"}}
+        sched = RateSchedule([("2000-01-01T00:00:00", None, 21.0)])   # inc only, no exc
+
+        async def _fake_segs(ch):
+            return [("2000-01-01T00:00:00", None, sched)]
+        engine._build_channel_rate_segs = _fake_segs
+
+        filled = asyncio.run(engine._run_historical_exc_backfill())
+        self.assertEqual(filled, 0)
+        r = store._conn.execute(
+            "SELECT imp_cost_exc FROM blocks "
+            "WHERE block_start='2026-03-02T00:00:00'").fetchone()
+        self.assertIsNone(r["imp_cost_exc"])                        # left NULL → view ≈ fallback
+        store.close()
+
+    def test_backfill_rearms_on_scope_bump_and_fills_settled_live(self):
+        # An instance that already ran the narrower (imported-only) backfill has its
+        # marker done at scope 1. After the coverage widened (scope 2 = settled live
+        # blocks), it must RE-ARM and fill those blocks rather than early-returning on
+        # the stale done flag — this is the prod fix for "exc approximate from 12 Feb".
+        import asyncio
+        store = self._store_with([
+            dict(start="2026-03-04T00:00:00", kwh=2.0, rate=0.21, cost=0.42)])
+        # Make it a settled LIVE block (as normal running would leave it, pre-ex-VAT).
+        store._conn.execute(
+            "UPDATE blocks SET source='kraken_api', imp_kwh_api=2.0 "
+            "WHERE block_start='2026-03-04T00:00:00'")
+        # Prior run under the OLD code: marked done with NO 'scope' key (pre-versioning),
+        # so the settled live block was never reached. Treated as scope 1 → must re-arm.
+        store.set_meta(engine._EXC_BACKFILL_MARKER,
+                       {"done": True, "filled": 999})
+        store._conn.commit()
+        engine._store = store
+        engine.kraken_available = lambda: True
+        engine._kraken_discovery = {"import": {"mpan": "M"}}
+        segs = self._flat_segs()
+
+        async def _fake_segs(ch):
+            return segs
+        engine._build_channel_rate_segs = _fake_segs
+
+        filled = asyncio.run(engine._run_historical_exc_backfill())
+        self.assertEqual(filled, 1, "re-arm must fill the settled live block")
+        r = store._conn.execute(
+            "SELECT imp_cost, imp_cost_exc, exc_source FROM blocks "
+            "WHERE block_start='2026-03-04T00:00:00'").fetchone()
+        self.assertAlmostEqual(r["imp_cost"], 0.42, places=6)      # inc byte-identical
+        self.assertAlmostEqual(r["imp_cost_exc"], 0.40, places=6)  # 2.0 × 0.20
+        self.assertEqual(r["exc_source"], "tariff")
+        marker = store.get_meta(engine._EXC_BACKFILL_MARKER, {}) or {}
+        self.assertTrue(marker.get("done"))
+        self.assertEqual(marker.get("scope"), engine._EXC_BACKFILL_SCOPE)  # re-stamped
+        store.close()
+
+
+class TestVatCalendarLearning(unittest.TestCase):
+    """The VAT calendar self-maintains from the tariff's inc/exc rates."""
+
+    def setUp(self):
+        self._s = engine._store
+        self._sched = engine._kraken_rate_schedules
+
+    def tearDown(self):
+        engine._store = self._s
+        engine._kraken_rate_schedules = self._sched
+
+    def test_learns_holiday_boundaries_from_tariff(self):
+        from block_store import BlockStore
+        from kraken_rates import RateSchedule
+        store = BlockStore(":memory:")
+        engine._store = store
+        # inc drops to == exc for a window (VAT 5% → 0% → 5%); exc constant throughout.
+        engine._kraken_rate_schedules = {"import": RateSchedule(
+            [("2026-03-17T00:00:00", "2026-10-01T00:00:00", 30.0),
+             ("2026-10-01T00:00:00", "2027-04-01T00:00:00", 28.5714),
+             ("2027-04-01T00:00:00", None, 30.0)],
+            exc_periods=[("2026-03-17T00:00:00", "2026-10-01T00:00:00", 28.5714),
+                         ("2026-10-01T00:00:00", "2027-04-01T00:00:00", 28.5714),
+                         ("2027-04-01T00:00:00", None, 28.5714)])}
+        engine._learn_vat_from_import_schedule()
+        self.assertEqual(store.get_vat_calendar(),
+                         [("2026-03-17", 0.05), ("2026-10-01", 0.0), ("2027-04-01", 0.05)])
+        self.assertAlmostEqual(store.vat_rate_at("2026-11-15"), 0.0, places=6)   # in holiday
+        self.assertAlmostEqual(store.vat_rate_at("2026-08-11"), 0.05, places=6)  # before
+        # idempotent — re-observing the same tariff doesn't grow the calendar
+        engine._learn_vat_from_import_schedule()
+        self.assertEqual(len(store.get_vat_calendar()), 3)
+        store.close()

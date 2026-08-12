@@ -438,7 +438,10 @@ def parse_bill(src, *, source_name: str = "") -> Bill:
 # inc-VAT rate and leave Cost blank (EMT computes cost = rate/100 × kWh). Standing
 # = the FULL daily inc-VAT charge on the first slot of each day, blank elsewhere.
 CSV_HEADER = ["Start", "End", "Consumption (kWh)", "Unit Rate (p/kWh)",
-              "Estimated Cost Inc. Tax (p)", "Standing Charge Inc. Tax (p)"]
+              "Estimated Cost Inc. Tax (p)", "Standing Charge Inc. Tax (p)",
+              # BL-23 (4.2 Slice D): the bill's pre-VAT figures, emitted so EMT stores
+              # imp_cost_exc/imp_rate_exc directly (penny-accurate off the bill).
+              "Unit Rate Exc. Tax (p/kWh)", "Standing Charge Exc. Tax (p)"]
 
 # Default synthesis windows (local time) when a period has no HH pages. Off-peak /
 # night window for a dual-rate import (IOG/Go family); daylight window for a flat
@@ -478,6 +481,15 @@ def _standing_inc_for_day(bill: Bill, d: date):
     return None
 
 
+def _standing_exc_for_day(bill: Bill, d: date):
+    """Full daily EX-VAT standing (pence) — the bill's printed pre-VAT figure, no
+    gross-up. None if uncovered. BL-23 (4.2 Slice D)."""
+    for p in bill.import_periods:
+        if (p.standing_pre_p is not None and p.frm and p.to and p.frm <= d <= p.to):
+            return round(p.standing_pre_p, 4)
+    return None
+
+
 def _import_hh_rows(bill: Bill, rate_resolver=None) -> list:
     """Transcription (§2a): one CSV row per HH slot, exact. inc-VAT rate; standing
     once per day. rate_resolver(tariff, date_iso, off_peak) → inc-VAT p/kWh overrides
@@ -487,6 +499,7 @@ def _import_hh_rows(bill: Bill, rate_resolver=None) -> list:
     for slots in bill.hh_days:
         d = slots[0].d
         stand = _standing_inc_for_day(bill, d)
+        stand_exc = _standing_exc_for_day(bill, d)   # BL-23: pre-VAT standing
         # Autumn clock-change: the page lists the repeated 01:00/01:30 hour twice, in
         # order (BST pair, then GMT pair). Wall-clock time therefore steps BACKWARD at
         # the fold; from that point on the slots are the second (GMT, fold=1) occurrence.
@@ -513,6 +526,10 @@ def _import_hh_rows(bill: Bill, rate_resolver=None) -> list:
                 "Unit Rate (p/kWh)": rate_inc,
                 "Estimated Cost Inc. Tax (p)": "",
                 "Standing Charge Inc. Tax (p)": (stand if i == 0 else ""),
+                # BL-23: the bill's pre-VAT rate + standing (penny-accurate); rate-first,
+                # so leave the exc Cost cell blank (EMT derives exc cost = rate_exc × kWh).
+                "Unit Rate Exc. Tax (p/kWh)": round(s.rate_pre, 4),
+                "Standing Charge Exc. Tax (p)": (stand_exc if i == 0 else ""),
             })
     return rows
 
@@ -556,6 +573,7 @@ def _import_synth_rows(bill: Bill, block_min: int = 30) -> list:
                 end_d = d + timedelta(days=1) if wrap else d
                 first = d not in seen_day
                 seen_day.add(d)
+                stand_exc = _standing_exc_for_day(bill, d)   # BL-23: pre-VAT standing
                 rows.append({
                     "Start": _iso_local(d, sh, sm),
                     "End": _iso_local(end_d, eh, em),
@@ -563,6 +581,9 @@ def _import_synth_rows(bill: Bill, block_min: int = 30) -> list:
                     "Unit Rate (p/kWh)": rate_inc,
                     "Estimated Cost Inc. Tax (p)": "",
                     "Standing Charge Inc. Tax (p)": (stand if first else ""),
+                    # BL-23: the tier's exact pre-VAT rate + standing (rate-first).
+                    "Unit Rate Exc. Tax (p/kWh)": round(rate_pre, 4),
+                    "Standing Charge Exc. Tax (p)": (stand_exc if (first and stand_exc is not None) else ""),
                 })
         if len(tiers) > 1:
             _emit(night_slots, night_kwh, night_rate)
