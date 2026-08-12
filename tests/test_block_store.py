@@ -867,6 +867,49 @@ class TestSchema(unittest.TestCase):
         self.assertEqual(store.count_import_blocks_missing_exc(), 0)
         store.close()
 
+    def test_exc_backfill_covers_settled_live_blocks(self):
+        # Scope 2: blocks captured LIVE before ex-VAT existed and already DCC-settled
+        # (imp_kwh_api set, source not 'imported%') must be reachable by the backfill.
+        # Settlement capture only stamps exc when a block re-settles, and these settled
+        # months ago — so without this they stay on the inc÷VAT approximation forever
+        # (the prod 12-Feb-onward "approximate" report). A truly-unsettled live block
+        # (imp_kwh_api NULL) is deliberately left for settlement capture.
+        store = BlockStore(":memory:")
+        store.insert_config_period(EXAMPLE_CONFIG)
+        store.upsert_imported_blocks(
+            [dict(start="2026-02-12T00:00:00", kwh=2.0, rate=0.21, cost=0.42),   # settled live
+             dict(start="2026-02-12T00:30:00", kwh=1.0, rate=0.21, cost=0.21)],  # unsettled live
+            "electricity_main", "import", source="imported_api")
+        # Make them look live (not imported), one settled and one not.
+        store._conn.execute(
+            "UPDATE blocks SET source='kraken_api', imp_kwh_api=2.0 "
+            "WHERE block_start='2026-02-12T00:00:00'")
+        store._conn.execute(
+            "UPDATE blocks SET source='kraken_api', imp_kwh_api=NULL "
+            "WHERE block_start='2026-02-12T00:30:00'")
+        store._conn.commit()
+
+        # Only the settled live block is in scope.
+        self.assertEqual(store.count_import_blocks_missing_exc(), 1)
+        self.assertEqual(
+            [r["start"] for r in store.get_import_blocks_missing_exc(limit=10)],
+            ["2026-02-12T00:00:00"])
+        # The writer fills the settled live block…
+        self.assertTrue(store.set_block_exc(
+            "2026-02-12T00:00:00", "electricity_main", 0.40, 0.20, "tariff"))
+        # …but refuses the unsettled live block (left for settlement capture).
+        self.assertFalse(store.set_block_exc(
+            "2026-02-12T00:30:00", "electricity_main", 0.20, 0.20, "tariff"))
+        got = {r["block_start"]: r for r in store._conn.execute(
+            "SELECT block_start, imp_cost, imp_cost_exc, exc_source FROM blocks "
+            "WHERE block_start LIKE '2026-02-12%'").fetchall()}
+        self.assertAlmostEqual(got["2026-02-12T00:00:00"]["imp_cost_exc"], 0.40, places=4)
+        self.assertAlmostEqual(got["2026-02-12T00:00:00"]["imp_cost"], 0.42, places=4)  # inc kept
+        self.assertEqual(got["2026-02-12T00:00:00"]["exc_source"], "tariff")
+        self.assertIsNone(got["2026-02-12T00:30:00"]["imp_cost_exc"])   # untouched
+        self.assertEqual(store.count_import_blocks_missing_exc(), 0)
+        store.close()
+
     def test_lightweight_surfaces_exvat(self):
         # Regression: get_blocks_lightweight (the chart/billing fetch) must surface
         # captured ex-VAT, else the whole ex-VAT view silently falls back to inc÷1.05.

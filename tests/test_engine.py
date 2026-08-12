@@ -2898,6 +2898,48 @@ class TestDrainRegeneratesCharts(unittest.TestCase):
         self.assertEqual(calls["charts"], 0,
             "no re-pricing → no chart regen")
 
+    def test_drain_schedules_offloaded_render_on_loop(self):
+        # Regression: the drain runs on the engine loop (via _engine_tick). It must
+        # NOT render charts inline there — a large-history render (heavier since the
+        # 4.2 ex-VAT billing path) stalls the HA WebSocket heartbeat → disconnect →
+        # startup re-run (reconnect storm, seen in prod on the 4.2.0 upgrade). It must
+        # instead schedule the offloaded read-only render as a loop task.
+        import asyncio
+        self.store._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, "
+            "config_period_id, interpolated, imp_kwh, imp_kwh_api, imp_rate, "
+            "imp_cost, standing_charge, is_provisional, needs_pass2_rerun) "
+            "VALUES (?,?,?,?,0,?,?,?,?,?,1,1)",
+            ("2026-06-05T12:00:00", "2026-06-05T12:30:00", "electricity_main",
+             self.cp, 1.0, 1.2, 0.32309, 0.32309, 0.50))
+        self.store._conn.commit()
+
+        seen = {"inline": 0, "offloaded": 0}
+        orig_gc = engine.generate_charts
+        orig_off = engine._generate_charts_offloaded
+        engine.generate_charts = lambda *a, **kw: seen.__setitem__(
+            "inline", seen["inline"] + 1)
+
+        async def _fake_off():
+            seen["offloaded"] += 1
+        engine._generate_charts_offloaded = _fake_off
+
+        async def _run():
+            done = engine._drain_pass2_queue(MagicMock(), limit=50)
+            await asyncio.sleep(0)   # let the scheduled loop task run
+            return done
+        try:
+            done = asyncio.run(_run())
+        finally:
+            engine.generate_charts = orig_gc
+            engine._generate_charts_offloaded = orig_off
+
+        self.assertEqual(done, 1, "drain should have re-priced the one block")
+        self.assertEqual(seen["offloaded"], 1,
+            "on the loop, the drain must schedule the offloaded render")
+        self.assertEqual(seen["inline"], 0,
+            "on the loop, the drain must NOT render charts inline")
+
 
 class TestCarbonGapRecovery(unittest.TestCase):
     """Carbon attribution for outage gap-fill blocks: prevention (attribute at
@@ -5402,6 +5444,55 @@ class TestExcHistoricalBackfill(unittest.TestCase):
         (engine._store, engine.kraken_available, engine._kraken_discovery,
          engine._build_channel_rate_segs) = self._saved
 
+    def _run_scheduler_with_marker(self, marker):
+        # Drive _maybe_backfill_historical_exc once with a given completion marker and
+        # report whether it dispatched the backfill worker. Patches the gating globals
+        # the class tearDown doesn't restore.
+        import asyncio
+        store = self._store_with([
+            dict(start="2026-03-05T00:00:00", kwh=2.0, rate=0.21, cost=0.42)])
+        if marker is not None:
+            store.set_meta(engine._EXC_BACKFILL_MARKER, marker)
+        engine._store = store
+        engine.kraken_available = lambda: True
+        engine._exc_backfill_running = False
+        saved = (engine._run_historical_exc_backfill,
+                 getattr(engine, "api_import_running", None),
+                 getattr(engine, "delete_in_progress", None))
+        ran = {"n": 0}
+
+        async def _fake_run():
+            ran["n"] += 1
+            return 0
+        engine._run_historical_exc_backfill = _fake_run
+        engine.api_import_running = lambda: False
+        engine.delete_in_progress = lambda: False
+        try:
+            async def _drive():
+                engine._maybe_backfill_historical_exc()
+                await asyncio.sleep(0)          # let the scheduled task run
+            asyncio.run(_drive())
+        finally:
+            (engine._run_historical_exc_backfill, engine.api_import_running,
+             engine.delete_in_progress) = saved
+            store.close()
+        return ran["n"]
+
+    def test_scheduler_dispatches_when_done_at_older_scope(self):
+        # Regression: the scheduler's done-gate must NOT swallow a run that completed
+        # at a NARROWER scope — otherwise _run_historical_exc_backfill (where the
+        # scope re-arm lives) never gets called, and the widened coverage never fills
+        # (prod: exc stayed ≈ from 12 Feb after fix6 because this gate short-circuited).
+        # Pre-versioning marker: done, no 'scope' key → treated as scope 1.
+        self.assertEqual(
+            self._run_scheduler_with_marker({"done": True, "filled": 1}), 1)
+
+    def test_scheduler_skips_when_done_at_current_scope(self):
+        # Done at the CURRENT scope → genuinely nothing to do → no dispatch.
+        self.assertEqual(
+            self._run_scheduler_with_marker(
+                {"done": True, "scope": engine._EXC_BACKFILL_SCOPE, "filled": 1}), 0)
+
     def _store_with(self, blocks):
         store = BlockStore(":memory:")
         with store._conn:
@@ -5470,8 +5561,10 @@ class TestExcHistoricalBackfill(unittest.TestCase):
             "WHERE block_start='2026-03-01T00:30:00'").fetchone()
         self.assertAlmostEqual(r2["imp_cost_exc"], 0.19, places=6)
         self.assertEqual(r2["exc_source"], "measurement")
-        # completion marker set; nothing left
-        self.assertTrue((store.get_meta(engine._EXC_BACKFILL_MARKER, {}) or {}).get("done"))
+        # completion marker set at the current scope; nothing left
+        _m = store.get_meta(engine._EXC_BACKFILL_MARKER, {}) or {}
+        self.assertTrue(_m.get("done"))
+        self.assertEqual(_m.get("scope"), engine._EXC_BACKFILL_SCOPE)   # fresh run stamps scope
         self.assertEqual(store.count_import_blocks_missing_exc(), 0)
         store.close()
 
@@ -5495,6 +5588,45 @@ class TestExcHistoricalBackfill(unittest.TestCase):
             "SELECT imp_cost_exc FROM blocks "
             "WHERE block_start='2026-03-02T00:00:00'").fetchone()
         self.assertIsNone(r["imp_cost_exc"])                        # left NULL → view ≈ fallback
+        store.close()
+
+    def test_backfill_rearms_on_scope_bump_and_fills_settled_live(self):
+        # An instance that already ran the narrower (imported-only) backfill has its
+        # marker done at scope 1. After the coverage widened (scope 2 = settled live
+        # blocks), it must RE-ARM and fill those blocks rather than early-returning on
+        # the stale done flag — this is the prod fix for "exc approximate from 12 Feb".
+        import asyncio
+        store = self._store_with([
+            dict(start="2026-03-04T00:00:00", kwh=2.0, rate=0.21, cost=0.42)])
+        # Make it a settled LIVE block (as normal running would leave it, pre-ex-VAT).
+        store._conn.execute(
+            "UPDATE blocks SET source='kraken_api', imp_kwh_api=2.0 "
+            "WHERE block_start='2026-03-04T00:00:00'")
+        # Prior run under the OLD code: marked done with NO 'scope' key (pre-versioning),
+        # so the settled live block was never reached. Treated as scope 1 → must re-arm.
+        store.set_meta(engine._EXC_BACKFILL_MARKER,
+                       {"done": True, "filled": 999})
+        store._conn.commit()
+        engine._store = store
+        engine.kraken_available = lambda: True
+        engine._kraken_discovery = {"import": {"mpan": "M"}}
+        segs = self._flat_segs()
+
+        async def _fake_segs(ch):
+            return segs
+        engine._build_channel_rate_segs = _fake_segs
+
+        filled = asyncio.run(engine._run_historical_exc_backfill())
+        self.assertEqual(filled, 1, "re-arm must fill the settled live block")
+        r = store._conn.execute(
+            "SELECT imp_cost, imp_cost_exc, exc_source FROM blocks "
+            "WHERE block_start='2026-03-04T00:00:00'").fetchone()
+        self.assertAlmostEqual(r["imp_cost"], 0.42, places=6)      # inc byte-identical
+        self.assertAlmostEqual(r["imp_cost_exc"], 0.40, places=6)  # 2.0 × 0.20
+        self.assertEqual(r["exc_source"], "tariff")
+        marker = store.get_meta(engine._EXC_BACKFILL_MARKER, {}) or {}
+        self.assertTrue(marker.get("done"))
+        self.assertEqual(marker.get("scope"), engine._EXC_BACKFILL_SCOPE)  # re-stamped
         store.close()
 
 
