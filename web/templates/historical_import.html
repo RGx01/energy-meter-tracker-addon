@@ -54,7 +54,15 @@
   </div>
 
   <div id="bf-range-row" style="display:none;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px;margin-bottom:12px;">
-    <label>Go back to <input type="date" id="bf-from" style="font-size:13px;" oninput="if(_bfSource==='csv'&&_bfScope==='range')bfPreview();"></label>
+    <label id="bf-range-channel-lbl" style="display:none;">Channel
+      <select id="bf-range-channel" style="font-size:13px;" onchange="bfRangeChannelChange()">
+        <option value="">Import + export (extend history back)</option>
+        <option value="export">Export only (overlay an existing range)</option>
+        <option value="import">Import only (overlay an existing range)</option>
+      </select>
+    </label>
+    <label><span id="bf-from-lbl">Go back to</span> <input type="date" id="bf-from" style="font-size:13px;" oninput="if(_bfSource==='csv'&&_bfScope==='range')bfPreview();"></label>
+    <label id="bf-to-lbl" style="display:none;">up to <input type="date" id="bf-to" style="font-size:13px;" oninput="if(_bfSource==='csv'&&_bfScope==='range')bfPreview();"></label>
     <span id="bf-range-end" style="color:var(--muted);"></span>
   </div>
 
@@ -362,6 +370,14 @@ function bfPickScope(el) {
   _bfScope = el.dataset.scope; bfHighlight('.bf-scope-btn', el);
   var isGaps = (_bfScope === 'gaps'), isRange = (_bfScope === 'range');
   document.getElementById('bf-range-row').style.display = isRange ? 'flex' : 'none';
+  // Channel overlay (add just one channel — e.g. export from a third-party feed on a
+  // FIT meter — over a range that already holds import) is a CSV-only capability; the
+  // API route always fetches both channels. Reset to the default extend-back mode.
+  var chLbl = document.getElementById('bf-range-channel-lbl');
+  var chSel = document.getElementById('bf-range-channel');
+  if (chSel) chSel.value = '';
+  if (chLbl) chLbl.style.display = (isRange && _bfSource === 'csv') ? '' : 'none';
+  bfRangeChannelChange();
   document.getElementById('bf-out').innerHTML = '';
   if (isRange) bfSetRangeEnd();
   bfSyncPreviewBtn();
@@ -416,8 +432,48 @@ async function bfSetRangeEnd() {
     if (j.up_to) el.textContent = '→ up to your earliest data (' + j.up_to.slice(0, 10) + ')';
   } catch (e) {}
 }
+// Overlay-channel toggle for the CSV date-range route. Empty = the normal extend-back
+// mode (both channels, ends at your earliest data). A channel = "add just this channel
+// over an explicit range that may already hold the other channel" — for a FIT meter
+// whose export has no Octopus feed, this lets you overlay export from a third-party CSV
+// (Glowmarkt/Bright etc.) onto a window that already has import.
+function bfRangeChannelChange() {
+  var chSel = document.getElementById('bf-range-channel');
+  var overlay = !!(chSel && chSel.value);
+  var toLbl = document.getElementById('bf-to-lbl');
+  var fromLbl = document.getElementById('bf-from-lbl');
+  var endSpan = document.getElementById('bf-range-end');
+  if (toLbl) toLbl.style.display = overlay ? '' : 'none';
+  if (fromLbl) fromLbl.textContent = overlay ? 'From' : 'Go back to';
+  if (endSpan) endSpan.style.display = overlay ? 'none' : '';
+  var f = document.getElementById('bf-from');
+  if (_bfSource === 'csv' && _bfScope === 'range' && f && f.value) bfPreview();
+}
 async function bfRangePreview(fromTs) {
   var out = document.getElementById('bf-out'); out.innerHTML = 'Checking…';
+  // Overlay a single channel onto an explicit range (may overlap existing data). The
+  // per-channel first-man-wins merge fills only the empty {channel} column and never
+  // touches the other channel, so — unlike extend-back — this deliberately does NOT
+  // require the window to precede your earliest data.
+  var chSel = document.getElementById('bf-range-channel');
+  var overlayCh = (_bfSource === 'csv' && chSel) ? chSel.value : '';
+  if (overlayCh) {
+    var toEl = document.getElementById('bf-to');
+    var toTs = (toEl && toEl.value) ? (toEl.value + 'T23:59:59') : null;
+    if (!toTs) { out.innerHTML = '<span style="color:var(--warning);">Pick the end date of the range to overlay.</span>'; return; }
+    if (toTs <= fromTs) { out.innerHTML = '<span style="color:var(--warning);">The end date must be after the start date.</span>'; return; }
+    var other = (overlayCh === 'export') ? 'import' : 'export';
+    out.innerHTML =
+      '<div>Overlay <strong style="text-transform:capitalize;">' + _esc(overlayCh) + '</strong> onto <strong>'
+      + _esc(fromTs.slice(0, 10)) + '</strong> → <strong>' + _esc(toTs.slice(0, 10)) + '</strong>.</div>'
+      + '<div style="font-size:12px;color:var(--muted);margin:6px 0 10px;line-height:1.6;">Fills only the '
+      + _esc(overlayCh) + ' figures for half-hours in this window that don\'t already have them — your existing '
+      + _esc(other) + ' data is left untouched (first-in wins, per channel). Grab the pre-filled ' + _esc(overlayCh)
+      + ' template, add a unit rate (p/kWh) or cost column, then upload.</div>'
+      + '<button class="btn" onclick="csvOpen({from:\'' + fromTs + '\',to:\'' + toTs
+      + '\',channel:\'' + overlayCh + '\',inclusive:true})">Fill from CSV →</button>';
+    return;
+  }
   var upTo = null;
   try { upTo = (await (await fetch(apiUrl('/api/backfill/reach'))).json()).up_to; } catch (e) {}
   if (!upTo) { out.innerHTML = '<span style="color:var(--warning);">Couldn\'t find your earliest data — you need existing data to extend back from.</span>'; return; }
@@ -1521,7 +1577,7 @@ function doPreview(){
   st.textContent = 'Reading…';
   Promise.all([_readFile('import-file'), _readFile('export-file')]).then(function(vals){
     STATE.import_csv = vals[0]; STATE.export_csv = vals[1];
-    if(!STATE.import_csv && !STATE.export_csv){ st.textContent = 'Pick at least an import CSV.'; return; }
+    if(!STATE.import_csv && !STATE.export_csv){ st.textContent = 'Pick at least one CSV (import or export).'; return; }
     st.textContent = 'Deriving rates…';
     fetch(apiUrl('/api/historical/csv/preview'), {
       method:'POST', headers:{'Content-Type':'application/json'},

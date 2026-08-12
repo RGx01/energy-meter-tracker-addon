@@ -78,6 +78,35 @@ class TestParse(unittest.TestCase):
         self.assertIsNone(b["rate"])
         self.assertAlmostEqual(b["cost"], 0.49, places=6)
 
+    def test_exvat_columns_parsed_rate_first(self):
+        # BL-23 (4.2 Slice D): optional ex-VAT columns, rate-first, disambiguated from
+        # the inc columns (Inc. vs Exc. Tax) by the exclude filter.
+        csv = ("Start,End,Consumption (kWh),Unit Rate (p/kWh),Unit Rate Exc. Tax (p/kWh),"
+               "Standing Charge Inc. Tax (p),Standing Charge Exc. Tax (p)\n"
+               "2024-07-01T01:00:00+01:00,2024-07-01T01:30:00+01:00,2.0,26.1537,24.9083,47.52,45.26\n")
+        b = ci.parse_octopus_csv(csv, "import")["blocks"][0]
+        self.assertAlmostEqual(b["rate"], 0.261537, places=6)          # inc rate
+        self.assertAlmostEqual(b["rate_exc"], 0.249083, places=6)      # exc rate
+        self.assertAlmostEqual(b["cost_exc"], 0.249083 * 2.0, places=6)  # rate_exc × kWh
+        self.assertAlmostEqual(b["standing_exc"], 0.4526, places=6)
+        self.assertEqual(b["exc_source"], "csv")
+
+    def test_exc_cost_column_when_no_exc_rate(self):
+        # Exc cost column used when no exc rate; inc/exc cost columns disambiguated.
+        csv = ("Start,End,Consumption (kWh),Estimated Cost Inc. Tax (p),Estimated Cost Exc. Tax (p)\n"
+               "2024-07-01T01:00:00+01:00,2024-07-01T01:30:00+01:00,2.0,52.31,49.82\n")
+        b = ci.parse_octopus_csv(csv, "import")["blocks"][0]
+        self.assertAlmostEqual(b["cost"], 0.5231, places=6)            # from inc-cost col
+        self.assertAlmostEqual(b["cost_exc"], 0.4982, places=6)        # from exc-cost col
+        self.assertEqual(b["exc_source"], "csv")
+
+    def test_inc_only_csv_has_no_exc(self):
+        # Back-compat: an inc-only CSV yields no exc — behaviour unchanged.
+        b = ci.parse_octopus_csv(OCTOPUS_CSV, "import")["blocks"][0]
+        self.assertIsNone(b.get("cost_exc"))
+        self.assertIsNone(b.get("rate_exc"))
+        self.assertIsNone(b.get("exc_source"))
+
 
 class TestDeriveBanded(unittest.TestCase):
     def _banded(self):
@@ -183,8 +212,17 @@ class TestTemplateGeneration(unittest.TestCase):
         self.assertEqual(
             lines[0],
             "Start,End,Consumption (kWh),Unit Rate (p/kWh),"
-            "Estimated Cost Inc. Tax (p),Standing Charge Inc. Tax (p)")
-        self.assertTrue(lines[1].endswith(",,,,"))   # four blank data columns
+            "Estimated Cost Inc. Tax (p),Standing Charge Inc. Tax (p),"
+            "Unit Rate Exc. Tax (p/kWh),Standing Charge Exc. Tax (p)")   # CSV v2
+        self.assertTrue(lines[1].endswith(",,,,,,"))   # six blank data columns
+
+    def test_gap_template_still_imports_inc_only(self):
+        # v2 header is additive: a gap template with blank exc columns parses fine and
+        # yields no exc — back-compatible.
+        text = ci.gap_template_csv("2024-07-01T00:00:00", "2024-07-01T01:00:00")
+        parsed = ci.parse_octopus_csv(text, "import")
+        self.assertTrue(parsed["ok"])
+        self.assertTrue(all(b.get("cost_exc") is None for b in parsed["blocks"]))
 
     def test_gap_template_local_offsets_track_dst(self):
         summer = ci.gap_template_csv("2024-07-01T00:00:00", "2024-07-01T00:30:00", tz_name="Europe/London")
@@ -196,8 +234,13 @@ class TestTemplateGeneration(unittest.TestCase):
         parsed = ci.parse_octopus_csv(ci.blank_template_csv(), "import")
         self.assertTrue(parsed["ok"])
         self.assertEqual(len(parsed["blocks"]), 4)
-        self.assertGreater(parsed["blocks"][0]["kwh"], 0)
-        self.assertIsNotNone(parsed["blocks"][0]["cost"])
+        b0 = parsed["blocks"][0]
+        self.assertGreater(b0["kwh"], 0)
+        self.assertIsNotNone(b0["cost"])
+        # v2: the example ex-VAT rate parses through to cost_exc.
+        self.assertIsNotNone(b0["cost_exc"])
+        self.assertEqual(b0["exc_source"], "csv")
+        self.assertLess(b0["cost_exc"], b0["cost"])   # exc < inc
 
     def test_slots_template_arbitrary_slots(self):
         # Non-contiguous slots (the escape hatch): one row per start, blank data,

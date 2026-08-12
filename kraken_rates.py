@@ -53,9 +53,17 @@ class RateSchedule:
     everything from its valid_from onward.
     """
 
-    def __init__(self, periods: list[tuple[str, Optional[str], float]]):
+    def __init__(self, periods: list[tuple[str, Optional[str], float]],
+                 exc_periods: Optional[list[tuple[str, Optional[str], float]]] = None):
         # Sorted by valid_from ascending; each entry (from, to|None, rate).
         self._periods = sorted(periods, key=lambda p: p[0])
+        # BL-23 (4.2): optional parallel EX-VAT schedule, exposed as `.exc`. It's a
+        # sibling RateSchedule, so every resolver (resolve / day_rate_bounds /
+        # off_peak_rate_near / flat_rate) works on exc for free — no duplicated logic
+        # and the inc path is untouched. None when exc rates weren't supplied (standing
+        # charges, older callers). The sibling is built with exc_periods=None, so its
+        # own `.exc` is None — no recursion.
+        self.exc = RateSchedule(exc_periods) if exc_periods else None
 
     def __len__(self) -> int:
         return len(self._periods)
@@ -142,6 +150,20 @@ class RateSchedule:
         lo, hi = min(rates), max(rates)
         return lo if (hi - lo) <= tol else None
 
+    def vat_series(self):
+        """[(valid_from, vat_rate)] at each period boundary — vat = inc/exc − 1, from
+        this (inc) schedule vs its `.exc` sibling. The VAT-calendar learner collapses
+        this to change-points, so a VAT holiday (inc/exc stepping 1.05→1.00 at a
+        `valid_from`) is picked up automatically. Empty when no exc sibling."""
+        if self.exc is None:
+            return []
+        out = []
+        for vfrom, _vto, inc in self._periods:
+            exc = self.exc.resolve(vfrom)
+            if exc is not None and abs(exc) > 1e-9 and inc is not None:
+                out.append((vfrom, float(inc) / float(exc) - 1.0))
+        return out
+
     @classmethod
     def from_api_records(cls, records: list[dict]) -> "RateSchedule":
         """Build from raw standard-unit-rates results, choosing one payment
@@ -162,6 +184,7 @@ class RateSchedule:
                              else sorted(m for m in methods if m)[0])
 
         periods: list[tuple[str, Optional[str], float]] = []
+        exc_periods: list[tuple[str, Optional[str], float]] = []
         for r in records:
             if chosen_method and r.get("payment_method") not in (chosen_method, None):
                 continue
@@ -183,7 +206,10 @@ class RateSchedule:
                 except ValueError:
                     vto = None
             periods.append((vfrom, vto, float(val)))
-        return cls(periods)
+            _exc = r.get("value_exc_vat")   # BL-23: parallel ex-VAT series (same window)
+            if _exc is not None:
+                exc_periods.append((vfrom, vto, float(_exc)))
+        return cls(periods, exc_periods or None)
 
 
 async def build_rate_schedule(

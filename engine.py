@@ -1620,6 +1620,17 @@ def build_gap_blocks(
                 post_read = post_reads_by_channel.get(meter_name, {}).get(channel_name)
 
                 if not pre_read or not post_read:
+                    if channel_name == "export":
+                        # Export with no reads means a DCC-only / no-export-sensor setup
+                        # (FIT, Mini, no export tariff). DON'T plant a false 0.0 — it renders
+                        # as "zero export" (e.g. right through the solar peak) until DCC
+                        # settles. Leave the channel UNMATERIALISED (NULL): DCC fills a NULL
+                        # identically to a 0.0, and until then the view reads "awaiting
+                        # settlement" rather than a wrong zero.
+                        logger.info("build_gap_blocks: %s export has no reads (DCC-only) "
+                                    "— leaving unmaterialised for settlement (no false-0)",
+                                    meter_name)
+                        continue
                     logger.warning("build_gap_blocks: missing reads for %s/%s", meter_name, channel_name)
                     _fallback_rate = _rate_value(last_known_rates.get(meter_name, {}).get(channel_name, 0.0))
                     meter_block["channels"][channel_name] = {
@@ -2934,6 +2945,25 @@ def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricit
             imp_ch["kwh"] = chosen
             imp_ch["kwh_total"] = chosen
             imp_ch["cost"] = round(chosen * rate, 6)
+            # BL-23 durable ex-VAT capture: settle the ex-VAT cost alongside inc. The
+            # settled inc cost is rate × kWh (reconstruction), so the ex-VAT cost is
+            # kWh × the published ex-VAT rate — obtained by scaling the resolved
+            # (post-overlay) inc rate by the tariff's exc/inc ratio at this slot (same
+            # basis as the historical import). This means every block carries real
+            # ex-VAT the moment it settles, so RECONCILED data never needs a separate
+            # backfill. Left untouched when no ex-VAT tariff covers the slot (the view
+            # then falls back to inc ÷ (1+VAT)).
+            _isched = _kraken_rate_schedules.get("import")
+            _iexc = getattr(_isched, "exc", None) if _isched is not None else None
+            if _iexc is not None and rate:
+                _st = block.get("start", "")
+                _inc_p = _isched.resolve(_st)
+                _exc_p = _iexc.resolve(_st)
+                if _exc_p is not None and _inc_p and abs(_inc_p) > 1e-6:
+                    _exc_rate = rate * (_exc_p / _inc_p)
+                    imp_ch["rate_exc"] = round(_exc_rate, 6)
+                    imp_ch["cost_exc"] = round(chosen * _exc_rate, 6)
+                    main["exc_source"] = "tariff"
 
     exp_ch = (main.get("channels") or {}).get("export")
     if exp_ch is None and main.get("exp_kwh_api") is not None:
@@ -3812,6 +3842,7 @@ def _fetch_carbon_intensity(postcode: str) -> list:
 _CARBON_BACKFILL_MARKER = "carbon_backfill_state"   # store_meta key
 _CARBON_RETRY_HOURS = 24                             # cool-down before re-attempting gaps
 _carbon_backfill_running = False                    # in-process re-entry guard
+_exc_backfill_running = False                       # 4.2 exc backfill re-entry guard
 _delete_active = False                              # a delete/purge job is mutating blocks
 
 
@@ -4183,6 +4214,51 @@ def _maybe_backfill_historical_carbon() -> None:
     except Exception as e:
         logger.warning("_maybe_backfill_historical_carbon: schedule failed: %s", e)
         _carbon_backfill_running = False
+
+
+def _maybe_backfill_historical_exc() -> None:
+    """Schedule the one-shot 4.2 ex-VAT historical backfill if API tariff data is
+    available and it hasn't completed. Safe to call repeatedly (engine startup +
+    post-import verify) — guarded by an in-process flag and the persistent done
+    marker; a no-op once done or without kraken discovery. Dispatched as a loop TASK
+    so all BlockStore access stays on the event-loop thread (single SQLite
+    connection), exactly like the carbon backfill."""
+    global _exc_backfill_running
+    try:
+        if _store is None or _exc_backfill_running:
+            return
+        if not kraken_available():
+            logger.info("exc backfill: deferred — supplier API not ready yet "
+                        "(no kraken discovery); will retry")
+            return
+        if api_import_running() or delete_in_progress():
+            logger.info("exc backfill: deferred — import/delete job active; will retry")
+            return
+        if (_store.get_meta(_EXC_BACKFILL_MARKER, {}) or {}).get("done"):
+            return   # already complete — silent
+        import asyncio as _aio
+        try:
+            loop = _aio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            return
+
+        async def _task():
+            global _exc_backfill_running
+            try:
+                await _run_historical_exc_backfill()
+            except Exception as e:
+                logger.warning("_maybe_backfill_historical_exc: worker failed: %s", e)
+            finally:
+                _exc_backfill_running = False
+
+        _exc_backfill_running = True
+        logger.info("exc backfill: scheduling historical ex-VAT pass")
+        loop.create_task(_task())
+    except Exception as e:
+        logger.warning("_maybe_backfill_historical_exc: schedule failed: %s", e)
+        _exc_backfill_running = False
 
 
 async def _tick_carbon_intensity() -> float | None:
@@ -5812,6 +5888,144 @@ def _tariff_rate_for(rate_segs, start, off_peak):
     return None
 
 
+def _exc_segs(segs):
+    """BL-23 (4.2): the parallel EX-VAT segments — swap each segment's RateSchedule for
+    its `.exc` sibling. Reused with _tariff_rate_for / _standing_for so exc pricing uses
+    the exact same band/coverage logic as inc. Empty when no segment carries exc."""
+    return [(vf, vt, s.exc) for (vf, vt, s) in (segs or [])
+            if getattr(s, "exc", None) is not None]
+
+
+def _exc_rate_for_block(rate_segs, start, stored_inc_rate):
+    """£/kWh EX-VAT for a stored import slot (4.2 exc historical backfill).
+
+    Scales the block's stored AUTHORITATIVE inc rate by the tariff's published
+    exc/inc ratio at that slot, so the result lands on the published ex-VAT figure
+    (correctly rounded per band) rather than a blind inc÷1.05. Robust across tariff
+    shapes without needing a stored OFF_PEAK label:
+      * Agile / flat — resolve() gives the exact per-slot inc & exc, ratio ≈ 1/(1+VAT),
+        and stored_inc == inc so the result IS the published exc.
+      * IOG in-window — resolve() gives the band's inc & exc; ratio maps the stored
+        band rate onto its published exc sibling.
+      * IOG dispatch out-of-window — resolve() gives the standard band, but VAT is a
+        flat multiplier so the standard-band ratio applied to the stored off-peak rate
+        still lands within per-band rounding of the off-peak exc.
+    None when no exc schedule covers the slot — the caller leaves imp_cost_exc NULL and
+    the view falls back to inc÷1.05 (shown as an approximation)."""
+    for vf, vt, sched in (rate_segs or []):
+        if start >= vf and (vt is None or start < vt):
+            exc = getattr(sched, "exc", None)
+            if exc is None:
+                return None
+            inc_r = sched.resolve(start)
+            if inc_r is None:
+                inc_r = sched.flat_rate()
+            exc_r = exc.resolve(start)
+            if exc_r is None:
+                exc_r = exc.flat_rate()
+            if exc_r is None:
+                return None
+            if stored_inc_rate is not None and inc_r is not None and abs(inc_r) > 1e-6:
+                return round(stored_inc_rate * (exc_r / inc_r), 6)
+            return round(exc_r / 100.0, 6)   # pence → £, when no usable stored inc
+    return None
+
+
+_EXC_BACKFILL_MARKER = "exc_backfill_state"   # store_meta key
+
+
+async def _run_historical_exc_backfill(max_blocks: int = 20000,
+                                       batch: int = 500,
+                                       pace_s: float = 0.02) -> int:
+    """One-shot EX-VAT historical backfill (4.2). For every imported block that
+    carries energy but no ex-VAT cost yet, compute cost_exc = kWh × the tariff's
+    published ex-VAT rate for that slot and persist it in place. Additive only — the
+    inc columns and the Total Bill are never touched. Idempotent (fills NULL exc
+    only), resumable (persistent cursor), a no-op without API tariff coverage.
+    Returns blocks filled this invocation.
+
+    Uses the tariff agreements (GraphQL) + the stored per-block kWh — NO per-slot
+    Measurements re-fetch, so no re-import. Reconstruction, not reconciliation: it
+    reproduces the bill's ex-VAT to ~0.1p (validated), which is the intended basis;
+    a slot the tariff can't cover is left NULL for the view's inc÷1.05 fallback.
+
+    COOPERATIVE: this runs on the engine loop thread (single SQLite connection), so
+    it must NOT hog it. Each `batch` of blocks is written in ONE transaction (not one
+    commit per block) and the loop is yielded (`await asyncio.sleep(pace_s)`) between
+    batches — otherwise the fsync-per-block loop over tens of thousands of blocks
+    blocked the loop for minutes, starving the HA WebSocket heartbeat (disconnect
+    storm) and timing out in-flight GraphQL polls."""
+    global _store
+    import asyncio as _aio
+    from datetime import datetime as _dt, timezone as _tz
+    if _store is None or not kraken_available():
+        return 0
+    state = _store.get_meta(_EXC_BACKFILL_MARKER, {}) or {}
+    if state.get("done") or delete_in_progress():
+        return 0
+    try:
+        rate_segs = await _build_channel_rate_segs("import")
+    except Exception as e:
+        logger.warning("_run_historical_exc_backfill: rate schedule build failed: %s", e)
+        return 0
+    if not _exc_segs(rate_segs):
+        logger.info("_run_historical_exc_backfill: no ex-VAT tariff coverage; skipping")
+        return 0
+
+    _remaining0 = _store.count_import_blocks_missing_exc()
+    if _remaining0 == 0:
+        _store.set_meta(_EXC_BACKFILL_MARKER,
+                        {"done": True, "filled": int(state.get("filled") or 0),
+                         "uncovered": 0,
+                         "completed_at": _dt.now(_tz.utc).replace(tzinfo=None).isoformat()})
+        logger.info("exc backfill: nothing to do — all import blocks already carry ex-VAT")
+        return 0
+    logger.info("exc backfill: starting — %d import block(s) missing ex-VAT", _remaining0)
+
+    _now_iso = lambda: _dt.now(_tz.utc).replace(tzinfo=None).isoformat()
+    filled = 0
+    scanned = 0
+    cursor = state.get("cursor")
+    total_filled = int(state.get("filled") or 0)
+    reached_end = False
+    while scanned < max_blocks:
+        rows = _store.get_import_blocks_missing_exc(limit=batch, after_start=cursor)
+        if not rows:
+            reached_end = True
+            break
+        updates = []
+        for r in rows:
+            cursor = r["start"]
+            scanned += 1
+            kwh = r.get("kwh") or 0.0
+            exc_rate = _exc_rate_for_block(rate_segs, cursor, r.get("rate"))
+            if exc_rate is None:
+                continue          # uncovered — leave NULL for the inc÷1.05 fallback
+            updates.append((cursor, r["meter_id"], round(kwh * exc_rate, 6),
+                            exc_rate, "tariff"))
+        if updates:
+            try:
+                filled += _store.set_blocks_exc(updates)   # one transaction / chunk
+            except Exception as e:
+                logger.warning("_run_historical_exc_backfill: chunk persist failed "
+                               "(cursor=%s): %s", cursor, e)
+        _store.set_meta(_EXC_BACKFILL_MARKER,
+                        {"cursor": cursor, "filled": total_filled + filled})
+        if len(rows) < batch:
+            reached_end = True
+            break
+        await _aio.sleep(pace_s)   # yield to the loop (HA heartbeat, polls, charts)
+    total_filled += filled
+    if reached_end:
+        _store.set_meta(_EXC_BACKFILL_MARKER,
+                        {"done": True, "filled": total_filled,
+                         "uncovered": _store.count_import_blocks_missing_exc(),
+                         "completed_at": _now_iso()})
+    logger.info("exc backfill: filled %d block(s) this pass%s",
+                filled, " — complete" if reached_end else " (resuming next pass)")
+    return filled
+
+
 def _billed_rate(rate_segs, start, off_peak, meas_cost, kwh,
                  tol: float = 0.001):
     """£/kWh for an imported slot, choosing the right source of truth by tariff type.
@@ -6229,11 +6443,14 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
         # STANDING_CHARGE_COST is patchy (whole stretches return none → £0/day),
         # which was silently under-billing the reconstructed range.
         meas_standing: dict = {}
+        meas_standing_exc: dict = {}   # BL-23 (4.2): parallel ex-VAT standing sum
         meas_count: dict = {}
         for st in imported:
             d = st[:10]
             meas_standing[d] = (meas_standing.get(d, 0.0)
                                 + (by_start[st].get("standing_incl") or 0.0))
+            meas_standing_exc[d] = (meas_standing_exc.get(d, 0.0)
+                                    + (by_start[st].get("standing_excl") or 0.0))
             meas_count[d] = meas_count.get(d, 0) + 1
         try:
             _slots_per_day = int(round(24 * 60 / max(1, int(get_block_minutes()))))
@@ -6253,6 +6470,19 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
                 n = meas_count.get(d, 0)
                 day_standing[d] = (round(meas_standing[d] / n * _slots_per_day, 6)
                                    if n else meas_standing[d])
+        # BL-23 (4.2): parallel ex-VAT daily standing — prefer the schedule's exc
+        # sibling, else extrapolate the summed Measurements standing_excl to a whole day
+        # (same logic as inc). Left absent (→ NULL) when no exc source covers the day.
+        day_standing_exc: dict = {}
+        _standing_segs_exc = _exc_segs(standing_segs)
+        for d in meas_standing:
+            sc = _standing_for(_standing_segs_exc, d) if _standing_segs_exc else None
+            if sc is None and meas_standing_exc.get(d):
+                n = meas_count.get(d, 0)
+                sc = (round(meas_standing_exc[d] / n * _slots_per_day, 6)
+                      if n else meas_standing_exc[d])
+            if sc is not None:
+                day_standing_exc[d] = sc
 
         priced = off_peak = 0
         fb_material = fb_no_bucket = 0     # IOG-dispatch pricing diagnostic
@@ -6276,6 +6506,21 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
                 cost = round(kwh * rate, 6)
             else:
                 cost = None
+            # BL-23: ex-VAT capture. A measurement slot carries the exact cost_excl;
+            # a tariff-reconstructed slot takes kWh × the exc SCHEDULED rate (same band
+            # as the inc rate, via rate_segs.exc). rate_exc is stored for the tariff case
+            # (published primary); for a measurement slot it's derived on read (cost_exc/kWh).
+            rate_exc = None
+            if meas_cost is not None:
+                cost_exc = r.get("cost_excl")
+                exc_source = "measurement" if cost_exc is not None else None
+            elif cost is not None and kwh > 0:
+                rate_exc = _tariff_rate_for(_exc_segs(rate_segs), st, ofp)
+                cost_exc = round(kwh * rate_exc, 6) if rate_exc is not None else None
+                exc_source = "tariff" if cost_exc is not None else None
+            else:
+                cost_exc = None
+                exc_source = None
             if cost is not None:
                 priced += 1
             if ofp:
@@ -6295,8 +6540,11 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
             # the export channel must not write it (it would clobber the import's
             # value with 0, since OUTGOING tariffs have no standing charge).
             _standing = day_standing.get(st[:10]) if channel == "import" else None
+            _standing_exc = day_standing_exc.get(st[:10]) if channel == "import" else None
             rows_to_write.append({"start": st, "kwh": kwh, "rate": rate,
-                                  "cost": cost, "standing": _standing})
+                                  "cost": cost, "standing": _standing,
+                                  "cost_exc": cost_exc, "rate_exc": rate_exc,
+                                  "standing_exc": _standing_exc, "exc_source": exc_source})
         # Total flagged this chunk BEFORE in-pass recovery reduces it — the "raised"
         # figure the post-import health summary reports.
         flags_raised_ch = fb_material
@@ -6335,6 +6583,11 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
                         off_peak += 1
                     row["cost"] = mc
                     row["rate"] = rate
+                    # BL-23 (4.2): the recovered node carries the exact ex-VAT cost too.
+                    _ce = node.get("cost_excl")
+                    if _ce is not None:
+                        row["cost_exc"] = _ce
+                        row["exc_source"] = "measurement"
                     row["_was_off_peak"] = bool(ofp)
                     _healed.append(st)
                 if _healed:
@@ -6640,7 +6893,9 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                 ofp = r.get("off_peak")
                 kwh = r.get("kwh") or 0
                 rate = _billed_rate(rate_segs, st, ofp, mc, kwh)
-                if _store.reprice_imported_block(st, meter_id, channel, rate, mc):
+                if _store.reprice_imported_block(st, meter_id, channel, rate, mc,
+                                                 cost_exc=r.get("cost_excl"),
+                                                 exc_source="measurement"):
                     recovered += 1
                     fixed.append(st)
             # Queue mode: a slot the API returns a cost for is DONE — whether we
@@ -6680,7 +6935,9 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                         cur_rate is not None and new_rate < cur_rate - 1e-6)
                     if not improves:
                         continue
-                    if _store.reprice_imported_block(st, meter_id, channel, new_rate, mc):
+                    if _store.reprice_imported_block(st, meter_id, channel, new_rate, mc,
+                                                     cost_exc=r.get("cost_excl"),
+                                                     exc_source="measurement"):
                         recovered += 1
                         opportunistic += 1
 
@@ -6711,7 +6968,9 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                 confirmed_ss.append(st)
                 ofp = node.get("off_peak")
                 rate = _billed_rate(rate_segs, st, ofp, mc, node.get("kwh") or 0)
-                if _store.reprice_imported_block(st, meter_id, channel, rate, mc):
+                if _store.reprice_imported_block(st, meter_id, channel, rate, mc,
+                                                 cost_exc=node.get("cost_excl"),
+                                                 exc_source="measurement"):
                     recovered += 1
                     fixed_ss.append(st)
             # Same as the window pass: clear every slot now confirmed to hold a cost,
@@ -7118,6 +7377,13 @@ async def run_deferred_verify_pricing(*, chunk_days: int = 30, headroom_frac: fl
         logger.info("verify pricing: complete — corrected %d slot(s) across %d day-range(s) "
                     "(re-checked %d, skipped %d already-correct) in %ds",
                     repriced, len(corrections), checked, skipped, _elapsed)
+        # 4.2: now the inc pricing is verified/final, backfill any missing ex-VAT
+        # cost over the same history (tariff rate × stored kWh). Additive; inc
+        # figures untouched. Idempotent + resumable, so a partial pass self-continues.
+        try:
+            await _run_historical_exc_backfill()
+        except Exception as _ee:
+            logger.warning("verify pricing: exc backfill failed (non-fatal): %s", _ee)
         return {"ran": True, "repriced": repriced, "checked": checked,
                 "skipped": skipped, "elapsed_s": _elapsed}
     except Exception as e:
@@ -7714,6 +7980,7 @@ async def _refresh_kraken_rate_schedules() -> None:
         logger.info("_refresh_kraken_rate_schedules: import=%d export=%d periods",
                     len(_kraken_rate_schedules.get("import", []) or []),
                     len(_kraken_rate_schedules.get("export", []) or []))
+        _learn_vat_from_import_schedule()
 
     # Standing charge comes from the import tariff.
     imp = _kraken_discovery.get("import") or {}
@@ -7727,6 +7994,33 @@ async def _refresh_kraken_rate_schedules() -> None:
                             len(sc))
         except Exception as e:
             logger.warning("_refresh_kraken_rate_schedules: standing build failed: %s", e)
+
+
+def _learn_vat_from_import_schedule() -> None:
+    """Update the persisted VAT calendar from the import tariff's inc/exc rates.
+
+    Octopus versions `valid_from` on the same tariff, so a VAT change surfaces as the
+    inc/exc ratio stepping at a date; `vat_series()` reads it, `vat_calendar.collapse`
+    reduces it to change-points, and we merge into the stored calendar. This only feeds
+    the FALLBACK VAT rate (per-slot inc/exc pairs stay the primary source). No-op without
+    a store or an exc sibling on the schedule; idempotent (re-observing is a no change)."""
+    if _store is None:
+        return
+    sched = _kraken_rate_schedules.get("import")
+    if sched is None or not hasattr(sched, "vat_series"):
+        return
+    try:
+        series = sched.vat_series()
+        if not series:
+            return
+        import vat_calendar as _vc
+        existing = _store.get_vat_calendar()
+        merged = _vc.merge_learned(existing, _vc.collapse(series))
+        if merged != existing:
+            _store.set_vat_calendar(merged)
+            logger.info("vat calendar: learned from tariff → %s", merged)
+    except Exception as e:
+        logger.debug("_learn_vat_from_import_schedule: skipped (%s)", e)
 
 
 # Smart-charge source vocabulary across API versions: legacy meta.source =
@@ -9652,6 +9946,14 @@ async def engine_startup(ha: HAClient):
         await _kraken_startup_discovery()
     except Exception as _kd_e:
         logger.warning("engine_startup: kraken discovery skipped: %s", _kd_e)
+
+    # 4.2 ex-VAT historical backfill — now that discovery has run, kick off the
+    # one-shot pass so an already-imported history gets ex-VAT filled on restart
+    # (no new import needed). No-op once done; also runs after each import's verify.
+    try:
+        _maybe_backfill_historical_exc()
+    except Exception as _eb_e:
+        logger.warning("engine_startup: exc backfill schedule failed: %s", _eb_e)
 
     # ── One-time region-timeline reconciliation (historical-carbon foundation) ──
     # With the API just discovered, stamp the DNO region (OUTWARD CODE ONLY) onto

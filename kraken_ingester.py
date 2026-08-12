@@ -117,7 +117,18 @@ class KrakenIngester:
 
     # ── window ────────────────────────────────────────────────────────────
     def _compute_window(self, now: Optional[datetime] = None) -> tuple[str, str]:
-        """Return (period_from, period_to) as 'Z'-suffixed UTC ISO strings."""
+        """Return (period_from, period_to) as 'Z'-suffixed UTC ISO strings.
+
+        The window normally slides forward from the last poll, but it is also
+        extended BACK to the oldest block still awaiting DCC settlement on ANY
+        channel (import or export). Export has no live source on a Mini / no-export-
+        sensor setup, so its DCC figure lags import by days; without this the lagging
+        export would only be chased by the once-a-day settlement sweep, leaving a
+        recent day showing import-but-no-export until then. Anchoring here makes every
+        poll re-cover the lag so it fills within a cycle. Self-bounding: the window
+        only widens when something is genuinely unsettled, and is floored at the
+        backfill horizon so a stuck-old block can't blow it up (blocks past the
+        horizon are finalised-from-CAD and drop out of "unsettled")."""
         now = now or datetime.now(timezone.utc)
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
@@ -132,6 +143,18 @@ class KrakenIngester:
                 start_dt = now - timedelta(days=self.backfill_days)
         else:
             start_dt = now - timedelta(days=self.backfill_days)
+        # Chase lagging settlement (esp. export): pull the start back to the oldest
+        # unsettled block, floored at the backfill horizon.
+        try:
+            oldest = self.store.get_oldest_unsettled_block_start()
+            if oldest:
+                oldest_dt = datetime.fromisoformat(str(oldest))
+                if oldest_dt.tzinfo is None:
+                    oldest_dt = oldest_dt.replace(tzinfo=timezone.utc)
+                floor_dt = now - timedelta(days=self.backfill_days)
+                start_dt = min(start_dt, max(oldest_dt, floor_dt))
+        except Exception:
+            pass          # never let the unsettled probe break the poll window
         return (self._z(start_dt), self._z(now))
 
     @staticmethod

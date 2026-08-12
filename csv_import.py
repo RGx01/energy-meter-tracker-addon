@@ -40,10 +40,10 @@ def _to_naive_utc(s: str):
     return dt.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
 
 
-def _find_col(fieldnames, *needles):
+def _find_col(fieldnames, *needles, exclude=None):
     for f in fieldnames or []:
         low = f.strip().lower()
-        if all(n in low for n in needles):
+        if all(n in low for n in needles) and (exclude is None or exclude not in low):
             return f
     return None
 
@@ -61,11 +61,16 @@ def parse_octopus_csv(text: str, channel: str) -> dict:
     reader = _csv.DictReader(io.StringIO(text))
     fn = reader.fieldnames
     col_kwh   = _find_col(fn, "consumption")
-    col_rate  = _find_col(fn, "rate")           # optional "Unit Rate (p/kWh)"
-    col_cost  = _find_col(fn, "cost")
-    col_stand = _find_col(fn, "standing")
+    col_rate  = _find_col(fn, "rate", exclude="exc")   # "Unit Rate (p/kWh)" (inc)
+    col_cost  = _find_col(fn, "cost", exclude="exc")   # "Estimated Cost Inc. Tax (p)"
+    col_stand = _find_col(fn, "standing", exclude="exc")
     col_start = _find_col(fn, "start")
     col_end   = _find_col(fn, "end")
+    # BL-23 (4.2 Slice D) — optional ex-VAT columns (CSV v2). Prefer-when-populated;
+    # absent columns leave exc NULL (→ inc-only, unchanged behaviour).
+    col_rate_exc  = _find_col(fn, "rate", "exc")
+    col_cost_exc  = _find_col(fn, "cost", "exc")
+    col_stand_exc = _find_col(fn, "standing", "exc")
     if not (col_kwh and col_start):
         return {"ok": False, "channel": channel, "blocks": [], "row_count": 0,
                 "errors": [{"row": 0, "reason":
@@ -97,6 +102,16 @@ def parse_octopus_csv(text: str, channel: str) -> dict:
         else:
             cost = None
         stand_p = _num(row.get(col_stand)) if col_stand else None
+        # ── ex-VAT (CSV v2), same rate-first convention as inc ──────────────────
+        rate_exc_p = _num(row.get(col_rate_exc)) if col_rate_exc else None
+        cost_exc_p = _num(row.get(col_cost_exc)) if col_cost_exc else None
+        if rate_exc_p is not None:
+            cost_exc = round((rate_exc_p / 100.0) * kwh, 6)
+        elif cost_exc_p is not None:
+            cost_exc = cost_exc_p / 100.0
+        else:
+            cost_exc = None
+        stand_exc_p = _num(row.get(col_stand_exc)) if col_stand_exc else None
         blocks.append({
             "channel": channel,
             "block_start": start,
@@ -105,6 +120,11 @@ def parse_octopus_csv(text: str, channel: str) -> dict:
             "rate": (rate_p / 100.0) if rate_p is not None else None,      # £/kWh, if given
             "cost": cost,
             "standing": (stand_p / 100.0) if stand_p is not None else None,
+            # BL-23: ex-VAT (NULL when the CSV omits the columns)
+            "rate_exc": (rate_exc_p / 100.0) if rate_exc_p is not None else None,
+            "cost_exc": cost_exc,
+            "standing_exc": (stand_exc_p / 100.0) if stand_exc_p is not None else None,
+            "exc_source": "csv" if cost_exc is not None else None,
         })
     blocks.sort(key=lambda b: b["block_start"])
     return {"ok": True, "channel": channel, "blocks": blocks,
@@ -128,6 +148,10 @@ def _num(v):
 TEMPLATE_HEADERS = [
     "Start", "End", "Consumption (kWh)", "Unit Rate (p/kWh)",
     "Estimated Cost Inc. Tax (p)", "Standing Charge Inc. Tax (p)",
+    # BL-23 (4.2 Slice D): optional ex-VAT columns (CSV v2) — rate-first, matching the
+    # bill parser's output. Leave blank to stay inc-only; fill from a bill's pre-VAT
+    # figures to capture true ex-VAT (else EMT falls back to the tariff/inc÷1.05).
+    "Unit Rate Exc. Tax (p/kWh)", "Standing Charge Exc. Tax (p)",
 ]
 
 
@@ -160,7 +184,7 @@ def gap_template_csv(from_iso, to_iso, *, block_minutes=30, tz_name="Europe/Lond
     w = _csv.writer(buf)
     w.writerow(TEMPLATE_HEADERS)
     for (a, b) in _iter_slots(from_iso, to_iso, block_minutes, tz_name):
-        w.writerow([a.isoformat(), b.isoformat(), "", "", "", ""])
+        w.writerow([a.isoformat(), b.isoformat(), "", "", "", "", "", ""])
     return buf.getvalue()
 
 
@@ -186,7 +210,7 @@ def slots_template_csv(starts, *, block_minutes=30, tz_name="Europe/London") -> 
             continue
         a = dt.astimezone(tz)
         b = (dt + step).astimezone(tz)
-        w.writerow([a.isoformat(), b.isoformat(), "", "", "", ""])
+        w.writerow([a.isoformat(), b.isoformat(), "", "", "", "", "", ""])
     return buf.getvalue()
 
 
@@ -201,15 +225,19 @@ def blank_template_csv(*, block_minutes=30, rows=4,
     w.writerow(TEMPLATE_HEADERS)
     base = datetime.fromisoformat(start_iso)          # keeps the example offset
     step = timedelta(minutes=int(block_minutes or 30))
-    # (kWh, unit-rate p/kWh) — the preferred path: fill a rate, leave Cost blank,
-    # and EMT computes cost = rate × kWh. Rates shown as peak / off-peak examples.
-    samples = [(0.42, 24.5), (0.38, 24.5), (0.51, 7.5), (0.29, 7.5)]
+    # (kWh, inc-rate p/kWh, exc-rate p/kWh) — the preferred path: fill a rate, leave
+    # Cost blank, and EMT computes cost = rate × kWh. Rates shown as peak / off-peak
+    # examples; the ex-VAT columns are optional (fill from a bill's pre-VAT figures).
+    samples = [(0.42, 24.5, 23.33), (0.38, 24.5, 23.33),
+               (0.51, 7.5, 7.14), (0.29, 7.5, 7.14)]
     for i in range(max(1, int(rows))):
         a = base + step * i
         b = a + step
-        kwh, rate = samples[i % len(samples)]
-        stand = "42.0" if i == 0 else ""            # standing is once-per-day
-        w.writerow([a.isoformat(), b.isoformat(), kwh, rate, "", stand])
+        kwh, rate, rate_exc = samples[i % len(samples)]
+        stand     = "42.0" if i == 0 else ""        # standing is once-per-day
+        stand_exc = "40.0" if i == 0 else ""        # its ex-VAT counterpart
+        w.writerow([a.isoformat(), b.isoformat(), kwh, rate, "", stand,
+                    rate_exc, stand_exc])
     return buf.getvalue()
 
 
