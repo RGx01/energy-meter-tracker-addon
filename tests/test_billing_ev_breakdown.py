@@ -144,18 +144,18 @@ class TestBankersRoundingLadder(unittest.TestCase):
         self.assertEqual(ec.bankers_round(2.5, 0), 2.0)
         self.assertEqual(ec.bankers_round(3.5, 0), 4.0)
 
-    def test_ladder_rounds_per_slot_then_totals(self):
-        # Two slots at 10p/kWh exc: 2 kWh → 20p, 1.5 kWh → 15p; exc 35p.
+    def test_sums_slots_and_rounds_total(self):
+        # Two slots at 10p/kWh exc: 2 kWh + 1.5 kWh → 35p exc; VAT on top.
         out = ec.octopus_bill_total([(2.0, 0.10), (1.5, 0.10)], vat_rate=0.05)
         self.assertEqual(out["exc_pence"], 35.0)
-        self.assertEqual(out["inc_pence"], round(35 * 1.05))   # 36.75 → 37 half-even? 36.75→37
+        self.assertEqual(out["inc_pence"], round(35 * 1.05))   # 36.75 → 37
         self.assertEqual(out["exc_gbp"], 0.35)
 
-    def test_ladder_per_slot_rounding_differs_from_raw_sum(self):
-        # 0.005 kWh @ £1/kWh over two slots: each slot 0.5p → rounds to 0p (half-even),
-        # total 0p — vs a naive raw sum of 1p. Proves per-slot half-even is applied.
+    def test_sums_raw_no_per_slot_rounding(self):
+        # Corrected method (verified vs a real bill): tiny slots are summed RAW, not
+        # rounded per half-hour. 0.005 kWh @ £1/kWh × 2 = 1.0p — NOT 0p.
         out = ec.octopus_bill_total([(0.005, 1.0), (0.005, 1.0)])
-        self.assertEqual(out["exc_pence"], 0.0)
+        self.assertEqual(out["exc_pence"], 1.0)
 
     def test_bill_slots_prefers_stored_exc_else_falls_back(self):
         blocks = [
@@ -167,6 +167,186 @@ class TestBankersRoundingLadder(unittest.TestCase):
         slots = ec.bill_slots_from_blocks(blocks, vat_rate=0.05)
         self.assertAlmostEqual(slots[0][1], 0.20, places=6)   # from stored exc
         self.assertAlmostEqual(slots[1][1], 0.20, places=6)   # from inc ÷ 1.05
+
+
+class TestBillMethodBreakdown(unittest.TestCase):
+    """BL-24: the opt-in ex-VAT bill-method breakdown on the Billing summary — per-rate
+    exc rows (Guy Lipman ladder), ex-VAT standing, a VAT row, the inc total. Additive:
+    the Total Bill is untouched; the section only renders when present."""
+
+    def _blk(self, kwh, cost, cost_exc=None, rate_exc=None, standing_exc=None,
+             start="2026-08-01T00:00:00", rate=None):
+        imp = {"kwh": kwh, "cost": cost}
+        if rate is not None:
+            imp["rate"] = rate
+        if cost_exc is not None:
+            imp["cost_exc"] = cost_exc
+        if rate_exc is not None:
+            imp["rate_exc"] = rate_exc
+        m = {"channels": {"import": imp}}
+        if standing_exc is not None:
+            m["standing_charge_exc"] = standing_exc
+        return {"start": start, "meters": {"electricity_main": m}}
+
+    def test_bands_by_clean_inc_rate_not_derived_exc(self):
+        # Regression: measurement slots carry a real per-slot cost_exc whose cost_exc÷kWh
+        # jitters with Octopus's rounding. Banding on that derived rate shattered the two
+        # real bands into 0.3075/0.3077/0.3078/… — band on the CLEAN inc rate instead.
+        blocks = [
+            # off-peak (inc 0.05493) — same tariff band, DIFFERENT effective exc rates
+            self._blk(3.000, 0.164790, rate=0.05493, cost_exc=0.156680,   # ~0.05223/kWh
+                      start="2026-07-26T02:30:00"),
+            self._blk(0.001, 0.000055, rate=0.05493, cost_exc=0.000052,   # ~0.052/kWh (jitter)
+                      start="2026-07-26T03:00:00"),
+            # peak (inc 0.323092) — tiny slots that used to spawn 0.3075/0.3078/0.3080
+            self._blk(4.000, 1.292368, rate=0.323092, cost_exc=1.230827,
+                      start="2026-07-26T18:00:00"),
+            self._blk(0.032, 0.010339, rate=0.323092, cost_exc=0.009847,
+                      start="2026-07-26T18:30:00"),
+            self._blk(0.104, 0.033602, rate=0.323092, cost_exc=0.032002,
+                      start="2026-07-26T19:00:00"),
+        ]
+        bm = ec._bill_method_breakdown(blocks)
+        self.assertEqual(len(bm["rows"]), 2)                          # two clean bands, not six
+        kwhs = sorted(r["kwh"] for r in bm["rows"])
+        self.assertAlmostEqual(kwhs[0], 3.001, places=3)              # off-peak 3.0+0.001
+        self.assertAlmostEqual(kwhs[1], 4.136, places=3)              # peak 4.0+0.032+0.104
+
+    def test_bill_slots_prefers_stored_rate_exc(self):
+        slots = ec.bill_slots_from_blocks([self._blk(2.0, 0.42, rate_exc=0.20)])
+        self.assertAlmostEqual(slots[0][1], 0.20, places=6)        # stored ex rate wins
+
+    def test_breakdown_bands_standing_vat_and_total(self):
+        # band 0.20: 2 kWh → 40.00p; band 0.60: 1 kWh → 60.00p; energy £1.00.
+        # standing 1 day @ £0.40; subtotal £1.40; VAT 5% → £0.07; inc £1.47.
+        blocks = [self._blk(2.0, 0.42, rate_exc=0.20, standing_exc=0.40,
+                            start="2026-08-01T00:00:00"),
+                  self._blk(1.0, 0.63, rate_exc=0.60, start="2026-08-01T18:00:00")]
+        bm = ec._bill_method_breakdown(blocks)
+        self.assertEqual(len(bm["rows"]), 2)
+        self.assertAlmostEqual(bm["energy_exc"], 1.00, places=2)
+        self.assertEqual(bm["standing_days"], 1)
+        self.assertAlmostEqual(bm["standing_exc"], 0.40, places=2)
+        self.assertAlmostEqual(bm["subtotal_exc"], 1.40, places=2)
+        self.assertAlmostEqual(bm["vat_amount"], 0.07, places=2)
+        self.assertAlmostEqual(bm["inc_total"], 1.47, places=2)
+        # bands sum to the energy total (round-per-band-then-sum).
+        self.assertAlmostEqual(sum(r["cost_exc"] for r in bm["rows"]), bm["energy_exc"], places=2)
+
+    def test_vat_derived_from_pair(self):
+        bm = ec._bill_method_breakdown([self._blk(2.0, 0.42, cost_exc=0.40, rate_exc=0.20)])
+        self.assertAlmostEqual(bm["vat_rate"], 0.05, places=3)     # 0.42/0.40 − 1
+
+    def test_partial_coverage(self):
+        blocks = [self._blk(2.0, 0.42, rate_exc=0.20), self._blk(2.0, 0.42)]  # 2nd inc-only
+        self.assertAlmostEqual(ec._bill_method_breakdown(blocks)["coverage"], 0.5, places=3)
+
+    def test_none_when_no_import(self):
+        self.assertIsNone(ec._bill_method_breakdown([]))
+
+    def test_render_section_only_when_present(self):
+        s = _summary()
+        # Default off: inc-VAT import display, no ex-VAT bill method.
+        default_html = ec.render_billing_summary(s)
+        self.assertNotIn("Total incl. VAT", default_html)
+        self.assertIn("Total incl. standing charge", default_html)
+        s["bill_method"] = {
+            "rows": [{"rate_exc": 0.20, "kwh": 2.0, "cost_exc": 0.40}],
+            "energy_exc": 0.40, "standing_days": 1, "standing_rate_exc": 0.40,
+            "standing_exc": 0.40, "subtotal_exc": 0.80, "vat_rate": 0.05,
+            "vat_amount": 0.04, "inc_total": 0.84, "coverage": 1.0}
+        html = ec.render_billing_summary(s)
+        # ex-VAT bill method REPLACES the inc-VAT import display.
+        self.assertIn("Standing charge (exc)", html)
+        self.assertIn("VAT @ 5%", html)
+        self.assertIn("Total incl. VAT", html)
+        self.assertNotIn("Total incl. standing charge", html)      # inc display replaced
+        self.assertNotIn("Bill-style rounding", html)              # header dropped
+        self.assertNotIn("penny-perfect", html)                    # footnote dropped
+        self.assertIn("Total Bill", html)                          # existing total untouched
+
+
+class TestDayChartPlungePrice(unittest.TestCase):
+    """Regression (reported after 4.1.3): build_day_chart_html must keep an Agile
+    plunge-price CREDIT (negative import cost) in the per-day chart + sidebar, not clamp
+    it to 0 — the bug where a −£1.09 day's sidebar read +£0.22 (positive slots only). The
+    4.1.3 negative-cost fix reached the aggregation/billing-summary paths but not this one."""
+
+    def _blk(self, kwh, cost, rate):
+        return {"meters": {"electricity_main": {"meta": {}, "standing_charge": 0.5,
+                "channels": {"import": {"kwh": kwh, "cost": cost, "rate": rate}}}}}
+
+    def _import_cost(self, day_blocks):
+        import re
+        html = ec.build_day_chart_html("2026-07-26", day_blocks,
+                                       {"electricity_main": "#1f77b4"},
+                                       block_minutes=30, currency="£")
+        m = re.search(r"Import cost: £([-0-9.]+)", html)
+        return float(m.group(1)) if m else None
+
+    def test_negative_day_credit_survives(self):
+        # negative slots −1.31 + positive 0.22 → signed −1.09, NOT +0.22.
+        db = [(0, self._blk(5.0, -1.31, -0.262)), (36, self._blk(1.0, 0.22, 0.22))]
+        self.assertAlmostEqual(self._import_cost(db), -1.09, places=2)
+
+    def test_positive_day_unchanged(self):
+        # Guard: a normal positive day is byte-identical (the fix is a no-op there).
+        db = [(0, self._blk(2.0, 0.60, 0.30)), (36, self._blk(1.0, 0.30, 0.30))]
+        self.assertAlmostEqual(self._import_cost(db), 0.90, places=2)
+
+
+class TestDayChartExcTable(unittest.TestCase):
+    """BL-24 opt-in: the per-slot data table gains ex-VAT import columns when Bill
+    Rounding is on. Default off ⇒ no exc data in the JSON (byte-identical table)."""
+
+    def _blk(self, kwh, cost, rate, rate_exc=None, cost_exc=None):
+        ch = {"kwh": kwh, "cost": cost, "rate": rate}
+        if rate_exc is not None:
+            ch["rate_exc"] = rate_exc
+        if cost_exc is not None:
+            ch["cost_exc"] = cost_exc
+        return {"meters": {"electricity_main": {"meta": {}, "standing_charge": 0.5,
+                "channels": {"import": ch}}}}
+
+    def _html(self, day_blocks, bill_rounding):
+        return ec.build_day_chart_html("2026-07-26", day_blocks,
+                                       {"electricity_main": "#1f77b4"},
+                                       block_minutes=30, currency="£",
+                                       bill_rounding=bill_rounding)
+
+    def test_default_off_no_exc_payload(self):
+        db = [(0, self._blk(2.0, 0.42, 0.21, rate_exc=0.19))]
+        html = self._html(db, bill_rounding=False)
+        self.assertNotIn('"bill_rounding"', html)       # no new JSON keys
+        self.assertNotIn('"exc_ratio"', html)
+        self.assertNotIn('"exc_approx"', html)
+
+    def test_on_emits_ratio_from_stored_exc(self):
+        db = [(0, self._blk(2.0, 0.42, 0.21, rate_exc=0.19))]   # ratio 0.19/0.21
+        html = self._html(db, bill_rounding=True)
+        self.assertIn('"bill_rounding":true', html)
+        self.assertIn('"exc_ratio":[0.9047619', html)           # 0.19/0.21, not inc/1.05
+        self.assertIn('"exc_approx":[false', html)
+
+    def test_on_flags_fallback_when_no_exc(self):
+        db = [(0, self._blk(2.0, 0.42, 0.21))]                  # no rate_exc/cost_exc
+        html = self._html(db, bill_rounding=True)
+        self.assertIn('"exc_ratio":[0.95238095', html)          # inc ÷ 1.05 fallback (5% default)
+        self.assertIn('"exc_approx":[true', html)
+
+    def test_fallback_uses_period_vat_not_hardcoded(self):
+        # A 0% VAT period: the fallback must be inc ÷ 1.0 (exc == inc), NOT inc ÷ 1.05.
+        db = [(0, self._blk(2.0, 0.42, 0.21))]                  # uncaptured → fallback
+        html0 = ec.build_day_chart_html("2026-11-15", db, {"electricity_main": "#1f77b4"},
+                                        block_minutes=30, currency="£",
+                                        bill_rounding=True, fallback_vat=0.0)
+        self.assertIn('"exc_ratio":[1.0', html0)
+        self.assertIn('"fallback_invat":1.0', html0)
+        # a 20% period scales by 1/1.2
+        html20 = ec.build_day_chart_html("2026-11-15", db, {"electricity_main": "#1f77b4"},
+                                         block_minutes=30, currency="£",
+                                         bill_rounding=True, fallback_vat=0.20)
+        self.assertIn('"fallback_invat":0.83333333', html20)
 
 
 if __name__ == "__main__":

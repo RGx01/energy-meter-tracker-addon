@@ -317,6 +317,11 @@ SETTINGS_DEFAULTS = {
     "hp_cop":                         3.0, # seasonal COP (SCOP) — override with manufacturer spec
     "gas_co2_g_per_kwh":            203.0, # BEIS/DESNZ 2023 GHG conversion factors
     "gas_boiler_efficiency":         0.90, # typical modern condensing boiler
+    # ── Bill rounding (BL-24) ──────────────────────────────────────────────
+    # Opt-in: show the Billing-tab bill summary with Octopus's bill-rounding
+    # method (Guy Lipman ladder) on the stored ex-VAT figures. Default off ⇒ the
+    # summary is byte-identical to today.
+    "bill_rounding_summary":        False,  # bool
 }
 
 SETTINGS_NUMERIC = {
@@ -1906,6 +1911,12 @@ def historical_probe_page():
 @app.route("/billing-history")
 def billing_history_page():
     return render_template("billing_history.html", active="settings")
+
+
+@app.route("/bill-rounding")
+def bill_rounding_page():
+    # BL-24: opt-in bill-style rounding for the Billing summary.
+    return render_template("bill_rounding.html", active="settings")
 
 
 @app.route("/delete-blocks")

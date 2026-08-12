@@ -1,7 +1,5 @@
 # Octopus bill → EMT CSV import — spec
 
-> _Status: Shipped — design note kept for rationale; the code is the source of truth._
-
 Reads Octopus PDF bills and produces CSVs EMT imports (Historical Import → CSV).
 
 > **Placement (revised):** the parser now lives **inside EMT** as `bill_parser.py`,
@@ -74,6 +72,44 @@ Rules EMT enforces / assumes:
   rows by `Start`. Emit both channels with **identical Start/End** for the same slot.
 - **Block size.** 30-minute (half-hourly). EMT's config block size may be 5/15/30; HH
   matches the Octopus grid and is what the import expects.
+
+---
+
+## 1b. Optional ex-VAT columns (CSV v2 — additive, back-compatible)
+
+*4.2 (BL-23). Lets a CSV or bill carry the real **pre-VAT** figures so EMT can store
+`imp_cost_exc` — which the "bill-style rounding" (BL-24) and ex-VAT display features read.
+Old inc-only CSVs are completely unaffected.*
+
+Three **optional** headers, matched the same way (case/space-insensitive, order-independent):
+
+```
+Unit Rate Exc. Tax (p/kWh), Estimated Cost Exc. Tax (p), Standing Charge Exc. Tax (p)
+```
+
+Rules:
+
+- **Additive & optional.** A file without these imports exactly as today; the exc columns
+  just stay empty. The inc columns of §1 remain required and authoritative for billing —
+  the exc columns never change an inc-VAT figure or the Total Bill.
+- **Prefer exc when populated.** If `Unit Rate Exc. Tax` (or `Estimated Cost Exc. Tax`) has a
+  value for a slot, EMT stores the exc figure directly (block `imp_cost_exc`; exc rate derived
+  on read as `cost_exc ÷ kWh`). If blank, EMT derives exc from the tariff API's `value_exc_vat`
+  where connected (§1a), else falls back to `inc ÷ 1.05` — an approximation, **not** the bill's
+  exact number.
+- **Same rate-first convention as §1.** Fill `Unit Rate Exc. Tax (p/kWh)` and leave
+  `Estimated Cost Exc. Tax (p)` blank; EMT computes exc cost = `rate_exc/100 × kWh`. Fill the
+  exc Cost only when no per-slot exc rate is known.
+- **Per-bill VAT.** A bill's VAT rate can vary (reduced-rate periods), so carrying exc
+  **explicitly** is more accurate than any global gross-down. `bill_parser` already holds
+  `rate_pre` / `cost_pre` / `standing_pre_p` at the bill's own printed precision — emit those
+  (`rate_pre` → `Unit Rate Exc. Tax`, `cost_pre` → `Estimated Cost Exc. Tax`, `standing_pre_p`
+  → `Standing Charge Exc. Tax`) instead of discarding them.
+- **Standing exc** goes on the same one-row-per-day slot as the inc standing.
+
+**Backfill without an API re-import:** because the exact ex-VAT lives in the source bills,
+re-running the *file* import over the same PDFs (now emitting these columns) backfills
+`imp_cost_exc` exactly, offline. A pure in-DB migration can only reach `inc ÷ 1.05`.
 
 ---
 

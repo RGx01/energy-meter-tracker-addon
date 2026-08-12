@@ -97,6 +97,27 @@ class TestWindow(_Base):
         # last_poll 00:00 minus 6h overlap → previous day 18:00
         self.assertTrue(frm.startswith("2026-05-09T18:00"))
 
+    def test_window_extends_back_to_oldest_unsettled(self):
+        # An unsettled block days before last_poll (e.g. lagging export) pulls the
+        # window start back to it, so the 6h poll re-fetches the lag every cycle.
+        self.store.set_kraken_state(_STATE_LAST_POLL, "2026-05-10T00:00:00")
+        self._block("2026-05-07T09:00:00")           # imp_kwh_api NULL → unsettled
+        ing = KrakenIngester(FakeClient(), self.store,
+                             import_mpan="M", import_serial="S", backfill_days=400)
+        now = datetime(2026, 5, 10, 12, 0, 0, tzinfo=timezone.utc)
+        frm, _to = ing._compute_window(now)
+        self.assertTrue(frm.startswith("2026-05-07T09:00"))   # pulled back, not 05-09 18:00
+
+    def test_window_floors_oldest_at_backfill_horizon(self):
+        # A very old stuck-unsettled block can't blow the window past the horizon.
+        self.store.set_kraken_state(_STATE_LAST_POLL, "2026-05-10T00:00:00")
+        self._block("2020-01-01T00:00:00")
+        ing = KrakenIngester(FakeClient(), self.store,
+                             import_mpan="M", import_serial="S", backfill_days=30)
+        now = datetime(2026, 5, 10, 12, 0, 0, tzinfo=timezone.utc)
+        frm, _to = ing._compute_window(now)
+        self.assertTrue(frm.startswith("2026-04-10"))         # now − 30d, not 2020
+
 
 class TestPoll(_Base):
     def _rows(self, *triples):

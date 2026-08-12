@@ -274,6 +274,29 @@ rule): the cap computation is a *predictor* for live/provisional blocks; once
 Measurements returns the real per-slot cost, trust it and reconcile. The existing
 deferred verify pass is the right vehicle.
 
+### D½. Ex-VAT capture must go per-channel under the split (BL-23 follow-on)
+The 4.2 ex-VAT work (BL-23/BL-24) captures `cost_exc`/`rate_exc` at settlement in
+`_rerun_pass2_for_settled_block`, and the Billing summary + data-table ex-VAT view read it.
+**Today that capture stamps only the MAIN import channel**, and the data table derives every
+column's ex-VAT from that one main VAT ratio. That is correct *while all import shares one
+tariff*, because VAT is a flat 5%: the exc/inc ratio is uniform across every rate band, so
+`EV exc = EV inc ÷ 1.05` regardless of the EV's rate.
+
+Under the split this is **still numerically fine for the ex-VAT total/columns** — a different
+`ev_device_*` *rate* does not change VAT — so nothing renders wrong. **But the per-channel
+STORED figure should be captured from each channel's own rate.** When settlement prices the EV
+portion at `ev_device_exc` and the house remainder at day/night exc, stamp `cost_exc`/`rate_exc`
+per import channel (main + EV sub-meter), not just the main, so the stored per-device ex-VAT is
+sourced from the device's *own* published exc rate. This future-proofs:
+- the section-E **"distinct line/colour for the capped (EV-peak) kWh"** ex-VAT breakdown, and
+- any per-device ex-VAT view that reads stored `cost_exc` directly (rather than the shared ratio).
+
+**Mechanically:** extend the `_rerun_pass2` exc block to loop each import channel and scale that
+channel's *resolved* inc rate by its tariff's exc/inc ratio (house schedule for the remainder,
+`ev_device` schedule for the EV). Build it **with** the ev_device rate support in step 2 — the
+`ev_device_exc` schedule doesn't exist until then, so doing it earlier would just replicate the
+main. Until then, the shared main VAT ratio keeps the visible ex-VAT correct to a rounding whisker.
+
 ### E. Display in billing & charts (capped tariff only)
 - **Smart-charging card:** surface cap consumption — e.g. "IOG cap: 4.2 of 6 h used" or "1.1 h over cap → EV-peak" — **paired with the actual-charging estimate** so the user sees dispatched-vs-charged, not one misleading number.
 - **Billing breakdown:** split the EV sub-meter cost into off-peak vs EV-peak portions, with a **distinct line/colour for the capped (peak) kWh**, so a peak-priced *overnight* slot reads as "over the cap", not as an error.
