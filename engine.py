@@ -4257,8 +4257,21 @@ def _maybe_backfill_historical_exc() -> None:
 
         async def _task():
             global _exc_backfill_running
+            import asyncio as _aio2
             try:
-                await _run_historical_exc_backfill()
+                # Drain to completion in THIS session. `_run_historical_exc_backfill`
+                # does one bounded pass (max_blocks) then returns; loop the passes,
+                # breathing between them, until the marker is `done`. Previously only
+                # one pass ran per engine startup, so a history larger than the pass
+                # cap stalled mid-way and stayed approximate until the next restart
+                # (prod: cursor stuck at 2024-09-15, everything after ≈). Each pass
+                # yields internally (chunk sleeps); the inter-pass sleep keeps the HA
+                # heartbeat/polls responsive. Hard pass-cap is a safety net only.
+                for _ in range(500):
+                    await _run_historical_exc_backfill()
+                    if (_store.get_meta(_EXC_BACKFILL_MARKER, {}) or {}).get("done"):
+                        break
+                    await _aio2.sleep(_EXC_BACKFILL_PASS_PACE)   # breathe between passes
             except Exception as e:
                 logger.warning("_maybe_backfill_historical_exc: worker failed: %s", e)
             finally:
@@ -5950,6 +5963,7 @@ _EXC_BACKFILL_MARKER = "exc_backfill_state"   # store_meta key
 #   2 = + settled live blocks (imp_kwh_api IS NOT NULL) captured before ex-VAT
 #       existed and already DCC-settled, so settlement capture won't re-stamp them
 _EXC_BACKFILL_SCOPE = 2
+_EXC_BACKFILL_PASS_PACE = 1.0   # seconds between drain passes (test-overridable)
 
 
 async def _run_historical_exc_backfill(max_blocks: int = 20000,
