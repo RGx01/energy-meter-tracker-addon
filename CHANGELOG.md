@@ -1,6 +1,6 @@
 # Changelog
  
-## [4.2.0] — 2026-08-09
+## [4.2.0] — 2026-08-12
 
 ### Added (ex-VAT figures, VAT calendar & settlement/backfill fixes)
 
