@@ -5493,6 +5493,50 @@ class TestExcHistoricalBackfill(unittest.TestCase):
             self._run_scheduler_with_marker(
                 {"done": True, "scope": engine._EXC_BACKFILL_SCOPE, "filled": 1}), 0)
 
+    def test_scheduler_drains_multiple_passes_to_done(self):
+        # Regression: a history bigger than one pass's cap must drain to completion in
+        # ONE session — the scheduler loops passes until the marker is done. Previously
+        # only one pass ran per startup, so prod stalled with cursor stuck mid-history
+        # and everything after it read ≈ until the next restart.
+        import asyncio
+        store = self._store_with([
+            dict(start="2026-03-06T00:00:00", kwh=2.0, rate=0.21, cost=0.42)])
+        engine._store = store
+        engine.kraken_available = lambda: True
+        engine._exc_backfill_running = False
+        saved = (engine._run_historical_exc_backfill,
+                 getattr(engine, "api_import_running", None),
+                 getattr(engine, "delete_in_progress", None),
+                 engine._EXC_BACKFILL_PASS_PACE)
+        engine._EXC_BACKFILL_PASS_PACE = 0        # no real sleeping in the test
+        calls = {"n": 0}
+
+        async def _fake_run():
+            # Two bounded passes, then done — mimics a >cap history.
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                store.set_meta(engine._EXC_BACKFILL_MARKER,
+                               {"done": True, "scope": engine._EXC_BACKFILL_SCOPE})
+            else:
+                store.set_meta(engine._EXC_BACKFILL_MARKER,
+                               {"cursor": "2026-03-06T00:00:00",
+                                "scope": engine._EXC_BACKFILL_SCOPE})
+            return 20000
+        engine._run_historical_exc_backfill = _fake_run
+        engine.api_import_running = lambda: False
+        engine.delete_in_progress = lambda: False
+        try:
+            async def _drive():
+                engine._maybe_backfill_historical_exc()
+                for _ in range(10):       # let the drain task iterate to completion
+                    await asyncio.sleep(0)
+            asyncio.run(_drive())
+        finally:
+            (engine._run_historical_exc_backfill, engine.api_import_running,
+             engine.delete_in_progress, engine._EXC_BACKFILL_PASS_PACE) = saved
+            store.close()
+        self.assertEqual(calls["n"], 2, "must loop passes until the marker is done")
+
     def _store_with(self, blocks):
         store = BlockStore(":memory:")
         with store._conn:
