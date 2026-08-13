@@ -66,14 +66,23 @@ for _i, _m in enumerate(
 MONTHS["Sept"] = 9               # common 4-letter variant
 
 # ── Bill regexes (Dec-2024 Octopus layout; extend as new layouts appear) ──────
-# HH day-page row: "00:00 - 00:30  6.67  3.59  23.928" (rate p/kWh, kWh, cost p)
-_ROW_RE   = re.compile(r"(\d{2}):(\d{2})\s*-\s*(\d{2}):(\d{2})\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)")
+# HH day-page row: "00:00 - 00:30  6.67  3.59  23.928" (rate p/kWh, kWh, cost p).
+# RATE and COST may be NEGATIVE on Agile plunge-price half-hours (e.g.
+# "07:00 - 07:30  -0.67  3.77  -2.526": you're paid to consume). The rate/cost
+# groups allow an optional leading '-'; without it, every plunge slot failed to
+# match and was silently dropped — a gap per plunge slot, and (since a day page
+# needs ≥40 matched rows) a WHOLE-DAY drop on heavy-plunge days. Consumption stays
+# non-negative: import kWh is never legitimately negative.
+_ROW_RE   = re.compile(r"(\d{2}):(\d{2})\s*-\s*(\d{2}):(\d{2})\s+(-?[\d.]+)\s+([\d.]+)\s+(-?[\d.]+)")
 _DATE_RE  = re.compile(r"(\d{1,2})(?:st|nd|rd|th)\s+([A-Z][a-z]+)\s+(\d{4})")
 _TOTAL_RE = re.compile(r"Total consumption\s+([\d.]+)\s*kWh")
 _STAND_RE = re.compile(r"(\d+)\s*days?\s*@\s*([\d.]+)\s*p/day")
 _VAT_RE   = re.compile(r"VAT\s*@\s*([\d.]+)\s*%")
 _MPAN_RE  = re.compile(r"\b(\d{13})\b")
 # Charges-In-Detail tier row: "6.67p/kWh  1040.5 kWh  £69.367"
+# (Agile is transcribed from the per-HH pages via _ROW_RE, not this aggregate tier;
+# if a bill ever prints a negative-rate/credit tier line, revisit the sign handling
+# here — left strict for now to avoid mis-signing a £ credit shown as "-£X".)
 _TIER_RE  = re.compile(r"([\d.]+)\s*p/kWh\s+([\d.]+)\s*kWh\s+£([\d.]+)")
 # Export line: "Energy Exported 118.1 kWh @ 15.00p/kWh £17.71"
 _EXP_RE   = re.compile(r"Energy Exported\s+([\d.]+)\s*kWh\s*@\s*([\d.]+)\s*p/kWh\s+£([\d.]+)")

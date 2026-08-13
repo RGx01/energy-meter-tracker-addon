@@ -1,10 +1,12 @@
 # Changelog
  
-## [4.2.2] — 2026-08-12
+## [4.2.2] — 2026-08-13
 
-*Two display fixes for Agile (half-hourly-priced) meters. Both are presentation-only — no stored data, no aggregation and no Total Bill figure changes.*
+*Agile (half-hourly-priced) fixes — two display fixes and one bill-import fix. The display changes are presentation-only (no stored data, aggregation, or Total Bill change); the import fix recovers plunge half-hours that were being dropped from PDF-bill imports.*
 
 ### Fixed
+
+- **Agile plunge half-hours are no longer dropped when reconstructing history from a PDF bill.** The bill parser transcribes each half-hour from the statement's per-day table, but its row pattern only matched **positive** rates and costs — so an Agile **plunge** slot (a *negative* unit rate, where Octopus pays you to consume, e.g. `07:00 - 07:30  -0.67  3.77  -2.526`) failed to match and the **whole row was silently dropped**. That left a **gap at every plunge half-hour**, and — because a day page is only accepted with **≥40 recognised rows** — a **whole day could be dropped** on a heavy-plunge day. The parser now accepts a negative **rate** and **cost** (consumption stays non-negative — import kWh is never legitimately negative), so plunge slots transcribe with the correct sign. Confirmed against a real 2024 Agile statement where **5 plunge rows on one page** had been lost. **Only the PDF-bill import was affected** — the supplier-API import and the direct Octopus consumption-CSV import already handled negative rates correctly. Re-import any affected bills to recover the missing plunge slots. *(This does not touch already-stored data; it only changes what a fresh bill import captures.)*
 
 - **Agile plunge-price half-hours now show the rate line dipping below zero on the day chart.** On Agile the unit rate can go **negative** (Octopus pays you to import). The 4.1.3 fix already made the negative *cost* display correctly, but the day chart's unit-rate step-line still flattened along the zero baseline on those slots, so a plunge period looked like a flat-zero rate rather than a dip into credit. The cause was the axis, not the data: on an **import-only day** there's no export to pull the axes below zero, so the rate (right-hand) axis was pinned at 0 and clipped the negative rate. The rate axis now drops just below zero to fit the lowest negative rate of the day — keeping the energy and rate **zero-lines aligned** (the same technique already used when export is present) — and labels the sub-zero ticks, so the rate line visibly goes negative through a plunge. The rate value itself was always correct in the data; this only stops the axis from hiding it. *(Display only — stored data and billing unchanged.)*
 

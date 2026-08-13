@@ -113,6 +113,34 @@ class TestParse(unittest.TestCase):
         self.assertTrue(self.bill.reconciliation["ok"])
 
 
+class TestPlungeNegativeRate(unittest.TestCase):
+    """Agile plunge-price half-hours print a NEGATIVE rate (and negative cost) on the
+    bill — e.g. "07:00 - 07:30  -0.67  3.77  -2.526" (you're paid to consume). _ROW_RE
+    must transcribe them; with the old digits-only pattern each plunge row failed to
+    match and was silently dropped, leaving a gap per plunge slot (and, since a day
+    page needs >=40 matched rows, a whole-day drop on heavy-plunge days). Confirmed
+    against a real 2024 Agile statement, where 5 plunge rows on one page were lost."""
+
+    def test_negative_rate_slots_are_transcribed_not_dropped(self):
+        rows = _full_day_rows()                       # 48 positive rows
+        rows[14] = ("07:00", "07:30", -0.67, 3.77, -2.526)   # plunge (neg rate + cost)
+        rows[16] = ("08:00", "08:30", -1.58, 3.09, -4.882)
+        days = bp._parse_hh_days([_hh_page("Sunday 4th February 2024", rows)])
+        self.assertEqual(len(days), 1)
+        slots = days[0]
+        self.assertEqual(len(slots), 48)              # nothing dropped
+        neg = sorted((s for s in slots if s.rate_pre < 0), key=lambda s: s.rate_pre)
+        self.assertEqual(len(neg), 2)
+        self.assertAlmostEqual(neg[0].rate_pre, -1.58, places=2)
+        self.assertAlmostEqual(neg[0].cost_pre, -4.882, places=3)   # sign preserved
+        self.assertAlmostEqual(neg[0].kwh, 3.09, places=2)          # consumption positive
+
+    def test_consumption_stays_non_negative(self):
+        # A negative in the CONSUMPTION column is not legitimate import — the pattern
+        # must NOT match it (so it can't masquerade as real usage).
+        self.assertFalse(bp._ROW_RE.findall("07:00 - 07:30  2.94  -3.77  0.000"))
+
+
 class TestCsv(unittest.TestCase):
     def setUp(self):
         self._orig = bp._read_pages
