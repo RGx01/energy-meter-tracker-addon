@@ -1708,6 +1708,30 @@ class TestApiConfigHistoryDelete(unittest.TestCase):
                          "config_restored must be False when non-active period deleted")
         mock_save.assert_not_called()
 
+    def test_delete_routes_through_engine_loop(self):
+        """#361: the delete + chain rebuild must go through _config_mutation_on_loop
+        (serialised on the engine loop/connection), not write on the shared web
+        connection — that race surfaced as SQLite 'another row available'."""
+        store, cfg_old, cfg_new = self._make_two_period_store()
+        client = make_client(store=store)
+        non_active_id = store._conn.execute(
+            "SELECT id FROM config_periods WHERE effective_to IS NOT NULL"
+        ).fetchone()["id"]
+        seen = {}
+        real = server._config_mutation_on_loop
+        def _spy(mutate, timeout=30.0):
+            seen["called"] = True
+            return real(mutate, timeout)
+        server._config_mutation_on_loop = _spy
+        try:
+            with patch("energy_engine_io.save_json_atomic", return_value=None), \
+                 patch("server.load_config", return_value=cfg_new):
+                r = client.delete(f"/api/config/history/{non_active_id}")
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(seen.get("called"), "delete must route through _config_mutation_on_loop")
+        finally:
+            server._config_mutation_on_loop = real
+
     def test_delete_only_period_returns_400(self):
         """Cannot delete the only period."""
         store = BlockStore(":memory:")
@@ -6204,6 +6228,14 @@ class TestBlocksDataVersion(unittest.TestCase):
             "INSERT INTO blocks VALUES (?,?,?,?,?,?)",
             [("2026-02-12T00:00:00", 0.0, 0.0, 0.0, 0.0, 0.0),
              ("2026-02-12T00:30:00", 1.0, 20.0, 2.0, 0.0, 150.0)])
+        # The token now also fingerprints config_periods (so a billing-period change
+        # busts the cache and the Charts page refreshes) — the fake store needs it.
+        conn.execute(
+            "CREATE TABLE config_periods (id INTEGER PRIMARY KEY, effective_from TEXT, "
+            "effective_to TEXT, billing_day INTEGER)")
+        conn.execute(
+            "INSERT INTO config_periods (id, effective_from, effective_to, billing_day) "
+            "VALUES (1, '2024-01-01T00:00:00', NULL, 1)")
         conn.commit()
         return types.SimpleNamespace(_conn=conn)
 
@@ -6241,6 +6273,28 @@ class TestBlocksDataVersion(unittest.TestCase):
         st = self._store()
         self.assertEqual(server._blocks_data_version(st),
                          server._blocks_data_version(st))
+
+    def test_config_period_change_moves_token(self):
+        # A billing-period create/edit/delete changes NO block value, so the block
+        # fingerprint (count:max:sums) is identical — but the Charts page must still
+        # refresh, so a config_periods change has to move the token.
+        import server
+        st = self._store()
+        before = server._blocks_data_version(st)
+        # (a) edit the billing day
+        st._conn.execute("UPDATE config_periods SET billing_day = 6 WHERE id = 1")
+        st._conn.commit()
+        edited = server._blocks_data_version(st)
+        self.assertNotEqual(before, edited)
+        # (b) add a new period
+        st._conn.execute(
+            "INSERT INTO config_periods (id, effective_from, effective_to, billing_day) "
+            "VALUES (2, '2026-07-01T00:00:00', NULL, 6)")
+        st._conn.commit()
+        added = server._blocks_data_version(st)
+        self.assertNotEqual(edited, added)
+        # The block-value prefix (count:max:sums) is unchanged throughout.
+        self.assertEqual(before.split(":")[:7], added.split(":")[:7])
 
 
 class TestUsageSubMeterGridShare(unittest.TestCase):

@@ -2268,8 +2268,21 @@ def _blocks_data_version(store) -> str:
         "ROUND(COALESCE(SUM(exp_cost), 0), 2) AS ec, "
         "ROUND(COALESCE(SUM(carbon_g), 0), 0) AS cg "
         "FROM blocks").fetchone()
+    # Config-period fingerprint: a billing-period create/edit/delete rebuilds the
+    # billing chart but changes NO block value, so without this the token stayed put
+    # and the Charts page's freshness gate never refreshed after a config change
+    # (the "charts don't update after removing a period" confusion). Covers add/remove
+    # (count/max-id), a billing-day edit (sum), and a date edit (max from/to). Tiny
+    # table → negligible cost.
+    cp = store._conn.execute(
+        "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS mid, "
+        "COALESCE(SUM(billing_day), 0) AS sbd, "
+        "COALESCE(MAX(effective_from), '') AS mef, "
+        "COALESCE(MAX(COALESCE(effective_to, '')), '') AS met "
+        "FROM config_periods").fetchone()
     return (f"{row['c']}:{row['m'] or ''}:"
-            f"{row['ik']}:{row['ic']}:{row['ek']}:{row['ec']}:{row['cg']}")
+            f"{row['ik']}:{row['ic']}:{row['ek']}:{row['ec']}:{row['cg']}:"
+            f"{cp['n']}:{cp['mid']}:{cp['sbd']}:{cp['mef']}:{cp['met']}")
 
 
 @app.route("/api/charts/data-version")
@@ -2950,73 +2963,50 @@ def api_config_history_update(period_id):
 @app.route("/api/config/history/<int:period_id>", methods=["DELETE"])
 def api_config_history_delete(period_id):
     """Delete a config period, re-assigning its blocks to an adjacent period."""
-    import json as _json
     try:
-        store = _get_store()
-
-        # Check before deleting whether this is the active period
-        cp = store.get_config_period(period_id)
-        is_active = cp and cp.get("effective_to") is None
-
-        result = store.delete_config_period(period_id)
-
-        # Rebuild chain first so effective_to values are consistent
-        try:
-            _rebuild_config_period_chain(store)
-        except Exception as _e:
-            logger.warning("api_config_history_delete: chain rebuild failed: %s", _e)
-
-        # If we deleted the active period, the predecessor is now active.
-        # Write its config back to meters_config.json (convenience export).
-        if is_active:
+        # #361: run the delete + chain rebuild on the ENGINE loop/connection so it's
+        # serialised with the engine's own writes — a delete on the shared web store
+        # from the Flask thread raced the engine and surfaced as SQLite "another row
+        # available" / "database is locked". Charts regen OFF the loop afterwards, the
+        # same path as create/update via _config_mutation_on_loop.
+        def _mutate(estore):
+            # Whether this is the active period must be read on the same connection,
+            # before the delete.
+            cp = estore.get_config_period(period_id)
+            is_active = bool(cp and cp.get("effective_to") is None)
+            result = estore.delete_config_period(period_id)
+            # Rebuild the contiguous chain so effective_to values stay consistent.
             try:
-                new_active = store._conn.execute(
-                    "SELECT id FROM config_periods "
-                    "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
-                ).fetchone()
-                if new_active:
-                    from energy_engine_io import save_json_atomic as _sja
-                    restored_cfg = store.config_from_db(new_active["id"])
-                    cfg_path = os.path.join(DATA_DIR, "meters_config.json")
-                    _sja(cfg_path, restored_cfg)
-                    logger.info(
-                        "api_config_history_delete: meters_config.json restored "
-                        "from newly-active config period"
-                    )
+                _rebuild_config_period_chain(estore)
             except Exception as _e:
-                logger.warning(
-                    "api_config_history_delete: could not restore meters_config.json: %s", _e
-                )
+                logger.warning("api_config_history_delete: chain rebuild failed: %s", _e)
+            # If we deleted the active period, the predecessor is now active — write
+            # its config back to meters_config.json (convenience export).
+            if is_active:
+                try:
+                    new_active = estore._conn.execute(
+                        "SELECT id FROM config_periods "
+                        "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+                    ).fetchone()
+                    if new_active:
+                        from energy_engine_io import save_json_atomic as _sja
+                        restored_cfg = estore.config_from_db(new_active["id"])
+                        cfg_path = os.path.join(DATA_DIR, "meters_config.json")
+                        _sja(cfg_path, restored_cfg)
+                        logger.info(
+                            "api_config_history_delete: meters_config.json restored "
+                            "from newly-active config period"
+                        )
+                except Exception as _e:
+                    logger.warning(
+                        "api_config_history_delete: could not restore meters_config.json: %s", _e
+                    )
+            return {"ok": True,
+                    "blocks_reassigned": result["blocks_reassigned"],
+                    "config_restored": is_active}
 
-        # Regenerate charts
-        try:
-            import energy_charts as _ec
-            blocks = store.get_blocks_lightweight()
-            if blocks:
-                from energy_engine_io import load_json as _lj_del
-                cfg       = load_config()
-                main_meta = {}
-                for md in cfg.get("meters", {}).values():
-                    if not (md.get("meta") or {}).get("sub_meter"):
-                        main_meta = md.get("meta") or {}
-                        break
-                tz_name  = main_meta.get("timezone", "UTC")
-                bm       = int(main_meta.get("block_minutes") or 30)
-                currency = main_meta.get("currency_symbol", "£")
-                os.makedirs(CHART_DIR, exist_ok=True)
-                html = _ec.generate_daily_import_export_charts(
-                    blocks, timezone_name=tz_name, block_minutes=bm, currency=currency, cfg=load_config(), store=store
-                )
-                with open(os.path.join(CHART_DIR, "daily_usage.html"), "w") as f:
-                    f.write(html)
-        except Exception as _e:
-            logger.warning("api_config_history_delete: chart regen failed: %s", _e)
-
-        return jsonify({
-            "ok": True,
-            "blocks_reassigned": result["blocks_reassigned"],
-            "config_restored": is_active,
-        })
+        result = _config_mutation_on_loop(_mutate)
+        return jsonify(result)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
