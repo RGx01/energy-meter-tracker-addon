@@ -900,13 +900,36 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
 # Billing summary renderer
 # ─────────────────────────────────────────────────────────────
 
+# Above this many distinct rates in one channel's period breakdown, collapse the
+# per-rate rows into a single kWh-weighted average row. Agile has ~48 rates a day →
+# hundreds across a bill period, which makes the billing summary unreadable; the
+# Total row is unchanged, so only the (unusably long) per-rate detail is folded.
+_MAX_RATE_ROWS = 5
+
+
 def _bill_rate_rows(channels, currency):
     """Render rate breakdown rows for a channel dict {rate: {kwh, cost}}.
-    Returns (html, total_kwh, total_cost) where totals are sum of rounded per-rate values."""
-    rows = ""
+    Returns (html, total_kwh, total_cost) where totals are sum of rounded per-rate
+    values. When a channel has more than _MAX_RATE_ROWS distinct rates (Agile), the
+    rows collapse to ONE weighted-average row — the totals are computed identically
+    (sum of the same rounded per-rate values), so the Total row never moves."""
+    rates = sorted(channels)
     total_kwh = 0.0
     total_cost = 0.0
-    for rate in sorted(channels):
+    if len(rates) > _MAX_RATE_ROWS:
+        for rate in rates:
+            total_kwh  += round(channels[rate]["kwh"],  3)
+            total_cost += round(channels[rate]["cost"], 2)
+        avg = (total_cost / total_kwh) if total_kwh else 0.0   # kWh-weighted £/kWh
+        cost_str = f"({-total_cost:.2f})" if total_cost < 0 else f"{total_cost:.2f}"
+        rows = f"""
+            <tr>
+              <td></td><td>{avg:.4f} <span style="opacity:0.6;">(avg of {len(rates)} rates)</span></td>
+              <td>{total_kwh:.3f}</td><td>{cost_str}</td>
+            </tr>"""
+        return rows, round(total_kwh, 3), round(total_cost, 2)
+    rows = ""
+    for rate in rates:
         d = channels[rate]
         kwh      = round(d["kwh"],  3)
         cost_val = round(d["cost"], 2)
@@ -927,6 +950,24 @@ def _bill_total_row(kwh, cost):
         <tr class="channel-total">
           <td>Total</td><td></td><td>{kwh:.3f}</td><td>{cost_str}</td>
         </tr>"""
+
+
+def _collapse_rate_kwh(rate_kwh):
+    """Side-panel rate breakdown collapse. `rate_kwh` is a {rate: kwh} mapping (the
+    day chart's `summary_rates[meter]`). Returns a list of (kwh, rate, n) tuples to
+    render: one per rate normally, or a SINGLE kWh-weighted-average tuple (with n =
+    the rate count) when there are more than _MAX_RATE_ROWS non-trivial rates — the
+    same threshold as the billing summary's _bill_rate_rows, so the side panel's
+    Direct-import and per-device lines fold the same way on Agile. Weighting is by
+    kWh (Σ rate·kwh ÷ Σ kwh) since only kWh is available here; that equals cost ÷ kWh
+    when cost = rate·kwh, so it agrees with the summary's cost-weighted average. Only
+    rates with kwh > 0.0001 are counted (matching the renderers' own filter)."""
+    items = [(k, r) for r, k in sorted(rate_kwh.items()) if k > 0.0001]
+    if len(items) > _MAX_RATE_ROWS:
+        tot_kwh = sum(k for k, _ in items)
+        avg = (sum(r * k for k, r in items) / tot_kwh) if tot_kwh else 0.0
+        return [(tot_kwh, avg, len(items))]
+    return [(k, r, None) for k, r in items]
 
 
 from decimal import Decimal as _Decimal, ROUND_HALF_EVEN as _ROUND_HALF_EVEN
@@ -1081,6 +1122,15 @@ def _bill_method_breakdown(blocks, period_vat=None, standing_inc_by_day=None):
         # only reconciles to the cost at finer precision; the summed raw cost is authoritative.
         rows.append({"rate_exc": round(key / (1.0 + vat), 4),
                      "kwh": round(bk, 3), "cost_exc": round(be, 3)})
+    # Collapse a long rate list (Agile: hundreds of distinct half-hourly rates across a
+    # bill period) into ONE kWh-weighted average row so the ex-VAT summary stays
+    # readable. Uses the raw sums (energy_raw = Σ exc), so Total (exc) is unchanged.
+    if len(rows) > _MAX_RATE_ROWS:
+        _tot_kwh = sum(bands[k]["kwh"] for k in bands)
+        _avg_exc = (energy_raw / _tot_kwh) if _tot_kwh else 0.0
+        rows = [{"rate_exc": round(_avg_exc, 4), "kwh": round(_tot_kwh, 3),
+                 "cost_exc": round(energy_raw, 3),
+                 "collapsed": True, "n_rates": len(bands)}]
     # Standing: prefer the summary's per-LOCAL-day inc figure (correct day count across
     # the BST midnight boundary), ex-VAT via ÷ (1+VAT) — exact-to-the-mill for a flat
     # charge. Fall back to the block-derived exc standing when no summary is supplied.
@@ -1333,8 +1383,10 @@ def render_billing_summary(summary, currency='£', site_name=None):
             # way: sum the raw ex-VAT half-hours, round at the subtotal, then add VAT. The
             # Total Bill below is UNCHANGED — this only changes how the import is presented.
             for _r in _bm["rows"]:
+                _rate_cell = (f"{_r['rate_exc']:.4f} <span style=\"opacity:0.6;\">(avg of {_r['n_rates']} rates)</span>"
+                              if _r.get("collapsed") else f"{_r['rate_exc']:.4f}")
                 html += f"""
-        <tr><td></td><td>{_r['rate_exc']:.4f}</td><td>{_r['kwh']:.3f}</td><td>{_r['cost_exc']:.3f}</td></tr>"""
+        <tr><td></td><td>{_rate_cell}</td><td>{_r['kwh']:.3f}</td><td>{_r['cost_exc']:.3f}</td></tr>"""
             html += f"""
         <tr class="channel-total"><td>Total (exc)</td><td></td><td></td><td>{_bm['energy_exc']:.2f}</td></tr>"""
             if _bm["standing_days"]:
@@ -1623,11 +1675,10 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
 
     def rate_breakdown_html(meter_key, css_extra=""):
         out = ""
-        for rate in sorted(summary_rates[meter_key]):
-            kwh = summary_rates[meter_key][rate]
-            if kwh > 0.0001:
-                out += (f'<span class="rate-row {css_extra}">'
-                        f'{kwh:.3f} kWh @ {currency}{rate:.4f}</span>')
+        for kwh, rate, n in _collapse_rate_kwh(summary_rates[meter_key]):
+            suffix = f' (avg of {n})' if n else ''
+            out += (f'<span class="rate-row {css_extra}">'
+                    f'{kwh:.3f} kWh @ {currency}{rate:.4f}{suffix}</span>')
         return out
 
     house_kwh  = summary_kwh.get("electricity_main", 0.0)
@@ -1643,10 +1694,9 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
 
     def rate_rows_colored(meter_key, color):
         out = ""
-        for rate in sorted(summary_rates[meter_key]):
-            kwh = summary_rates[meter_key][rate]
-            if kwh > 0.0001:
-                out += cs(f'{kwh:.3f} kWh @ {currency}{rate:.4f}', color, size="0.8em")
+        for kwh, rate, n in _collapse_rate_kwh(summary_rates[meter_key]):
+            suffix = f' (avg of {n})' if n else ''
+            out += cs(f'{kwh:.3f} kWh @ {currency}{rate:.4f}{suffix}', color, size="0.8em")
         return out
 
     # ── Per-meter totals rounded to display precision ──────────────────────
@@ -3263,7 +3313,30 @@ function _buildDayChart(chartId) {{
       y1top = y1range[1];
       var negFrac = -y1min / (y1range[1] - y1min);
       y2min = -negFrac * (y2max / (1 - negFrac));
-    }} else {{ y1top = y1range[1]; y2min = 0; }}
+    }} else {{
+      // Import-only day (no export to pull the axes below zero). Normally the rate
+      // axis floors at 0 — but an Agile plunge-price slot has a NEGATIVE rate, which
+      // then clips flat at the baseline. Give the rate axis room below zero for the
+      // lowest negative rate, and give the energy axis a matching zero-fraction so
+      // the two zero-lines stay aligned (same trick as the export branches).
+      y1top = y1range[1];
+      var rateMin = 0;
+      traces.forEach(function(t) {{
+        if (t.yaxis === 'y2' && t.y) t.y.forEach(function(v) {{ if (v < rateMin) rateMin = v; }});
+      }});
+      if (rateMin < 0) {{
+        y2min = rateMin - (-rateMin) * 0.08;          // small headroom below the trough
+        var f = -y2min / (y2max - y2min);             // zero fraction from the bottom
+        y1min = -(f / (1 - f)) * y1top;               // matching negative headroom on y1
+      }} else {{
+        y2min = 0;
+      }}
+    }}
+    // Label the below-zero region of the rate axis when it dips negative (plunge
+    // price / export), so the line has readable ticks rather than an unlabelled tail.
+    if (y2min < 0) {{
+      for (var tn = -step; tn >= y2min - step * 0.01; tn -= step) ticks.unshift(parseFloat(tn.toFixed(10)));
+    }}
     Plotly.relayout(el, {{
       'yaxis.range': [y1min, y1top], 'yaxis2.range': [y2min, y2max],
       'yaxis2.tickmode': 'array', 'yaxis2.tickvals': ticks,
