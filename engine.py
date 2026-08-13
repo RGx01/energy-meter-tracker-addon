@@ -137,6 +137,9 @@ _on_block_boundary_cb = None   # Optional[Callable[[str], None]]
 _kraken_client = None          # KrakenAPIClient | None
 _kraken_discovery: dict | None = None
 _kraken_account_number: str | None = None
+# (db_account, creds_account) when the loaded DB is stamped to a different Octopus
+# account than the current credentials → API auto-activation is suppressed (#357).
+_kraken_account_mismatch = None
 # Reference to the running HAClient + poll-task handle, captured when the engine
 # loop starts. Lets connect_kraken_now() (the in-app credential-save path)
 # launch the DCC poll task without an addon restart — the task is otherwise
@@ -215,6 +218,35 @@ _VALID_BILLING_SOURCES = ("dcc", "cad")
 
 _MODE_KEY = "data_source_mode"
 _VALID_MODES = ("cad", "cad+api", "api", "api+mini")
+
+# DB↔account stamp (#357): the Octopus account this DB belongs to, written on the
+# first successful discovery. Lets us swap DBs safely — if the credentials now
+# present are for a DIFFERENT account than the loaded DB was stamped with, the API
+# is NOT auto-activated (which would poll the wrong account's data into this DB).
+# Credentials are KEPT either way; an explicit in-app reconnect re-associates.
+_ACCOUNT_KEY = "kraken_account_number"
+
+
+def _norm_account(x) -> str:
+    return (x or "").strip().upper()
+
+
+def get_db_account() -> str | None:
+    """The Octopus account this DB is stamped to, or None if never stamped
+    (legacy/fresh DB)."""
+    try:
+        v = _store.get_kraken_state(_ACCOUNT_KEY)
+    except Exception:
+        v = None
+    return v or None
+
+
+def kraken_account_mismatch():
+    """When non-None, the loaded DB is stamped to a different Octopus account than
+    the current credentials, so the API was NOT auto-activated. Returns
+    (db_account, creds_account). Credentials are kept; an explicit in-app reconnect
+    re-associates this DB."""
+    return _kraken_account_mismatch
 
 
 def get_data_source_mode() -> str:
@@ -4849,6 +4881,8 @@ async def disconnect_kraken() -> dict:
     """
     global _kraken_client, _kraken_mini_reader, _kraken_discovery
     global _kraken_rate_schedules, _kraken_standing_schedule
+    global _kraken_account_mismatch
+    _kraken_account_mismatch = None
     had = has_kraken_credentials()
     try:
         # 1. Stop the live poll loop and drop all in-memory API state, so polling
@@ -4983,13 +5017,42 @@ async def _kraken_startup_discovery(force: bool = False) -> None:
                            conn.get("detail"))
             return
         acct = env["account_number"] or conn.get("account_number")
+        # DB↔account stamp guard (#357). A DB is stamped with its Octopus account on
+        # first successful discovery. If the credentials now present are for a
+        # DIFFERENT account (operator swapped to another user's DB), do NOT
+        # auto-activate — that would poll the wrong account's data into this DB.
+        # Credentials are KEPT (never silently dropped). An explicit in-app reconnect
+        # (force=True) re-associates the DB with the new account.
+        global _kraken_account_mismatch
+        from kraken_api_client import _mask as _m
+        stamped = get_db_account()
+        if stamped and acct and _norm_account(stamped) != _norm_account(acct):
+            if not force:
+                _kraken_account_mismatch = (stamped, acct)
+                logger.warning(
+                    "kraken_discovery: this DB is stamped to account %s but the "
+                    "configured credentials are for %s — API NOT auto-activated. "
+                    "Credentials kept; reconnect in-app to re-associate this DB.",
+                    _m(stamped), _m(acct))
+                try:
+                    await _kraken_client.close()
+                except Exception:
+                    pass
+                _kraken_client = None
+                _kraken_discovery = {}
+                return
+            logger.info("kraken_discovery: explicit reconnect re-associates this DB "
+                        "from account %s to %s", _m(stamped), _m(acct))
+            _store.set_kraken_state(_ACCOUNT_KEY, acct)
+        elif acct and not stamped:
+            _store.set_kraken_state(_ACCOUNT_KEY, acct)   # first association
+        _kraken_account_mismatch = None
         _kraken_account_number = acct
         disc = await _kraken_client.auto_discover(acct)
         _kraken_discovery = disc
 
         imp = disc.get("import") or {}
         exp = disc.get("export") or {}
-        from kraken_api_client import _mask as _m
         logger.info("=" * 60)
         logger.info("kraken_discovery: account verified — REVIEW BEFORE ENABLING POLLING")
         logger.info("  account_number : %s", _m(disc.get("account_number")))

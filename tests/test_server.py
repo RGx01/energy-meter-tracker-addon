@@ -418,6 +418,53 @@ class TestEngineLoopBridge(unittest.TestCase):
             loop.close()
 
 
+class TestKrakenConfigCredentialSafety(unittest.TestCase):
+    """#357: a failed live-connect must never look like the credentials were
+    dropped (the save happens first, unconditionally), and the config GET must
+    surface a DB↔account mismatch so the UI can prompt an explicit reconnect."""
+
+    def test_failed_connect_reports_saved_and_kept(self):
+        # engine here is the test stub — add the attributes the handler needs.
+        import server, engine
+        saved_run = server._run_on_engine_loop
+        engine.save_kraken_credentials = lambda *a, **k: None
+        engine.connect_kraken_now = lambda: None   # coro arg; patched loop ignores it
+        server._run_on_engine_loop = lambda coro, timeout=None: {
+            "ok": False, "connected": False, "detail": "rate_limited"}
+        try:
+            r = make_client().post("/api/kraken-config",
+                                   json={"api_key": "k", "account_number": "A-OWNER"})
+            self.assertEqual(r.status_code, 400)      # still signals "not connected"
+            body = r.get_json()
+            self.assertTrue(body["saved"])            # …but the key was kept
+            self.assertIn("rate_limited", body["message"])
+            self.assertIn("Disconnect", body["message"])
+        finally:
+            server._run_on_engine_loop = saved_run
+            del engine.save_kraken_credentials
+            del engine.connect_kraken_now
+
+    def test_config_get_surfaces_account_mismatch(self):
+        import engine
+        engine._kraken_env = lambda: {"api_key": "k", "account_number": "A-OWNER",
+                                      "base_url": None}
+        engine.kraken_available = lambda: False
+        engine._kraken_mini_reader = None
+        engine.kraken_account_mismatch = lambda: ("A-OTHERUSER", "A-OWNER")
+        try:
+            r = make_client().get("/api/kraken-config")
+            self.assertEqual(r.status_code, 200)
+            body = r.get_json()
+            self.assertTrue(body["account_mismatch"])
+            self.assertEqual(body["db_account"], "A-OTHERUSER")
+            self.assertEqual(body["credentials_account"], "A-OWNER")
+        finally:
+            del engine._kraken_env
+            del engine.kraken_available
+            del engine._kraken_mini_reader
+            del engine.kraken_account_mismatch
+
+
 class TestApiLastPage(unittest.TestCase):
 
     def setUp(self):

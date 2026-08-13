@@ -3692,12 +3692,21 @@ def api_kraken_config_get():
         import engine as _eng
         env = _eng._kraken_env()
         configured = bool(env.get("api_key"))
-        return jsonify({
+        out = {
             "configured": configured,
             "account_number": env.get("account_number"),
             "connected": _eng.kraken_available(),
             "mini": _eng._kraken_mini_reader is not None,
-        })
+        }
+        # #357: if this DB is stamped to a different account than the credentials,
+        # the API was NOT auto-activated — surface it so the UI can prompt an
+        # explicit reconnect (credentials are kept, not dropped).
+        mm = _eng.kraken_account_mismatch()
+        if mm:
+            out["account_mismatch"] = True
+            out["db_account"] = mm[0]
+            out["credentials_account"] = mm[1]
+        return jsonify(out)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3722,6 +3731,18 @@ def api_kraken_config_post():
             return jsonify({"ok": result.get("ok", True), "connected": False,
                             "disconnected": True, "mode": result.get("mode")})
         result = _run_on_engine_loop(_eng.connect_kraken_now(), timeout=45.0)
+        if not result.get("ok"):
+            # The key was already persisted (save happens above, before the live
+            # check). A failed check is usually TRANSIENT — rate limit, a network
+            # blip, or a DB mid-swap — not a bad key. Make the save visible so a
+            # failed verify never looks like the credentials were dropped, and
+            # never auto-delete them here: only Disconnect removes credentials.
+            result["saved"] = True
+            result["message"] = (
+                "Credentials saved, but the connection could not be verified right "
+                "now (%s). They have been kept — EMT will connect automatically when "
+                "the API is reachable. If the key is wrong, use Disconnect to remove "
+                "it." % (result.get("detail") or "unknown"))
         return jsonify(result), (200 if result.get("ok") else 400)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
