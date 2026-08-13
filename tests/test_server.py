@@ -6252,5 +6252,36 @@ class TestConfigHistoryConsistency(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
 
 
+class TestVatToggleRegen(unittest.TestCase):
+    """Selecting the ex-VAT / bill-rounding option must rebuild the pre-built charts
+    so the billing summary switches immediately, not after the next finalise."""
+
+    def setUp(self):
+        self.store = BlockStore(":memory:")
+        self.store.insert_config_period({
+            "meters": {"electricity_main": {"meta": {
+                "timezone": "UTC", "billing_day": 1, "block_minutes": 30,
+                "currency_symbol": "£", "currency_code": "GBP", "site_name": "Home"}}}})
+        server.DATA_DIR = "/tmp/emt_test_vat"
+        server._store = self.store
+        self.client = server.app.test_client()
+        self._orig = server._schedule_offloaded_regen
+        self.calls = {"n": 0}
+        server._schedule_offloaded_regen = lambda: self.calls.__setitem__("n", self.calls["n"] + 1)
+
+    def tearDown(self):
+        server._schedule_offloaded_regen = self._orig
+
+    def test_vat_toggle_regenerates(self):
+        r = self.client.post("/api/settings", json={"bill_rounding_summary": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.calls["n"], 1)          # regen scheduled
+
+    def test_non_display_setting_does_not_regen(self):
+        r = self.client.post("/api/settings", json={"co2_tree_kg_per_year": 22.0})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.calls["n"], 0)          # no needless rebuild
+
+
 if __name__ == "__main__":
     unittest.main()

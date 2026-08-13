@@ -5707,3 +5707,27 @@ class TestVatCalendarLearning(unittest.TestCase):
         engine._learn_vat_from_import_schedule()
         self.assertEqual(len(store.get_vat_calendar()), 3)
         store.close()
+
+
+class TestChartRegenCoalesce(unittest.TestCase):
+    """A regen requested while one is in progress must NOT be dropped — it's marked
+    dirty so the in-flight render re-runs afterwards (the stale-charts window #361
+    would otherwise leave: a config/VAT change landing during a finalise render)."""
+
+    def setUp(self):
+        self._store = engine._store
+        self._rendering = engine._charts_rendering
+        self._dirty = engine._charts_dirty
+
+    def tearDown(self):
+        engine._store = self._store
+        engine._charts_rendering = self._rendering
+        engine._charts_dirty = self._dirty
+
+    def test_request_during_render_is_coalesced_not_dropped(self):
+        import asyncio
+        engine._store = object()          # not None
+        engine._charts_rendering = True   # a render is already in progress
+        engine._charts_dirty = False
+        asyncio.run(engine._generate_charts_offloaded())
+        self.assertTrue(engine._charts_dirty)   # re-run queued, not silently skipped

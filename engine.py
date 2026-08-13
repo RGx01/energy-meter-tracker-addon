@@ -1752,6 +1752,7 @@ def generate_charts(store: "BlockStore", config: dict = None):
 
 
 _charts_rendering = False        # guard: at most one off-loop render at a time
+_charts_dirty = False            # a regen was requested while one was in progress → re-run
 _charts_task = None              # held reference so a fire-and-forget task isn't GC'd
 
 
@@ -1772,40 +1773,50 @@ async def _generate_charts_offloaded():
     """
     import asyncio as _asyncio
     from block_store import BlockStore
-    global _charts_rendering
+    global _charts_rendering, _charts_dirty
     if _store is None:
         return
     if _charts_rendering:
-        logger.info("generate_charts: a render is already in progress — skipping")
+        # Don't drop this request: mark dirty so the in-flight render re-runs once it
+        # finishes. Without this, a config/VAT change that lands during a finalise
+        # render (which read the OLD config) is skipped and the charts stay stale
+        # until the next natural regen — the very gap #361 is about.
+        _charts_dirty = True
+        logger.info("generate_charts: a render is already in progress — will re-run after it")
         return
     _charts_rendering = True
     try:
-        try:
-            cfg = load_config()      # on the loop (reads the primary connection)
-        except Exception:
-            cfg = None
-
-        def _work():
-            ro = None
+        while True:
+            _charts_dirty = False        # claim the current request; re-set if a change lands mid-render
             try:
-                ro = BlockStore(BLOCKS_DB_PATH, read_only=True)
-                generate_charts(ro, config=cfg)
-            finally:
-                if ro is not None:
-                    try:
-                        ro.close()
-                    except Exception:
-                        pass
+                cfg = load_config()      # reload each pass (on the loop) so config/settings changes land
+            except Exception:
+                cfg = None
 
-        loop = _asyncio.get_event_loop()
-        try:
-            await loop.run_in_executor(None, _work)
-        except Exception as e:
-            logger.warning("generate_charts: offload failed (%s) — rendering inline", e)
+            def _work():
+                ro = None
+                try:
+                    ro = BlockStore(BLOCKS_DB_PATH, read_only=True)
+                    generate_charts(ro, config=cfg)
+                finally:
+                    if ro is not None:
+                        try:
+                            ro.close()
+                        except Exception:
+                            pass
+
+            loop = _asyncio.get_event_loop()
             try:
-                generate_charts(_store, config=cfg)
-            except Exception as _e2:
-                logger.error("generate_charts: inline fallback failed: %s", _e2)
+                await loop.run_in_executor(None, _work)
+            except Exception as e:
+                logger.warning("generate_charts: offload failed (%s) — rendering inline", e)
+                try:
+                    generate_charts(_store, config=cfg)
+                except Exception as _e2:
+                    logger.error("generate_charts: inline fallback failed: %s", _e2)
+            if not _charts_dirty:
+                break
+            logger.info("generate_charts: a change arrived mid-render — re-rendering with fresh config")
     finally:
         _charts_rendering = False
 

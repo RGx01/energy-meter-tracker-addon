@@ -306,6 +306,28 @@ def _config_mutation_on_loop(mutate, timeout: float = 30.0):
     return _run_on_engine_loop(_coro(), timeout=timeout)
 
 
+def _schedule_offloaded_regen():
+    """Rebuild the pre-built charts OFF the loop, from a Flask request thread.
+
+    Schedules engine._schedule_chart_regen() ON the loop, which offloads the render
+    to a read-only worker (never the request thread, never blocking the loop) and is
+    coalesced so a change is never dropped. Used by settings toggles that change the
+    displayed billing view (e.g. the ex-VAT / bill-rounding option) so the change
+    shows immediately instead of waiting for the next block finalise. Inline fallback
+    when no engine loop is running (tests / pre-init)."""
+    try:
+        import engine as _eng
+        if _event_loop and _event_loop.is_running():
+            import asyncio as _a
+            async def _c():
+                _eng._schedule_chart_regen()
+            _a.run_coroutine_threadsafe(_c(), _event_loop)
+        else:
+            _eng.generate_charts(_eng.get_store())
+    except Exception as e:
+        logger.warning("_schedule_offloaded_regen: %s", e)
+
+
 
 def start():
     """Start Flask in a background daemon thread."""
@@ -3565,6 +3587,11 @@ def api_settings_post():
                     return jsonify({"error": f"{key} must be a number"}), 400
             saved[key] = val
     store.save_settings(saved)
+    # The ex-VAT / bill-rounding option changes how the billing summary is rendered
+    # (bill-method vs inc-VAT), so rebuild the pre-built charts now — otherwise the
+    # toggle wouldn't show until the next block finalise (same regen gap as #361).
+    if "bill_rounding_summary" in data:
+        _schedule_offloaded_regen()
     return jsonify({"ok": True})
 
 
