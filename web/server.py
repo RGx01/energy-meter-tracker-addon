@@ -3307,10 +3307,13 @@ def api_backup_delete():
         return jsonify({"error": str(e)}), 500
 
 
-def _restore_worker(zipname, selected, from_flat):
+def _restore_worker(zipname, selected, from_flat, staged=None):
     """Background restore worker (runs in its own thread; survives navigation).
     Updates _restore_job at each phase. Restores selected data files from a named
-    backup zip or from last-finalise flat files."""
+    backup zip, from last-finalise flat files, or — when `staged` is an absolute
+    path to an already-validated uploaded blocks.db (#356) — from that single
+    upload. The upload path gets the SAME safety backup, progress, atomic swap and
+    gap-detection as the backup-zip restore."""
     global _store
     import zipfile, shutil, sys as _sys_r
     _j = _restore_job
@@ -3347,6 +3350,9 @@ def _restore_worker(zipname, selected, from_flat):
             if not stopped:
                 if hasattr(_eng_r, "resume_engine"):
                     _eng_r.resume_engine()
+                if staged and os.path.exists(staged):
+                    try: os.remove(staged)
+                    except Exception: pass
                 _j["status"] = "error"
                 _j["error"] = ("An import was still finishing — restore aborted. "
                                "Try again in a moment.")
@@ -3395,7 +3401,18 @@ def _restore_worker(zipname, selected, from_flat):
         _step("restoring files")
         restored = []
 
-        if from_flat:
+        if staged:
+            # #356: swap in the uploaded (already SQLite-validated) blocks.db with
+            # the same atomic write the zip/flat paths use, then drop the staging
+            # file. Everything downstream (reset, migrate, gap-detect) is shared.
+            dest = os.path.join(DATA_DIR, "blocks.db")
+            with open(staged, "rb") as _src:
+                _atomic_write(dest, lambda d, _s=_src: shutil.copyfileobj(_s, d))
+            restored.append("blocks.db")
+            try: os.remove(staged)
+            except Exception: pass
+            logger.info("api_backup_restore: restored blocks.db from upload")
+        elif from_flat:
             for fname in (selected or list(known)):
                 if fname not in known:
                     continue
@@ -3510,6 +3527,9 @@ def _restore_worker(zipname, selected, from_flat):
         logger.error("api_backup_restore: %s", e)
         _j["status"] = "error"
         _j["error"] = str(e)
+        if staged and os.path.exists(staged):
+            try: os.remove(staged)
+            except Exception: pass
     finally:
         # Always resume engine — reset_store already called above on success,
         # but we must resume even if an exception occurred mid-restore
@@ -6501,90 +6521,61 @@ def api_import_from_zip():
 
 @app.route("/api/import", methods=["POST"])
 def api_import():
-    """
-    Accept uploaded data files (blocks.db, meters_config.json).
-    blocks.json import removed in 2.2.2 — use blocks.db instead.
-    Pauses the engine during import to prevent file conflicts.
-    """
-    global _store
-    import sys
-    import importlib
+    """Accept an uploaded blocks.db and restore it through the SAME background job
+    as the backup-zip restore (#356): a pre-restore safety backup, live progress
+    via /api/backup/restore/status, an atomic swap, store reset and gap detection.
+
+    The upload is staged and SQLite-validated synchronously (a bad file fails here,
+    with the live DB untouched); the swap itself runs in the shared _restore_worker
+    so the client sees the same progress banner instead of a silent, blocking wait.
+    Returns {ok, status:"running"}; the client polls the restore status.
+    (blocks.json import removed in 2.2.2; meters_config.json is ignored — the DB is
+    authoritative.)"""
+    global _restore_job
     try:
-        engine = sys.modules.get("engine")
-        if engine and hasattr(engine, 'pause_engine'):
-            engine.pause_engine()
-
-        imported = []
-
-        # ── blocks.db — write directly then reset store connection ────────────
         blocks_file = request.files.get("blocks")
-        if blocks_file:
-            dest    = os.path.join(DATA_DIR, "blocks.db")
-            tmp     = dest + ".import_tmp"
-            try:
-                blocks_file.save(tmp)
-                # Validate it is a real SQLite file before replacing live DB
-                import sqlite3 as _sq3
-                _tc = _sq3.connect(tmp)
-                _tc.execute("SELECT COUNT(*) FROM blocks")
-                _tc.close()
-                # Close live store so the file handle is released
-                global _store
-                if _store:
-                    try: _store.close()
-                    except Exception: pass
-                    _store = None
-                os.replace(tmp, dest)
-                imported.append("blocks.db")
-                logger.info("server: imported blocks.db")
-            except Exception as _dbe:
-                if os.path.exists(tmp):
-                    try: os.remove(tmp)
-                    except Exception: pass
-                logger.error("server: blocks.db import failed: %s", _dbe)
-                raise
-
-        # ── meters_config.json upload ignored — config lives in blocks.db ───
-        # If a meters_config.json is uploaded alongside blocks.db, ignore it.
-        # The DB is authoritative; engine_startup reads config from it on next start.
-
-        if not imported:
-            if engine and hasattr(engine, 'resume_engine'):
-                engine.resume_engine()
+        if not blocks_file:
             return jsonify({"error": "No files received"}), 400
 
-        # ── Post-import: close stores so engine reopens from new DB ──────────
-        if "blocks.db" in imported:
-            # Remove WAL/SHM files left by running engine
-            import sqlite3 as _sq3i
-            _dest_i = os.path.join(DATA_DIR, "blocks.db")
-            for _ext in ("-wal", "-shm"):
-                _fi = _dest_i + _ext
-                if os.path.exists(_fi):
-                    try: os.remove(_fi)
-                    except Exception: pass
-            # Reset engine store and web store so both reopen from new DB
-            import sys as _sys2
-            _eng2 = _sys2.modules.get("engine")
-            if _eng2 and hasattr(_eng2, "reset_store"):
-                try: _eng2.reset_store()
-                except Exception as _re2:
-                    logger.warning("server: api_import engine reset_store failed: %s", _re2)
-            _store = None
+        # Stage + validate BEFORE touching the live DB. A non-SQLite / wrong-schema
+        # upload is rejected synchronously here and the live database is never
+        # disturbed.
+        staged = os.path.join(DATA_DIR, "uploaded_restore.db")
+        try:
+            blocks_file.save(staged)
+            import sqlite3 as _sq3
+            _tc = _sq3.connect(staged)
+            try:
+                _tc.execute("SELECT COUNT(*) FROM blocks")
+            finally:
+                _tc.close()
+        except Exception as _ve:
+            if os.path.exists(staged):
+                try: os.remove(staged)
+                except Exception: pass
+            logger.error("api_import: uploaded file is not a valid blocks.db: %s", _ve)
+            return jsonify({"error": "That file is not a valid EMT database "
+                                     "(blocks.db)."}), 400
 
-        return jsonify({"ok": True, "imported": imported})
+        # Don't collide with an in-flight restore.
+        if _restore_job.get("status") == "running":
+            if os.path.exists(staged):
+                try: os.remove(staged)
+                except Exception: pass
+            return jsonify({"error": "a restore is already running",
+                            "status": _restore_job}), 409
+
+        _restore_job.clear()
+        _restore_job.update({"status": "running", "step": "starting",
+                             "restored": None, "error": None})
+        threading.Thread(target=_restore_worker,
+                         args=("", ["blocks.db"], False),
+                         kwargs={"staged": staged},
+                         daemon=True, name="restore-upload").start()
+        return jsonify({"ok": True, "status": "running"})
     except Exception as e:
         logger.error("api_import: %s", e)
         return jsonify({"error": str(e)}), 500
-    finally:
-        # Always resume engine after import, wait one tick for files to settle
-        import threading
-        def delayed_resume():
-            import time
-            time.sleep(12)  # wait > one engine tick
-            if engine and hasattr(engine, 'resume_engine'):
-                engine.resume_engine()
-        threading.Thread(target=delayed_resume, daemon=True).start()
 
 # ── Database maintenance ───────────────────────────────────────────────────────────────────
 

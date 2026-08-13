@@ -1849,10 +1849,22 @@ if __name__ == "__main__":
 # /api/import — blocks.db import (regression test for silent drop bug)
 # ─────────────────────────────────────────────────────────────────────────────
 
+class _SyncThread:
+    """Drop-in for threading.Thread that runs the target synchronously on start(),
+    so a launch test can assert without racing the background worker."""
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None, name=None):
+        self._t, self._a, self._k = target, args, kwargs or {}
+    def start(self):
+        if self._t:
+            self._t(*self._a, **self._k)
+
+
 class TestApiImportBlocksDb(unittest.TestCase):
     """
-    Regression tests for the api_import endpoint.
-    Previously blocks.db was silently ignored — only meters_config.json was written.
+    Regression tests for the api_import endpoint. #356: an uploaded blocks.db now
+    restores through the SAME background job as a backup-zip restore — the endpoint
+    stages + validates synchronously, then returns {ok, status:"running"} and the
+    swap runs in _restore_worker (progress via /api/backup/restore/status).
     """
 
     def setUp(self):
@@ -1861,11 +1873,13 @@ class TestApiImportBlocksDb(unittest.TestCase):
         server.DATA_DIR = self.tmpdir
         self.client = make_client()
         server.DATA_DIR = self.tmpdir  # re-set after make_client resets it
+        self._saved_job = server._restore_job
 
     def tearDown(self):
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
         server.DATA_DIR = "/tmp/emt_test_data"  # restore default
+        server._restore_job = self._saved_job
 
     def _make_db_bytes(self):
         """Create a minimal valid SQLite blocks.db as bytes."""
@@ -1886,46 +1900,71 @@ class TestApiImportBlocksDb(unittest.TestCase):
             if os.path.exists(tmp):
                 os.remove(tmp)
 
-    def test_blocks_db_accepted_in_import(self):
-        """blocks.db upload must appear in the imported list."""
-        import io
+    def test_blocks_db_upload_launches_restore_job(self):
+        """A valid blocks.db upload stages the file, returns running, and hands the
+        actual swap to _restore_worker with the staged path (#356)."""
+        import io, os
         db_bytes = self._make_db_bytes()
         data = {"blocks": (io.BytesIO(db_bytes), "blocks.db")}
-        r = self.client.post(
-            "/api/import",
-            data=data,
-            content_type="multipart/form-data"
-        )
+        captured = {}
+        def _fake_worker(zipname, selected, from_flat, staged=None):
+            captured.update(zipname=zipname, selected=selected,
+                            from_flat=from_flat, staged=staged)
+        with patch.object(server, "_restore_worker", _fake_worker), \
+             patch("server.threading.Thread", _SyncThread):
+            r = self.client.post("/api/import", data=data,
+                                 content_type="multipart/form-data")
         self.assertEqual(r.status_code, 200)
         result = r.get_json()
         self.assertTrue(result.get("ok"), msg=f"Import failed: {result}")
-        self.assertTrue(
-            any("blocks.db" in f for f in result.get("imported", [])),
-            msg=f"blocks.db not in imported list: {result.get('imported')}"
-        )
+        self.assertEqual(result.get("status"), "running")
+        # The worker was handed the staged upload and asked to restore blocks.db.
+        self.assertEqual(captured.get("selected"), ["blocks.db"])
+        self.assertFalse(captured.get("from_flat"))
+        self.assertTrue(str(captured.get("staged", "")).endswith("uploaded_restore.db"))
 
-    def test_meters_config_not_written_when_db_imported(self):
-        """When blocks.db is imported, meters_config.json must come from the DB not the upload."""
+    def test_invalid_upload_rejected_without_touching_live_db(self):
+        """A non-SQLite upload is rejected synchronously (400) and the staged file
+        is cleaned up — the live DB is never disturbed."""
+        import io, os
+        data = {"blocks": (io.BytesIO(b"not a database"), "blocks.db")}
+        called = {"n": 0}
+        def _fake_worker(*a, **k):
+            called["n"] += 1
+        with patch.object(server, "_restore_worker", _fake_worker), \
+             patch("server.threading.Thread", _SyncThread):
+            r = self.client.post("/api/import", data=data,
+                                 content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("error", r.get_json())
+        self.assertEqual(called["n"], 0)                       # worker never launched
+        self.assertFalse(os.path.exists(os.path.join(self.tmpdir, "uploaded_restore.db")))
+
+    def test_upload_rejected_when_restore_already_running(self):
         import io
+        server._restore_job = {"status": "running"}
         db_bytes = self._make_db_bytes()
-        # Upload both — meters_config should be ignored in favour of DB
-        cfg_bytes = b'{"meters": {"electricity_main": {"meta": {"billing_day": 1}}}}'.replace(b"'", b"'")
-        data = {
-            "blocks":        (io.BytesIO(db_bytes), "blocks.db"),
-            "meters_config": (io.BytesIO(cfg_bytes), "meters_config.json"),
-        }
-        r = self.client.post(
-            "/api/import",
-            data=data,
-            content_type="multipart/form-data"
-        )
-        result = r.get_json()
-        self.assertTrue(result.get("ok"), msg=f"Import failed: {result}")
-        # The imported list should contain blocks.db
-        self.assertTrue(
-            any("blocks.db" in f for f in result.get("imported", [])),
-            msg=f"blocks.db not in imported: {result.get('imported')}"
-        )
+        data = {"blocks": (io.BytesIO(db_bytes), "blocks.db")}
+        with patch("server.threading.Thread", _SyncThread):
+            r = self.client.post("/api/import", data=data,
+                                 content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 409)
+
+    def test_restore_worker_staged_swaps_db_and_cleans_up(self):
+        """The staged-upload branch of _restore_worker atomically swaps blocks.db in
+        and removes the staging file, marking the job done (#356)."""
+        import os
+        staged = os.path.join(self.tmpdir, "uploaded_restore.db")
+        with open(staged, "wb") as f:
+            f.write(self._make_db_bytes())
+        server._restore_job = {"status": "running", "step": "starting"}
+        with patch.object(server, "_create_backup_zip", return_value=None), \
+             patch.object(server, "_regen_charts_safely", return_value=None):
+            server._restore_worker("", ["blocks.db"], False, staged=staged)
+        self.assertTrue(os.path.exists(os.path.join(self.tmpdir, "blocks.db")))
+        self.assertFalse(os.path.exists(staged))          # staging cleaned up
+        self.assertEqual(server._restore_job["status"], "done")
+        self.assertIn("blocks.db", server._restore_job.get("restored") or [])
 
     def test_meters_config_alone_returns_error(self):
         """Importing meters_config.json without blocks.db is rejected — DB is sole source of truth since 2.1.0."""

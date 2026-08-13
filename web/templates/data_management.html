@@ -403,12 +403,12 @@ async function doImport() {
     const r    = await fetch(apiUrl('/api/import'), { method: 'POST', body: form });
     const data = await r.json();
     if (data.ok) {
-      const el = document.getElementById('alert-success');
-      el.textContent = '✓ Imported: ' + data.imported.join(', ') + '. Reloading…';
-      setTimeout(function() { sessionStorage.setItem('emt_db_restored', Date.now()); window.location.reload(); }, 2500);
-      el.classList.add('show');
+      // The upload now restores through the SAME background job as a backup-zip
+      // restore (#356): show progress via the shared banner and reload on done.
       selectedFiles = {};
       renderFileList();
+      _restoreWasRunning = true;
+      pollRestoreStatus();
     } else {
       showError(data.error || 'Import failed');
     }
