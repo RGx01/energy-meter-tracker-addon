@@ -271,6 +271,41 @@ def _run_on_engine_loop(coro, timeout: float = 30.0):
     return fut.result(timeout=timeout)
 
 
+class _ConfigError(Exception):
+    """A config-period mutation validation error → surfaced as HTTP 400."""
+
+
+def _config_mutation_on_loop(mutate, timeout: float = 30.0):
+    """Run a config_periods read+write on the ENGINE's loop and connection, then
+    schedule an OFF-loop chart regen (#361).
+
+    Config edits used to write on the shared web BlockStore from the Flask request
+    thread, racing the engine's writes on its own connection — producing SQLite
+    "database is locked" / "another row available", and (when a write half-applied)
+    a Total Bill that no longer summed until the next finalise regenerated the
+    charts. Running the mutation on the engine loop serialises it with every other
+    engine write (one connection, one thread); `_schedule_chart_regen()` — fired on
+    the loop — offloads the chart rebuild to a read-only worker so the change shows
+    immediately without blocking the loop. `mutate(store)` receives the engine's
+    store and returns the JSON-able result. No engine loop (tests / pre-init) →
+    there is no concurrent writer, so run inline on the web store."""
+    if not (_event_loop and _event_loop.is_running()):
+        store = _get_store()
+        res = mutate(store)
+        _regen_charts_safely()
+        return res
+    import engine as _eng
+    async def _coro():
+        store = _eng.get_store()
+        res = mutate(store)
+        try:
+            _eng._schedule_chart_regen()      # on-loop → offloaded read-only render
+        except Exception as _ce:
+            logger.warning("_config_mutation_on_loop: chart regen schedule failed: %s", _ce)
+        return res
+    return _run_on_engine_loop(_coro(), timeout=timeout)
+
+
 
 def start():
     """Start Flask in a background daemon thread."""
@@ -2711,7 +2746,6 @@ def api_region_reconcile_dismiss():
 def api_config_history_create():
     """Create a new config period, inheriting meter definitions from the current active period."""
     try:
-        store = _get_store()
         data  = request.get_json(force=True)
 
         from datetime import datetime as _dt
@@ -2724,66 +2758,71 @@ def api_config_history_create():
         except ValueError:
             return jsonify({"error": "Invalid effective_from date"}), 400
 
-        # Load current active config — this is now read from normalised tables
-        active_cp = store._conn.execute(
-            "SELECT id, billing_day, block_minutes, timezone, "
-            "currency_symbol, currency_code, site_name, supplier "
-            "FROM config_periods WHERE effective_to IS NULL "
-            "ORDER BY effective_from DESC LIMIT 1"
-        ).fetchone()
-        if not active_cp:
-            return jsonify({"error": "No active config period found to inherit from"}), 400
+        # #361: read + write on the ENGINE loop/connection (serialised with the
+        # engine's writes) instead of the shared web connection on the Flask thread.
+        def _mutate(store):
+            active_cp = store._conn.execute(
+                "SELECT id, billing_day, block_minutes, timezone, "
+                "currency_symbol, currency_code, site_name, supplier "
+                "FROM config_periods WHERE effective_to IS NULL "
+                "ORDER BY effective_from DESC LIMIT 1"
+            ).fetchone()
+            if not active_cp:
+                raise _ConfigError("No active config period found to inherit from")
 
-        # Build override values
-        billing_day     = data.get("billing_day",     active_cp["billing_day"])
-        timezone        = data.get("timezone",        active_cp["timezone"])
-        currency_symbol = data.get("currency_symbol", active_cp["currency_symbol"])
-        currency_code   = data.get("currency_code",   active_cp["currency_code"])
-        site_name       = data.get("site_name",       active_cp["site_name"])
-        supplier        = data.get("supplier",        active_cp["supplier"])
-        change_reason   = data.get("change_reason") or None
+            billing_day     = data.get("billing_day",     active_cp["billing_day"])
+            timezone        = data.get("timezone",        active_cp["timezone"])
+            currency_symbol = data.get("currency_symbol", active_cp["currency_symbol"])
+            currency_code   = data.get("currency_code",   active_cp["currency_code"])
+            site_name       = data.get("site_name",       active_cp["site_name"])
+            supplier        = data.get("supplier",        active_cp["supplier"])
+            change_reason   = data.get("change_reason") or None
 
-        # Reconstruct config from DB, apply overrides, then insert new period
-        full_cfg = store.config_from_db(active_cp["id"])
-        for md in full_cfg.get("meters", {}).values():
-            meta = md.get("meta") or {}
-            if "billing_day"     in data: meta["billing_day"]     = int(billing_day)
-            if "timezone"        in data: meta["timezone"]        = timezone
-            if "currency_symbol" in data: meta["currency_symbol"] = currency_symbol
-            if "currency_code"   in data: meta["currency_code"]   = currency_code
-            if "site_name"       in data: meta["site_name"]       = site_name
-            if "supplier"        in data: meta["supplier"]        = supplier
-            # Postcode is main-meter-only (outward code); a manual entry is 'user'.
-            if "postcode" in data and not meta.get("sub_meter"):
-                from block_store import outward_code as _oc
-                meta["postcode_prefix"] = _oc(data.get("postcode"))
-                meta["postcode_source"] = "user"
-            md["meta"] = meta
+            # Reconstruct config from DB, apply overrides, then insert new period
+            full_cfg = store.config_from_db(active_cp["id"])
+            for md in full_cfg.get("meters", {}).values():
+                meta = md.get("meta") or {}
+                if "billing_day"     in data: meta["billing_day"]     = int(billing_day)
+                if "timezone"        in data: meta["timezone"]        = timezone
+                if "currency_symbol" in data: meta["currency_symbol"] = currency_symbol
+                if "currency_code"   in data: meta["currency_code"]   = currency_code
+                if "site_name"       in data: meta["site_name"]       = site_name
+                if "supplier"        in data: meta["supplier"]        = supplier
+                # Postcode is main-meter-only (outward code); a manual entry is 'user'.
+                if "postcode" in data and not meta.get("sub_meter"):
+                    from block_store import outward_code as _oc
+                    meta["postcode_prefix"] = _oc(data.get("postcode"))
+                    meta["postcode_source"] = "user"
+                md["meta"] = meta
 
-        with store._conn:
-            cur = store._conn.execute(
-                """INSERT INTO config_periods
-                   (effective_from, effective_to, billing_day, block_minutes, timezone,
-                    currency_symbol, currency_code, site_name, supplier, change_reason)
-                   VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    ef_from,
-                    int(billing_day) if billing_day else 1,
-                    int(active_cp["block_minutes"] or 30),
-                    timezone or "UTC",
-                    currency_symbol or "£",
-                    currency_code or "GBP",
-                    site_name,
-                    supplier,
-                    change_reason,
+            with store._conn:
+                cur = store._conn.execute(
+                    """INSERT INTO config_periods
+                       (effective_from, effective_to, billing_day, block_minutes, timezone,
+                        currency_symbol, currency_code, site_name, supplier, change_reason)
+                       VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        ef_from,
+                        int(billing_day) if billing_day else 1,
+                        int(active_cp["block_minutes"] or 30),
+                        timezone or "UTC",
+                        currency_symbol or "£",
+                        currency_code or "GBP",
+                        site_name,
+                        supplier,
+                        change_reason,
+                    )
                 )
-            )
-            new_period_id = cur.lastrowid
-            store._write_meters(full_cfg, new_period_id)
+                new_period_id = cur.lastrowid
+                store._write_meters(full_cfg, new_period_id)
+            _rebuild_config_period_chain(store)
+            return {"ok": True}
 
-        _rebuild_config_period_chain(store)
+        result = _config_mutation_on_loop(_mutate)
         logger.info("api_config_history_create: new period from %s", ef_from)
-        return jsonify({"ok": True})
+        return jsonify(result)
+    except _ConfigError as ce:
+        return jsonify({"error": str(ce)}), 400
     except Exception as e:
         logger.error("api_config_history_create: %s", e)
         return jsonify({"error": str(e)}), 500
@@ -2846,61 +2885,41 @@ def api_config_history_update(period_id):
             if _dt.fromisoformat(from_val) >= _dt.fromisoformat(to_val):
                 return jsonify({"error": "Effective From must be before Effective To"}), 400
 
-        # Build UPDATE statement
-        with store._conn:
-            if updates:
-                set_clause = ", ".join(f"{k} = ?" for k in updates)
-                store._conn.execute(
-                    f"UPDATE config_periods SET {set_clause} WHERE id = ?",
-                    list(updates.values()) + [period_id]
-                )
+        # #361: run the write + chain rebuild on the ENGINE loop/connection (serialised
+        # with the engine's writes — no shared-web-connection race), then regen charts
+        # OFF the loop so a billing-period change reflects immediately. Same path as
+        # the create endpoint via _config_mutation_on_loop.
+        def _mutate(estore):
+            with estore._conn:
+                if updates:
+                    set_clause = ", ".join(f"{k} = ?" for k in updates)
+                    estore._conn.execute(
+                        f"UPDATE config_periods SET {set_clause} WHERE id = ?",
+                        list(updates.values()) + [period_id]
+                    )
+                if postcode_edit:
+                    # Outward code only; a manual edit is provenance 'user'.
+                    estore._conn.execute(
+                        "UPDATE meters SET postcode_prefix = ?, postcode_source = 'user' "
+                        "WHERE config_period_id = ? AND is_sub_meter = 0",
+                        (postcode_outcode, period_id)
+                    )
             if postcode_edit:
-                # Outward code only; a manual edit is provenance 'user'.
-                store._conn.execute(
-                    "UPDATE meters SET postcode_prefix = ?, postcode_source = 'user' "
-                    "WHERE config_period_id = ? AND is_sub_meter = 0",
-                    (postcode_outcode, period_id)
-                )
-        if postcode_edit:
-            store.rearm_carbon_backfill()   # a region change may free carbon backfill
+                estore.rearm_carbon_backfill()   # a region change may free carbon backfill
+            # Rebuild the contiguous chain: sort all periods by effective_from, then
+            # set each period's effective_to = next period's effective_from. Robust
+            # regardless of how far the date was moved.
+            try:
+                _rebuild_config_period_chain(estore)
+            except Exception as _snap_e:
+                logger.warning("api_config_history_update: chain rebuild failed: %s", _snap_e)
+            return {"ok": True}
 
+        result = _config_mutation_on_loop(_mutate)
         logger.info("api_config_history_update: period %d updated %s%s",
                     period_id, list(updates.keys()),
                     " +postcode" if postcode_edit else "")
-
-        # Rebuild the contiguous chain: sort all periods by effective_from,
-        # then set each period's effective_to = next period's effective_from.
-        # Robust regardless of how far the date was moved.
-        try:
-            _rebuild_config_period_chain(store)
-        except Exception as _snap_e:
-            logger.warning("api_config_history_update: chain rebuild failed: %s", _snap_e)
-
-                # Regenerate charts since billing periods may have changed
-        try:
-            import energy_charts as _ec
-            import os as _os
-            blocks = store.get_blocks_lightweight()
-            if blocks:
-                from energy_engine_io import load_json as _lj_ec
-                cfg       = load_config()
-                main_meta = {}
-                for md in cfg.get("meters", {}).values():
-                    if not (md.get("meta") or {}).get("sub_meter"):
-                        main_meta = md.get("meta") or {}
-                        break
-                tz_name   = main_meta.get("timezone", "UTC")
-                bm        = int(main_meta.get("block_minutes") or 30)
-                currency  = main_meta.get("currency_symbol", "£")
-                os.makedirs(CHART_DIR, exist_ok=True)
-                html = _ec.generate_daily_import_export_charts(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency, cfg=cfg, store=store)
-                with open(os.path.join(CHART_DIR, "daily_usage.html"), "w") as f:
-                    f.write(html)
-                logger.info("api_config_history_update: charts regenerated")
-        except Exception as _e:
-            logger.warning("api_config_history_update: chart regen failed: %s", _e)
-
-        return jsonify({"ok": True})
+        return jsonify(result)
     except Exception as e:
         logger.error("api_config_history_update: %s", e)
         return jsonify({"error": str(e)}), 500

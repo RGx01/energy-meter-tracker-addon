@@ -109,5 +109,35 @@ class TestSidePanelRateCollapse(unittest.TestCase):
         self.assertLess(rate, 0.0)      # plunge dominates → negative avg, not clamped
 
 
+class TestBillMethodStandingCharge(unittest.TestCase):
+    """A standing-charge RATE change mid-period (a price-cap or tariff switch) must
+    show as separate lines in the ex-VAT bill method — not one averaged rate that
+    matches neither. (March: £0.476317/day inc until the switch, then £0.504559/day.)"""
+
+    def _blocks(self):
+        return [{"start": "2026-03-05T12:00:00", "meters": {"electricity_main": {
+                 "meta": {}, "channels": {"import": {"kwh": 1.0, "rate": 0.30, "cost": 0.30}}}}}]
+
+    def test_standing_change_breaks_into_two_rows(self):
+        sib = {}
+        for d in range(1, 17):  sib[f"2026-03-{d:02d}"] = 0.476317   # 16 days, old cap
+        for d in range(17, 32): sib[f"2026-03-{d:02d}"] = 0.504559   # 15 days, new cap
+        bm = ec._bill_method_breakdown(self._blocks(), standing_inc_by_day=sib)
+        self.assertEqual(len(bm["standing_rows"]), 2)
+        self.assertEqual(sorted(s["days"] for s in bm["standing_rows"]), [15, 16])
+        rates = sorted(s["rate_exc"] for s in bm["standing_rows"])
+        self.assertAlmostEqual(rates[0], 0.476317 / 1.05, places=3)
+        self.assertAlmostEqual(rates[1], 0.504559 / 1.05, places=3)
+        # no money is lost/created: the rows sum to the overall standing total
+        self.assertAlmostEqual(sum(s["cost_exc"] for s in bm["standing_rows"]),
+                               bm["standing_exc"], places=2)
+
+    def test_single_standing_rate_stays_one_row(self):
+        sib = {f"2026-03-{d:02d}": 0.476317 for d in range(1, 32)}
+        bm = ec._bill_method_breakdown(self._blocks(), standing_inc_by_day=sib)
+        self.assertEqual(len(bm["standing_rows"]), 1)
+        self.assertEqual(bm["standing_rows"][0]["days"], 31)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6201,5 +6201,56 @@ class TestUsageSubMeterGridShare(unittest.TestCase):
             msg="solar-charged block (grid share 0) must count 0, not total 3.0")
 
 
+class TestConfigHistoryConsistency(unittest.TestCase):
+    """#361: a billing-day change must leave ONE consistent config-period chain — the
+    old racy shared-connection write could half-apply / duplicate, which then made the
+    Total Bill stop summing. Exercised on the no-loop fallback (inline on the web
+    store), which runs the same mutation logic as the on-loop path."""
+
+    def setUp(self):
+        self._orig_loop = server._event_loop
+        server._event_loop = None                     # force the inline fallback
+        self.store = BlockStore(":memory:")
+        self.store.insert_config_period({
+            "meters": {"electricity_main": {"meta": {
+                "timezone": "UTC", "billing_day": 3, "block_minutes": 30,
+                "currency_symbol": "£", "currency_code": "GBP", "site_name": "Home"}}}},
+            effective_from="2024-06-03T00:00:00")
+        server.DATA_DIR = "/tmp/emt_test_361"
+        server._store = self.store
+        self.client = server.app.test_client()
+
+    def tearDown(self):
+        server._event_loop = self._orig_loop
+
+    def _periods(self):
+        return self.store._conn.execute(
+            "SELECT billing_day, effective_from, effective_to "
+            "FROM config_periods ORDER BY effective_from").fetchall()
+
+    def test_billing_day_change_leaves_one_contiguous_chain(self):
+        r = self.client.post("/api/config/history",
+                             json={"effective_from": "2026-08-13T00:00:00", "billing_day": 4})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json().get("ok"))
+        rows = self._periods()
+        self.assertEqual(len(rows), 2)                                  # old + new, no dupes
+        active = [x for x in rows if x["effective_to"] is None]
+        self.assertEqual(len(active), 1)                               # exactly one active
+        self.assertEqual(active[0]["billing_day"], 4)                  # new period = day 4
+        self.assertEqual(rows[0]["billing_day"], 3)                    # old period unchanged
+        # contiguous, non-overlapping: old closes exactly where new opens
+        self.assertEqual(rows[0]["effective_to"], rows[1]["effective_from"])
+
+    def test_missing_active_period_is_400(self):
+        # Close the only period so there's no active one to inherit from → clean 400.
+        self.store._conn.execute(
+            "UPDATE config_periods SET effective_to='2025-01-01T00:00:00'")
+        self.store._conn.commit()
+        r = self.client.post("/api/config/history",
+                             json={"effective_from": "2026-08-13T00:00:00", "billing_day": 4})
+        self.assertEqual(r.status_code, 400)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1134,14 +1134,30 @@ def _bill_method_breakdown(blocks, period_vat=None, standing_inc_by_day=None):
     # Standing: prefer the summary's per-LOCAL-day inc figure (correct day count across
     # the BST midnight boundary), ex-VAT via ÷ (1+VAT) — exact-to-the-mill for a flat
     # charge. Fall back to the block-derived exc standing when no summary is supplied.
+    def _group_standing(day_amounts, to_exc):
+        # {day: amount} → one row per DISTINCT daily rate, so a mid-period standing
+        # change (price-cap / tariff switch) shows as separate lines instead of a
+        # single averaged rate that matches neither. `to_exc(amount)` converts a
+        # daily amount to its ex-VAT value.
+        by_rate: dict = {}
+        for _d, _amt in day_amounts.items():
+            k = round(_amt, 6)
+            g = by_rate.setdefault(k, [0, 0.0])
+            g[0] += 1
+            g[1] += _amt
+        return [{"days": g[0], "rate_exc": round(to_exc(k), 4),
+                 "cost_exc": round(to_exc(g[1]), 2)}
+                for k, g in sorted(by_rate.items())]
     if standing_inc_by_day:
         standing_days = len(standing_inc_by_day)
         standing_inc_raw = sum(standing_inc_by_day.values())
         standing_raw  = standing_inc_raw / (1.0 + vat)
+        standing_rows = _group_standing(standing_inc_by_day, lambda a: a / (1.0 + vat))
     else:
         standing_days = len(stand_exc_day)
         standing_raw  = sum(stand_exc_day.values())
         standing_inc_raw = standing_raw * (1.0 + vat)
+        standing_rows = _group_standing(stand_exc_day, lambda a: a)   # already ex-VAT
     standing_rate = round(standing_raw / standing_days, 4) if standing_days else 0.0
     subtotal_raw  = energy_raw + standing_raw            # ex-VAT subtotal
     inc_raw       = energy_inc + standing_inc_raw        # inc-VAT subtotal
@@ -1154,6 +1170,7 @@ def _bill_method_breakdown(blocks, period_vat=None, standing_inc_by_day=None):
         "energy_exc":        round(energy_raw, 2),
         "standing_days":     standing_days,
         "standing_rate_exc": standing_rate,
+        "standing_rows":     standing_rows,
         "standing_exc":      round(standing_raw, 2),
         "subtotal_exc":      subtotal,
         "vat_rate":          vat,
@@ -1390,7 +1407,15 @@ def render_billing_summary(summary, currency='£', site_name=None):
             html += f"""
         <tr class="channel-total"><td>Total (exc)</td><td></td><td></td><td>{_bm['energy_exc']:.2f}</td></tr>"""
             if _bm["standing_days"]:
-                html += f"""
+                _srows = _bm.get("standing_rows") or []
+                if len(_srows) > 1:
+                    # Standing-charge rate changed mid-period (price cap / tariff
+                    # switch) — one line per rate, not a single averaged rate.
+                    for _s in _srows:
+                        html += f"""
+        <tr class="standing"><td colspan="3">Standing charge (exc): {_s['days']} days @ {currency}{_s['rate_exc']:.4f}/day</td><td>{_s['cost_exc']:.2f}</td></tr>"""
+                else:
+                    html += f"""
         <tr class="standing"><td colspan="3">Standing charge (exc): {_bm['standing_days']} days @ {currency}{_bm['standing_rate_exc']:.4f}/day</td><td>{_bm['standing_exc']:.2f}</td></tr>"""
             html += f"""
         <tr class="bill-method"><td colspan="3">VAT @ {_bm['vat_rate'] * 100:.0f}%</td><td>{currency}{_bm['vat_amount']:.2f}</td></tr>
