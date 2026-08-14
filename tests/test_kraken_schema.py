@@ -518,6 +518,53 @@ class TestFinalisedOnly(_StoreBase):
                          len(self.store.get_blocks_for_utc_range(s, e, finalised_only=True)))
 
 
+class TestComputePeriodNetMultiConfigPeriod(_StoreBase):
+    """Regression: compute_period_net must count each block ONCE even when the
+    meter has a row in more than one config period. Its meters JOIN was missing the
+    `AND m.config_period_id = b.config_period_id` constraint that every other block
+    query uses, so with 2+ config periods every block fanned out ×(config periods) —
+    doubling the import and export halves of the Total Bill (standing charge was
+    immune, being start-of-day). It appeared the moment a user created a second
+    billing period: the summary's own sections stayed correct (they use the
+    constrained fetch) but the Total Bill no longer equalled import − export.
+    Reproduced against a real 2-period DB: −147.28 buggy vs −65.09 correct.
+    """
+    MAIN = "electricity_main"
+
+    def _settled_main(self, start, imp_cost, exp_cost, sc):
+        end = (datetime.fromisoformat(start) + timedelta(minutes=30)).isoformat()
+        self.store._conn.execute(
+            """INSERT INTO blocks (block_start, block_end, meter_id, config_period_id,
+                 imp_cost, exp_cost, standing_charge, is_provisional)
+               VALUES (?,?,?,?,?,?,?,0)""",
+            (start, end, "electricity_main", self.pid, imp_cost, exp_cost, sc))
+        self.store._conn.commit()
+
+    def test_second_config_period_does_not_double_the_net(self):
+        # One settled main block: import £2.00, export £1.00, standing £0.50.
+        self._settled_main("2026-05-01T10:00:00", 2.0, 1.0, 0.50)
+        s, e = "2026-05-01T00:00:00", "2026-05-02T00:00:00"
+        expected = round(2.0 + 0.50 - 1.0, 2)                 # 1.50
+        self.assertAlmostEqual(self.store.compute_period_net(s, e, "Europe/London"),
+                               expected)
+
+        # Create a SECOND config period → a second electricity_main meters row.
+        self.store.insert_config_period({
+            "meters": {"electricity_main": {"meta": {
+                "timezone": "Europe/London", "billing_day": 6, "block_minutes": 30,
+                "currency_symbol": "£", "currency_code": "GBP", "sub_meter": False},
+                "standing_charge": 0.50,
+                "channels": {"import": {"sensor": "sensor.import"}}}}},
+            effective_from="2026-06-01T00:00:00")
+        self.assertEqual(self.store._conn.execute(
+            "SELECT COUNT(*) FROM meters WHERE meter_id='electricity_main'"
+        ).fetchone()[0], 2)
+
+        # The (unchanged) May block's net must be IDENTICAL — not doubled.
+        self.assertAlmostEqual(
+            self.store.compute_period_net(s, e, "Europe/London"), expected)
+
+
 class TestCarbonIntensityPersistence(_StoreBase):
     """append_block persists carbon_intensity_g (3.0.0), the value PASS 3b
     re-run will reuse instead of re-querying the pruned intensity table."""

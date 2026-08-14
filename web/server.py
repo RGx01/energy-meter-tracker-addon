@@ -271,6 +271,63 @@ def _run_on_engine_loop(coro, timeout: float = 30.0):
     return fut.result(timeout=timeout)
 
 
+class _ConfigError(Exception):
+    """A config-period mutation validation error → surfaced as HTTP 400."""
+
+
+def _config_mutation_on_loop(mutate, timeout: float = 30.0):
+    """Run a config_periods read+write on the ENGINE's loop and connection, then
+    schedule an OFF-loop chart regen (#361).
+
+    Config edits used to write on the shared web BlockStore from the Flask request
+    thread, racing the engine's writes on its own connection — producing SQLite
+    "database is locked" / "another row available", and (when a write half-applied)
+    a Total Bill that no longer summed until the next finalise regenerated the
+    charts. Running the mutation on the engine loop serialises it with every other
+    engine write (one connection, one thread); `_schedule_chart_regen()` — fired on
+    the loop — offloads the chart rebuild to a read-only worker so the change shows
+    immediately without blocking the loop. `mutate(store)` receives the engine's
+    store and returns the JSON-able result. No engine loop (tests / pre-init) →
+    there is no concurrent writer, so run inline on the web store."""
+    if not (_event_loop and _event_loop.is_running()):
+        store = _get_store()
+        res = mutate(store)
+        _regen_charts_safely()
+        return res
+    import engine as _eng
+    async def _coro():
+        store = _eng.get_store()
+        res = mutate(store)
+        try:
+            _eng._schedule_chart_regen()      # on-loop → offloaded read-only render
+        except Exception as _ce:
+            logger.warning("_config_mutation_on_loop: chart regen schedule failed: %s", _ce)
+        return res
+    return _run_on_engine_loop(_coro(), timeout=timeout)
+
+
+def _schedule_offloaded_regen():
+    """Rebuild the pre-built charts OFF the loop, from a Flask request thread.
+
+    Schedules engine._schedule_chart_regen() ON the loop, which offloads the render
+    to a read-only worker (never the request thread, never blocking the loop) and is
+    coalesced so a change is never dropped. Used by settings toggles that change the
+    displayed billing view (e.g. the ex-VAT / bill-rounding option) so the change
+    shows immediately instead of waiting for the next block finalise. Inline fallback
+    when no engine loop is running (tests / pre-init)."""
+    try:
+        import engine as _eng
+        if _event_loop and _event_loop.is_running():
+            import asyncio as _a
+            async def _c():
+                _eng._schedule_chart_regen()
+            _a.run_coroutine_threadsafe(_c(), _event_loop)
+        else:
+            _eng.generate_charts(_eng.get_store())
+    except Exception as e:
+        logger.warning("_schedule_offloaded_regen: %s", e)
+
+
 
 def start():
     """Start Flask in a background daemon thread."""
@@ -2211,8 +2268,24 @@ def _blocks_data_version(store) -> str:
         "ROUND(COALESCE(SUM(exp_cost), 0), 2) AS ec, "
         "ROUND(COALESCE(SUM(carbon_g), 0), 0) AS cg "
         "FROM blocks").fetchone()
+    # Rendered-chart freshness: the Billing (daily) and Heatmap tabs serve the
+    # PRE-RENDERED files, and a config-period change (or settlement) regenerates them
+    # OFF the loop a moment AFTER the DB write. Keying the token on the DB alone moved
+    # it at write time — before the file was rewritten — so the Charts page reloaded
+    # the STALE file, latched the new token, and then didn't refresh again until the
+    # next finalise moved the token. Fingerprinting the rendered files' mtimes advances
+    # the token exactly when the new HTML actually lands, so the reload picks up fresh
+    # content — and this also covers a config change (billing-day / add / remove), since
+    # every config mutation schedules a regen that rewrites these files.
+    _mt = []
+    for _cf in ("daily_usage.html", "net_heatmap.html"):
+        try:
+            _mt.append(f"{os.path.getmtime(os.path.join(CHART_DIR, _cf)):.3f}")
+        except (OSError, TypeError):   # missing file, or CHART_DIR unset (tests)
+            _mt.append("0")
     return (f"{row['c']}:{row['m'] or ''}:"
-            f"{row['ik']}:{row['ic']}:{row['ek']}:{row['ec']}:{row['cg']}")
+            f"{row['ik']}:{row['ic']}:{row['ek']}:{row['ec']}:{row['cg']}:"
+            f"{':'.join(_mt)}")
 
 
 @app.route("/api/charts/data-version")
@@ -2711,7 +2784,6 @@ def api_region_reconcile_dismiss():
 def api_config_history_create():
     """Create a new config period, inheriting meter definitions from the current active period."""
     try:
-        store = _get_store()
         data  = request.get_json(force=True)
 
         from datetime import datetime as _dt
@@ -2724,66 +2796,71 @@ def api_config_history_create():
         except ValueError:
             return jsonify({"error": "Invalid effective_from date"}), 400
 
-        # Load current active config — this is now read from normalised tables
-        active_cp = store._conn.execute(
-            "SELECT id, billing_day, block_minutes, timezone, "
-            "currency_symbol, currency_code, site_name, supplier "
-            "FROM config_periods WHERE effective_to IS NULL "
-            "ORDER BY effective_from DESC LIMIT 1"
-        ).fetchone()
-        if not active_cp:
-            return jsonify({"error": "No active config period found to inherit from"}), 400
+        # #361: read + write on the ENGINE loop/connection (serialised with the
+        # engine's writes) instead of the shared web connection on the Flask thread.
+        def _mutate(store):
+            active_cp = store._conn.execute(
+                "SELECT id, billing_day, block_minutes, timezone, "
+                "currency_symbol, currency_code, site_name, supplier "
+                "FROM config_periods WHERE effective_to IS NULL "
+                "ORDER BY effective_from DESC LIMIT 1"
+            ).fetchone()
+            if not active_cp:
+                raise _ConfigError("No active config period found to inherit from")
 
-        # Build override values
-        billing_day     = data.get("billing_day",     active_cp["billing_day"])
-        timezone        = data.get("timezone",        active_cp["timezone"])
-        currency_symbol = data.get("currency_symbol", active_cp["currency_symbol"])
-        currency_code   = data.get("currency_code",   active_cp["currency_code"])
-        site_name       = data.get("site_name",       active_cp["site_name"])
-        supplier        = data.get("supplier",        active_cp["supplier"])
-        change_reason   = data.get("change_reason") or None
+            billing_day     = data.get("billing_day",     active_cp["billing_day"])
+            timezone        = data.get("timezone",        active_cp["timezone"])
+            currency_symbol = data.get("currency_symbol", active_cp["currency_symbol"])
+            currency_code   = data.get("currency_code",   active_cp["currency_code"])
+            site_name       = data.get("site_name",       active_cp["site_name"])
+            supplier        = data.get("supplier",        active_cp["supplier"])
+            change_reason   = data.get("change_reason") or None
 
-        # Reconstruct config from DB, apply overrides, then insert new period
-        full_cfg = store.config_from_db(active_cp["id"])
-        for md in full_cfg.get("meters", {}).values():
-            meta = md.get("meta") or {}
-            if "billing_day"     in data: meta["billing_day"]     = int(billing_day)
-            if "timezone"        in data: meta["timezone"]        = timezone
-            if "currency_symbol" in data: meta["currency_symbol"] = currency_symbol
-            if "currency_code"   in data: meta["currency_code"]   = currency_code
-            if "site_name"       in data: meta["site_name"]       = site_name
-            if "supplier"        in data: meta["supplier"]        = supplier
-            # Postcode is main-meter-only (outward code); a manual entry is 'user'.
-            if "postcode" in data and not meta.get("sub_meter"):
-                from block_store import outward_code as _oc
-                meta["postcode_prefix"] = _oc(data.get("postcode"))
-                meta["postcode_source"] = "user"
-            md["meta"] = meta
+            # Reconstruct config from DB, apply overrides, then insert new period
+            full_cfg = store.config_from_db(active_cp["id"])
+            for md in full_cfg.get("meters", {}).values():
+                meta = md.get("meta") or {}
+                if "billing_day"     in data: meta["billing_day"]     = int(billing_day)
+                if "timezone"        in data: meta["timezone"]        = timezone
+                if "currency_symbol" in data: meta["currency_symbol"] = currency_symbol
+                if "currency_code"   in data: meta["currency_code"]   = currency_code
+                if "site_name"       in data: meta["site_name"]       = site_name
+                if "supplier"        in data: meta["supplier"]        = supplier
+                # Postcode is main-meter-only (outward code); a manual entry is 'user'.
+                if "postcode" in data and not meta.get("sub_meter"):
+                    from block_store import outward_code as _oc
+                    meta["postcode_prefix"] = _oc(data.get("postcode"))
+                    meta["postcode_source"] = "user"
+                md["meta"] = meta
 
-        with store._conn:
-            cur = store._conn.execute(
-                """INSERT INTO config_periods
-                   (effective_from, effective_to, billing_day, block_minutes, timezone,
-                    currency_symbol, currency_code, site_name, supplier, change_reason)
-                   VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    ef_from,
-                    int(billing_day) if billing_day else 1,
-                    int(active_cp["block_minutes"] or 30),
-                    timezone or "UTC",
-                    currency_symbol or "£",
-                    currency_code or "GBP",
-                    site_name,
-                    supplier,
-                    change_reason,
+            with store._conn:
+                cur = store._conn.execute(
+                    """INSERT INTO config_periods
+                       (effective_from, effective_to, billing_day, block_minutes, timezone,
+                        currency_symbol, currency_code, site_name, supplier, change_reason)
+                       VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        ef_from,
+                        int(billing_day) if billing_day else 1,
+                        int(active_cp["block_minutes"] or 30),
+                        timezone or "UTC",
+                        currency_symbol or "£",
+                        currency_code or "GBP",
+                        site_name,
+                        supplier,
+                        change_reason,
+                    )
                 )
-            )
-            new_period_id = cur.lastrowid
-            store._write_meters(full_cfg, new_period_id)
+                new_period_id = cur.lastrowid
+                store._write_meters(full_cfg, new_period_id)
+            _rebuild_config_period_chain(store)
+            return {"ok": True}
 
-        _rebuild_config_period_chain(store)
+        result = _config_mutation_on_loop(_mutate)
         logger.info("api_config_history_create: new period from %s", ef_from)
-        return jsonify({"ok": True})
+        return jsonify(result)
+    except _ConfigError as ce:
+        return jsonify({"error": str(ce)}), 400
     except Exception as e:
         logger.error("api_config_history_create: %s", e)
         return jsonify({"error": str(e)}), 500
@@ -2846,61 +2923,41 @@ def api_config_history_update(period_id):
             if _dt.fromisoformat(from_val) >= _dt.fromisoformat(to_val):
                 return jsonify({"error": "Effective From must be before Effective To"}), 400
 
-        # Build UPDATE statement
-        with store._conn:
-            if updates:
-                set_clause = ", ".join(f"{k} = ?" for k in updates)
-                store._conn.execute(
-                    f"UPDATE config_periods SET {set_clause} WHERE id = ?",
-                    list(updates.values()) + [period_id]
-                )
+        # #361: run the write + chain rebuild on the ENGINE loop/connection (serialised
+        # with the engine's writes — no shared-web-connection race), then regen charts
+        # OFF the loop so a billing-period change reflects immediately. Same path as
+        # the create endpoint via _config_mutation_on_loop.
+        def _mutate(estore):
+            with estore._conn:
+                if updates:
+                    set_clause = ", ".join(f"{k} = ?" for k in updates)
+                    estore._conn.execute(
+                        f"UPDATE config_periods SET {set_clause} WHERE id = ?",
+                        list(updates.values()) + [period_id]
+                    )
+                if postcode_edit:
+                    # Outward code only; a manual edit is provenance 'user'.
+                    estore._conn.execute(
+                        "UPDATE meters SET postcode_prefix = ?, postcode_source = 'user' "
+                        "WHERE config_period_id = ? AND is_sub_meter = 0",
+                        (postcode_outcode, period_id)
+                    )
             if postcode_edit:
-                # Outward code only; a manual edit is provenance 'user'.
-                store._conn.execute(
-                    "UPDATE meters SET postcode_prefix = ?, postcode_source = 'user' "
-                    "WHERE config_period_id = ? AND is_sub_meter = 0",
-                    (postcode_outcode, period_id)
-                )
-        if postcode_edit:
-            store.rearm_carbon_backfill()   # a region change may free carbon backfill
+                estore.rearm_carbon_backfill()   # a region change may free carbon backfill
+            # Rebuild the contiguous chain: sort all periods by effective_from, then
+            # set each period's effective_to = next period's effective_from. Robust
+            # regardless of how far the date was moved.
+            try:
+                _rebuild_config_period_chain(estore)
+            except Exception as _snap_e:
+                logger.warning("api_config_history_update: chain rebuild failed: %s", _snap_e)
+            return {"ok": True}
 
+        result = _config_mutation_on_loop(_mutate)
         logger.info("api_config_history_update: period %d updated %s%s",
                     period_id, list(updates.keys()),
                     " +postcode" if postcode_edit else "")
-
-        # Rebuild the contiguous chain: sort all periods by effective_from,
-        # then set each period's effective_to = next period's effective_from.
-        # Robust regardless of how far the date was moved.
-        try:
-            _rebuild_config_period_chain(store)
-        except Exception as _snap_e:
-            logger.warning("api_config_history_update: chain rebuild failed: %s", _snap_e)
-
-                # Regenerate charts since billing periods may have changed
-        try:
-            import energy_charts as _ec
-            import os as _os
-            blocks = store.get_blocks_lightweight()
-            if blocks:
-                from energy_engine_io import load_json as _lj_ec
-                cfg       = load_config()
-                main_meta = {}
-                for md in cfg.get("meters", {}).values():
-                    if not (md.get("meta") or {}).get("sub_meter"):
-                        main_meta = md.get("meta") or {}
-                        break
-                tz_name   = main_meta.get("timezone", "UTC")
-                bm        = int(main_meta.get("block_minutes") or 30)
-                currency  = main_meta.get("currency_symbol", "£")
-                os.makedirs(CHART_DIR, exist_ok=True)
-                html = _ec.generate_daily_import_export_charts(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency, cfg=cfg, store=store)
-                with open(os.path.join(CHART_DIR, "daily_usage.html"), "w") as f:
-                    f.write(html)
-                logger.info("api_config_history_update: charts regenerated")
-        except Exception as _e:
-            logger.warning("api_config_history_update: chart regen failed: %s", _e)
-
-        return jsonify({"ok": True})
+        return jsonify(result)
     except Exception as e:
         logger.error("api_config_history_update: %s", e)
         return jsonify({"error": str(e)}), 500
@@ -2909,73 +2966,50 @@ def api_config_history_update(period_id):
 @app.route("/api/config/history/<int:period_id>", methods=["DELETE"])
 def api_config_history_delete(period_id):
     """Delete a config period, re-assigning its blocks to an adjacent period."""
-    import json as _json
     try:
-        store = _get_store()
-
-        # Check before deleting whether this is the active period
-        cp = store.get_config_period(period_id)
-        is_active = cp and cp.get("effective_to") is None
-
-        result = store.delete_config_period(period_id)
-
-        # Rebuild chain first so effective_to values are consistent
-        try:
-            _rebuild_config_period_chain(store)
-        except Exception as _e:
-            logger.warning("api_config_history_delete: chain rebuild failed: %s", _e)
-
-        # If we deleted the active period, the predecessor is now active.
-        # Write its config back to meters_config.json (convenience export).
-        if is_active:
+        # #361: run the delete + chain rebuild on the ENGINE loop/connection so it's
+        # serialised with the engine's own writes — a delete on the shared web store
+        # from the Flask thread raced the engine and surfaced as SQLite "another row
+        # available" / "database is locked". Charts regen OFF the loop afterwards, the
+        # same path as create/update via _config_mutation_on_loop.
+        def _mutate(estore):
+            # Whether this is the active period must be read on the same connection,
+            # before the delete.
+            cp = estore.get_config_period(period_id)
+            is_active = bool(cp and cp.get("effective_to") is None)
+            result = estore.delete_config_period(period_id)
+            # Rebuild the contiguous chain so effective_to values stay consistent.
             try:
-                new_active = store._conn.execute(
-                    "SELECT id FROM config_periods "
-                    "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
-                ).fetchone()
-                if new_active:
-                    from energy_engine_io import save_json_atomic as _sja
-                    restored_cfg = store.config_from_db(new_active["id"])
-                    cfg_path = os.path.join(DATA_DIR, "meters_config.json")
-                    _sja(cfg_path, restored_cfg)
-                    logger.info(
-                        "api_config_history_delete: meters_config.json restored "
-                        "from newly-active config period"
-                    )
+                _rebuild_config_period_chain(estore)
             except Exception as _e:
-                logger.warning(
-                    "api_config_history_delete: could not restore meters_config.json: %s", _e
-                )
+                logger.warning("api_config_history_delete: chain rebuild failed: %s", _e)
+            # If we deleted the active period, the predecessor is now active — write
+            # its config back to meters_config.json (convenience export).
+            if is_active:
+                try:
+                    new_active = estore._conn.execute(
+                        "SELECT id FROM config_periods "
+                        "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+                    ).fetchone()
+                    if new_active:
+                        from energy_engine_io import save_json_atomic as _sja
+                        restored_cfg = estore.config_from_db(new_active["id"])
+                        cfg_path = os.path.join(DATA_DIR, "meters_config.json")
+                        _sja(cfg_path, restored_cfg)
+                        logger.info(
+                            "api_config_history_delete: meters_config.json restored "
+                            "from newly-active config period"
+                        )
+                except Exception as _e:
+                    logger.warning(
+                        "api_config_history_delete: could not restore meters_config.json: %s", _e
+                    )
+            return {"ok": True,
+                    "blocks_reassigned": result["blocks_reassigned"],
+                    "config_restored": is_active}
 
-        # Regenerate charts
-        try:
-            import energy_charts as _ec
-            blocks = store.get_blocks_lightweight()
-            if blocks:
-                from energy_engine_io import load_json as _lj_del
-                cfg       = load_config()
-                main_meta = {}
-                for md in cfg.get("meters", {}).values():
-                    if not (md.get("meta") or {}).get("sub_meter"):
-                        main_meta = md.get("meta") or {}
-                        break
-                tz_name  = main_meta.get("timezone", "UTC")
-                bm       = int(main_meta.get("block_minutes") or 30)
-                currency = main_meta.get("currency_symbol", "£")
-                os.makedirs(CHART_DIR, exist_ok=True)
-                html = _ec.generate_daily_import_export_charts(
-                    blocks, timezone_name=tz_name, block_minutes=bm, currency=currency, cfg=load_config(), store=store
-                )
-                with open(os.path.join(CHART_DIR, "daily_usage.html"), "w") as f:
-                    f.write(html)
-        except Exception as _e:
-            logger.warning("api_config_history_delete: chart regen failed: %s", _e)
-
-        return jsonify({
-            "ok": True,
-            "blocks_reassigned": result["blocks_reassigned"],
-            "config_restored": is_active,
-        })
+        result = _config_mutation_on_loop(_mutate)
+        return jsonify(result)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
@@ -3266,10 +3300,13 @@ def api_backup_delete():
         return jsonify({"error": str(e)}), 500
 
 
-def _restore_worker(zipname, selected, from_flat):
+def _restore_worker(zipname, selected, from_flat, staged=None):
     """Background restore worker (runs in its own thread; survives navigation).
     Updates _restore_job at each phase. Restores selected data files from a named
-    backup zip or from last-finalise flat files."""
+    backup zip, from last-finalise flat files, or — when `staged` is an absolute
+    path to an already-validated uploaded blocks.db (#356) — from that single
+    upload. The upload path gets the SAME safety backup, progress, atomic swap and
+    gap-detection as the backup-zip restore."""
     global _store
     import zipfile, shutil, sys as _sys_r
     _j = _restore_job
@@ -3306,6 +3343,9 @@ def _restore_worker(zipname, selected, from_flat):
             if not stopped:
                 if hasattr(_eng_r, "resume_engine"):
                     _eng_r.resume_engine()
+                if staged and os.path.exists(staged):
+                    try: os.remove(staged)
+                    except Exception: pass
                 _j["status"] = "error"
                 _j["error"] = ("An import was still finishing — restore aborted. "
                                "Try again in a moment.")
@@ -3354,7 +3394,18 @@ def _restore_worker(zipname, selected, from_flat):
         _step("restoring files")
         restored = []
 
-        if from_flat:
+        if staged:
+            # #356: swap in the uploaded (already SQLite-validated) blocks.db with
+            # the same atomic write the zip/flat paths use, then drop the staging
+            # file. Everything downstream (reset, migrate, gap-detect) is shared.
+            dest = os.path.join(DATA_DIR, "blocks.db")
+            with open(staged, "rb") as _src:
+                _atomic_write(dest, lambda d, _s=_src: shutil.copyfileobj(_s, d))
+            restored.append("blocks.db")
+            try: os.remove(staged)
+            except Exception: pass
+            logger.info("api_backup_restore: restored blocks.db from upload")
+        elif from_flat:
             for fname in (selected or list(known)):
                 if fname not in known:
                     continue
@@ -3469,6 +3520,9 @@ def _restore_worker(zipname, selected, from_flat):
         logger.error("api_backup_restore: %s", e)
         _j["status"] = "error"
         _j["error"] = str(e)
+        if staged and os.path.exists(staged):
+            try: os.remove(staged)
+            except Exception: pass
     finally:
         # Always resume engine — reset_store already called above on success,
         # but we must resume even if an exception occurred mid-restore
@@ -3546,6 +3600,11 @@ def api_settings_post():
                     return jsonify({"error": f"{key} must be a number"}), 400
             saved[key] = val
     store.save_settings(saved)
+    # The ex-VAT / bill-rounding option changes how the billing summary is rendered
+    # (bill-method vs inc-VAT), so rebuild the pre-built charts now — otherwise the
+    # toggle wouldn't show until the next block finalise (same regen gap as #361).
+    if "bill_rounding_summary" in data:
+        _schedule_offloaded_regen()
     return jsonify({"ok": True})
 
 
@@ -3646,12 +3705,21 @@ def api_kraken_config_get():
         import engine as _eng
         env = _eng._kraken_env()
         configured = bool(env.get("api_key"))
-        return jsonify({
+        out = {
             "configured": configured,
             "account_number": env.get("account_number"),
             "connected": _eng.kraken_available(),
             "mini": _eng._kraken_mini_reader is not None,
-        })
+        }
+        # #357: if this DB is stamped to a different account than the credentials,
+        # the API was NOT auto-activated — surface it so the UI can prompt an
+        # explicit reconnect (credentials are kept, not dropped).
+        mm = _eng.kraken_account_mismatch()
+        if mm:
+            out["account_mismatch"] = True
+            out["db_account"] = mm[0]
+            out["credentials_account"] = mm[1]
+        return jsonify(out)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3676,6 +3744,18 @@ def api_kraken_config_post():
             return jsonify({"ok": result.get("ok", True), "connected": False,
                             "disconnected": True, "mode": result.get("mode")})
         result = _run_on_engine_loop(_eng.connect_kraken_now(), timeout=45.0)
+        if not result.get("ok"):
+            # The key was already persisted (save happens above, before the live
+            # check). A failed check is usually TRANSIENT — rate limit, a network
+            # blip, or a DB mid-swap — not a bad key. Make the save visible so a
+            # failed verify never looks like the credentials were dropped, and
+            # never auto-delete them here: only Disconnect removes credentials.
+            result["saved"] = True
+            result["message"] = (
+                "Credentials saved, but the connection could not be verified right "
+                "now (%s). They have been kept — EMT will connect automatically when "
+                "the API is reachable. If the key is wrong, use Disconnect to remove "
+                "it." % (result.get("detail") or "unknown"))
         return jsonify(result), (200 if result.get("ok") else 400)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -6434,90 +6514,61 @@ def api_import_from_zip():
 
 @app.route("/api/import", methods=["POST"])
 def api_import():
-    """
-    Accept uploaded data files (blocks.db, meters_config.json).
-    blocks.json import removed in 2.2.2 — use blocks.db instead.
-    Pauses the engine during import to prevent file conflicts.
-    """
-    global _store
-    import sys
-    import importlib
+    """Accept an uploaded blocks.db and restore it through the SAME background job
+    as the backup-zip restore (#356): a pre-restore safety backup, live progress
+    via /api/backup/restore/status, an atomic swap, store reset and gap detection.
+
+    The upload is staged and SQLite-validated synchronously (a bad file fails here,
+    with the live DB untouched); the swap itself runs in the shared _restore_worker
+    so the client sees the same progress banner instead of a silent, blocking wait.
+    Returns {ok, status:"running"}; the client polls the restore status.
+    (blocks.json import removed in 2.2.2; meters_config.json is ignored — the DB is
+    authoritative.)"""
+    global _restore_job
     try:
-        engine = sys.modules.get("engine")
-        if engine and hasattr(engine, 'pause_engine'):
-            engine.pause_engine()
-
-        imported = []
-
-        # ── blocks.db — write directly then reset store connection ────────────
         blocks_file = request.files.get("blocks")
-        if blocks_file:
-            dest    = os.path.join(DATA_DIR, "blocks.db")
-            tmp     = dest + ".import_tmp"
-            try:
-                blocks_file.save(tmp)
-                # Validate it is a real SQLite file before replacing live DB
-                import sqlite3 as _sq3
-                _tc = _sq3.connect(tmp)
-                _tc.execute("SELECT COUNT(*) FROM blocks")
-                _tc.close()
-                # Close live store so the file handle is released
-                global _store
-                if _store:
-                    try: _store.close()
-                    except Exception: pass
-                    _store = None
-                os.replace(tmp, dest)
-                imported.append("blocks.db")
-                logger.info("server: imported blocks.db")
-            except Exception as _dbe:
-                if os.path.exists(tmp):
-                    try: os.remove(tmp)
-                    except Exception: pass
-                logger.error("server: blocks.db import failed: %s", _dbe)
-                raise
-
-        # ── meters_config.json upload ignored — config lives in blocks.db ───
-        # If a meters_config.json is uploaded alongside blocks.db, ignore it.
-        # The DB is authoritative; engine_startup reads config from it on next start.
-
-        if not imported:
-            if engine and hasattr(engine, 'resume_engine'):
-                engine.resume_engine()
+        if not blocks_file:
             return jsonify({"error": "No files received"}), 400
 
-        # ── Post-import: close stores so engine reopens from new DB ──────────
-        if "blocks.db" in imported:
-            # Remove WAL/SHM files left by running engine
-            import sqlite3 as _sq3i
-            _dest_i = os.path.join(DATA_DIR, "blocks.db")
-            for _ext in ("-wal", "-shm"):
-                _fi = _dest_i + _ext
-                if os.path.exists(_fi):
-                    try: os.remove(_fi)
-                    except Exception: pass
-            # Reset engine store and web store so both reopen from new DB
-            import sys as _sys2
-            _eng2 = _sys2.modules.get("engine")
-            if _eng2 and hasattr(_eng2, "reset_store"):
-                try: _eng2.reset_store()
-                except Exception as _re2:
-                    logger.warning("server: api_import engine reset_store failed: %s", _re2)
-            _store = None
+        # Stage + validate BEFORE touching the live DB. A non-SQLite / wrong-schema
+        # upload is rejected synchronously here and the live database is never
+        # disturbed.
+        staged = os.path.join(DATA_DIR, "uploaded_restore.db")
+        try:
+            blocks_file.save(staged)
+            import sqlite3 as _sq3
+            _tc = _sq3.connect(staged)
+            try:
+                _tc.execute("SELECT COUNT(*) FROM blocks")
+            finally:
+                _tc.close()
+        except Exception as _ve:
+            if os.path.exists(staged):
+                try: os.remove(staged)
+                except Exception: pass
+            logger.error("api_import: uploaded file is not a valid blocks.db: %s", _ve)
+            return jsonify({"error": "That file is not a valid EMT database "
+                                     "(blocks.db)."}), 400
 
-        return jsonify({"ok": True, "imported": imported})
+        # Don't collide with an in-flight restore.
+        if _restore_job.get("status") == "running":
+            if os.path.exists(staged):
+                try: os.remove(staged)
+                except Exception: pass
+            return jsonify({"error": "a restore is already running",
+                            "status": _restore_job}), 409
+
+        _restore_job.clear()
+        _restore_job.update({"status": "running", "step": "starting",
+                             "restored": None, "error": None})
+        threading.Thread(target=_restore_worker,
+                         args=("", ["blocks.db"], False),
+                         kwargs={"staged": staged},
+                         daemon=True, name="restore-upload").start()
+        return jsonify({"ok": True, "status": "running"})
     except Exception as e:
         logger.error("api_import: %s", e)
         return jsonify({"error": str(e)}), 500
-    finally:
-        # Always resume engine after import, wait one tick for files to settle
-        import threading
-        def delayed_resume():
-            import time
-            time.sleep(12)  # wait > one engine tick
-            if engine and hasattr(engine, 'resume_engine'):
-                engine.resume_engine()
-        threading.Thread(target=delayed_resume, daemon=True).start()
 
 # ── Database maintenance ───────────────────────────────────────────────────────────────────
 

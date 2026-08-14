@@ -145,8 +145,8 @@
     </div>
 
     <div style="display:flex;gap:8px;justify-content:flex-end;">
-      <button onclick="closeModal()" class="btn" style="font-size:13px;">Cancel</button>
-      <button onclick="saveEdit()" class="btn btn-primary" style="font-size:13px;">Save Changes</button>
+      <button id="edit-cancel-btn" onclick="closeModal()" class="btn" style="font-size:13px;">Cancel</button>
+      <button id="edit-save-btn" onclick="saveEdit()" class="btn btn-primary" style="font-size:13px;">Save Changes</button>
     </div>
   </div>
 </div>
@@ -367,7 +367,7 @@ function render() {
       ? '<div style="font-size:13px;color:var(--muted);margin-top:6px;font-style:italic;">"' + escHtml(p.change_reason) + '"</div>'
       : '';
 
-    html += '<div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px 20px;margin-bottom:12px;">';
+    html += '<div id="period-card-' + p.id + '" style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px 20px;margin-bottom:12px;transition:opacity .2s;">';
     html += '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;">';
     html += '<div style="flex:1;">';
 
@@ -484,6 +484,19 @@ function saveEdit() {
   var url    = isCreate ? apiUrl('/api/config/history') : apiUrl('/api/config/history/' + _editId);
   var method = isCreate ? 'POST' : 'PUT';
 
+  // Immediate feedback: creating/updating a period rebuilds the billing charts on
+  // the server, which can take several seconds — so lock the buttons and show a
+  // working state instead of leaving the dialog looking inert.
+  var _saveBtn   = document.getElementById('edit-save-btn');
+  var _cancelBtn = document.getElementById('edit-cancel-btn');
+  var _saveLabel = _saveBtn ? _saveBtn.textContent : '';
+  if (_saveBtn)   { _saveBtn.disabled = true; _saveBtn.textContent = 'Saving… regenerating charts'; }
+  if (_cancelBtn) { _cancelBtn.disabled = true; }
+  function _restoreSaveBtn() {
+    if (_saveBtn)   { _saveBtn.disabled = false; _saveBtn.textContent = _saveLabel || 'Save Changes'; }
+    if (_cancelBtn) { _cancelBtn.disabled = false; }
+  }
+
   fetch(url, {
     method: method,
     headers: { 'Content-Type': 'application/json' },
@@ -502,15 +515,17 @@ function saveEdit() {
   })
   .then(function(r) { return r.json(); })
   .then(function(data) {
+    _restoreSaveBtn();
     if (data.ok) {
       closeModal();
-      showSuccess(isCreate ? 'New billing period created.' : 'Config period updated. Billing chart regenerated.');
+      showSuccess(isCreate ? 'New billing period created. Billing charts regenerated.'
+                           : 'Config period updated. Billing charts regenerated.');
       load();
     } else {
       showError(data.error || (isCreate ? 'Create failed' : 'Update failed'));
     }
   })
-  .catch(function(e) { showError(e.message); });
+  .catch(function(e) { _restoreSaveBtn(); showError(e.message); });
 }
 
 // Close modal on backdrop click
@@ -573,6 +588,22 @@ function confirmDelete(id, blockCount, isActive) {
 }
 
 function doDelete(id, isActive) {
+  // Immediate feedback: mark the card as working and lock every action button so
+  // the delete (which rebuilds the billing charts server-side) doesn't look inert.
+  var card = document.getElementById('period-card-' + id);
+  var _prevHTML = null;
+  if (card) {
+    card.style.opacity = '0.55';
+    card.style.pointerEvents = 'none';
+    var badge = document.createElement('div');
+    badge.className = 'period-deleting-badge';
+    badge.style.cssText = 'margin-top:10px;font-size:13px;color:var(--accent);font-weight:600;';
+    badge.textContent = '⏳ Deleting… regenerating charts';
+    card.appendChild(badge);
+  }
+  document.querySelectorAll('#history-container button, .btn')
+    .forEach(function(b){ b.disabled = true; });
+
   fetch(apiUrl('/api/config/history/' + id), { method: 'DELETE' })
     .then(function(r) { return r.json(); })
     .then(function(data) {
@@ -582,14 +613,30 @@ function doDelete(id, isActive) {
           parts.push(data.blocks_reassigned.toLocaleString() + ' blocks reassigned — no data lost.');
         if (data.config_restored)
           parts.push('Meter Config restored to the previous period\'s settings. The engine will pick up the restored config on its next tick.');
-        parts.push('Charts regenerated.');
+        parts.push('Charts regenerated — open charts will refresh shortly.');
         showSuccess(parts.join(' '));
-        load();
+        // Re-enable the persistent buttons (New Period / Meter Config) that load()
+        // doesn't re-render; the card buttons are rebuilt fresh by load().
+        document.querySelectorAll('.btn').forEach(function(b){ b.disabled = false; });
+        load();   // re-render: the removed period disappears
       } else {
+        _unlockAfterDelete(card);
         showError(data.error || 'Delete failed');
       }
     })
-    .catch(function(e) { showError(e.message); });
+    .catch(function(e) { _unlockAfterDelete(card); showError(e.message); });
+}
+
+function _unlockAfterDelete(card) {
+  // Restore the page on failure (on success, load() re-renders everything fresh).
+  if (card) {
+    card.style.opacity = '';
+    card.style.pointerEvents = '';
+    var badge = card.querySelector('.period-deleting-badge');
+    if (badge) badge.remove();
+  }
+  document.querySelectorAll('#history-container button, #btn-new-period, .btn')
+    .forEach(function(b){ b.disabled = false; });
 }
 
 load();

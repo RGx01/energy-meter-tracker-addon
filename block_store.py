@@ -3196,6 +3196,7 @@ class BlockStore:
             """SELECT b.block_start, b.imp_cost, b.exp_cost, b.standing_charge,
                       m.is_sub_meter, m.meter_id
                FROM blocks b JOIN meters m ON m.meter_id = b.meter_id
+                                          AND m.config_period_id = b.config_period_id
                WHERE b.block_start >= ? AND b.block_start < ?"""
             + self._finalised_clause(finalised_only),
             (utc_s, utc_e)

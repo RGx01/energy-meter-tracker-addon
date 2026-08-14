@@ -418,6 +418,53 @@ class TestEngineLoopBridge(unittest.TestCase):
             loop.close()
 
 
+class TestKrakenConfigCredentialSafety(unittest.TestCase):
+    """#357: a failed live-connect must never look like the credentials were
+    dropped (the save happens first, unconditionally), and the config GET must
+    surface a DB↔account mismatch so the UI can prompt an explicit reconnect."""
+
+    def test_failed_connect_reports_saved_and_kept(self):
+        # engine here is the test stub — add the attributes the handler needs.
+        import server, engine
+        saved_run = server._run_on_engine_loop
+        engine.save_kraken_credentials = lambda *a, **k: None
+        engine.connect_kraken_now = lambda: None   # coro arg; patched loop ignores it
+        server._run_on_engine_loop = lambda coro, timeout=None: {
+            "ok": False, "connected": False, "detail": "rate_limited"}
+        try:
+            r = make_client().post("/api/kraken-config",
+                                   json={"api_key": "k", "account_number": "A-OWNER"})
+            self.assertEqual(r.status_code, 400)      # still signals "not connected"
+            body = r.get_json()
+            self.assertTrue(body["saved"])            # …but the key was kept
+            self.assertIn("rate_limited", body["message"])
+            self.assertIn("Disconnect", body["message"])
+        finally:
+            server._run_on_engine_loop = saved_run
+            del engine.save_kraken_credentials
+            del engine.connect_kraken_now
+
+    def test_config_get_surfaces_account_mismatch(self):
+        import engine
+        engine._kraken_env = lambda: {"api_key": "k", "account_number": "A-OWNER",
+                                      "base_url": None}
+        engine.kraken_available = lambda: False
+        engine._kraken_mini_reader = None
+        engine.kraken_account_mismatch = lambda: ("A-OTHERUSER", "A-OWNER")
+        try:
+            r = make_client().get("/api/kraken-config")
+            self.assertEqual(r.status_code, 200)
+            body = r.get_json()
+            self.assertTrue(body["account_mismatch"])
+            self.assertEqual(body["db_account"], "A-OTHERUSER")
+            self.assertEqual(body["credentials_account"], "A-OWNER")
+        finally:
+            del engine._kraken_env
+            del engine.kraken_available
+            del engine._kraken_mini_reader
+            del engine.kraken_account_mismatch
+
+
 class TestApiLastPage(unittest.TestCase):
 
     def setUp(self):
@@ -1661,6 +1708,30 @@ class TestApiConfigHistoryDelete(unittest.TestCase):
                          "config_restored must be False when non-active period deleted")
         mock_save.assert_not_called()
 
+    def test_delete_routes_through_engine_loop(self):
+        """#361: the delete + chain rebuild must go through _config_mutation_on_loop
+        (serialised on the engine loop/connection), not write on the shared web
+        connection — that race surfaced as SQLite 'another row available'."""
+        store, cfg_old, cfg_new = self._make_two_period_store()
+        client = make_client(store=store)
+        non_active_id = store._conn.execute(
+            "SELECT id FROM config_periods WHERE effective_to IS NOT NULL"
+        ).fetchone()["id"]
+        seen = {}
+        real = server._config_mutation_on_loop
+        def _spy(mutate, timeout=30.0):
+            seen["called"] = True
+            return real(mutate, timeout)
+        server._config_mutation_on_loop = _spy
+        try:
+            with patch("energy_engine_io.save_json_atomic", return_value=None), \
+                 patch("server.load_config", return_value=cfg_new):
+                r = client.delete(f"/api/config/history/{non_active_id}")
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(seen.get("called"), "delete must route through _config_mutation_on_loop")
+        finally:
+            server._config_mutation_on_loop = real
+
     def test_delete_only_period_returns_400(self):
         """Cannot delete the only period."""
         store = BlockStore(":memory:")
@@ -1802,10 +1873,22 @@ if __name__ == "__main__":
 # /api/import — blocks.db import (regression test for silent drop bug)
 # ─────────────────────────────────────────────────────────────────────────────
 
+class _SyncThread:
+    """Drop-in for threading.Thread that runs the target synchronously on start(),
+    so a launch test can assert without racing the background worker."""
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None, name=None):
+        self._t, self._a, self._k = target, args, kwargs or {}
+    def start(self):
+        if self._t:
+            self._t(*self._a, **self._k)
+
+
 class TestApiImportBlocksDb(unittest.TestCase):
     """
-    Regression tests for the api_import endpoint.
-    Previously blocks.db was silently ignored — only meters_config.json was written.
+    Regression tests for the api_import endpoint. #356: an uploaded blocks.db now
+    restores through the SAME background job as a backup-zip restore — the endpoint
+    stages + validates synchronously, then returns {ok, status:"running"} and the
+    swap runs in _restore_worker (progress via /api/backup/restore/status).
     """
 
     def setUp(self):
@@ -1814,11 +1897,13 @@ class TestApiImportBlocksDb(unittest.TestCase):
         server.DATA_DIR = self.tmpdir
         self.client = make_client()
         server.DATA_DIR = self.tmpdir  # re-set after make_client resets it
+        self._saved_job = server._restore_job
 
     def tearDown(self):
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
         server.DATA_DIR = "/tmp/emt_test_data"  # restore default
+        server._restore_job = self._saved_job
 
     def _make_db_bytes(self):
         """Create a minimal valid SQLite blocks.db as bytes."""
@@ -1839,46 +1924,71 @@ class TestApiImportBlocksDb(unittest.TestCase):
             if os.path.exists(tmp):
                 os.remove(tmp)
 
-    def test_blocks_db_accepted_in_import(self):
-        """blocks.db upload must appear in the imported list."""
-        import io
+    def test_blocks_db_upload_launches_restore_job(self):
+        """A valid blocks.db upload stages the file, returns running, and hands the
+        actual swap to _restore_worker with the staged path (#356)."""
+        import io, os
         db_bytes = self._make_db_bytes()
         data = {"blocks": (io.BytesIO(db_bytes), "blocks.db")}
-        r = self.client.post(
-            "/api/import",
-            data=data,
-            content_type="multipart/form-data"
-        )
+        captured = {}
+        def _fake_worker(zipname, selected, from_flat, staged=None):
+            captured.update(zipname=zipname, selected=selected,
+                            from_flat=from_flat, staged=staged)
+        with patch.object(server, "_restore_worker", _fake_worker), \
+             patch("server.threading.Thread", _SyncThread):
+            r = self.client.post("/api/import", data=data,
+                                 content_type="multipart/form-data")
         self.assertEqual(r.status_code, 200)
         result = r.get_json()
         self.assertTrue(result.get("ok"), msg=f"Import failed: {result}")
-        self.assertTrue(
-            any("blocks.db" in f for f in result.get("imported", [])),
-            msg=f"blocks.db not in imported list: {result.get('imported')}"
-        )
+        self.assertEqual(result.get("status"), "running")
+        # The worker was handed the staged upload and asked to restore blocks.db.
+        self.assertEqual(captured.get("selected"), ["blocks.db"])
+        self.assertFalse(captured.get("from_flat"))
+        self.assertTrue(str(captured.get("staged", "")).endswith("uploaded_restore.db"))
 
-    def test_meters_config_not_written_when_db_imported(self):
-        """When blocks.db is imported, meters_config.json must come from the DB not the upload."""
+    def test_invalid_upload_rejected_without_touching_live_db(self):
+        """A non-SQLite upload is rejected synchronously (400) and the staged file
+        is cleaned up — the live DB is never disturbed."""
+        import io, os
+        data = {"blocks": (io.BytesIO(b"not a database"), "blocks.db")}
+        called = {"n": 0}
+        def _fake_worker(*a, **k):
+            called["n"] += 1
+        with patch.object(server, "_restore_worker", _fake_worker), \
+             patch("server.threading.Thread", _SyncThread):
+            r = self.client.post("/api/import", data=data,
+                                 content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("error", r.get_json())
+        self.assertEqual(called["n"], 0)                       # worker never launched
+        self.assertFalse(os.path.exists(os.path.join(self.tmpdir, "uploaded_restore.db")))
+
+    def test_upload_rejected_when_restore_already_running(self):
         import io
+        server._restore_job = {"status": "running"}
         db_bytes = self._make_db_bytes()
-        # Upload both — meters_config should be ignored in favour of DB
-        cfg_bytes = b'{"meters": {"electricity_main": {"meta": {"billing_day": 1}}}}'.replace(b"'", b"'")
-        data = {
-            "blocks":        (io.BytesIO(db_bytes), "blocks.db"),
-            "meters_config": (io.BytesIO(cfg_bytes), "meters_config.json"),
-        }
-        r = self.client.post(
-            "/api/import",
-            data=data,
-            content_type="multipart/form-data"
-        )
-        result = r.get_json()
-        self.assertTrue(result.get("ok"), msg=f"Import failed: {result}")
-        # The imported list should contain blocks.db
-        self.assertTrue(
-            any("blocks.db" in f for f in result.get("imported", [])),
-            msg=f"blocks.db not in imported: {result.get('imported')}"
-        )
+        data = {"blocks": (io.BytesIO(db_bytes), "blocks.db")}
+        with patch("server.threading.Thread", _SyncThread):
+            r = self.client.post("/api/import", data=data,
+                                 content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 409)
+
+    def test_restore_worker_staged_swaps_db_and_cleans_up(self):
+        """The staged-upload branch of _restore_worker atomically swaps blocks.db in
+        and removes the staging file, marking the job done (#356)."""
+        import os
+        staged = os.path.join(self.tmpdir, "uploaded_restore.db")
+        with open(staged, "wb") as f:
+            f.write(self._make_db_bytes())
+        server._restore_job = {"status": "running", "step": "starting"}
+        with patch.object(server, "_create_backup_zip", return_value=None), \
+             patch.object(server, "_regen_charts_safely", return_value=None):
+            server._restore_worker("", ["blocks.db"], False, staged=staged)
+        self.assertTrue(os.path.exists(os.path.join(self.tmpdir, "blocks.db")))
+        self.assertFalse(os.path.exists(staged))          # staging cleaned up
+        self.assertEqual(server._restore_job["status"], "done")
+        self.assertIn("blocks.db", server._restore_job.get("restored") or [])
 
     def test_meters_config_alone_returns_error(self):
         """Importing meters_config.json without blocks.db is rejected — DB is sole source of truth since 2.1.0."""
@@ -6156,6 +6266,32 @@ class TestBlocksDataVersion(unittest.TestCase):
         self.assertEqual(server._blocks_data_version(st),
                          server._blocks_data_version(st))
 
+    def test_chart_file_regen_moves_token(self):
+        # A config-period change (or settlement) rebuilds the pre-rendered chart files
+        # a moment AFTER the DB write. The token must advance when the FILE is rewritten
+        # — not at DB-write time — otherwise the Charts page reloads the stale file,
+        # latches the token, and stays stale until the next finalise. So the rendered
+        # files' mtimes are part of the token.
+        import server, os, time, tempfile, shutil
+        st = self._store()
+        d = tempfile.mkdtemp()
+        daily = os.path.join(d, "daily_usage.html")
+        open(daily, "w").write("x")
+        open(os.path.join(d, "net_heatmap.html"), "w").write("y")
+        _orig = server.CHART_DIR
+        server.CHART_DIR = d
+        try:
+            before = server._blocks_data_version(st)
+            # Simulate the off-loop regen rewriting the daily chart (newer mtime).
+            os.utime(daily, (time.time() + 5, time.time() + 5))
+            after = server._blocks_data_version(st)
+            self.assertNotEqual(before, after)
+            # The block-value prefix (count:max:sums) is unchanged — only the file moved.
+            self.assertEqual(before.split(":")[:7], after.split(":")[:7])
+        finally:
+            server.CHART_DIR = _orig
+            shutil.rmtree(d, ignore_errors=True)
+
 
 class TestUsageSubMeterGridShare(unittest.TestCase):
     """_aggregate_usage must count a sub-meter's GRID share (imp_kwh_grid). A real
@@ -6199,6 +6335,88 @@ class TestUsageSubMeterGridShare(unittest.TestCase):
         self.assertAlmostEqual(
             out["sub_meters"]["house_battery"]["imp_kwh"], 0.0, places=6,
             msg="solar-charged block (grid share 0) must count 0, not total 3.0")
+
+
+class TestConfigHistoryConsistency(unittest.TestCase):
+    """#361: a billing-day change must leave ONE consistent config-period chain — the
+    old racy shared-connection write could half-apply / duplicate, which then made the
+    Total Bill stop summing. Exercised on the no-loop fallback (inline on the web
+    store), which runs the same mutation logic as the on-loop path."""
+
+    def setUp(self):
+        self._orig_loop = server._event_loop
+        server._event_loop = None                     # force the inline fallback
+        self.store = BlockStore(":memory:")
+        self.store.insert_config_period({
+            "meters": {"electricity_main": {"meta": {
+                "timezone": "UTC", "billing_day": 3, "block_minutes": 30,
+                "currency_symbol": "£", "currency_code": "GBP", "site_name": "Home"}}}},
+            effective_from="2024-06-03T00:00:00")
+        server.DATA_DIR = "/tmp/emt_test_361"
+        server._store = self.store
+        self.client = server.app.test_client()
+
+    def tearDown(self):
+        server._event_loop = self._orig_loop
+
+    def _periods(self):
+        return self.store._conn.execute(
+            "SELECT billing_day, effective_from, effective_to "
+            "FROM config_periods ORDER BY effective_from").fetchall()
+
+    def test_billing_day_change_leaves_one_contiguous_chain(self):
+        r = self.client.post("/api/config/history",
+                             json={"effective_from": "2026-08-13T00:00:00", "billing_day": 4})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json().get("ok"))
+        rows = self._periods()
+        self.assertEqual(len(rows), 2)                                  # old + new, no dupes
+        active = [x for x in rows if x["effective_to"] is None]
+        self.assertEqual(len(active), 1)                               # exactly one active
+        self.assertEqual(active[0]["billing_day"], 4)                  # new period = day 4
+        self.assertEqual(rows[0]["billing_day"], 3)                    # old period unchanged
+        # contiguous, non-overlapping: old closes exactly where new opens
+        self.assertEqual(rows[0]["effective_to"], rows[1]["effective_from"])
+
+    def test_missing_active_period_is_400(self):
+        # Close the only period so there's no active one to inherit from → clean 400.
+        self.store._conn.execute(
+            "UPDATE config_periods SET effective_to='2025-01-01T00:00:00'")
+        self.store._conn.commit()
+        r = self.client.post("/api/config/history",
+                             json={"effective_from": "2026-08-13T00:00:00", "billing_day": 4})
+        self.assertEqual(r.status_code, 400)
+
+
+class TestVatToggleRegen(unittest.TestCase):
+    """Selecting the ex-VAT / bill-rounding option must rebuild the pre-built charts
+    so the billing summary switches immediately, not after the next finalise."""
+
+    def setUp(self):
+        self.store = BlockStore(":memory:")
+        self.store.insert_config_period({
+            "meters": {"electricity_main": {"meta": {
+                "timezone": "UTC", "billing_day": 1, "block_minutes": 30,
+                "currency_symbol": "£", "currency_code": "GBP", "site_name": "Home"}}}})
+        server.DATA_DIR = "/tmp/emt_test_vat"
+        server._store = self.store
+        self.client = server.app.test_client()
+        self._orig = server._schedule_offloaded_regen
+        self.calls = {"n": 0}
+        server._schedule_offloaded_regen = lambda: self.calls.__setitem__("n", self.calls["n"] + 1)
+
+    def tearDown(self):
+        server._schedule_offloaded_regen = self._orig
+
+    def test_vat_toggle_regenerates(self):
+        r = self.client.post("/api/settings", json={"bill_rounding_summary": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.calls["n"], 1)          # regen scheduled
+
+    def test_non_display_setting_does_not_regen(self):
+        r = self.client.post("/api/settings", json={"co2_tree_kg_per_year": 22.0})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.calls["n"], 0)          # no needless rebuild
 
 
 if __name__ == "__main__":
