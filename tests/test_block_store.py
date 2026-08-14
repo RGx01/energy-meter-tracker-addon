@@ -5427,5 +5427,47 @@ class TestSourceTagRoundTrip(unittest.TestCase):
         self.assertEqual(src, "imported_api")                        # NOT wiped to NULL
 
 
+class TestOldestGapStart(unittest.TestCase):
+    """get_oldest_gap_start finds an outage HOLE (blocks either side, none of its own)
+    so the poll window can pull back and BL-8 backfills it — the block-gap-after-
+    reimport bug where the register-measurements and DCC-poll windows leave a hole."""
+
+    def _store(self):
+        st = BlockStore(":memory:")
+        st.insert_config_period({"meters": {"electricity_main": {"meta": {
+            "billing_day": 1, "block_minutes": 30, "timezone": "UTC",
+            "currency_symbol": "£", "currency_code": "GBP"}}}})
+        return st
+
+    def _add(self, st, starts):
+        for s in starts:
+            st._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, "
+                "config_period_id, imp_kwh) VALUES (?,?, 'electricity_main', ?, 1.0)",
+                (s, s, st.get_current_config_period_id()))
+        st._conn.commit()
+
+    def test_finds_interior_hole(self):
+        st = self._store()
+        # 09:00, 09:30 present; 10:00, 10:30 MISSING; 11:00 present → hole at 10:00
+        self._add(st, ["2026-08-12T09:00:00", "2026-08-12T09:30:00",
+                       "2026-08-12T11:00:00"])
+        self.assertEqual(
+            st.get_oldest_gap_start(since_iso="2026-08-01T00:00:00"),
+            "2026-08-12T10:00:00")
+
+    def test_no_gap_returns_none(self):
+        st = self._store()
+        self._add(st, ["2026-08-12T09:00:00", "2026-08-12T09:30:00",
+                       "2026-08-12T10:00:00"])
+        self.assertIsNone(st.get_oldest_gap_start(since_iso="2026-08-01T00:00:00"))
+
+    def test_hole_before_since_is_ignored(self):
+        st = self._store()
+        # hole at 10:00, but since_iso is after it → out of the recovery window
+        self._add(st, ["2026-08-12T09:00:00", "2026-08-12T11:00:00"])
+        self.assertIsNone(st.get_oldest_gap_start(since_iso="2026-08-12T10:30:00"))
+
+
 if __name__ == "__main__":
     unittest.main()

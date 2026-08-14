@@ -3784,6 +3784,51 @@ class BlockStore:
             (main_meter_id,)).fetchone()
         return row["m"] if row and row["m"] else None
 
+    def get_oldest_gap_start(self, main_meter_id: str = "electricity_main",
+                             since_iso: Optional[str] = None,
+                             block_minutes: Optional[int] = None) -> Optional[str]:
+        """Earliest MISSING main-meter block slot (an outage HOLE) within
+        [since_iso, newest-block), or None.
+
+        A hole has real blocks on BOTH sides — it's an interior/outage gap, not the
+        pre-recording past. The DCC-poll window anchors at the oldest *unsettled*
+        block (get_oldest_unsettled_block_start), which only sees blocks that EXIST —
+        so a hole between two disjoint fetch windows (register measurements ending at
+        T, DCC poll starting at T+n) is invisible to it and never backfilled. This
+        surfaces the oldest such hole so the poll window can be pulled back to cover
+        it (bounded by `since_iso` so we never chase ancient, un-resettleable gaps).
+        block_minutes defaults to the newest config period's resolution.
+        """
+        from datetime import datetime, timedelta
+        since = since_iso or ""
+        rng = self._conn.execute(
+            "SELECT MIN(block_start) AS mn, MAX(block_start) AS mx FROM blocks "
+            "WHERE meter_id = ? AND block_start >= ?",
+            (main_meter_id, since)).fetchone()
+        if not rng or not rng["mn"]:
+            return None
+        if not block_minutes:
+            r = self._conn.execute(
+                "SELECT block_minutes FROM config_periods "
+                "ORDER BY effective_from DESC LIMIT 1").fetchone()
+            block_minutes = (r["block_minutes"] if r else 30) or 30
+        have = {row[0] for row in self._conn.execute(
+            "SELECT DISTINCT block_start FROM blocks "
+            "WHERE meter_id = ? AND block_start >= ?",
+            (main_meter_id, since)).fetchall()}
+        try:
+            step = timedelta(minutes=int(block_minutes))
+            t = datetime.fromisoformat(rng["mn"])
+            end = datetime.fromisoformat(rng["mx"])
+        except ValueError:
+            return None
+        t += step
+        while t < end:
+            if t.isoformat() not in have:
+                return t.isoformat()
+            t += step
+        return None
+
     def get_timed_out_provisionals(
         self, cutoff_utc: str,
         sources: tuple = ("kraken_api", "kraken_mini"),

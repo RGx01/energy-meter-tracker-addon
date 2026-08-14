@@ -439,21 +439,34 @@ class TestReconcileDecision(unittest.TestCase):
     def test_neither_already_peak_is_ok(self):
         self.assertEqual(engine._reconcile_decision(False, False, None, False)[0], "ok")
 
-    def test_completed_without_started_substantial_is_off_peak(self):
-        # POLICY (dev-DB #dispatch-reimport): SUBSTANTIAL completed, no started →
-        # accept Octopus's authoritative completed dispatch as off-peak (was 'review',
-        # which left a missed-poll / re-imported smart charge under-credited at peak).
-        self.assertEqual(engine._reconcile_decision(False, True, -3.0, False)[0], "off_peak")
-        # already off-peak → nothing to do
-        self.assertEqual(engine._reconcile_decision(False, True, -3.0, True)[0], "ok")
+    def test_completed_only_offline_is_off_peak(self):
+        # §14: COMPLETED-ONLY (no planned/started ever captured → EMT offline or a
+        # re-import) with substantial energy → accept the authoritative completed
+        # dispatch as off-peak (was 'review', under-crediting a missed smart charge).
+        self.assertEqual(
+            engine._reconcile_decision(False, True, -3.0, False, has_planned=False)[0], "off_peak")
+        self.assertEqual(
+            engine._reconcile_decision(False, True, -3.0, True, has_planned=False)[0], "ok")
+
+    def test_completed_with_planned_not_started_stays_review(self):
+        # §11.1: we WERE online (a 'planned' was captured) but the slot never started
+        # → ambiguous (bump vs paused smart). Left at peak, flagged for review — we do
+        # NOT auto-off-peak this, because unlike the offline case we could have seen
+        # 'started' and didn't.
+        self.assertEqual(
+            engine._reconcile_decision(False, True, -3.0, False, has_planned=True)[0], "review")
+        self.assertEqual(
+            engine._reconcile_decision(False, True, -3.0, True, has_planned=True)[0], "review")
 
     def test_completed_without_started_negligible_is_peak(self):
         # #286 / 10-Jul: tiny completion (−0.26 kWh) can be neither a bump nor a
         # real charge → peak. Off-peak now → actionable revert; already peak → ok.
         self.assertEqual(engine._reconcile_decision(False, True, -0.26, True)[0], "peak")
         self.assertEqual(engine._reconcile_decision(False, True, -0.26, False)[0], "ok")
-        # boundary: exactly at the 0.4 kWh floor is substantial → off-peak
-        self.assertEqual(engine._reconcile_decision(False, True, -0.4, False)[0], "off_peak")
+        # boundary: exactly at the 0.4 kWh floor is substantial — off-peak only for
+        # the completed-only (offline) case; with a planned seen it's review.
+        self.assertEqual(
+            engine._reconcile_decision(False, True, -0.4, False, has_planned=False)[0], "off_peak")
 
     def test_started_overrides_missing_completed(self):
         # started with no completed yet (completed lands later) still → off-peak
@@ -578,13 +591,13 @@ class TestReconcilePass(unittest.IsolatedAsyncioTestCase):
                              ("2020-01-01T20:00:00",)).fetchone()
         self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)  # untouched
 
-    async def test_completed_substantial_restores_off_peak(self):
+    async def test_completed_only_offline_restores_off_peak(self):
         from block_store import BlockStore
         st = BlockStore(":memory:")
-        # POLICY: SUBSTANTIAL completed, no 'started' (EMT was offline / re-imported)
-        # → accept Octopus's authoritative completed dispatch as off-peak. A block
-        # sitting at PEAK is restored to off-peak, rate_reconciled, no review flag.
-        self._seed(st, "2020-01-01T20:00:00", 0.323092, ["planned", "completed"],
+        # §14: COMPLETED-ONLY (no planned/started — EMT offline / re-imported) with
+        # substantial energy → restore a PEAK block to off-peak, rate_reconciled, no
+        # review flag.
+        self._seed(st, "2020-01-01T20:00:00", 0.323092, ["completed"],
                    completed_kwh=-3.0)
         res = await self._run(st)
         self.assertEqual((res["restored"], res["reverted"], res["review"]),
@@ -595,6 +608,22 @@ class TestReconcilePass(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)   # peak → off-peak
         self.assertEqual(r["rate_reconciled"], 1)                  # stamped reconciled
         self.assertEqual(r["needs_review"], 0)                     # not flagged
+
+    async def test_completed_with_planned_not_started_flagged_review(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # §11.1: online (planned seen) but never started, substantial completed →
+        # ambiguous (bump vs paused smart): price left unchanged, flagged for review.
+        self._seed(st, "2020-01-01T20:00:00", 0.05493, ["planned", "completed"],
+                   completed_kwh=-3.0)
+        res = await self._run(st)
+        self.assertEqual((res["restored"], res["reverted"], res["review"]),
+                         (0, 0, 1))
+        r = st._conn.execute(
+            "SELECT imp_rate, needs_review FROM blocks WHERE block_start=?",
+            ("2020-01-01T20:00:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)   # unchanged
+        self.assertEqual(r["needs_review"], 1)                     # flagged
 
     async def test_resolved_clears_prior_review_flag(self):
         from block_store import BlockStore
