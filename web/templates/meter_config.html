@@ -248,6 +248,33 @@
   </div>
 </div>
 
+<!-- ── Reconnect Modal (lightweight: key only, keeps API mode, no recalc) ───── -->
+<div id="reconnect-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;overflow-y:auto;">
+  <div style="max-width:480px;margin:120px auto;padding:0 16px;">
+    <div class="card" style="padding:32px;">
+      <div style="font-size:22px;margin-bottom:12px;">🔑</div>
+      <div style="font-size:17px;font-weight:700;margin-bottom:8px;">Reconnect to Octopus</div>
+      <div style="font-size:13px;color:var(--muted);margin-bottom:20px;line-height:1.6;">
+        Re-enter your API key to resume import and settlement. This <strong>doesn't change your setup</strong> — your data source stays the same, so nothing is recalculated.
+      </div>
+      <div class="form-group" style="margin-bottom:12px;">
+        <label>Account number</label>
+        <input type="text" id="reconnect-account" placeholder="A-XXXXXXXX" autocomplete="off">
+        <div id="reconnect-account-note" style="font-size:11px;color:var(--muted);margin-top:4px;display:none;">Pre-filled from this database's previous connection — edit if needed.</div>
+      </div>
+      <div class="form-group" style="margin-bottom:8px;">
+        <label>API key</label>
+        <input type="password" id="reconnect-apikey" placeholder="sk_live_…" autocomplete="off">
+      </div>
+      <div id="reconnect-status" style="font-size:12px;min-height:18px;margin-bottom:12px;"></div>
+      <div style="display:flex;gap:12px;justify-content:flex-end;">
+        <button class="btn btn-secondary" onclick="closeReconnectModal()">Cancel</button>
+        <button class="btn btn-primary" id="reconnect-confirm-btn" onclick="executeReconnect()">Reconnect</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ── Wizard Modal ───────────────────────────────────────────────────────── -->
 <div id="wizard-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;overflow-y:auto;">
   <div style="max-width:600px;margin:40px auto;padding:0 16px 60px;">
@@ -634,7 +661,7 @@ function buildMainCard(meterId, meter) {
                 '<li><strong>Rate sensors</strong> — current rate per kWh (e.g. Octopus Energy rate sensors)</li>' +
                 '<li><strong>Standing charge</strong> — daily standing charge sensor (can be a fixed-value helper)</li>')) +
       '</ul>' +
-      (usesApi
+      (usesApi && !credsMissing
         ? '<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-wrap:wrap;">' +
             '<button class="btn btn-danger btn-sm js-disconnect-octopus">Disconnect ' + esc(supLabel) + '</button>' +
             '<span style="font-size:11px;color:var(--muted);">Clears stored API credentials and switches to local sensors. Billing history is kept.</span>' +
@@ -1133,10 +1160,12 @@ function onContainerClick(e) {
   } else if (el.classList.contains('js-disconnect-octopus')) {
     openDisconnectModal();
   } else if (el.classList.contains('js-reconnect-octopus')) {
-    // API mode with no stored key — jump straight into the setup wizard, which
-    // includes the credentials step for any API mode, so the user can re-enter
-    // the key without changing anything else.
-    startWizard();
+    // API mode with no stored key — a lightweight KEY-ONLY reconnect. The data
+    // source is already 'api'; we only re-add the credential, so the mode is
+    // unchanged and no history recalculation is triggered. (The full setup wizard
+    // would flip the mode if you'd disconnected first — cad→api — which needlessly
+    // offered a full recalc.) Account is pre-filled from the DB's stored stamp.
+    openReconnectModal();
   }
 }
 
@@ -1190,6 +1219,71 @@ function openDisconnectModal() {
 }
 function closeDisconnectModal() {
   document.getElementById('disconnect-overlay').style.display = 'none';
+}
+
+// Lightweight key-only reconnect (no wizard, no recalc). Account pre-filled from
+// the DB's stored stamp (surfaced by /api/kraken-config as db_account).
+function openReconnectModal() {
+  var acct  = document.getElementById('reconnect-account');
+  var key   = document.getElementById('reconnect-apikey');
+  var note  = document.getElementById('reconnect-account-note');
+  var stat  = document.getElementById('reconnect-status');
+  if (key)  key.value = '';
+  if (stat) stat.textContent = '';
+  document.getElementById('reconnect-overlay').style.display = 'block';
+  // Pre-fill the account from the previously-connected account on this DB.
+  fetch(apiUrl('/api/kraken-config'))
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      var prev = (d && (d.db_account || d.account_number)) || '';
+      if (acct && !acct.value) acct.value = prev;
+      if (note) note.style.display = prev ? 'block' : 'none';
+    })
+    .catch(function(){ /* leave account blank on failure */ });
+  setTimeout(function(){ if (key) key.focus(); }, 60);
+}
+function closeReconnectModal() {
+  document.getElementById('reconnect-overlay').style.display = 'none';
+}
+function executeReconnect() {
+  var acct = (document.getElementById('reconnect-account').value || '').trim();
+  var key  = (document.getElementById('reconnect-apikey').value || '').trim();
+  var stat = document.getElementById('reconnect-status');
+  var btn  = document.getElementById('reconnect-confirm-btn');
+  if (!key) {
+    if (stat) { stat.style.color = 'var(--error-color,#c00)'; stat.textContent = 'Enter your API key.'; }
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = 'Reconnecting…'; }
+  if (stat) { stat.style.color = 'var(--muted)'; stat.textContent = 'Connecting…'; }
+  fetch(apiUrl('/api/kraken-config'), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ api_key: key, account_number: acct || null })
+  })
+    .then(function(r){ return r.text().then(function(t){
+      var j; try { j = t ? JSON.parse(t) : {}; } catch(e){ j = { error: 'Unexpected response (' + r.status + ')' }; }
+      return { ok: r.ok, j: j };
+    }); })
+    .then(function(res){
+      if (btn) { btn.disabled = false; btn.textContent = 'Reconnect'; }
+      if (!res.ok || res.j.error || !res.j.connected) {
+        if (stat) { stat.style.color = 'var(--error-color,#c00)';
+          stat.textContent = 'Could not connect: ' + (res.j.detail || res.j.error || 'check key/account'); }
+        return;
+      }
+      // Connected — key is stored and API mode is unchanged, so just refresh the
+      // card in place (no reload, no recalc).
+      HAS_CREDENTIALS = true;
+      closeReconnectModal();
+      renderAll();
+      document.getElementById('alert-success').textContent =
+        '✓ Reconnected to Octopus' + (res.j.account_number ? ' — ' + res.j.account_number : '') + '.';
+      show('alert-success');
+    })
+    .catch(function(e){
+      if (btn) { btn.disabled = false; btn.textContent = 'Reconnect'; }
+      if (stat) { stat.style.color = 'var(--error-color,#c00)'; stat.textContent = 'Connect failed: ' + e; }
+    });
 }
 function executeDisconnect() {
   var btn = document.getElementById('disconnect-confirm-btn');
@@ -2463,6 +2557,13 @@ function _wizVerifyCredentialsThenAdvance() {
           + '</span>';
         return;   // stay on the step
       }
+      // Connected — the key is now stored, so update the client state the meter
+      // card reads (HAS_CREDENTIALS) and the wizard's own flag. Without this the
+      // final renderAll() (on wizard finish) still recomputes credsMissing from the
+      // stale page-load value and leaves the "credentials missing" banner up until a
+      // manual refresh.
+      HAS_CREDENTIALS = true;
+      wiz.data.hasStoredKey = true;
       // Connected — capture detected account and advance.
       if (res.j.account_number) wiz.data.accountNumber = res.j.account_number;
       if (status) status.innerHTML = '<span style="color:var(--ok,green);">✓ Connected'

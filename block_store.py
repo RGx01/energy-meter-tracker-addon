@@ -360,6 +360,24 @@ CREATE TABLE IF NOT EXISTS historical_derivation (
 );
 CREATE INDEX IF NOT EXISTS idx_hderiv_subject ON historical_derivation (scope, subject);
 CREATE INDEX IF NOT EXISTS idx_hderiv_current ON historical_derivation (superseded_by);
+
+-- ── BL-8 phase 2: deliberate-deletion persistence (deleted_ranges tombstone) ──
+-- A manual delete records its span here so BL-8 backfill, the settlement sweep, and
+-- the outage gap-scan SKIP it (a deleted range stays deleted instead of being
+-- re-created as if it were an outage hole). Consulted ONLY at block-CREATION and
+-- window-scan points — never by billing/chart/settlement reads, so the numbers are
+-- byte-identical. meter_id '*' = all meters; [start_utc, end_utc) is half-open, in
+-- block_start grain. An explicit, TARGETED user fill (re-import / per-gap / CSV /
+-- range) clears or splits the covering row; a blanket "recover all" respects it.
+CREATE TABLE IF NOT EXISTS deleted_ranges (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    meter_id    TEXT NOT NULL,       -- 'electricity_main', a sub-meter id, or '*' = all meters
+    start_utc   TEXT NOT NULL,       -- inclusive, naive-UTC ISO 'YYYY-MM-DDTHH:MM:SS'
+    end_utc     TEXT NOT NULL,       -- EXCLUSIVE upper bound
+    created_at  TEXT NOT NULL,       -- UTC ISO
+    reason      TEXT                 -- 'user_delete' | 'user_purge' | free text
+);
+CREATE INDEX IF NOT EXISTS idx_deleted_ranges ON deleted_ranges (meter_id, start_utc, end_utc);
 """
 
 
@@ -507,6 +525,33 @@ def local_date_to_utc_bounds(local_date: str, tz_name: str) -> tuple[str, str]:
     utc_end   = local_end.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
 
     return utc_start.isoformat(), utc_end.isoformat()
+
+
+def local_datetime_to_utc(local_date: str, local_time: str, tz_name: str) -> str:
+    """Convert a local wall-clock date + HH:MM to a naive-UTC ISO string (no Z),
+    DST-correct, for direct comparison with block_start. Used by the contiguous
+    date-range delete so `FROM 14/04 00:00 → TO 15/04 12:00` means one continuous
+    span, not a per-day time-of-day window."""
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    y, m, d = int(local_date[:4]), int(local_date[5:7]), int(local_date[8:10])
+    hh, mm = int(local_time[:2]), int(local_time[3:5])
+    dt = datetime(y, m, d, hh, mm, 0, tzinfo=tz)
+    return dt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None).isoformat()
+
+
+def utc_to_local_label(utc_iso: str, tz_name: str, with_date: bool = True) -> str:
+    """Format a naive-UTC ISO string as local wall-clock time for display (the gap
+    list / deleted-ranges list). Returns 'YYYY-MM-DD HH:MM' (or 'HH:MM' when
+    with_date=False). Falls back to the raw string on any error."""
+    try:
+        tz = ZoneInfo(tz_name)
+        dt = datetime.fromisoformat(utc_iso).replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
+        return dt.strftime("%Y-%m-%d %H:%M" if with_date else "%H:%M")
+    except Exception:
+        return str(utc_iso).replace("T", " ")
 
 
 def local_date_range_to_utc_bounds(first_local_date: str, last_local_date: str,
@@ -1500,6 +1545,50 @@ class BlockStore:
             )
         return cur.rowcount
 
+    def materialise_completed_only_slots(self, small_kwh: float = 0.4) -> int:
+        """Promote SUBSTANTIAL completed-ONLY dispatches from dispatch_history into
+        off-peak dispatch_slots (design §14). A completed-only slot — one EMT saw
+        purely as a `completed` dispatch (no `planned`/`started`, e.g. EMT was
+        offline for it, or the completed record arrived via a re-import) — lives in
+        dispatch_history but, under the live capture path, only becomes a billing
+        `dispatch_slot` if the completed dispatch is still in the provider's current
+        (rolling) dispatch window. Once it ages out, the evidence is stranded in the
+        history ledger and reconcile_dispatch_overlay's candidate query (which gates
+        on an off-peak dispatch_slot EXISTING) can never see it, so a genuine smart
+        charge stays mispriced at peak forever.
+
+        This is the settlement-time complement to that live capture: for any
+        `completed` history row with |energy| >= small_kwh, no `planned`/`started`
+        for the same slot, and no existing dispatch_slot, create an off-peak slot
+        (source='smart-charge-completed', state='completed'). _reconcile_decision
+        then prices it via the has_planned=False (offline / re-import) branch, i.e.
+        off-peak. Only SUBSTANTIAL completed-only slots are materialised — that is
+        exactly the set reconcile would price off-peak; a sub-threshold completed
+        dispatch would only ever resolve to peak, so creating a slot for it is
+        pointless (and it is left alone). Idempotent — a second run is a no-op
+        because the slot then exists. Returns the number of slots created.
+        """
+        with self._conn:
+            cur = self._conn.execute(
+                """INSERT INTO dispatch_slots
+                       (slot_start, off_peak, provider, source, captured_at,
+                        state, energy_planned, energy_completed, raw_start, raw_end)
+                   SELECT h.slot_start, 1, h.provider, 'smart-charge-completed', ?,
+                          'completed', NULL, h.energy_kwh, h.raw_start, h.raw_end
+                   FROM dispatch_history h
+                   WHERE h.kind = 'completed' AND h.energy_kwh IS NOT NULL
+                     AND ABS(h.energy_kwh) >= ?
+                     AND NOT EXISTS (SELECT 1 FROM dispatch_slots s
+                                     WHERE s.slot_start = h.slot_start)
+                     AND NOT EXISTS (SELECT 1 FROM dispatch_history h2
+                                     WHERE h2.slot_start = h.slot_start
+                                       AND h2.kind IN ('planned', 'started'))
+                   GROUP BY h.slot_start""",
+                ((datetime.now(timezone.utc).replace(tzinfo=None).isoformat()),
+                 small_kwh),
+            )
+        return cur.rowcount
+
     # ── Dispatch history (observe-only accumulation, design §11) ──────────────
 
     def record_dispatch_history(self, slot_start: str, kind: str, *,
@@ -1966,34 +2055,42 @@ class BlockStore:
         ids.extend(r["meter_id"] for r in cur.fetchall())
         return list(dict.fromkeys(ids))
 
-    def _block_range_where(self, utc_start, utc_end, from_time, to_time, meter_ids,
+    def _delete_range_bounds(self, from_date, to_date, from_time, to_time, tz_name):
+        """Resolve the delete/preview window to a CONTIGUOUS UTC datetime span
+        [utc_start, utc_end], NOT a per-day time-of-day window.
+
+        `FROM 14/04 00:00 → TO 15/04 12:00` means one continuous range (14th 00:00
+        through 15th 12:00), which is how the UI reads. The old behaviour applied
+        the two times as a TIME(block_start) filter to every day in the range, so it
+        deleted 00:00–12:00 on BOTH days — the delete-scoping bug. `from_time`/
+        `to_time` are LOCAL wall-clock HH:MM.
+
+        Returns (utc_start, utc_end, end_inclusive). A whole-day end (to_time
+        '23:59') resolves to the next local-midnight boundary and is EXCLUSIVE; an
+        explicit end time is INCLUSIVE of that slot.
+        """
+        from_time = from_time or "00:00"
+        to_time   = to_time   or "23:59"
+        utc_start = local_datetime_to_utc(from_date, from_time, tz_name)
+        if to_time == "23:59":
+            _, utc_end = local_date_to_utc_bounds(to_date, tz_name)  # exclusive next-midnight
+            return utc_start, utc_end, False
+        return utc_start, local_datetime_to_utc(to_date, to_time, tz_name), True
+
+    def _block_range_where(self, utc_start, utc_end, end_inclusive, meter_ids,
                            reconstructed_only=False):
-        """Build the shared WHERE clause + params for block date-range
+        """Build the shared WHERE clause + params for a CONTIGUOUS block date-range
         delete/preview. `meter_ids` is None (all meters) or a list of ids.
 
         `reconstructed_only` restricts to historical-import blocks
         (`source LIKE 'imported%'`), so a bad import can be rolled back without
         touching native live/kraken data."""
-        clauses = ["block_start >= ?", "block_start < ?"]
+        clauses = ["block_start >= ?",
+                   "block_start <= ?" if end_inclusive else "block_start < ?"]
         params  = [utc_start, utc_end]
 
         if reconstructed_only:
             clauses.append("source LIKE 'imported%'")
-
-        if from_time != "00:00" and to_time != "23:59":
-            if from_time <= to_time:
-                clauses.append("TIME(block_start) >= ?")
-                clauses.append("TIME(block_start) <= ?")
-                params.extend([from_time, to_time])
-            else:
-                clauses.append("(TIME(block_start) >= ? OR TIME(block_start) <= ?)")
-                params.extend([from_time, to_time])
-        elif from_time != "00:00":
-            clauses.append("TIME(block_start) >= ?")
-            params.append(from_time)
-        elif to_time != "23:59":
-            clauses.append("TIME(block_start) <= ?")
-            params.append(to_time)
 
         if meter_ids is not None:
             placeholders = ",".join("?" * len(meter_ids))
@@ -2053,11 +2150,14 @@ class BlockStore:
         from_time = from_time or "00:00"
         to_time   = to_time   or "23:59"
 
-        utc_start, utc_end = local_date_range_to_utc_bounds(from_date, to_date, tz_name)
+        # CONTIGUOUS span (from_date+from_time .. to_date+to_time), NOT a per-day
+        # time-of-day window (the delete-scoping fix). from_time/to_time are LOCAL.
+        utc_start, utc_end, end_incl = self._delete_range_bounds(
+            from_date, to_date, from_time, to_time, tz_name)
 
         meter_ids = self._resolve_delete_meters(meter_id)
         where, params = self._block_range_where(
-            utc_start, utc_end, from_time, to_time, meter_ids, reconstructed_only
+            utc_start, utc_end, end_incl, meter_ids, reconstructed_only
         )
 
         n_blocks, n_dates = self._count_blocks_and_local_dates(where, params, tz_name)
@@ -2074,7 +2174,8 @@ class BlockStore:
             latest = self._conn.execute(
                 "SELECT MAX(block_start) AS m FROM blocks"
             ).fetchone()["m"]
-        is_tail = bool(latest is not None and utc_start <= latest < utc_end)
+        is_tail = bool(latest is not None and utc_start <= latest
+                       and (latest <= utc_end if end_incl else latest < utc_end))
 
         # Device-only delete? If the resolved target is a single sub-meter (its
         # parent's blocks are untouched and survive), the parent's stored
@@ -2115,6 +2216,33 @@ class BlockStore:
                 # Reseed live engine state so the next block starts cleanly.
                 self._conn.execute("DELETE FROM current_block")
                 self._conn.execute("DELETE FROM current_reads")
+            if n_blocks:
+                # BL-8 phase 2: tombstone the deleted span so auto-backfill, the
+                # settlement sweep, and the gap-scan skip it — a deliberate delete
+                # stays deleted instead of being re-created as an outage hole. One
+                # row per resolved meter (or '*' for an all-meters delete). Written
+                # in the SAME transaction as the delete so the two can't diverge.
+                # The delete is now CONTIGUOUS, so [utc_start, tomb_end) matches
+                # exactly what was removed. deleted_ranges is half-open; when the
+                # end is INCLUSIVE (explicit to_time) extend by one block so the last
+                # deleted slot is covered.
+                if end_incl:
+                    try:
+                        _cp = self.get_config_period_for_date(utc_end)
+                        _step = int((_cp or {}).get("block_minutes") or 30)
+                    except Exception:
+                        _step = 30
+                    _tomb_end = (datetime.fromisoformat(utc_end)
+                                 + timedelta(minutes=_step)).isoformat()
+                else:
+                    _tomb_end = utc_end
+                _reason = "imported_rollback" if reconstructed_only else "user_delete"
+                _now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+                for _mid in (meter_ids if meter_ids is not None else ["*"]):
+                    self._conn.execute(
+                        "INSERT INTO deleted_ranges (meter_id, start_utc, end_utc, "
+                        "created_at, reason) VALUES (?,?,?,?,?)",
+                        (_mid, utc_start, _tomb_end, _now, _reason))
 
         return {
             "deleted":                n_blocks,
@@ -2143,10 +2271,13 @@ class BlockStore:
         from_time = from_time or "00:00"
         to_time   = to_time   or "23:59"
 
-        utc_start, utc_end = local_date_range_to_utc_bounds(from_date, to_date, tz_name)
+        # CONTIGUOUS span — identical bounds to the delete so the preview can never
+        # disagree with what actually gets removed.
+        utc_start, utc_end, end_incl = self._delete_range_bounds(
+            from_date, to_date, from_time, to_time, tz_name)
         meter_ids = self._resolve_delete_meters(meter_id)
         where, params = self._block_range_where(
-            utc_start, utc_end, from_time, to_time, meter_ids, reconstructed_only
+            utc_start, utc_end, end_incl, meter_ids, reconstructed_only
         )
 
         n_blocks, n_dates = self._count_blocks_and_local_dates(where, params, tz_name)
@@ -3111,6 +3242,25 @@ class BlockStore:
             # fills the added span (region-eligible blocks inherit their period's
             # postcode; same-MPAN history needs no region change).
             self.rearm_carbon_backfill()
+            # BL-8 phase 2: a CSV fill over a span is a TARGETED, explicit restore —
+            # lift any tombstone over the written range (sub-span split) so the range
+            # is genuinely un-deleted, not left as present data under a stale
+            # tombstone. (The blanket auto-backfill never does this.)
+            _sf, _st = out["span"].get("from"), out["span"].get("to")
+            if _sf and _st:
+                try:
+                    self.clear_deleted_range(meter_id, _sf, _st)
+                except Exception:
+                    pass
+            # Historical EXPORT import: a solar meter exports nothing overnight, and
+            # the source (PDF/CSV) only lists the daytime export — so fill the blank
+            # export slots on imported export days with 0, else they show as a
+            # permanent, un-fillable export gap. Day-scoped + imported-only.
+            if "export" in (channel_csvs or {}):
+                try:
+                    self.zero_fill_imported_export_blanks()
+                except Exception:
+                    pass
         return out
 
     def backup(self, dst_path: str) -> None:
@@ -3196,6 +3346,7 @@ class BlockStore:
             """SELECT b.block_start, b.imp_cost, b.exp_cost, b.standing_charge,
                       m.is_sub_meter, m.meter_id
                FROM blocks b JOIN meters m ON m.meter_id = b.meter_id
+                                          AND m.config_period_id = b.config_period_id
                WHERE b.block_start >= ? AND b.block_start < ?"""
             + self._finalised_clause(finalised_only),
             (utc_s, utc_e)
@@ -3481,7 +3632,8 @@ class BlockStore:
     def create_backfill_block(self, block_start: str, meter_id: str,
                               settled_kwh: float, *,
                               channel: str = "import",
-                              source: str = "kraken_api") -> Optional[int]:
+                              source: str = "kraken_api",
+                              override_tombstone: bool = False) -> Optional[int]:
         """BL-8: materialise a block that does not exist, from DCC-settled data.
 
         An outage longer than the gap-fill limit leaves no block for the period,
@@ -3501,7 +3653,16 @@ class BlockStore:
         `block_end` is derived from the covering config period's `block_minutes`.
         Returns the new block id, or None if the block already exists or no
         config period covers the timestamp.
+
+        BL-8 phase 2: a tombstoned (deliberately-deleted) slot is NOT re-created —
+        this returns None — UNLESS `override_tombstone=True`, which only a TARGETED
+        user re-import / per-gap / CSV / range fill passes (and which also clears the
+        covering tombstone). Automatic callers (poll `missing_block` branch,
+        settlement sweep) and blanket "recover all" fills leave it False, so a
+        deliberate delete stays deleted.
         """
+        if not override_tombstone and self.is_slot_tombstoned(meter_id, block_start):
+            return None
         kwh_col = "imp_kwh" if channel == "import" else "exp_kwh"
         api_col = "imp_kwh_api" if channel == "import" else "exp_kwh_api"
         existing = self._conn.execute(
@@ -3560,6 +3721,64 @@ class BlockStore:
             f"AND block_start >= ? AND block_start <= ? AND {col} IS NOT NULL",
             (meter_id, from_iso, to_iso)).fetchone()
         return int(row[0]) if row else 0
+
+    def zero_fill_imported_export_blanks(self, tz_name: Optional[str] = None) -> int:
+        """Historical-export hygiene: on any LOCAL day that carries some imported
+        export data, set that day's BLANK (NULL) export slots to 0.
+
+        A solar export meter exports nothing overnight, but a PDF/CSV/API historical
+        import that only wrote the daytime export left the rest of the day's export
+        NULL. The gap detector can't tell a legitimately-zero overnight slot from
+        real missing data, so those days show a permanent, un-fillable export "gap"
+        (the API returns nothing for a slot with no export, so it can never clear).
+
+        Day-scoped: only days that already have >=1 imported export value are filled,
+        so a genuinely un-imported export range (no export on the day at all) is left
+        untouched. IMPORTED blocks only (`source LIKE 'imported%'`) — never a live/DCC
+        block that is correctly awaiting export settlement. Sets exp_kwh=0.0 and
+        exp_cost=0.0 (billing-neutral: zero export is £0 either way), matching how the
+        surrounding fully-imported days already store their overnight zeros. Returns
+        the number of slots zero-filled.
+        """
+        from zoneinfo import ZoneInfo
+        if not tz_name:
+            r = self._conn.execute("SELECT timezone FROM config_periods "
+                                   "ORDER BY effective_from DESC LIMIT 1").fetchone()
+            tz_name = (r["timezone"] if r else "UTC") or "UTC"
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo("UTC")
+        utc = ZoneInfo("UTC")
+
+        def _local_day(bs: str) -> str:
+            try:
+                return (datetime.fromisoformat(bs).replace(tzinfo=utc)
+                        .astimezone(tz).date().isoformat())
+            except Exception:
+                return bs[:10]
+
+        rows = self._conn.execute(
+            "SELECT id, meter_id, block_start, exp_kwh FROM blocks "
+            "WHERE source LIKE 'imported%'").fetchall()
+        # (meter_id, local_day) that has any imported export value
+        export_days = set()
+        for r in rows:
+            if r["exp_kwh"] is not None:
+                export_days.add((r["meter_id"], _local_day(r["block_start"])))
+        to_fill = [r["id"] for r in rows
+                   if r["exp_kwh"] is None
+                   and (r["meter_id"], _local_day(r["block_start"])) in export_days]
+        if not to_fill:
+            return 0
+        with self._conn:
+            for i in range(0, len(to_fill), 900):
+                chunk = to_fill[i:i + 900]
+                ph = ",".join("?" * len(chunk))
+                self._conn.execute(
+                    f"UPDATE blocks SET exp_kwh = 0.0, exp_cost = 0.0 "
+                    f"WHERE id IN ({ph})", chunk)
+        return len(to_fill)
 
     def find_block_gaps(self, meter_id: str = "electricity_main",
                         *, min_age_hours: float = 48.0,
@@ -3782,6 +4001,142 @@ class BlockStore:
             f"WHERE meter_id = ? AND {self._UNSETTLED_WHERE}",
             (main_meter_id,)).fetchone()
         return row["m"] if row and row["m"] else None
+
+    def get_oldest_gap_start(self, main_meter_id: str = "electricity_main",
+                             since_iso: Optional[str] = None,
+                             block_minutes: Optional[int] = None) -> Optional[str]:
+        """Earliest MISSING main-meter block slot (an outage HOLE) within
+        [since_iso, newest-block), or None.
+
+        A hole has real blocks on BOTH sides — it's an interior/outage gap, not the
+        pre-recording past. The DCC-poll window anchors at the oldest *unsettled*
+        block (get_oldest_unsettled_block_start), which only sees blocks that EXIST —
+        so a hole between two disjoint fetch windows (register measurements ending at
+        T, DCC poll starting at T+n) is invisible to it and never backfilled. This
+        surfaces the oldest such hole so the poll window can be pulled back to cover
+        it (bounded by `since_iso` so we never chase ancient, un-resettleable gaps).
+        block_minutes defaults to the newest config period's resolution.
+        """
+        from datetime import datetime, timedelta
+        since = since_iso or ""
+        rng = self._conn.execute(
+            "SELECT MIN(block_start) AS mn, MAX(block_start) AS mx FROM blocks "
+            "WHERE meter_id = ? AND block_start >= ?",
+            (main_meter_id, since)).fetchone()
+        if not rng or not rng["mn"]:
+            return None
+        if not block_minutes:
+            r = self._conn.execute(
+                "SELECT block_minutes FROM config_periods "
+                "ORDER BY effective_from DESC LIMIT 1").fetchone()
+            block_minutes = (r["block_minutes"] if r else 30) or 30
+        have = {row[0] for row in self._conn.execute(
+            "SELECT DISTINCT block_start FROM blocks "
+            "WHERE meter_id = ? AND block_start >= ?",
+            (main_meter_id, since)).fetchall()}
+        try:
+            step = timedelta(minutes=int(block_minutes))
+            t = datetime.fromisoformat(rng["mn"])
+            end = datetime.fromisoformat(rng["mx"])
+        except ValueError:
+            return None
+        t += step
+        while t < end:
+            iso = t.isoformat()
+            # BL-8 phase 2: a deliberately-deleted (tombstoned) hole is NOT an outage
+            # gap — skip it so the poll window is never pulled back to re-create it.
+            if iso not in have and not self.is_slot_tombstoned(main_meter_id, iso):
+                return iso
+            t += step
+        return None
+
+    # ── BL-8 phase 2: deleted_ranges tombstone helpers ───────────────────────────
+
+    def is_slot_tombstoned(self, meter_id: str, slot_utc: str) -> bool:
+        """True if `slot_utc` falls in an active deleted_range for this meter (or a
+        '*' all-meters range). The one hot predicate the create-gates consult."""
+        row = self._conn.execute(
+            """SELECT 1 FROM deleted_ranges
+               WHERE (meter_id = ? OR meter_id = '*')
+                 AND ? >= start_utc AND ? < end_utc
+               LIMIT 1""",
+            (meter_id, slot_utc, slot_utc)).fetchone()
+        return row is not None
+
+    def tombstoned_slots_in(self, meter_id: str, start_utc: str,
+                            end_utc: str) -> set:
+        """The set of block_start slots in [start_utc, end_utc) that are tombstoned
+        for this meter — one query to filter a whole poll window at once. Returns the
+        covering ranges' union clipped to the window, materialised at block grain by
+        the caller when needed; here we return the raw covering ranges as (s,e)."""
+        rows = self._conn.execute(
+            """SELECT start_utc, end_utc FROM deleted_ranges
+               WHERE (meter_id = ? OR meter_id = '*')
+                 AND end_utc > ? AND start_utc < ?""",
+            (meter_id, start_utc, end_utc)).fetchall()
+        return {(r["start_utc"], r["end_utc"]) for r in rows}
+
+    def add_deleted_range(self, meter_id: str, start_utc: str, end_utc: str,
+                          reason: str = "user_delete") -> int:
+        """Record a deliberate deletion so auto-backfill/gap-scan skip the span.
+        [start_utc, end_utc) half-open. Returns the new row id."""
+        cur = self._conn.execute(
+            "INSERT INTO deleted_ranges (meter_id, start_utc, end_utc, created_at, "
+            "reason) VALUES (?,?,?,?,?)",
+            (meter_id, start_utc, end_utc,
+             datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), reason))
+        self._conn.commit()
+        return cur.lastrowid
+
+    def get_deleted_ranges(self, meter_id: Optional[str] = None) -> list:
+        """Active tombstones (for the Data Management list), newest first."""
+        if meter_id:
+            rows = self._conn.execute(
+                "SELECT * FROM deleted_ranges WHERE meter_id = ? "
+                "ORDER BY start_utc DESC", (meter_id,)).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM deleted_ranges ORDER BY start_utc DESC").fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_deleted_range(self, meter_id: str, start_utc: str,
+                            end_utc: str) -> int:
+        """Lift the tombstone over [start_utc, end_utc) for a TARGETED re-import.
+
+        Interval subtraction (Q4 sub-span): every active row that overlaps the
+        cleared window is removed; any portion of that row OUTSIDE the window is
+        re-inserted as ≤2 remainder rows, so re-importing a sub-span leaves the rest
+        deleted. A '*' row is split against the requested meter's clear too (the
+        cleared window simply carves the interval; meter identity is preserved on the
+        remainders). Returns the number of covering rows that were lifted.
+        """
+        overlapping = self._conn.execute(
+            """SELECT id, meter_id, start_utc, end_utc, created_at, reason
+               FROM deleted_ranges
+               WHERE (meter_id = ? OR meter_id = '*' OR ? = '*')
+                 AND end_utc > ? AND start_utc < ?""",
+            (meter_id, meter_id, start_utc, end_utc)).fetchall()
+        lifted = 0
+        with self._conn:
+            for r in overlapping:
+                self._conn.execute("DELETE FROM deleted_ranges WHERE id = ?",
+                                   (r["id"],))
+                lifted += 1
+                # left remainder: [row.start, clear.start)
+                if r["start_utc"] < start_utc:
+                    self._conn.execute(
+                        "INSERT INTO deleted_ranges (meter_id, start_utc, end_utc, "
+                        "created_at, reason) VALUES (?,?,?,?,?)",
+                        (r["meter_id"], r["start_utc"], start_utc,
+                         r["created_at"], r["reason"]))
+                # right remainder: [clear.end, row.end)
+                if r["end_utc"] > end_utc:
+                    self._conn.execute(
+                        "INSERT INTO deleted_ranges (meter_id, start_utc, end_utc, "
+                        "created_at, reason) VALUES (?,?,?,?,?)",
+                        (r["meter_id"], end_utc, r["end_utc"],
+                         r["created_at"], r["reason"]))
+        return lifted
 
     def get_timed_out_provisionals(
         self, cutoff_utc: str,

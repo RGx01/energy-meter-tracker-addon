@@ -121,6 +121,35 @@ sweep. (Confirmed in practice: a prod-dev DB held blocks back to February but on
   planned→completed transition proves it. (This is BCD's "started dispatch"
   concept — capture the active planned dispatch into a durable record.)
 
+### UPDATE (4.2.3) — completed-ONLY slots ARE trusted off-peak (offline / re-import)
+The statement above — "the smart signal CANNOT be recovered from completed data" —
+holds for **smart-vs-bump discrimination**: a completed dispatch still carries
+`source=unknown`. But relying on it *exclusively* left a real gap. When the add-on was
+**offline** for a slot, or a day was **deleted and re-imported**, the planned/started
+signal was **never capturable**, so the slot stayed at **peak** and a genuine smart
+charge was silently **under-credited** (dev-DB case: a 20:00 slot billed 32.31p that
+should have been 5.493p; the prod DB, which captured it live, was correct).
+
+The settlement reconcile now splits the completed-without-started case on **whether we
+had the chance to see the signal** (`has_planned`, from `dispatch_history`):
+
+- **A `planned` was recorded** (add-on online) but the slot never `started` → still
+  ambiguous (bump vs paused smart) → **`review`, left at peak** — unchanged, and the
+  STANDING PRINCIPLE against degrading correct history is untouched.
+- **Completed-ONLY** — no planned/started ever recorded → the add-on was offline / this
+  is a re-import → **accept Octopus's completed dispatch as authoritative and reprice
+  peak → off-peak** at settlement reconciliation, stamped `rate_reconciled=1` with the
+  slot marked `source='smart-charge-completed'` for audit.
+
+This does **not** violate the *never blanket-recompute* rule: it only PROMOTES
+peak→off-peak for a slot with a real completed dispatch **and** real meter draw, never
+degrades a correct off-peak slot to peak, and is bounded to the settlement window.
+**Trade-off (accepted):** a completed dispatch alone can't tell a smart charge from a
+bump (§1b), so a genuine **offline bump is credited off-peak** — accepted because
+under-crediting a missed smart charge is the worse default on IOG, and a bump is rare
+and correctable in the corrections tool. Full rationale + implementation:
+`dispatch_validation_design.md` §14.
+
 ### GENERAL PRINCIPLE: validate dispatch intent against actual meter draw (BUILT)
 Dispatch signals report INTENT and OVER-REPORT (CONFIRMED for Zappi: the slot
 stays "on" after charging stops; real users report planned slots billed at peak

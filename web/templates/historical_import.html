@@ -624,6 +624,11 @@ async function bfLoadGaps() {
       var chs = (g.channels && g.channels.length) ? g.channels : [g.channel];
       var both = chs.length > 1;
       var chLabel = chs.join(' + ');
+      // BL-8 phase 2: a hole that is a DELIBERATE deletion (tombstoned) is not a
+      // fault — label it so, and filling it here is a targeted restore (it clears
+      // the deletion). The blanket "recover all" leaves these alone.
+      var delBadge = g.deleted
+        ? ' <span style="color:var(--warning);font-size:11px;">· deleted — fill to restore</span>' : '';
       var btns = '';
       if (csvSrc) {
         // CSV route: open the panel scoped to this gap's window. `channel:null`
@@ -646,7 +651,7 @@ async function bfLoadGaps() {
       html += '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;'
             + 'border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px;">'
             + '<span><span style="color:' + col + ';font-weight:600;">' + _esc(chLabel) + ' · ' + kindTxt + '</span> · '
-            + _esc(g.start.replace('T', ' ')) + ' → ' + _esc(g.end.replace('T', ' ')) + ' · ' + g.hours + ' h</span>'
+            + _esc(g.start_local || g.start.replace('T', ' ')) + ' → ' + _esc(g.end_local || g.end.replace('T', ' ')) + ' · ' + g.hours + ' h' + delBadge + '</span>'
             + '<span style="white-space:nowrap;">' + btns + '</span></div>';
     });
     html += '</div>';

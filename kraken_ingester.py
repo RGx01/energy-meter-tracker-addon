@@ -53,6 +53,12 @@ _STATE_LAST_POLL = "last_poll_utc"
 # adjusted DCC settlements that landed just behind the previous cursor.
 _RECHECK_OVERLAP = timedelta(hours=6)
 
+# How far back the poll window may be pulled to backfill an OUTAGE HOLE (a gap with
+# blocks either side). Deliberately short — an outage/re-import hole is recent, and a
+# gap older than this is left for a manual CSV import rather than re-fetching months
+# of DCC every poll. Independent of backfill_days (which can be very large).
+_GAP_RECOVERY = timedelta(days=14)
+
 
 def normalise_to_naive_utc(ts: str) -> str:
     """Convert an API interval timestamp to naive-UTC ISO matching block_start.
@@ -155,6 +161,24 @@ class KrakenIngester:
                 start_dt = min(start_dt, max(oldest_dt, floor_dt))
         except Exception:
             pass          # never let the unsettled probe break the poll window
+        # ALSO pull back to the oldest OUTAGE HOLE — a slot with blocks either side but
+        # none of its own. The oldest-unsettled anchor only sees blocks that EXIST, so
+        # a hole between two disjoint fetch windows (register measurements ending at T,
+        # DCC poll starting at T+n) is invisible to it and never backfilled — the block
+        # gap seen after a delete-and-reimport. BL-8 fills it once the window covers it.
+        # Bounded to a SHORT recovery window (not backfill_days) so we don't chase
+        # ancient, un-resettleable gaps and re-fetch months every poll; a fillable hole
+        # closes on the next poll and stops widening the window.
+        try:
+            gap_floor = now - _GAP_RECOVERY
+            gap = self.store.get_oldest_gap_start(since_iso=self._z(gap_floor)[:-1])
+            if gap:
+                gap_dt = datetime.fromisoformat(str(gap))
+                if gap_dt.tzinfo is None:
+                    gap_dt = gap_dt.replace(tzinfo=timezone.utc)
+                start_dt = min(start_dt, max(gap_dt, gap_floor))
+        except Exception:
+            pass          # never let the gap probe break the poll window
         return (self._z(start_dt), self._z(now))
 
     @staticmethod

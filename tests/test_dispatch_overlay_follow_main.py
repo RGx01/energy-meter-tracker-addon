@@ -439,18 +439,34 @@ class TestReconcileDecision(unittest.TestCase):
     def test_neither_already_peak_is_ok(self):
         self.assertEqual(engine._reconcile_decision(False, False, None, False)[0], "ok")
 
-    def test_completed_without_started_substantial_is_review(self):
-        # SUBSTANTIAL completed, no started → still ambiguous (missed-poll vs bump)
-        self.assertEqual(engine._reconcile_decision(False, True, -3.0, True)[0], "review")
-        self.assertEqual(engine._reconcile_decision(False, True, -3.0, False)[0], "review")
+    def test_completed_only_offline_is_off_peak(self):
+        # §14: COMPLETED-ONLY (no planned/started ever captured → EMT offline or a
+        # re-import) with substantial energy → accept the authoritative completed
+        # dispatch as off-peak (was 'review', under-crediting a missed smart charge).
+        self.assertEqual(
+            engine._reconcile_decision(False, True, -3.0, False, has_planned=False)[0], "off_peak")
+        self.assertEqual(
+            engine._reconcile_decision(False, True, -3.0, True, has_planned=False)[0], "ok")
+
+    def test_completed_with_planned_not_started_stays_review(self):
+        # §11.1: we WERE online (a 'planned' was captured) but the slot never started
+        # → ambiguous (bump vs paused smart). Left at peak, flagged for review — we do
+        # NOT auto-off-peak this, because unlike the offline case we could have seen
+        # 'started' and didn't.
+        self.assertEqual(
+            engine._reconcile_decision(False, True, -3.0, False, has_planned=True)[0], "review")
+        self.assertEqual(
+            engine._reconcile_decision(False, True, -3.0, True, has_planned=True)[0], "review")
 
     def test_completed_without_started_negligible_is_peak(self):
         # #286 / 10-Jul: tiny completion (−0.26 kWh) can be neither a bump nor a
         # real charge → peak. Off-peak now → actionable revert; already peak → ok.
         self.assertEqual(engine._reconcile_decision(False, True, -0.26, True)[0], "peak")
         self.assertEqual(engine._reconcile_decision(False, True, -0.26, False)[0], "ok")
-        # boundary: exactly at the 0.4 kWh floor is still ambiguous (review)
-        self.assertEqual(engine._reconcile_decision(False, True, -0.4, True)[0], "review")
+        # boundary: exactly at the 0.4 kWh floor is substantial — off-peak only for
+        # the completed-only (offline) case; with a planned seen it's review.
+        self.assertEqual(
+            engine._reconcile_decision(False, True, -0.4, False, has_planned=False)[0], "off_peak")
 
     def test_started_overrides_missing_completed(self):
         # started with no completed yet (completed lands later) still → off-peak
@@ -575,22 +591,78 @@ class TestReconcilePass(unittest.IsolatedAsyncioTestCase):
                              ("2020-01-01T20:00:00",)).fetchone()
         self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)  # untouched
 
-    async def test_review_left_untouched_but_flagged(self):
+    async def test_completed_only_offline_restores_off_peak(self):
         from block_store import BlockStore
         st = BlockStore(":memory:")
-        # SUBSTANTIAL completed but no started -> review: genuinely ambiguous,
-        # price left unchanged, but the block is now FLAGGED for the UI (BL-18).
+        # §14: COMPLETED-ONLY (no planned/started — EMT offline / re-imported) with
+        # substantial energy → restore a PEAK block to off-peak, rate_reconciled, no
+        # review flag.
+        self._seed(st, "2020-01-01T20:00:00", 0.323092, ["completed"],
+                   completed_kwh=-3.0)
+        res = await self._run(st)
+        self.assertEqual((res["restored"], res["reverted"], res["review"]),
+                         (1, 0, 0))
+        r = st._conn.execute(
+            "SELECT imp_rate, rate_reconciled, needs_review FROM blocks "
+            "WHERE block_start=?", ("2020-01-01T20:00:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)   # peak → off-peak
+        self.assertEqual(r["rate_reconciled"], 1)                  # stamped reconciled
+        self.assertEqual(r["needs_review"], 0)                     # not flagged
+
+    async def test_completed_only_from_history_no_slot_restores_off_peak(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # §14 dev-DB #dispatch-reimport (the 20:00-BST mispricing): a completed-ONLY
+        # dispatch whose record is in dispatch_history but which NEVER got a billing
+        # dispatch_slot (its completed dispatch aged out of the provider's rolling
+        # window before the completed-only capture could promote it). Reconcile must
+        # MATERIALISE the off-peak slot from history first, then restore the block.
+        self._seed(st, "2020-01-01T20:00:00", 0.323092, ["completed"],
+                   off_peak_slot=False, completed_kwh=-1.65)
+        # precondition: no billing slot exists — only the history ledger row
+        self.assertIsNone(st.get_dispatch_slot("2020-01-01T20:00:00"))
+        res = await self._run(st)
+        self.assertEqual((res["restored"], res["reverted"], res["review"]),
+                         (1, 0, 0))
+        slot = st.get_dispatch_slot("2020-01-01T20:00:00")
+        self.assertIsNotNone(slot)                                  # slot materialised
+        self.assertEqual(slot["source"], "smart-charge-completed")
+        r = st._conn.execute(
+            "SELECT imp_rate, rate_reconciled FROM blocks WHERE block_start=?",
+            ("2020-01-01T20:00:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)    # peak → off-peak
+        self.assertEqual(r["rate_reconciled"], 1)
+
+    async def test_completed_only_from_history_negligible_stays_peak(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # A negligible completed-only history row (|energy| < floor) is NOT
+        # materialised, so the peak block is left untouched (no false off-peak).
+        self._seed(st, "2020-01-01T20:00:00", 0.323092, ["completed"],
+                   off_peak_slot=False, completed_kwh=-0.2)
+        res = await self._run(st)
+        self.assertEqual((res["restored"], res["reverted"], res["review"]),
+                         (0, 0, 0))
+        self.assertIsNone(st.get_dispatch_slot("2020-01-01T20:00:00"))
+        r = st._conn.execute("SELECT imp_rate FROM blocks WHERE block_start=?",
+                             ("2020-01-01T20:00:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.323092, places=5)   # untouched
+
+    async def test_completed_with_planned_not_started_flagged_review(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # §11.1: online (planned seen) but never started, substantial completed →
+        # ambiguous (bump vs paused smart): price left unchanged, flagged for review.
         self._seed(st, "2020-01-01T20:00:00", 0.05493, ["planned", "completed"],
                    completed_kwh=-3.0)
         res = await self._run(st)
         self.assertEqual((res["restored"], res["reverted"], res["review"]),
                          (0, 0, 1))
         r = st._conn.execute(
-            "SELECT imp_rate, needs_review, review_reason FROM blocks "
-            "WHERE block_start=?", ("2020-01-01T20:00:00",)).fetchone()
-        self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)   # price unchanged
-        self.assertEqual(r["needs_review"], 1)                     # flagged (BL-18)
-        self.assertTrue(r["review_reason"])                        # reason stored
+            "SELECT imp_rate, needs_review FROM blocks WHERE block_start=?",
+            ("2020-01-01T20:00:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)   # unchanged
+        self.assertEqual(r["needs_review"], 1)                     # flagged
 
     async def test_resolved_clears_prior_review_flag(self):
         from block_store import BlockStore
@@ -611,24 +683,28 @@ class TestReconcilePass(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r["needs_review"], 0)
         self.assertIsNone(r["review_reason"])
 
-    async def test_review_deferred_when_unsettled(self):
+    async def test_recent_completed_only_deferred_until_settled(self):
+        # A completed-only slot still inside the settle window is DEFERRED — the
+        # completed record lands hours after the charge, so we wait before repricing
+        # rather than act on a half-arrived signal. (A past slot, below, is restored.)
+        import engine, datetime as _dt
         from block_store import BlockStore
         st = BlockStore(":memory:")
-        # Substantial completed, no started, but NOT DCC-settled yet: the review
-        # task isn't correctable (tool needs settlement), so defer — don't flag.
-        self._seed(st, "2020-01-01T20:00:00", 0.05493, ["planned", "completed"],
-                   completed_kwh=-3.0, settled=False)
-        # a stale flag from before the settlement gate existed
-        st._conn.execute(
-            "UPDATE blocks SET needs_review=1, review_reason='stale' "
-            "WHERE block_start=?", ("2020-01-01T20:00:00",))
-        st._conn.commit()
-        res = await self._run(st)
-        self.assertEqual(res["review"], 0)
+        recent = (_dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None, second=0, microsecond=0)
+                  - _dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:00")
+        self._seed(st, recent, 0.323092, ["planned", "completed"], completed_kwh=-3.0)
+        engine._store = st
+        engine._RECONCILE_SETTLE_HOURS = 6.0     # a real settle window (not the 0.0 harness)
+        engine._kraken_rate_schedules = {"import": self._sched()}
+        try:
+            res = await engine.reconcile_dispatch_overlay()
+        finally:
+            engine._store = None
         self.assertEqual(res["deferred"], 1)
-        r = st._conn.execute("SELECT needs_review FROM blocks WHERE block_start=?",
-                             ("2020-01-01T20:00:00",)).fetchone()
-        self.assertEqual(r["needs_review"], 0)      # not flagged / retracted while unsettled
+        self.assertEqual((res["restored"], res["reverted"], res["review"]), (0, 0, 0))
+        r = st._conn.execute("SELECT imp_rate FROM blocks WHERE block_start=?",
+                             (recent,)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.323092, places=5)  # untouched while deferred
 
     async def _run_offpeak_sched(self, store):
         # Reconcile with a schedule whose BASE rate equals the off-peak rate at
