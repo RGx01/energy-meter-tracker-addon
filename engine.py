@@ -7843,6 +7843,18 @@ async def run_gap_fill_job(from_ts, to_ts, *, channels=("import", "export"),
                 _store.rearm_carbon_backfill()
         except Exception as _ce:
             logger.warning("run_gap_fill_job: carbon re-arm failed: %s", _ce)
+        # Historical EXPORT fill: the API returns nothing for a slot with no export
+        # (a solar meter overnight), leaving it NULL — which then reads as a
+        # permanent, un-fillable export gap. Fill blank export slots on days that DID
+        # get export with 0 (day-scoped, imported-only, billing-neutral).
+        if _store is not None and "export" in tuple(channels):
+            try:
+                _zn = _store.zero_fill_imported_export_blanks()
+                if _zn:
+                    logger.info("run_gap_fill_job: zero-filled %d blank export slot(s) "
+                                "on imported export days", _zn)
+            except Exception as _ze:
+                logger.warning("run_gap_fill_job: export zero-fill failed: %s", _ze)
         try:
             j["phase"] = "recovering_prices"
             await repair_import_pricing()
@@ -9929,6 +9941,29 @@ async def _engine_startup_impl(ha: HAClient):
         logger.info("engine_startup: new install — initial config period created")
 
     logger.info("engine_startup: %d existing blocks in store", _store.count_blocks())
+
+    # ── One-off (versioned): zero-fill blank export slots on imported days that
+    # already carry export. A PDF/CSV/API historical import of a solar export meter
+    # only writes the daytime export and leaves overnight NULL; the gap detector
+    # can't tell that from real missing data, so it shows a permanent, un-fillable
+    # export "gap". Day-scoped (only days with >=1 imported export), imported blocks
+    # only, billing-neutral (0 export = £0). Runs once; the export gap then
+    # self-clears on the next api_import_gaps read.
+    try:
+        if not _store.get_meta("export_zero_fill_v1", False):
+            _tz = "UTC"
+            for _m in (config.get("meters") or {}).values():
+                if not (_m.get("meta") or {}).get("sub_meter"):
+                    _tz = (_m.get("meta") or {}).get("timezone", "UTC")
+                    break
+            _n = _store.zero_fill_imported_export_blanks(_tz)
+            _store.set_meta("export_zero_fill_v1", True)
+            if _n:
+                logger.info("engine_startup: export zero-fill — set %d blank export "
+                            "slot(s) to 0 on imported export days (one-off)", _n)
+    except Exception as _ze:
+        logger.warning("engine_startup: export zero-fill migration failed "
+                       "(non-fatal): %s", _ze)
 
     # ── Session gap detection ────────────────────────────────────────────
     # Use the last block BEFORE current_block.start to avoid zero-rate catch-up

@@ -3252,6 +3252,15 @@ class BlockStore:
                     self.clear_deleted_range(meter_id, _sf, _st)
                 except Exception:
                     pass
+            # Historical EXPORT import: a solar meter exports nothing overnight, and
+            # the source (PDF/CSV) only lists the daytime export — so fill the blank
+            # export slots on imported export days with 0, else they show as a
+            # permanent, un-fillable export gap. Day-scoped + imported-only.
+            if "export" in (channel_csvs or {}):
+                try:
+                    self.zero_fill_imported_export_blanks()
+                except Exception:
+                    pass
         return out
 
     def backup(self, dst_path: str) -> None:
@@ -3712,6 +3721,64 @@ class BlockStore:
             f"AND block_start >= ? AND block_start <= ? AND {col} IS NOT NULL",
             (meter_id, from_iso, to_iso)).fetchone()
         return int(row[0]) if row else 0
+
+    def zero_fill_imported_export_blanks(self, tz_name: Optional[str] = None) -> int:
+        """Historical-export hygiene: on any LOCAL day that carries some imported
+        export data, set that day's BLANK (NULL) export slots to 0.
+
+        A solar export meter exports nothing overnight, but a PDF/CSV/API historical
+        import that only wrote the daytime export left the rest of the day's export
+        NULL. The gap detector can't tell a legitimately-zero overnight slot from
+        real missing data, so those days show a permanent, un-fillable export "gap"
+        (the API returns nothing for a slot with no export, so it can never clear).
+
+        Day-scoped: only days that already have >=1 imported export value are filled,
+        so a genuinely un-imported export range (no export on the day at all) is left
+        untouched. IMPORTED blocks only (`source LIKE 'imported%'`) — never a live/DCC
+        block that is correctly awaiting export settlement. Sets exp_kwh=0.0 and
+        exp_cost=0.0 (billing-neutral: zero export is £0 either way), matching how the
+        surrounding fully-imported days already store their overnight zeros. Returns
+        the number of slots zero-filled.
+        """
+        from zoneinfo import ZoneInfo
+        if not tz_name:
+            r = self._conn.execute("SELECT timezone FROM config_periods "
+                                   "ORDER BY effective_from DESC LIMIT 1").fetchone()
+            tz_name = (r["timezone"] if r else "UTC") or "UTC"
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo("UTC")
+        utc = ZoneInfo("UTC")
+
+        def _local_day(bs: str) -> str:
+            try:
+                return (datetime.fromisoformat(bs).replace(tzinfo=utc)
+                        .astimezone(tz).date().isoformat())
+            except Exception:
+                return bs[:10]
+
+        rows = self._conn.execute(
+            "SELECT id, meter_id, block_start, exp_kwh FROM blocks "
+            "WHERE source LIKE 'imported%'").fetchall()
+        # (meter_id, local_day) that has any imported export value
+        export_days = set()
+        for r in rows:
+            if r["exp_kwh"] is not None:
+                export_days.add((r["meter_id"], _local_day(r["block_start"])))
+        to_fill = [r["id"] for r in rows
+                   if r["exp_kwh"] is None
+                   and (r["meter_id"], _local_day(r["block_start"])) in export_days]
+        if not to_fill:
+            return 0
+        with self._conn:
+            for i in range(0, len(to_fill), 900):
+                chunk = to_fill[i:i + 900]
+                ph = ",".join("?" * len(chunk))
+                self._conn.execute(
+                    f"UPDATE blocks SET exp_kwh = 0.0, exp_cost = 0.0 "
+                    f"WHERE id IN ({ph})", chunk)
+        return len(to_fill)
 
     def find_block_gaps(self, meter_id: str = "electricity_main",
                         *, min_age_hours: float = 48.0,
