@@ -8444,27 +8444,45 @@ async def _capture_dispatch_slots() -> int:
     completed = disp.get("completed") or []
     if completed:
         comp = _completed_dispatch_slot_energy(completed)
+        _comp_bounds_bill = _completed_dispatch_slot_bounds(completed)
         n_comp = 0
+        n_new = 0
         for slot_start, e_comp in comp.items():
             if e_comp is None:
                 continue
             existing = _store.get_dispatch_slot(slot_start)
-            if not existing:
-                continue
             try:
-                _store.upsert_dispatch_slot(
-                    slot_start,
-                    off_peak=bool(existing.get("off_peak")),
-                    provider=existing.get("provider") or provider,
-                    source=existing.get("source") or "smart-charge",
-                    state="completed", energy_completed=e_comp)
-                n_comp += 1
+                if existing:
+                    # Annotate an already-captured (planned) slot with completed
+                    # energy — off_peak/provider/source preserved.
+                    _store.upsert_dispatch_slot(
+                        slot_start,
+                        off_peak=bool(existing.get("off_peak")),
+                        provider=existing.get("provider") or provider,
+                        source=existing.get("source") or "smart-charge",
+                        state="completed", energy_completed=e_comp)
+                    n_comp += 1
+                else:
+                    # No 'planned' slot was ever captured (EMT was offline for it, or
+                    # this is a historical re-import). A COMPLETED Octopus dispatch is
+                    # the supplier's authoritative smart-charge record, so create an
+                    # off-peak slot from it — marked source='smart-charge-completed'
+                    # so the settlement reconcile reprices it off-peak with an audit
+                    # trail (reconciled-from-completed, not live-verified). The overlay
+                    # still gates on real meter draw, so a phantom slot never credits.
+                    _cb = _comp_bounds_bill.get(slot_start) or (None, None)
+                    _store.upsert_dispatch_slot(
+                        slot_start, off_peak=True, provider=provider,
+                        source="smart-charge-completed", state="completed",
+                        energy_completed=e_comp, raw_start=_cb[0], raw_end=_cb[1])
+                    n_new += 1
             except Exception as e:
                 logger.warning("_capture_dispatch_slots: completed persist %s "
                                "failed: %s", slot_start, e)
-        if n_comp:
-            logger.info("_capture_dispatch_slots: recorded completed energy for "
-                        "%d slot(s) (observe-only)", n_comp)
+        if n_comp or n_new:
+            logger.info("_capture_dispatch_slots: completed energy on %d slot(s); "
+                        "created %d off-peak slot(s) from completed-only dispatch(es)",
+                        n_comp, n_new)
 
     # Accumulate ALL planned + completed dispatches into dispatch_history
     # (observe-only, design §11) — a persistent record across polls, separate
@@ -8887,9 +8905,18 @@ def _reconcile_decision(has_started: bool, has_completed: bool,
             reason = (f"completed but not started, negligible energy "
                       f"({mag:.2f} kWh < {small_kwh} kWh) → peak (did not run)")
         else:
-            return ("review",
-                    f"completed ({mag:.2f} kWh) but not started — ambiguous "
-                    "(missed-poll smart or bump)")
+            # completed-with-substantial-energy but no 'started' seen. This is the
+            # EMT-was-offline / historical re-import case (the 'started' real-time
+            # signal was never captured). Octopus's `completedDispatches` is the
+            # supplier's authoritative smart-charge record — a manual boost is not a
+            # dispatch and doesn't appear there — so we accept it as off-peak rather
+            # than leaving it ambiguous at peak. rate_reconciled + the slot's
+            # source='smart-charge-completed' record that this came from a completed
+            # dispatch (reconciled, not live-verified) for audit. (Previously 'review'
+            # — left at peak — which silently under-credited a missed smart charge.)
+            target = "off_peak"
+            reason = (f"completed ({mag:.2f} kWh) but not started — off-peak from "
+                      "Octopus completed dispatch (authoritative; not live-verified)")
     if (target == "off_peak" and currently_off_peak) or \
        (target == "peak" and not currently_off_peak):
         return ("ok", "already correct")
@@ -8944,8 +8971,12 @@ async def reconcile_dispatch_overlay() -> dict:
                  AND b.block_start < ?
                  AND EXISTS (SELECT 1 FROM dispatch_slots s
                              WHERE s.slot_start = b.block_start AND s.off_peak = 1)
+                 -- Candidate if we saw a 'planned' dispatch OR a 'completed' one:
+                 -- a completed-only slot (EMT offline / re-imported) is repriced from
+                 -- the authoritative completed record (see _reconcile_decision).
                  AND EXISTS (SELECT 1 FROM dispatch_history h
-                             WHERE h.slot_start = b.block_start AND h.kind = 'planned')
+                             WHERE h.slot_start = b.block_start
+                               AND h.kind IN ('planned', 'completed'))
                ORDER BY b.block_start""", (started_cutoff,)).fetchall()
     except Exception as e:
         logger.warning("reconcile_dispatch_overlay: query failed: %s", e)
@@ -9236,7 +9267,42 @@ def _clear_stale_inprogress_reads(cb_for_gap, cold_start: bool) -> bool:
     return cleared
 
 
+_startup_lock = asyncio.Lock()   # serialises engine_startup (see wrapper below)
+_startup_pending = False         # a startup was requested while one was running
+
+
 async def engine_startup(ha: HAClient):
+    """Re-entrancy guard around the real startup.
+
+    engine_startup re-runs on several triggers — a config save, a DB restore, and an
+    HA reconnect — and each one tears down and rebuilds the BlockStore and the Kraken
+    API client. When two fire close together (e.g. a restore that also reconnects HA)
+    they used to run CONCURRENTLY on the loop, so one run closed the store / aiohttp
+    connector out from under the other: 'Connector is closed', 'Unclosed client
+    session', 'store not open — returning empty config' (a chart then rendered in the
+    wrong timezone), plus an API rate-limit storm from overlapping discovery. It also
+    saturated the loop, so loop-serialised operations elsewhere (the restore's store
+    teardown, a config-history delete) timed out.
+
+    This serialises runs (only one at a time) and COALESCES: a request that lands while
+    one is running sets a flag instead of stacking, and the in-flight run re-runs ONCE
+    at the end to pick up the latest state. Single-threaded event loop, so the flag
+    handoff is race-free."""
+    global _startup_pending
+    if _startup_lock.locked():
+        _startup_pending = True
+        logger.info("engine_startup: already running — request coalesced")
+        return
+    async with _startup_lock:
+        while True:
+            _startup_pending = False
+            await _engine_startup_impl(ha)
+            if not _startup_pending:
+                return
+            logger.info("engine_startup: a startup was requested mid-run — re-running once")
+
+
+async def _engine_startup_impl(ha: HAClient):
     """
     Run once when the add-on starts.
     Registers state triggers, detects session gaps, generates startup charts.

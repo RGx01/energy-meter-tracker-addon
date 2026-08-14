@@ -450,6 +450,7 @@ class TestKrakenConfigCredentialSafety(unittest.TestCase):
                                       "base_url": None}
         engine.kraken_available = lambda: False
         engine._kraken_mini_reader = None
+        engine.get_db_account = lambda: "A-OTHERUSER"
         engine.kraken_account_mismatch = lambda: ("A-OTHERUSER", "A-OWNER")
         try:
             r = make_client().get("/api/kraken-config")
@@ -462,6 +463,29 @@ class TestKrakenConfigCredentialSafety(unittest.TestCase):
             del engine._kraken_env
             del engine.kraken_available
             del engine._kraken_mini_reader
+            del engine.get_db_account
+            del engine.kraken_account_mismatch
+
+    def test_config_get_exposes_db_account_for_reconnect_prefill(self):
+        # After a restore, creds are missing but the DB is still stamped with the
+        # previously-connected account — the GET must surface it so the lightweight
+        # reconnect can pre-fill the account (no full wizard needed).
+        import engine
+        engine._kraken_env = lambda: {"api_key": None, "account_number": None,
+                                      "base_url": None}
+        engine.kraken_available = lambda: False
+        engine._kraken_mini_reader = None
+        engine.get_db_account = lambda: "A-OWNER"
+        engine.kraken_account_mismatch = lambda: None
+        try:
+            body = make_client().get("/api/kraken-config").get_json()
+            self.assertFalse(body["configured"])
+            self.assertEqual(body["db_account"], "A-OWNER")
+        finally:
+            del engine._kraken_env
+            del engine.kraken_available
+            del engine._kraken_mini_reader
+            del engine.get_db_account
             del engine.kraken_account_mismatch
 
 
@@ -1747,6 +1771,60 @@ class TestApiConfigHistoryDelete(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
 
 
+class TestConfigSaveRestoreGuard(unittest.TestCase):
+    """A config save must be refused while a DB restore is running — otherwise it
+    writes to the file the restore is swapping ('database is locked') and schedules
+    an extra engine_startup that piles onto the restore's own (the concurrency storm)."""
+
+    def test_save_config_rejected_during_restore(self):
+        saved = server._restore_job
+        server._restore_job = {"status": "running"}
+        try:
+            r = make_client().post("/api/config", json={"meters": {}})
+            self.assertEqual(r.status_code, 409)
+            self.assertIn("restore", r.get_json()["error"].lower())
+        finally:
+            server._restore_job = saved
+
+
+class TestConfigMutationBusy(unittest.TestCase):
+    """When the engine loop is busy (a slow post-restore engine_startup), a config
+    mutation submitted to it times out — but the coroutine stays queued and applies.
+    _config_mutation_on_loop turns that loop timeout into _ConfigBusy, and the config
+    endpoints report an honest 'queued' (503) instead of a raw TimeoutError (500)."""
+
+    def test_loop_timeout_becomes_configbusy(self):
+        import concurrent.futures
+        class _FakeLoop:
+            def is_running(self): return True
+        saved_loop, saved_run = server._event_loop, server._run_on_engine_loop
+        server._event_loop = _FakeLoop()
+        def _boom(coro, timeout=None):
+            try: coro.close()      # avoid 'coroutine never awaited'
+            except Exception: pass
+            raise concurrent.futures.TimeoutError()
+        server._run_on_engine_loop = _boom
+        try:
+            with self.assertRaises(server._ConfigBusy):
+                server._config_mutation_on_loop(lambda store: {"ok": True})
+        finally:
+            server._event_loop, server._run_on_engine_loop = saved_loop, saved_run
+
+    def test_delete_reports_queued_503_when_busy(self):
+        saved = server._config_mutation_on_loop
+        def _busy(mutate, timeout=30.0):
+            raise server._ConfigBusy()
+        server._config_mutation_on_loop = _busy
+        try:
+            r = make_client().delete("/api/config/history/1")
+            self.assertEqual(r.status_code, 503)
+            body = r.get_json()
+            self.assertTrue(body.get("queued"))
+            self.assertIn("queued", body["error"].lower())
+        finally:
+            server._config_mutation_on_loop = saved
+
+
 class TestApiBackupRestoreSync(unittest.TestCase):
     """
     When meters_config.json is restored, the active config_period and
@@ -1903,7 +1981,11 @@ class TestApiImportBlocksDb(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
         server.DATA_DIR = "/tmp/emt_test_data"  # restore default
-        server._restore_job = self._saved_job
+        # Reset to a FRESH idle dict: api_import / _restore_worker mutate _restore_job
+        # in place (.clear()/.update()), so restoring the saved reference could hand
+        # back a dict that's since been flipped to "running" — which then trips the
+        # config-save restore guard in a later test.
+        server._restore_job = {"status": "idle"}
 
     def _make_db_bytes(self):
         """Create a minimal valid SQLite blocks.db as bytes."""

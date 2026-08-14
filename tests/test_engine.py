@@ -1468,7 +1468,7 @@ class TestGapFillLimit(unittest.TestCase):
         """R2.5 — _meter_reset_detected must be False at start of engine_startup.
         Verified by checking the flag is reset in the function source."""
         import inspect
-        src = inspect.getsource(engine.engine_startup)
+        src = inspect.getsource(engine._engine_startup_impl)
         self.assertIn('_meter_reset_detected = False', src,
             "engine_startup must reset _meter_reset_detected to False")
 
@@ -1550,7 +1550,7 @@ class TestRogueTotalStaleReadGuard(unittest.TestCase):
         # The clear must run before/outside the `if missing_windows:` branch so
         # the no-gap short-restart path is covered too.
         import inspect
-        src = inspect.getsource(engine.engine_startup)
+        src = inspect.getsource(engine._engine_startup_impl)
         self.assertIn("rogue-total guard", src,
             "engine_startup must clear stale in-progress reads unconditionally")
         # The unconditional clear must appear BEFORE the gap-detection branch.
@@ -5731,3 +5731,39 @@ class TestChartRegenCoalesce(unittest.TestCase):
         engine._charts_dirty = False
         asyncio.run(engine._generate_charts_offloaded())
         self.assertTrue(engine._charts_dirty)   # re-run queued, not silently skipped
+
+
+class TestEngineStartupReentrancy(unittest.TestCase):
+    """engine_startup re-runs on a config save, a restore, and an HA reconnect — which
+    can all fire at once. Without a guard they ran concurrently and tore down/rebuilt
+    the store + Kraken client under each other ('Connector is closed', 'Unclosed client
+    session', 'store not open'). The wrapper must (a) never run two at once and
+    (b) coalesce overlapping requests into a single re-run."""
+
+    def test_concurrent_startups_serialised_and_coalesced(self):
+        import asyncio
+        state = {"n": 0, "live": 0, "max_live": 0}
+
+        async def _fake_impl(ha):
+            state["live"] += 1
+            state["max_live"] = max(state["max_live"], state["live"])
+            state["n"] += 1
+            await asyncio.sleep(0.02)     # hold the lock so the others pile up
+            state["live"] -= 1
+
+        orig = engine._engine_startup_impl
+        engine._engine_startup_impl = _fake_impl
+        engine._startup_lock = asyncio.Lock()   # fresh lock for this test's loop
+        engine._startup_pending = False
+        try:
+            async def _go():
+                await asyncio.gather(engine.engine_startup(None),
+                                     engine.engine_startup(None),
+                                     engine.engine_startup(None))
+            asyncio.run(_go())
+        finally:
+            engine._engine_startup_impl = orig
+
+        self.assertEqual(state["max_live"], 1)    # never two at once
+        self.assertEqual(state["n"], 2)           # first run + ONE coalesced re-run
+

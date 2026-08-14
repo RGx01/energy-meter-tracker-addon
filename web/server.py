@@ -275,6 +275,19 @@ class _ConfigError(Exception):
     """A config-period mutation validation error → surfaced as HTTP 400."""
 
 
+class _ConfigBusy(Exception):
+    """The mutation was submitted to the engine loop but the loop was busy (typically a
+    long post-restore engine_startup, made slower by an HA WebSocket drop), so we
+    stopped waiting. run_coroutine_threadsafe is NOT cancelled by a result-timeout —
+    the coroutine stays queued and WILL apply once the loop frees. The endpoint reports
+    an honest 'queued' instead of a misleading raw TimeoutError."""
+
+
+_CONFIG_BUSY_MSG = ("The engine is busy finishing a restore or reconnecting — your "
+                    "change has been queued and should apply within a minute. Refresh "
+                    "to confirm.")
+
+
 def _config_mutation_on_loop(mutate, timeout: float = 30.0):
     """Run a config_periods read+write on the ENGINE's loop and connection, then
     schedule an OFF-loop chart regen (#361).
@@ -303,7 +316,16 @@ def _config_mutation_on_loop(mutate, timeout: float = 30.0):
         except Exception as _ce:
             logger.warning("_config_mutation_on_loop: chart regen schedule failed: %s", _ce)
         return res
-    return _run_on_engine_loop(_coro(), timeout=timeout)
+    import concurrent.futures as _cf
+    try:
+        return _run_on_engine_loop(_coro(), timeout=timeout)
+    except _cf.TimeoutError:
+        # The loop was busy (e.g. a slow post-restore engine_startup). The mutation is
+        # still queued and will apply — signal 'queued' so the endpoint doesn't report
+        # a raw TimeoutError for a change that actually succeeds.
+        logger.warning("_config_mutation_on_loop: engine loop busy after %.0fs — "
+                       "mutation left queued (will apply once the loop frees)", timeout)
+        raise _ConfigBusy()
 
 
 def _schedule_offloaded_regen():
@@ -2861,6 +2883,8 @@ def api_config_history_create():
         return jsonify(result)
     except _ConfigError as ce:
         return jsonify({"error": str(ce)}), 400
+    except _ConfigBusy:
+        return jsonify({"queued": True, "error": _CONFIG_BUSY_MSG}), 503
     except Exception as e:
         logger.error("api_config_history_create: %s", e)
         return jsonify({"error": str(e)}), 500
@@ -2958,6 +2982,8 @@ def api_config_history_update(period_id):
                     period_id, list(updates.keys()),
                     " +postcode" if postcode_edit else "")
         return jsonify(result)
+    except _ConfigBusy:
+        return jsonify({"queued": True, "error": _CONFIG_BUSY_MSG}), 503
     except Exception as e:
         logger.error("api_config_history_update: %s", e)
         return jsonify({"error": str(e)}), 500
@@ -3012,14 +3038,26 @@ def api_config_history_delete(period_id):
         return jsonify(result)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    except _ConfigBusy:
+        return jsonify({"queued": True, "error": _CONFIG_BUSY_MSG}), 503
     except Exception as e:
-        logger.error("api_config_history_delete: %s", e)
-        return jsonify({"error": str(e)}), 500
+        # repr(): a loop timeout (TimeoutError) str()s to '' — repr keeps the type.
+        logger.error("api_config_history_delete: %r", e)
+        return jsonify({"error": str(e) or e.__class__.__name__}), 500
 
 
 @app.route("/api/config", methods=["POST"])
 def api_save_config():
     try:
+        # Don't let a config save race an in-flight DB restore: it writes to the same
+        # SQLite file the restore is swapping out (→ "database is locked"), takes a
+        # pointless pre_config_save backup, and schedules an extra engine_startup that
+        # piles onto the restore's own — the concurrency storm seen in the logs. Refuse
+        # clearly; the user can save again once the restore's progress banner clears.
+        if _restore_job.get("status") == "running":
+            return jsonify({"error": "A database restore is in progress — wait for it "
+                                     "to finish, then save your config again."}), 409
+
         payload = request.get_json(force=True)
         if not isinstance(payload, dict) or "meters" not in payload:
             return jsonify({"error": "Invalid config structure"}), 400
@@ -3360,22 +3398,41 @@ def _restore_worker(zipname, selected, from_flat, staged=None):
         # If any connection remains open, SQLite WAL will be inconsistent with
         # the newly written DB file, causing "malformed" on next open.
         try:
-            # Checkpoint via engine store (primary write connection)
-            if _eng_r and hasattr(_eng_r, "get_store"):
+            # Checkpoint + close the ENGINE store ON THE ENGINE LOOP — never from this
+            # restore-worker thread. The engine's connection is opened
+            # check_same_thread=False, so a PRAGMA wal_checkpoint / close() issued here
+            # while the loop is mid-query on the SAME connection is a concurrent use of
+            # one SQLite connection from two threads → Segmentation fault. pause_engine()
+            # only sets a cooperative flag; it does NOT stop work already in flight on the
+            # loop (a chart regen, discovery, a scheduled task), so the collision is real
+            # whenever the loop is busy. Running this as a loop task serialises it against
+            # every other loop DB access (the event loop is single-threaded).
+            def _teardown_engine_store():
+                import engine as _eng_mod2
+                if getattr(_eng_mod2, "_store", None) is None:
+                    return
                 try:
-                    _es = _eng_r.get_store()
-                    _es._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    _eng_mod2._store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                     logger.info("api_backup_restore: WAL checkpoint complete")
                 except Exception as _ce:
                     logger.warning("api_backup_restore: WAL checkpoint failed: %s", _ce)
-            # Close engine store connection
-            import engine as _eng_mod
-            if hasattr(_eng_mod, "_store") and _eng_mod._store is not None:
                 try:
-                    _eng_mod._store.close()
-                except Exception: pass
-                _eng_mod._store = None
-            # Close web server store connection
+                    _eng_mod2._store.close()
+                except Exception:
+                    pass
+                _eng_mod2._store = None
+            try:
+                if _event_loop and _event_loop.is_running():
+                    async def _co_teardown():
+                        _teardown_engine_store()
+                    _run_on_engine_loop(_co_teardown(), timeout=30.0)
+                else:
+                    _teardown_engine_store()
+            except Exception as _te:
+                # repr(): a loop timeout (TimeoutError) has an empty str(), which
+                # logged a blank reason — repr keeps the type visible.
+                logger.warning("api_backup_restore: engine store teardown failed: %r", _te)
+            # Close web server store connection (this thread's own store handle)
             if _store:
                 try: _store.close()
                 except Exception: pass
@@ -3473,12 +3530,20 @@ def _restore_worker(zipname, selected, from_flat, staged=None):
                 _rc.close()
             except Exception as _je:
                 logger.warning("api_backup_restore: journal_mode switch failed: %s", _je)
-            # Reset engine store so it reopens from the new file on next tick
+            # Reset engine store so it reopens from the new file — ON THE ENGINE LOOP,
+            # so the fresh connection is created and owned by the loop thread and never
+            # races a concurrent loop query (same check_same_thread=False hazard as the
+            # checkpoint/close above).
             import sys as _sys_r
             _eng_r = _sys_r.modules.get("engine")
             if _eng_r and hasattr(_eng_r, "reset_store"):
                 try:
-                    _eng_r.reset_store()
+                    if _event_loop and _event_loop.is_running():
+                        async def _co_reset():
+                            _eng_r.reset_store()
+                        _run_on_engine_loop(_co_reset(), timeout=30.0)
+                    else:
+                        _eng_r.reset_store()
                     logger.info("api_backup_restore: engine store reset OK")
                 except Exception as _re:
                     logger.warning("api_backup_restore: engine reset_store failed: %s", _re)
@@ -3710,6 +3775,10 @@ def api_kraken_config_get():
             "account_number": env.get("account_number"),
             "connected": _eng.kraken_available(),
             "mini": _eng._kraken_mini_reader is not None,
+            # #357: the account this DB was previously connected to (stamped on first
+            # discovery). Lets the UI pre-fill the account on a lightweight reconnect
+            # after a restore, so re-adding a key doesn't need the full setup wizard.
+            "db_account": _eng.get_db_account(),
         }
         # #357: if this DB is stamped to a different account than the credentials,
         # the API was NOT auto-activated — surface it so the UI can prompt an
@@ -6346,9 +6415,18 @@ def _create_backup_zip(label="backup"):
                         _bk_store = None
                 if _bk_store is None:
                     _bk_store = _get_store()
-                _bk_store.backup(db_src + ".bak")
-                zf.write(db_src + ".bak", "blocks.db")
-                os.remove(db_src + ".bak")
+                # Unique temp name per call: two backups can run at once (e.g. a
+                # config-save's pre_config_save and a restore's pre_restore), and a
+                # shared 'blocks.db.bak' let one delete the other's file mid-write →
+                # "No such file: blocks.db.bak". Scope it to this pid+thread.
+                _bak = f"{db_src}.{os.getpid()}.{threading.get_ident()}.bak"
+                try:
+                    _bk_store.backup(_bak)
+                    zf.write(_bak, "blocks.db")
+                finally:
+                    if os.path.exists(_bak):
+                        try: os.remove(_bak)
+                        except OSError: pass
             except Exception as _e:
                 logger.warning("_create_backup_zip: blocks.db backup failed: %s", _e)
         for fname in files:
