@@ -2268,21 +2268,24 @@ def _blocks_data_version(store) -> str:
         "ROUND(COALESCE(SUM(exp_cost), 0), 2) AS ec, "
         "ROUND(COALESCE(SUM(carbon_g), 0), 0) AS cg "
         "FROM blocks").fetchone()
-    # Config-period fingerprint: a billing-period create/edit/delete rebuilds the
-    # billing chart but changes NO block value, so without this the token stayed put
-    # and the Charts page's freshness gate never refreshed after a config change
-    # (the "charts don't update after removing a period" confusion). Covers add/remove
-    # (count/max-id), a billing-day edit (sum), and a date edit (max from/to). Tiny
-    # table → negligible cost.
-    cp = store._conn.execute(
-        "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS mid, "
-        "COALESCE(SUM(billing_day), 0) AS sbd, "
-        "COALESCE(MAX(effective_from), '') AS mef, "
-        "COALESCE(MAX(COALESCE(effective_to, '')), '') AS met "
-        "FROM config_periods").fetchone()
+    # Rendered-chart freshness: the Billing (daily) and Heatmap tabs serve the
+    # PRE-RENDERED files, and a config-period change (or settlement) regenerates them
+    # OFF the loop a moment AFTER the DB write. Keying the token on the DB alone moved
+    # it at write time — before the file was rewritten — so the Charts page reloaded
+    # the STALE file, latched the new token, and then didn't refresh again until the
+    # next finalise moved the token. Fingerprinting the rendered files' mtimes advances
+    # the token exactly when the new HTML actually lands, so the reload picks up fresh
+    # content — and this also covers a config change (billing-day / add / remove), since
+    # every config mutation schedules a regen that rewrites these files.
+    _mt = []
+    for _cf in ("daily_usage.html", "net_heatmap.html"):
+        try:
+            _mt.append(f"{os.path.getmtime(os.path.join(CHART_DIR, _cf)):.3f}")
+        except (OSError, TypeError):   # missing file, or CHART_DIR unset (tests)
+            _mt.append("0")
     return (f"{row['c']}:{row['m'] or ''}:"
             f"{row['ik']}:{row['ic']}:{row['ek']}:{row['ec']}:{row['cg']}:"
-            f"{cp['n']}:{cp['mid']}:{cp['sbd']}:{cp['mef']}:{cp['met']}")
+            f"{':'.join(_mt)}")
 
 
 @app.route("/api/charts/data-version")

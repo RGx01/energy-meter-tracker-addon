@@ -6228,14 +6228,6 @@ class TestBlocksDataVersion(unittest.TestCase):
             "INSERT INTO blocks VALUES (?,?,?,?,?,?)",
             [("2026-02-12T00:00:00", 0.0, 0.0, 0.0, 0.0, 0.0),
              ("2026-02-12T00:30:00", 1.0, 20.0, 2.0, 0.0, 150.0)])
-        # The token now also fingerprints config_periods (so a billing-period change
-        # busts the cache and the Charts page refreshes) — the fake store needs it.
-        conn.execute(
-            "CREATE TABLE config_periods (id INTEGER PRIMARY KEY, effective_from TEXT, "
-            "effective_to TEXT, billing_day INTEGER)")
-        conn.execute(
-            "INSERT INTO config_periods (id, effective_from, effective_to, billing_day) "
-            "VALUES (1, '2024-01-01T00:00:00', NULL, 1)")
         conn.commit()
         return types.SimpleNamespace(_conn=conn)
 
@@ -6274,27 +6266,31 @@ class TestBlocksDataVersion(unittest.TestCase):
         self.assertEqual(server._blocks_data_version(st),
                          server._blocks_data_version(st))
 
-    def test_config_period_change_moves_token(self):
-        # A billing-period create/edit/delete changes NO block value, so the block
-        # fingerprint (count:max:sums) is identical — but the Charts page must still
-        # refresh, so a config_periods change has to move the token.
-        import server
+    def test_chart_file_regen_moves_token(self):
+        # A config-period change (or settlement) rebuilds the pre-rendered chart files
+        # a moment AFTER the DB write. The token must advance when the FILE is rewritten
+        # — not at DB-write time — otherwise the Charts page reloads the stale file,
+        # latches the token, and stays stale until the next finalise. So the rendered
+        # files' mtimes are part of the token.
+        import server, os, time, tempfile, shutil
         st = self._store()
-        before = server._blocks_data_version(st)
-        # (a) edit the billing day
-        st._conn.execute("UPDATE config_periods SET billing_day = 6 WHERE id = 1")
-        st._conn.commit()
-        edited = server._blocks_data_version(st)
-        self.assertNotEqual(before, edited)
-        # (b) add a new period
-        st._conn.execute(
-            "INSERT INTO config_periods (id, effective_from, effective_to, billing_day) "
-            "VALUES (2, '2026-07-01T00:00:00', NULL, 6)")
-        st._conn.commit()
-        added = server._blocks_data_version(st)
-        self.assertNotEqual(edited, added)
-        # The block-value prefix (count:max:sums) is unchanged throughout.
-        self.assertEqual(before.split(":")[:7], added.split(":")[:7])
+        d = tempfile.mkdtemp()
+        daily = os.path.join(d, "daily_usage.html")
+        open(daily, "w").write("x")
+        open(os.path.join(d, "net_heatmap.html"), "w").write("y")
+        _orig = server.CHART_DIR
+        server.CHART_DIR = d
+        try:
+            before = server._blocks_data_version(st)
+            # Simulate the off-loop regen rewriting the daily chart (newer mtime).
+            os.utime(daily, (time.time() + 5, time.time() + 5))
+            after = server._blocks_data_version(st)
+            self.assertNotEqual(before, after)
+            # The block-value prefix (count:max:sums) is unchanged — only the file moved.
+            self.assertEqual(before.split(":")[:7], after.split(":")[:7])
+        finally:
+            server.CHART_DIR = _orig
+            shutil.rmtree(d, ignore_errors=True)
 
 
 class TestUsageSubMeterGridShare(unittest.TestCase):
