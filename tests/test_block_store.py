@@ -5469,5 +5469,81 @@ class TestOldestGapStart(unittest.TestCase):
         self.assertIsNone(st.get_oldest_gap_start(since_iso="2026-08-12T10:30:00"))
 
 
+class TestMaterialiseCompletedOnlySlots(unittest.TestCase):
+    """materialise_completed_only_slots promotes SUBSTANTIAL completed-ONLY
+    dispatch_history rows (no planned/started, no existing slot) into off-peak
+    dispatch_slots so a smart charge stranded in the history ledger (completed
+    dispatch aged out of the provider's rolling window / re-imported) can be
+    repriced off-peak by reconcile. The 20:00-BST dev-DB mispricing."""
+
+    def _store(self):
+        return BlockStore(":memory:")
+
+    def _slot(self, st, slot_start):
+        return st._conn.execute(
+            "SELECT off_peak, source, state, energy_completed "
+            "FROM dispatch_slots WHERE slot_start = ?", (slot_start,)).fetchone()
+
+    def test_materialises_completed_only_substantial(self):
+        st = self._store()
+        st.record_dispatch_history("2026-08-12T19:00:00", "completed",
+                                   provider="Myenergi", source="unknown",
+                                   energy_kwh=-1.65)
+        self.assertEqual(st.materialise_completed_only_slots(0.4), 1)
+        row = self._slot(st, "2026-08-12T19:00:00")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["off_peak"], 1)
+        self.assertEqual(row["source"], "smart-charge-completed")
+        self.assertEqual(row["state"], "completed")
+        self.assertAlmostEqual(row["energy_completed"], -1.65)
+
+    def test_negligible_completed_is_not_materialised(self):
+        st = self._store()
+        st.record_dispatch_history("2026-08-12T19:30:00", "completed",
+                                   provider="Myenergi", energy_kwh=-0.25)
+        self.assertEqual(st.materialise_completed_only_slots(0.4), 0)
+        self.assertIsNone(self._slot(st, "2026-08-12T19:30:00"))
+
+    def test_completed_with_planned_is_skipped(self):
+        # planned present → NOT the offline/completed-only case; the live capture
+        # already made a slot and reconcile handles it (review, not auto off-peak).
+        st = self._store()
+        st.record_dispatch_history("2026-08-12T20:00:00", "planned",
+                                   provider="Myenergi", energy_kwh=-3.0)
+        st.record_dispatch_history("2026-08-12T20:00:00", "completed",
+                                   provider="Myenergi", energy_kwh=-3.0)
+        self.assertEqual(st.materialise_completed_only_slots(0.4), 0)
+        self.assertIsNone(self._slot(st, "2026-08-12T20:00:00"))
+
+    def test_completed_with_started_is_skipped(self):
+        st = self._store()
+        st.record_dispatch_history("2026-08-12T21:00:00", "started",
+                                   provider="Myenergi")
+        st.record_dispatch_history("2026-08-12T21:00:00", "completed",
+                                   provider="Myenergi", energy_kwh=-3.0)
+        self.assertEqual(st.materialise_completed_only_slots(0.4), 0)
+        self.assertIsNone(self._slot(st, "2026-08-12T21:00:00"))
+
+    def test_existing_slot_is_left_untouched(self):
+        # a slot already present (e.g. captured live as smart-charge) is never
+        # overwritten by the completed-only materialisation.
+        st = self._store()
+        st.upsert_dispatch_slot("2026-08-12T22:00:00", off_peak=True,
+                                provider="Myenergi", source="smart-charge",
+                                state="planned")
+        st.record_dispatch_history("2026-08-12T22:00:00", "completed",
+                                   provider="Myenergi", energy_kwh=-3.0)
+        self.assertEqual(st.materialise_completed_only_slots(0.4), 0)
+        self.assertEqual(self._slot(st, "2026-08-12T22:00:00")["source"],
+                         "smart-charge")
+
+    def test_idempotent(self):
+        st = self._store()
+        st.record_dispatch_history("2026-08-12T19:00:00", "completed",
+                                   provider="Myenergi", energy_kwh=-1.65)
+        self.assertEqual(st.materialise_completed_only_slots(0.4), 1)
+        self.assertEqual(st.materialise_completed_only_slots(0.4), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

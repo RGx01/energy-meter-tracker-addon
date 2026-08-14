@@ -25,6 +25,7 @@ specs — the code is the source of truth; read these for context.
 - `intelligent_rates_design.md` — IOG dispatch overlay and off-peak pricing.
 - `dispatch_validation_design.md` — validating smart-charge dispatch slots.
 - `measurements_cost_recovery_design.md` — recovering exact billed cost from the Measurements API.
+- `deleted_ranges_design.md` — BL-8 phase 2: deliberate deletions persist (tombstones) and only a targeted re-import restores them.
 - `bill_to_csv_import_spec.md` — reconstructing history from Octopus PDF bills.
 - `mode_ui_design.md` / `wizard_design.md` / `historical_import_wizard_design.md` — setup/mode UX.
 - `data_management_vision.md` — the Data Management area's direction.

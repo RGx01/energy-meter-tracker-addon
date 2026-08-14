@@ -61,8 +61,29 @@ async def main():
     # 3 — Run startup sequence (register triggers, gap detection, charts)
     await engine_startup(ha)
 
-    # Register reconnect handler — re-runs startup if HA restarts
+    # Register reconnect handler — re-runs startup if HA genuinely restarted, but
+    # NOT on a brief WS flap. Re-running the whole startup (WAL checkpoint, backup,
+    # discovery, poll, chart render) saturates the single event loop; that stalls the
+    # WS heartbeat, HA drops the socket, we reconnect, and it re-runs again — a self-
+    # sustaining reconnect storm (seen after a large delete's chart rebuild). The
+    # listen loop already re-subscribes state_changed on every reconnect, so a flap
+    # needs no startup. Only re-run after a genuine outage (a while since the last
+    # startup completed).
+    import engine as _eng
+    # Long enough to cover an offloaded chart render (which can run a few minutes
+    # after startup completes over a large history and is the usual flap trigger).
+    RECONNECT_STARTUP_COOLDOWN_S = 300
     async def on_reconnect():
+        since = _eng.seconds_since_startup()
+        # Skip the heavy startup re-run on a self-inflicted flap: either a startup
+        # completed recently, OR a chart render is in progress / just finished (the
+        # render is CPU/GIL-bound, so it stalls the WS heartbeat for MINUTES —
+        # longer than the startup cooldown — and IS the usual flap trigger).
+        if since < RECONNECT_STARTUP_COOLDOWN_S or _eng.render_recently_active():
+            logger.info("main: HA reconnected (%.0fs since startup, render_active=%s) "
+                        "— skipping startup re-run (WS re-subscribed; avoids reconnect "
+                        "storm)", since, _eng.render_recently_active())
+            return
         logger.info("main: HA reconnected — re-running engine startup")
         await engine_startup(ha)
     ha._on_reconnect = on_reconnect
