@@ -19,6 +19,7 @@ import logging
 import os
 import shutil
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 from energy_engine_io import (
@@ -1785,6 +1786,20 @@ def generate_charts(store: "BlockStore", config: dict = None):
 
 _charts_rendering = False        # guard: at most one off-loop render at a time
 _charts_dirty = False            # a regen was requested while one was in progress → re-run
+_last_render_complete_ts = 0.0   # monotonic time the last chart render finished
+
+
+def render_recently_active(quiet_s: float = 180.0) -> bool:
+    """True if a chart render is in progress OR finished within the last `quiet_s`
+    seconds. The HA-reconnect handler uses this to skip a startup re-run: a heavy
+    render (CPU/GIL-bound, so the thread offload can't stop it stalling the WS
+    heartbeat) is what causes the flap, and it can run for MINUTES — longer than the
+    startup-completion cooldown — so keying off render activity closes that gap."""
+    if _charts_rendering:
+        return True
+    if not _last_render_complete_ts:
+        return False
+    return (time.monotonic() - _last_render_complete_ts) < quiet_s
 _charts_task = None              # held reference so a fire-and-forget task isn't GC'd
 
 
@@ -1805,7 +1820,7 @@ async def _generate_charts_offloaded():
     """
     import asyncio as _asyncio
     from block_store import BlockStore
-    global _charts_rendering, _charts_dirty
+    global _charts_rendering, _charts_dirty, _last_render_complete_ts
     if _store is None:
         return
     if _charts_rendering:
@@ -1851,6 +1866,7 @@ async def _generate_charts_offloaded():
             logger.info("generate_charts: a change arrived mid-render — re-rendering with fresh config")
     finally:
         _charts_rendering = False
+        _last_render_complete_ts = time.monotonic()
 
 
 def _schedule_chart_regen() -> None:
@@ -3905,6 +3921,25 @@ def set_delete_active(active: bool) -> None:
 
 def delete_in_progress() -> bool:
     return _delete_active
+
+
+_poll_active = False   # a kraken DCC poll / BL-8 backfill cycle is mutating blocks
+
+
+def set_poll_active(active: bool) -> None:
+    """Flagged around a kraken poll cycle (DCC ingest + BL-8 outage backfill).
+    A manual date-range delete refuses while this is set: the poll and the delete
+    share the single SQLite connection, and BL-8 backfill re-creates settled blocks
+    with no local block — so a delete racing a backfill leaves a half-deleted day
+    (the dev-DB 'deleted the 12th mid-backfill, it came back partial' incident).
+    Time-bounded (cleared in a finally), so a delete can never be blocked
+    indefinitely."""
+    global _poll_active
+    _poll_active = bool(active)
+
+
+def poll_in_progress() -> bool:
+    return _poll_active
 
 
 def _fetch_carbon_intensity_range(postcode: str, from_iso: str, to_iso: str) -> dict:
@@ -7743,6 +7778,19 @@ async def run_gap_fill_job(from_ts, to_ts, *, channels=("import", "export"),
               "reason": None, "error": None, "done": False, "go_live": None,
               "gap": {"from": from_ts, "to": to_ts}})
     _reset_pricing_health()
+    # BL-8 phase 2: a gap fill over a SPECIFIC window is a TARGETED, explicit restore
+    # (per-gap button / range / re-import) — lift any tombstone over it first (sub-
+    # span split), so the range is genuinely un-deleted and the create-gate no longer
+    # skips it. The blanket "recover all" path (resolve_history_gaps) does NOT do this
+    # and so leaves deliberately-deleted ranges deleted.
+    try:
+        if _store is not None:
+            _lifted = _store.clear_deleted_range(meter_id, from_ts, to_ts)
+            if _lifted:
+                logger.info("run_gap_fill_job: lifted %d tombstone(s) over %s..%s "
+                            "(targeted re-import)", _lifted, from_ts, to_ts)
+    except Exception as _te:
+        logger.warning("run_gap_fill_job: tombstone clear failed (non-fatal): %s", _te)
     hi = to_ts
     try:
         while True:
@@ -8444,27 +8492,45 @@ async def _capture_dispatch_slots() -> int:
     completed = disp.get("completed") or []
     if completed:
         comp = _completed_dispatch_slot_energy(completed)
+        _comp_bounds_bill = _completed_dispatch_slot_bounds(completed)
         n_comp = 0
+        n_new = 0
         for slot_start, e_comp in comp.items():
             if e_comp is None:
                 continue
             existing = _store.get_dispatch_slot(slot_start)
-            if not existing:
-                continue
             try:
-                _store.upsert_dispatch_slot(
-                    slot_start,
-                    off_peak=bool(existing.get("off_peak")),
-                    provider=existing.get("provider") or provider,
-                    source=existing.get("source") or "smart-charge",
-                    state="completed", energy_completed=e_comp)
-                n_comp += 1
+                if existing:
+                    # Annotate an already-captured (planned) slot with completed
+                    # energy — off_peak/provider/source preserved.
+                    _store.upsert_dispatch_slot(
+                        slot_start,
+                        off_peak=bool(existing.get("off_peak")),
+                        provider=existing.get("provider") or provider,
+                        source=existing.get("source") or "smart-charge",
+                        state="completed", energy_completed=e_comp)
+                    n_comp += 1
+                else:
+                    # No 'planned' slot was ever captured (EMT was offline for it, or
+                    # this is a historical re-import). A COMPLETED Octopus dispatch is
+                    # the supplier's authoritative smart-charge record, so create an
+                    # off-peak slot from it — marked source='smart-charge-completed'
+                    # so the settlement reconcile reprices it off-peak with an audit
+                    # trail (reconciled-from-completed, not live-verified). The overlay
+                    # still gates on real meter draw, so a phantom slot never credits.
+                    _cb = _comp_bounds_bill.get(slot_start) or (None, None)
+                    _store.upsert_dispatch_slot(
+                        slot_start, off_peak=True, provider=provider,
+                        source="smart-charge-completed", state="completed",
+                        energy_completed=e_comp, raw_start=_cb[0], raw_end=_cb[1])
+                    n_new += 1
             except Exception as e:
                 logger.warning("_capture_dispatch_slots: completed persist %s "
                                "failed: %s", slot_start, e)
-        if n_comp:
-            logger.info("_capture_dispatch_slots: recorded completed energy for "
-                        "%d slot(s) (observe-only)", n_comp)
+        if n_comp or n_new:
+            logger.info("_capture_dispatch_slots: completed energy on %d slot(s); "
+                        "created %d off-peak slot(s) from completed-only dispatch(es)",
+                        n_comp, n_new)
 
     # Accumulate ALL planned + completed dispatches into dispatch_history
     # (observe-only, design §11) — a persistent record across polls, separate
@@ -8852,25 +8918,33 @@ _RECONCILE_SMALL_COMPLETED_KWH = 0.4
 
 def _reconcile_decision(has_started: bool, has_completed: bool,
                         completed_energy, currently_off_peak: bool,
+                        has_planned: bool = True,
                         small_kwh: float = _RECONCILE_SMALL_COMPLETED_KWH) -> tuple:
     """Settlement-time reconciliation of the dispatch overlay against the
-    accumulated lifecycle (design §12). Keys on whether the slot STARTED
+    accumulated lifecycle (design §12, §14). Keys on whether the slot STARTED
     (SMART_CONTROL_IN_PROGRESS + planned active) — the validated smart-vs-bump,
-    solar-immune signal — and, for the completed-without-started case, on the
-    completed ENERGY magnitude (also solar-safe; never the meter).
+    solar-immune signal — and, for the completed-without-started case, on whether we
+    were online to see it (has_planned) and the completed ENERGY magnitude.
 
     Returns (target, reason) where target is one of:
-      - 'off_peak' : started present → genuine smart charge. Restores off-peak,
-                     including solar slots the meter floor wrongly rejected.
+      - 'off_peak' : (a) started present → genuine smart charge (restore, incl. solar
+                     slots the meter floor wrongly rejected); or (b) COMPLETED-ONLY
+                     with substantial energy and NO planned/started ever captured —
+                     EMT was offline / this is a re-import, so 'started' was never
+                     capturable. We accept Octopus's completed dispatch as authoritative
+                     (design §14). NOTE this can over-credit a genuine offline BUMP —
+                     completed alone can't tell smart from bump (§11.1) — but under-
+                     crediting a missed smart charge is the worse default, and a bump
+                     is correctable via the corrections tool.
       - 'peak'     : (a) neither started nor completed → planned but never charged;
                      or (b) completed-without-started with NEGLIGIBLE energy
-                     (|completed| < small_kwh) — the dispatch didn't materially
-                     run, so it can be neither a bump nor a real charge, hence
-                     peak (fixes the 10-Jul over-credit).
-      - 'review'   : completed-without-started with SUBSTANTIAL energy — still
-                     genuinely ambiguous (a missed-poll smart charge OR a bump).
-                     Price left unchanged and the block flagged for the user to
-                     check against the real bill.
+                     (|completed| < small_kwh) — the dispatch didn't materially run.
+      - 'review'   : we WERE online (a 'planned' was captured) but the slot never
+                     STARTED, yet completed with substantial energy — genuinely
+                     ambiguous (a bump vs a paused smart charge), §11.1. Price left
+                     unchanged and the block flagged for the user to check. We do NOT
+                     auto-off-peak this case, because unlike the offline case we had
+                     the chance to see 'started' and didn't.
       - 'ok'       : the correct target already matches the current rate.
     Only 'off_peak' and 'peak' are actionable; 'review' flags, 'ok' writes nothing.
     """
@@ -8886,10 +8960,24 @@ def _reconcile_decision(has_started: bool, has_completed: bool,
             target = "peak"
             reason = (f"completed but not started, negligible energy "
                       f"({mag:.2f} kWh < {small_kwh} kWh) → peak (did not run)")
-        else:
+        elif has_planned:
+            # We were ONLINE (captured a 'planned') but it never went
+            # SMART_CONTROL_IN_PROGRESS. Per §11.1 that's ambiguous (bump vs paused
+            # smart) — leave at peak, flag for review. Unchanged from the original.
             return ("review",
-                    f"completed ({mag:.2f} kWh) but not started — ambiguous "
-                    "(missed-poll smart or bump)")
+                    f"completed ({mag:.2f} kWh) but not started, planned was seen — "
+                    "ambiguous (bump vs paused smart)")
+        else:
+            # COMPLETED-ONLY: no planned/started ever captured → EMT was offline for
+            # this slot or it's a historical re-import, so 'started' was never
+            # capturable. Accept Octopus's authoritative completed dispatch as
+            # off-peak (design §14). rate_reconciled + the slot's
+            # source='smart-charge-completed' record that this came from a completed
+            # dispatch (reconciled, not live-verified) for audit. (Previously 'review'
+            # — left at peak — which silently under-credited a missed smart charge.)
+            target = "off_peak"
+            reason = (f"completed ({mag:.2f} kWh) but not started — off-peak from "
+                      "Octopus completed dispatch (authoritative; not live-verified)")
     if (target == "off_peak" and currently_off_peak) or \
        (target == "peak" and not currently_off_peak):
         return ("ok", "already correct")
@@ -8921,6 +9009,20 @@ async def reconcile_dispatch_overlay() -> dict:
     sched = _kraken_rate_schedules.get("import")
     if sched is None or sched.is_empty():
         return {}
+    # Settlement-time backfill of the billing overlay: a completed-ONLY dispatch
+    # (EMT offline / re-imported) whose completed record has aged out of the
+    # provider's rolling dispatch window is stranded in dispatch_history with no
+    # billing slot, so the candidate query below can't see it and a genuine smart
+    # charge stays mispriced at peak. Promote such substantial completed-only
+    # history rows into off-peak dispatch_slots first so they become candidates
+    # (design §14). Idempotent; no-op once slots exist.
+    try:
+        n_mat = store.materialise_completed_only_slots(_RECONCILE_SMALL_COMPLETED_KWH)
+        if n_mat:
+            logger.info("reconcile: materialised %d off-peak slot(s) from completed-"
+                        "only dispatch history (no prior billing slot)", n_mat)
+    except Exception as e:
+        logger.warning("reconcile: completed-only slot materialisation failed: %s", e)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     # Two gates: a RESTORE can happen as soon as the slot has ended (`started` is
     # captured in real-time, so it's already known); a REVERT/REVIEW must wait for
@@ -8944,8 +9046,12 @@ async def reconcile_dispatch_overlay() -> dict:
                  AND b.block_start < ?
                  AND EXISTS (SELECT 1 FROM dispatch_slots s
                              WHERE s.slot_start = b.block_start AND s.off_peak = 1)
+                 -- Candidate if we saw a 'planned' dispatch OR a 'completed' one:
+                 -- a completed-only slot (EMT offline / re-imported) is repriced from
+                 -- the authoritative completed record (see _reconcile_decision).
                  AND EXISTS (SELECT 1 FROM dispatch_history h
-                             WHERE h.slot_start = b.block_start AND h.kind = 'planned')
+                             WHERE h.slot_start = b.block_start
+                               AND h.kind IN ('planned', 'completed'))
                ORDER BY b.block_start""", (started_cutoff,)).fetchall()
     except Exception as e:
         logger.warning("reconcile_dispatch_overlay: query failed: %s", e)
@@ -8989,7 +9095,8 @@ async def reconcile_dispatch_overlay() -> dict:
         cur_rate = r["imp_rate"] or 0.0
         currently_off_peak = abs(cur_rate - off_peak) < 1e-6
         target, reason = _reconcile_decision(
-            has_started, "completed" in kinds, completed_energy, currently_off_peak)
+            has_started, "completed" in kinds, completed_energy, currently_off_peak,
+            has_planned=("planned" in kinds))
         if target == "review":
             # A review flag invites a manual correction, but the correction tool
             # can only touch DCC-settled blocks. Dispatch `completed` arrives at
@@ -9096,6 +9203,11 @@ async def resolve_history_gaps(now=None, meter_id: str = "electricity_main",
     runs_done = []
     step = timedelta(minutes=30)
     for g in gaps[:max_runs]:
+        # BL-8 phase 2: this is the BLANKET "recover all gaps" path — it must NOT
+        # resurrect deliberately-deleted ranges. Skip a tombstoned hole (a targeted
+        # per-gap fill / re-import is the only thing that restores one).
+        if _store.is_slot_tombstoned(meter_id, g["start"]):
+            continue
         # widen by one slot each side so boundary intervals are included
         pf = (datetime.fromisoformat(g["start"]) - step)
         pt = (datetime.fromisoformat(g["end"]) + step * 2)
@@ -9153,6 +9265,18 @@ async def kraken_poll_task(ha: HAClient):
                 ingester.backfill_days)
     while True:
         try:
+            # Don't poll/backfill while a manual delete is mutating blocks: they
+            # share one SQLite connection and BL-8 backfill would re-create rows the
+            # delete is removing (and vice-versa). Skip this cycle; the next one
+            # catches up (the window anchors back to the oldest unsettled block).
+            if delete_in_progress():
+                logger.info("kraken_poll_task: delete in progress — skipping this "
+                            "poll cycle")
+                await asyncio.sleep(_KRAKEN_POLL_INTERVAL_S)
+                continue
+            # Mark the cycle active so a manual delete refuses rather than racing
+            # this backfill. Cleared in finally, so it can never wedge deletes.
+            set_poll_active(True)
             # Chunk 5: refresh rate schedules once per cycle (cheap — fixed
             # tariffs return ~1 record). The sync drain reads these via
             # _kraken_rate_resolver to repair zero/missing rates at reconcile.
@@ -9207,6 +9331,8 @@ async def kraken_poll_task(ha: HAClient):
             await _maybe_run_settlement_sweep()
         except Exception as e:
             logger.error("kraken_poll_task: poll failed: %s", e)
+        finally:
+            set_poll_active(False)
         await asyncio.sleep(_KRAKEN_POLL_INTERVAL_S)
 
 
@@ -9236,7 +9362,55 @@ def _clear_stale_inprogress_reads(cb_for_gap, cold_start: bool) -> bool:
     return cleared
 
 
+_startup_lock = asyncio.Lock()   # serialises engine_startup (see wrapper below)
+_startup_pending = False         # a startup was requested while one was running
+_last_startup_complete_ts = 0.0  # monotonic time the last startup finished (reconnect debounce)
+
+
+def seconds_since_startup() -> float:
+    """Monotonic seconds since the last engine_startup completed. Used to debounce
+    the HA-reconnect handler: a brief WS flap must not re-run the whole (heavy)
+    startup, which saturates the loop, stalls the WS heartbeat and triggers ANOTHER
+    disconnect — a reconnect storm. A large value means it's been a while (a genuine
+    HA outage), so a full re-run is warranted."""
+    if not _last_startup_complete_ts:
+        return float("inf")
+    return time.monotonic() - _last_startup_complete_ts
+
+
 async def engine_startup(ha: HAClient):
+    """Re-entrancy guard around the real startup.
+
+    engine_startup re-runs on several triggers — a config save, a DB restore, and an
+    HA reconnect — and each one tears down and rebuilds the BlockStore and the Kraken
+    API client. When two fire close together (e.g. a restore that also reconnects HA)
+    they used to run CONCURRENTLY on the loop, so one run closed the store / aiohttp
+    connector out from under the other: 'Connector is closed', 'Unclosed client
+    session', 'store not open — returning empty config' (a chart then rendered in the
+    wrong timezone), plus an API rate-limit storm from overlapping discovery. It also
+    saturated the loop, so loop-serialised operations elsewhere (the restore's store
+    teardown, a config-history delete) timed out.
+
+    This serialises runs (only one at a time) and COALESCES: a request that lands while
+    one is running sets a flag instead of stacking, and the in-flight run re-runs ONCE
+    at the end to pick up the latest state. Single-threaded event loop, so the flag
+    handoff is race-free."""
+    global _startup_pending, _last_startup_complete_ts
+    if _startup_lock.locked():
+        _startup_pending = True
+        logger.info("engine_startup: already running — request coalesced")
+        return
+    async with _startup_lock:
+        while True:
+            _startup_pending = False
+            await _engine_startup_impl(ha)
+            _last_startup_complete_ts = time.monotonic()
+            if not _startup_pending:
+                return
+            logger.info("engine_startup: a startup was requested mid-run — re-running once")
+
+
+async def _engine_startup_impl(ha: HAClient):
     """
     Run once when the add-on starts.
     Registers state triggers, detects session gaps, generates startup charts.

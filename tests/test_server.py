@@ -98,6 +98,8 @@ bs_mod.BlockStore       = BlockStore
 bs_mod.open_block_store = lambda path: _make_test_store()
 bs_mod.local_date_to_utc_bounds        = _ldtub
 bs_mod.local_date_range_to_utc_bounds  = _ldrtub
+bs_mod.local_datetime_to_utc           = _bs_real.local_datetime_to_utc
+bs_mod.utc_to_local_label              = _bs_real.utc_to_local_label
 bs_mod.outward_code          = _bs_real.outward_code
 bs_mod.derive_region_periods = _bs_real.derive_region_periods
 sys.modules["block_store"] = bs_mod
@@ -114,6 +116,8 @@ eng.resume_engine = lambda: None
 eng.engine_startup = MagicMock()
 eng.set_delete_active = lambda _a: None   # delete/purge workers toggle the carbon-backfill guard
 eng.delete_in_progress = lambda: False
+eng.set_poll_active = lambda _a: None     # kraken poll cycle toggles the delete guard
+eng.poll_in_progress = lambda: False      # a manual delete refuses while a poll/backfill runs
 eng.attribution_running = lambda: False
 eng.api_attribution_status = lambda: {"status": "idle"}
 eng.attribution_control = lambda a: {"status": "idle", "control": a}
@@ -450,6 +454,7 @@ class TestKrakenConfigCredentialSafety(unittest.TestCase):
                                       "base_url": None}
         engine.kraken_available = lambda: False
         engine._kraken_mini_reader = None
+        engine.get_db_account = lambda: "A-OTHERUSER"
         engine.kraken_account_mismatch = lambda: ("A-OTHERUSER", "A-OWNER")
         try:
             r = make_client().get("/api/kraken-config")
@@ -462,6 +467,29 @@ class TestKrakenConfigCredentialSafety(unittest.TestCase):
             del engine._kraken_env
             del engine.kraken_available
             del engine._kraken_mini_reader
+            del engine.get_db_account
+            del engine.kraken_account_mismatch
+
+    def test_config_get_exposes_db_account_for_reconnect_prefill(self):
+        # After a restore, creds are missing but the DB is still stamped with the
+        # previously-connected account — the GET must surface it so the lightweight
+        # reconnect can pre-fill the account (no full wizard needed).
+        import engine
+        engine._kraken_env = lambda: {"api_key": None, "account_number": None,
+                                      "base_url": None}
+        engine.kraken_available = lambda: False
+        engine._kraken_mini_reader = None
+        engine.get_db_account = lambda: "A-OWNER"
+        engine.kraken_account_mismatch = lambda: None
+        try:
+            body = make_client().get("/api/kraken-config").get_json()
+            self.assertFalse(body["configured"])
+            self.assertEqual(body["db_account"], "A-OWNER")
+        finally:
+            del engine._kraken_env
+            del engine.kraken_available
+            del engine._kraken_mini_reader
+            del engine.get_db_account
             del engine.kraken_account_mismatch
 
 
@@ -1463,6 +1491,31 @@ class TestApiHistoricalPurge(unittest.TestCase):
         rp = client.post("/api/historical/purge", json={"confirmed": True})
         self.assertEqual(rp.status_code, 409)
 
+    def test_delete_409_when_backfill_in_progress(self):
+        # A kraken poll / BL-8 backfill is mutating blocks: the delete must refuse
+        # (not race it into a half-deleted day) with a retry-later message.
+        client = make_client(store=self._store())
+        with patch.object(eng, "poll_in_progress", lambda: True):
+            r = client.post("/api/blocks/delete", json={
+                "from_date": "2024-03-01", "to_date": "2024-03-01", "confirmed": True})
+        self.assertEqual(r.status_code, 409)
+        body = json.loads(r.data)
+        self.assertTrue(body.get("retry"))
+        self.assertIn("backfill", body["error"].lower())
+
+    def test_delete_proceeds_once_backfill_clears(self):
+        # Same request succeeds once the poll flag has cleared (time-bounded guard,
+        # so a retry works — the delete is never wedged).
+        store = self._store()
+        client = make_client(store=store)
+        with patch.object(eng, "poll_in_progress", lambda: False), \
+             patch("server.threading.Thread", _InlineThread), \
+             patch("server._regen_charts_safely", return_value=None):
+            r = client.post("/api/blocks/delete", json={
+                "from_date": "2024-03-01", "to_date": "2024-03-01", "confirmed": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(json.loads(r.data)["status"], "running")
+
 
 class TestApiBackup(unittest.TestCase):
     """Manual backup returns the filename AND its byte size, so the UI can confirm
@@ -1747,6 +1800,60 @@ class TestApiConfigHistoryDelete(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
 
 
+class TestConfigSaveRestoreGuard(unittest.TestCase):
+    """A config save must be refused while a DB restore is running — otherwise it
+    writes to the file the restore is swapping ('database is locked') and schedules
+    an extra engine_startup that piles onto the restore's own (the concurrency storm)."""
+
+    def test_save_config_rejected_during_restore(self):
+        saved = server._restore_job
+        server._restore_job = {"status": "running"}
+        try:
+            r = make_client().post("/api/config", json={"meters": {}})
+            self.assertEqual(r.status_code, 409)
+            self.assertIn("restore", r.get_json()["error"].lower())
+        finally:
+            server._restore_job = saved
+
+
+class TestConfigMutationBusy(unittest.TestCase):
+    """When the engine loop is busy (a slow post-restore engine_startup), a config
+    mutation submitted to it times out — but the coroutine stays queued and applies.
+    _config_mutation_on_loop turns that loop timeout into _ConfigBusy, and the config
+    endpoints report an honest 'queued' (503) instead of a raw TimeoutError (500)."""
+
+    def test_loop_timeout_becomes_configbusy(self):
+        import concurrent.futures
+        class _FakeLoop:
+            def is_running(self): return True
+        saved_loop, saved_run = server._event_loop, server._run_on_engine_loop
+        server._event_loop = _FakeLoop()
+        def _boom(coro, timeout=None):
+            try: coro.close()      # avoid 'coroutine never awaited'
+            except Exception: pass
+            raise concurrent.futures.TimeoutError()
+        server._run_on_engine_loop = _boom
+        try:
+            with self.assertRaises(server._ConfigBusy):
+                server._config_mutation_on_loop(lambda store: {"ok": True})
+        finally:
+            server._event_loop, server._run_on_engine_loop = saved_loop, saved_run
+
+    def test_delete_reports_queued_503_when_busy(self):
+        saved = server._config_mutation_on_loop
+        def _busy(mutate, timeout=30.0):
+            raise server._ConfigBusy()
+        server._config_mutation_on_loop = _busy
+        try:
+            r = make_client().delete("/api/config/history/1")
+            self.assertEqual(r.status_code, 503)
+            body = r.get_json()
+            self.assertTrue(body.get("queued"))
+            self.assertIn("queued", body["error"].lower())
+        finally:
+            server._config_mutation_on_loop = saved
+
+
 class TestApiBackupRestoreSync(unittest.TestCase):
     """
     When meters_config.json is restored, the active config_period and
@@ -1903,7 +2010,11 @@ class TestApiImportBlocksDb(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
         server.DATA_DIR = "/tmp/emt_test_data"  # restore default
-        server._restore_job = self._saved_job
+        # Reset to a FRESH idle dict: api_import / _restore_worker mutate _restore_job
+        # in place (.clear()/.update()), so restoring the saved reference could hand
+        # back a dict that's since been flipped to "running" — which then trips the
+        # config-save restore guard in a later test.
+        server._restore_job = {"status": "idle"}
 
     def _make_db_bytes(self):
         """Create a minimal valid SQLite blocks.db as bytes."""
@@ -4194,6 +4305,62 @@ class TestHistoryGaps(unittest.TestCase):
         r = client.post("/api/resolve-gaps")
         self.assertEqual(r.status_code, 400)
         self.assertEqual(r.get_json()["reason"], "no_api")
+
+
+class TestDeletedRangesEndpoints(unittest.TestCase):
+    """BL-8 phase 2: the deleted-ranges list + the targeted re-import endpoint."""
+
+    def setUp(self):
+        import engine as _eng
+        self._eng = _eng
+        self._saved = getattr(_eng, "kraken_available", None)
+
+    def tearDown(self):
+        if self._saved is None:
+            if hasattr(self._eng, "kraken_available"):
+                del self._eng.kraken_available
+        else:
+            self._eng.kraken_available = self._saved
+
+    def _store_with_tombstone(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        with st._conn:
+            cp = st._conn.execute(
+                "INSERT INTO config_periods (effective_from, billing_day, "
+                "block_minutes, timezone, currency_symbol, currency_code) "
+                "VALUES ('2024-01-01T00:00:00',1,30,'UTC','£','GBP')").lastrowid
+            st._conn.execute("INSERT INTO meters (config_period_id, meter_id, "
+                             "is_sub_meter) VALUES (?, 'electricity_main', 0)", (cp,))
+        st._conn.commit()
+        st.add_deleted_range("*", "2026-08-12T00:00:00", "2026-08-13T00:00:00")
+        return st
+
+    def test_deleted_ranges_listed_with_fillable(self):
+        self._eng.kraken_available = lambda: True
+        client = make_client(store=self._store_with_tombstone())
+        d = client.get("/api/blocks/deleted-ranges").get_json()
+        self.assertTrue(d["ok"])
+        self.assertEqual(len(d["ranges"]), 1)
+        self.assertEqual(d["ranges"][0]["meter_id"], "*")
+        self.assertIn("fillable", d["ranges"][0])
+
+    def test_reimport_requires_api(self):
+        self._eng.kraken_available = lambda: False
+        client = make_client(store=self._store_with_tombstone())
+        r = client.post("/api/blocks/reimport",
+                        json={"from_date": "2026-08-12", "to_date": "2026-08-12",
+                              "confirmed": True})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "no_api")
+
+    def test_reimport_requires_confirmation(self):
+        self._eng.kraken_available = lambda: True
+        client = make_client(store=self._store_with_tombstone())
+        r = client.post("/api/blocks/reimport",
+                        json={"from_date": "2026-08-12", "to_date": "2026-08-12"})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["reason"], "unconfirmed")
 
 
 class TestInstanceLabel(unittest.TestCase):

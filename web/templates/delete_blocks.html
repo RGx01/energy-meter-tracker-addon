@@ -106,6 +106,18 @@
   <div id="purge-success" class="alert alert-success" style="display:none;"></div>
   <div id="purge-error"   class="alert alert-danger"  style="display:none;"></div>
 </div>
+
+<!-- BL-8 phase 2: deliberately-deleted ranges stay deleted; targeted re-import restores one -->
+<div class="card">
+  <div style="font-weight:600;margin-bottom:6px;">Deleted ranges</div>
+  <div style="font-size:13px;color:var(--muted);margin-bottom:12px;line-height:1.7;">
+    Ranges you delete <strong>stay deleted</strong> — the automatic supplier sync will not
+    re-create them. To bring one back, <strong>re-import</strong> it: this fetches the range
+    fresh from the supplier API and clears the deletion. Ranges older than the API's reach
+    can't be recovered this way (they'll say so).
+  </div>
+  <div id="del-ranges-out" style="font-size:13px;">Loading…</div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -324,5 +336,66 @@ function purgeApply() {
   })
   .catch(function(e) { err.textContent = 'Delete failed: ' + e.message; err.style.display = 'block'; btn.disabled = false; });
 }
+
+// ── BL-8 phase 2: Deleted ranges list + targeted re-import ──────────────────
+function _reFmtTs(t){ return String(t == null ? '' : t).replace('T', ' ').replace(/Z$/, ''); }
+function loadDeletedRanges() {
+  var out = document.getElementById('del-ranges-out');
+  if (!out) return;
+  fetch(apiUrl('/api/blocks/deleted-ranges'))
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d.ok) { out.innerHTML = '<span style="color:var(--danger);">' + _esc(d.error || 'failed') + '</span>'; return; }
+      if (!d.ranges || !d.ranges.length) {
+        out.innerHTML = '<span style="color:var(--muted);">No deleted ranges — nothing to restore.</span>'; return;
+      }
+      var html = '<div style="display:flex;flex-direction:column;gap:6px;">';
+      d.ranges.forEach(function(r){
+        var meter = r.meter_id === '*' ? 'all meters' : r.meter_id;
+        var right;
+        var startL = r.start_local || _reFmtTs(r.start_utc);
+        var endL = r.end_local || _reFmtTs(r.end_utc);
+        if (r.fillable) {
+          right = '<button class="btn" onclick="reimportRange(this, \'' + _esc(r.start_utc) + '\',\'' + _esc(r.end_utc)
+                + '\',\'' + _esc(r.meter_id) + '\',\'' + _esc(startL) + '\',\'' + _esc(endL) + '\')">🔁 Re-import →</button>';
+        } else {
+          right = '<span style="color:var(--warning);font-size:12px;" title="Older than the supplier API can reach">predates API coverage — can\'t re-import</span>';
+        }
+        html += '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;'
+              + 'border:1px solid var(--border);border-radius:6px;padding:6px 10px;">'
+              + '<span><strong>' + _esc(meter) + '</strong> · ' + _esc(startL) + ' → ' + _esc(endL) + '</span>'
+              + '<span style="white-space:nowrap;">' + right + '</span></div>';
+      });
+      html += '</div>';
+      out.innerHTML = html;
+    })
+    .catch(function(e){ out.innerHTML = '<span style="color:var(--danger);">' + _esc(e) + '</span>'; });
+}
+function reimportRange(btnEl, startUtc, endUtc, meter, startLabel, endLabel) {
+  if (!confirm('Re-import ' + (startLabel || _reFmtTs(startUtc)) + ' → ' + (endLabel || _reFmtTs(endUtc))
+             + ' from the supplier API? This clears the deletion and re-fetches the data.')) return;
+  if (btnEl) { btnEl.disabled = true; btnEl.textContent = '⏳ Re-importing…'; }
+  fetch(apiUrl('/api/blocks/reimport'), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from_utc: startUtc, to_utc: endUtc,
+                           meter_id: (meter === '*' ? null : meter), confirmed: true })
+  })
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if (!d.ok) {
+      alert('Re-import failed: ' + (d.message || d.error || d.reason));
+      if (btnEl) { btnEl.disabled = false; btnEl.textContent = '🔁 Re-import →'; }
+      return;
+    }
+    // The fill runs in the background; the range clears from this list once it lands.
+    if (btnEl) btnEl.textContent = '⏳ Fetching…';
+    setTimeout(loadDeletedRanges, 2000);
+  })
+  .catch(function(e){
+    alert('Re-import error: ' + e);
+    if (btnEl) { btnEl.disabled = false; btnEl.textContent = '🔁 Re-import →'; }
+  });
+}
+document.addEventListener('DOMContentLoaded', loadDeletedRanges);
 </script>
 {% endblock %}

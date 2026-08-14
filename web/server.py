@@ -216,6 +216,19 @@ def _get_store() -> BlockStore:
     return _store
 
 
+def _config_timezone() -> str:
+    """The main meter's configured timezone (for wall-clock display of UTC
+    block_start values in the gap / deleted-ranges lists). Falls back to UTC."""
+    try:
+        _cfg = load_config()
+        for _md in (_cfg.get("meters") or {}).values():
+            if not (_md.get("meta") or {}).get("sub_meter"):
+                return (_md.get("meta") or {}).get("timezone", "UTC")
+    except Exception:
+        pass
+    return "UTC"
+
+
 def _regen_charts_safely():
     """Regenerate the pre-built charts on the engine's event-loop thread — never
     the Flask request thread.
@@ -275,6 +288,19 @@ class _ConfigError(Exception):
     """A config-period mutation validation error → surfaced as HTTP 400."""
 
 
+class _ConfigBusy(Exception):
+    """The mutation was submitted to the engine loop but the loop was busy (typically a
+    long post-restore engine_startup, made slower by an HA WebSocket drop), so we
+    stopped waiting. run_coroutine_threadsafe is NOT cancelled by a result-timeout —
+    the coroutine stays queued and WILL apply once the loop frees. The endpoint reports
+    an honest 'queued' instead of a misleading raw TimeoutError."""
+
+
+_CONFIG_BUSY_MSG = ("The engine is busy finishing a restore or reconnecting — your "
+                    "change has been queued and should apply within a minute. Refresh "
+                    "to confirm.")
+
+
 def _config_mutation_on_loop(mutate, timeout: float = 30.0):
     """Run a config_periods read+write on the ENGINE's loop and connection, then
     schedule an OFF-loop chart regen (#361).
@@ -303,7 +329,16 @@ def _config_mutation_on_loop(mutate, timeout: float = 30.0):
         except Exception as _ce:
             logger.warning("_config_mutation_on_loop: chart regen schedule failed: %s", _ce)
         return res
-    return _run_on_engine_loop(_coro(), timeout=timeout)
+    import concurrent.futures as _cf
+    try:
+        return _run_on_engine_loop(_coro(), timeout=timeout)
+    except _cf.TimeoutError:
+        # The loop was busy (e.g. a slow post-restore engine_startup). The mutation is
+        # still queued and will apply — signal 'queued' so the endpoint doesn't report
+        # a raw TimeoutError for a change that actually succeeds.
+        logger.warning("_config_mutation_on_loop: engine loop busy after %.0fs — "
+                       "mutation left queued (will apply once the loop frees)", timeout)
+        raise _ConfigBusy()
 
 
 def _schedule_offloaded_regen():
@@ -2861,6 +2896,8 @@ def api_config_history_create():
         return jsonify(result)
     except _ConfigError as ce:
         return jsonify({"error": str(ce)}), 400
+    except _ConfigBusy:
+        return jsonify({"queued": True, "error": _CONFIG_BUSY_MSG}), 503
     except Exception as e:
         logger.error("api_config_history_create: %s", e)
         return jsonify({"error": str(e)}), 500
@@ -2958,6 +2995,8 @@ def api_config_history_update(period_id):
                     period_id, list(updates.keys()),
                     " +postcode" if postcode_edit else "")
         return jsonify(result)
+    except _ConfigBusy:
+        return jsonify({"queued": True, "error": _CONFIG_BUSY_MSG}), 503
     except Exception as e:
         logger.error("api_config_history_update: %s", e)
         return jsonify({"error": str(e)}), 500
@@ -3012,14 +3051,26 @@ def api_config_history_delete(period_id):
         return jsonify(result)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    except _ConfigBusy:
+        return jsonify({"queued": True, "error": _CONFIG_BUSY_MSG}), 503
     except Exception as e:
-        logger.error("api_config_history_delete: %s", e)
-        return jsonify({"error": str(e)}), 500
+        # repr(): a loop timeout (TimeoutError) str()s to '' — repr keeps the type.
+        logger.error("api_config_history_delete: %r", e)
+        return jsonify({"error": str(e) or e.__class__.__name__}), 500
 
 
 @app.route("/api/config", methods=["POST"])
 def api_save_config():
     try:
+        # Don't let a config save race an in-flight DB restore: it writes to the same
+        # SQLite file the restore is swapping out (→ "database is locked"), takes a
+        # pointless pre_config_save backup, and schedules an extra engine_startup that
+        # piles onto the restore's own — the concurrency storm seen in the logs. Refuse
+        # clearly; the user can save again once the restore's progress banner clears.
+        if _restore_job.get("status") == "running":
+            return jsonify({"error": "A database restore is in progress — wait for it "
+                                     "to finish, then save your config again."}), 409
+
         payload = request.get_json(force=True)
         if not isinstance(payload, dict) or "meters" not in payload:
             return jsonify({"error": "Invalid config structure"}), 400
@@ -3360,22 +3411,41 @@ def _restore_worker(zipname, selected, from_flat, staged=None):
         # If any connection remains open, SQLite WAL will be inconsistent with
         # the newly written DB file, causing "malformed" on next open.
         try:
-            # Checkpoint via engine store (primary write connection)
-            if _eng_r and hasattr(_eng_r, "get_store"):
+            # Checkpoint + close the ENGINE store ON THE ENGINE LOOP — never from this
+            # restore-worker thread. The engine's connection is opened
+            # check_same_thread=False, so a PRAGMA wal_checkpoint / close() issued here
+            # while the loop is mid-query on the SAME connection is a concurrent use of
+            # one SQLite connection from two threads → Segmentation fault. pause_engine()
+            # only sets a cooperative flag; it does NOT stop work already in flight on the
+            # loop (a chart regen, discovery, a scheduled task), so the collision is real
+            # whenever the loop is busy. Running this as a loop task serialises it against
+            # every other loop DB access (the event loop is single-threaded).
+            def _teardown_engine_store():
+                import engine as _eng_mod2
+                if getattr(_eng_mod2, "_store", None) is None:
+                    return
                 try:
-                    _es = _eng_r.get_store()
-                    _es._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    _eng_mod2._store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                     logger.info("api_backup_restore: WAL checkpoint complete")
                 except Exception as _ce:
                     logger.warning("api_backup_restore: WAL checkpoint failed: %s", _ce)
-            # Close engine store connection
-            import engine as _eng_mod
-            if hasattr(_eng_mod, "_store") and _eng_mod._store is not None:
                 try:
-                    _eng_mod._store.close()
-                except Exception: pass
-                _eng_mod._store = None
-            # Close web server store connection
+                    _eng_mod2._store.close()
+                except Exception:
+                    pass
+                _eng_mod2._store = None
+            try:
+                if _event_loop and _event_loop.is_running():
+                    async def _co_teardown():
+                        _teardown_engine_store()
+                    _run_on_engine_loop(_co_teardown(), timeout=30.0)
+                else:
+                    _teardown_engine_store()
+            except Exception as _te:
+                # repr(): a loop timeout (TimeoutError) has an empty str(), which
+                # logged a blank reason — repr keeps the type visible.
+                logger.warning("api_backup_restore: engine store teardown failed: %r", _te)
+            # Close web server store connection (this thread's own store handle)
             if _store:
                 try: _store.close()
                 except Exception: pass
@@ -3473,12 +3543,20 @@ def _restore_worker(zipname, selected, from_flat, staged=None):
                 _rc.close()
             except Exception as _je:
                 logger.warning("api_backup_restore: journal_mode switch failed: %s", _je)
-            # Reset engine store so it reopens from the new file on next tick
+            # Reset engine store so it reopens from the new file — ON THE ENGINE LOOP,
+            # so the fresh connection is created and owned by the loop thread and never
+            # races a concurrent loop query (same check_same_thread=False hazard as the
+            # checkpoint/close above).
             import sys as _sys_r
             _eng_r = _sys_r.modules.get("engine")
             if _eng_r and hasattr(_eng_r, "reset_store"):
                 try:
-                    _eng_r.reset_store()
+                    if _event_loop and _event_loop.is_running():
+                        async def _co_reset():
+                            _eng_r.reset_store()
+                        _run_on_engine_loop(_co_reset(), timeout=30.0)
+                    else:
+                        _eng_r.reset_store()
                     logger.info("api_backup_restore: engine store reset OK")
                 except Exception as _re:
                     logger.warning("api_backup_restore: engine reset_store failed: %s", _re)
@@ -3710,6 +3788,10 @@ def api_kraken_config_get():
             "account_number": env.get("account_number"),
             "connected": _eng.kraken_available(),
             "mini": _eng._kraken_mini_reader is not None,
+            # #357: the account this DB was previously connected to (stamped on first
+            # discovery). Lets the UI pre-fill the account on a lightweight reconnect
+            # after a restore, so re-adding a key doesn't need the full setup wizard.
+            "db_account": _eng.get_db_account(),
         }
         # #357: if this DB is stamped to a different account than the credentials,
         # the API was NOT auto-activated — surface it so the UI can prompt an
@@ -4219,6 +4301,99 @@ def api_backfill_fill_gap():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/blocks/reimport", methods=["POST"])
+def api_blocks_reimport():
+    """BL-8 phase 2: TARGETED restore of a deliberately-deleted range — the explicit
+    inverse of Delete. Lifts the tombstone over [from_date, to_date] (sub-span split)
+    and IMMEDIATELY re-fills the window from the supplier API. The tombstone lift
+    happens inside `run_gap_fill_job` (the shared targeted-fill worker), so this is
+    the same 'clear + fill' primitive the per-gap button uses, scoped to a date range.
+    Body: {from_date, to_date, meter_id?, channel?, confirmed}."""
+    try:
+        import engine as _eng
+        import asyncio as _asyncio
+        from block_store import local_date_range_to_utc_bounds
+        if not _eng.kraken_available():
+            return jsonify({"ok": False, "reason": "no_api",
+                            "message": "No supplier API configured."}), 400
+        body = request.get_json(silent=True) or {}
+        # Accept EITHER an explicit UTC window (from the deleted-ranges list, exact —
+        # no lossy local-date round-trip across a DST boundary) OR local dates.
+        from_utc = (body.get("from_utc") or "").strip()
+        to_utc   = (body.get("to_utc") or "").strip()
+        if not body.get("confirmed"):
+            return jsonify({"ok": False, "reason": "unconfirmed",
+                            "message": "Confirmation required before writing."}), 400
+        if _eng.api_import_running():
+            return jsonify({"ok": False, "reason": "busy",
+                            "message": "An import is already running.",
+                            "status": _eng.api_import_status()}), 409
+        if not (_event_loop and _event_loop.is_running()):
+            return jsonify({"ok": False, "reason": "no_loop",
+                            "message": "engine loop not running"}), 500
+        if from_utc and to_utc:
+            if from_utc >= to_utc:
+                return jsonify({"ok": False, "reason": "bad_range",
+                                "message": "from_utc must be before to_utc."}), 400
+            utc_start, utc_end = from_utc, to_utc
+        else:
+            from_date = (body.get("from_date") or "").strip()
+            to_date   = (body.get("to_date") or "").strip()
+            if not from_date or not to_date:
+                return jsonify({"ok": False, "reason": "bad_range",
+                                "message": "from_date and to_date (or from_utc and "
+                                           "to_utc) are required."}), 400
+            if from_date > to_date:
+                return jsonify({"ok": False, "reason": "bad_range",
+                                "message": "from_date must not be after to_date."}), 400
+            _cfg = load_config()
+            _tz = "UTC"
+            for _md in (_cfg.get("meters") or {}).values():
+                if not (_md.get("meta") or {}).get("sub_meter"):
+                    _tz = (_md.get("meta") or {}).get("timezone", "UTC")
+                    break
+            utc_start, utc_end = local_date_range_to_utc_bounds(from_date, to_date, _tz)
+        meter_id = body.get("meter_id") or "electricity_main"
+        ch = body.get("channel")
+        channels = (ch,) if ch in ("import", "export") else ("import", "export")
+        _asyncio.run_coroutine_threadsafe(
+            _eng.run_gap_fill_job(utc_start, utc_end, channels=channels,
+                                  meter_id=meter_id), _event_loop)
+        return jsonify({"ok": True, "status": "running",
+                        "window": {"from": utc_start, "to": utc_end}}), 200
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        logger.error("api_blocks_reimport: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/blocks/deleted-ranges")
+def api_blocks_deleted_ranges():
+    """Active deletion tombstones for the Data Management list. Each is annotated
+    with `fillable` — whether the supplier API can re-fetch it (advisory only; the
+    re-import button uses it to warn/disable, it NEVER auto-clears a tombstone)."""
+    try:
+        import engine as _eng
+        from datetime import datetime, timezone, timedelta
+        store = _get_store()
+        api_ok = _eng.kraken_available()
+        horizon_days = getattr(_eng, "_KRAKEN_BACKFILL_DAYS", 400) or 400
+        floor = (datetime.now(timezone.utc).replace(tzinfo=None)
+                 - timedelta(days=horizon_days)).isoformat()
+        from block_store import utc_to_local_label as _lbl
+        _tz = _config_timezone()
+        ranges = [{**r, "fillable": bool(api_ok and r["end_utc"] > floor),
+                   "start_local": _lbl(r["start_utc"], _tz),
+                   "end_local": _lbl(r["end_utc"], _tz)}
+                  for r in store.get_deleted_ranges()]
+        return jsonify({"ok": True, "ranges": ranges, "api_available": api_ok,
+                        "timezone": _tz})
+    except Exception as e:
+        logger.error("api_blocks_deleted_ranges: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/backfill/gaps")
 def api_backfill_gaps():
     """Unified "what's missing" for the heal UI. The user doesn't distinguish, so
@@ -4251,10 +4426,16 @@ def api_backfill_gaps():
         # configured channel (import, and export where the meter exports).
         for g in store.find_block_gaps():
             slots = int(g.get("slots") or 0)
+            # BL-8 phase 2: flag a hole that is a deliberate deletion (tombstoned) so
+            # the UI can label it "deleted — fill to restore" rather than as a fault.
+            # It still appears here so the user can TARGET it for a restore; only the
+            # blanket "recover all" and the automatic poll step over it.
+            _deleted = store.is_slot_tombstoned("electricity_main", g.get("start"))
             gaps.append({"start": g.get("start"), "end": g.get("end"), "slots": slots,
                          "hours": round(slots / 2.0, 1), "channel": "import",
                          "channels": list(block_channels),
-                         "kind": "missing_blocks", "fetchable": True})
+                         "kind": "missing_blocks", "fetchable": True,
+                         "deleted": _deleted})
         # (2) Missing per-channel data recorded by the import (import + export).
         imp = _eng.api_import_gaps() or {}
         for ch, cd in (imp.get("channels") or {}).items():
@@ -4267,8 +4448,16 @@ def api_backfill_gaps():
                              "channels": [ch],
                              "kind": "missing_data", "fetchable": api_available})
         gaps.sort(key=lambda x: (x.get("start") or ""), reverse=True)
+        # Gap start/end are naive-UTC block_start; annotate wall-clock (local) so the
+        # UI shows the times the user thinks in, not UTC. start/end stay UTC (the
+        # fill/re-import endpoints need them).
+        from block_store import utc_to_local_label as _lbl
+        _tz = _config_timezone()
+        for g in gaps:
+            g["start_local"] = _lbl(g.get("start"), _tz)
+            g["end_local"] = _lbl(g.get("end"), _tz)
         return jsonify({
-            "ok": True, "gaps": gaps,
+            "ok": True, "gaps": gaps, "timezone": _tz,
             "total_slots": sum(g["slots"] for g in gaps),
             "fetchable_slots": sum(g["slots"] for g in gaps if g["fetchable"]),
             "api_available": api_available,
@@ -6346,9 +6535,18 @@ def _create_backup_zip(label="backup"):
                         _bk_store = None
                 if _bk_store is None:
                     _bk_store = _get_store()
-                _bk_store.backup(db_src + ".bak")
-                zf.write(db_src + ".bak", "blocks.db")
-                os.remove(db_src + ".bak")
+                # Unique temp name per call: two backups can run at once (e.g. a
+                # config-save's pre_config_save and a restore's pre_restore), and a
+                # shared 'blocks.db.bak' let one delete the other's file mid-write →
+                # "No such file: blocks.db.bak". Scope it to this pid+thread.
+                _bak = f"{db_src}.{os.getpid()}.{threading.get_ident()}.bak"
+                try:
+                    _bk_store.backup(_bak)
+                    zf.write(_bak, "blocks.db")
+                finally:
+                    if os.path.exists(_bak):
+                        try: os.remove(_bak)
+                        except OSError: pass
             except Exception as _e:
                 logger.warning("_create_backup_zip: blocks.db backup failed: %s", _e)
         for fname in files:
@@ -6669,11 +6867,11 @@ def api_blocks_delete_preview():
             if not (_md.get("meta") or {}).get("sub_meter"):
                 _tz_name = (_md.get("meta") or {}).get("timezone", "UTC")
                 break
-        from_time_utc, to_time_utc = _delete_window_to_utc_times(
-            from_time, to_time, _tz_name, from_date, to_date)
         reconstructed_only = bool(data.get("reconstructed_only"))
         store = _get_store()
-        result = store.count_blocks_for_date_range(from_date, to_date, meter_id, from_time_utc, to_time_utc, _tz_name, reconstructed_only)
+        # Pass LOCAL times: the store treats from/to as the ends of ONE contiguous
+        # span (from_date+from_time .. to_date+to_time), not a per-day window.
+        result = store.count_blocks_for_date_range(from_date, to_date, meter_id, from_time, to_time, _tz_name, reconstructed_only)
         return jsonify(result)
     except Exception as e:
         logger.error("api_blocks_delete_preview: %s", e)
@@ -6790,22 +6988,32 @@ def api_blocks_delete():
         if _delete_job.get("status") == "running":
             return jsonify({"error": "a delete is already running",
                             "status": _delete_job}), 409
-        # Convert local times to UTC using the configured timezone
+        # Refuse while a kraken poll / BL-8 backfill is mutating blocks — the two
+        # share the single SQLite connection and a delete racing an in-flight
+        # backfill leaves a half-deleted day (the 'deleted the 12th mid-backfill,
+        # it came back partial' incident). The flag is cleared when the poll cycle
+        # finishes, so a retry succeeds once the log shows poll completion.
+        import engine as _eng
+        if _eng.poll_in_progress():
+            return jsonify({"error": "Unable to delete — a backfill is in progress. "
+                            "Please try again once it completes (watch the logs for "
+                            "poll completion), then retry.",
+                            "retry": True}), 409
+        # Resolve the configured timezone; the store converts the LOCAL from/to
+        # times into one CONTIGUOUS UTC span (not a per-day time-of-day window).
         _cfg = load_config()
         _tz_name = "UTC"
         for _md in (_cfg.get("meters") or {}).values():
             if not (_md.get("meta") or {}).get("sub_meter"):
                 _tz_name = (_md.get("meta") or {}).get("timezone", "UTC")
                 break
-        from_time_utc, to_time_utc = _delete_window_to_utc_times(
-            from_time, to_time, _tz_name, from_date, to_date)
         reconstructed_only = bool(data.get("reconstructed_only"))
         _delete_job.clear()
         _delete_job.update({"status": "running", "kind": "delete",
                             "step": "starting", "result": None, "error": None})
         threading.Thread(
             target=_delete_worker,
-            args=(from_date, from_time_utc, to_date, to_time_utc,
+            args=(from_date, from_time, to_date, to_time,
                   meter_id, _tz_name, reconstructed_only),
             daemon=True, name="delete").start()
         return jsonify({"ok": True, "status": "running"})

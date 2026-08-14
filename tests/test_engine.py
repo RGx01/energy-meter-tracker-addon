@@ -1468,7 +1468,7 @@ class TestGapFillLimit(unittest.TestCase):
         """R2.5 — _meter_reset_detected must be False at start of engine_startup.
         Verified by checking the flag is reset in the function source."""
         import inspect
-        src = inspect.getsource(engine.engine_startup)
+        src = inspect.getsource(engine._engine_startup_impl)
         self.assertIn('_meter_reset_detected = False', src,
             "engine_startup must reset _meter_reset_detected to False")
 
@@ -1550,7 +1550,7 @@ class TestRogueTotalStaleReadGuard(unittest.TestCase):
         # The clear must run before/outside the `if missing_windows:` branch so
         # the no-gap short-restart path is covered too.
         import inspect
-        src = inspect.getsource(engine.engine_startup)
+        src = inspect.getsource(engine._engine_startup_impl)
         self.assertIn("rogue-total guard", src,
             "engine_startup must clear stale in-progress reads unconditionally")
         # The unconditional clear must appear BEFORE the gap-detection branch.
@@ -1577,6 +1577,84 @@ class TestRogueTotalStaleReadGuard(unittest.TestCase):
         ch = cb["meters"]["electricity_main"]["channels"]["import"]
         self.assertEqual(ch["reads"], [])
         self.assertEqual(ch["rates"], [])
+
+
+class TestPollActiveGuard(unittest.TestCase):
+    """set_poll_active / poll_in_progress back the delete busy-guard: a manual
+    date-range delete refuses while a kraken poll / BL-8 backfill is mutating
+    blocks. Time-bounded (set True at cycle start, cleared in finally), so the
+    guard can never wedge deletes."""
+
+    def tearDown(self):
+        engine.set_poll_active(False)
+
+    def test_default_false(self):
+        engine.set_poll_active(False)
+        self.assertFalse(engine.poll_in_progress())
+
+    def test_set_and_clear(self):
+        engine.set_poll_active(True)
+        self.assertTrue(engine.poll_in_progress())
+        engine.set_poll_active(False)
+        self.assertFalse(engine.poll_in_progress())
+
+
+class TestSecondsSinceStartup(unittest.TestCase):
+    """seconds_since_startup backs the HA-reconnect debounce: a recent startup means
+    a WS blip is a flap (skip the heavy re-run); a long gap means a genuine outage."""
+
+    def setUp(self):
+        self._saved = engine._last_startup_complete_ts
+
+    def tearDown(self):
+        engine._last_startup_complete_ts = self._saved
+
+    def test_infinite_before_any_startup(self):
+        engine._last_startup_complete_ts = 0.0
+        self.assertEqual(engine.seconds_since_startup(), float("inf"))
+
+    def test_small_right_after_startup(self):
+        import time as _t
+        engine._last_startup_complete_ts = _t.monotonic()
+        self.assertLess(engine.seconds_since_startup(), 5.0)
+
+    def test_large_after_a_long_gap(self):
+        import time as _t
+        engine._last_startup_complete_ts = _t.monotonic() - 3600
+        self.assertGreater(engine.seconds_since_startup(), 300)
+
+
+class TestRenderRecentlyActive(unittest.TestCase):
+    """render_recently_active backs the reconnect debounce's render-activity gate:
+    a render in progress OR just finished means a WS blip is a self-inflicted flap."""
+
+    def setUp(self):
+        self._r, self._t = engine._charts_rendering, engine._last_render_complete_ts
+
+    def tearDown(self):
+        engine._charts_rendering = self._r
+        engine._last_render_complete_ts = self._t
+
+    def test_true_while_rendering(self):
+        engine._charts_rendering = True
+        self.assertTrue(engine.render_recently_active())
+
+    def test_true_just_after_render(self):
+        import time as _t
+        engine._charts_rendering = False
+        engine._last_render_complete_ts = _t.monotonic()
+        self.assertTrue(engine.render_recently_active(quiet_s=180))
+
+    def test_false_when_idle_and_stale(self):
+        import time as _t
+        engine._charts_rendering = False
+        engine._last_render_complete_ts = _t.monotonic() - 3600
+        self.assertFalse(engine.render_recently_active(quiet_s=180))
+
+    def test_false_before_any_render(self):
+        engine._charts_rendering = False
+        engine._last_render_complete_ts = 0.0
+        self.assertFalse(engine.render_recently_active())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5731,3 +5809,39 @@ class TestChartRegenCoalesce(unittest.TestCase):
         engine._charts_dirty = False
         asyncio.run(engine._generate_charts_offloaded())
         self.assertTrue(engine._charts_dirty)   # re-run queued, not silently skipped
+
+
+class TestEngineStartupReentrancy(unittest.TestCase):
+    """engine_startup re-runs on a config save, a restore, and an HA reconnect — which
+    can all fire at once. Without a guard they ran concurrently and tore down/rebuilt
+    the store + Kraken client under each other ('Connector is closed', 'Unclosed client
+    session', 'store not open'). The wrapper must (a) never run two at once and
+    (b) coalesce overlapping requests into a single re-run."""
+
+    def test_concurrent_startups_serialised_and_coalesced(self):
+        import asyncio
+        state = {"n": 0, "live": 0, "max_live": 0}
+
+        async def _fake_impl(ha):
+            state["live"] += 1
+            state["max_live"] = max(state["max_live"], state["live"])
+            state["n"] += 1
+            await asyncio.sleep(0.02)     # hold the lock so the others pile up
+            state["live"] -= 1
+
+        orig = engine._engine_startup_impl
+        engine._engine_startup_impl = _fake_impl
+        engine._startup_lock = asyncio.Lock()   # fresh lock for this test's loop
+        engine._startup_pending = False
+        try:
+            async def _go():
+                await asyncio.gather(engine.engine_startup(None),
+                                     engine.engine_startup(None),
+                                     engine.engine_startup(None))
+            asyncio.run(_go())
+        finally:
+            engine._engine_startup_impl = orig
+
+        self.assertEqual(state["max_live"], 1)    # never two at once
+        self.assertEqual(state["n"], 2)           # first run + ONE coalesced re-run
+
