@@ -8918,25 +8918,33 @@ _RECONCILE_SMALL_COMPLETED_KWH = 0.4
 
 def _reconcile_decision(has_started: bool, has_completed: bool,
                         completed_energy, currently_off_peak: bool,
+                        has_planned: bool = True,
                         small_kwh: float = _RECONCILE_SMALL_COMPLETED_KWH) -> tuple:
     """Settlement-time reconciliation of the dispatch overlay against the
-    accumulated lifecycle (design §12). Keys on whether the slot STARTED
+    accumulated lifecycle (design §12, §14). Keys on whether the slot STARTED
     (SMART_CONTROL_IN_PROGRESS + planned active) — the validated smart-vs-bump,
-    solar-immune signal — and, for the completed-without-started case, on the
-    completed ENERGY magnitude (also solar-safe; never the meter).
+    solar-immune signal — and, for the completed-without-started case, on whether we
+    were online to see it (has_planned) and the completed ENERGY magnitude.
 
     Returns (target, reason) where target is one of:
-      - 'off_peak' : started present → genuine smart charge. Restores off-peak,
-                     including solar slots the meter floor wrongly rejected.
+      - 'off_peak' : (a) started present → genuine smart charge (restore, incl. solar
+                     slots the meter floor wrongly rejected); or (b) COMPLETED-ONLY
+                     with substantial energy and NO planned/started ever captured —
+                     EMT was offline / this is a re-import, so 'started' was never
+                     capturable. We accept Octopus's completed dispatch as authoritative
+                     (design §14). NOTE this can over-credit a genuine offline BUMP —
+                     completed alone can't tell smart from bump (§11.1) — but under-
+                     crediting a missed smart charge is the worse default, and a bump
+                     is correctable via the corrections tool.
       - 'peak'     : (a) neither started nor completed → planned but never charged;
                      or (b) completed-without-started with NEGLIGIBLE energy
-                     (|completed| < small_kwh) — the dispatch didn't materially
-                     run, so it can be neither a bump nor a real charge, hence
-                     peak (fixes the 10-Jul over-credit).
-      - 'review'   : completed-without-started with SUBSTANTIAL energy — still
-                     genuinely ambiguous (a missed-poll smart charge OR a bump).
-                     Price left unchanged and the block flagged for the user to
-                     check against the real bill.
+                     (|completed| < small_kwh) — the dispatch didn't materially run.
+      - 'review'   : we WERE online (a 'planned' was captured) but the slot never
+                     STARTED, yet completed with substantial energy — genuinely
+                     ambiguous (a bump vs a paused smart charge), §11.1. Price left
+                     unchanged and the block flagged for the user to check. We do NOT
+                     auto-off-peak this case, because unlike the offline case we had
+                     the chance to see 'started' and didn't.
       - 'ok'       : the correct target already matches the current rate.
     Only 'off_peak' and 'peak' are actionable; 'review' flags, 'ok' writes nothing.
     """
@@ -8952,13 +8960,18 @@ def _reconcile_decision(has_started: bool, has_completed: bool,
             target = "peak"
             reason = (f"completed but not started, negligible energy "
                       f"({mag:.2f} kWh < {small_kwh} kWh) → peak (did not run)")
+        elif has_planned:
+            # We were ONLINE (captured a 'planned') but it never went
+            # SMART_CONTROL_IN_PROGRESS. Per §11.1 that's ambiguous (bump vs paused
+            # smart) — leave at peak, flag for review. Unchanged from the original.
+            return ("review",
+                    f"completed ({mag:.2f} kWh) but not started, planned was seen — "
+                    "ambiguous (bump vs paused smart)")
         else:
-            # completed-with-substantial-energy but no 'started' seen. This is the
-            # EMT-was-offline / historical re-import case (the 'started' real-time
-            # signal was never captured). Octopus's `completedDispatches` is the
-            # supplier's authoritative smart-charge record — a manual boost is not a
-            # dispatch and doesn't appear there — so we accept it as off-peak rather
-            # than leaving it ambiguous at peak. rate_reconciled + the slot's
+            # COMPLETED-ONLY: no planned/started ever captured → EMT was offline for
+            # this slot or it's a historical re-import, so 'started' was never
+            # capturable. Accept Octopus's authoritative completed dispatch as
+            # off-peak (design §14). rate_reconciled + the slot's
             # source='smart-charge-completed' record that this came from a completed
             # dispatch (reconciled, not live-verified) for audit. (Previously 'review'
             # — left at peak — which silently under-credited a missed smart charge.)
@@ -9082,7 +9095,8 @@ async def reconcile_dispatch_overlay() -> dict:
         cur_rate = r["imp_rate"] or 0.0
         currently_off_peak = abs(cur_rate - off_peak) < 1e-6
         target, reason = _reconcile_decision(
-            has_started, "completed" in kinds, completed_energy, currently_off_peak)
+            has_started, "completed" in kinds, completed_energy, currently_off_peak,
+            has_planned=("planned" in kinds))
         if target == "review":
             # A review flag invites a manual correction, but the correction tool
             # can only touch DCC-settled blocks. Dispatch `completed` arrives at
