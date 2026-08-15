@@ -1,6 +1,6 @@
 # Changelog
  
-## [4.2.3] — 2026-08-14
+## [4.2.4] — 2026-08-14
 
 *Billing-period reliability: the Total Bill could **double** once you had more than one billing period, and creating, editing or removing a period could race the engine, corrupt the bill, or fail with a raw database error. Also — Octopus credentials survive a database swap, restoring a database from a file matches the backup-restore flow, the Charts page refreshes after a config change, and a standing-charge rate change shows correctly. Deliberate deletions now **stay deleted** (with an explicit Re-import to bring them back), a delete with explicit times spans one continuous range as you'd expect, outage/re-import gaps self-heal, and a big delete or chart rebuild no longer triggers a Home Assistant reconnect storm. The doubling fix only removes an over-count; no correct billing figure moves, and inc-VAT figures are otherwise byte-identical.*
 
