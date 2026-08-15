@@ -2045,6 +2045,14 @@ function renderUsageTierBars(tiers, totalKwh, containerId, currency) {
     var pct     = totalKwh > 0 ? (t.kwh / totalKwh * 100) : 0;
     var pctDisp = pct < 1 ? pct.toFixed(1) : Math.round(pct);
     var rateP   = (t.rate * 100).toFixed(2);
+    // Collapsed (Agile) rows carry a "(avg of N rates)" note, matching Billing.
+    var rateLbl = rateP + 'p/kWh' + (t.collapsed
+      ? ' <span style="opacity:0.6;">(avg of ' + t.n_rates + ' rates)</span>' : '');
+    var cur     = currency || '£';
+    // A plunge-price period nets a CREDIT (negative cost) — show it in parens like
+    // the Billing summary rather than a bare minus sign.
+    var costStr = t.cost < 0 ? '(' + cur + Math.abs(t.cost).toFixed(2) + ')'
+                             : cur + t.cost.toFixed(2);
     // Bar width: minimum 2px so even 0% tiers show a sliver
     var barW    = Math.max(pct, 0.3);
     // Colour: cheapest = accent, others step through muted palette
@@ -2053,10 +2061,10 @@ function renderUsageTierBars(tiers, totalKwh, containerId, currency) {
     html +=
       '<div style="margin-bottom:14px;">' +
         '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;">' +
-          '<span style="font-family:var(--mono);font-size:13px;color:var(--text);">' + rateP + 'p/kWh</span>' +
+          '<span style="font-family:var(--mono);font-size:13px;color:var(--text);">' + rateLbl + '</span>' +
           '<span style="font-size:12px;color:var(--muted);">' +
             t.kwh.toFixed(1) + ' kWh &nbsp;·&nbsp; ' +
-            (currency || '£') + t.cost.toFixed(2) + ' &nbsp;·&nbsp; ' +
+            costStr + ' &nbsp;·&nbsp; ' +
             '<strong style="color:var(--text);">' + pctDisp + '%</strong>' +
           '</span>' +
         '</div>' +
@@ -2073,7 +2081,8 @@ function renderSubDeviceRates(tiers, totalKwh, containerId, currency) {
   if (!el || !tiers || !tiers.length) { if(el) el.style.display='none'; return; }
   var lines = tiers.map(function(t) {
     var pct = totalKwh > 0 ? Math.round(t.kwh / totalKwh * 100) : 0;
-    return (t.rate * 100).toFixed(2) + 'p/kWh: ' + t.kwh.toFixed(1) + ' kWh (' + pct + '%)';
+    var lbl = (t.rate * 100).toFixed(2) + 'p/kWh' + (t.collapsed ? ' (avg of ' + t.n_rates + ' rates)' : '');
+    return lbl + ': ' + t.kwh.toFixed(1) + ' kWh (' + pct + '%)';
   });
   el.textContent = 'Rate breakdown: ' + lines.join(' · ');
   el.style.display = '';
@@ -2292,7 +2301,9 @@ function renderUsage(d, cmpData) {
 
   // ── Rate Period Usage ────────────────────────────────────────────────────
   var rateTiers = d.rate_tiers || [];
-  if (rateTiers.length > 1) {
+  // Show for >1 rate, OR a single COLLAPSED row (Agile folded to an avg-of-N) — but
+  // hide for a genuine single flat rate, where a lone 100% bar says nothing.
+  if (rateTiers.length > 1 || (rateTiers.length === 1 && rateTiers[0].collapsed)) {
     document.getElementById('ucard-rates').style.display = 'block';
     renderUsageTierBars(rateTiers, d.imp_kwh, 'u-rate-bars', currency);
   } else {

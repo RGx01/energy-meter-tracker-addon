@@ -5503,6 +5503,24 @@ def api_insights_periods():
         return jsonify({"error": str(e)}), 500
 
 
+def _collapse_rate_tiers(tiers_list):
+    """Fold a serialised rate_tiers list to ONE cost-weighted-average entry when it
+    exceeds the Billing view's _MAX_RATE_ROWS threshold — the same collapse
+    energy_charts._bill_rate_rows / _collapse_rate_kwh apply to Agile's ~48 rates a
+    day, so Usage Insights and Billing fold identically (#371). The average rate is
+    Σcost / Σkwh, so a net plunge-credit period reads NEGATIVE (sign preserved).
+    `collapsed` + `n_rates` let the renderer label it 'avg of N rates'."""
+    import energy_charts as _ec
+    if len(tiers_list) <= _ec._MAX_RATE_ROWS:
+        return tiers_list
+    tot_kwh  = round(sum(t["kwh"]  for t in tiers_list), 3)
+    tot_cost = round(sum(t["cost"] for t in tiers_list), 4)
+    tot_blk  = sum(t.get("blocks", 0) for t in tiers_list)
+    avg = round(tot_cost / tot_kwh, 6) if tot_kwh else 0.0
+    return [{"rate": avg, "kwh": tot_kwh, "cost": tot_cost, "blocks": tot_blk,
+             "collapsed": True, "n_rates": len(tiers_list)}]
+
+
 def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
     """
     Core aggregation for Insights — works for any UTC time range.
@@ -6046,7 +6064,7 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
             sub_totals[mid]["imp_kwh"]  += sub_grid_kwh
             sub_totals[mid]["imp_cost"] += imp_cost
             sub_totals[mid]["exp_kwh"]  += exp
-            if rate > 0:
+            if rate != 0:      # keep plunge-price (negative-rate) slots too (#371)
                 sub_totals[mid]["rate_tiers"][round(rate, 6)]["kwh"]    += sub_grid_kwh
                 sub_totals[mid]["rate_tiers"][round(rate, 6)]["cost"]   += imp_cost
                 sub_totals[mid]["rate_tiers"][round(rate, 6)]["blocks"] += 1
@@ -6083,8 +6101,11 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
         elif local_d not in daily_sc:
             daily_sc[local_d] = 0.0
 
-        # Rate tier accumulation (main meter total) — only when actually importing
-        if rate > 0 and imp > 0:
+        # Rate tier accumulation (main meter total) — only when actually importing.
+        # `rate != 0` (not `> 0`) so Agile plunge-price slots (negative rate — a
+        # CREDIT) stay in the distribution instead of being silently dropped (#371);
+        # a rate of exactly 0 still means unpriced/gap-filled and is excluded.
+        if imp > 0 and rate != 0:
             rate_key = round(rate, 6)
             rate_tiers[rate_key]["kwh"]    += imp
             rate_tiers[rate_key]["cost"]   += imp_cost
@@ -6134,7 +6155,7 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
                 _ec = _mc * (_ek / _mk) if _mk > 0 else 0.0   # apportion cost
                 _ev_kwh += _ek
                 _ev_cost += _ec
-                if _mr > 0:
+                if _mr != 0:                     # keep plunge-price slots too (#371)
                     _t = _ev_tiers[round(_mr, 6)]
                     _t["kwh"] += _ek; _t["cost"] += _ec; _t["blocks"] += 1
             if _ev_kwh > 1e-9:
@@ -6191,22 +6212,23 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
         peak_window_start = best_h
         peak_window_kwh   = round(best, 3)
 
-    # Serialise rate_tiers (keys are floats, not JSON-safe as dict keys)
-    rate_tiers_list = sorted(
+    # Serialise rate_tiers (keys are floats, not JSON-safe as dict keys), then fold
+    # to a single average row above _MAX_RATE_ROWS so Agile matches the Billing view.
+    rate_tiers_list = _collapse_rate_tiers(sorted(
         [{"rate": k, "kwh": round(v["kwh"], 3),
           "cost": round(v["cost"], 4), "blocks": v["blocks"]}
          for k, v in rate_tiers.items()],
         key=lambda x: x["rate"]
-    )
+    ))
 
-    # Serialise sub_totals rate_tiers similarly
+    # Serialise sub_totals rate_tiers similarly (same per-device collapse)
     for mid, st in sub_totals.items():
-        st["rate_tiers"] = sorted(
+        st["rate_tiers"] = _collapse_rate_tiers(sorted(
             [{"rate": k, "kwh": round(v["kwh"], 3),
               "cost": round(v["cost"], 4), "blocks": v["blocks"]}
              for k, v in st["rate_tiers"].items()],
             key=lambda x: x["rate"]
-        )
+        ))
 
     return {
         # Cost & earnings
