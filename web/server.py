@@ -5371,12 +5371,34 @@ def api_historical_gap_template():
         to  = request.args.get("to")
         channel = (request.args.get("channel") or "import").strip().lower()
         inclusive = (request.args.get("inclusive") or "").lower() in ("1", "true", "yes")
+        from_local = (request.args.get("from_local") or "").lower() in ("1", "true", "yes")
+        to_local = (request.args.get("to_local") or "").lower() in ("1", "true", "yes")
         if not frm or not to:
             return jsonify({"error": "from and to are required"}), 400
         bm, tz = _period_block_minutes_tz(_get_store(), frm)
+        # A date-range picker sends LOCAL wall-clock (e.g. the picked day
+        # 2026-08-01T00:00:00 meaning local midnight); the generator treats its
+        # input as UTC, so in BST that renders the first row as 01:00+01:00 not
+        # 00:00+01:00. Localise those boundaries to naive-UTC first so the grid
+        # lands on local midnight. (Gap paths pass real UTC block_starts and set
+        # neither flag, so they are unaffected.)
+        if from_local or to_local:
+            import block_store as _bs
+            def _loc(s):
+                s = str(s)
+                return _bs.local_datetime_to_utc(s[:10], (s[11:16] or "00:00"), tz)
+            try:
+                if from_local:
+                    frm = _loc(frm)
+                if to_local:
+                    to = _loc(to)
+            except Exception:
+                pass
         # A persisted gap's `to` is the LAST missing slot's start (inclusive); the
-        # generator is half-open, so extend the end by one block to include it.
-        if inclusive:
+        # generator is half-open, so extend the end by one block to include it. A
+        # localised end is already an exclusive next-midnight/end-of-day boundary,
+        # so it needs no bump (bumping would spill one slot into the next day).
+        if inclusive and not to_local:
             from datetime import datetime as _dt, timedelta as _td
             try:
                 _t = _dt.fromisoformat(str(to).replace("Z", "").split("+")[0])
