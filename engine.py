@@ -5088,6 +5088,19 @@ async def _kraken_startup_discovery(force: bool = False) -> None:
 
         imp = disc.get("import") or {}
         exp = disc.get("export") or {}
+        # Persist whether this account is on an OUTGOING/export agreement, so the
+        # unsettled-blocks badge only treats export as 'awaiting DCC settlement'
+        # when export is actually expected to settle. A FIT/deemed-export account
+        # has no outgoing agreement — its export never settles — so counting it is
+        # a permanent false alarm. Default (flag absent) is TRUE so a real gap is
+        # never silenced; this write corrects it to False for FIT accounts.
+        try:
+            _store.set_meta(
+                "export_settlement_expected",
+                bool(exp.get("mpan") or exp.get("tariff_code")
+                     or exp.get("agreements")))
+        except Exception:
+            pass
         logger.info("=" * 60)
         logger.info("kraken_discovery: account verified — REVIEW BEFORE ENABLING POLLING")
         logger.info("  account_number : %s", _m(disc.get("account_number")))

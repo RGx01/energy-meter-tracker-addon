@@ -3926,6 +3926,29 @@ class BlockStore:
         "        AND (b2.exp_kwh > 0 OR b2.exp_kwh_api > 0)))) "
         "AND (source IS NULL OR source NOT LIKE 'imported%')")
 
+    # Import-only variant: used when export is NOT expected to DCC-settle (a FIT/
+    # deemed-export account has no outgoing agreement, so its export never settles —
+    # chasing/counting it is a permanent false alarm). See _unsettled_where.
+    _UNSETTLED_WHERE_IMPORT_ONLY = (
+        "imp_kwh_api IS NULL "
+        "AND (source IS NULL OR source NOT LIKE 'imported%')")
+
+    def _export_settlement_expected(self) -> bool:
+        """Whether export is expected to DCC-settle for this account — True iff
+        Octopus discovery found an OUTGOING/export agreement (persisted by
+        engine._kraken_startup_discovery). FIT/deemed-export accounts have no
+        outgoing agreement, so their export never settles and must not be counted
+        as 'awaiting settlement'. Defaults TRUE when the flag is absent (older DB,
+        or discovery hasn't run yet) so a genuine gap is never silenced — discovery
+        sets it False for FIT accounts on the next account refresh."""
+        return bool(self.get_meta("export_settlement_expected", True))
+
+    def _unsettled_where(self, export_expected: bool) -> str:
+        """The 'awaiting DCC settlement' predicate. Import is always chased; export
+        is chased only when the account is on an outgoing/export agreement."""
+        return (self._UNSETTLED_WHERE if export_expected
+                else self._UNSETTLED_WHERE_IMPORT_ONLY)
+
     def get_unsettled_blocks(self, main_meter_id: str = "electricity_main",
                              limit: Optional[int] = None,
                              since_iso: Optional[str] = None) -> list:
@@ -3942,9 +3965,10 @@ class BlockStore:
         `now − horizon` to keep the count honest even before the settlement sweep
         has finalised past-horizon blocks.
         """
+        w = self._unsettled_where(self._export_settlement_expected())
         sql = ("SELECT block_start, block_end, imp_kwh, imp_kwh_api, "
                "       exp_kwh, exp_kwh_api, is_provisional "
-               f"FROM blocks WHERE meter_id = ? AND {self._UNSETTLED_WHERE} "
+               f"FROM blocks WHERE meter_id = ? AND {w} "
                "AND finalised_from_cad = 0")
         params: list = [main_meter_id]
         if since_iso:
@@ -3962,8 +3986,9 @@ class BlockStore:
         (import or export), excluding those finalised-from-CAD. `since_iso` floors
         the count at the settlement horizon (see get_unsettled_blocks) so historic
         / never-settling blocks don't inflate the 'awaiting DCC settlement' badge."""
+        w = self._unsettled_where(self._export_settlement_expected())
         sql = ("SELECT COUNT(*) AS n FROM blocks "
-               f"WHERE meter_id = ? AND {self._UNSETTLED_WHERE} "
+               f"WHERE meter_id = ? AND {w} "
                "AND finalised_from_cad = 0")
         params: list = [main_meter_id]
         if since_iso:
@@ -3980,9 +4005,10 @@ class BlockStore:
         This is DISTINCT from a real settlement — the *_api columns stay NULL —
         and reversible: a later DCC settlement clears the flag (see
         upsert_kraken_block). Returns the number of blocks newly flagged."""
+        w = self._unsettled_where(self._export_settlement_expected())
         cur = self._conn.execute(
             "UPDATE blocks SET finalised_from_cad = 1 "
-            f"WHERE meter_id = ? AND {self._UNSETTLED_WHERE} "
+            f"WHERE meter_id = ? AND {w} "
             "AND finalised_from_cad = 0 AND block_start < ?",
             (main_meter_id, cutoff_block_start))
         self._conn.commit()
@@ -3996,9 +4022,10 @@ class BlockStore:
         Bounds the sweep / user-triggered retry re-fetch window
         (oldest-unsettled → now). Including export here is what lets an
         export-lagging block stay in the window until its export settles."""
+        w = self._unsettled_where(self._export_settlement_expected())
         row = self._conn.execute(
             "SELECT MIN(block_start) AS m FROM blocks "
-            f"WHERE meter_id = ? AND {self._UNSETTLED_WHERE}",
+            f"WHERE meter_id = ? AND {w}",
             (main_meter_id,)).fetchone()
         return row["m"] if row and row["m"] else None
 
