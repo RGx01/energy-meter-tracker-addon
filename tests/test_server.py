@@ -53,6 +53,9 @@ ec.calculate_billing_summary_for_period = lambda *a, **kw: {
 }
 ec.get_billing_periods_from_config_history = lambda *a, **kw: []
 ec.get_billing_periods_from_config_periods = lambda *a, **kw: []
+# server._collapse_rate_tiers (#371) reads this threshold from energy_charts so Usage
+# Insights folds Agile rates the same way the Billing view does; mirror the real value.
+ec._MAX_RATE_ROWS = 5
 sys.modules["energy_charts"] = ec
 
 # Stub ha_client
