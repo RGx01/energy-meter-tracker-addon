@@ -127,6 +127,14 @@ bucket — show its **effective p/kWh**.
 - **Cap indicator:** "IOG cap: 4.2 of 6 h used" / "1.1 h over → EV-peak", paired
   with the actual-charging estimate so dispatched-vs-charged is visible.
 
+**Scope — split display for ALL IOG tariffs (post-back-end).** The house-vs-EV
+**billed split** on the billing summary should render for **every IOG tariff**, not
+only the capped one — a non-capped IOG user still benefits from the split Octopus
+rates internally but doesn't itemise. Only the **cap-specific** elements above (the
+`ev_device_peak` rate line, the over-cap colour, and the cap indicator) stay gated
+on the capped tariff. This presentation work is **deferred until the back-end lands**
+(the dispatch-derived split is the shared substrate either way).
+
 ## Build pieces
 1. **`off_peak_windows()` on `RateSchedule`** — return the low-rate time band(s)
    from the schedule periods, so the guaranteed home window is agreement-driven.
@@ -147,12 +155,26 @@ bucket — show its **effective p/kWh**.
 - **Completed-dispatch window capture** — **done**: `_completed_dispatch_slot_bounds`
   + `raw_start`/`raw_end` threaded into the completed history/slot writes.
 - **Dispatch-derived EV sub-meter** (`house = main import − completed-dispatch EV`)
-  — attribution + display, **changes no billing totals**, and **ships before the
-  cap**: it's the substrate the cap prices, validated against a real CT-clamp EV
-  meter (dispatch-derived EV within ~1 % aggregate, per-slot ratio unbiased around
-  1.0). Rules: completed-only, grid-clip solar-concurrent dispatch, IOG/dispatch
-  tariffs only; surface a "charged outside a smart dispatch — not counted" note
-  when non-dispatched charging is non-zero.
+  — **done (BL-22)**. Read-time split from `dispatch_history` `completed` deltas,
+  grid-clipped, validated ~99 % against a real CT-clamp EV meter; renders on the
+  **billing summary, usage insights, and Billing-tab charts** (`ev_dispatch` meter,
+  "EV (from dispatch)"). It is the cap's substrate. Two things it does **not** yet
+  do, which are the cap's job:
+    1. **It's display-only** — the EV slice's cost is apportioned *pro-rata at the
+       block's own effective rate* (`_dispatch_ev_split_by_bucket`), so EV and house
+       currently share one rate and totals stay byte-identical. The cap must price
+       the two slices at **different** rates (`ev_device_off_peak`/`ev_device_peak`
+       vs day/night) — that differential pricing is new.
+    2. **It's gated to the no-sub-meter / no-EV-meter case** (`electricity_main`
+       only) — an experimental-caution gate. **Open it for IOG tariffs.** On IOG
+       the **dispatch-derived split is the authoritative EV/house billing basis**,
+       regardless of what sub-meters exist. HA-sensor sub-meters (a battery, or a
+       physical EV-charger CT clamp) stay **indicative** — shown per-device where a
+       sensor measures them, but not the billing basis: the charger sensor is now a
+       nice-to-have next to a real solution that matches Octopus's own method. The
+       EV portion of the bill is counted **once**, from dispatch; a physical EV
+       sub-meter's cost renders alongside as an indicative reference, never added on
+       top.
 - **Historical `completed`-dispatch fetch (90-day)** — see BL-9 in the roadmap. The
   cap-day union and the completed-only reprice both need the `completed` record
   present; a bounded historical fetch backfills it across downtime / re-import.

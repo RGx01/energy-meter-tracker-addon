@@ -610,6 +610,11 @@ def _block_rows(block: dict, config_period_id: int, tz_name: str) -> list[dict]:
             # (NULL otherwise — inc-VAT figures are unaffected).
             "imp_cost_exc":      imp.get("cost_exc"),
             "imp_rate_exc":      imp.get("rate_exc"),
+            # BL-9: IOG house/EV split — the dispatch-derived EV portion of import
+            # (NULL when not an IOG-priced dispatched slot; house = the remainder).
+            "imp_kwh_ev":        imp.get("kwh_ev"),
+            "imp_cost_ev":       imp.get("cost_ev"),
+            "imp_rate_ev":       imp.get("rate_ev"),
             "imp_read_start":    imp.get("read_start"),
             "imp_read_end":      imp.get("read_end"),
             # export channel
@@ -1120,6 +1125,15 @@ class BlockStore:
             ("imp_rate_exc",       "blocks",        "REAL",                       _b_cols),
             ("standing_charge_exc","blocks",        "REAL",                       _b_cols),
             ("exc_source",         "blocks",        "TEXT",                       _b_cols),
+            # ── 4.3 BL-9: IOG house/EV billing split. The dispatch-derived EV
+            # portion of this block's main import (grid-clipped) + its cost/rate;
+            # house = imp_kwh − imp_kwh_ev, imp_cost − imp_cost_ev (not stored).
+            # Additive, NULL until a dispatched IOG slot is priced — populated for
+            # ALL IOG tariffs (the capped tariff prices the EV portion at
+            # ev_device_*, uncapped IOG at the general off-peak overlay).
+            ("imp_kwh_ev",         "blocks",        "REAL",                       _b_cols),
+            ("imp_cost_ev",        "blocks",        "REAL",                       _b_cols),
+            ("imp_rate_ev",        "blocks",        "REAL",                       _b_cols),
             ("carbon_gco2_min",  "power_history",   "REAL",              _ph_cols),
             # ── 3.1.x dispatch lifecycle capture (observe-only, no billing effect)
             ("state",            "dispatch_slots", "TEXT",  _ds_cols),
@@ -5923,7 +5937,8 @@ class BlockStore:
                 exp_read_start, exp_read_end,
                 standing_charge, standing_charge_exc, carbon_g, carbon_intensity_g, imp_provisional,
                 source, exc_source, is_provisional, needs_pass2_rerun, imp_kwh_api, needs_review,
-                exp_kwh_api
+                exp_kwh_api,
+                imp_kwh_ev, imp_cost_ev, imp_rate_ev
             ) VALUES (
                 :block_start, :block_end,
                 :meter_id, :config_period_id, :interpolated,
@@ -5934,7 +5949,8 @@ class BlockStore:
                 :exp_read_start, :exp_read_end,
                 :standing_charge, :standing_charge_exc, :carbon_g, :carbon_intensity_g, :imp_provisional,
                 :source, :exc_source, :is_provisional, :needs_pass2_rerun, :imp_kwh_api, :needs_review,
-                :exp_kwh_api
+                :exp_kwh_api,
+                :imp_kwh_ev, :imp_cost_ev, :imp_rate_ev
             )
         """
         with self._conn:
@@ -5956,7 +5972,8 @@ class BlockStore:
                 exp_read_start, exp_read_end,
                 standing_charge, standing_charge_exc, carbon_g, carbon_intensity_g, imp_provisional,
                 source, exc_source, is_provisional, needs_pass2_rerun, imp_kwh_api, needs_review,
-                exp_kwh_api
+                exp_kwh_api,
+                imp_kwh_ev, imp_cost_ev, imp_rate_ev
             ) VALUES (
                 :block_start, :block_end,
                 :meter_id, :config_period_id, :interpolated,
@@ -5967,7 +5984,8 @@ class BlockStore:
                 :exp_read_start, :exp_read_end,
                 :standing_charge, :standing_charge_exc, :carbon_g, :carbon_intensity_g, :imp_provisional,
                 :source, :exc_source, :is_provisional, :needs_pass2_rerun, :imp_kwh_api, :needs_review,
-                :exp_kwh_api
+                :exp_kwh_api,
+                :imp_kwh_ev, :imp_cost_ev, :imp_rate_ev
             )
         """
         with self._conn:

@@ -496,6 +496,124 @@ def _snap_to_slot(block_start: str) -> str:
         return block_start
 
 
+# ── IOG 6-hour-cap house/EV billing split (BL-9) ─────────────────────────────
+# A bump/boost dispatch bills EV at peak, never off-peak (the cap's exception).
+_IOG_BUMP_SOURCES = {"bump-charge", "boost"}
+
+
+def _iog_slot_ev_kwh(block_start: str, chosen_kwh: float) -> float:
+    """Grid-clipped dispatch-derived EV kWh for a slot: the completed-dispatch
+    delta (Octopus's own per-slot EV energy) clipped to the slot's grid import."""
+    if _store is None or not chosen_kwh or chosen_kwh <= 0:
+        return 0.0
+    try:
+        rows = _store._conn.execute(
+            "SELECT energy_kwh FROM dispatch_history "
+            "WHERE kind='completed' AND slot_start = ?",
+            (_snap_to_slot(block_start),)).fetchall()
+    except Exception:
+        return 0.0
+    ev = sum(abs(float(r["energy_kwh"])) for r in rows if r["energy_kwh"] is not None)
+    return min(ev, float(chosen_kwh))
+
+
+def _iog_slot_is_boost(block_start: str) -> bool:
+    """True when a bump/boost dispatch covers the slot (source on the planned/
+    started record; completed rows carry no source)."""
+    if _store is None:
+        return False
+    try:
+        rows = _store._conn.execute(
+            "SELECT source FROM dispatch_history WHERE slot_start = ? "
+            "AND source IS NOT NULL", (_snap_to_slot(block_start),)).fetchall()
+    except Exception:
+        return False
+    return any((r["source"] or "") in _IOG_BUMP_SOURCES for r in rows)
+
+
+def _iog_cap_day_boundary(block_start: str, tz_name: str):
+    """The 6-hour cap boundary instant for this slot's noon→noon cap-day, or None.
+    Reads the cap-day's completed dispatch windows and unions them (iog_cap)."""
+    if _store is None:
+        return None
+    import iog_cap
+    key = iog_cap.cap_day_key(block_start, tz_name)
+    try:
+        from datetime import date as _date, timedelta as _td
+        y, m, d = int(key[:4]), int(key[5:7]), int(key[8:10])
+        nxt = (_date(y, m, d) + _td(days=1)).isoformat()
+        rows = _store._conn.execute(
+            "SELECT raw_start, raw_end FROM dispatch_history WHERE kind='completed' "
+            "AND raw_start IS NOT NULL AND raw_end IS NOT NULL "
+            "AND raw_start >= ? AND raw_start < ?",
+            (key + "T00:00:00", nxt + "T23:59:59")).fetchall()
+    except Exception:
+        return None
+    return iog_cap.cap_day_boundaries(
+        [(r["raw_start"], r["raw_end"]) for r in rows], tz_name).get(key)
+
+
+def _iog_site_tz() -> str:
+    """The site's IANA timezone (for the noon→noon cap-day), from the newest
+    config period; 'UTC' fallback."""
+    if _store is None:
+        return "UTC"
+    try:
+        row = _store._conn.execute(
+            "SELECT timezone FROM config_periods "
+            "ORDER BY effective_from DESC LIMIT 1").fetchone()
+        return (row["timezone"] or "UTC") if row else "UTC"
+    except Exception:
+        return "UTC"
+
+
+def _apply_iog_split(imp_ch: dict, block_start: str, block_end: str,
+                     chosen_kwh: float, overlay_rate: float,
+                     tz_name: "str | None" = None) -> None:
+    """Compute + apply the IOG house/EV billing split onto `imp_ch` IN PLACE.
+
+    Sets `kwh_ev`/`cost_ev`/`rate_ev` for any dispatched IOG slot (all IOG tariffs
+    — the billing-summary primer). On the CAPPED tariff it also re-prices the block
+    (`rate`/`cost` → the blended 4-rate values); on UNCAPPED IOG it leaves
+    `rate`/`cost` exactly as the overlay set them (byte-identical), carving the EV
+    slice at that same rate. No-op when there's no import schedule or no EV this
+    slot — so non-IOG and non-dispatched slots are untouched. Callers must only
+    invoke this when no authoritative rate override is in force."""
+    import iog_cap
+    import_sched = _kraken_rate_schedules.get("import")
+    if import_sched is None or import_sched.is_empty():
+        return
+    ev_kwh = _iog_slot_ev_kwh(block_start, chosen_kwh)
+    if ev_kwh <= 1e-9:
+        return
+    if tz_name is None:
+        tz_name = _iog_site_tz()
+    if not block_end:
+        try:
+            block_end = (datetime.fromisoformat(
+                str(block_start).replace("Z", "").split("+")[0])
+                + timedelta(minutes=30)).isoformat()
+        except Exception:
+            return
+    capped = ("ev_device_off_peak" in _kraken_rate_schedules
+              and "ev_device_peak" in _kraken_rate_schedules)
+    boundary = _iog_cap_day_boundary(block_start, tz_name) if capped else None
+    res = iog_cap.compute_iog_split(
+        block_start, block_end, chosen_kwh=chosen_kwh, ev_kwh=ev_kwh,
+        overlay_rate=overlay_rate, is_boost=_iog_slot_is_boost(block_start),
+        capped=capped, boundary_utc=boundary, import_sched=import_sched,
+        ev_off_sched=_kraken_rate_schedules.get("ev_device_off_peak"),
+        ev_peak_sched=_kraken_rate_schedules.get("ev_device_peak"))
+    if res is None:
+        return
+    imp_ch["kwh_ev"] = res["imp_kwh_ev"]
+    imp_ch["cost_ev"] = res["imp_cost_ev"]
+    imp_ch["rate_ev"] = res["imp_rate_ev"]
+    if capped:                              # capped tariff RE-PRICES the block
+        imp_ch["rate"] = res["imp_rate"]
+        imp_ch["cost"] = res["imp_cost"]
+
+
 def _log_config_state(config: dict | None = None) -> None:
     """Emit a one-shot config-state dump at startup (design open-item 2).
 
@@ -3004,6 +3122,13 @@ def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricit
             imp_ch["kwh"] = chosen
             imp_ch["kwh_total"] = chosen
             imp_ch["cost"] = round(chosen * rate, 6)
+            # BL-9: IOG house/EV split — carve the dispatched EV portion (all IOG)
+            # and, on the capped tariff, re-price the block. Only when the overlay
+            # actually ran (no authoritative rate override in force), so a user
+            # correction / dispatch reconciliation is never stomped.
+            if _override_rate is None:
+                _apply_iog_split(imp_ch, block.get("start", ""),
+                                 block.get("end", ""), chosen, rate)
             # BL-23 durable ex-VAT capture: settle the ex-VAT cost alongside inc. The
             # settled inc cost is rate × kWh (reconstruction), so the ex-VAT cost is
             # kWh × the published ex-VAT rate — obtained by scaling the resolved
@@ -3552,6 +3677,11 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
                     if _ov != _base:
                         result["rate"] = _ov
                         result["cost"] = round((result.get("kwh") or 0.0) * _ov, 6)
+                    # BL-9: IOG house/EV split — carve the dispatched EV portion
+                    # (all IOG) and, on the capped tariff, re-price live. Settlement
+                    # re-applies it when the DCC kWh re-materialises.
+                    _apply_iog_split(result, start, "", result.get("kwh"),
+                                     result.get("rate") or _base)
 
             # NOTE: sub-meter (device) import is NOT priced here. Devices always
             # follow the main meter's effective import rate, applied uniformly in
@@ -8169,11 +8299,33 @@ async def _refresh_kraken_rate_schedules() -> None:
     # cycle. A transient failure leaves the previous flag exactly as it was.
     if import_determined:
         _rate_schedule_unsupported = unsupported
+
+    # IOG-SMB-TOU EV-device buckets (6-hour cap). Additive: only the capped tariff
+    # exposes these, so gate on the IOG signature and keep only non-empty results;
+    # any failure is non-fatal (the cap classifier then falls back to the general
+    # overlay). The cap prices the EV portion of a dispatched slot from these.
+    _imp = _kraken_discovery.get("import") or {}
+    _imp_tariff = _imp.get("tariff_code") or ""
+    if _imp.get("product_code") and "IOG" in _imp_tariff.upper():
+        try:
+            from kraken_rates import build_ev_device_schedules
+            _ev_off, _ev_peak = await build_ev_device_schedules(
+                _kraken_client, _imp["product_code"], _imp_tariff)
+            if not _ev_off.is_empty():
+                new_cache["ev_device_off_peak"] = _ev_off
+            if not _ev_peak.is_empty():
+                new_cache["ev_device_peak"] = _ev_peak
+        except Exception as e:
+            logger.warning("_refresh_kraken_rate_schedules: ev_device build failed: %s", e)
+
     if new_cache:
         _kraken_rate_schedules = new_cache
-        logger.info("_refresh_kraken_rate_schedules: import=%d export=%d periods",
+        logger.info("_refresh_kraken_rate_schedules: import=%d export=%d "
+                    "ev_off=%d ev_peak=%d periods",
                     len(_kraken_rate_schedules.get("import", []) or []),
-                    len(_kraken_rate_schedules.get("export", []) or []))
+                    len(_kraken_rate_schedules.get("export", []) or []),
+                    len(_kraken_rate_schedules.get("ev_device_off_peak", []) or []),
+                    len(_kraken_rate_schedules.get("ev_device_peak", []) or []))
         _learn_vat_from_import_schedule()
 
     # Standing charge comes from the import tariff.

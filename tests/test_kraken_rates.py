@@ -256,5 +256,43 @@ class TestBuildRateScheduleFetchErrors(unittest.TestCase):
         self.assertFalse(s.is_empty())
 
 
+class TestIsOffPeak(unittest.TestCase):
+    """RateSchedule.is_off_peak — the agreement-driven guaranteed-window primitive
+    for the IOG 6-hour-cap classifier (docs/iog_6hr_cap_design.md build piece 1)."""
+
+    def _iog_day_night(self):
+        # IOG-style banded schedule: off-peak 23:30–05:30 (5.5p), peak otherwise
+        # (32.0p), across two days so day 2 also carries a peak band.
+        return RateSchedule([
+            ("2026-01-01T00:00:00", "2026-01-01T05:30:00", 5.5),    # night tail
+            ("2026-01-01T05:30:00", "2026-01-01T23:30:00", 32.0),   # day / peak
+            ("2026-01-01T23:30:00", "2026-01-02T05:30:00", 5.5),    # night
+            ("2026-01-02T05:30:00", "2026-01-02T23:30:00", 32.0),   # day / peak
+        ])
+
+    def test_off_peak_band_true(self):
+        s = self._iog_day_night()
+        self.assertTrue(s.is_off_peak("2026-01-01T02:00:00"))   # night tail
+        self.assertTrue(s.is_off_peak("2026-01-01T23:45:00"))   # night
+        self.assertTrue(s.is_off_peak("2026-01-02T00:30:00"))   # night, into day 2
+
+    def test_peak_band_false(self):
+        s = self._iog_day_night()
+        self.assertFalse(s.is_off_peak("2026-01-01T12:00:00"))  # midday / peak
+        self.assertFalse(s.is_off_peak("2026-01-02T18:00:00"))  # evening / peak
+
+    def test_uncovered_is_none(self):
+        s = self._iog_day_night()
+        self.assertIsNone(s.is_off_peak("2025-12-31T12:00:00"))  # before coverage
+
+    def test_flat_tariff_reads_off_peak(self):
+        # A flat tariff has min == max, so every covered ts is 'off-peak'. Callers
+        # meaning banded IOG guard with day_rate_bounds(min < max) first.
+        s = RateSchedule([("2026-01-01T00:00:00", None, 24.5)])
+        self.assertTrue(s.is_off_peak("2026-06-01T12:00:00"))
+        lo, hi = s.day_rate_bounds("2026-06-01T12:00:00")
+        self.assertEqual(lo, hi)   # the caller's banded-only guard
+
+
 if __name__ == "__main__":
     unittest.main()
