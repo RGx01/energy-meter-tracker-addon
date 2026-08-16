@@ -191,3 +191,63 @@ in a day:
    confirmed for the *in-window* case (house stays off-peak); the out-of-window
    case is inferred from rule 3's "within your car allowance" wording. Strong, but
    verify against a real over-cap daytime slot.
+
+## Surfacing the split — billing summary & charts (UI)
+
+Confirmed against a real capped bill (IOG 12M Fixed, Jul–Aug 2026): the rate table
+is a **2×2 grid — {EV, Home} × {off-peak, peak}** — up to four rows (a zero band
+shows 0.0 kWh). On that tariff the EV and Home unit rates are **equal within each
+band** (off-peak 5.23p both; peak 32.11p both), so the split is pure *attribution*
+until the **cap** pushes EV charging into peak. The boundary half-hour (cap crossing
+mid-block) carries a **blended average rate for both EV and Home**, so an over-cap
+period adds a **transition dual row** at that average on top of the four clean rows —
+exactly what `price_import_split` yields (house and EV blend together outside the
+guaranteed window).
+
+### Billing summary
+Show the EV/Home split under **"Import — total grid"**, mirroring the statement:
+group `imp_kwh_ev` (EV) and the remainder (Home) by rate band → EV/Home off-peak,
+EV/Home peak, plus an EV/Home **transition-average** row when boundary blocks exist.
+**"Breakdown by meter" is untouched** — the grid-total section shows the *billed
+dispatch split*, the per-meter section shows the *physical devices*. Different views,
+no conflict.
+
+### Charts — one EV line, coverage-based
+Never draw two EV representations. The rule is **per-slot coverage**: the charts show
+the **physical EV device where it has a block**, and the **synthetic dispatch EV fills
+only the slots the physical device doesn't cover**. Self-healing, no timeline stitch:
+- no physical device ever → synthetic covers all history (where dispatch exists);
+- physical device present and reporting → synthetic suppressed (today's behaviour);
+- physical device **decommissioned** at cutover T → it stops writing new blocks, so
+  the synthetic naturally takes over from T.
+
+**Decommission = retire the physical EV device at a cutover datetime** (`retired_at`,
+default now, adjustable back to when a sensor went bad). Its history is retained and
+keeps showing; the synthetic picks up where its blocks end. EV is already grid-clipped
+first (`min(ev, grid_import)`, house = remainder), so physical and synthetic follow the
+same clip and the house line never moves at the hand-off.
+
+**Fully reversible:** clear the decommission date (un-retire) and run the device's
+**HA-sensor history fill** to backfill the gap — as physical blocks reappear, the
+coverage gate hands those slots back to the physical device automatically. Because the
+gate keys on *actual block coverage*, decommission / un-retire / sensor-fill all
+converge on a consistent chart with no contradictory half-state.
+
+### Cross-threading caution (UI)
+Decommission, un-retire and sensor-fill interact, and the controls must not strand a
+user in a confusing state — e.g. a **backdated** cutover that leaves a flaky tail of
+physical blocks after T still present (so the synthetic can't show there), or an
+un-retire with no fill (a gap the physical device now "owns" but has no data for). The
+coverage gate keeps the *chart* honest regardless, but surface the interplay: pair
+un-retire with an offer to sensor-fill, and when backdating a cutover make clear
+whether existing physical blocks after T are kept or cleared.
+
+### Billing stays decoupled
+None of this touches billing: the summary's EV/Home split always uses the **dispatch**
+figures across all history, whatever the charts draw. Neat consequence —
+decommissioning the physical device is the one-click way to make a user's chart match
+their bill going forward.
+
+### Naming
+The synthetic line must read as clearly *derived* — e.g. **"Car — from Octopus"** —
+never a bare "EV" that looks like a second charger the user doesn't remember adding.

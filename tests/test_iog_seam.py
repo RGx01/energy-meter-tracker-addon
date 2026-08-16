@@ -78,6 +78,7 @@ class TestApplyIogSplit(unittest.TestCase):
         self.assertAlmostEqual(imp["cost_ev"], 0.10)  # 2*0.05
         self.assertAlmostEqual(imp["cost"], 0.15)     # UNCHANGED
         self.assertAlmostEqual(imp["rate"], 0.05)
+        self.assertEqual(imp["ev_band"], "off_peak")  # uncapped: whole slot off-peak
 
     # ── capped: re-prices ───────────────────────────────────────────────────
     def _capped(self):
@@ -95,6 +96,8 @@ class TestApplyIogSplit(unittest.TestCase):
         self._apply(imp)
         self.assertAlmostEqual(imp["cost"], 0.17)     # 2*0.05 + 1*0.07 (house freebie)
         self.assertAlmostEqual(imp["cost_ev"], 0.10)
+        self.assertEqual(imp["ev_band"], "off_peak")
+        self.assertEqual(imp["home_band"], "off_peak")
 
     def test_capped_over_cap_ev_peak(self):
         self._capped()
@@ -105,6 +108,8 @@ class TestApplyIogSplit(unittest.TestCase):
         self._apply(imp, start="2026-01-01T18:30:00", end="2026-01-01T19:00:00")
         self.assertAlmostEqual(imp["cost"], 0.80)     # 2*0.25 + 1*0.30
         self.assertAlmostEqual(imp["rate_ev"], 0.25)
+        self.assertEqual(imp["ev_band"], "peak")
+        self.assertEqual(imp["home_band"], "day")     # freebie withdrawn out-of-window
 
 
 if __name__ == "__main__":
