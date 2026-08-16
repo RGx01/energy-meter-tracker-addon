@@ -572,12 +572,19 @@ def _import_synth_rows(bill: Bill, block_min: int = 30) -> list:
             for hhmm, (sh, sm, eh, em, wrap) in _day_slots(d, block_min):
                 is_night = (len(tiers) > 1 and _in_window(hhmm, _NIGHT_WINDOW))
                 (night_slots if is_night else day_slots_).append((d, sh, sm, eh, em, wrap, stand))
+        # One standing charge per local day — the seen-day set is SHARED across the
+        # night and day emits. `_emit` runs twice for a dual-rate period (night
+        # slots, then day slots); a per-call set made each day look "first-seen" in
+        # BOTH passes, so the daily standing charge was written twice (issue #370).
+        # A period-scoped set fixes it: the day's first slot carries it once —
+        # chronologically the 00:00 night slot, or the first day slot on a day with
+        # no night portion.
+        seen_day = set()
         def _emit(slot_list, total_kwh, rate_pre):
             if not slot_list or rate_pre is None:
                 return
             per = total_kwh / len(slot_list)
             rate_inc = round(rate_pre * (1 + vat), 4)
-            seen_day = set()
             for (d, sh, sm, eh, em, wrap, stand) in slot_list:
                 end_d = d + timedelta(days=1) if wrap else d
                 first = d not in seen_day

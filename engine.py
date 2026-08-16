@@ -496,6 +496,129 @@ def _snap_to_slot(block_start: str) -> str:
         return block_start
 
 
+# ── IOG 6-hour-cap house/EV billing split (BL-9) ─────────────────────────────
+# A bump/boost dispatch bills EV at peak, never off-peak (the cap's exception).
+_IOG_BUMP_SOURCES = {"bump-charge", "boost"}
+
+
+def _iog_slot_ev_kwh(block_start: str, chosen_kwh: float) -> float:
+    """Grid-clipped dispatch-derived EV kWh for a slot: the completed-dispatch
+    delta (Octopus's own per-slot EV energy) clipped to the slot's grid import."""
+    if _store is None or not chosen_kwh or chosen_kwh <= 0:
+        return 0.0
+    try:
+        rows = _store._conn.execute(
+            "SELECT energy_kwh FROM dispatch_history "
+            "WHERE kind='completed' AND slot_start = ?",
+            (_snap_to_slot(block_start),)).fetchall()
+    except Exception:
+        return 0.0
+    ev = sum(abs(float(r["energy_kwh"])) for r in rows if r["energy_kwh"] is not None)
+    return min(ev, float(chosen_kwh))
+
+
+def _iog_slot_is_boost(block_start: str) -> bool:
+    """True when a bump/boost dispatch covers the slot (source on the planned/
+    started record; completed rows carry no source)."""
+    if _store is None:
+        return False
+    try:
+        rows = _store._conn.execute(
+            "SELECT source FROM dispatch_history WHERE slot_start = ? "
+            "AND source IS NOT NULL", (_snap_to_slot(block_start),)).fetchall()
+    except Exception:
+        return False
+    return any((r["source"] or "") in _IOG_BUMP_SOURCES for r in rows)
+
+
+def _iog_cap_day_boundary(block_start: str, tz_name: str):
+    """The 6-hour cap boundary instant for this slot's noon→noon cap-day, or None.
+    Reads the cap-day's completed dispatch windows and unions them (iog_cap)."""
+    if _store is None:
+        return None
+    import iog_cap
+    key = iog_cap.cap_day_key(block_start, tz_name)
+    try:
+        from datetime import date as _date, timedelta as _td
+        y, m, d = int(key[:4]), int(key[5:7]), int(key[8:10])
+        nxt = (_date(y, m, d) + _td(days=1)).isoformat()
+        rows = _store._conn.execute(
+            "SELECT raw_start, raw_end FROM dispatch_history WHERE kind='completed' "
+            "AND raw_start IS NOT NULL AND raw_end IS NOT NULL "
+            "AND raw_start >= ? AND raw_start < ?",
+            (key + "T00:00:00", nxt + "T23:59:59")).fetchall()
+    except Exception:
+        return None
+    return iog_cap.cap_day_boundaries(
+        [(r["raw_start"], r["raw_end"]) for r in rows], tz_name).get(key)
+
+
+def _iog_site_tz() -> str:
+    """The site's IANA timezone (for the noon→noon cap-day), from the newest
+    config period; 'UTC' fallback."""
+    if _store is None:
+        return "UTC"
+    try:
+        row = _store._conn.execute(
+            "SELECT timezone FROM config_periods "
+            "ORDER BY effective_from DESC LIMIT 1").fetchone()
+        return (row["timezone"] or "UTC") if row else "UTC"
+    except Exception:
+        return "UTC"
+
+
+def _apply_iog_split(imp_ch: dict, block_start: str, block_end: str,
+                     chosen_kwh: float, overlay_rate: float,
+                     tz_name: "str | None" = None) -> None:
+    """Compute + apply the IOG house/EV billing split onto `imp_ch` IN PLACE.
+
+    Sets `kwh_ev`/`cost_ev`/`rate_ev` for any dispatched IOG slot (all IOG tariffs
+    — the billing-summary primer). On the CAPPED tariff it also re-prices the block
+    (`rate`/`cost` → the blended 4-rate values); on UNCAPPED IOG it leaves
+    `rate`/`cost` exactly as the overlay set them (byte-identical), carving the EV
+    slice at that same rate. No-op when there's no import schedule or no EV this
+    slot — so non-IOG and non-dispatched slots are untouched. Callers must only
+    invoke this when no authoritative rate override is in force."""
+    import iog_cap
+    import_sched = _kraken_rate_schedules.get("import")
+    if import_sched is None or import_sched.is_empty():
+        return
+    ev_kwh = _iog_slot_ev_kwh(block_start, chosen_kwh)
+    if ev_kwh <= 1e-9:
+        return
+    if tz_name is None:
+        tz_name = _iog_site_tz()
+    if not block_end:
+        try:
+            block_end = (datetime.fromisoformat(
+                str(block_start).replace("Z", "").split("+")[0])
+                + timedelta(minutes=30)).isoformat()
+        except Exception:
+            return
+    capped = ("ev_device_off_peak" in _kraken_rate_schedules
+              and "ev_device_peak" in _kraken_rate_schedules)
+    boundary = _iog_cap_day_boundary(block_start, tz_name) if capped else None
+    res = iog_cap.compute_iog_split(
+        block_start, block_end, chosen_kwh=chosen_kwh, ev_kwh=ev_kwh,
+        overlay_rate=overlay_rate, is_boost=_iog_slot_is_boost(block_start),
+        capped=capped, boundary_utc=boundary, import_sched=import_sched,
+        ev_off_sched=_kraken_rate_schedules.get("ev_device_off_peak"),
+        ev_peak_sched=_kraken_rate_schedules.get("ev_device_peak"))
+    if res is None:
+        return
+    imp_ch["kwh_ev"] = res["imp_kwh_ev"]
+    imp_ch["cost_ev"] = res["imp_cost_ev"]
+    imp_ch["rate_ev"] = res["imp_rate_ev"]
+    # The EV/Home rate bands (off_peak|peak|mixed / off_peak|day|mixed) so the
+    # billing summary can show clean bands + one collapsed transition row.
+    _cls = res.get("classification") or {}
+    imp_ch["ev_band"] = _cls.get("ev")
+    imp_ch["home_band"] = _cls.get("house")
+    if capped:                              # capped tariff RE-PRICES the block
+        imp_ch["rate"] = res["imp_rate"]
+        imp_ch["cost"] = res["imp_cost"]
+
+
 def _log_config_state(config: dict | None = None) -> None:
     """Emit a one-shot config-state dump at startup (design open-item 2).
 
@@ -3004,6 +3127,13 @@ def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricit
             imp_ch["kwh"] = chosen
             imp_ch["kwh_total"] = chosen
             imp_ch["cost"] = round(chosen * rate, 6)
+            # BL-9: IOG house/EV split — carve the dispatched EV portion (all IOG)
+            # and, on the capped tariff, re-price the block. Only when the overlay
+            # actually ran (no authoritative rate override in force), so a user
+            # correction / dispatch reconciliation is never stomped.
+            if _override_rate is None:
+                _apply_iog_split(imp_ch, block.get("start", ""),
+                                 block.get("end", ""), chosen, rate)
             # BL-23 durable ex-VAT capture: settle the ex-VAT cost alongside inc. The
             # settled inc cost is rate × kWh (reconstruction), so the ex-VAT cost is
             # kWh × the published ex-VAT rate — obtained by scaling the resolved
@@ -3552,6 +3682,11 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
                     if _ov != _base:
                         result["rate"] = _ov
                         result["cost"] = round((result.get("kwh") or 0.0) * _ov, 6)
+                    # BL-9: IOG house/EV split — carve the dispatched EV portion
+                    # (all IOG) and, on the capped tariff, re-price live. Settlement
+                    # re-applies it when the DCC kWh re-materialises.
+                    _apply_iog_split(result, start, "", result.get("kwh"),
+                                     result.get("rate") or _base)
 
             # NOTE: sub-meter (device) import is NOT priced here. Devices always
             # follow the main meter's effective import rate, applied uniformly in
@@ -5088,6 +5223,19 @@ async def _kraken_startup_discovery(force: bool = False) -> None:
 
         imp = disc.get("import") or {}
         exp = disc.get("export") or {}
+        # Persist whether this account is on an OUTGOING/export agreement, so the
+        # unsettled-blocks badge only treats export as 'awaiting DCC settlement'
+        # when export is actually expected to settle. A FIT/deemed-export account
+        # has no outgoing agreement — its export never settles — so counting it is
+        # a permanent false alarm. Default (flag absent) is TRUE so a real gap is
+        # never silenced; this write corrects it to False for FIT accounts.
+        try:
+            _store.set_meta(
+                "export_settlement_expected",
+                bool(exp.get("mpan") or exp.get("tariff_code")
+                     or exp.get("agreements")))
+        except Exception:
+            pass
         logger.info("=" * 60)
         logger.info("kraken_discovery: account verified — REVIEW BEFORE ENABLING POLLING")
         logger.info("  account_number : %s", _m(disc.get("account_number")))
@@ -6180,6 +6328,205 @@ async def _run_historical_exc_backfill(max_blocks: int = 20000,
     logger.info("exc backfill: filled %d block(s) this pass%s",
                 filled, " — complete" if reached_end else " (resuming next pass)")
     return filled
+
+
+_IOG_SPLIT_BACKFILL_MARKER = "iog_split_backfill_state"   # store_meta key
+# Coverage-scope version of the IOG house/EV split backfill. Bump when the fill
+# logic widens (e.g. capped re-pricing added) so an instance that already ran at a
+# narrower scope re-arms instead of skipping forever.
+#   1 = additive EV/Home carve only (no inc re-pricing) — the billing-summary primer
+_IOG_SPLIT_BACKFILL_SCOPE = 1
+_IOG_SPLIT_BACKFILL_PASS_PACE = 1.0   # seconds between drain passes (test-overridable)
+_iog_split_backfill_running = False   # BL-9 split backfill re-entry guard
+
+
+async def _run_historical_iog_split_backfill(max_blocks: int = 20000,
+                                             batch: int = 500,
+                                             pace_s: float = 0.02) -> int:
+    """One-shot IOG house/EV split historical backfill (BL-9). The split seam
+    (_apply_iog_split) only fires when a block is finalised or repriced at settlement,
+    so every block priced BEFORE the split shipped — the whole existing dispatch
+    history, and anything already DCC-settled — has no EV/Home columns and the billing
+    summary shows no split. This walks those blocks and carves the split in place.
+
+    ADDITIVE ONLY: it writes just imp_kwh_ev/imp_cost_ev/imp_rate_ev and the two band
+    columns; it NEVER re-prices imp_rate/imp_cost, so the settled inc bill stays
+    byte-identical. (On a capped tariff the forward seam re-prices new blocks; whether
+    to retroactively re-price settled capped history is a separate decision — hence
+    scope 1.) Idempotent (fills NULL split only), resumable (persistent cursor),
+    cooperative (one transaction per chunk, yields between batches like the exc
+    backfill). A no-op when the import rate schedule isn't ready yet (deferred, not
+    marked done) or there's no dispatch history (marked done — nothing to carve).
+    Returns blocks filled this invocation."""
+    global _store
+    import asyncio as _aio
+    from datetime import datetime as _dt, timezone as _tz
+    if _store is None:
+        return 0
+    state = _store.get_meta(_IOG_SPLIT_BACKFILL_MARKER, {}) or {}
+    if state and int(state.get("scope") or 1) < _IOG_SPLIT_BACKFILL_SCOPE:
+        logger.info("iog split backfill: coverage scope widened to %d — re-arming",
+                    _IOG_SPLIT_BACKFILL_SCOPE)
+        state = {"filled": int(state.get("filled") or 0)}
+    if state.get("done") or delete_in_progress():
+        return 0
+    # The carve needs the import rate schedule; it populates async at startup. Without
+    # it _apply_iog_split no-ops, so run it too early and we'd fill nothing then wrongly
+    # mark done. Defer (return without a done marker) until the schedule is ready.
+    _isched = _kraken_rate_schedules.get("import")
+    if _isched is None or _isched.is_empty():
+        logger.info("iog split backfill: import schedule not ready — deferring")
+        return 0
+
+    _remaining0 = _store.count_blocks_missing_iog_split()
+    if _remaining0 == 0:
+        _store.set_meta(_IOG_SPLIT_BACKFILL_MARKER,
+                        {"done": True, "scope": _IOG_SPLIT_BACKFILL_SCOPE,
+                         "filled": int(state.get("filled") or 0),
+                         "completed_at": _dt.now(_tz.utc).replace(tzinfo=None).isoformat()})
+        logger.info("iog split backfill: nothing to carve — no dispatched blocks "
+                    "missing the EV/Home split")
+        return 0
+    logger.info("iog split backfill: starting — %d dispatched block(s) missing the "
+                "EV/Home split", _remaining0)
+
+    _now_iso = lambda: _dt.now(_tz.utc).replace(tzinfo=None).isoformat()
+    tz_name = _iog_site_tz()
+    filled = 0
+    scanned = 0
+    cursor = state.get("cursor")
+    total_filled = int(state.get("filled") or 0)
+    reached_end = False
+    while scanned < max_blocks:
+        rows = _store.get_blocks_missing_iog_split(limit=batch, after_start=cursor)
+        if not rows:
+            reached_end = True
+            break
+        updates = []
+        for r in rows:
+            cursor = r["start"]
+            scanned += 1
+            kwh = r.get("kwh") or 0.0
+            rate = r.get("rate") or 0.0
+            tmp: dict = {}
+            try:
+                _apply_iog_split(tmp, cursor, "", kwh, rate, tz_name)
+            except Exception as e:
+                logger.warning("iog split backfill: carve failed (start=%s): %s",
+                               cursor, e)
+                continue
+            if tmp.get("kwh_ev") is None:
+                continue          # no EV this slot — leave NULL, cursor walks past it
+            updates.append((cursor, r["meter_id"], tmp.get("kwh_ev"),
+                            tmp.get("cost_ev"), tmp.get("rate_ev"),
+                            tmp.get("ev_band"), tmp.get("home_band")))
+        if updates:
+            try:
+                filled += _store.set_blocks_iog_split(updates)   # one transaction / chunk
+            except Exception as e:
+                logger.warning("_run_historical_iog_split_backfill: chunk persist failed "
+                               "(cursor=%s): %s", cursor, e)
+        _store.set_meta(_IOG_SPLIT_BACKFILL_MARKER,
+                        {"cursor": cursor, "scope": _IOG_SPLIT_BACKFILL_SCOPE,
+                         "filled": total_filled + filled})
+        if len(rows) < batch:
+            reached_end = True
+            break
+        await _aio.sleep(pace_s)   # yield to the loop (HA heartbeat, polls, charts)
+    total_filled += filled
+    if reached_end:
+        _store.set_meta(_IOG_SPLIT_BACKFILL_MARKER,
+                        {"done": True, "scope": _IOG_SPLIT_BACKFILL_SCOPE,
+                         "filled": total_filled, "completed_at": _now_iso()})
+    logger.info("iog split backfill: carved %d block(s) this pass%s",
+                filled, " — complete" if reached_end else " (resuming next pass)")
+    return filled
+
+
+def _maybe_backfill_historical_iog_split() -> None:
+    """Schedule the one-shot BL-9 IOG split backfill as a loop TASK (all BlockStore
+    access stays on the event-loop thread — single SQLite connection — exactly like
+    the exc backfill). Guarded by an in-process flag and the persistent done marker;
+    a no-op once done, without kraken discovery, or while an import/delete is active."""
+    global _iog_split_backfill_running
+    try:
+        if _store is None or _iog_split_backfill_running:
+            return
+        if not kraken_available():
+            logger.info("iog split backfill: deferred — supplier API not ready yet; "
+                        "will retry")
+            return
+        if api_import_running() or delete_in_progress():
+            logger.info("iog split backfill: deferred — import/delete job active; "
+                        "will retry")
+            return
+        _m = _store.get_meta(_IOG_SPLIT_BACKFILL_MARKER, {}) or {}
+        if _m.get("done") and int(_m.get("scope") or 1) >= _IOG_SPLIT_BACKFILL_SCOPE:
+            return   # already complete at the current scope — silent
+        import asyncio as _aio
+        try:
+            loop = _aio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            return
+
+        async def _task():
+            global _iog_split_backfill_running
+            import asyncio as _aio2
+            try:
+                # Drain to completion in THIS session: each pass is bounded (max_blocks);
+                # loop the passes (breathing between them) until the marker is `done`.
+                for _ in range(500):
+                    await _run_historical_iog_split_backfill()
+                    if (_store.get_meta(_IOG_SPLIT_BACKFILL_MARKER, {}) or {}).get("done"):
+                        break
+                    await _aio2.sleep(_IOG_SPLIT_BACKFILL_PASS_PACE)
+            except Exception as e:
+                logger.warning("_maybe_backfill_historical_iog_split: worker failed: %s", e)
+            finally:
+                _iog_split_backfill_running = False
+
+        _iog_split_backfill_running = True
+        logger.info("iog split backfill: scheduling historical EV/Home carve pass")
+        loop.create_task(_task())
+    except Exception as e:
+        logger.warning("_maybe_backfill_historical_iog_split: schedule failed: %s", e)
+        _iog_split_backfill_running = False
+
+
+_STALE_EXC_REPAIR_MARKER = "stale_exc_repair_state"   # store_meta key
+# Bump if the repair's detection widens, so a prior narrower run re-arms.
+_STALE_EXC_REPAIR_SCOPE = 1
+
+
+def _maybe_repair_stale_exc() -> None:
+    """Run the one-off stale-ex-VAT repair (block_store.repair_stale_exc) once per
+    install. A pre-fix reconcile rewrote imp_rate without re-stamping the ex-VAT
+    columns, leaving some blocks with an ex-VAT rate inconsistent with their inc rate;
+    this re-derives them from the VAT calendar. It's a single indexed-free scan plus a
+    handful of UPDATEs (the implausible rows are rare), so it runs inline rather than as
+    a cooperative drain. No-op once the done marker is set, or while a delete is active."""
+    try:
+        if _store is None or delete_in_progress():
+            return
+        _m = _store.get_meta(_STALE_EXC_REPAIR_MARKER, {}) or {}
+        if _m.get("done") and int(_m.get("scope") or 1) >= _STALE_EXC_REPAIR_SCOPE:
+            return   # already complete at the current scope — silent
+        res = _store.repair_stale_exc()
+        from datetime import datetime as _dt, timezone as _tz
+        _store.set_meta(_STALE_EXC_REPAIR_MARKER,
+                        {"done": True, "scope": _STALE_EXC_REPAIR_SCOPE,
+                         "repaired": res["repaired"], "examined": res["examined"],
+                         "completed_at": _dt.now(_tz.utc).replace(tzinfo=None).isoformat()})
+        if res["repaired"]:
+            logger.info("stale exc repair: re-derived ex-VAT on %d block(s) with an "
+                        "implausible exc rate (stale from a pre-fix reconcile)",
+                        res["repaired"])
+        else:
+            logger.info("stale exc repair: none found — all ex-VAT rates consistent")
+    except Exception as e:
+        logger.warning("_maybe_repair_stale_exc: %s", e)
 
 
 def _billed_rate(rate_segs, start, off_peak, meas_cost, kwh,
@@ -8156,11 +8503,33 @@ async def _refresh_kraken_rate_schedules() -> None:
     # cycle. A transient failure leaves the previous flag exactly as it was.
     if import_determined:
         _rate_schedule_unsupported = unsupported
+
+    # IOG-SMB-TOU EV-device buckets (6-hour cap). Additive: only the capped tariff
+    # exposes these, so gate on the IOG signature and keep only non-empty results;
+    # any failure is non-fatal (the cap classifier then falls back to the general
+    # overlay). The cap prices the EV portion of a dispatched slot from these.
+    _imp = _kraken_discovery.get("import") or {}
+    _imp_tariff = _imp.get("tariff_code") or ""
+    if _imp.get("product_code") and "IOG" in _imp_tariff.upper():
+        try:
+            from kraken_rates import build_ev_device_schedules
+            _ev_off, _ev_peak = await build_ev_device_schedules(
+                _kraken_client, _imp["product_code"], _imp_tariff)
+            if not _ev_off.is_empty():
+                new_cache["ev_device_off_peak"] = _ev_off
+            if not _ev_peak.is_empty():
+                new_cache["ev_device_peak"] = _ev_peak
+        except Exception as e:
+            logger.warning("_refresh_kraken_rate_schedules: ev_device build failed: %s", e)
+
     if new_cache:
         _kraken_rate_schedules = new_cache
-        logger.info("_refresh_kraken_rate_schedules: import=%d export=%d periods",
+        logger.info("_refresh_kraken_rate_schedules: import=%d export=%d "
+                    "ev_off=%d ev_peak=%d periods",
                     len(_kraken_rate_schedules.get("import", []) or []),
-                    len(_kraken_rate_schedules.get("export", []) or []))
+                    len(_kraken_rate_schedules.get("export", []) or []),
+                    len(_kraken_rate_schedules.get("ev_device_off_peak", []) or []),
+                    len(_kraken_rate_schedules.get("ev_device_peak", []) or []))
         _learn_vat_from_import_schedule()
 
     # Standing charge comes from the import tariff.
@@ -9142,21 +9511,44 @@ async def reconcile_dispatch_overlay() -> dict:
             logger.info("reconcile: WOULD %s %s %.5f→%.5f (%s)",
                         target, bs, cur_rate, new_rate, reason)
             continue
+        # BL-23/BL-9: re-stamp the ex-VAT columns alongside the inc rate/cost. A
+        # reconcile that rewrites imp_rate WITHOUT this leaves imp_rate_exc/imp_cost_exc
+        # at the OLD band's value — a stale ex-VAT figure (e.g. an off-peak exc rate on
+        # a block reverted to peak), which then shows a wrong rate in the billing
+        # summary's EV/Home split and understates Total (exc). Derive the fresh exc rate
+        # the same way pass-2 does (new_rate × published exc/inc at the slot); when no
+        # exc schedule covers the slot, NULL the exc columns so the view falls back to
+        # inc ÷ (1+VAT) and the exc backfill re-derives later — never leave it stale.
+        _exc_rate = None
+        _isched = _kraken_rate_schedules.get("import")
+        _iexc = getattr(_isched, "exc", None) if _isched is not None else None
+        if _iexc is not None:
+            _inc_p = _isched.resolve(bs)
+            _exc_p = _iexc.resolve(bs)
+            if _exc_p is not None and _inc_p and abs(_inc_p) > 1e-6:
+                _exc_rate = round(new_rate * (_exc_p / _inc_p), 6)
+        _exc_src = "tariff" if _exc_rate is not None else None
         with store._conn:
             # A definite verdict also clears any prior ambiguous-review flag on
             # the main row (needs_review / review_reason).
             store._conn.execute(
                 "UPDATE blocks SET imp_rate = ?, rate_reconciled = 1, "
                 "needs_review = 0, review_reason = NULL, "
-                "imp_cost = ROUND(COALESCE(imp_kwh, 0) * ?, 6) "
+                "imp_cost = ROUND(COALESCE(imp_kwh, 0) * ?, 6), "
+                "imp_rate_exc = ?, "
+                "imp_cost_exc = ROUND(COALESCE(imp_kwh, 0) * ?, 6), "
+                "exc_source = ? "
                 "WHERE block_start = ? AND meter_id = 'electricity_main'",
-                (new_rate, new_rate, bs))
+                (new_rate, new_rate, _exc_rate, _exc_rate, _exc_src, bs))
             store._conn.execute(
                 "UPDATE blocks SET imp_rate = ?, rate_reconciled = 1, "
-                "imp_cost = ROUND(COALESCE(imp_kwh_grid, imp_kwh, 0) * ?, 6) "
+                "imp_cost = ROUND(COALESCE(imp_kwh_grid, imp_kwh, 0) * ?, 6), "
+                "imp_rate_exc = ?, "
+                "imp_cost_exc = ROUND(COALESCE(imp_kwh_grid, imp_kwh, 0) * ?, 6), "
+                "exc_source = ? "
                 "WHERE block_start = ? AND rate_corrected = 0 AND meter_id IN "
                 "(SELECT meter_id FROM meters WHERE is_sub_meter = 1)",
-                (new_rate, new_rate, bs))
+                (new_rate, new_rate, _exc_rate, _exc_rate, _exc_src, bs))
         changed = True
         if target == "off_peak":
             n_restore += 1
@@ -10291,6 +10683,24 @@ async def _engine_startup_impl(ha: HAClient):
         _maybe_backfill_historical_exc()
     except Exception as _eb_e:
         logger.warning("engine_startup: exc backfill schedule failed: %s", _eb_e)
+
+    # BL-9 IOG house/EV split historical backfill — the split seam only fires on
+    # finalise/settlement, so blocks priced before it shipped (existing dispatch
+    # history + already-settled blocks) have no EV/Home columns and the billing
+    # summary shows no split. This one-shot pass carves it onto that history in place
+    # (additive; inc bill untouched). No-op once done or when there's no dispatch.
+    try:
+        _maybe_backfill_historical_iog_split()
+    except Exception as _ib_e:
+        logger.warning("engine_startup: iog split backfill schedule failed: %s", _ib_e)
+
+    # One-off stale-ex-VAT repair — fixes blocks whose ex-VAT rate was left
+    # inconsistent with their inc rate by a pre-fix reconcile (which rewrote imp_rate
+    # but not imp_rate_exc). Cheap single scan + a handful of UPDATEs; no-op once done.
+    try:
+        _maybe_repair_stale_exc()
+    except Exception as _sr_e:
+        logger.warning("engine_startup: stale exc repair failed: %s", _sr_e)
 
     # ── One-time region-timeline reconciliation (historical-carbon foundation) ──
     # With the API just discovered, stamp the DNO region (OUTWARD CODE ONLY) onto

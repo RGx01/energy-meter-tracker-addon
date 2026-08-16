@@ -29,7 +29,7 @@ specs — the code is the source of truth; read these for context.
 - `bill_to_csv_import_spec.md` — reconstructing history from Octopus PDF bills.
 - `mode_ui_design.md` / `wizard_design.md` / `historical_import_wizard_design.md` — setup/mode UX.
 - `data_management_vision.md` — the Data Management area's direction.
-- `iog_6hr_cap_design.md` — **draft**, not yet built (BL-9: IOG 6-hour charge cap).
+- `iog_6hr_cap_design.md` — IOG 6-hour charge cap (BL-9); model confirmed, back-end build in progress.
 
 ## History (archived)
 

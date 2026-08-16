@@ -622,6 +622,16 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
     meter_summary  = defaultdict(lambda: defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "read_start": None, "read_end": None}))
     meter_totals   = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "read_start": None, "read_end": None})
     main_import_raw = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0})
+    # BL-9: IOG house/EV split by rate band (inc + derived exc). ev_by_rate is only
+    # populated on dispatched IOG blocks; home_by_rate carries the remainder of every
+    # main-import block, so together they reconstruct the grid total. exc is derived
+    # from each block's own exc/inc ratio (flat VAT → exact, even across a VAT change).
+    ev_by_rate   = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "cost_exc": 0.0})
+    home_by_rate = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "cost_exc": 0.0})
+    # Boundary (cap-transition) blocks carry a mixed band and a per-day blended
+    # rate; collapse them into ONE transition row each rather than a row per blend.
+    ev_transition   = {"kwh": 0.0, "cost": 0.0, "cost_exc": 0.0}
+    home_transition = {"kwh": 0.0, "cost": 0.0, "cost_exc": 0.0}
     main_export_raw = {"kwh": 0.0, "cost": 0.0}  # raw main meter export totals
     # Main-meter-only daily accumulators for total_cost.
     # Matches _fmt_total in server.py: raw main meter imp/exp/sc per day,
@@ -723,6 +733,50 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
                         # Store raw total before sub-meter subtraction
                         main_import_raw[rate]["kwh"]  += kwh
                         main_import_raw[rate]["cost"] += cost
+                        # BL-9: split this block's import into EV (dispatch-derived,
+                        # stored) and Home (remainder), grouped by each portion's own
+                        # rate. exc derived from the block's exc/inc ratio (flat VAT →
+                        # exact). ev_by_rate only on dispatched IOG blocks; home_by_rate
+                        # carries every main block's remainder → they sum to the total.
+                        _cx = channel.get("cost_exc")
+                        if _cx is not None and cost:
+                            _ratio = float(_cx) / cost
+                        else:
+                            # Not-yet-settled block has no stored ex-VAT cost. Counting
+                            # its kWh at £0 exc would DILUTE the displayed ex-VAT rate
+                            # (EV/Home read below the true off-peak rate until every
+                            # block settles). Fall back to the same inc ÷ (1+VAT) basis
+                            # the rest of the bill uses for uncovered slots, so the rate
+                            # is correct immediately and self-corrects to the exact
+                            # figure when the block settles and stamps cost_exc.
+                            _vat = store.vat_rate_at(block.get("start")) if store is not None else 0.05
+                            _ratio = 1.0 / (1.0 + _vat)
+                        _evk = float(channel.get("kwh_ev") or 0.0)
+                        _evc = float(channel.get("cost_ev") or 0.0)
+                        if _evk > 1e-9:
+                            _evx = _evc * _ratio
+                            if channel.get("ev_band") == "mixed":
+                                ev_transition["kwh"]      += _evk
+                                ev_transition["cost"]     += _evc
+                                ev_transition["cost_exc"] += _evx
+                            else:                          # clean band → exact rate row
+                                _evr = round(float(channel.get("rate_ev") or 0.0), 4)
+                                ev_by_rate[_evr]["kwh"]      += _evk
+                                ev_by_rate[_evr]["cost"]     += _evc
+                                ev_by_rate[_evr]["cost_exc"] += _evx
+                        _hk = kwh - _evk
+                        _hc = cost - _evc
+                        if _hk > 1e-9:
+                            _hx = _hc * _ratio
+                            if channel.get("home_band") == "mixed":
+                                home_transition["kwh"]      += _hk
+                                home_transition["cost"]     += _hc
+                                home_transition["cost_exc"] += _hx
+                            else:
+                                _hr = round(_hc / _hk, 4)
+                                home_by_rate[_hr]["kwh"]      += _hk
+                                home_by_rate[_hr]["cost"]     += _hc
+                                home_by_rate[_hr]["cost_exc"] += _hx
                         # Use kwh_remainder directly when available. With no
                         # sub-meters this key is absent (NULL in DB, omitted by
                         # reconstruction), so the raw kwh is kept unchanged —
@@ -804,6 +858,17 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
     for rate in main_import_raw:
         main_import_raw[rate]["kwh"]  = round(main_import_raw[rate]["kwh"],  3)
         main_import_raw[rate]["cost"] = round(main_import_raw[rate]["cost"], 2)
+    # BL-9: round the house/EV split — costs to 3dp so the per-rate breakdown shows
+    # like the statement (e.g. £8.001), while the section Total stays 2dp.
+    for _grp in (ev_by_rate, home_by_rate):
+        for _r in _grp:
+            _grp[_r]["kwh"]      = round(_grp[_r]["kwh"], 3)
+            _grp[_r]["cost"]     = round(_grp[_r]["cost"], 3)
+            _grp[_r]["cost_exc"] = round(_grp[_r]["cost_exc"], 3)
+    for _t in (ev_transition, home_transition):
+        _t["kwh"]      = round(_t["kwh"], 3)
+        _t["cost"]     = round(_t["cost"], 3)
+        _t["cost_exc"] = round(_t["cost_exc"], 3)
     # total_cost = sum of daily net_cost values.
     # Same method as api_blocks_summary: round each day's imp/sc/exp to 4dp,
     # compute net = round(imp + sc - exp, 2) per day, sum across days.
@@ -888,6 +953,10 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
         "meters":            meter_summary,
         "totals":            meter_totals,
         "main_import_raw":   dict(main_import_raw),
+        "ev_by_rate":        dict(ev_by_rate),
+        "home_by_rate":      dict(home_by_rate),
+        "ev_transition":     ev_transition,
+        "home_transition":   home_transition,
         "main_import_reads": main_import_reads,
         "standing":          standing_by_day,
         "total_standing":    total_standing,
@@ -950,6 +1019,72 @@ def _bill_total_row(kwh, cost):
         <tr class="channel-total">
           <td>Total</td><td></td><td>{kwh:.3f}</td><td>{cost_str}</td>
         </tr>"""
+
+
+# Rate keys within this gap (£/kWh) are the SAME tariff band jittered by Octopus's
+# per-half-hour settlement rounding (e.g. 0.323091/0.323092/0.323097 → 0.3230/0.3231/
+# 0.3232). Fold them into one displayed band. Sub-penny, so it never merges two real
+# IOG bands (off-peak ≈5p vs peak ≈32p vs any day rate are pence apart) — and the
+# cap-transition block is a separate 'mixed' bucket, never grouped by rate at all.
+_SPLIT_BAND_EPS = 0.0015
+
+
+def _bill_split_rows(summary, currency, exc=False):
+    """BL-9: EV/Home breakdown rows for the IOG 'Import — total grid' section — the
+    house-vs-car split Octopus itemises on the statement. EV and Home are interleaved
+    per rate band (matching the bill); near-identical rates are collapsed into one band
+    (see _SPLIT_BAND_EPS) so per-half-hour settlement jitter doesn't shatter a band into
+    look-alike rows, exactly as the bill-method view already does. The boundary
+    (cap-transition) blocks are a separate 'mixed' bucket → one EV and one Home row at
+    their blended average, untouched by the collapse. The rate shown is cost ÷ kWh, so
+    it's correct in both inc and (derived) ex-VAT bases.
+
+    Returns an HTML string, or None when there's no EV in the period (the caller
+    then shows the plain per-rate rows)."""
+    ev_by_rate   = summary.get("ev_by_rate") or {}
+    home_by_rate = summary.get("home_by_rate") or {}
+    ev_tr        = summary.get("ev_transition") or {}
+    home_tr      = summary.get("home_transition") or {}
+    _ck = "cost_exc" if exc else "cost"
+    if (sum(v["kwh"] for v in ev_by_rate.values()) + (ev_tr.get("kwh") or 0.0)) <= 1e-9:
+        return None
+
+    def _row(label, kwh, cost, note=""):
+        rate = (cost / kwh) if kwh else 0.0
+        cs = f"({-cost:.3f})" if cost < 0 else f"{cost:.3f}"   # 3dp, as the bill
+        return (f'\n        <tr><td>{label}</td><td>{rate:.4f}{note}</td>'
+                f'<td>{kwh:.3f}</td><td>{cs}</td></tr>')
+
+    # Cluster the rate keys of BOTH series together into bands (adjacent rates within
+    # _SPLIT_BAND_EPS merge), so EV and Home stay aligned on the same displayed band.
+    _rates = sorted(set(ev_by_rate) | set(home_by_rate))
+    _bands: list[list[float]] = []
+    for r in _rates:
+        if _bands and (r - _bands[-1][-1]) <= _SPLIT_BAND_EPS:
+            _bands[-1].append(r)
+        else:
+            _bands.append([r])
+
+    html = ""
+    for band in _bands:
+        ek = ec = hk = hc = 0.0
+        for r in band:
+            e = ev_by_rate.get(r)
+            if e:
+                ek += e["kwh"]; ec += e.get(_ck, 0.0)
+            h = home_by_rate.get(r)
+            if h:
+                hk += h["kwh"]; hc += h.get(_ck, 0.0)
+        if ek > 1e-9:
+            html += _row("EV", ek, ec)
+        if hk > 1e-9:
+            html += _row("Home", hk, hc)
+    _note = ' <span style="opacity:0.6;">(transition)</span>'
+    if (ev_tr.get("kwh") or 0.0) > 1e-9:
+        html += _row("EV", ev_tr["kwh"], ev_tr.get(_ck, 0.0), _note)
+    if (home_tr.get("kwh") or 0.0) > 1e-9:
+        html += _row("Home", home_tr["kwh"], home_tr.get(_ck, 0.0), _note)
+    return html
 
 
 def _collapse_rate_kwh(rate_kwh):
@@ -1190,14 +1325,34 @@ def _has_sub_meters(cfg):
     return False
 
 
+def _ev_meter_id(cfg):
+    """The configured physical EV-charger meter_id (meter_type 'ev_charger', or an
+    'ev'/'charger' id), or None. Used for the coverage-based synthetic-EV gate."""
+    for mid, md in ((cfg or {}).get("meters") or {}).items():
+        meta = md.get("meta") or {}
+        if (meta.get("meter_type") == "ev_charger"
+                or any(kw in str(mid).lower() for kw in ("ev", "charger"))):
+            return mid
+    return None
+
+
 def _dispatch_ev_slot_map(store, blocks, cfg):
     """{slot_start(UTC ISO): {"kwh","cost","rate"}} — per-slot EV reconstructed from
     COMPLETED dispatches (Octopus's own per-slot EV energy), grid-clipped to that slot's
     main import and cost-apportioned from the slot's import cost. Gated to no-sub-meter
     accounts. Empty when gated off / no store / no dispatch. This is the display-only
     source for the derived-EV billing breakdown; it never affects a bill total."""
-    if store is None or _has_sub_meters(cfg) or not blocks:
+    if store is None or not blocks:
         return {}
+    # Coverage-based gate: synthesise EV only for slots the PHYSICAL EV device doesn't
+    # already have a block for. An active EV meter covers every slot (synthetic stays
+    # off, as before); a retired/decommissioned one stops writing blocks, so the
+    # synthetic takes over from the cutover automatically. A battery or other sub-meter
+    # never blocks the EV synthetic — only the EV device's OWN coverage does.
+    _evm = _ev_meter_id(cfg)
+    covered = ({b["start"] for b in blocks
+                if b and b.get("start") and _evm in (b.get("meters") or {})}
+               if _evm else set())
     starts = [b["start"] for b in blocks if b and b.get("start")]
     if not starts:
         return {}
@@ -1221,7 +1376,7 @@ def _dispatch_ev_slot_map(store, blocks, cfg):
     out = {}
     for b in blocks:
         slot = (b or {}).get("start")
-        if not slot or slot not in ev_raw:
+        if not slot or slot not in ev_raw or slot in covered:
             continue
         imp = (((b.get("meters") or {}).get("electricity_main") or {})
                .get("channels", {}) or {}).get("import", {}) or {}
@@ -1399,10 +1554,17 @@ def render_billing_summary(summary, currency='£', site_name=None):
             # standing charge, a VAT row, then the inc-VAT total. Octopus builds a bill this
             # way: sum the raw ex-VAT half-hours, round at the subtotal, then add VAT. The
             # Total Bill below is UNCHANGED — this only changes how the import is presented.
-            for _r in _bm["rows"]:
-                _rate_cell = (f"{_r['rate_exc']:.4f} <span style=\"opacity:0.6;\">(avg of {_r['n_rates']} rates)</span>"
-                              if _r.get("collapsed") else f"{_r['rate_exc']:.4f}")
-                html += f"""
+            # BL-9: on an IOG tariff show the EV/Home split (ex-VAT, derived from each
+            # block's own exc/inc ratio) in place of the plain per-rate rows; the
+            # Total (exc) below is the authoritative bill-method figure, unchanged.
+            _split_html = _bill_split_rows(summary, currency, exc=True)
+            if _split_html is not None:
+                html += _split_html
+            else:
+                for _r in _bm["rows"]:
+                    _rate_cell = (f"{_r['rate_exc']:.4f} <span style=\"opacity:0.6;\">(avg of {_r['n_rates']} rates)</span>"
+                                  if _r.get("collapsed") else f"{_r['rate_exc']:.4f}")
+                    html += f"""
         <tr><td></td><td>{_rate_cell}</td><td>{_r['kwh']:.3f}</td><td>{_r['cost_exc']:.3f}</td></tr>"""
             html += f"""
         <tr class="channel-total"><td>Total (exc)</td><td></td><td></td><td>{_bm['energy_exc']:.2f}</td></tr>"""
@@ -1422,7 +1584,10 @@ def render_billing_summary(summary, currency='£', site_name=None):
         <tr class="channel-total"><td colspan="3">Total incl. VAT</td><td>{currency}{_bm['inc_total']:.2f}</td></tr>"""
         else:
             _rate_html, raw_kwh_r, raw_cost_r = _bill_rate_rows(main_import_raw, currency)
-            html += _rate_html
+            # BL-9: on an IOG tariff show the EV/Home split (as Octopus does) in place
+            # of the plain per-rate rows; the Total is unchanged (the split sums to it).
+            _split_html = _bill_split_rows(summary, currency)
+            html += _split_html if _split_html is not None else _rate_html
             html += _bill_total_row(raw_kwh_r, raw_cost_r)
 
             # ── Standing charge folded into the import charge (display only) —
@@ -1652,17 +1817,27 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                         _mc = meter_cost["electricity_main"][hh]
                         _ec = _mc * (_ek / _mk)
                         _r4 = round(main_rate, 4)
+                        # BL-9: the EV rate LINE follows the stored dispatch EV rate
+                        # (imp_rate_ev) so it DIVERGES from the house line once the 6-h
+                        # cap pushes EV charging to peak (the 4-rate rule). On an uncapped
+                        # IOG account imp_rate_ev == the house rate, so the line sits
+                        # exactly on the house line (no visible change). Energy/cost stay
+                        # on the validated synthetic split (grid total untouched); only
+                        # the rate the EV line is plotted at, and its summary rate bucket,
+                        # change. Absent (non-IOG / no split) → falls back to main_rate.
+                        _evr = _f(main_import.get("rate_ev")) or main_rate
+                        _r4e = round(_evr, 4)
                         meter_kwh["electricity_main"][hh]  = _mk - _ek
                         meter_cost["electricity_main"][hh] = _mc - _ec
                         meter_kwh["ev_dispatch"][hh]  = _ek
                         meter_cost["ev_dispatch"][hh] = _ec
-                        meter_rate["ev_dispatch"][hh] = main_rate
+                        meter_rate["ev_dispatch"][hh] = _evr
                         summary_kwh["electricity_main"]  -= _ek
                         summary_cost["electricity_main"] -= _ec
                         summary_kwh["ev_dispatch"]  += _ek
                         summary_cost["ev_dispatch"] += _ec
                         summary_rates["electricity_main"][_r4] -= _ek
-                        summary_rates["ev_dispatch"][_r4]      += _ek
+                        summary_rates["ev_dispatch"][_r4e]     += _ek
                         meter_display_name.setdefault("ev_dispatch", "EV (from dispatch)")
 
             if main_export:

@@ -130,6 +130,24 @@ class RateSchedule:
                 rates.append(rate)
         return (min(rates), max(rates)) if rates else (None, None)
 
+    def is_off_peak(self, ts: str, tol: float = 1e-9) -> Optional[bool]:
+        """Whether naive-UTC ts falls in the tariff's OFF-PEAK band — the rate
+        active at ts equals the day's minimum (off-peak) rate.
+
+        This is what makes the guaranteed home off-peak window (IOG's 23:30–05:30)
+        AGREEMENT-DRIVEN for the 6-hour-cap classifier: read from the published
+        schedule, never hard-coded. True in the off-peak band, False in a higher
+        (peak/day) band, None if the day/ts isn't covered. On a FLAT tariff every
+        covered ts reads True (min == max) — a caller that only means banded IOG
+        should gate with `day_rate_bounds` (min < max) first. Uses the same
+        day-scan as off_peak_rate_near, so a dispatch overlay applied on TOP of the
+        base schedule doesn't affect it — this reflects the base tariff window."""
+        now = self.resolve(ts)
+        op = self.off_peak_rate_near(ts)
+        if now is None or op is None:
+            return None
+        return now <= op + tol
+
     def flat_rate(self, tol: float = 1e-6):
         """The single rate if this schedule is FLAT — every period carries the
         same value (a fixed-price tariff, e.g. a flat OUTGOING export). None if
@@ -301,6 +319,38 @@ async def build_rate_schedule(
         logger.info("build_rate_schedule: %s/%s → %d periods (diag failed: %s)",
                     product_code, tariff_code, len(sched), _de)
     return sched
+
+
+async def build_ev_device_schedules(
+    client, product_code: str, tariff_code: str,
+    *, period_from: Optional[str] = None, period_to: Optional[str] = None,
+) -> tuple:
+    """Fetch the IOG-SMB-TOU EV-device rate buckets — returns
+    (off_peak_schedule, peak_schedule) from `ev-device-off-peak-unit-rates` /
+    `ev-device-peak-unit-rates`.
+
+    Only the new 6-hour-cap tariff exposes these; any other tariff simply returns
+    empty schedules. Additive and non-fatal by design — a fetch failure or a
+    missing bucket yields an empty RateSchedule, so the cap classifier just has no
+    EV-device rate for that slot and the caller falls back to the general overlay.
+    Used to price the EV portion of a dispatched slot (off-peak within the 6-hour
+    cap, peak beyond). See docs/iog_6hr_cap_design.md."""
+    async def _one(rate_type: str) -> RateSchedule:
+        if not product_code or not tariff_code:
+            return RateSchedule([])
+        try:
+            recs = await client.get_unit_rates(
+                product_code, tariff_code, rate_type=rate_type,
+                period_from=period_from, period_to=period_to)
+        except Exception as e:
+            logger.warning("build_ev_device_schedules: %s fetch failed for %s/%s: %s",
+                           rate_type, product_code, tariff_code, e)
+            return RateSchedule([])
+        return RateSchedule.from_api_records(recs or [])
+
+    off_peak = await _one("ev-device-off-peak-unit-rates")
+    peak = await _one("ev-device-peak-unit-rates")
+    return off_peak, peak
 
 
 async def build_standing_charge_schedule(

@@ -122,12 +122,20 @@ class TestDispatchEvSlotMap(unittest.TestCase):
         self.assertAlmostEqual(m["2026-08-04T00:30:00"]["kwh"], 4.0, places=3)   # 6 clipped to 4
         self.assertAlmostEqual(m["2026-08-04T00:30:00"]["cost"], 0.28, places=4)
 
-    def test_gated_off_when_submeter_configured(self):
+    def test_gated_off_when_ev_device_covers_slot(self):
+        # Coverage-based (BL-9): the synthetic is suppressed only where the physical
+        # EV device HAS a block; a configured-but-absent (retired) EV device does not
+        # block it. (test_ev_coverage_gate covers the full matrix.)
         store = self._store([("2026-08-04T00:00:00", "completed", -4.0)])
-        blocks = [self._blk("2026-08-04T00:00:00", 5.0, 0.35, 0.07)]
         cfg = {"meters": {"electricity_main": {"meta": {}},
                           "ev": {"meta": {"sub_meter": True, "meter_type": "ev_charger"}}}}
-        self.assertEqual(ec._dispatch_ev_slot_map(store, blocks, cfg), {})
+        covered = self._blk("2026-08-04T00:00:00", 5.0, 0.35, 0.07)
+        covered["meters"]["ev"] = {"channels": {"import": {"kwh": 2.0}}}
+        self.assertEqual(ec._dispatch_ev_slot_map(store, [covered], cfg), {})
+        # retired: EV configured but no block at the slot → synthetic takes over
+        retired = self._blk("2026-08-04T00:00:00", 5.0, 0.35, 0.07)
+        self.assertIn("2026-08-04T00:00:00",
+                      ec._dispatch_ev_slot_map(store, [retired], cfg))
 
 
 class TestBankersRoundingLadder(unittest.TestCase):
