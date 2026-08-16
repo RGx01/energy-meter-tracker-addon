@@ -2,7 +2,7 @@
  
 ## [4.3.0] — 2026-08-16
 
-*Theme: **Charge Cap**. Groundwork for Intelligent Octopus Go's new 4-rate / 6-hour-cap tariff lands under the hood — every IOG block now stores the house-vs-car split, a migrated (capped) meter is priced with the full 4-rate model, and the billing summary now itemises the house-vs-car split per rate band (with the day chart's car rate line wired to diverge the moment a cap engages). Plus a batch of fixes: CSV templates start at local midnight, synthesised bill CSVs no longer double the standing charge, the Usage Insights rate breakdown matches the Billing view, and FIT / no-export-agreement accounts no longer show a permanent "awaiting settlement" backlog. Additive and off for non-IOG tariffs; inc-VAT figures for existing tariffs are byte-identical.*
+*Theme: **Charge Cap**. [Still Experimental] Groundwork for Intelligent Octopus Go's new 4-rate / 6-hour-cap tariff lands under the hood — every IOG block now stores the house-vs-car split, a migrated (capped) meter is priced with the full 4-rate model, and the billing summary now itemises the house-vs-car split per rate band (with the day chart's car rate line wired to diverge the moment a cap engages). Plus a batch of fixes: CSV templates start at local midnight, synthesised bill CSVs no longer double the standing charge, the Usage Insights rate breakdown matches the Billing view, and FIT / no-export-agreement accounts no longer show a permanent "awaiting settlement" backlog. Additive and off for non-IOG tariffs; inc-VAT figures for existing tariffs are byte-identical.*
 
 ### Added
 
