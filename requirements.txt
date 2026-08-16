@@ -7,4 +7,4 @@ waitress==3.0.2
 # Octopus PDF-bill → CSV parsing (Data Management → build a CSV from bills). Pure
 # Python, light. bill_parser imports it lazily/guarded, so a build without it just
 # disables the "build from bills" feature — the rest of EMT is unaffected.
-pypdf==6.14.2
+pypdf==6.15.0
