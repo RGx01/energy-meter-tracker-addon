@@ -610,6 +610,13 @@ def _block_rows(block: dict, config_period_id: int, tz_name: str) -> list[dict]:
             # (NULL otherwise — inc-VAT figures are unaffected).
             "imp_cost_exc":      imp.get("cost_exc"),
             "imp_rate_exc":      imp.get("rate_exc"),
+            # BL-9: IOG house/EV split — the dispatch-derived EV portion of import
+            # (NULL when not an IOG-priced dispatched slot; house = the remainder).
+            "imp_kwh_ev":        imp.get("kwh_ev"),
+            "imp_cost_ev":       imp.get("cost_ev"),
+            "imp_rate_ev":       imp.get("rate_ev"),
+            "imp_ev_band":       imp.get("ev_band"),
+            "imp_home_band":     imp.get("home_band"),
             "imp_read_start":    imp.get("read_start"),
             "imp_read_end":      imp.get("read_end"),
             # export channel
@@ -811,6 +818,18 @@ def _row_to_block(rows: list[sqlite3.Row]) -> dict:
                     imp_ch["rate_exc"] = row["imp_rate_exc"]
             except (IndexError, KeyError):
                 pass
+            # BL-9: IOG house/EV split — surface the stored EV portion so the billing
+            # summary can show the EV vs Home breakdown (None/absent = no EV this slot).
+            for _evk, _evcol in (("kwh_ev", "imp_kwh_ev"),
+                                 ("cost_ev", "imp_cost_ev"),
+                                 ("rate_ev", "imp_rate_ev"),
+                                 ("ev_band", "imp_ev_band"),
+                                 ("home_band", "imp_home_band")):
+                try:
+                    if row[_evcol] is not None:
+                        imp_ch[_evk] = row[_evcol]
+                except (IndexError, KeyError):
+                    pass
             # Expose provisional flag so the amendment path can identify blocks
             # written without a post-boundary sub-meter read.
             try:
@@ -1120,6 +1139,20 @@ class BlockStore:
             ("imp_rate_exc",       "blocks",        "REAL",                       _b_cols),
             ("standing_charge_exc","blocks",        "REAL",                       _b_cols),
             ("exc_source",         "blocks",        "TEXT",                       _b_cols),
+            # ── 4.3 BL-9: IOG house/EV billing split. The dispatch-derived EV
+            # portion of this block's main import (grid-clipped) + its cost/rate;
+            # house = imp_kwh − imp_kwh_ev, imp_cost − imp_cost_ev (not stored).
+            # Additive, NULL until a dispatched IOG slot is priced — populated for
+            # ALL IOG tariffs (the capped tariff prices the EV portion at
+            # ev_device_*, uncapped IOG at the general off-peak overlay).
+            ("imp_kwh_ev",         "blocks",        "REAL",                       _b_cols),
+            ("imp_cost_ev",        "blocks",        "REAL",                       _b_cols),
+            ("imp_rate_ev",        "blocks",        "REAL",                       _b_cols),
+            # BL-9: the EV and Home rate bands for this slot (off_peak|peak|mixed /
+            # off_peak|day|mixed) — lets the billing summary group clean bands and
+            # collapse the boundary (mixed) blocks into one transition row.
+            ("imp_ev_band",        "blocks",        "TEXT",                       _b_cols),
+            ("imp_home_band",      "blocks",        "TEXT",                       _b_cols),
             ("carbon_gco2_min",  "power_history",   "REAL",              _ph_cols),
             # ── 3.1.x dispatch lifecycle capture (observe-only, no billing effect)
             ("state",            "dispatch_slots", "TEXT",  _ds_cols),
@@ -2865,6 +2898,103 @@ class BlockStore:
                 changed += cur.rowcount
         return changed
 
+    # ── BL-9 IOG house/EV split historical backfill ─────────────────────────
+    # The seam (_apply_iog_split) only runs when a block is finalised or repriced
+    # at settlement, so blocks priced BEFORE the split shipped — the whole existing
+    # dispatch history, plus any block already DCC-settled — never got the EV/Home
+    # columns. These three mirror the ex-VAT backfill trio so a one-shot startup pass
+    # can carve the split onto that history without a re-import.
+
+    def get_blocks_missing_iog_split(self, limit: int = 2000,
+                                     after_start: str | None = None) -> list:
+        """Page MAIN-meter import blocks that sit on a completed smart-charge
+        dispatch slot but have no EV/Home split yet (imp_kwh_ev IS NULL, imp_kwh > 0).
+        Sub-meter blocks are excluded — the dispatch EV is carved out of the parent's
+        grid import, never a device channel. Ordered by block_start; pass the last
+        start back as `after_start` to walk past blocks that can't be carved (so an
+        unfillable slot never re-pages forever). Returns [{start, meter_id, kwh, rate}]."""
+        sql = ("SELECT b.block_start, b.meter_id, b.imp_kwh, b.imp_rate FROM blocks b "
+               "WHERE b.imp_kwh_ev IS NULL AND b.imp_kwh IS NOT NULL AND b.imp_kwh > 0 "
+               "AND b.meter_id NOT IN (SELECT meter_id FROM meters WHERE is_sub_meter = 1) "
+               "AND EXISTS (SELECT 1 FROM dispatch_history d "
+               "            WHERE d.kind = 'completed' AND d.slot_start = b.block_start)")
+        params: list = []
+        if after_start is not None:
+            sql += " AND b.block_start > ?"
+            params.append(after_start)
+        sql += " ORDER BY b.block_start LIMIT ?"
+        params.append(int(limit))
+        rows = self._conn.execute(sql, params).fetchall()
+        return [{"start": r["block_start"], "meter_id": r["meter_id"],
+                 "kwh": r["imp_kwh"], "rate": r["imp_rate"]} for r in rows]
+
+    def count_blocks_missing_iog_split(self) -> int:
+        """Count of MAIN-meter blocks on a completed dispatch slot still lacking the
+        EV/Home split — the backfill's remaining-work signal (0 ⇒ mark the pass done).
+        Same coverage as get_blocks_missing_iog_split."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM blocks b "
+            "WHERE b.imp_kwh_ev IS NULL AND b.imp_kwh IS NOT NULL AND b.imp_kwh > 0 "
+            "AND b.meter_id NOT IN (SELECT meter_id FROM meters WHERE is_sub_meter = 1) "
+            "AND EXISTS (SELECT 1 FROM dispatch_history d "
+            "            WHERE d.kind = 'completed' AND d.slot_start = b.block_start)"
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def set_blocks_iog_split(self, updates) -> int:
+        """Batch EV/Home split writer: many UPDATEs in ONE transaction (one fsync per
+        chunk, not per block — same event-loop-friendliness as set_blocks_exc).
+        `updates` = iterable of
+        (block_start, meter_id, kwh_ev, cost_ev, rate_ev, ev_band, home_band).
+        ADDITIVE ONLY — writes just the five split columns behind a NULL-only guard
+        (idempotent; never re-carves) and NEVER touches imp_rate/imp_cost, so the
+        settled inc bill stays byte-identical. Returns the number of rows changed."""
+        changed = 0
+        with self._conn:
+            for bs, mid, kev, cev, rev, evb, hmb in updates:
+                cur = self._conn.execute(
+                    "UPDATE blocks SET imp_kwh_ev = ?, imp_cost_ev = ?, imp_rate_ev = ?, "
+                    "imp_ev_band = ?, imp_home_band = ? "
+                    "WHERE block_start = ? AND meter_id = ? AND imp_kwh_ev IS NULL",
+                    (kev, cev, rev, evb, hmb, bs, mid))
+                changed += cur.rowcount
+        return changed
+
+    def repair_stale_exc(self, ratio_floor: float = 0.80, dry_run: bool = False) -> dict:
+        """One-off repair for STALE ex-VAT left by a pre-fix reconcile. The settlement
+        reconciliation used to rewrite imp_rate WITHOUT re-stamping imp_rate_exc/
+        imp_cost_exc, so a block reverted (e.g.) off-peak→peak kept the OLD band's exc
+        rate — an ex-VAT figure inconsistent with its inc rate, which shows a wrong rate
+        in the billing summary's EV/Home split and understates Total (exc).
+
+        Finds blocks whose stored exc/inc rate ratio is IMPLAUSIBLE (imp_rate_exc ÷
+        imp_rate < ratio_floor). A real VAT rate can never produce that: 5% VAT is a
+        ratio of 0.952, and even a 25% rate is 0.80 — so the floor catches only stale
+        rows, never a genuine VAT band. Re-derives imp_rate_exc/imp_cost_exc from the
+        inc figures ÷ (1+VAT) using the per-slot VAT calendar (exact for a flat charge,
+        correct across a VAT change). Idempotent — a repaired row is no longer
+        implausible, so a re-run is a no-op. Returns {examined, repaired, dry_run}."""
+        rows = self._conn.execute(
+            "SELECT block_start, meter_id, imp_rate, imp_rate_exc, imp_cost "
+            "FROM blocks WHERE imp_rate_exc IS NOT NULL AND imp_rate > 0 "
+            "AND (imp_rate_exc / imp_rate) < ?", (float(ratio_floor),)).fetchall()
+        updates = []
+        for r in rows:
+            vat = self.vat_rate_at(r["block_start"])
+            f = 1.0 / (1.0 + vat)
+            updates.append((round(r["imp_rate"] * f, 6),
+                            round((r["imp_cost"] or 0.0) * f, 6),
+                            r["block_start"], r["meter_id"]))
+        if updates and not dry_run:
+            with self._conn:
+                for nre, nce, bs, mid in updates:
+                    self._conn.execute(
+                        "UPDATE blocks SET imp_rate_exc = ?, imp_cost_exc = ?, "
+                        "exc_source = 'tariff-repair' "
+                        "WHERE block_start = ? AND meter_id = ?", (nre, nce, bs, mid))
+        return {"examined": len(rows),
+                "repaired": (0 if dry_run else len(updates)), "dry_run": dry_run}
+
     def get_vat_calendar(self) -> list:
         """Learned VAT-rate boundaries [(effective_from, rate), …] from store_meta.
         Merged with the statutory seed by vat_calendar.resolve_vat; empty until the
@@ -3926,6 +4056,29 @@ class BlockStore:
         "        AND (b2.exp_kwh > 0 OR b2.exp_kwh_api > 0)))) "
         "AND (source IS NULL OR source NOT LIKE 'imported%')")
 
+    # Import-only variant: used when export is NOT expected to DCC-settle (a FIT/
+    # deemed-export account has no outgoing agreement, so its export never settles —
+    # chasing/counting it is a permanent false alarm). See _unsettled_where.
+    _UNSETTLED_WHERE_IMPORT_ONLY = (
+        "imp_kwh_api IS NULL "
+        "AND (source IS NULL OR source NOT LIKE 'imported%')")
+
+    def _export_settlement_expected(self) -> bool:
+        """Whether export is expected to DCC-settle for this account — True iff
+        Octopus discovery found an OUTGOING/export agreement (persisted by
+        engine._kraken_startup_discovery). FIT/deemed-export accounts have no
+        outgoing agreement, so their export never settles and must not be counted
+        as 'awaiting settlement'. Defaults TRUE when the flag is absent (older DB,
+        or discovery hasn't run yet) so a genuine gap is never silenced — discovery
+        sets it False for FIT accounts on the next account refresh."""
+        return bool(self.get_meta("export_settlement_expected", True))
+
+    def _unsettled_where(self, export_expected: bool) -> str:
+        """The 'awaiting DCC settlement' predicate. Import is always chased; export
+        is chased only when the account is on an outgoing/export agreement."""
+        return (self._UNSETTLED_WHERE if export_expected
+                else self._UNSETTLED_WHERE_IMPORT_ONLY)
+
     def get_unsettled_blocks(self, main_meter_id: str = "electricity_main",
                              limit: Optional[int] = None,
                              since_iso: Optional[str] = None) -> list:
@@ -3942,9 +4095,10 @@ class BlockStore:
         `now − horizon` to keep the count honest even before the settlement sweep
         has finalised past-horizon blocks.
         """
+        w = self._unsettled_where(self._export_settlement_expected())
         sql = ("SELECT block_start, block_end, imp_kwh, imp_kwh_api, "
                "       exp_kwh, exp_kwh_api, is_provisional "
-               f"FROM blocks WHERE meter_id = ? AND {self._UNSETTLED_WHERE} "
+               f"FROM blocks WHERE meter_id = ? AND {w} "
                "AND finalised_from_cad = 0")
         params: list = [main_meter_id]
         if since_iso:
@@ -3962,8 +4116,9 @@ class BlockStore:
         (import or export), excluding those finalised-from-CAD. `since_iso` floors
         the count at the settlement horizon (see get_unsettled_blocks) so historic
         / never-settling blocks don't inflate the 'awaiting DCC settlement' badge."""
+        w = self._unsettled_where(self._export_settlement_expected())
         sql = ("SELECT COUNT(*) AS n FROM blocks "
-               f"WHERE meter_id = ? AND {self._UNSETTLED_WHERE} "
+               f"WHERE meter_id = ? AND {w} "
                "AND finalised_from_cad = 0")
         params: list = [main_meter_id]
         if since_iso:
@@ -3980,9 +4135,10 @@ class BlockStore:
         This is DISTINCT from a real settlement — the *_api columns stay NULL —
         and reversible: a later DCC settlement clears the flag (see
         upsert_kraken_block). Returns the number of blocks newly flagged."""
+        w = self._unsettled_where(self._export_settlement_expected())
         cur = self._conn.execute(
             "UPDATE blocks SET finalised_from_cad = 1 "
-            f"WHERE meter_id = ? AND {self._UNSETTLED_WHERE} "
+            f"WHERE meter_id = ? AND {w} "
             "AND finalised_from_cad = 0 AND block_start < ?",
             (main_meter_id, cutoff_block_start))
         self._conn.commit()
@@ -3996,9 +4152,10 @@ class BlockStore:
         Bounds the sweep / user-triggered retry re-fetch window
         (oldest-unsettled → now). Including export here is what lets an
         export-lagging block stay in the window until its export settles."""
+        w = self._unsettled_where(self._export_settlement_expected())
         row = self._conn.execute(
             "SELECT MIN(block_start) AS m FROM blocks "
-            f"WHERE meter_id = ? AND {self._UNSETTLED_WHERE}",
+            f"WHERE meter_id = ? AND {w}",
             (main_meter_id,)).fetchone()
         return row["m"] if row and row["m"] else None
 
@@ -5896,7 +6053,8 @@ class BlockStore:
                 exp_read_start, exp_read_end,
                 standing_charge, standing_charge_exc, carbon_g, carbon_intensity_g, imp_provisional,
                 source, exc_source, is_provisional, needs_pass2_rerun, imp_kwh_api, needs_review,
-                exp_kwh_api
+                exp_kwh_api,
+                imp_kwh_ev, imp_cost_ev, imp_rate_ev, imp_ev_band, imp_home_band
             ) VALUES (
                 :block_start, :block_end,
                 :meter_id, :config_period_id, :interpolated,
@@ -5907,7 +6065,8 @@ class BlockStore:
                 :exp_read_start, :exp_read_end,
                 :standing_charge, :standing_charge_exc, :carbon_g, :carbon_intensity_g, :imp_provisional,
                 :source, :exc_source, :is_provisional, :needs_pass2_rerun, :imp_kwh_api, :needs_review,
-                :exp_kwh_api
+                :exp_kwh_api,
+                :imp_kwh_ev, :imp_cost_ev, :imp_rate_ev, :imp_ev_band, :imp_home_band
             )
         """
         with self._conn:
@@ -5929,7 +6088,8 @@ class BlockStore:
                 exp_read_start, exp_read_end,
                 standing_charge, standing_charge_exc, carbon_g, carbon_intensity_g, imp_provisional,
                 source, exc_source, is_provisional, needs_pass2_rerun, imp_kwh_api, needs_review,
-                exp_kwh_api
+                exp_kwh_api,
+                imp_kwh_ev, imp_cost_ev, imp_rate_ev, imp_ev_band, imp_home_band
             ) VALUES (
                 :block_start, :block_end,
                 :meter_id, :config_period_id, :interpolated,
@@ -5940,7 +6100,8 @@ class BlockStore:
                 :exp_read_start, :exp_read_end,
                 :standing_charge, :standing_charge_exc, :carbon_g, :carbon_intensity_g, :imp_provisional,
                 :source, :exc_source, :is_provisional, :needs_pass2_rerun, :imp_kwh_api, :needs_review,
-                :exp_kwh_api
+                :exp_kwh_api,
+                :imp_kwh_ev, :imp_cost_ev, :imp_rate_ev, :imp_ev_band, :imp_home_band
             )
         """
         with self._conn:
@@ -6057,6 +6218,8 @@ class BlockStore:
                        b.imp_kwh, b.imp_kwh_grid, b.imp_kwh_remainder,
                        b.imp_rate, b.imp_cost, b.imp_read_start, b.imp_read_end,
                        b.imp_cost_exc, b.imp_rate_exc, b.standing_charge_exc, b.exc_source,
+                       b.imp_kwh_ev, b.imp_cost_ev, b.imp_rate_ev,
+                       b.imp_ev_band, b.imp_home_band,
                        b.exp_kwh, b.exp_rate, b.exp_cost,
                        b.exp_read_start, b.exp_read_end,
                        b.standing_charge, b.carbon_g, b.carbon_intensity_g, b.interpolated,
@@ -6129,6 +6292,20 @@ class BlockStore:
                 imp_channel["cost_exc"] = float(row["imp_cost_exc"])
             if row["imp_rate_exc"] is not None:
                 imp_channel["rate_exc"] = float(row["imp_rate_exc"])
+            # BL-9: surface the IOG house/EV split so the billing summary's
+            # 'Import — total grid' section shows the EV/Home rows. _row_to_block does
+            # this too; the lightweight chart fetch MUST match or the split silently
+            # falls back to the plain per-rate rows (kwh_ev never reaches the aggregator).
+            if row["imp_kwh_ev"] is not None:
+                imp_channel["kwh_ev"] = float(row["imp_kwh_ev"])
+            if row["imp_cost_ev"] is not None:
+                imp_channel["cost_ev"] = float(row["imp_cost_ev"])
+            if row["imp_rate_ev"] is not None:
+                imp_channel["rate_ev"] = float(row["imp_rate_ev"])
+            if row["imp_ev_band"] is not None:
+                imp_channel["ev_band"] = row["imp_ev_band"]
+            if row["imp_home_band"] is not None:
+                imp_channel["home_band"] = row["imp_home_band"]
 
             exp_channel = {
                 "kwh":        exp,

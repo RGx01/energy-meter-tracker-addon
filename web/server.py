@@ -2412,6 +2412,7 @@ def api_blocks_summary():
             SELECT b.block_start, b.meter_id, m.is_sub_meter, m.parent_meter_id,
                    b.imp_kwh, b.imp_kwh_grid, b.imp_kwh_remainder,
                    b.imp_rate, b.imp_cost, b.imp_cost_remainder, b.exp_kwh, b.exp_cost,
+                   b.imp_kwh_ev, b.imp_cost_ev,
                    b.standing_charge, b.carbon_g,
                    b.interpolated, cp.billing_day
             FROM blocks b
@@ -2513,12 +2514,17 @@ def api_blocks_summary():
                     [{"slot_start": r["slot_start"], "kind": r["kind"],
                       "energy_kwh": r["energy_kwh"]} for r in _drows])
                 _main_slot = {}
+                _stored_slot = {}
                 for _rr in _raw_rows:
                     if _rr["is_sub_meter"]:
                         continue
                     _main_slot[_rr["block_start"]] = (
                         float(_rr["imp_kwh"] or 0), float(_rr["imp_cost"] or 0))
-                _ev_day = _dispatch_ev_split_by_bucket(_main_slot, _ev_slot, _bucket_local_day)
+                    if _rr["imp_kwh_ev"] is not None:      # BL-9: stored, bill-authoritative
+                        _stored_slot[_rr["block_start"]] = (
+                            float(_rr["imp_kwh_ev"]), float(_rr["imp_cost_ev"] or 0))
+                _ev_day = _dispatch_ev_split_by_bucket(
+                    _main_slot, _ev_slot, _bucket_local_day, stored_by_slot=_stored_slot)
             except Exception:
                 _ev_day = {}
             _apply_ev_split_to_summary_rows(rows, meters_list, _ev_day)
@@ -5371,12 +5377,34 @@ def api_historical_gap_template():
         to  = request.args.get("to")
         channel = (request.args.get("channel") or "import").strip().lower()
         inclusive = (request.args.get("inclusive") or "").lower() in ("1", "true", "yes")
+        from_local = (request.args.get("from_local") or "").lower() in ("1", "true", "yes")
+        to_local = (request.args.get("to_local") or "").lower() in ("1", "true", "yes")
         if not frm or not to:
             return jsonify({"error": "from and to are required"}), 400
         bm, tz = _period_block_minutes_tz(_get_store(), frm)
+        # A date-range picker sends LOCAL wall-clock (e.g. the picked day
+        # 2026-08-01T00:00:00 meaning local midnight); the generator treats its
+        # input as UTC, so in BST that renders the first row as 01:00+01:00 not
+        # 00:00+01:00. Localise those boundaries to naive-UTC first so the grid
+        # lands on local midnight. (Gap paths pass real UTC block_starts and set
+        # neither flag, so they are unaffected.)
+        if from_local or to_local:
+            import block_store as _bs
+            def _loc(s):
+                s = str(s)
+                return _bs.local_datetime_to_utc(s[:10], (s[11:16] or "00:00"), tz)
+            try:
+                if from_local:
+                    frm = _loc(frm)
+                if to_local:
+                    to = _loc(to)
+            except Exception:
+                pass
         # A persisted gap's `to` is the LAST missing slot's start (inclusive); the
-        # generator is half-open, so extend the end by one block to include it.
-        if inclusive:
+        # generator is half-open, so extend the end by one block to include it. A
+        # localised end is already an exclusive next-midnight/end-of-day boundary,
+        # so it needs no bump (bumping would spill one slot into the next day).
+        if inclusive and not to_local:
             from datetime import datetime as _dt, timedelta as _td
             try:
                 _t = _dt.fromisoformat(str(to).replace("Z", "").split("+")[0])
@@ -5479,6 +5507,24 @@ def api_insights_periods():
     except Exception as e:
         logger.exception("api_insights_periods failed")
         return jsonify({"error": str(e)}), 500
+
+
+def _collapse_rate_tiers(tiers_list):
+    """Fold a serialised rate_tiers list to ONE cost-weighted-average entry when it
+    exceeds the Billing view's _MAX_RATE_ROWS threshold — the same collapse
+    energy_charts._bill_rate_rows / _collapse_rate_kwh apply to Agile's ~48 rates a
+    day, so Usage Insights and Billing fold identically (#371). The average rate is
+    Σcost / Σkwh, so a net plunge-credit period reads NEGATIVE (sign preserved).
+    `collapsed` + `n_rates` let the renderer label it 'avg of N rates'."""
+    import energy_charts as _ec
+    if len(tiers_list) <= _ec._MAX_RATE_ROWS:
+        return tiers_list
+    tot_kwh  = round(sum(t["kwh"]  for t in tiers_list), 3)
+    tot_cost = round(sum(t["cost"] for t in tiers_list), 4)
+    tot_blk  = sum(t.get("blocks", 0) for t in tiers_list)
+    avg = round(tot_cost / tot_kwh, 6) if tot_kwh else 0.0
+    return [{"rate": avg, "kwh": tot_kwh, "cost": tot_cost, "blocks": tot_blk,
+             "collapsed": True, "n_rates": len(tiers_list)}]
 
 
 def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
@@ -5874,19 +5920,32 @@ def _dispatch_derived_ev_kwh(dispatch_rows) -> dict:
     return out
 
 
-def _dispatch_ev_split_by_bucket(main_by_slot, ev_by_slot, bucket_fn) -> dict:
+def _dispatch_ev_split_by_bucket(main_by_slot, ev_by_slot, bucket_fn,
+                                 stored_by_slot=None) -> dict:
     """Grid-clip the per-slot dispatch EV to that slot's main import and apportion its
-    cost from the slot's import cost, then bucket to {bucket: {"kwh","cost"}}. Pure —
-    `main_by_slot` is {slot: (imp_kwh, imp_cost)}, `ev_by_slot` is {slot: kwh}. The
-    clip + apportionment guarantee house + EV == the slot's grid import exactly, so a
-    caller can split a chart segment without moving any total."""
+    cost, then bucket to {bucket: {"kwh","cost"}}. Pure — `main_by_slot` is
+    {slot: (imp_kwh, imp_cost)}, `ev_by_slot` is {slot: kwh}.
+
+    BL-9: when `stored_by_slot` supplies a slot's STORED split ({slot: (ev_kwh,
+    ev_cost)} — the bill-authoritative 4-rate figures), that is used in preference to
+    the pro-rata carve, so this matches the billing summary on a capped account. Slots
+    without a stored split (un-backfilled / older history) fall back to the pro-rata
+    carve (EV at the block's own rate). On an uncapped account the two are identical, so
+    the bucketed result is byte-identical there. The clip keeps house + EV == the slot's
+    grid import, so a caller can split a chart segment without moving any total."""
+    stored_by_slot = stored_by_slot or {}
     out: dict = {}
     for _slot, _e in ev_by_slot.items():
         _mk, _mc = main_by_slot.get(_slot, (0.0, 0.0))
-        _ek = min(_e, _mk) if _mk > 0 else 0.0        # can't exceed the grid that slot
+        _sv = stored_by_slot.get(_slot)
+        if _sv is not None and _sv[0] > 1e-9:
+            _ek = min(_sv[0], _mk) if _mk > 0 else 0.0
+            _ec = _sv[1] * (_ek / _sv[0]) if _sv[0] > 0 else 0.0
+        else:
+            _ek = min(_e, _mk) if _mk > 0 else 0.0        # can't exceed the grid that slot
+            _ec = _mc * (_ek / _mk) if _mk > 0 else 0.0   # cost follows the same fraction
         if _ek <= 1e-9:
             continue
-        _ec = _mc * (_ek / _mk) if _mk > 0 else 0.0   # cost follows the same fraction
         _b = bucket_fn(_slot)
         _acc = out.setdefault(_b, {"kwh": 0.0, "cost": 0.0})
         _acc["kwh"]  += _ek
@@ -5957,6 +6016,7 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
         """SELECT b.meter_id, b.block_start,
                   b.imp_kwh, b.imp_kwh_grid, b.imp_kwh_remainder,
                   b.imp_rate, b.imp_cost,
+                  b.imp_kwh_ev, b.imp_cost_ev, b.imp_rate_ev,
                   b.exp_kwh, b.exp_rate, b.exp_cost,
                   b.standing_charge,
                   COALESCE(m.is_sub_meter, 0) as is_sub_meter,
@@ -6024,7 +6084,7 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
             sub_totals[mid]["imp_kwh"]  += sub_grid_kwh
             sub_totals[mid]["imp_cost"] += imp_cost
             sub_totals[mid]["exp_kwh"]  += exp
-            if rate > 0:
+            if rate != 0:      # keep plunge-price (negative-rate) slots too (#371)
                 sub_totals[mid]["rate_tiers"][round(rate, 6)]["kwh"]    += sub_grid_kwh
                 sub_totals[mid]["rate_tiers"][round(rate, 6)]["cost"]   += imp_cost
                 sub_totals[mid]["rate_tiers"][round(rate, 6)]["blocks"] += 1
@@ -6061,8 +6121,11 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
         elif local_d not in daily_sc:
             daily_sc[local_d] = 0.0
 
-        # Rate tier accumulation (main meter total) — only when actually importing
-        if rate > 0 and imp > 0:
+        # Rate tier accumulation (main meter total) — only when actually importing.
+        # `rate != 0` (not `> 0`) so Agile plunge-price slots (negative rate — a
+        # CREDIT) stay in the distribution instead of being silently dropped (#371);
+        # a rate of exactly 0 still means unpriced/gap-filled and is excluded.
+        if imp > 0 and rate != 0:
             rate_key = round(rate, 6)
             rate_tiers[rate_key]["kwh"]    += imp
             rate_tiers[rate_key]["cost"]   += imp_cost
@@ -6099,21 +6162,35 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
         if _ev_by_slot:
             _main_by_slot = {}
             for row in rows:                     # no sub-meters here, so all main
+                # (imp_kwh, imp_cost, imp_rate, stored_ev_kwh|None, stored_ev_cost,
+                #  stored_ev_rate) — the stored split is the bill-authoritative one.
                 _main_by_slot[row["block_start"]] = (
                     float(row["imp_kwh"] or 0), float(row["imp_cost"] or 0),
-                    float(row["imp_rate"] or 0))
+                    float(row["imp_rate"] or 0),
+                    (float(row["imp_kwh_ev"]) if row["imp_kwh_ev"] is not None else None),
+                    float(row["imp_cost_ev"] or 0), float(row["imp_rate_ev"] or 0))
             _ev_kwh = _ev_cost = 0.0
             _ev_tiers = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "blocks": 0})
             for _slot, _e in _ev_by_slot.items():
-                _mk, _mc, _mr = _main_by_slot.get(_slot, (0.0, 0.0, 0.0))
-                _ek = min(_e, _mk) if _mk > 0 else 0.0     # grid-clip to the slot
+                _mk, _mc, _mr, _sk, _sc, _sr = _main_by_slot.get(
+                    _slot, (0.0, 0.0, 0.0, None, 0.0, 0.0))
+                # BL-9: prefer the STORED split (matches the bill on a capped account;
+                # EV tiered at its own rate_ev), else the pro-rata carve at the block
+                # rate. Identical on uncapped, so byte-identical there.
+                if _sk is not None and _sk > 1e-9:
+                    _ek = min(_sk, _mk) if _mk > 0 else 0.0
+                    _ec = _sc * (_ek / _sk) if _sk > 0 else 0.0
+                    _tier_rate = _sr or _mr
+                else:
+                    _ek = min(_e, _mk) if _mk > 0 else 0.0     # grid-clip to the slot
+                    _ec = _mc * (_ek / _mk) if _mk > 0 else 0.0   # apportion cost
+                    _tier_rate = _mr
                 if _ek <= 1e-9:
                     continue
-                _ec = _mc * (_ek / _mk) if _mk > 0 else 0.0   # apportion cost
                 _ev_kwh += _ek
                 _ev_cost += _ec
-                if _mr > 0:
-                    _t = _ev_tiers[round(_mr, 6)]
+                if _tier_rate != 0:              # keep plunge-price slots too (#371)
+                    _t = _ev_tiers[round(_tier_rate, 6)]
                     _t["kwh"] += _ek; _t["cost"] += _ec; _t["blocks"] += 1
             if _ev_kwh > 1e-9:
                 house_imp_kwh  = max(0.0, house_imp_kwh  - _ev_kwh)
@@ -6169,22 +6246,23 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
         peak_window_start = best_h
         peak_window_kwh   = round(best, 3)
 
-    # Serialise rate_tiers (keys are floats, not JSON-safe as dict keys)
-    rate_tiers_list = sorted(
+    # Serialise rate_tiers (keys are floats, not JSON-safe as dict keys), then fold
+    # to a single average row above _MAX_RATE_ROWS so Agile matches the Billing view.
+    rate_tiers_list = _collapse_rate_tiers(sorted(
         [{"rate": k, "kwh": round(v["kwh"], 3),
           "cost": round(v["cost"], 4), "blocks": v["blocks"]}
          for k, v in rate_tiers.items()],
         key=lambda x: x["rate"]
-    )
+    ))
 
-    # Serialise sub_totals rate_tiers similarly
+    # Serialise sub_totals rate_tiers similarly (same per-device collapse)
     for mid, st in sub_totals.items():
-        st["rate_tiers"] = sorted(
+        st["rate_tiers"] = _collapse_rate_tiers(sorted(
             [{"rate": k, "kwh": round(v["kwh"], 3),
               "cost": round(v["cost"], 4), "blocks": v["blocks"]}
              for k, v in st["rate_tiers"].items()],
             key=lambda x: x["rate"]
-        )
+        ))
 
     return {
         # Cost & earnings

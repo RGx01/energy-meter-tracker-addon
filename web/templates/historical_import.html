@@ -261,14 +261,20 @@ var PENDING_GAP = null;
 
 // CSV panel window: the contiguous span (and optional single channel) the pre-filled
 // templates + upload apply to. Set by the CSV tasks (date range / a chosen gap).
-var CSV_WINDOW = { from: null, to: null, channel: null, inclusive: false };
+// localFrom/localTo mark a boundary as LOCAL wall-clock (a date-range pick) rather
+// than a real UTC block_start (a detected gap) — the template endpoint localises
+// those so the first row is local midnight (00:00), not UTC midnight (01:00 in BST).
+var CSV_WINDOW = { from: null, to: null, channel: null, inclusive: false,
+                   localFrom: false, localTo: false };
 
 function csvTemplateUrl(channel) {
   if (CSV_WINDOW.from && CSV_WINDOW.to) {
     return apiUrl('/api/historical/gap-template?channel=' + encodeURIComponent(channel)
       + '&from=' + encodeURIComponent(CSV_WINDOW.from)
       + '&to=' + encodeURIComponent(CSV_WINDOW.to)
-      + (CSV_WINDOW.inclusive ? '&inclusive=1' : ''));
+      + (CSV_WINDOW.inclusive ? '&inclusive=1' : '')
+      + (CSV_WINDOW.localFrom ? '&from_local=1' : '')
+      + (CSV_WINDOW.localTo ? '&to_local=1' : ''));
   }
   return apiUrl('/api/historical/csv-template');   // fallback: blank illustrative template
 }
@@ -292,7 +298,8 @@ function csvRenderTemplates() {
 }
 function csvOpen(win) {
   CSV_WINDOW = { from: (win && win.from) || null, to: (win && win.to) || null,
-                 channel: (win && win.channel) || null, inclusive: !!(win && win.inclusive) };
+                 channel: (win && win.channel) || null, inclusive: !!(win && win.inclusive),
+                 localFrom: !!(win && win.localFrom), localTo: !!(win && win.localTo) };
   var imp = document.getElementById('import-file'); if (imp) imp.value = '';
   var exp = document.getElementById('export-file'); if (exp) exp.value = '';
   var ps = document.getElementById('preview-status'); if (ps) ps.textContent = '';
@@ -471,7 +478,7 @@ async function bfRangePreview(fromTs) {
       + _esc(other) + ' data is left untouched (first-in wins, per channel). Grab the pre-filled ' + _esc(overlayCh)
       + ' template, add a unit rate (p/kWh) or cost column, then upload.</div>'
       + '<button class="btn" onclick="csvOpen({from:\'' + fromTs + '\',to:\'' + toTs
-      + '\',channel:\'' + overlayCh + '\',inclusive:true})">Fill from CSV →</button>';
+      + '\',channel:\'' + overlayCh + '\',inclusive:true,localFrom:true,localTo:true})">Fill from CSV →</button>';
     return;
   }
   var upTo = null;
@@ -485,7 +492,7 @@ async function bfRangePreview(fromTs) {
   var html = '<div>Import <strong>' + _esc(fromTs.slice(0, 10)) + '</strong> → your earliest data <strong>'
            + _esc(upTo.slice(0, 10)) + '</strong>, as one contiguous run.</div>'
            + '<div style="font-size:12px;color:var(--muted);margin:6px 0 10px;">Fill this window from CSV — grab the pre-filled Import and Export templates, add your figures, then upload.</div>'
-           + '<button class="btn" onclick="csvOpen({from:\'' + fromTs + '\',to:\'' + upTo + '\'})">Fill from CSV →</button>';
+           + '<button class="btn" onclick="csvOpen({from:\'' + fromTs + '\',to:\'' + upTo + '\',localFrom:true})">Fill from CSV →</button>';
   out.innerHTML = html;
 }
 async function bfPreview() {
