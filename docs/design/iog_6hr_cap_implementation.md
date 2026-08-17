@@ -182,11 +182,36 @@ EV device (`retire_meter` / `retired_at`; engine skips writing its blocks from t
 UI in `meter_config.html`) hands those slots to the synthetic from the cutover, fully
 reversibly.
 
-Note the chart EV series is a **separate, display-only** path from the billing split — it
-re-partitions the house slot using the synthetic dispatch map and currently prices the EV
-portion at `main_rate`. The remaining chart item is to point its rate line at the stored
-`imp_rate_ev` so it diverges under the cap; on an uncapped account EV and Home share the
-off-peak rate, so the line correctly shows no divergence until the cap engages.
+The chart EV series takes its kWh, cost **and** rate line from the **same stored split as
+the bill** (see §9): `_dispatch_ev_slot_map` prefers the block's `imp_kwh_ev`/`imp_cost_ev`/
+`imp_rate_ev`, and the day chart plots the EV rate line at `imp_rate_ev`. So the EV line
+**diverges from the house line** the moment the cap pushes charging to peak; on an uncapped
+account EV and Home share the off-peak rate, so it correctly shows no divergence. The
+re-partition stays display-only — house = main − EV, so the grid total and the "Direct
+import" segment are unchanged.
+
+## 9. One EV/house split, everywhere — the stored columns are the source of truth
+
+The EV/house cost split is produced in exactly one place (the seam, §3) and stored on the
+block (§4); **every surface that shows it derives from those columns**, falling back to the
+dispatch-derived pro-rata carve *only* where a block has no stored split (un-backfilled /
+non-IOG history). This matters on a **capped** account: the pro-rata carve prices EV at the
+block's blended rate, which disagrees with the bill's 4-rate figures — so a surface that
+computed its own split would show a different EV cost than the statement. The consumers, now
+unified:
+
+- **Bill — "Import — total grid"** reads the stored split directly (§6).
+- **Bill — "Breakdown by meter" and the day chart** both flow through
+  `energy_charts._dispatch_ev_slot_map`, which prefers the stored split — one change point
+  covers both.
+- **Usage Stats and Usage Insights** (`server._dispatch_ev_split_by_bucket` /
+  `_aggregate_usage`) prefer a per-slot stored map and tier the EV at `imp_rate_ev`.
+
+On an **uncapped** account the stored split equals the pro-rata carve (EV and house share
+the rate), so every surface is byte-identical to before — the unification only changes what
+**capped** users see, and it makes all surfaces agree with the bill. `main_import_raw`,
+`total_cost` and the Total Bill are never touched: the split only apportions a total that
+already exists.
 
 ## Test inventory
 
@@ -196,7 +221,9 @@ byte-identical + capped re-price), `test_cap_split_columns` / `_writepath` / `_r
 lightweight surfacing), `test_billing_split_agg` / `_render` / `test_billing_ev_breakdown`
 (summary), `test_billing_split_polish` (ex-VAT fallback + band collapse),
 `test_reconcile_exc_restamp` (forward fix), `test_stale_exc_repair` (repair),
-`test_ev_coverage_gate` (charts gate).
+`test_ev_coverage_gate` (charts gate), `test_day_chart_ev_rate_line` (rate-line
+divergence), `test_ev_split_prefers_stored` + `test_server` additions (§9 unification —
+every surface prefers the stored split, uncapped byte-identical).
 
 ## Invariants (must hold)
 
@@ -207,5 +234,9 @@ lightweight surfacing), `test_billing_split_agg` / `_render` / `test_billing_ev_
   live estimate and converges to it.
 - Any new billing column must be surfaced by **both** `_row_to_block` and
   `get_blocks_lightweight`.
+- The EV/house cost split has ONE source — the stored `imp_*_ev` columns (§9). Every
+  surface (bill, charts, Usage Stats/Insights) derives from them; the pro-rata dispatch
+  carve is a fallback for blocks without a stored split and equals the stored value on
+  uncapped accounts, so no surface re-computes a split that could diverge from the bill.
 - Credential values are never entered or handled by tooling; all patches are applied by
   the maintainer.

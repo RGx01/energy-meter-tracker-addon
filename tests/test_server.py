@@ -3571,6 +3571,7 @@ class TestAggregateUsage(unittest.TestCase):
                 imp_cost_remainder REAL, imp_read_start REAL, imp_read_end REAL,
                 exp_kwh REAL, exp_rate REAL, exp_cost REAL,
                 exp_read_start REAL, exp_read_end REAL,
+                imp_kwh_ev REAL, imp_cost_ev REAL, imp_rate_ev REAL,
                 standing_charge REAL, carbon_g REAL, interpolated INTEGER DEFAULT 0
             );
         """)
@@ -4906,6 +4907,7 @@ class TestDispatchDerivedEVWiring(unittest.TestCase):
                 imp_kwh REAL, imp_kwh_grid REAL, imp_kwh_remainder REAL,
                 imp_rate REAL, imp_cost REAL, imp_cost_remainder REAL,
                 exp_kwh REAL, exp_rate REAL, exp_cost REAL, standing_charge REAL,
+                imp_kwh_ev REAL, imp_cost_ev REAL, imp_rate_ev REAL,
                 carbon_g REAL, interpolated INTEGER DEFAULT 0
             );
             CREATE TABLE dispatch_history (
@@ -4968,6 +4970,24 @@ class TestDispatchDerivedEVWiring(unittest.TestCase):
         # House untouched: with no EV block, house == full grid import.
         self.assertAlmostEqual(d["house_imp_kwh"], d["imp_kwh"], places=3)
 
+    def test_prefers_stored_split_over_prorata(self):
+        # BL-9 unification: slot A carries a STORED split (the bill-authoritative 4-rate
+        # figure) that differs from the pro-rata carve; slot B has none → pro-rata
+        # fallback. Usage Stats must use the stored figure so it matches the bill.
+        store, conn = self._store()
+        conn.execute("INSERT INTO meters (config_period_id,meter_id,is_sub_meter,meter_type) "
+                     "VALUES (1,'electricity_main',0,NULL)")
+        conn.execute("UPDATE blocks SET imp_kwh_ev=4.0, imp_cost_ev=0.30, imp_rate_ev=0.075 "
+                     "WHERE block_start='2026-08-04T00:00:00'"); conn.commit()
+        cfg = {"meters": {"electricity_main": {"meta": {"timezone": "UTC"}}}}
+        d = server._aggregate_usage(store, cfg,
+                                    "2026-08-04T00:00:00", "2026-08-05T00:00:00")
+        ev = d["sub_meters"]["ev_dispatch"]
+        # slot A stored 0.30 (NOT pro-rata 0.28) + slot B pro-rata 0.28 = 0.58
+        self.assertAlmostEqual(ev["imp_cost"], 0.58, places=4)
+        # house + EV still reconstruct the grid import exactly
+        self.assertAlmostEqual(d["house_imp_cost"] + ev["imp_cost"], d["imp_cost"], places=4)
+
 
 class TestBlocksSummaryEVSplit(unittest.TestCase):
     """BL-22 on the Charts 'Usage Stats' path: split the 'Direct' import segment into a
@@ -4984,6 +5004,17 @@ class TestBlocksSummaryEVSplit(unittest.TestCase):
         out = server._dispatch_ev_split_by_bucket(main, ev, lambda s: s[:10])
         self.assertAlmostEqual(out["2026-08-04"]["kwh"], 8.0, places=3)
         self.assertAlmostEqual(out["2026-08-04"]["cost"], 0.56, places=4)
+
+    def test_split_by_bucket_prefers_stored(self):
+        # BL-9: a stored split for slot A is used over pro-rata; slot B (no stored) falls
+        # back. Stored 0.30 (slot A) + pro-rata 0.28 (slot B) = 0.58 vs all-pro-rata 0.56.
+        main = {"2026-08-04T00:00:00": (5.0, 0.35), "2026-08-04T00:30:00": (4.0, 0.28)}
+        ev   = {"2026-08-04T00:00:00": 4.0, "2026-08-04T00:30:00": 6.0}
+        stored = {"2026-08-04T00:00:00": (4.0, 0.30)}
+        out = server._dispatch_ev_split_by_bucket(
+            main, ev, lambda s: s[:10], stored_by_slot=stored)
+        self.assertAlmostEqual(out["2026-08-04"]["kwh"], 8.0, places=3)
+        self.assertAlmostEqual(out["2026-08-04"]["cost"], 0.58, places=4)
 
     def _row(self, y, m, d, main_kwh, main_cost):
         return {"year": y, "month": m, "day": d,

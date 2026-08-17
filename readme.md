@@ -106,6 +106,16 @@ Full documentation is on the **[GitHub Wiki](https://github.com/RGx01/energy-met
 
 ---
 
+## What's new in 4.3.0
+
+EMT 4.3.0 — theme **Charge Cap** — is a drop-in upgrade: additive and **off for non-IOG tariffs**, with inc-VAT figures for every existing tariff byte-identical.
+
+- **🚗 Intelligent Octopus Go house-vs-car split _(experimental)_.** Octopus's new IOG tariff gives your car up to **6 hours** of cheap charging a day (measured midday-to-midday) and puts anything beyond it on the peak rate. EMT now reconstructs the **house-vs-car split** for every IOG block from Octopus's own dispatch record — **no charger sensor needed**, it works for any charger or vehicle integration — and itemises it on the bill under *Import — total grid*, the way the statement lays it out. On a **migrated (capped)** meter it prices the full **4-rate** model, and the day chart's car rate line lifts away from the house line when a cap bites. The **same** split now drives **Usage Stats, Usage Insights and the charts**, so every screen shows the same house-vs-car figure as the bill. On an **uncapped** IOG meter it's shown for reference and your billing is unchanged. *(The cap model is a live estimate; settled DCC cost stays authoritative and any boundary estimate self-corrects at settlement.)*
+
+See the [full changelog](CHANGELOG.md) for everything in 4.3.0.
+
+---
+
 ## What's new in 4.0
 
 EMT 4.0 is a **major-additive** release — like 3.0 it's a drop-in upgrade: nothing breaks, existing installs keep working, and the new tools are opt-in.

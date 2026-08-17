@@ -1388,10 +1388,28 @@ def _dispatch_ev_slot_map(store, blocks, cfg):
             continue
         if mk <= 0:
             continue
-        ek = min(ev_raw[slot], mk)
+        # BL-9: prefer the STORED, bill-authoritative split (imp_kwh_ev/imp_cost_ev/
+        # imp_rate_ev — the 4-rate figures the billing summary's grid-total section
+        # uses) so every EV/house surface agrees with the bill on a capped account.
+        # Fall back to the dispatch-derived pro-rata carve (EV at the block's own rate)
+        # only where a block has no stored split — un-backfilled / older history. On an
+        # uncapped account the two are identical (EV and house share the rate), so this
+        # is byte-identical there.
+        _sk = imp.get("kwh_ev")
+        if _sk is not None and float(_sk) > 1e-9:
+            ek = min(float(_sk), mk)
+            _sc = float(imp.get("cost_ev") or 0.0)
+            ec = _sc * (ek / float(_sk)) if float(_sk) > 0 else 0.0
+            _sr = imp.get("rate_ev")
+            rate = round(float(_sr), 4) if _sr else (round(ec / ek, 4) if ek else rate)
+        else:
+            ek = min(ev_raw[slot], mk)
+            if ek <= 1e-9:
+                continue
+            ec = mc * (ek / mk)
         if ek <= 1e-9:
             continue
-        out[slot] = {"kwh": ek, "cost": mc * (ek / mk), "rate": rate}
+        out[slot] = {"kwh": ek, "cost": ec, "rate": rate}
     return out
 
 
@@ -1815,9 +1833,17 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                     _ek = min(_ev["kwh"], _mk)
                     if _ek > 1e-9:
                         _mc = meter_cost["electricity_main"][hh]
-                        _ec = _mc * (_ek / _mk)
+                        # BL-9: EV cost from the (bill-authoritative) ev_slot_map cost,
+                        # clipped consistently with _ek, so the EV bar, rate line and cost
+                        # all match the bill on a capped account; house = main − EV keeps
+                        # the grid total untouched. Uncapped → ev_slot_map cost == the
+                        # pro-rata carve, so byte-identical. Fall back to pro-rata if the
+                        # map somehow lacks kWh.
+                        _evk_map = _f(_ev.get("kwh"))
+                        _ec = (_f(_ev.get("cost")) * (_ek / _evk_map)
+                               if _evk_map > 1e-9 else _mc * (_ek / _mk))
                         _r4 = round(main_rate, 4)
-                        # BL-9: the EV rate LINE follows the stored dispatch EV rate
+                        # The EV rate LINE follows the stored dispatch EV rate
                         # (imp_rate_ev) so it DIVERGES from the house line once the 6-h
                         # cap pushes EV charging to peak (the 4-rate rule). On an uncapped
                         # IOG account imp_rate_ev == the house rate, so the line sits
