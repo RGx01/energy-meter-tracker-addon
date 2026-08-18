@@ -145,6 +145,19 @@ invariant throughout.
   the reconciliation invariant (house + devices == grid, kWh and cost) is the acceptance
   test at every phase.
 
+## Known limitation until this lands
+
+On a **capped** account with a **physical** sub-meter (a configured EV charger or battery),
+PASS 2 prices that device's grid import at the parent's **blended** 4-rate rate, so the
+device's **day-chart rate line and its per-device cost read the blend, not the proper band**
+(EV-peak / house-day). This is display/attribution only — the **Total Bill, the grid total,
+and the "Import — total grid" EV/house split are correct** (they use the dispatch 4-rate
+split), and the device breakdown still reconciles to the grid. The **synthetic** EV line
+(an account with no physical charger) is already correct — it follows `imp_rate_ev`. The
+held 4.3.1 rate-line patch would fix the *line* at the display layer, but was parked
+deliberately because this refactor fixes the rate **and** the per-device cost at the source
+in one move.
+
 ## Status
 
 Tactical fixes shipped (4.3.0/4.3.1): ex-VAT and EV-split re-stamp + repair, display
