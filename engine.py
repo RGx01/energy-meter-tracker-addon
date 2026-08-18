@@ -9411,6 +9411,70 @@ _RECONCILE_STARTED_GATE_MIN = 40  # restore: slot ended + a poll margin (started
 _DISPATCH_RECONCILE_APPLY = True  # write (risk accepted; soaked on prod_dev first)
 
 
+def _attribute_missing_ev_split() -> int:
+    """Back-attribute the EV/Home split on blocks that HAD EV charging but never got a
+    stored split. `imp_kwh_ev` is stamped once, at pricing, from the COMPLETED dispatch
+    known then — but Octopus reports a slot's completed energy hours later, usually after
+    the block was priced (with only a 'planned' dispatch). The completed charge is then
+    never attributed: it sits silently in Home, and the reconcile's re-stamp skips it (that
+    UPDATE only touches rows where imp_kwh_ev IS NOT NULL). Whichever instance priced a
+    block BEFORE its completed record arrived diverges permanently from one that priced it
+    AFTER — the prod vs prod-dev EV/Home mismatch (a whole missed overnight session).
+
+    This re-runs the IOG split (`_apply_iog_split`, the exact pricing-time logic) on every
+    main block that now has a completed dispatch but a NULL split, so both instances
+    converge deterministically. Idempotent (an attributed block is no longer NULL, so it
+    drops out). Imported history is left alone (Octopus's own billed, dispatch-aware rate).
+    Gated to UNCAPPED — a capped 4-rate split re-prices the block, which is the segment
+    refactor's job; here we only add the missing split, never touch the block's price.
+    Returns the number of blocks attributed."""
+    if _store is None:
+        return 0
+    sched = _kraken_rate_schedules.get("import")
+    if sched is None or sched.is_empty():
+        return 0
+    if ("ev_device_off_peak" in _kraken_rate_schedules
+            and "ev_device_peak" in _kraken_rate_schedules):
+        return 0        # capped: the 4-rate attribution belongs to the segment refactor
+    try:
+        rows = _store._conn.execute(
+            "SELECT b.block_start, b.imp_kwh, b.imp_cost, b.imp_rate FROM blocks b "
+            "WHERE b.meter_id = 'electricity_main' AND b.imp_kwh_ev IS NULL "
+            "AND COALESCE(b.imp_kwh, 0) > 0 "
+            "AND (b.source IS NULL OR b.source NOT LIKE 'imported%') "
+            "AND EXISTS (SELECT 1 FROM dispatch_history h WHERE h.slot_start = b.block_start "
+            "AND h.kind = 'completed' AND h.energy_kwh IS NOT NULL)").fetchall()
+    except Exception as e:
+        logger.warning("_attribute_missing_ev_split: query failed: %s", e)
+        return 0
+    n = 0
+    for r in rows:
+        imp_ch = {"kwh": float(r["imp_kwh"] or 0.0), "cost": float(r["imp_cost"] or 0.0),
+                  "rate": float(r["imp_rate"] or 0.0)}
+        try:
+            _apply_iog_split(imp_ch, r["block_start"], "", imp_ch["kwh"], imp_ch["rate"])
+        except Exception:
+            continue
+        if imp_ch.get("kwh_ev") is None:        # completed dispatch clipped to no grid EV
+            continue
+        try:
+            with _store._conn:
+                _store._conn.execute(
+                    "UPDATE blocks SET imp_kwh_ev = ?, imp_cost_ev = ?, imp_rate_ev = ?, "
+                    "imp_ev_band = ?, imp_home_band = ? "
+                    "WHERE block_start = ? AND meter_id = 'electricity_main'",
+                    (imp_ch["kwh_ev"], imp_ch["cost_ev"], imp_ch["rate_ev"],
+                     imp_ch.get("ev_band"), imp_ch.get("home_band"), r["block_start"]))
+            n += 1
+        except Exception as e:
+            logger.warning("_attribute_missing_ev_split: write failed for %s: %s",
+                           r["block_start"], e)
+    if n:
+        logger.info("ev attribution: back-attributed the EV/Home split on %d block(s) whose "
+                    "completed dispatch arrived after pricing (was silently all-Home)", n)
+    return n
+
+
 async def reconcile_dispatch_overlay() -> dict:
     """Settlement-time reconciliation of the dispatch overlay against the
     accumulated lifecycle (design §12). For each SETTLED, non-user-corrected main
@@ -9445,6 +9509,15 @@ async def reconcile_dispatch_overlay() -> dict:
                         "only dispatch history (no prior billing slot)", n_mat)
     except Exception as e:
         logger.warning("reconcile: completed-only slot materialisation failed: %s", e)
+    # BL-9 fix: back-attribute any block whose COMPLETED dispatch landed after it was
+    # priced — otherwise the real EV charge stays in Home and two instances that priced
+    # the same slot at different times disagree permanently. Runs every pass, so it heals
+    # existing history on the first run and self-heals late dispatch thereafter.
+    try:
+        _n_attr = _attribute_missing_ev_split()
+    except Exception as e:
+        _n_attr = 0
+        logger.warning("reconcile: ev back-attribution failed: %s", e)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     # Two gates: a RESTORE can happen as soon as the slot has ended (`started` is
     # captured in real-time, so it's already known); a REVERT/REVIEW must wait for
@@ -9479,7 +9552,7 @@ async def reconcile_dispatch_overlay() -> dict:
         logger.warning("reconcile_dispatch_overlay: query failed: %s", e)
         return {}
     n_restore = n_revert = n_review = n_deferred = 0
-    changed = False
+    changed = bool(_n_attr)          # back-attribution alone should refresh the charts
     n_candidates = len(rows)
     for r in rows:
         bs = r["block_start"]
