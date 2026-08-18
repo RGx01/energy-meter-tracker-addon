@@ -87,6 +87,42 @@ class TestBillingSplitAgg(unittest.TestCase):
         self.assertEqual(s["ev_by_rate"][0.05]["kwh"], 2.0)
         self.assertEqual(s["ev_transition"]["kwh"], 0.0)
 
+    # ---- BL-27: when priced SEGMENTS travel with the block, they drive the split ----
+
+    def test_segments_drive_split_when_present(self):
+        # A capped block priced as segments: EV peak + house day. The split reads the
+        # segments' own rates, ignoring the legacy columns entirely.
+        s = self._summary([_block("2026-01-01T18:00:00", {
+            "kwh": 3.0, "rate": 0.31, "cost": round(2 * 0.30 + 1 * 0.3231, 6),
+            # deliberately WRONG legacy columns to prove segments win:
+            "kwh_ev": 99.0, "cost_ev": 99.0, "rate_ev": 99.0, "ev_band": "mixed",
+            "segments": [
+                {"kwh": 2.0, "inc_rate": 0.30, "exc_rate": 0.30 / 1.05, "attribution": "ev"},
+                {"kwh": 1.0, "inc_rate": 0.3231, "exc_rate": 0.3231 / 1.05, "attribution": "house"},
+            ]})])
+        self.assertEqual(s["ev_by_rate"][0.30]["kwh"], 2.0)
+        self.assertAlmostEqual(s["ev_by_rate"][0.30]["cost"], 0.60, places=5)
+        self.assertEqual(s["home_by_rate"][0.3231]["kwh"], 1.0)
+        self.assertEqual(s["ev_transition"]["kwh"], 0.0)      # transition retired for segments
+
+    def test_boundary_segments_become_constituent_rows(self):
+        # The boundary block that used to collapse to a transition now presents its
+        # constituent rate rows — the whole point of the segment migration.
+        s = self._summary([_block("2026-01-01T16:00:00", {
+            "kwh": 2.0, "rate": 0.175, "cost": 0.35,
+            "segments": [
+                {"kwh": 0.5, "inc_rate": 0.05, "exc_rate": None, "attribution": "ev"},
+                {"kwh": 0.5, "inc_rate": 0.30, "exc_rate": None, "attribution": "ev"},
+                {"kwh": 0.5, "inc_rate": 0.05, "exc_rate": None, "attribution": "house"},
+                {"kwh": 0.5, "inc_rate": 0.3231, "exc_rate": None, "attribution": "house"},
+            ]})])
+        self.assertEqual(s["ev_by_rate"][0.05]["kwh"], 0.5)
+        self.assertEqual(s["ev_by_rate"][0.30]["kwh"], 0.5)
+        self.assertEqual(s["home_by_rate"][0.05]["kwh"], 0.5)
+        self.assertEqual(s["home_by_rate"][0.3231]["kwh"], 0.5)
+        self.assertEqual(s["ev_transition"]["kwh"], 0.0)
+        self.assertEqual(s["home_transition"]["kwh"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

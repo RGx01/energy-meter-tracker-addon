@@ -614,9 +614,52 @@ def _apply_iog_split(imp_ch: dict, block_start: str, block_end: str,
     _cls = res.get("classification") or {}
     imp_ch["ev_band"] = _cls.get("ev")
     imp_ch["home_band"] = _cls.get("house")
+    # BL-27: carry the seam's full-fidelity band segments so the persist step stores them
+    # directly (a boundary block keeps all four bands) instead of re-deriving the collapsed
+    # 1–2 from the columns. None on a non-dispatched slot → persist falls back to columns.
+    imp_ch["segments"] = res.get("segments")
     if capped:                              # capped tariff RE-PRICES the block
         imp_ch["rate"] = res["imp_rate"]
         imp_ch["cost"] = res["imp_cost"]
+
+
+def _persist_block_segments(block_start: str, meter_id: str, imp_ch: dict) -> None:
+    """BL-27: write the priced segments for a just-priced MAIN import channel, so new /
+    settled blocks carry `block_segments` alongside the imp_* columns (history is filled by
+    the segment backfill). Segments mirror the columns during the migration; the readers
+    then read segments. Derived from the channel so it stays in sync with whatever pricing
+    just ran (overlay / IOG split / settlement). Best-effort — never blocks pricing."""
+    if _store is None or not block_start or not imp_ch:
+        return
+    try:
+        import pricing_segments as _ps
+        _rate = float(imp_ch.get("rate") or 0.0)
+        _rexc = imp_ch.get("rate_exc")
+        if _rexc is not None and _rate:
+            _ratio = float(_rexc) / _rate
+        else:
+            try:
+                _ratio = 1.0 / (1.0 + _store.vat_rate_at(block_start))
+            except Exception:
+                _ratio = None
+        # BL-27: prefer the FULL-fidelity segments the pricing seam emitted (all four bands
+        # on a boundary block); apply the block's exc ratio here. Fall back to reconstructing
+        # from the columns for non-dispatched / non-seam blocks (single house segment).
+        _seam = imp_ch.get("segments")
+        if _seam:
+            def _exc(inc):
+                return round(inc * _ratio, 6) if (_ratio is not None and inc is not None) else None
+            segs = [_ps.Segment(round(float(k), 6), float(r), _exc(float(r)), band, attr)
+                    for (k, r, band, attr) in _seam]
+        else:
+            segs = _ps.segments_from_legacy(
+                imp_kwh=float(imp_ch.get("kwh") or 0.0), imp_cost=float(imp_ch.get("cost") or 0.0),
+                imp_rate=_rate, kwh_ev=imp_ch.get("kwh_ev"), cost_ev=imp_ch.get("cost_ev"),
+                rate_ev=imp_ch.get("rate_ev"), ev_band=imp_ch.get("ev_band"),
+                home_band=imp_ch.get("home_band"), exc_ratio=_ratio)
+        _store.set_block_segments(block_start, meter_id, segs)
+    except Exception as e:
+        logger.warning("_persist_block_segments: %s", e)
 
 
 def _log_config_state(config: dict | None = None) -> None:
@@ -3153,6 +3196,9 @@ def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricit
                     imp_ch["rate_exc"] = round(_exc_rate, 6)
                     imp_ch["cost_exc"] = round(chosen * _exc_rate, 6)
                     main["exc_source"] = "tariff"
+            # BL-27: persist the priced segments for the settled main import channel.
+            if _override_rate is None:
+                _persist_block_segments(block.get("start", ""), main_meter_id, imp_ch)
 
     exp_ch = (main.get("channels") or {}).get("export")
     if exp_ch is None and main.get("exp_kwh_api") is not None:
@@ -3687,6 +3733,8 @@ def finalise_block(ha: HAClient, block_data: dict | None = None, interpolated: b
                     # re-applies it when the DCC kWh re-materialises.
                     _apply_iog_split(result, start, "", result.get("kwh"),
                                      result.get("rate") or _base)
+                # BL-27: persist the priced segments for the main import block.
+                _persist_block_segments(start, meter_name, result)
 
             # NOTE: sub-meter (device) import is NOT priced here. Devices always
             # follow the main meter's effective import rate, applied uniformly in
@@ -6653,47 +6701,6 @@ def _maybe_repair_stale_exc() -> None:
             logger.info("stale exc repair: none found — all ex-VAT rates consistent")
     except Exception as e:
         logger.warning("_maybe_repair_stale_exc: %s", e)
-
-
-_STALE_SPLIT_REPAIR_MARKER = "stale_iog_split_repair_state"   # store_meta key
-_STALE_SPLIT_REPAIR_SCOPE = 1
-
-
-def _maybe_repair_stale_iog_split() -> None:
-    """Run the one-off stale-EV-split repair (block_store.repair_stale_iog_split) once per
-    install, on an UNCAPPED IOG account. A reprice (e.g. reconcile reverting a negligible
-    smart-charge slot off-peak→peak) rewrote imp_rate/imp_cost but not the EV-split columns,
-    leaving imp_rate_ev on the old band; the home remainder then derives a phantom rate
-    above the tariff peak in the billing summary. On uncapped the EV shares the block's
-    rate, so re-deriving imp_rate_ev := imp_rate fixes it. **Gated to uncapped** — on a
-    capped tariff imp_rate_ev legitimately differs, so we must not touch it (the segment
-    refactor is the proper fix there). No-op once done, on a capped account, or during a
-    delete."""
-    try:
-        if _store is None or delete_in_progress():
-            return
-        _capped = ("ev_device_off_peak" in _kraken_rate_schedules
-                   and "ev_device_peak" in _kraken_rate_schedules)
-        if _capped:
-            return   # capped: imp_rate_ev legitimately differs — leave for the segment work
-        _m = _store.get_meta(_STALE_SPLIT_REPAIR_MARKER, {}) or {}
-        if _m.get("done") and int(_m.get("scope") or 1) >= _STALE_SPLIT_REPAIR_SCOPE:
-            return   # already complete at the current scope — silent
-        res = _store.repair_stale_iog_split()
-        from datetime import datetime as _dt, timezone as _tz
-        _store.set_meta(_STALE_SPLIT_REPAIR_MARKER,
-                        {"done": True, "scope": _STALE_SPLIT_REPAIR_SCOPE,
-                         "repaired": res["repaired"], "examined": res["examined"],
-                         "completed_at": _dt.now(_tz.utc).replace(tzinfo=None).isoformat()})
-        if res["repaired"]:
-            logger.info("stale split repair: re-derived the EV/house split on %d block(s) "
-                        "whose EV rate had drifted from the block rate (stale after a "
-                        "reprice)", res["repaired"])
-        else:
-            logger.info("stale split repair: none found — EV split consistent with the "
-                        "block rate")
-    except Exception as e:
-        logger.warning("_maybe_repair_stale_iog_split: %s", e)
 
 
 def _billed_rate(rate_segs, start, off_peak, meas_cost, kwh,
@@ -9724,13 +9731,33 @@ async def reconcile_dispatch_overlay() -> dict:
                 "WHERE block_start = ? AND rate_corrected = 0 AND meter_id IN "
                 "(SELECT meter_id FROM meters WHERE is_sub_meter = 1)",
                 (new_rate, new_rate, _exc_rate, _exc_rate, _exc_src, bs))
-            if not _capped:
-                store._conn.execute(
-                    "UPDATE blocks SET imp_rate_ev = ?, "
-                    "imp_cost_ev = ROUND(COALESCE(imp_kwh_ev, 0) * ?, 6) "
-                    "WHERE block_start = ? AND meter_id = 'electricity_main' "
-                    "AND imp_kwh_ev IS NOT NULL",
-                    (new_rate, new_rate, bs))
+        # BL-27: the bill split / Usage Stats / chart all price from block_segments now, so
+        # the reconcile REWRITES THE SEGMENTS as the source of truth — the old dedicated
+        # re-stamp of the imp_rate_ev/imp_cost_ev columns is retired (nothing reads them but
+        # the one-time backfill). An uncapped revert/restore puts the whole block on the new
+        # rate, so EV and house share it; build those bands directly at new_rate. Runs AFTER
+        # the column txn commits (set_block_segments opens its own). Capped left to the seam.
+        try:
+            import pricing_segments as _ps_rc
+            _mrow = store._conn.execute(
+                "SELECT imp_kwh, imp_kwh_ev, imp_ev_band, imp_home_band FROM blocks "
+                "WHERE block_start = ? AND meter_id = 'electricity_main'", (bs,)).fetchone()
+            if _mrow is not None and (_mrow["imp_kwh"] or 0) > 0 and not _capped:
+                _evk = _mrow["imp_kwh_ev"]
+                _segs_rc = []
+                if _evk is not None and float(_evk) > 1e-9:
+                    _segs_rc.append(_ps_rc.Segment(round(float(_evk), 6), new_rate,
+                                    _exc_rate, _mrow["imp_ev_band"] or "standard", "ev"))
+                    _hk = float(_mrow["imp_kwh"]) - float(_evk)
+                    if _hk > 1e-9:
+                        _segs_rc.append(_ps_rc.Segment(round(_hk, 6), new_rate, _exc_rate,
+                                        _mrow["imp_home_band"] or "standard", "house"))
+                else:
+                    _segs_rc.append(_ps_rc.Segment(round(float(_mrow["imp_kwh"]), 6), new_rate,
+                                    _exc_rate, _mrow["imp_home_band"] or "standard", "house"))
+                store.set_block_segments(bs, "electricity_main", _segs_rc)
+        except Exception as _rc_e:
+            logger.warning("reconcile: segment resync failed for %s: %s", bs, _rc_e)
         changed = True
         if target == "off_peak":
             n_restore += 1
@@ -10890,14 +10917,6 @@ async def _engine_startup_impl(ha: HAClient):
         _maybe_repair_stale_exc()
     except Exception as _sr_e:
         logger.warning("engine_startup: stale exc repair failed: %s", _sr_e)
-
-    # One-off stale-EV-split repair (uncapped IOG) — fixes blocks whose EV/house split
-    # drifted from the block rate after a reprice, which otherwise shows a phantom
-    # home rate above the tariff peak in the billing summary.
-    try:
-        _maybe_repair_stale_iog_split()
-    except Exception as _ss_e:
-        logger.warning("engine_startup: stale split repair failed: %s", _ss_e)
 
     # ── One-time region-timeline reconciliation (historical-carbon foundation) ──
     # With the API just discovered, stamp the DNO region (OUTWARD CODE ONLY) onto

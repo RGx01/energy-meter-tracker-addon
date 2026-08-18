@@ -230,6 +230,28 @@ def price_slot(block_start: str, block_end: str, chosen_kwh: float, ev_kwh: floa
                         in_off_peak_window=in_off_peak_window,
                         is_dispatch=has_ev, is_boost=is_boost,
                         boundary_utc=boundary_utc)
+    # BL-27: the slot's band SEGMENTS are the single source of truth — a boundary slot
+    # carries its true four bands (EV off/peak, house off/day), and the imp_* columns below
+    # are PROJECTIONS of them (one decomposition, one rounding). This is sub-penny vs the
+    # old independent arithmetic (≤3e-6, settlement-jitter scale); the bill (2dp) is
+    # unchanged. exc is left off the segments here; the persist seam applies the exc ratio.
+    segs = _slot_segments(cls, ev_kwh=ev_kwh, house_kwh=house_kwh,
+                          house_offpeak_rate=house_offpeak_rate,
+                          house_day_rate=house_day_rate,
+                          ev_offpeak_rate=ev_offpeak_rate,
+                          ev_peak_rate=ev_peak_rate) if has_ev else None
+    if segs:
+        _kwh = ev_kwh + house_kwh
+        _tot = round(sum(k * r for (k, r, b, a) in segs), 6)
+        _evc = round(sum(k * r for (k, r, b, a) in segs if a == "ev"), 6)
+        return {"imp_cost": _tot,
+                "imp_rate": round(_tot / _kwh, 6) if _kwh > 1e-12 else house_day_rate,
+                "imp_kwh_ev": round(ev_kwh, 6),
+                "imp_cost_ev": _evc,
+                "imp_rate_ev": round(_evc / ev_kwh, 6) if ev_kwh > 1e-12 else None,
+                "segments": segs,
+                "classification": cls}
+    # House-only slot (no EV): a single house band — price_import_split is exact here.
     priced = price_import_split(cls, ev_kwh=ev_kwh, house_kwh=house_kwh,
                                 house_offpeak_rate=house_offpeak_rate,
                                 house_day_rate=house_day_rate,
@@ -237,10 +259,39 @@ def price_slot(block_start: str, block_end: str, chosen_kwh: float, ev_kwh: floa
                                 ev_peak_rate=ev_peak_rate)
     return {"imp_cost": priced["total_cost"],
             "imp_rate": priced["effective_rate"],
-            "imp_kwh_ev": round(ev_kwh, 6) if has_ev else None,
-            "imp_cost_ev": priced["ev_cost"] if has_ev else None,
-            "imp_rate_ev": (round(priced["ev_cost"] / ev_kwh, 6) if has_ev else None),
+            "imp_kwh_ev": None,
+            "imp_cost_ev": None,
+            "imp_rate_ev": None,
+            "segments": None,
             "classification": cls}
+
+
+def _slot_segments(classification: dict, *, ev_kwh: float, house_kwh: float,
+                   house_offpeak_rate: float, house_day_rate: float,
+                   ev_offpeak_rate: Optional[float] = None,
+                   ev_peak_rate: Optional[float] = None) -> list:
+    """Decompose a priced slot into its band segments as (kwh, inc_rate, band,
+    attribution) tuples — the same split `price_import_split` costs, but kept per-band
+    so a boundary slot yields all four. Pure; mirrors `pricing_segments.import_segments`
+    (kept inline so `iog_cap` stays dependency-free). Zero-kWh bands are dropped."""
+    evf = float(classification.get("ev_offpeak_frac", 0.0))
+    hf = float(classification.get("house_offpeak_frac", 0.0))
+    out: list = []
+    if ev_kwh > 1e-9 and ev_offpeak_rate is not None and ev_peak_rate is not None:
+        k_off = ev_kwh * evf
+        k_pk = ev_kwh - k_off
+        if k_off > 1e-9:
+            out.append((round(k_off, 6), ev_offpeak_rate, "off_peak", "ev"))
+        if k_pk > 1e-9:
+            out.append((round(k_pk, 6), ev_peak_rate, "peak", "ev"))
+    if house_kwh > 1e-9:
+        k_off = house_kwh * hf
+        k_day = house_kwh - k_off
+        if k_off > 1e-9:
+            out.append((round(k_off, 6), house_offpeak_rate, "off_peak", "house"))
+        if k_day > 1e-9:
+            out.append((round(k_day, 6), house_day_rate, "day", "house"))
+    return out
 
 
 def compute_iog_split(block_start: str, block_end: str, *, chosen_kwh: float,

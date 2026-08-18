@@ -213,3 +213,46 @@ def attribute_devices(segments: List[Segment], devices) -> dict:
 
     remainder = _row(grid_k - claimed_k, grid_c - claimed_c)
     return {"devices": out, "ev_dispatch": ev_dispatch, "remainder": remainder}
+
+
+def price_devices_hybrid(segments: List[Segment], devices) -> dict:
+    """Price PHYSICAL sub-devices by valuing each device's METERED grid kWh at the block's
+    band rate for its attribution — the model for accounts that meter a device directly.
+
+    Contrast with `attribute_devices`, which prices an EV device from the EV *dispatch*
+    segment cost: on an account with a real EV meter the metered draw is the physical truth
+    (a car also grid-charges outside smart-dispatch windows, at the house/day rate), so we
+    keep the device's own kWh and value it at the correct rate:
+
+      * a **single-rate** (uncapped-equivalent) block → every band rate equals the block's
+        blended rate, so a device costs `metered × block_rate` — BYTE-IDENTICAL to its
+        stored `imp_cost` column, so uncapped accounts are unchanged (no dispatch-maturity
+        divergence, no leakage into house);
+      * a **multi-rate** (capped / boundary) block → an EV device's metered kWh is valued at
+        the EV band rate (off-peak within cap, peak beyond), a house device at the house band
+        rate — the 4-rate fix the parent blended rate got wrong.
+
+    `devices` = iterable of {"meter_id", "attribution" ('ev'|else house), "grid_kwh"}.
+    The house **remainder** is the plug on both axes, so devices + remainder == the grid
+    total exactly (the reconciliation invariant). Returns
+    {"devices": {meter_id: {kwh,cost,rate}}, "remainder": {kwh,cost,rate}}.
+    """
+    grid_k = total_kwh(segments)
+    grid_c = total_cost(segments)
+    blended = blended_rate(segments)
+    single = len({round(s.inc_rate, 6) for s in segments}) <= 1
+    ev_rate = blended if single else (attribution_rate(segments, "ev") or blended)
+    house_rate = blended if single else (attribution_rate(segments, "house") or blended)
+
+    out: dict = {}
+    claimed_k = claimed_c = 0.0
+    for d in devices:
+        k = d.get("grid_kwh", 0.0)
+        r = ev_rate if d.get("attribution") == "ev" else house_rate
+        c = round(k * r, 6)
+        out[d["meter_id"]] = _row(k, c)
+        claimed_k += k
+        claimed_c += c
+
+    remainder = _row(grid_k - claimed_k, grid_c - claimed_c)
+    return {"devices": out, "remainder": remainder}

@@ -6051,6 +6051,12 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
     # Sub-meter accumulators
     sub_totals: dict = {}
 
+    # BL-27: per-block device grid draw, so a post-pass can re-price each physical
+    # device from the main block's priced SEGMENTS (EV charger on the EV-attributed
+    # segment cost, house devices at the house-band rate) instead of the parent
+    # blended rate. block_start → [(meter_id, meter_type, grid_kwh)].
+    _dev_by_block: dict = defaultdict(list)
+
     for row in rows:
         mid     = row["meter_id"]
         bs      = row["block_start"]
@@ -6081,6 +6087,8 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
             # battery hardest). Mirrors the remainder handling below (`is not None`).
             _grid = row["imp_kwh_grid"]
             sub_grid_kwh = float(_grid) if _grid is not None else imp
+            _dev_by_block[bs].append(
+                (mid, (row["meter_type"] or "").lower(), sub_grid_kwh))
             sub_totals[mid]["imp_kwh"]  += sub_grid_kwh
             sub_totals[mid]["imp_cost"] += imp_cost
             sub_totals[mid]["exp_kwh"]  += exp
@@ -6141,6 +6149,64 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
         except Exception:
             pass
 
+    # ── BL-27: re-price physical devices from the block SEGMENTS ─────────────────
+    # When every main import block in the range carries priced segments (i.e. the
+    # account is fully backfilled), the per-device headline kWh/cost and the house
+    # remainder are recomputed with `price_devices_hybrid`: each device's METERED grid
+    # kWh is valued at the block's band rate for its attribution. On a single-rate
+    # (uncapped-equivalent) block every band rate equals the block rate, so a device
+    # costs metered × block_rate — byte-identical to its stored cost column, with no
+    # dispatch-maturity divergence and nothing leaking into house. On a multi-rate
+    # (capped / boundary) block an EV device is valued at the EV band rate and a house
+    # device at the house band rate — the 4-rate fix the parent blended rate got wrong.
+    # Gated + fallback: any block missing a segment keeps the column figures.
+    try:
+        _missing = store._conn.execute(
+            "SELECT COUNT(*) n FROM blocks b "
+            "JOIN meters m ON m.meter_id=b.meter_id AND m.config_period_id=b.config_period_id "
+            "WHERE b.block_start>=? AND b.block_start<? AND COALESCE(m.is_sub_meter,0)=0 "
+            "AND b.imp_kwh>0 AND NOT EXISTS (SELECT 1 FROM block_segments s "
+            "WHERE s.block_start=b.block_start AND s.meter_id=b.meter_id AND s.channel='import')",
+            (utc_start, utc_end)).fetchone()["n"]
+        _seg_rows = [] if _missing else store._conn.execute(
+            "SELECT block_start, kwh, inc_rate, exc_rate, band, attribution "
+            "FROM block_segments WHERE channel='import' AND block_start>=? AND block_start<? "
+            "ORDER BY block_start, seq", (utc_start, utc_end)).fetchall()
+    except Exception:
+        _seg_rows = []
+    if _seg_rows:
+        import pricing_segments as _ps
+        _segs_by_block: dict = defaultdict(list)
+        for _r in _seg_rows:
+            _segs_by_block[_r["block_start"]].append(_ps.Segment(
+                _r["kwh"], _r["inc_rate"], _r["exc_rate"], _r["band"], _r["attribution"]))
+
+        def _is_ev_dev(mid, mt):
+            return mt in ("ev", "ev_charger") or any(
+                k in (mid or "").lower() for k in ("ev", "charger"))
+
+        _seg_dev: dict = {}
+        _seg_house_k = _seg_house_c = 0.0
+        for _bs, _segs in _segs_by_block.items():
+            _devs = [{"meter_id": _m,
+                      "attribution": "ev" if _is_ev_dev(_m, _mt) else "house",
+                      "grid_kwh": _gk}
+                     for (_m, _mt, _gk) in _dev_by_block.get(_bs, [])]
+            _res = _ps.price_devices_hybrid(_segs, _devs)
+            for _m, _v in _res["devices"].items():
+                _d = _seg_dev.setdefault(_m, {"kwh": 0.0, "cost": 0.0})
+                _d["kwh"] += _v["kwh"]; _d["cost"] += _v["cost"]
+            _seg_house_k += _res["remainder"]["kwh"]
+            _seg_house_c += _res["remainder"]["cost"]
+        # Overwrite the headline device kWh/cost and the house remainder (rate-tier
+        # breakdowns are left on the column basis for now — byte-identical uncapped).
+        for _m, _v in _seg_dev.items():
+            if _m in sub_totals:
+                sub_totals[_m]["imp_kwh"]  = _v["kwh"]
+                sub_totals[_m]["imp_cost"] = _v["cost"]
+        house_imp_kwh  = _seg_house_k
+        house_imp_cost = _seg_house_c
+
     # ── Synthetic dispatch-derived EV device (display-only; BL-22) ───────────────
     # For an account with NO EV sub-meter AND no other sub-meters (a pure-API /
     # no-HA-sensor setup), reconstruct the EV/house split from the completed-dispatch
@@ -6169,15 +6235,34 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
                     float(row["imp_rate"] or 0),
                     (float(row["imp_kwh_ev"]) if row["imp_kwh_ev"] is not None else None),
                     float(row["imp_cost_ev"] or 0), float(row["imp_rate_ev"] or 0))
+            # BL-27: source the EV split from the EV-attributed SEGMENTS (single source of
+            # truth); the stored imp_*_ev columns are a dead fallback for any un-backfilled
+            # block, so the reconcile re-stamp of those columns can retire. Byte-identical:
+            # imp_cost_ev is just the EV segments' summed cost.
+            _seg_ev = {}
+            try:
+                for _sg in store._conn.execute(
+                        "SELECT block_start, SUM(kwh) k, SUM(kwh * inc_rate) c "
+                        "FROM block_segments WHERE channel='import' AND attribution='ev' "
+                        "AND block_start >= ? AND block_start < ? GROUP BY block_start",
+                        (utc_start, utc_end)):
+                    _seg_ev[_sg["block_start"]] = (float(_sg["k"] or 0.0),
+                                                   round(float(_sg["c"] or 0.0), 6))
+            except Exception:
+                _seg_ev = {}
             _ev_kwh = _ev_cost = 0.0
             _ev_tiers = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "blocks": 0})
             for _slot, _e in _ev_by_slot.items():
                 _mk, _mc, _mr, _sk, _sc, _sr = _main_by_slot.get(
                     _slot, (0.0, 0.0, 0.0, None, 0.0, 0.0))
-                # BL-9: prefer the STORED split (matches the bill on a capped account;
-                # EV tiered at its own rate_ev), else the pro-rata carve at the block
-                # rate. Identical on uncapped, so byte-identical there.
-                if _sk is not None and _sk > 1e-9:
+                _gk, _gc = _seg_ev.get(_slot, (None, None))
+                # Prefer segments; fall back to the stored split columns; then the dispatch
+                # pro-rata carve. EV is tiered at its own (segment/stored) rate.
+                if _gk is not None and _gk > 1e-9:
+                    _ek = min(_gk, _mk) if _mk > 0 else 0.0
+                    _ec = _gc * (_ek / _gk) if _gk > 0 else 0.0
+                    _tier_rate = (_gc / _gk if _gk > 0 else 0.0) or _mr
+                elif _sk is not None and _sk > 1e-9:
                     _ek = min(_sk, _mk) if _mk > 0 else 0.0
                     _ec = _sc * (_ek / _sk) if _sk > 0 else 0.0
                     _tier_rate = _sr or _mr

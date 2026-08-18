@@ -105,6 +105,29 @@ class TestAggregateInsightsRateTiers(unittest.TestCase):
         self.assertTrue(d["rate_tiers"][0]["collapsed"])
         self.assertEqual(d["rate_tiers"][0]["n_rates"], 7)
 
+    def test_synthetic_ev_device_sources_from_segments(self):
+        # BL-27: the sensor-less synthetic EV device now prices from the EV-attributed
+        # SEGMENTS, not the imp_*_ev columns. Seed a deliberately WRONG imp_cost_ev column
+        # and correct segments — the device must reflect the segments (0.60, not 99).
+        import pricing_segments as ps
+        st = self._store()
+        st._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+            "imp_kwh, imp_rate, imp_cost, imp_kwh_ev, imp_cost_ev, imp_rate_ev, source) "
+            "VALUES (?,?, 'electricity_main', ?, 3.0, 0.31, 0.923092, 2.0, 99.0, 99.0, "
+            "'imported_api')",
+            ("2025-01-01T02:00:00", "2025-01-01T02:00:00", self._cp))
+        st.set_block_segments("2025-01-01T02:00:00", "electricity_main", [
+            ps.Segment(2.0, 0.30, None, "peak", "ev"),
+            ps.Segment(1.0, 0.323092, None, "day", "house")])
+        st._conn.execute("INSERT INTO dispatch_history (slot_start, kind, energy_kwh, "
+                         "first_seen, last_seen) VALUES ('2025-01-01T02:00:00', "
+                         "'completed', 2.0, '2025-01-01T02:00:00', '2025-01-01T02:00:00')")
+        st._conn.commit()
+        ev = self._agg(st)["sub_meters"]["ev_dispatch"]
+        self.assertAlmostEqual(ev["imp_kwh"], 2.0, places=5)
+        self.assertAlmostEqual(ev["imp_cost"], 0.60, places=5)   # segments, NOT the 99 column
+
 
 if __name__ == "__main__":
     unittest.main()

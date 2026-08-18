@@ -270,6 +270,58 @@ class TestPriceSlot(unittest.TestCase):
         self.assertAlmostEqual(r["imp_rate"], OP)
         self.assertAlmostEqual(r["imp_cost_ev"], round(2.0 * OP, 6))
 
+    # ── BL-27: the seam emits full-fidelity segments that reconcile to the columns ──
+
+    def _reconciles(self, r):
+        segs = r["segments"]
+        self.assertAlmostEqual(sum(k * rate for (k, rate, b, a) in segs),
+                               r["imp_cost"], places=6)
+        self.assertAlmostEqual(sum(k * rate for (k, rate, b, a) in segs if a == "ev"),
+                               r["imp_cost_ev"], places=6)
+
+    def test_boundary_slot_emits_four_bands(self):
+        # Cap boundary mid-slot, out of window → EV and house both straddle → four bands,
+        # each at a REAL tariff rate (not the blended 0.15 the imp_rate_ev column collapses to).
+        r = cap.price_slot(*self.DAY, 3.0, 2.0, in_off_peak_window=False, is_boost=False,
+                           boundary_utc="2026-01-01T13:15:00", **self.CAP_RATES)
+        self._reconciles(r)
+        bands = {(a, b) for (k, rate, b, a) in r["segments"]}
+        self.assertEqual(bands, {("ev", "off_peak"), ("ev", "peak"),
+                                 ("house", "off_peak"), ("house", "day")})
+        self.assertEqual(len(r["segments"]), 4)
+
+    def test_clean_over_cap_slot_two_bands(self):
+        # Over-cap, out of window: EV all peak, house all day → two bands, no blend.
+        r = cap.price_slot(*self.DAY, 3.0, 2.0, in_off_peak_window=False, is_boost=False,
+                           boundary_utc="2026-01-01T01:00:00", **self.CAP_RATES)
+        self._reconciles(r)
+        self.assertEqual({(a, b) for (k, rate, b, a) in r["segments"]},
+                         {("ev", "peak"), ("house", "day")})
+
+    def test_uncapped_segments_reconcile_at_single_rate(self):
+        OP = 0.05
+        r = cap.price_slot(*self.DAY, 3.0, 2.0, in_off_peak_window=False, is_boost=False,
+                           boundary_utc=None, house_offpeak_rate=OP, house_day_rate=OP,
+                           ev_offpeak_rate=OP, ev_peak_rate=OP)
+        self._reconciles(r)
+        self.assertTrue(all(rate == OP for (k, rate, b, a) in r["segments"]))
+
+    def test_no_ev_slot_has_no_segments(self):
+        r = cap.price_slot(*self.DAY, 1.5, 0.0, in_off_peak_window=False, is_boost=False,
+                           boundary_utc=None, house_offpeak_rate=0.07, house_day_rate=0.30)
+        self.assertIsNone(r["segments"])
+
+    def test_columns_are_exact_segment_projections(self):
+        # BL-27: with messy kWh the columns are now bit-identical projections of the
+        # segments (single source of truth) — Σ segment cost EQUALS imp_cost exactly, and
+        # the EV bands EQUAL imp_cost_ev, not merely to a tolerance.
+        r = cap.price_slot(*self.DAY, 2.837, 1.913, in_off_peak_window=False, is_boost=False,
+                           boundary_utc="2026-01-01T13:15:00", **self.CAP_RATES)
+        self.assertEqual(round(sum(k * rate for (k, rate, b, a) in r["segments"]), 6),
+                         r["imp_cost"])
+        self.assertEqual(round(sum(k * rate for (k, rate, b, a) in r["segments"]
+                                   if a == "ev"), 6), r["imp_cost_ev"])
+
 
 class TestComputeIogSplit(unittest.TestCase):
     DAY = ("2026-01-01T13:00:00", "2026-01-01T13:30:00")

@@ -192,5 +192,57 @@ class TestDeviceAttribution(unittest.TestCase):
         self.assertAlmostEqual(res["remainder"]["kwh"], 3.0)
 
 
+class TestPriceDevicesHybrid(unittest.TestCase):
+    """The hybrid physical-device model: a device is shown at its METERED kWh and valued
+    at the block's band rate for its attribution. Single-rate blocks reproduce metered ×
+    block_rate exactly (byte-identical uncapped); capped blocks apply the band rates. Every
+    case asserts devices + remainder == the grid total (the reconciliation invariant)."""
+
+    def _reconciles(self, segs, res):
+        tot_k = sum(v["kwh"] for v in res["devices"].values()) + res["remainder"]["kwh"]
+        tot_c = sum(v["cost"] for v in res["devices"].values()) + res["remainder"]["cost"]
+        self.assertAlmostEqual(tot_k, ps.total_kwh(segs), places=5)
+        self.assertAlmostEqual(tot_c, ps.total_cost(segs), places=5)
+
+    def test_single_rate_block_is_metered_times_block_rate(self):
+        # Uncapped: EV + house share one rate. A device costs metered × that rate — exactly
+        # what its own imp_cost column holds, so the reader is byte-identical uncapped.
+        segs = ps.import_segments(ev_kwh=2.0, house_kwh=1.0,
+                                  house_offpeak_rate=OFF, house_day_rate=OFF,
+                                  ev_offpeak_rate=OFF, ev_peak_rate=OFF)
+        res = ps.price_devices_hybrid(segs, [
+            {"meter_id": "zappi", "attribution": "ev", "grid_kwh": 2.05},
+            {"meter_id": "battery", "attribution": "house", "grid_kwh": 0.5}])
+        self._reconciles(segs, res)
+        self.assertAlmostEqual(res["devices"]["zappi"]["cost"], 2.05 * OFF, places=5)
+        self.assertAlmostEqual(res["devices"]["battery"]["cost"], 0.5 * OFF, places=5)
+
+    def test_capped_block_values_metered_at_band_rate(self):
+        # Over-cap: EV metered valued at the EV PEAK rate (not the parent blended), the
+        # battery at the house DAY rate — the 4-rate fix, on the device's own metered kWh.
+        segs = ps.import_segments(
+            ev_kwh=4.0, house_kwh=2.0, house_offpeak_rate=OFF, house_day_rate=DAY,
+            ev_offpeak_rate=EV_OFF, ev_peak_rate=PEAK,
+            ev_offpeak_frac=0.0, house_offpeak_frac=0.0)
+        res = ps.price_devices_hybrid(segs, [
+            {"meter_id": "zappi", "attribution": "ev", "grid_kwh": 4.05},   # metered ≠ dispatch
+            {"meter_id": "battery", "attribution": "house", "grid_kwh": 1.0}])
+        self._reconciles(segs, res)
+        self.assertAlmostEqual(res["devices"]["zappi"]["rate"], PEAK, places=5)
+        self.assertAlmostEqual(res["devices"]["zappi"]["cost"], 4.05 * PEAK, places=5)
+        self.assertAlmostEqual(res["devices"]["battery"]["rate"], DAY, places=5)
+
+    def test_non_dispatch_ev_on_house_only_block_bills_at_house_rate(self):
+        # A house-only (no dispatch) block: an EV device that grid-charged here drew at the
+        # house/day rate — so it is valued there, never leaking into house.
+        segs = ps.import_segments(ev_kwh=0.0, house_kwh=2.0,
+                                  house_offpeak_rate=OFF, house_day_rate=DAY,
+                                  house_offpeak_frac=0.0)
+        res = ps.price_devices_hybrid(segs, [
+            {"meter_id": "zappi", "attribution": "ev", "grid_kwh": 1.0}])
+        self._reconciles(segs, res)
+        self.assertAlmostEqual(res["devices"]["zappi"]["rate"], DAY, places=5)
+
+
 if __name__ == "__main__":
     unittest.main()

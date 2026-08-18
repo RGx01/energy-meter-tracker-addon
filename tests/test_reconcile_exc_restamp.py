@@ -100,9 +100,12 @@ class TestReconcileRestampsExc(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(r["imp_rate_exc"])
         self.assertIsNone(r["imp_cost_exc"])
 
-    async def test_revert_restamps_ev_split_uncapped(self):
-        # BL-9: the revert must also re-stamp the EV/house split — otherwise imp_rate_ev
-        # keeps the off-peak band on a block reverted to peak (the Highgrove phantom row).
+    async def test_revert_puts_ev_split_on_new_rate_via_segments(self):
+        # BL-27: the revert no longer re-stamps the imp_*_ev COLUMNS (retired); it rewrites
+        # the SEGMENTS to the new band. The EV segment carries the reverted peak rate, so
+        # every segment-reading surface follows the block — no phantom off-peak row — and
+        # the segments still reconcile to imp_cost (the bill total, which IS re-stamped).
+        import pricing_segments as ps
         st = BlockStore(":memory:")
         self._seed_stale(st)
         st._conn.execute(
@@ -110,10 +113,15 @@ class TestReconcileRestampsExc(unittest.IsolatedAsyncioTestCase):
             "imp_rate_ev=0.05493 WHERE block_start=?", (self.SLOT,)); st._conn.commit()
         res = await self._run(st, with_exc=True)         # uncapped (no ev_device scheds)
         self.assertEqual(res["reverted"], 1)
-        r = st._conn.execute("SELECT imp_rate, imp_rate_ev, imp_cost_ev FROM blocks "
-                             "WHERE block_start=?", (self.SLOT,)).fetchone()
-        self.assertAlmostEqual(r["imp_rate_ev"], 0.323092, places=5)   # follows the block
-        self.assertAlmostEqual(r["imp_cost_ev"], round(0.23 * 0.323092, 6), places=6)
+        segs = [ps.Segment(**x) for x in
+                st.get_block_segments(self.SLOT, "electricity_main")]
+        _ev = [x for x in segs if x.attribution == "ev"]
+        self.assertTrue(_ev and abs(_ev[0].inc_rate - 0.323092) < 1e-5)   # EV on the new rate
+        self.assertAlmostEqual(ps.attribution_cost(segs, "ev"),
+                               round(0.23 * 0.323092, 6), places=6)
+        row = st._conn.execute("SELECT imp_cost FROM blocks WHERE block_start=?",
+                               (self.SLOT,)).fetchone()
+        self.assertAlmostEqual(ps.total_cost(segs), row["imp_cost"], places=6)  # bill total
 
     async def test_revert_leaves_split_on_capped(self):
         # On a capped tariff imp_rate_ev legitimately differs — must NOT be touched.

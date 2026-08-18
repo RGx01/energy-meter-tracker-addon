@@ -751,32 +751,55 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
                             # figure when the block settles and stamps cost_exc.
                             _vat = store.vat_rate_at(block.get("start")) if store is not None else 0.05
                             _ratio = 1.0 / (1.0 + _vat)
-                        _evk = float(channel.get("kwh_ev") or 0.0)
-                        _evc = float(channel.get("cost_ev") or 0.0)
-                        if _evk > 1e-9:
-                            _evx = _evc * _ratio
-                            if channel.get("ev_band") == "mixed":
-                                ev_transition["kwh"]      += _evk
-                                ev_transition["cost"]     += _evc
-                                ev_transition["cost_exc"] += _evx
-                            else:                          # clean band → exact rate row
-                                _evr = round(float(channel.get("rate_ev") or 0.0), 4)
-                                ev_by_rate[_evr]["kwh"]      += _evk
-                                ev_by_rate[_evr]["cost"]     += _evc
-                                ev_by_rate[_evr]["cost_exc"] += _evx
-                        _hk = kwh - _evk
-                        _hc = cost - _evc
-                        if _hk > 1e-9:
-                            _hx = _hc * _ratio
-                            if channel.get("home_band") == "mixed":
-                                home_transition["kwh"]      += _hk
-                                home_transition["cost"]     += _hc
-                                home_transition["cost_exc"] += _hx
-                            else:
-                                _hr = round(_hc / _hk, 4)
-                                home_by_rate[_hr]["kwh"]      += _hk
-                                home_by_rate[_hr]["cost"]     += _hc
-                                home_by_rate[_hr]["cost_exc"] += _hx
+                        # BL-27: price the split from the block's priced SEGMENTS when they
+                        # travel with it (block_store attaches them to the import channel).
+                        # Each segment already carries its own inc/exc rate + attribution, so
+                        # a boundary block simply presents its constituent rate rows — the
+                        # mixed-band "transition" special-case is retired for segment blocks.
+                        # Legacy blocks (pre-backfill / no segments) keep the column path.
+                        _segs = channel.get("segments")
+                        if _segs:
+                            for _s in _segs:
+                                _sk = float(_s.get("kwh") or 0.0)
+                                if _sk <= 1e-9:
+                                    continue
+                                _sr = round(float(_s.get("inc_rate") or 0.0), 4)
+                                _sc = _sk * float(_s.get("inc_rate") or 0.0)
+                                _sxr = _s.get("exc_rate")
+                                _sx = (_sk * float(_sxr)) if _sxr is not None \
+                                    else _sc * _ratio
+                                _grp = ev_by_rate if _s.get("attribution") == "ev" \
+                                    else home_by_rate
+                                _grp[_sr]["kwh"]      += _sk
+                                _grp[_sr]["cost"]     += _sc
+                                _grp[_sr]["cost_exc"] += _sx
+                        else:
+                            _evk = float(channel.get("kwh_ev") or 0.0)
+                            _evc = float(channel.get("cost_ev") or 0.0)
+                            if _evk > 1e-9:
+                                _evx = _evc * _ratio
+                                if channel.get("ev_band") == "mixed":
+                                    ev_transition["kwh"]      += _evk
+                                    ev_transition["cost"]     += _evc
+                                    ev_transition["cost_exc"] += _evx
+                                else:                          # clean band → exact rate row
+                                    _evr = round(float(channel.get("rate_ev") or 0.0), 4)
+                                    ev_by_rate[_evr]["kwh"]      += _evk
+                                    ev_by_rate[_evr]["cost"]     += _evc
+                                    ev_by_rate[_evr]["cost_exc"] += _evx
+                            _hk = kwh - _evk
+                            _hc = cost - _evc
+                            if _hk > 1e-9:
+                                _hx = _hc * _ratio
+                                if channel.get("home_band") == "mixed":
+                                    home_transition["kwh"]      += _hk
+                                    home_transition["cost"]     += _hc
+                                    home_transition["cost_exc"] += _hx
+                                else:
+                                    _hr = round(_hc / _hk, 4)
+                                    home_by_rate[_hr]["kwh"]      += _hk
+                                    home_by_rate[_hr]["cost"]     += _hc
+                                    home_by_rate[_hr]["cost_exc"] += _hx
                         # Use kwh_remainder directly when available. With no
                         # sub-meters this key is absent (NULL in DB, omitted by
                         # reconstruction), so the raw kwh is kept unchanged —
@@ -1395,8 +1418,21 @@ def _dispatch_ev_slot_map(store, blocks, cfg):
         # only where a block has no stored split — un-backfilled / older history. On an
         # uncapped account the two are identical (EV and house share the rate), so this
         # is byte-identical there.
+        # BL-27: prefer the EV-attributed SEGMENTS (the single source of truth) — imp_cost_ev
+        # is just their summed cost, so this is byte-identical to the stored split while
+        # letting the reconcile re-stamp of the EV columns retire. Fall back to the stored
+        # columns, then the dispatch pro-rata carve, for any block without segments.
+        _segs = imp.get("segments")
+        _seg_evk = (sum(float(x.get("kwh") or 0.0) for x in _segs
+                        if x.get("attribution") == "ev") if _segs else 0.0)
         _sk = imp.get("kwh_ev")
-        if _sk is not None and float(_sk) > 1e-9:
+        if _seg_evk > 1e-9:
+            _seg_evc = sum(float(x.get("kwh") or 0.0) * float(x.get("inc_rate") or 0.0)
+                           for x in _segs if x.get("attribution") == "ev")
+            ek = min(_seg_evk, mk)
+            ec = _seg_evc * (ek / _seg_evk) if _seg_evk > 0 else 0.0
+            rate = round(ec / ek, 4) if ek else rate
+        elif _sk is not None and float(_sk) > 1e-9:
             ek = min(float(_sk), mk)
             _sc = float(imp.get("cost_ev") or 0.0)
             ec = _sc * (ek / float(_sk)) if float(_sk) > 0 else 0.0
@@ -1851,7 +1887,17 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                         # on the validated synthetic split (grid total untouched); only
                         # the rate the EV line is plotted at, and its summary rate bucket,
                         # change. Absent (non-IOG / no split) → falls back to main_rate.
-                        _evr = _f(main_import.get("rate_ev")) or main_rate
+                        # BL-27: the EV rate LINE follows the EV-attributed SEGMENT rate
+                        # (full precision, == the old imp_rate_ev); the column is a dead
+                        # fallback for any un-backfilled block, so the re-stamp can retire.
+                        _segsr = main_import.get("segments")
+                        _segr_k = (sum(_f(x.get("kwh")) for x in _segsr
+                                       if x.get("attribution") == "ev") if _segsr else 0.0)
+                        if _segr_k > 1e-9:
+                            _evr = (sum(_f(x.get("kwh")) * _f(x.get("inc_rate")) for x in _segsr
+                                        if x.get("attribution") == "ev") / _segr_k) or main_rate
+                        else:
+                            _evr = _f(main_import.get("rate_ev")) or main_rate
                         _r4e = round(_evr, 4)
                         meter_kwh["electricity_main"][hh]  = _mk - _ek
                         meter_cost["electricity_main"][hh] = _mc - _ec
