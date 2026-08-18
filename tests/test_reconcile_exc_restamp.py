@@ -100,6 +100,41 @@ class TestReconcileRestampsExc(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(r["imp_rate_exc"])
         self.assertIsNone(r["imp_cost_exc"])
 
+    async def test_revert_restamps_ev_split_uncapped(self):
+        # BL-9: the revert must also re-stamp the EV/house split — otherwise imp_rate_ev
+        # keeps the off-peak band on a block reverted to peak (the Highgrove phantom row).
+        st = BlockStore(":memory:")
+        self._seed_stale(st)
+        st._conn.execute(
+            "UPDATE blocks SET imp_kwh_ev=0.23, imp_cost_ev=ROUND(0.23*0.05493,6), "
+            "imp_rate_ev=0.05493 WHERE block_start=?", (self.SLOT,)); st._conn.commit()
+        res = await self._run(st, with_exc=True)         # uncapped (no ev_device scheds)
+        self.assertEqual(res["reverted"], 1)
+        r = st._conn.execute("SELECT imp_rate, imp_rate_ev, imp_cost_ev FROM blocks "
+                             "WHERE block_start=?", (self.SLOT,)).fetchone()
+        self.assertAlmostEqual(r["imp_rate_ev"], 0.323092, places=5)   # follows the block
+        self.assertAlmostEqual(r["imp_cost_ev"], round(0.23 * 0.323092, 6), places=6)
+
+    async def test_revert_leaves_split_on_capped(self):
+        # On a capped tariff imp_rate_ev legitimately differs — must NOT be touched.
+        st = BlockStore(":memory:")
+        self._seed_stale(st)
+        st._conn.execute(
+            "UPDATE blocks SET imp_kwh_ev=0.23, imp_cost_ev=ROUND(0.23*0.05493,6), "
+            "imp_rate_ev=0.05493 WHERE block_start=?", (self.SLOT,)); st._conn.commit()
+        engine._store = st
+        engine._RECONCILE_SETTLE_HOURS = 0.0
+        engine._kraken_rate_schedules = {"import": _Sched(True),
+                                         "ev_device_off_peak": _Sched(True),
+                                         "ev_device_peak": _Sched(True)}
+        try:
+            await engine.reconcile_dispatch_overlay()
+        finally:
+            engine._store = None
+        r = st._conn.execute("SELECT imp_rate_ev FROM blocks WHERE block_start=?",
+                             (self.SLOT,)).fetchone()
+        self.assertAlmostEqual(r["imp_rate_ev"], 0.05493, places=5)   # untouched (capped)
+
 
 if __name__ == "__main__":
     unittest.main()
