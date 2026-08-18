@@ -2995,6 +2995,35 @@ class BlockStore:
         return {"examined": len(rows),
                 "repaired": (0 if dry_run else len(updates)), "dry_run": dry_run}
 
+    def repair_stale_iog_split(self, tol: float = 0.005, dry_run: bool = False) -> dict:
+        """One-off repair for a STALE IOG EV/house split on an UNCAPPED account. A reprice
+        (e.g. reconcile reverting a negligible smart-charge slot off-peak→peak) rewrote
+        imp_rate/imp_cost but NOT the split columns, so imp_rate_ev/imp_cost_ev kept the
+        OLD band. On an **uncapped** IOG tariff the EV and house share the block's rate, so
+        imp_rate_ev MUST equal imp_rate; when it doesn't, the home remainder
+        `(imp_cost − imp_cost_ev)/(imp_kwh − imp_kwh_ev)` derives a phantom rate above the
+        tariff peak.
+
+        Re-derives the split at the block's own rate: imp_rate_ev := imp_rate,
+        imp_cost_ev := imp_kwh_ev × imp_rate. Idempotent (a repaired row agrees, so it's no
+        longer selected). **Uncapped only** — on a capped tariff imp_rate_ev legitimately
+        differs from imp_rate, so the caller MUST gate this to uncapped accounts (the engine
+        runner does). Returns {examined, repaired, dry_run}."""
+        rows = self._conn.execute(
+            "SELECT block_start, meter_id, imp_rate, imp_rate_ev, imp_kwh_ev "
+            "FROM blocks WHERE imp_rate_ev IS NOT NULL AND imp_rate > 0 "
+            "AND ABS(imp_rate_ev - imp_rate) > ?", (float(tol),)).fetchall()
+        updates = [(r["imp_rate"], round((r["imp_kwh_ev"] or 0.0) * r["imp_rate"], 6),
+                    r["block_start"], r["meter_id"]) for r in rows]
+        if updates and not dry_run:
+            with self._conn:
+                for nrev, ncev, bs, mid in updates:
+                    self._conn.execute(
+                        "UPDATE blocks SET imp_rate_ev = ?, imp_cost_ev = ? "
+                        "WHERE block_start = ? AND meter_id = ?", (nrev, ncev, bs, mid))
+        return {"examined": len(rows),
+                "repaired": (0 if dry_run else len(updates)), "dry_run": dry_run}
+
     def get_vat_calendar(self) -> list:
         """Learned VAT-rate boundaries [(effective_from, rate), …] from store_meta.
         Merged with the statutory seed by vat_calendar.resolve_vat; empty until the

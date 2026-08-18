@@ -1,5 +1,11 @@
 # Changelog
  
+## [4.3.1] — 2026-08-18
+
+### Fixed
+
+- **A phantom rate above the tariff peak in the IOG house/car billing split is gone.** On an Intelligent Octopus Go tariff, when settlement reconciliation **reverted a negligible smart-charge slot** — a completed dispatch too small to count as a real charge — from off-peak back to peak, it rewrote the block's inc rate and ex-VAT figure but **not** the stored **EV/house split**. So the car slice stayed frozen at off-peak while the block was priced at peak, and the **home remainder absorbed the missing peak cost** — surfacing an *impossible* "Home" row at a rate **above the tariff peak** (an ex-VAT figure that even exceeded the inc peak rate) on the *Import — total grid* breakdown. Reconciliation now **re-derives the EV/house split** (`imp_rate_ev`/`imp_cost_ev`) alongside the rate on uncapped IOG, so it can't drift again, and a **one-off startup repair** corrects any block already showing it. *(Display attribution only — the grid total, the per-meter breakdown, and the Total Bill were always correct. Capped tariffs are intentionally left untouched here: the car's rate legitimately differs from the house's there, and the proper fix is the **priced-segment pricing model** — see `docs/design/segment_pricing_refactor_design.md` / roadmap BL-27, which retires the layered EV-split/ex-VAT columns that keep drifting out of sync.)*
+
 ## [4.3.0] — 2026-08-17
 
 *Theme: **Charge Cap**. [Still Experimental] Groundwork for Intelligent Octopus Go's new 4-rate / 6-hour-cap tariff lands under the hood — every IOG block now stores the house-vs-car split, a migrated (capped) meter is priced with the full 4-rate model, and the billing summary now itemises the house-vs-car split per rate band (with the day chart's car rate line wired to diverge the moment a cap engages). Plus a batch of fixes: CSV templates start at local midnight, synthesised bill CSVs no longer double the standing charge, the Usage Insights rate breakdown matches the Billing view, and FIT / no-export-agreement accounts no longer show a permanent "awaiting settlement" backlog. Additive and off for non-IOG tariffs; inc-VAT figures for existing tariffs are byte-identical.*

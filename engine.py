@@ -6529,6 +6529,47 @@ def _maybe_repair_stale_exc() -> None:
         logger.warning("_maybe_repair_stale_exc: %s", e)
 
 
+_STALE_SPLIT_REPAIR_MARKER = "stale_iog_split_repair_state"   # store_meta key
+_STALE_SPLIT_REPAIR_SCOPE = 1
+
+
+def _maybe_repair_stale_iog_split() -> None:
+    """Run the one-off stale-EV-split repair (block_store.repair_stale_iog_split) once per
+    install, on an UNCAPPED IOG account. A reprice (e.g. reconcile reverting a negligible
+    smart-charge slot off-peak→peak) rewrote imp_rate/imp_cost but not the EV-split columns,
+    leaving imp_rate_ev on the old band; the home remainder then derives a phantom rate
+    above the tariff peak in the billing summary. On uncapped the EV shares the block's
+    rate, so re-deriving imp_rate_ev := imp_rate fixes it. **Gated to uncapped** — on a
+    capped tariff imp_rate_ev legitimately differs, so we must not touch it (the segment
+    refactor is the proper fix there). No-op once done, on a capped account, or during a
+    delete."""
+    try:
+        if _store is None or delete_in_progress():
+            return
+        _capped = ("ev_device_off_peak" in _kraken_rate_schedules
+                   and "ev_device_peak" in _kraken_rate_schedules)
+        if _capped:
+            return   # capped: imp_rate_ev legitimately differs — leave for the segment work
+        _m = _store.get_meta(_STALE_SPLIT_REPAIR_MARKER, {}) or {}
+        if _m.get("done") and int(_m.get("scope") or 1) >= _STALE_SPLIT_REPAIR_SCOPE:
+            return   # already complete at the current scope — silent
+        res = _store.repair_stale_iog_split()
+        from datetime import datetime as _dt, timezone as _tz
+        _store.set_meta(_STALE_SPLIT_REPAIR_MARKER,
+                        {"done": True, "scope": _STALE_SPLIT_REPAIR_SCOPE,
+                         "repaired": res["repaired"], "examined": res["examined"],
+                         "completed_at": _dt.now(_tz.utc).replace(tzinfo=None).isoformat()})
+        if res["repaired"]:
+            logger.info("stale split repair: re-derived the EV/house split on %d block(s) "
+                        "whose EV rate had drifted from the block rate (stale after a "
+                        "reprice)", res["repaired"])
+        else:
+            logger.info("stale split repair: none found — EV split consistent with the "
+                        "block rate")
+    except Exception as e:
+        logger.warning("_maybe_repair_stale_iog_split: %s", e)
+
+
 def _billed_rate(rate_segs, start, off_peak, meas_cost, kwh,
                  tol: float = 0.001):
     """£/kWh for an imported slot, choosing the right source of truth by tariff type.
@@ -9528,6 +9569,14 @@ async def reconcile_dispatch_overlay() -> dict:
             if _exc_p is not None and _inc_p and abs(_inc_p) > 1e-6:
                 _exc_rate = round(new_rate * (_exc_p / _inc_p), 6)
         _exc_src = "tariff" if _exc_rate is not None else None
+        # BL-9: the same drift hits the EV/house SPLIT. On an UNCAPPED IOG tariff the EV
+        # shares the block's rate, so imp_rate_ev must follow the rewrite too — otherwise
+        # the split keeps the old band (e.g. off-peak EV on a block reverted to peak) and
+        # the home remainder derives a phantom rate above the tariff peak. Re-stamp it at
+        # the new rate. On a CAPPED tariff imp_rate_ev legitimately differs (EV peak vs
+        # house day), so we leave it — the segment-pricing refactor is the proper fix there.
+        _capped = ("ev_device_off_peak" in _kraken_rate_schedules
+                   and "ev_device_peak" in _kraken_rate_schedules)
         with store._conn:
             # A definite verdict also clears any prior ambiguous-review flag on
             # the main row (needs_review / review_reason).
@@ -9549,6 +9598,13 @@ async def reconcile_dispatch_overlay() -> dict:
                 "WHERE block_start = ? AND rate_corrected = 0 AND meter_id IN "
                 "(SELECT meter_id FROM meters WHERE is_sub_meter = 1)",
                 (new_rate, new_rate, _exc_rate, _exc_rate, _exc_src, bs))
+            if not _capped:
+                store._conn.execute(
+                    "UPDATE blocks SET imp_rate_ev = ?, "
+                    "imp_cost_ev = ROUND(COALESCE(imp_kwh_ev, 0) * ?, 6) "
+                    "WHERE block_start = ? AND meter_id = 'electricity_main' "
+                    "AND imp_kwh_ev IS NOT NULL",
+                    (new_rate, new_rate, bs))
         changed = True
         if target == "off_peak":
             n_restore += 1
@@ -10701,6 +10757,14 @@ async def _engine_startup_impl(ha: HAClient):
         _maybe_repair_stale_exc()
     except Exception as _sr_e:
         logger.warning("engine_startup: stale exc repair failed: %s", _sr_e)
+
+    # One-off stale-EV-split repair (uncapped IOG) — fixes blocks whose EV/house split
+    # drifted from the block rate after a reprice, which otherwise shows a phantom
+    # home rate above the tariff peak in the billing summary.
+    try:
+        _maybe_repair_stale_iog_split()
+    except Exception as _ss_e:
+        logger.warning("engine_startup: stale split repair failed: %s", _ss_e)
 
     # ── One-time region-timeline reconciliation (historical-carbon foundation) ──
     # With the API just discovered, stamp the DNO region (OUTWARD CODE ONLY) onto
