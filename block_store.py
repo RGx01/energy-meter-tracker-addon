@@ -378,6 +378,26 @@ CREATE TABLE IF NOT EXISTS deleted_ranges (
     reason      TEXT                 -- 'user_delete' | 'user_purge' | free text
 );
 CREATE INDEX IF NOT EXISTS idx_deleted_ranges ON deleted_ranges (meter_id, start_utc, end_utc);
+
+-- BL-27: the priced-segment decomposition of a block's grid import. Each row is ONE
+-- homogeneously-priced slice; a block carries 1–4 (the 4-rate matrix). `band` and
+-- `attribution` are OPEN labels — storage and surfaces never switch on them, only the
+-- classifier assigns meaning (a new rate dimension is a new label, not a schema change).
+-- The legacy imp_rate/imp_cost/imp_*_ev/imp_*_exc columns are PROJECTIONS over these rows
+-- (see pricing_segments). Invariant: Σ block_segments.kwh == the block's grid kWh.
+CREATE TABLE IF NOT EXISTS block_segments (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    block_start  TEXT NOT NULL,
+    meter_id     TEXT NOT NULL,
+    channel      TEXT NOT NULL DEFAULT 'import',
+    seq          INTEGER NOT NULL,        -- order within the block (EV-off, EV-peak, house-off, house-day)
+    kwh          REAL NOT NULL,
+    inc_rate     REAL NOT NULL,
+    exc_rate     REAL,                    -- per-segment ex-VAT rate (NULL → view falls back to inc ÷ VAT)
+    band         TEXT NOT NULL,           -- open label: off_peak | day | peak | …
+    attribution  TEXT NOT NULL            -- open label: house | ev | …
+);
+CREATE INDEX IF NOT EXISTS idx_block_segments ON block_segments (block_start, meter_id, channel);
 """
 
 
@@ -3023,6 +3043,81 @@ class BlockStore:
                         "WHERE block_start = ? AND meter_id = ?", (nrev, ncev, bs, mid))
         return {"examined": len(rows),
                 "repaired": (0 if dry_run else len(updates)), "dry_run": dry_run}
+
+    # ── BL-27 priced segments — the block's grid import as priced slices ─────────────
+
+    def set_block_segments(self, block_start: str, meter_id: str, segments,
+                           channel: str = "import") -> int:
+        """Replace the priced segments for one block/meter/channel. `segments` is an
+        iterable of (kwh, inc_rate, exc_rate, band, attribution) — e.g. a list of
+        pricing_segments.Segment. Written in ONE transaction (delete-then-insert, ordered
+        by position), so the set is always consistent. Returns the number of rows written."""
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM block_segments WHERE block_start = ? AND meter_id = ? "
+                "AND channel = ?", (block_start, meter_id, channel))
+            n = 0
+            for seq, seg in enumerate(segments or []):
+                kwh, inc_rate, exc_rate, band, attribution = seg
+                self._conn.execute(
+                    "INSERT INTO block_segments (block_start, meter_id, channel, seq, "
+                    "kwh, inc_rate, exc_rate, band, attribution) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (block_start, meter_id, channel, seq, kwh, inc_rate, exc_rate,
+                     band, attribution))
+                n += 1
+        return n
+
+    def get_block_segments(self, block_start: str, meter_id: str,
+                           channel: str = "import") -> list:
+        """Priced segments for one block/meter/channel, in position order — a list of
+        {kwh, inc_rate, exc_rate, band, attribution}. Empty when none stored (the caller
+        then falls back to the legacy imp_* columns during the migration)."""
+        rows = self._conn.execute(
+            "SELECT kwh, inc_rate, exc_rate, band, attribution FROM block_segments "
+            "WHERE block_start = ? AND meter_id = ? AND channel = ? ORDER BY seq",
+            (block_start, meter_id, channel)).fetchall()
+        return [{"kwh": r["kwh"], "inc_rate": r["inc_rate"], "exc_rate": r["exc_rate"],
+                 "band": r["band"], "attribution": r["attribution"]} for r in rows]
+
+    def count_block_segments(self) -> int:
+        """Total stored segment rows — the segment backfill's remaining-work signal."""
+        return int(self._conn.execute(
+            "SELECT COUNT(*) AS n FROM block_segments").fetchone()["n"])
+
+    def get_blocks_missing_segments(self, limit: int = 2000,
+                                    after_start: str | None = None) -> list:
+        """Page MAIN-meter import blocks that carry energy but have no priced segments yet
+        (BL-27 backfill). Sub-meters are excluded — segments live on the main import; a
+        device's share is attributed from them at read time. Ordered by block_start; pass
+        the last start back as `after_start` to continue. Returns the legacy columns each
+        block's segments are derived from."""
+        sql = ("SELECT b.block_start, b.meter_id, b.imp_kwh, b.imp_cost, b.imp_rate, "
+               "b.imp_kwh_ev, b.imp_cost_ev, b.imp_rate_ev, b.imp_ev_band, b.imp_home_band, "
+               "b.imp_rate_exc FROM blocks b "
+               "WHERE b.imp_kwh IS NOT NULL AND b.imp_kwh > 0 "
+               "AND b.meter_id NOT IN (SELECT meter_id FROM meters WHERE is_sub_meter = 1) "
+               "AND NOT EXISTS (SELECT 1 FROM block_segments s "
+               "                WHERE s.block_start = b.block_start AND s.meter_id = b.meter_id "
+               "                AND s.channel = 'import')")
+        params: list = []
+        if after_start is not None:
+            sql += " AND b.block_start > ?"
+            params.append(after_start)
+        sql += " ORDER BY b.block_start LIMIT ?"
+        params.append(int(limit))
+        rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_blocks_missing_segments(self) -> int:
+        """Count of MAIN-meter blocks still lacking priced segments — remaining-work signal."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM blocks b "
+            "WHERE b.imp_kwh IS NOT NULL AND b.imp_kwh > 0 "
+            "AND b.meter_id NOT IN (SELECT meter_id FROM meters WHERE is_sub_meter = 1) "
+            "AND NOT EXISTS (SELECT 1 FROM block_segments s "
+            "                WHERE s.block_start = b.block_start AND s.meter_id = b.meter_id "
+            "                AND s.channel = 'import')").fetchone()
+        return int(row["n"]) if row else 0
 
     def get_vat_calendar(self) -> list:
         """Learned VAT-rate boundaries [(effective_from, rate), …] from store_meta.

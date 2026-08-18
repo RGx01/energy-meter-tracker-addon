@@ -6495,6 +6495,132 @@ def _maybe_backfill_historical_iog_split() -> None:
         _iog_split_backfill_running = False
 
 
+_SEGMENT_BACKFILL_MARKER = "segment_backfill_state"   # store_meta key
+_SEGMENT_BACKFILL_SCOPE = 1
+_SEGMENT_BACKFILL_PASS_PACE = 1.0
+_segment_backfill_running = False
+
+
+async def _run_historical_segment_backfill(max_blocks: int = 20000,
+                                           batch: int = 500,
+                                           pace_s: float = 0.02) -> int:
+    """One-shot BL-27 backfill: derive the priced `block_segments` for existing history
+    from the legacy imp_* columns, so migrated readers project identical figures. Pure
+    derivation (pricing_segments.segments_from_legacy) — no API/schedule needed; the exc
+    ratio comes from the stored imp_rate_exc or the VAT calendar. Paged, resumable (cursor),
+    idempotent (only fills blocks with no segments yet), cooperative (one transaction per
+    chunk, yields between batches). Returns blocks filled this invocation."""
+    global _store
+    import asyncio as _aio
+    import pricing_segments as _ps
+    from datetime import datetime as _dt, timezone as _tz
+    if _store is None:
+        return 0
+    state = _store.get_meta(_SEGMENT_BACKFILL_MARKER, {}) or {}
+    if state.get("done") or delete_in_progress():
+        return 0
+    _remaining0 = _store.count_blocks_missing_segments()
+    if _remaining0 == 0:
+        _store.set_meta(_SEGMENT_BACKFILL_MARKER,
+                        {"done": True, "scope": _SEGMENT_BACKFILL_SCOPE,
+                         "filled": int(state.get("filled") or 0),
+                         "completed_at": _dt.now(_tz.utc).replace(tzinfo=None).isoformat()})
+        logger.info("segment backfill: nothing to do — all blocks already have segments")
+        return 0
+    logger.info("segment backfill: starting — %d block(s) missing priced segments",
+                _remaining0)
+    _now_iso = lambda: _dt.now(_tz.utc).replace(tzinfo=None).isoformat()
+    filled = 0
+    scanned = 0
+    cursor = state.get("cursor")
+    total_filled = int(state.get("filled") or 0)
+    reached_end = False
+    while scanned < max_blocks:
+        rows = _store.get_blocks_missing_segments(limit=batch, after_start=cursor)
+        if not rows:
+            reached_end = True
+            break
+        for r in rows:
+            cursor = r["block_start"]
+            scanned += 1
+            _rate = r.get("imp_rate") or 0.0
+            _rexc = r.get("imp_rate_exc")
+            if _rexc is not None and _rate:
+                _ratio = float(_rexc) / _rate
+            else:
+                try:
+                    _ratio = 1.0 / (1.0 + _store.vat_rate_at(cursor))
+                except Exception:
+                    _ratio = None
+            try:
+                segs = _ps.segments_from_legacy(
+                    imp_kwh=r.get("imp_kwh") or 0.0, imp_cost=r.get("imp_cost") or 0.0,
+                    imp_rate=_rate, kwh_ev=r.get("imp_kwh_ev"), cost_ev=r.get("imp_cost_ev"),
+                    rate_ev=r.get("imp_rate_ev"), ev_band=r.get("imp_ev_band"),
+                    home_band=r.get("imp_home_band"), exc_ratio=_ratio)
+                if segs:
+                    _store.set_block_segments(cursor, r["meter_id"], segs)
+                    filled += 1
+            except Exception as e:
+                logger.warning("segment backfill: derive failed (start=%s): %s", cursor, e)
+        _store.set_meta(_SEGMENT_BACKFILL_MARKER,
+                        {"cursor": cursor, "scope": _SEGMENT_BACKFILL_SCOPE,
+                         "filled": total_filled + filled})
+        if len(rows) < batch:
+            reached_end = True
+            break
+        await _aio.sleep(pace_s)
+    total_filled += filled
+    if reached_end:
+        _store.set_meta(_SEGMENT_BACKFILL_MARKER,
+                        {"done": True, "scope": _SEGMENT_BACKFILL_SCOPE,
+                         "filled": total_filled, "completed_at": _now_iso()})
+    logger.info("segment backfill: filled %d block(s) this pass%s",
+                filled, " — complete" if reached_end else " (resuming next pass)")
+    return filled
+
+
+def _maybe_backfill_historical_segments() -> None:
+    """Schedule the one-shot BL-27 segment backfill as a loop TASK (BlockStore access stays
+    on the event-loop thread, like the other backfills). No-op once done or during a
+    delete. Runs for every account — segments are the general model, not IOG-specific."""
+    global _segment_backfill_running
+    try:
+        if _store is None or _segment_backfill_running or delete_in_progress():
+            return
+        _m = _store.get_meta(_SEGMENT_BACKFILL_MARKER, {}) or {}
+        if _m.get("done") and int(_m.get("scope") or 1) >= _SEGMENT_BACKFILL_SCOPE:
+            return
+        import asyncio as _aio
+        try:
+            loop = _aio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            return
+
+        async def _task():
+            global _segment_backfill_running
+            import asyncio as _aio2
+            try:
+                for _ in range(500):
+                    await _run_historical_segment_backfill()
+                    if (_store.get_meta(_SEGMENT_BACKFILL_MARKER, {}) or {}).get("done"):
+                        break
+                    await _aio2.sleep(_SEGMENT_BACKFILL_PASS_PACE)
+            except Exception as e:
+                logger.warning("_maybe_backfill_historical_segments: worker failed: %s", e)
+            finally:
+                _segment_backfill_running = False
+
+        _segment_backfill_running = True
+        logger.info("segment backfill: scheduling historical priced-segment derivation")
+        loop.create_task(_task())
+    except Exception as e:
+        logger.warning("_maybe_backfill_historical_segments: schedule failed: %s", e)
+        _segment_backfill_running = False
+
+
 _STALE_EXC_REPAIR_MARKER = "stale_exc_repair_state"   # store_meta key
 # Bump if the repair's detection widens, so a prior narrower run re-arms.
 _STALE_EXC_REPAIR_SCOPE = 1
@@ -10749,6 +10875,13 @@ async def _engine_startup_impl(ha: HAClient):
         _maybe_backfill_historical_iog_split()
     except Exception as _ib_e:
         logger.warning("engine_startup: iog split backfill schedule failed: %s", _ib_e)
+
+    # BL-27 priced-segment backfill — derive block_segments for existing history from the
+    # legacy imp_* columns so migrated readers project identical figures. No-op once done.
+    try:
+        _maybe_backfill_historical_segments()
+    except Exception as _sb_e:
+        logger.warning("engine_startup: segment backfill schedule failed: %s", _sb_e)
 
     # One-off stale-ex-VAT repair — fixes blocks whose ex-VAT rate was left
     # inconsistent with their inc rate by a pre-fix reconcile (which rewrote imp_rate
