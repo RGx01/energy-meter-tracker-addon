@@ -5101,6 +5101,14 @@ def api_historical_reprice_repair():
         from_date = (body.get("from_date") or "").strip() or None
         to_date = (body.get("to_date") or "").strip() or None
         preview = bool(body.get("preview"))
+        # Guard: refuse a real reprice while the first-upgrade migration sweep is still working —
+        # it would race the sweep over the same blocks (and spin up a second one via the post-fill
+        # re-arm). Preview (count-only) is safe and allowed. The UI greys Retry to match.
+        if not preview and _eng.reprice_history_in_progress():
+            return jsonify({"ok": False, "reason": "migrating",
+                            "error": "History is still migrating to the new pricing model. Please "
+                                     "wait for it to finish, then retry any slots that still need "
+                                     "it."}), 409
         # Date validation: end must not precede start.
         if from_date and to_date and to_date < from_date:
             return jsonify({"ok": False,
@@ -5115,6 +5123,13 @@ def api_historical_reprice_repair():
             _eng.repair_import_pricing(from_date, to_date, channels=channels,
                                        count_only=preview),
             timeout=(60.0 if preview else 1800.0))
+        # G2: a real recovery invalidated those blocks' segments (block_store) — re-run the reprice
+        # sweep so the segment surfaces reflect the fill immediately, not just after a restart.
+        if not preview and (result.get("recovered") or 0) > 0:
+            try:
+                _run_on_engine_loop(_eng.run_reprice_history_sweep_to_done(), timeout=1800.0)
+            except Exception as _e:
+                logger.warning("reprice-repair: post-fill re-segment sweep failed: %s", _e)
         return jsonify(result), (200 if result.get("ok") else 400)
     except Exception as e:
         logger.error("api_historical_reprice_repair: %s", e)
@@ -5195,7 +5210,22 @@ def api_historical_reprice_from_csv():
         channel = data.get("channel") or "import"
         if not csv_text:
             return jsonify({"ok": False, "error": "no CSV supplied"}), 400
+        try:
+            import engine as _eng_g
+            if _eng_g.reprice_history_in_progress():
+                return jsonify({"ok": False, "reason": "migrating",
+                                "error": "History is still migrating to the new pricing model. "
+                                         "Please wait for it to finish, then fill from CSV."}), 409
+        except Exception:
+            pass
         res = store.reprice_imported_blocks_from_csv(csv_text, channel=channel)
+        # G2: re-segment the CSV-filled blocks (their stale segments were invalidated in the store).
+        try:
+            import engine as _eng_csv
+            if _eng_csv.kraken_available():
+                _run_on_engine_loop(_eng_csv.run_reprice_history_sweep_to_done(), timeout=1800.0)
+        except Exception as _e:
+            logger.warning("reprice-from-csv: post-fill re-segment sweep failed: %s", _e)
         if res.get("changed"):
             try:
                 import engine as _eng

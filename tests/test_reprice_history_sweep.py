@@ -400,3 +400,123 @@ class TestPenceSelfHeal(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGapAwareMigration(unittest.TestCase):
+    """G1/G2: a gap (imp_cost NULL = unknown price) is left honestly unsegmented and never stalls
+    the sweep; a genuine free slot (imp_cost 0) is segmented; and filling or correcting a price
+    RE-OPENS the block for segmentation — the fill-later door stays open, idempotently."""
+    def setUp(self):
+        self._s = engine._kraken_rate_schedules
+        self._st_saved = engine._store
+        self._bcs = engine._build_channel_rate_segs
+        engine._kraken_rate_schedules = {"import": _Sched(0.30, _EXC)}
+        async def _fake(ch): return _RATE_SEGS
+        engine._build_channel_rate_segs = _fake
+        self.st, self._cp = _mk_store()
+        engine._store = self.st
+
+    def tearDown(self):
+        engine._kraken_rate_schedules = self._s
+        engine._store = self._st_saved
+        engine._build_channel_rate_segs = self._bcs
+        self.st._conn.close()
+
+    def _ins(self, start, kwh, rate, cost):
+        self.st._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, imp_kwh, "
+            "imp_rate, imp_cost, source, imp_kwh_api) VALUES (?,?, 'electricity_main', ?, ?, ?, ?, "
+            "'imported_api', ?)", (start, start, self._cp, kwh, rate, cost, kwh))
+
+    def _has_seg(self, start):
+        return self.st._conn.execute(
+            "SELECT COUNT(*) c FROM block_segments WHERE block_start=? AND meter_id='electricity_main'",
+            (start,)).fetchone()["c"] > 0
+
+    def _seg_rate(self, start):
+        r = self.st._conn.execute("SELECT inc_rate FROM block_segments WHERE block_start=? "
+                                  "AND meter_id='electricity_main'", (start,)).fetchone()
+        return r["inc_rate"] if r else None
+
+    def _done(self):
+        return (self.st.get_meta(engine._REPRICE_HISTORY_MARKER, {}) or {}).get("done")
+
+    def _sweep(self):
+        for _ in range(20):
+            asyncio.run(engine._run_historical_reprice_sweep(batch=50))
+            if self._done():
+                break
+
+    def test_gap_skipped_free_segmented_sweep_completes(self):
+        self._ins("2026-01-01T00:00:00", 2.0, None, None)   # GAP — imp_cost NULL
+        self._ins("2026-01-01T00:30:00", 1.0, 0.0, 0.0)     # FREE — imp_cost 0
+        self._ins("2026-01-01T01:00:00", 3.0, 0.30, 0.90)   # priced
+        self.st._conn.commit()
+        self.assertEqual(self.st.count_blocks_needing_reprice(), 2)   # gap excluded; free+priced in
+        self._sweep()
+        self.assertTrue(self._done())                                 # no stall on the gap
+        self.assertFalse(self._has_seg("2026-01-01T00:00:00"))        # gap NOT segmented (honest)
+        self.assertTrue(self._has_seg("2026-01-01T00:30:00"))         # free segmented (£0, real)
+        self.assertTrue(self._has_seg("2026-01-01T01:00:00"))         # priced segmented
+
+    def test_filling_a_gap_reopens_segmentation(self):
+        G = "2026-02-01T00:00:00"
+        self._ins(G, 2.0, None, None)
+        self.st._conn.commit()
+        self._sweep()
+        self.assertFalse(self._has_seg(G))                            # gap stays unsegmented
+        # fill the price later (the Retry/CSV path uses reprice_imported_block)
+        self.assertTrue(self.st.reprice_imported_block(G, "electricity_main", "import", 0.30, 0.60))
+        self.assertEqual(self.st.count_blocks_needing_reprice(), 1)   # door re-opened
+        asyncio.run(engine.run_reprice_history_sweep_to_done())       # G2: endpoints force this
+        self.assertTrue(self._has_seg(G))                             # now segmented from the fill
+        self.assertAlmostEqual(self._seg_rate(G), 0.30, places=6)
+
+    def test_correcting_a_price_reinvalidates_and_resegments(self):
+        B = "2026-03-01T00:00:00"
+        self._ins(B, 2.0, 0.30, 0.60)
+        self.st._conn.commit()
+        self._sweep()
+        self.assertAlmostEqual(self._seg_rate(B), 0.30, places=6)     # segmented at first price
+        # correct the price → segment invalidated → re-admitted → rebuilt at the new price
+        self.assertTrue(self.st.reprice_imported_block(B, "electricity_main", "import", 0.25, 0.50))
+        self.assertFalse(self._has_seg(B))                            # stale segment invalidated
+        self.assertEqual(self.st.count_blocks_needing_reprice(), 1)
+        asyncio.run(engine.run_reprice_history_sweep_to_done())       # G2: endpoints force this
+        self.assertAlmostEqual(self._seg_rate(B), 0.25, places=6)     # rebuilt at corrected price
+
+
+class TestMigrationGuard(unittest.TestCase):
+    """The guard that refuses manual reprice/fill while the first-upgrade sweep is still working."""
+    def setUp(self):
+        self._st_saved = engine._store
+        self._run_saved = engine._reprice_history_running
+        self.st, self._cp = _mk_store()
+        engine._store = self.st
+
+    def tearDown(self):
+        engine._store = self._st_saved
+        engine._reprice_history_running = self._run_saved
+        self.st._conn.close()
+
+    def _priced_block(self):
+        self.st._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, imp_kwh, "
+            "imp_rate, imp_cost, source, imp_kwh_api) VALUES ('2026-01-01T00:00:00','2026-01-01T00:00:00',"
+            "'electricity_main', ?, 2.0, 0.30, 0.60, 'imported_api', 2.0)", (self._cp,))
+        self.st._conn.commit()
+
+    def test_guard_signals(self):
+        engine._reprice_history_running = False
+        # not done + a priced block still needs a segment → migrating
+        self._priced_block()
+        self.assertTrue(engine.reprice_history_in_progress())
+        # marked done → not migrating (manual recovery allowed)
+        self.st.set_meta(engine._REPRICE_HISTORY_MARKER, {"done": True})
+        self.assertFalse(engine.reprice_history_in_progress())
+        # a pass executing right now → migrating, even past 'done'
+        engine._reprice_history_running = True
+        self.assertTrue(engine.reprice_history_in_progress())
+        engine._reprice_history_running = False
+        # done and nothing needs reprice → not migrating
+        self.assertFalse(engine.reprice_history_in_progress())

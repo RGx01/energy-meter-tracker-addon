@@ -6285,6 +6285,7 @@ class TestRepriceRepairVerifyGuard(unittest.TestCase):
         import engine, server
         engine.kraken_available = lambda: True
         engine.api_verify_pricing_status = lambda: {"status": verify_status}
+        engine.reprice_history_in_progress = lambda: False   # isolate: test the VERIFY guard only
         # If the guard DOESN'T fire, the endpoint reaches the engine loop — stub
         # those so the non-guarded path returns cleanly rather than erroring.
         engine.repair_import_pricing = lambda *a, **k: "CORO"
@@ -6315,6 +6316,25 @@ class TestRepriceRepairVerifyGuard(unittest.TestCase):
         r = self._post("done")
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.get_json()["ok"])
+
+    def test_refused_while_migration_in_progress(self):
+        import engine
+        engine.kraken_available = lambda: True
+        engine.api_verify_pricing_status = lambda: {"status": "idle"}
+        engine.reprice_history_in_progress = lambda: True     # first-upgrade sweep still working
+        r = self.client.post("/api/historical/reprice-repair", json={})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.get_json()["reason"], "migrating")
+
+    def test_preview_allowed_during_migration(self):
+        import engine, server
+        engine.kraken_available = lambda: True
+        engine.api_verify_pricing_status = lambda: {"status": "idle"}
+        engine.reprice_history_in_progress = lambda: True
+        engine.repair_import_pricing = lambda *a, **k: "CORO"
+        server._run_on_engine_loop = lambda coro, **k: {"ok": True, "affected": 0}
+        r = self.client.post("/api/historical/reprice-repair", json={"preview": True})
+        self.assertEqual(r.status_code, 200)     # count-only is safe during migration
 
 
 class TestStartLockedWhileVerifyActive(unittest.TestCase):

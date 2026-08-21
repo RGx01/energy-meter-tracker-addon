@@ -2851,6 +2851,13 @@ class BlockStore:
                 f"WHERE block_start = ? AND meter_id = ? AND source LIKE 'imported%' "
                 f"AND (COALESCE({rcol}, -1) != ? OR COALESCE({ccol}, -1) != ?)",
                 (rate, cost, *extra, start, meter_id, rate, cost))
+            # G2: a real price change (a gap filled or a price corrected) invalidates any stale
+            # segment so the reprice sweep rebuilds it from the corrected column — keeps the block
+            # rewritable at any later date. Import-only (segments are import-only); no-op if none.
+            if cur.rowcount > 0 and channel == "import":
+                self._conn.execute(
+                    "DELETE FROM block_segments WHERE block_start = ? AND meter_id = ? "
+                    "AND channel = 'import'", (start, meter_id))
         return cur.rowcount > 0
 
     def set_block_carbon(self, block_start: str, meter_id: str,
@@ -3136,6 +3143,11 @@ class BlockStore:
     # ── P3.3c: unified "needs reprice" coverage — a true SUPERSET of the three legacy backfills ──
     _NEEDS_REPRICE_WHERE = (
         "b.imp_kwh IS NOT NULL AND b.imp_kwh > 0 "
+        # G1: only PRICED blocks are segmentable. A gap (imp_cost NULL = unknown price) is left
+        # honestly unsegmented — never faked at £0, never stalls the sweep. A genuine free slot
+        # (imp_cost 0, not NULL) is still included. Filling a gap flips imp_cost non-NULL, which
+        # re-admits the block here so the sweep segments it from the real price (the fill-later door).
+        "AND b.imp_cost IS NOT NULL "
         "AND b.meter_id NOT IN (SELECT meter_id FROM meters WHERE is_sub_meter = 1) "
         "AND ("
         "  NOT EXISTS (SELECT 1 FROM block_segments s WHERE s.block_start = b.block_start "
@@ -3393,6 +3405,13 @@ class BlockStore:
                     changed_starts.append(start)
         if changed_starts:
             self.clear_reprice_queue_slots(channel, changed_starts)
+            # G2: invalidate segments for CSV-filled/corrected import blocks so the sweep rebuilds.
+            if channel == "import":
+                _ph = ",".join("?" * len(changed_starts))
+                with self._conn:
+                    self._conn.execute(
+                        f"DELETE FROM block_segments WHERE channel = 'import' AND meter_id = ? "
+                        f"AND block_start IN ({_ph})", [meter_id] + changed_starts)
         logger.info("reprice_imported_blocks_from_csv[%s]: %d changed of %d (%s..%s)",
                     channel, changed, checked, lo, hi)
         return {"checked": checked, "changed": changed, "from": lo, "to": hi}

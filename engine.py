@@ -7028,6 +7028,40 @@ async def _run_historical_reprice_sweep(max_blocks: int = 20000, batch: int = 50
     return swept
 
 
+def reprice_history_in_progress() -> bool:
+    """True while the first-upgrade reprice sweep is still working through the backlog — a pass is
+    executing now, OR blocks still need repricing and it hasn't marked done. Used to refuse manual
+    reprice / gap-fill actions during migration so they can't race the sweep (or spin up a second,
+    concurrent one). Once the sweep marks done (even if it stalled on a bad block), this is False
+    and manual recovery is allowed again."""
+    if _store is None:
+        return False
+    if _reprice_history_running:
+        return True
+    m = _store.get_meta(_REPRICE_HISTORY_MARKER, {}) or {}
+    if m.get("done"):
+        return False
+    try:
+        return _store.count_blocks_needing_reprice() > 0
+    except Exception:
+        return False
+
+
+async def run_reprice_history_sweep_to_done(max_passes: int = 500) -> None:
+    """G2: run the reprice-history sweep FORCED until it marks done — for use right after a manual
+    gap-fill (Retry / CSV). A filled or corrected block has had its stale segment invalidated
+    (block_store), so it re-enters the sweep's queue and gets (re)segmented from the real price.
+    Best-effort; the startup sweep would catch it anyway, this just makes it immediate."""
+    for _ in range(max_passes):
+        try:
+            await _run_historical_reprice_sweep(force=True)
+        except Exception as e:
+            logger.warning("run_reprice_history_sweep_to_done: %s", e)
+            return
+        if (_store.get_meta(_REPRICE_HISTORY_MARKER, {}) or {}).get("done"):
+            return
+
+
 def _maybe_reprice_history() -> None:
     """Schedule the P3.3b unified reprice-history sweep as a loop task (mirrors the segment
     backfill scheduler). PRIMARY derivation for history; the three legacy backfills run after
