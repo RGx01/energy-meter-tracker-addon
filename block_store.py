@@ -2248,6 +2248,7 @@ class BlockStore:
 
         reads_deleted = 0
         mix_deleted   = 0
+        segments_deleted = 0
         with self._conn:
             if n_blocks:
                 # Children first (reads FK -> blocks(id) with foreign_keys=ON).
@@ -2264,6 +2265,15 @@ class BlockStore:
                     params,
                 )
                 mix_deleted = cur_m.rowcount
+                # P3.1: block_segments has no block_id FK (keyed by block_start) so it
+                # is NOT cascade-cleaned — delete it explicitly or the range leaves
+                # orphaned segments (breaks Σ segments == grid for the touched span).
+                cur_s = self._conn.execute(
+                    f"DELETE FROM block_segments WHERE (block_start, meter_id) IN "
+                    f"(SELECT block_start, meter_id FROM blocks WHERE {where})",
+                    params,
+                )
+                segments_deleted = cur_s.rowcount
                 self._conn.execute(f"DELETE FROM blocks WHERE {where}", params)
             if is_tail and n_blocks:
                 # Reseed live engine state so the next block starts cleanly.
@@ -2302,6 +2312,7 @@ class BlockStore:
             "dates":                  n_dates,
             "reads_deleted":          reads_deleted,
             "generation_mix_deleted": mix_deleted,
+            "segments_deleted":       segments_deleted,
             "reseeded":               bool(is_tail and n_blocks),
             # set only for a device-only delete with surviving parent blocks
             "recompute_parent":       recompute_parent if n_blocks else None,
@@ -2366,6 +2377,10 @@ class BlockStore:
             mix = self._conn.execute(
                 "DELETE FROM generation_mix WHERE block_id IN "
                 "(SELECT id FROM blocks WHERE source LIKE 'imported%')").rowcount
+            # P3.1: block_segments is keyed by block_start (no FK) — clean it too.
+            segs = self._conn.execute(
+                "DELETE FROM block_segments WHERE (block_start, meter_id) IN "
+                "(SELECT block_start, meter_id FROM blocks WHERE source LIKE 'imported%')").rowcount
             self._conn.execute("DELETE FROM blocks WHERE source LIKE 'imported%'")
             derivs = self._conn.execute(
                 "DELETE FROM historical_derivation WHERE source LIKE 'imported%'").rowcount
@@ -2383,6 +2398,7 @@ class BlockStore:
         logger.info("purge_imported_history: removed %d block(s), %d derivation(s)",
                     info["blocks"], derivs)
         return {"blocks": info["blocks"], "reads": reads, "generation_mix": mix,
+                "block_segments": segs,
                 "derivations": derivs, "from": info["from"], "to": info["to"]}
 
     # ── Recorder device attribution — reversible layer ────────────────────────
@@ -2420,6 +2436,10 @@ class BlockStore:
             self._conn.execute(
                 "DELETE FROM reads WHERE block_id IN "
                 f"(SELECT id FROM blocks WHERE {clause})", params)
+            # P3.1: block_segments keyed by block_start (no FK) — clean before blocks.
+            self._conn.execute(
+                f"DELETE FROM block_segments WHERE (block_start, meter_id) IN "
+                f"(SELECT block_start, meter_id FROM blocks WHERE {clause})", params)
             cur = self._conn.execute(f"DELETE FROM blocks WHERE {clause}", params)
         return {"deleted": cur.rowcount, "meters": meters, "parents": parents,
                 "from": span["lo"] if span else None,
@@ -2961,6 +2981,29 @@ class BlockStore:
         ).fetchone()
         return int(row["n"]) if row else 0
 
+    def repair_pence_inc_blocks(self, block_starts, threshold: float = 3.0) -> int:
+        """Q1 SELF-HEAL: ÷100 the INC columns (rate/cost + EV split) on MAIN + sub-meter rows for
+        blocks whose `imp_rate` is implausibly high (> `threshold` £/kWh = pence-not-pounds — the
+        legacy 4.3.0 capped `compute_iog_split` bug, watch #15). Deliberate force-repair: it
+        OVERWRITES (unlike the fill-null sweep writers), justified because an inc rate above the
+        ceiling is unambiguous corruption, not data worth keeping — the same ÷100 as the §4a guard
+        and the manual data-fix. exc columns are LEFT (already £, the trusted reference). Idempotent
+        (`imp_rate > threshold` self-gates), NULL split columns stay NULL. Returns rows repaired."""
+        if not block_starts:
+            return 0
+        ph = ",".join("?" * len(block_starts))
+        with self._conn:
+            cur = self._conn.execute(
+                f"UPDATE blocks SET "
+                f"  imp_rate           = imp_rate/100.0, "
+                f"  imp_cost           = imp_cost/100.0, "
+                f"  imp_cost_remainder = imp_cost_remainder/100.0, "
+                f"  imp_cost_ev        = imp_cost_ev/100.0, "
+                f"  imp_rate_ev        = imp_rate_ev/100.0 "
+                f"WHERE block_start IN ({ph}) AND imp_rate > ?",
+                list(block_starts) + [float(threshold)])
+        return cur.rowcount
+
     def set_blocks_iog_split(self, updates) -> int:
         """Batch EV/Home split writer: many UPDATEs in ONE transaction (one fsync per
         chunk, not per block — same event-loop-friendliness as set_blocks_exc).
@@ -3064,7 +3107,7 @@ class BlockStore:
         block's segments are derived from."""
         sql = ("SELECT b.block_start, b.meter_id, b.imp_kwh, b.imp_cost, b.imp_rate, "
                "b.imp_kwh_ev, b.imp_cost_ev, b.imp_rate_ev, b.imp_ev_band, b.imp_home_band, "
-               "b.imp_rate_exc FROM blocks b "
+               "b.imp_rate_exc, b.source, b.imp_kwh_api FROM blocks b "
                "WHERE b.imp_kwh IS NOT NULL AND b.imp_kwh > 0 "
                "AND b.meter_id NOT IN (SELECT meter_id FROM meters WHERE is_sub_meter = 1) "
                "AND NOT EXISTS (SELECT 1 FROM block_segments s "
@@ -3088,6 +3131,44 @@ class BlockStore:
             "AND NOT EXISTS (SELECT 1 FROM block_segments s "
             "                WHERE s.block_start = b.block_start AND s.meter_id = b.meter_id "
             "                AND s.channel = 'import')").fetchone()
+        return int(row["n"]) if row else 0
+
+    # ── P3.3c: unified "needs reprice" coverage — a true SUPERSET of the three legacy backfills ──
+    _NEEDS_REPRICE_WHERE = (
+        "b.imp_kwh IS NOT NULL AND b.imp_kwh > 0 "
+        "AND b.meter_id NOT IN (SELECT meter_id FROM meters WHERE is_sub_meter = 1) "
+        "AND ("
+        "  NOT EXISTS (SELECT 1 FROM block_segments s WHERE s.block_start = b.block_start "
+        "              AND s.meter_id = b.meter_id AND s.channel = 'import') "
+        "  OR (b.imp_cost_exc IS NULL AND (b.source LIKE 'imported%' OR b.imp_kwh_api IS NOT NULL))"
+        ")")
+
+    def get_blocks_needing_reprice(self, limit: int = 2000,
+                                   after_start: str | None = None) -> list:
+        """Page MAIN-meter import blocks that need ANY derived field the sweep owns: missing
+        priced segments, OR (imported/DCC-settled) missing ex-VAT. This is the SUPERSET the
+        unified sweep walks so it fully covers the retired segment/iog_split/exc backfills.
+        Each row carries `needs_segments` (1 = no segments yet) so the driver only (re)writes
+        segments when they are ABSENT — split/exc use fill-null-only writers and are always safe."""
+        sql = ("SELECT b.block_start, b.meter_id, b.imp_kwh, b.imp_cost, b.imp_rate, "
+               "b.imp_kwh_ev, b.imp_cost_ev, b.imp_rate_ev, b.imp_ev_band, b.imp_home_band, "
+               "b.imp_rate_exc, b.source, b.imp_kwh_api, "
+               "(NOT EXISTS (SELECT 1 FROM block_segments s WHERE s.block_start = b.block_start "
+               "             AND s.meter_id = b.meter_id AND s.channel = 'import')) AS needs_segments "
+               "FROM blocks b WHERE " + self._NEEDS_REPRICE_WHERE)
+        params: list = []
+        if after_start is not None:
+            sql += " AND b.block_start > ?"
+            params.append(after_start)
+        sql += " ORDER BY b.block_start LIMIT ?"
+        params.append(int(limit))
+        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def count_blocks_needing_reprice(self) -> int:
+        """Remaining-work signal for the unified sweep (superset: missing segments OR
+        imported/settled missing exc)."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM blocks b WHERE " + self._NEEDS_REPRICE_WHERE).fetchone()
         return int(row["n"]) if row else 0
 
     def get_vat_calendar(self) -> list:

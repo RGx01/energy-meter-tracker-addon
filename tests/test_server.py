@@ -268,6 +268,9 @@ class TestRouteRegistration(unittest.TestCase):
     def test_api_unsettled_blocks_registered(self):
         self.assertTrue(self._registered("api_unsettled_blocks"))
 
+    def test_api_reprice_history_status_registered(self):
+        self.assertTrue(self._registered("api_reprice_history_status"))
+
     def test_api_retry_settlement_registered(self):
         self.assertTrue(self._registered("api_retry_settlement"))
 
@@ -5064,6 +5067,31 @@ class TestBlocksSummaryEVSplit(unittest.TestCase):
         self.assertGreaterEqual(main["imp_kwh"], 0.0)
         self.assertAlmostEqual(evm["imp_kwh"], 3.0, places=3)   # clipped to the import
         self.assertAlmostEqual(main["imp_kwh"] + evm["imp_kwh"], 3.0, places=4)
+
+    def _slot_row(self, slot, main_kwh, main_cost):
+        return {"slot": slot, "label": slot,
+                "imp_kwh": main_kwh, "imp_cost": main_cost, "net_cost": main_cost,
+                "exp_kwh": 0.0, "exp_cost": 0.0, "standing": 0.0,
+                "meters": {"electricity_main": {
+                    "imp_kwh": main_kwh, "imp_cost": main_cost,
+                    "exp_kwh": 0.0, "exp_cost": 0.0, "carbon_g": None}}}
+
+    def test_apply_split_by_slot_key_for_hh(self):
+        # HH view: rows keyed by SLOT, carve applied via key_fn — the half-hour bar splits
+        # into EV + reduced house, and a slot with no EV is left untouched.
+        rows = [self._slot_row("02:00", 6.0, 0.33), self._slot_row("13:00", 1.0, 0.30)]
+        meters = [{"id": "electricity_main", "label": "Direct",
+                   "color": "#1f77b4", "is_sub": False}]
+        ev_by_slot = {"02:00": {"kwh": 5.0, "cost": 0.28}}      # EV only in the 02:00 slot
+        applied = server._apply_ev_split_to_summary_rows(
+            rows, meters, ev_by_slot, key_fn=lambda r: r.get("slot"))
+        self.assertTrue(applied)
+        m0 = rows[0]["meters"]
+        self.assertAlmostEqual(m0["ev_dispatch"]["imp_kwh"], 5.0, places=3)
+        self.assertAlmostEqual(m0["electricity_main"]["imp_kwh"]
+                               + m0["ev_dispatch"]["imp_kwh"], 6.0, places=4)   # totals hold
+        self.assertNotIn("ev_dispatch", rows[1]["meters"])     # 13:00 untouched (no EV)
+        self.assertIn("ev_dispatch", [m["id"] for m in meters])
 
 
 class TestNegativeCostAggregation(unittest.TestCase):

@@ -15,8 +15,8 @@ real DB like Highgrove — "on top of Highgrove"). `CFG` describes the meters fo
 import pricing_segments as ps
 
 HOFF, HDAY = 0.05493, 0.323092        # house off-peak / day (inc)
-EVOFF, EVPEAK = 0.05493, 0.30         # EV off-peak / peak (inc) — peak kept DISTINCT from
-VAT = 0.05                            #   house day so EV-peak vs house-day rows are visible
+EVOFF, EVPEAK = 0.05493, 0.323092     # EV off-peak / peak (inc). IOG-SMB-TOU has only TWO
+VAT = 0.05                            #   rates: EV peak IS the house peak (day) rate.
 
 MAIN, EV, BATT = "electricity_main", "ev_charger", "house_battery"
 
@@ -110,10 +110,12 @@ def reprice_under_cap(store, *, cap_hours: float = 3.0, tz: str = "Europe/London
     from zoneinfo import ZoneInfo
     import iog_cap
     c = store._conn
-    rows = c.execute("SELECT raw_start, raw_end FROM dispatch_history WHERE kind='completed' "
-                     "AND raw_start IS NOT NULL AND raw_end IS NOT NULL").fetchall()
+    rows = c.execute("SELECT raw_start, raw_end, energy_kwh FROM dispatch_history "
+                     "WHERE kind='completed' AND raw_start IS NOT NULL AND raw_end IS NOT NULL"
+                     ).fetchall()
     boundaries = iog_cap.cap_day_boundaries(
-        [(r["raw_start"], r["raw_end"]) for r in rows], tz, cap_hours=cap_hours)
+        [(r["raw_start"], r["raw_end"], r["energy_kwh"]) for r in rows], tz,
+        cap_hours=cap_hours)
 
     def _in_window(bs):
         lt = (datetime.fromisoformat(bs[:19]).replace(tzinfo=ZoneInfo("UTC"))
@@ -129,7 +131,7 @@ def reprice_under_cap(store, *, cap_hours: float = 3.0, tz: str = "Europe/London
         bs, be = r["block_start"], r["block_end"] or r["block_start"]
         cls = iog_cap.classify_slot(
             bs, be, in_off_peak_window=_in_window(bs), is_dispatch=True,
-            boundary_utc=boundaries.get(iog_cap.cap_day_key(bs, tz)))
+            boundary=boundaries.get(iog_cap.cap_day_key(bs, tz)))
         ek = r["imp_kwh_ev"]
         hk = (r["imp_kwh"] or 0.0) - ek
         segs = ps.import_segments(

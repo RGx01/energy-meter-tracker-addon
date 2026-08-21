@@ -5,6 +5,7 @@ except ImportError:
     from backports.zoneinfo import ZoneInfo
 from collections import defaultdict
 import json
+import carbon as _carbon
 import os
 import re
 
@@ -1734,6 +1735,64 @@ def render_billing_summary(summary, currency='£', site_name=None):
 # Daily chart builder (returns HTML string for one day)
 # ─────────────────────────────────────────────────────────────
 
+def _day_segment_split(main_import, meters):
+    """BL-27: on a CAPPED block (EV pushed to PEAK, or straddling the cap boundary) return
+    the per-meter slot values driven by the block's dispatch SEGMENTS — the physical EV
+    device on the EV bands (grid-clipped dispatch: off-peak within cap, peak beyond), house
+    sub-devices at the house band rate, and 'Direct import' the house-segment remainder. So
+    the house stays cleanly off-peak and the EV carries the peak, with no metered-vs-dispatch
+    residual. Returns {meter_id: {"kwh","cost","rate"}} (incl. 'electricity_main' for the
+    house remainder), or None — uncapped blocks (EV off-peak == house) and sensor-less
+    accounts keep the column / synthetic paths, so they're byte-identical. Requires a
+    physical EV sub-meter to attribute the EV bands onto."""
+    segs = main_import.get("segments")
+    if not segs:
+        return None
+    if not any(s.get("attribution") == "ev" and s.get("band") in ("peak", "mixed")
+               for s in segs):
+        return None
+    _v = lambda x: float(x or 0.0)
+    ev_k = sum(_v(s.get("kwh")) for s in segs if s.get("attribution") == "ev")
+    ev_c = sum(_v(s.get("kwh")) * _v(s.get("inc_rate")) for s in segs if s.get("attribution") == "ev")
+    ho_k = sum(_v(s.get("kwh")) for s in segs if s.get("attribution") != "ev")
+    ho_c = sum(_v(s.get("kwh")) * _v(s.get("inc_rate")) for s in segs if s.get("attribution") != "ev")
+    house_rate = (ho_c / ho_k) if ho_k > 1e-9 else 0.0
+    ev_dev = None
+    house_devs = []
+    for _mn, _m in (meters or {}).items():
+        if not (((_m or {}).get("meta", {}) or {}).get("sub_meter")):
+            continue
+        _mt = (((_m.get("meta") or {}).get("meter_type")) or "").lower()
+        if _mt in ("ev", "ev_charger") or any(k in _mn.lower() for k in ("ev", "charger")):
+            ev_dev = _mn
+        else:
+            house_devs.append((_mn, _m))
+    if ev_dev is None or ev_k <= 1e-9:
+        return None                      # no physical EV to carry the bands → leave as-is
+    # The EV BAR is the physical charger's METERED grid kWh (the bar the user recognises);
+    # its COST/RATE come from the dispatch split (ev_c / dispatch rate). The house remainder
+    # absorbs the metered-vs-dispatch kWh difference, so Σ device kWh == grid import and the
+    # remainder can never go negative from dispatch over-attributing the grid (design:
+    # device-pricing "physical-EV-device question").
+    _evsub = ((meters.get(ev_dev, {}).get("channels", {}) or {}).get("import", {}) or {})
+    dev_ev = _v(_evsub.get("kwh_grid", _evsub.get("kwh"))) or ev_k   # metered; else dispatch
+    grid_k = ev_k + ho_k                                             # block grid import (Σ seg)
+    out = {ev_dev: {"kwh": round(dev_ev, 6), "cost": round(ev_c, 6),
+                    "rate": round(ev_c / ev_k, 6)}}
+    hk_used = hc_used = 0.0
+    for _mn, _m in house_devs:
+        _sub = ((_m.get("channels", {}) or {}).get("import", {}) or {})
+        _gk = _v(_sub.get("kwh_grid", _sub.get("kwh")))
+        _c = round(_gk * house_rate, 6)
+        out[_mn] = {"kwh": round(_gk, 6), "cost": _c, "rate": round(house_rate, 6)}
+        hk_used += _gk
+        hc_used += _c
+    out["electricity_main"] = {"kwh": round(grid_k - dev_ev - hk_used, 6),
+                               "cost": round(ho_c - hc_used, 6),
+                               "rate": round(house_rate, 6)}
+    return out
+
+
 def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_minutes=30, currency='£', site_name=None, ev_slot_map=None, bill_rounding=False, fallback_vat=0.05):
     slots = 1440 // block_minutes
     meter_kwh    = defaultdict(lambda: [0.0] * slots)
@@ -1798,6 +1857,7 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                 # plunge-price credit (negative cost) must survive, not clamp to 0.
                 main_cost = main_cost if _raw_main_cost < 0 else max(main_cost, 0.0)
             main_rate = _f(main_import.get("rate_used", main_import.get("rate")))
+            _seg_split = _day_segment_split(main_import, meters)  # BL-27: applied after exc
 
             # Per-slot ex-VAT ratio for the opt-in data-table Cost (exc) column.
             if bill_rounding:
@@ -1816,6 +1876,11 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                     slot_exc_approx[hh] = True
                 else:
                     slot_exc_ratio[hh]  = round(_ratio, 8)
+
+            if _seg_split is not None:                      # BL-27: house from house segments
+                _hh = _seg_split["electricity_main"]
+                main_kwh, main_cost = _hh["kwh"], _hh["cost"]
+                main_rate = _hh["rate"] or main_rate
 
             meter_kwh["electricity_main"][hh]  = main_kwh
             meter_rate["electricity_main"][hh] = main_rate
@@ -1839,6 +1904,11 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                     sub_kwh_grid = _f(sub.get("kwh_grid", sub_kwh))  # grid-attributed portion
                     sub_cost = _f(sub.get("cost"))
                     sub_rate = _f(sub.get("rate"))
+                    if _seg_split is not None and meter_name in _seg_split:
+                        _sv = _seg_split[meter_name]     # BL-27: EV on dispatch bands / house dev on house band
+                        sub_kwh_grid = _sv["kwh"]
+                        sub_cost = _sv["cost"]
+                        sub_rate = _sv["rate"]
                     meter_kwh[meter_name][hh]  = sub_kwh_grid  # grid-attributed, matches usage stats
                     meter_rate[meter_name][hh] = sub_rate
                     meter_cost[meter_name][hh] = sub_cost
@@ -1926,6 +1996,21 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
 
         except Exception:
             pass
+
+    # ── BL-27: the rate LINES come from the day-level emit (chart_emit.day_rate_series) —
+    # ONE tested place for "what rate applies each half-hour"; the chart only plots it. See
+    # the presentation read-contract in docs/design/4.4.0_iog_pricing_and_reprice_design.md.
+    import chart_emit
+    _series = chart_emit.day_rate_series(day_blocks, slots=slots, block_minutes=block_minutes)
+    for _mid in list(meter_rate.keys()):
+        if _mid.endswith("_export"):
+            continue
+        _is_ev = (_mid == "ev_dispatch" or "charger" in _mid.lower()
+                  or _mid.lower().startswith("ev_") or _mid.lower().startswith("ev "))
+        _curve = _series["ev"] if _is_ev else _series["house"]
+        for hh in range(slots):
+            if _curve[hh] is not None:
+                meter_rate[_mid][hh] = _curve[hh]
 
     # ── x axis labels — outside the loop ──
     total_hh_kwh = [sum(meter_kwh[m][i] for m in meter_kwh if not m.endswith('_export')) for i in range(slots)]
@@ -4281,11 +4366,11 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None, curren
                 # stored at write time (3.0.0+), which is defined even for a
                 # zero-net block (so it no longer leaves an empty cell); fall back
                 # to carbon_g/net for pre-3.0.0 blocks that predate the column.
-                ci = md.get("carbon_intensity_g")
-                if ci is not None:
-                    days_intensity[day][hh_index] = round(abs(float(ci)), 1)
-                elif net != 0:
-                    days_intensity[day][hh_index] = round(abs(cg / net), 1)
+                # Δ5c: intensity resolution lives in the carbon emit — the heatmap plots
+                # what carbon.slot_intensity returns rather than deriving it inline.
+                _it = _carbon.slot_intensity(cg, md.get("carbon_intensity_g"), net)
+                if _it is not None:
+                    days_intensity[day][hh_index] = _it
                 break
         except Exception:
             continue

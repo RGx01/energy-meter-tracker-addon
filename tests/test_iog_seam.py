@@ -101,9 +101,16 @@ class TestApplyIogSplit(unittest.TestCase):
 
     def test_capped_over_cap_ev_peak(self):
         self._capped()
-        # 7.5h completed dispatch in the cap-day → boundary 18:00; slot 18:30 over
+        # Charged-time cap (7 kW car → 3.5 kWh is a full 30-min slot). Twelve full slots
+        # = 6 h of charging → the cap is used up; the 18:30 slot is beyond it → EV peak.
+        import datetime as _dt
+        base = _dt.datetime(2026, 1, 1, 12, 0)
+        for i in range(12):
+            ts = (base + _dt.timedelta(minutes=30 * i)).isoformat()
+            te = (base + _dt.timedelta(minutes=30 * (i + 1))).isoformat()
+            self._completed(ts, 3.5, ts, te)
         self._completed("2026-01-01T18:30:00", 2.0,
-                        "2026-01-01T12:00:00", "2026-01-01T19:30:00")
+                        "2026-01-01T18:30:00", "2026-01-01T19:00:00")
         imp = self._imp(0.30, 0.90)
         self._apply(imp, start="2026-01-01T18:30:00", end="2026-01-01T19:00:00")
         self.assertAlmostEqual(imp["cost"], 0.80)     # 2*0.25 + 1*0.30

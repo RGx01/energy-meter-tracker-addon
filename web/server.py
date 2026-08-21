@@ -1851,6 +1851,13 @@ def api_meter_delete_data(meter_id: str):
             )
             deleted["blocks"] = cur.rowcount
 
+            # P3.1: block_segments keyed by block_start (no block_id FK) → not
+            # cascade-cleaned; remove this meter's segments so none are orphaned.
+            cur = store._conn.execute(
+                "DELETE FROM block_segments WHERE meter_id = ?", (meter_id,)
+            )
+            deleted["block_segments"] = cur.rowcount
+
             cur = store._conn.execute(
                 "DELETE FROM sub_meter_history WHERE meter_id = ?", (meter_id,)
             )
@@ -2587,7 +2594,8 @@ def api_blocks_day():
         _raw = store._conn.execute(f"""
             SELECT b.block_start, b.meter_id, m.is_sub_meter,
                    b.imp_kwh, b.imp_kwh_grid, b.imp_kwh_remainder,
-                   b.imp_rate, b.imp_cost, b.exp_kwh, b.exp_cost,
+                   b.imp_rate, b.imp_cost, b.imp_kwh_ev, b.imp_cost_ev,
+                   b.exp_kwh, b.exp_cost,
                    b.standing_charge, b.carbon_g
             FROM blocks b
             JOIN config_periods cp ON b.config_period_id = cp.id
@@ -2636,6 +2644,38 @@ def api_blocks_day():
         meters_list = [{"id": mid, "label": meter_labels.get(mid, mid),
                         "color": meter_colors[mid], "is_sub": mid != "electricity_main"}
                        for mid in all_meter_ids]
+        # BL-9: synthetic dispatch-derived EV slice for a sensor-less account — the SAME
+        # carve the daily view applies (_apply_ev_split_to_summary_rows), but bucketed by
+        # SLOT so the half-hour bars split into EV + reduced house too. Guaranteed no-op
+        # when an EV meter — or any sub-meter — exists. Display-only: slot totals unchanged.
+        if (_configured_ev_meter_id(cfg) is None
+                and len(meters_list) == 1
+                and meters_list[0]["id"] == "electricity_main"):
+            try:
+                _drows = store._conn.execute(
+                    "SELECT slot_start, kind, energy_kwh FROM dispatch_history "
+                    "WHERE kind='completed' AND slot_start >= ? AND slot_start < ?",
+                    (_u_s, _u_e)).fetchall()
+                _ev_slot = _dispatch_derived_ev_kwh(
+                    [{"slot_start": r["slot_start"], "kind": r["kind"],
+                      "energy_kwh": r["energy_kwh"]} for r in _drows])
+                _main_slot = {}
+                _stored_slot = {}
+                for _rr in _raw:
+                    if _rr["is_sub_meter"]:
+                        continue
+                    _main_slot[_rr["block_start"]] = (
+                        float(_rr["imp_kwh"] or 0), float(_rr["imp_cost"] or 0))
+                    if _rr["imp_kwh_ev"] is not None:
+                        _stored_slot[_rr["block_start"]] = (
+                            float(_rr["imp_kwh_ev"]), float(_rr["imp_cost_ev"] or 0))
+                _ev_by_slot = _dispatch_ev_split_by_bucket(
+                    _main_slot, _ev_slot, _slot_of, stored_by_slot=_stored_slot)
+            except Exception:
+                _ev_by_slot = {}
+            _apply_ev_split_to_summary_rows(
+                rows, meters_list, _ev_by_slot, key_fn=lambda _r: _r.get("slot"))
+
         _postcode = ""
         for _md in cfg.get("meters", {}).values():
             _postcode = (_md.get("meta") or {}).get("postcode_prefix", "").strip()
@@ -5460,6 +5500,56 @@ def api_historical_csv_template():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/reprice-history-status")
+def api_reprice_history_status():
+    """Read-only: is the historical re-price sweep still working through a backlog (the first
+    run after an upgrade)? Drives the 'finishing your upgrade' banner. `in_progress` = not done
+    AND blocks still need re-pricing. Fails safe to not-in-progress so a hiccup never nags."""
+    try:
+        import engine as _eng
+        store = _get_store()
+        m = store.get_meta(_eng._REPRICE_HISTORY_MARKER, {}) or {}
+        remaining = int(store.count_blocks_needing_reprice())
+        done = bool(m.get("done"))
+        return jsonify({
+            "done": done,
+            "remaining": remaining,
+            "swept": int(m.get("swept") or 0),
+            "stalled": int(m.get("stalled") or 0),
+            "in_progress": (not done) and remaining > 0,
+        })
+    except Exception as e:
+        logger.debug("api_reprice_history_status: %s", e)
+        return jsonify({"in_progress": False, "remaining": 0, "done": True})
+
+
+@app.route("/api/reprice-history-conformance")
+def api_reprice_history_conformance():
+    """P3.3c soak check (non-destructive): recompute split+exc for a UTC date range via the
+    unified sweep core and diff against stored values. `verdict` is "clean" only with zero
+    uncapped divergences. Params: from=YYYY-MM-DD, to=YYYY-MM-DD (UTC), meter_id (optional)."""
+    try:
+        import engine as _eng
+        frm = request.args.get("from"); to = request.args.get("to")
+        if not frm or not to:
+            return jsonify({"ok": False, "reason": "from and to (YYYY-MM-DD) required"}), 400
+        meter = request.args.get("meter_id", "electricity_main")
+        # Build the full historical import rate segments ON THE ENGINE LOOP (the Kraken client is
+        # bound to it) and hand them to the harness — a sync-thread build raises "attached to a
+        # different loop". If it fails, the harness simply skips exc (exc_checked=False).
+        rate_segs = None
+        try:
+            rate_segs = _run_on_engine_loop(_eng._build_channel_rate_segs("import"), timeout=60)
+        except Exception as _rse:
+            logger.warning("api_reprice_history_conformance: engine-loop rate-seg build failed: %s", _rse)
+        rep = _eng.reprice_history_conformance(frm + "T00:00:00", to + "T00:00:00", meter,
+                                               rate_segs=rate_segs)
+        return jsonify(rep)
+    except Exception as e:
+        logger.exception("api_reprice_history_conformance failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/insights/periods")
 def api_insights_periods():
     """Return list of all billing periods with basic carbon summary for each."""
@@ -5652,13 +5742,67 @@ def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
         del st["ci_kwh_weighted"]
         del st["ci_kwh_duration"]
 
+    # ── EV carbon (synthetic dispatch, single-source) ─────────────────────────
+    # 4.4.0 Δ5-wire: the EV carbon axis comes from the SYNTHETIC dispatch device, not the
+    # physical charger (mirrors the cost side's single-source rule). The credit is the draw
+    # gap — the car's full completed-dispatch draw minus the grid-clipped billing kWh
+    # (imp_kwh_ev) — valued at the block's grid intensity (carbon.py; price never enters).
+    # ADDITIVE: a new `ev_carbon` key only; every existing field above is byte-identical.
+    # Non-IOG (no completed dispatch in range) ⇒ zeros ⇒ the template shows nothing.
+    ev_carbon_block = None
+    try:
+        import carbon as _carbon
+        _unclipped = {}
+        for _r in store._conn.execute(
+                "SELECT slot_start, energy_kwh FROM dispatch_history "
+                "WHERE kind='completed' AND slot_start >= ? AND slot_start < ?",
+                (utc_start, utc_end)):
+            _e = _r["energy_kwh"]
+            if _e is None:
+                continue
+            _v = abs(float(_e))
+            if _v > 1e-9:
+                _unclipped[_r["slot_start"]] = _unclipped.get(_r["slot_start"], 0.0) + _v
+        if _unclipped:
+            _ev_rows = store._conn.execute(
+                "SELECT block_start, imp_kwh_ev, carbon_intensity_g FROM blocks "
+                "WHERE meter_id='electricity_main' AND imp_kwh_ev IS NOT NULL "
+                "AND imp_kwh_ev > 0 AND block_start >= ? AND block_start < ?",
+                (utc_start, utc_end)).fetchall()
+            _agg = _carbon.period_ev_saving(
+                ((r["block_start"], r["imp_kwh_ev"], r["carbon_intensity_g"]) for r in _ev_rows),
+                _unclipped)
+            if _agg["clipped_kwh"] > 0:
+                ev_carbon_block = {
+                    "source":        "synthetic_dispatch",
+                    "grid_g":        _agg["grid_g"],
+                    "saving_g":      _agg["saving_g"],
+                    "gross_g":       _agg["gross_g"],
+                    "clipped_kwh":   round(_agg["clipped_kwh"], 3),
+                    "credit_blocks": _agg["credit_blocks"],
+                }
+    except Exception:
+        logger.debug("insights: synthetic EV carbon unavailable", exc_info=True)
+
+    # SINGLE-SOURCE EV on IOG (watch #8 — the carbon twin of P4.15): when the synthetic dispatch
+    # EV carbon exists, IT (not the physical charger) is authority for the carbon EV axis. Drop the
+    # physical EV device from the breakdown (superseded — its metered carbon can diverge wildly from
+    # the dispatch truth: the fixture reads 3129 kg physical vs 141 kg dispatch), net the SYNTHETIC
+    # EV GRID carbon/kWh from the house remainder (the behind-meter saving never crossed the grid, so
+    # it is NOT subtracted), and keep non-EV sub-meters. Non-IOG (no dispatch) ⇒ byte-identical.
+    if ev_carbon_block:
+        for _m in [mid for mid, st in list(sub_totals.items())
+                   if (st.get("meter_type") or "") == "ev_charger"
+                   or any(k in mid.lower() for k in ("ev", "charger"))]:
+            sub_totals.pop(_m, None)
     total_sub_imp_kwh  = sum(st["imp_kwh"]   for st in sub_totals.values())
     total_sub_carbon_g = sum(st["carbon_g"]  for st in sub_totals.values())
-    house_imp_kwh    = max(0.0, main_imp_kwh - total_sub_imp_kwh)
+    _syn_ev_kwh    = ev_carbon_block["clipped_kwh"] if ev_carbon_block else 0.0
+    _syn_ev_carbon = ev_carbon_block["grid_g"]      if ev_carbon_block else 0.0
+    house_imp_kwh    = max(0.0, main_imp_kwh - total_sub_imp_kwh - _syn_ev_kwh)
     house_ci_imp_kwh = max(0.0, main_ci_imp_kwh - sum(
-        st.get("ci_imp_kwh", 0.0) for st in sub_totals.values()
-    ))
-    house_carbon_g   = max(0.0, cg_imp - total_sub_carbon_g) if has_carbon else None
+        st.get("ci_imp_kwh", 0.0) for st in sub_totals.values()) - _syn_ev_kwh)
+    house_carbon_g   = max(0.0, cg_imp - total_sub_carbon_g - _syn_ev_carbon) if has_carbon else None
     house_avg_intensity = round(house_carbon_g / house_ci_imp_kwh, 1) \
         if house_carbon_g and house_ci_imp_kwh > 0 else None
 
@@ -5691,11 +5835,13 @@ def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
     except Exception:
         pass
 
+
     return {
         "has_carbon":           has_carbon,
         "carbon_coverage_pct":  coverage_pct,
         "data_start":           data_start,
         "generation_mix":       generation_mix,
+        "ev_carbon":            ev_carbon_block,
         "imp_kwh":              round(main_imp_kwh, 3),
         "exp_kwh":              round(main_exp_kwh, 3),
         "ci_imp_kwh":           round(main_ci_imp_kwh, 3),
@@ -5953,18 +6099,25 @@ def _dispatch_ev_split_by_bucket(main_by_slot, ev_by_slot, bucket_fn,
     return out
 
 
-def _apply_ev_split_to_summary_rows(rows, meters_list, ev_by_day,
-                                    color="#8b5cf6", label="EV (from dispatch)") -> bool:
+def _apply_ev_split_to_summary_rows(rows, meters_list, ev_by_bucket,
+                                    color="#8b5cf6", label="EV (from dispatch)",
+                                    key_fn=None) -> bool:
     """Split each row's electricity_main import segment into a derived EV slice + a
-    reduced house slice, per {local_date: {"kwh","cost"}} from _dispatch_ev_split_by_bucket.
+    reduced house slice, per {bucket: {"kwh","cost"}} from _dispatch_ev_split_by_bucket.
     DISPLAY-ONLY: the row's top-level imp_kwh/imp_cost/net_cost are never touched, so the
     chart totals, the data-table Totals row, and the bill stay byte-identical — only the
     'Direct' stack segment is subdivided. Appends an 'ev_dispatch' meter to meters_list
-    when any row splits. Mutates in place; returns True if applied. Pure/testable."""
+    when any row splits. Mutates in place; returns True if applied. Pure/testable.
+
+    `key_fn(row)` maps a row to its bucket key — defaults to the local date (the daily /
+    monthly / yearly views); the HH view passes `lambda r: r["slot"]` so the same carve
+    lands on the half-hour bars."""
+    def _date_key(_row):
+        return "%04d-%02d-%02d" % (_row["year"], _row["month"], _row["day"])
+    _key = key_fn or _date_key
     applied = False
     for _row in rows:
-        _ds = "%04d-%02d-%02d" % (_row["year"], _row["month"], _row["day"])
-        _ev = ev_by_day.get(_ds)
+        _ev = ev_by_bucket.get(_key(_row))
         _mm = (_row.get("meters") or {}).get("electricity_main")
         if not _ev or not _mm:
             continue
@@ -6185,27 +6338,95 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
             return mt in ("ev", "ev_charger") or any(
                 k in (mid or "").lower() for k in ("ev", "charger"))
 
+        # SYNTHETIC EV IS THE SPINE (design — synthetic-EV authority). The EV portion is taken
+        # from the block's dispatch-derived 'ev' SEGMENT (Octopus's own smart-charge energy,
+        # what they cost), NOT from a physical EV clamp's metered draw. A physical EV sub-meter
+        # is therefore SUPERSEDED here — surfaced as a posterity row (shown, not counted) — so
+        # it never double-counts. Non-dispatch home charging (granny cable / dumb charger) has
+        # no dispatch segment, so it stays in the house remainder by construction (accepted).
+        # Non-EV sub-meters (heat pump, …) keep their metered kWh, priced at the house band.
+        # Tariff-gated for free: a block has an 'ev' segment only while on a dispatch tariff, so
+        # off-tariff blocks fall back to the sensor via the column path (BL-27 not entered).
+        _ev_seg_k_by_block: dict = defaultdict(float)
+        for _r in _seg_rows:
+            if _r["attribution"] == "ev":
+                _ev_seg_k_by_block[_r["block_start"]] += float(_r["kwh"] or 0.0)
+        _EV_SYN_ID = "ev_dispatch"
+        _phys_ev_ids: set = set()
         _seg_dev: dict = {}
         _seg_house_k = _seg_house_c = 0.0
+        _syn_ev_k = _syn_ev_c = 0.0
         for _bs, _segs in _segs_by_block.items():
-            _devs = [{"meter_id": _m,
-                      "attribution": "ev" if _is_ev_dev(_m, _mt) else "house",
-                      "grid_kwh": _gk}
-                     for (_m, _mt, _gk) in _dev_by_block.get(_bs, [])]
+            _devs = []
+            for (_m, _mt, _gk) in _dev_by_block.get(_bs, []):
+                if _is_ev_dev(_m, _mt):
+                    _phys_ev_ids.add(_m)          # superseded by synthetic → posterity
+                    continue
+                _devs.append({"meter_id": _m, "attribution": "house", "grid_kwh": _gk})
+            _evk = _ev_seg_k_by_block.get(_bs, 0.0)
+            if _evk > 1e-9:                        # synthetic EV = the 'ev' segment kWh
+                _devs.append({"meter_id": _EV_SYN_ID, "attribution": "ev", "grid_kwh": _evk})
             _res = _ps.price_devices_hybrid(_segs, _devs)
             for _m, _v in _res["devices"].items():
-                _d = _seg_dev.setdefault(_m, {"kwh": 0.0, "cost": 0.0})
-                _d["kwh"] += _v["kwh"]; _d["cost"] += _v["cost"]
+                if _m == _EV_SYN_ID:
+                    _syn_ev_k += _v["kwh"]; _syn_ev_c += _v["cost"]
+                else:
+                    _d = _seg_dev.setdefault(_m, {"kwh": 0.0, "cost": 0.0})
+                    _d["kwh"] += _v["kwh"]; _d["cost"] += _v["cost"]
             _seg_house_k += _res["remainder"]["kwh"]
             _seg_house_c += _res["remainder"]["cost"]
-        # Overwrite the headline device kWh/cost and the house remainder (rate-tier
-        # breakdowns are left on the column basis for now — byte-identical uncapped).
+        # Non-EV devices → overwrite their headline kWh/cost from segments.
         for _m, _v in _seg_dev.items():
             if _m in sub_totals:
                 sub_totals[_m]["imp_kwh"]  = _v["kwh"]
                 sub_totals[_m]["imp_cost"] = _v["cost"]
+        # Physical EV clamp(s) → superseded by the synthetic EV. Drop from the breakdown
+        # entirely so there's no 0-kWh ghost row in the UI; the sensor's block data stays
+        # untouched in the DB, kept only for a possible future use (no consumer for a posterity
+        # row today).
+        for _m in _phys_ev_ids:
+            sub_totals.pop(_m, None)
+        # Synthetic EV headline row (the authority).
+        if _syn_ev_k > 1e-9:
+            sub_totals[_EV_SYN_ID] = {
+                "imp_kwh": round(_syn_ev_k, 6), "imp_cost": round(_syn_ev_c, 6), "exp_kwh": 0.0,
+                "label": "EV (from dispatch)", "meter_type": "ev_charger", "derived": True,
+                "rate_tiers": defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "blocks": 0}),
+            }
         house_imp_kwh  = _seg_house_k
         house_imp_cost = _seg_house_c
+
+        # P4.2: rebuild the main-import RATE TIERS from segments too. Otherwise a cap-boundary
+        # block contributes at its single BLENDED imp_rate (a unique mid-value per boundary block),
+        # which proliferates distinct rates past _MAX_RATE_ROWS and collapses the whole Usage-Stats
+        # rate breakdown into one meaningless average row (observed on the 3h-cap fixture: 16
+        # boundary blends → one 0.0752 row). From segments each boundary block splits into its two
+        # REAL bands (off-peak + peak), matching the bill. Byte-identical uncapped (1 band/block).
+        # Cluster adjacent segment rates within _SPLIT_BAND_EPS into display bands (as the bill's
+        # _bill_rate_rows does) so per-slot jitter (0.0549 vs 0.055) doesn't shatter one band into
+        # look-alike rows — otherwise the distinct-rate count still trips _collapse_rate_tiers.
+        _acc: dict = defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "blk": set()})
+        for _r in _seg_rows:
+            _ir = _r["inc_rate"]
+            if not _ir:
+                continue
+            _v = _acc[round(_ir, 6)]
+            _v["kwh"] += _r["kwh"]; _v["cost"] += _r["kwh"] * _ir; _v["blk"].add(_r["block_start"])
+        _EPS = 0.0015
+        _bands: list = []
+        for _rk in sorted(_acc):
+            _v = _acc[_rk]
+            if _bands and (_rk - _bands[-1]["max"]) <= _EPS:
+                _b = _bands[-1]
+                _b["kwh"] += _v["kwh"]; _b["cost"] += _v["cost"]; _b["blk"] |= _v["blk"]; _b["max"] = _rk
+            else:
+                _bands.append({"kwh": _v["kwh"], "cost": _v["cost"], "blk": set(_v["blk"]), "max": _rk})
+        rate_tiers.clear()
+        for _b in _bands:
+            _wr = round(_b["cost"] / _b["kwh"], 6) if _b["kwh"] else 0.0
+            rate_tiers[_wr]["kwh"]  += _b["kwh"]
+            rate_tiers[_wr]["cost"] += _b["cost"]
+            rate_tiers[_wr]["blocks"] = len(_b["blk"])
 
     # ── Synthetic dispatch-derived EV device (display-only; BL-22) ───────────────
     # For an account with NO EV sub-meter AND no other sub-meters (a pure-API /
@@ -6214,7 +6435,10 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
     # car-vs-house. Guaranteed no-op when an EV meter (or any sub-meter) exists.
     # Grid-clipped per slot (EV can't exceed that slot's grid import) with its cost
     # apportioned from the slot's import cost, so house + EV == grid import exactly.
-    if _configured_ev_meter_id(cfg) is None and not sub_totals:
+    if not _seg_rows and _configured_ev_meter_id(cfg) is None and not sub_totals:
+        # Fallback ONLY when BL-27 did not run (range not fully segmented). When it did, the
+        # synthetic EV is already derived above from the 'ev' segments — running this too would
+        # double-count.
         try:
             _drows = store._conn.execute(
                 "SELECT slot_start, kind, energy_kwh FROM dispatch_history "
@@ -8121,7 +8345,30 @@ def api_corrections_apply():
             # ambiguous-review flag on the block (BL-18).
             _mark = (", rate_corrected = 1, needs_review = 0, review_reason = NULL"
                      if col in ("imp_rate", "exp_rate") else "")
-            if recalc_cost:
+            if recalc_cost and channel == "import":
+                # P4.6 (watch #11) — the corrected rate applies to the WHOLE block: imp_cost
+                # already recomputes over imp_kwh, which INCLUDES the EV kWh. Keep the EV-split
+                # columns consistent in the same UPDATE so imp_cost_ev + imp_cost_remainder ==
+                # imp_cost and imp_rate_ev tracks the correction — otherwise the split surfaces
+                # (EV bar, per-rate breakdown) keep reading the stale pre-correction figure
+                # (the correction-tool "partial-heal" that left the 2026-08-18 EV columns 100x).
+                # Non-EV blocks (imp_kwh_ev IS NULL) leave the split columns untouched.
+                cur = store._conn.execute(
+                    f"""UPDATE blocks
+                        SET imp_rate = ?,
+                            imp_cost = ROUND(imp_kwh * ?, 6),
+                            imp_rate_ev = CASE WHEN imp_kwh_ev IS NOT NULL
+                                               THEN ? ELSE imp_rate_ev END,
+                            imp_cost_ev = CASE WHEN imp_kwh_ev IS NOT NULL
+                                               THEN ROUND(imp_kwh_ev * ?, 6)
+                                               ELSE imp_cost_ev END,
+                            imp_cost_remainder = CASE WHEN imp_kwh_ev IS NOT NULL
+                                               THEN ROUND(imp_kwh * ? - ROUND(imp_kwh_ev * ?, 6), 6)
+                                               ELSE imp_cost_remainder END{_mark}
+                        WHERE {where}""",
+                    [value, value, value, value, value, value] + params
+                )
+            elif recalc_cost:
                 cost_col = "imp_cost" if channel == "import" else "exp_cost"
                 cur = store._conn.execute(
                     f"""UPDATE blocks
@@ -8161,6 +8408,36 @@ def api_corrections_apply():
                             f"UPDATE blocks SET imp_rate = ? WHERE {dev}",
                             [value] + bs_list)
                     store._conn.commit()
+
+                    # P4.10 (watch #11) — on a SEGMENTED account (4.4.0+) the block's pricing
+                    # ALSO lives in block_segments, which the segment-based surfaces read
+                    # (Usage-Stats rate-tiers P4.2, the EV/house split). A rate correction that
+                    # only rewrote the columns would leave segments on the stale rate. The
+                    # correction flattens the block to ONE import rate (imp_cost = imp_kwh ×
+                    # value), so every import segment on the affected blocks takes that rate —
+                    # Σ(kwh×inc_rate) == imp_cost still holds (Σ kwh == imp_kwh is unchanged).
+                    # Segment exc_rate is rescaled PROPORTIONALLY (P4.18) — preserving each
+                    # segment's exc/inc ratio — NOT left as-is: leaving it would break the ratio
+                    # even on a normal correction (inc→0.28 but exc still 0.2857 > inc), and it
+                    # is the exact hole that stopped the Cost-Corrections tool from repairing a
+                    # capped block whose segments the upgrade sweep built in PENCE (segment inc
+                    # AND exc both pence). `exc_rate * value / inc_rate` uses the OLD inc_rate
+                    # (SQLite evaluates all RHS against the original row), so pence→£ and normal
+                    # corrections both land on the right exc. Guarded on non-zero inc + non-NULL
+                    # exc (NULL exc → view falls back to inc÷VAT, leave it). Gated on recalc and
+                    # skipped on pre-4.4.0 DBs with no block_segments table.
+                    if recalc_cost and store._conn.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                            "AND name = 'block_segments'").fetchone():
+                        store._conn.execute(
+                            f"UPDATE block_segments SET "
+                            f"  exc_rate = CASE WHEN exc_rate IS NOT NULL AND inc_rate != 0 "
+                            f"                  THEN ROUND(exc_rate * ? / inc_rate, 6) "
+                            f"                  ELSE exc_rate END, "
+                            f"  inc_rate = ? "
+                            f"WHERE channel = 'import' AND block_start IN ({ph})",
+                            [value, value] + bs_list)
+                        store._conn.commit()
 
             logger.info(
                 "api_corrections_apply: %s %s_rate=%.6f recalc=%s %d main block(s) "
