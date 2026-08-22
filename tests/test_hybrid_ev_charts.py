@@ -56,7 +56,9 @@ class TestApplyHybridEvCharts(unittest.TestCase):
         A([r], ml, "ev_charger", {"2026-06-01": {"kwh": 5.0, "cost": 0.35}})
         ev = [m for m in ml if m["id"] == "ev_charger"][0]
         self.assertEqual(ev["label"], "EV")
-        self.assertEqual(ev["color"], "#8b5cf6")
+        # H6c: the EV series keeps its DEVICE colour (relabel only) — not forced to purple —
+        # so it stays at the palette index that came before (accessibility: distinct from house).
+        self.assertEqual(ev["color"], "#0a0")
 
     def test_synthetic_bucket_with_no_physical_draw(self):
         # dispatch EV in a bucket where the physical meter recorded nothing

@@ -2438,8 +2438,9 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     _ev_day_map = None if _ev_phys_id else _ev_slot_map
     if _ev_slot_map:
         meter_colors["ev_dispatch"] = "#8b5cf6"
-    if _ev_phys_id:
-        meter_colors[_ev_phys_id] = "#8b5cf6"
+    # H6c: the EV line keeps its DEVICE-INDEX palette colour (the colour the physical meter
+    # had before), synthetic or recorded — not the synthetic purple — so it stays distinct
+    # from the blue house line (accessibility — see roadmap BL-29).
 
     # ── Billing periods ──
     # Use historically correct billing_day per block from config_periods join.
