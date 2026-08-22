@@ -47,6 +47,32 @@ class TestBillSplitRows(unittest.TestCase):
         html = ec._bill_split_rows(sm, "£")
         self.assertIn("(transition)", html)      # legacy path keeps the blended row
 
+    def test_same_band_ev_home_share_one_rate(self):
+        # B1: EV & Home in one band (same tariff rate) must display the SAME rate, even when
+        # each row's independent cost/kWh would diverge on small kWh (the reported bug).
+        sm = self._summary(ev={0.3231: (2.029, 0.624)},     # cost/kwh = 0.30754
+                           home={0.3231: (2.977, 0.916)})   # cost/kwh = 0.30769
+        rows = _rows(ec._bill_split_rows(sm, "£"))
+        ev_rate   = [float(r) for (l, r, k, c) in rows if l == "EV"][0]
+        home_rate = [float(r) for (l, r, k, c) in rows if l == "Home"][0]
+        self.assertEqual(ev_rate, home_rate)                       # matched, not 0.3075 vs 0.3077
+        # kWh + cost unchanged (display-only fix)
+        self.assertIn("2.029", ec._bill_split_rows(sm, "£"))
+        self.assertIn("2.977", ec._bill_split_rows(sm, "£"))
+
+    def test_in_period_rate_change_stays_separate_bands(self):
+        # B1 rate-change safety: two peak rates > _SPLIT_BAND_EPS apart (a mid-period change)
+        # must remain TWO bands — never blended — each with EV & Home matched at its OWN rate.
+        sm = self._summary(ev={0.3231: (2.0, 0.646), 0.3400: (1.0, 0.340)},
+                           home={0.3231: (3.0, 0.969), 0.3400: (2.0, 0.680)})
+        rows = _rows(ec._bill_split_rows(sm, "£"))
+        by_rate = {}
+        for (lbl, rate, kwh, cost) in rows:
+            by_rate.setdefault(round(float(rate), 3), {})[lbl] = float(rate)
+        self.assertEqual(sorted(by_rate), [0.323, 0.340])          # two distinct bands, not one blend
+        for band, pair in by_rate.items():
+            self.assertEqual(pair["EV"], pair["Home"])             # matched within each band
+
     def test_none_when_no_ev(self):
         sm = self._summary(ev={}, home={OFF: (200.0, 10.98)})
         self.assertIsNone(ec._bill_split_rows(sm, "£"))  # no EV → caller shows plain rows
