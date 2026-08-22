@@ -1073,8 +1073,14 @@ def _bill_split_rows(summary, currency, exc=False):
     if (sum(v["kwh"] for v in ev_by_rate.values()) + (ev_tr.get("kwh") or 0.0)) <= 1e-9:
         return None
 
-    def _row(label, kwh, cost, note=""):
-        rate = (cost / kwh) if kwh else 0.0
+    def _row(label, kwh, cost, note="", rate=None):
+        # B1: EV and Home in the SAME collapsed band are the same tariff rate. Show one
+        # shared per-band rate (passed in) rather than each row re-deriving cost/kWh, which
+        # diverges on small-kWh bands from independent per-block cost rounding. Per-band, so
+        # a genuine in-period rate change (> _SPLIT_BAND_EPS) is a separate band → separate
+        # rows at their own rates. kWh + cost printed here are unchanged (still exact).
+        if rate is None:
+            rate = (cost / kwh) if kwh else 0.0
         cs = f"({-cost:.3f})" if cost < 0 else f"{cost:.3f}"   # 3dp, as the bill
         return (f'\n        <tr><td>{label}</td><td>{rate:.4f}{note}</td>'
                 f'<td>{kwh:.3f}</td><td>{cs}</td></tr>')
@@ -1099,10 +1105,14 @@ def _bill_split_rows(summary, currency, exc=False):
             h = home_by_rate.get(r)
             if h:
                 hk += h["kwh"]; hc += h.get(_ck, 0.0)
+        # Shared band rate — kWh-weighted over BOTH series for THIS band only, so EV and
+        # Home always read identically within a band and a real in-period rate change (its
+        # own band) keeps its own rate.
+        _band_rate = ((ec + hc) / (ek + hk)) if (ek + hk) > 1e-9 else 0.0
         if ek > 1e-9:
-            html += _row("EV", ek, ec)
+            html += _row("EV", ek, ec, rate=_band_rate)
         if hk > 1e-9:
-            html += _row("Home", hk, hc)
+            html += _row("Home", hk, hc, rate=_band_rate)
     _note = ' <span style="opacity:0.6;">(transition)</span>'
     if (ev_tr.get("kwh") or 0.0) > 1e-9:
         html += _row("EV", ev_tr["kwh"], ev_tr.get(_ck, 0.0), _note)
