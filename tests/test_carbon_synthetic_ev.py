@@ -73,5 +73,50 @@ class TestCarbonSyntheticEv(unittest.TestCase):
         self.assertEqual(r["house_carbon_g"], 0.0)                # 2000 − 3000 physical → floored (unchanged)
 
 
+    def test_straddling_window_folds_recorded_preseam_ev(self):
+        # H4: a window straddling the dispatch seam counts SYNTHETIC EV post-seam +
+        # RECORDED physical EV pre-seam (imp_kwh_ev NULL) — not synthetic only.
+        A, Ae = "2025-07-07T23:00:00", "2025-07-07T23:30:00"   # post-seam (dispatch)
+        Bp, Bpe = "2025-07-06T22:00:00", "2025-07-06T22:30:00" # pre-seam  (no dispatch)
+        st = BlockStore(":memory:")
+        with st._conn:
+            cp = st._conn.execute(
+                "INSERT INTO config_periods (effective_from, billing_day, block_minutes, timezone, "
+                "currency_symbol, currency_code) VALUES ('2024-01-01T00:00:00',1,30,'UTC','£','GBP')"
+            ).lastrowid
+            st._conn.execute("INSERT INTO meters (config_period_id, meter_id, is_sub_meter, meter_type) "
+                             "VALUES (?, 'electricity_main', 0, '')", (cp,))
+            st._conn.execute("INSERT INTO meters (config_period_id, meter_id, is_sub_meter, meter_type, "
+                             "parent_meter_id) VALUES (?, 'ev_charger', 1, 'ev_charger', 'electricity_main')", (cp,))
+            # post-seam main: 10 kWh @200g, synthetic EV 4 kWh
+            st._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, imp_kwh, "
+                "exp_kwh, carbon_g, carbon_intensity_g, imp_kwh_ev) VALUES (?,?, 'electricity_main', "
+                "?, 10.0, 0.0, 2000.0, 200.0, 4.0)", (A, Ae, cp))
+            st._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, imp_kwh, "
+                "carbon_g) VALUES (?,?, 'ev_charger', ?, 4.0, 900.0)", (A, Ae, cp))
+            st._conn.execute(
+                "INSERT INTO dispatch_history (slot_start, kind, energy_kwh, first_seen, last_seen) "
+                "VALUES (?, 'completed', 4.0, ?, ?)", (A, A, A))
+            # pre-seam main: 8 kWh @200g, imp_kwh_ev NULL; physical EV recorded 3 kWh / 600 g
+            st._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, imp_kwh, "
+                "exp_kwh, carbon_g, carbon_intensity_g) VALUES (?,?, 'electricity_main', "
+                "?, 8.0, 0.0, 1600.0, 200.0)", (Bp, Bpe, cp))
+            st._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, imp_kwh, "
+                "carbon_g) VALUES (?,?, 'ev_charger', ?, 3.0, 600.0)", (Bp, Bpe, cp))
+        st._conn.commit()
+        r = server._aggregate_insights(st, _cfg(), "2025-07-01T00:00:00", "2025-08-01T00:00:00")
+        ev = r["ev_carbon"]
+        self.assertIsNotNone(ev)
+        self.assertAlmostEqual(ev["clipped_kwh"], 4.0, places=3)     # synthetic (post-seam)
+        self.assertAlmostEqual(ev["recorded_kwh"], 3.0, places=3)    # recorded (pre-seam)
+        self.assertAlmostEqual(ev["ev_kwh_total"], 7.0, places=3)
+        self.assertAlmostEqual(ev["recorded_g"], 600.0, places=1)
+        self.assertAlmostEqual(ev["grid_g_total"], ev["grid_g"] + 600.0, places=1)
+
+
 if __name__ == "__main__":
     unittest.main()

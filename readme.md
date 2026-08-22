@@ -84,6 +84,14 @@ A Home Assistant add-on that records your electricity usage in precise configura
 - **Usage Insights** — cost breakdown by meter, rate period distribution, grid position, peak demand window, per-device costs with period comparison narrative in plain English
 - Exports any chart tab as a PDF report — Billing (with per-day data tables and billing summary), Heatmaps, and Usage Stats
 
+> **Known limitation — historical car/home split on Intelligent Octopus Go.**
+>
+> It helps to separate two things a half-hour block carries. The **total** is what that half-hour cost you; your bill is just these totals stacked up. On Intelligent Octopus Go that total is Octopus's own billed figure, and it already has the car/home (and, on the capped tariff, 4-rate) split *baked into it* — Octopus computes the split behind the scenes and hands EMT the finished number. **Your bill is therefore always correct**, whether the data was captured live or imported later.
+>
+> The **split** — how much of that total was the *car* versus the *home* — is something EMT shows by decomposing each block's total, and that decomposition needs Octopus's live smart-charge **dispatch** records (which slots the car charged, and how much). Octopus only exposes those in real time, so they can't be fetched for the past. That's the entire limitation: for a **backfilled or imported history** EMT has each block's correct total but not the dispatch behind it, so it can't pull the total back apart into car versus home — *like trying to un-bake a cake to get the eggs back out*. The split, and the capped cap-boundary rate breakdown, are only precise from the day EMT started capturing dispatch.
+>
+> If your EV was on a **physical sub-meter already recording in Home Assistant**, the historical car/home *energy* split can be rebuilt from HA's recorder (Device History) — a second recording to lean on; the cap-boundary *rate* split still can't be recovered. Nothing here affects your bill — only the car/home split and rate-band breakdown detail.
+
 ---
 
 ## 📖 Documentation
