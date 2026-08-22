@@ -1,14 +1,12 @@
 """
-test_ev_back_attribution.py — BL-9 fix: back-attribute the EV/Home split on blocks whose
-COMPLETED dispatch arrived AFTER the block was priced.
+test_ev_back_attribution.py — BL-9/BL-27 fix: back-attribute the EV/Home split on blocks
+whose COMPLETED dispatch arrived AFTER the block was priced.
 
 `imp_kwh_ev` is stamped once, at pricing, from the completed dispatch known then. Octopus
 reports a slot's completed energy hours later — often after the block was priced with only a
-'planned' dispatch — so the real charge is never attributed: it sits in Home, and the
-reconcile re-stamp skips it (it only touches rows where imp_kwh_ev IS NOT NULL). Two
-instances that priced the same slot at different times relative to that late record then
-disagree permanently (the prod vs prod-dev split mismatch). `_attribute_missing_ev_split`
-re-runs the IOG split on such blocks so they converge deterministically.
+'planned' dispatch — so the real charge is never attributed: it sits in Home. Two instances
+that priced the same slot at different times then disagree permanently. On 4.4.0 the fix
+rewrites the columns AND the block's segments (the readers' source of truth).
 """
 
 import os
@@ -17,6 +15,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import engine
+import pricing_segments as ps
 from block_store import BlockStore
 
 OFF = 0.05493
@@ -72,15 +71,20 @@ class TestEvBackAttribution(unittest.TestCase):
             "WHERE block_start=? AND meter_id='electricity_main'",
             (slot or self.SLOT,)).fetchone()
 
-    def test_attributes_completed_after_pricing(self):
+    def test_attributes_columns_and_segments(self):
+        # NULL split + completed dispatch → EV attributed on the columns AND the segments.
         self._block(imp_kwh=3.0, ev=None)
         self._completed(energy=-2.0)
         self.assertEqual(engine._attribute_missing_ev_split(), 1)
         r = self._row()
         self.assertAlmostEqual(r["imp_kwh_ev"], 2.0, places=5)
         self.assertAlmostEqual(r["imp_rate_ev"], OFF, places=5)
-        self.assertAlmostEqual(r["imp_cost_ev"], round(2.0 * OFF, 6), places=6)
         self.assertEqual(r["imp_ev_band"], "off_peak")
+        # segments (BL-27 source of truth) now carry the EV slice too
+        segs = [ps.Segment(**x) for x in
+                self.st.get_block_segments(self.SLOT, "electricity_main")]
+        self.assertAlmostEqual(ps.attribution_kwh(segs, "ev"), 2.0, places=5)
+        self.assertAlmostEqual(ps.total_kwh(segs), 3.0, places=5)          # reconciles to grid
 
     def test_clips_ev_to_grid_import(self):
         self._block(imp_kwh=1.5, ev=None)

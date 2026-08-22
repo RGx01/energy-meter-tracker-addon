@@ -698,6 +698,39 @@ window.EMT = window.EMT || {};
     .catch(function () {});
 })();
 
+/* ── Upgrade re-price sweep advisory ─────────────────────────────────────────
+   The first run after an upgrade re-prices history in the BACKGROUND (can be slow
+   on a large account; the engine keeps running throughout). Surface a patient-wait
+   banner via the global notification region — same style/dismiss pattern as the
+   other notices — and auto-clear it the moment the sweep completes. Dismissal is
+   per-session, so it reappears on a fresh load if still running but never nags. */
+(function () {
+  var ID = 'reprice-sweep';
+  var DISMISS_KEY = 'repriceSweepDismissed';
+  function check() {
+    fetch(apiUrl('/api/reprice-history-status'))
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || !d.in_progress) { EMT.dismiss(ID); return; }   // done → clear
+        if (sessionStorage.getItem(DISMISS_KEY)) return;         // hushed this session
+        EMT.notify({
+          id: ID,
+          level: 'info',
+          dismissible: true,
+          html: '\u23f3 <strong>Finishing your upgrade</strong> \u2014 EMT is re-pricing your ' +
+                'history in the background (' + d.remaining + ' block' +
+                (d.remaining === 1 ? '' : 's') + ' left). This can take a while on a large ' +
+                'account \u2014 please be patient and <strong>avoid restarting or rebuilding</strong>. ' +
+                'Some figures may look off until it finishes.',
+          onDismiss: function () { sessionStorage.setItem(DISMISS_KEY, '1'); }
+        });
+      })
+      .catch(function () {});
+  }
+  check();
+  setInterval(check, 30000);
+})();
+
 /* \u2500\u2500 BL-18: "blocks flagged for review" notice \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
    The dispatch reconciliation leaves genuinely-ambiguous blocks unpriced and
    flags them. Surface a dismissible pointer to the Corrections review list.

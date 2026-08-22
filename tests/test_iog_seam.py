@@ -81,11 +81,22 @@ class TestApplyIogSplit(unittest.TestCase):
         self.assertEqual(imp["ev_band"], "off_peak")  # uncapped: whole slot off-peak
 
     # ── capped: re-prices ───────────────────────────────────────────────────
+    def _house_pence(self):
+        # Production stores rate schedules in PENCE (RateSchedule / from_api_records keep the API's
+        # native value_inc_vat). compute_iog_split's capped branch converts pence→£, so the capped
+        # tests must feed pence; the £ assertions below then validate that conversion. (The uncapped
+        # / no-op tests take the overlay fall-through, not this branch, so `_house()` stays £.)
+        return RateSchedule([
+            ("2026-01-01T00:00:00", "2026-01-01T05:30:00", 7.0),    # night 7.0p
+            ("2026-01-01T05:30:00", "2026-01-01T23:30:00", 30.0),   # day  30.0p
+            ("2026-01-01T23:30:00", "2026-01-02T05:30:00", 7.0),    # night
+        ])
+
     def _capped(self):
         engine._kraken_rate_schedules = {
-            "import": self._house(),
-            "ev_device_off_peak": self._flat(0.05),
-            "ev_device_peak": self._flat(0.25)}
+            "import": self._house_pence(),
+            "ev_device_off_peak": self._flat(5.0),    # 5.0p
+            "ev_device_peak": self._flat(25.0)}       # 25.0p
 
     def test_capped_within_cap_freebie(self):
         self._capped()
@@ -101,9 +112,16 @@ class TestApplyIogSplit(unittest.TestCase):
 
     def test_capped_over_cap_ev_peak(self):
         self._capped()
-        # 7.5h completed dispatch in the cap-day → boundary 18:00; slot 18:30 over
+        # Charged-time cap (7 kW car → 3.5 kWh is a full 30-min slot). Twelve full slots
+        # = 6 h of charging → the cap is used up; the 18:30 slot is beyond it → EV peak.
+        import datetime as _dt
+        base = _dt.datetime(2026, 1, 1, 12, 0)
+        for i in range(12):
+            ts = (base + _dt.timedelta(minutes=30 * i)).isoformat()
+            te = (base + _dt.timedelta(minutes=30 * (i + 1))).isoformat()
+            self._completed(ts, 3.5, ts, te)
         self._completed("2026-01-01T18:30:00", 2.0,
-                        "2026-01-01T12:00:00", "2026-01-01T19:30:00")
+                        "2026-01-01T18:30:00", "2026-01-01T19:00:00")
         imp = self._imp(0.30, 0.90)
         self._apply(imp, start="2026-01-01T18:30:00", end="2026-01-01T19:00:00")
         self.assertAlmostEqual(imp["cost"], 0.80)     # 2*0.25 + 1*0.30
