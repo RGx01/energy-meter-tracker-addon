@@ -6319,7 +6319,9 @@ def _apply_hybrid_ev_to_summary_rows(rows, meters_list, ev_meter_id, hybrid_by_b
     for _m in meters_list:                              # one continuous 'EV' identity
         if _m.get("id") == ev_meter_id:
             _m["label"] = label
-            _m["color"] = color
+            # H6c: keep the device's own legend colour (its palette index) — do NOT force the
+            # synthetic purple, so 'EV' sits at the device colour that came before and stays
+            # distinguishable from the blue house line (accessibility — see roadmap BL-29).
             break
     return changed
 
