@@ -1852,7 +1852,7 @@ def _day_segment_split(main_import, meters):
     return out
 
 
-def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_minutes=30, currency='£', site_name=None, ev_slot_map=None, bill_rounding=False, fallback_vat=0.05):
+def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_minutes=30, currency='£', site_name=None, ev_slot_map=None, bill_rounding=False, fallback_vat=0.05, ev_relabel_meter=None, ev_label=None):
     slots = 1440 // block_minutes
     meter_kwh    = defaultdict(lambda: [0.0] * slots)
     meter_rate   = defaultdict(lambda: [0.0] * slots)
@@ -2084,6 +2084,11 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
         x_ranges.append(f"{h_s:02d}:{m_s:02d} - {h_e:02d}:{m_e:02d}")
 
     # ── Summary panel ──
+    # H6b: on a has-EV-meter account, present the physical EV sub-meter as one continuous
+    # 'EV' identity (matching Usage Stats / the period bill). Display-only relabel — the
+    # metered kWh/cost are untouched, so the day total and the bill are byte-identical.
+    if ev_relabel_meter and ev_label and ev_relabel_meter in meter_display_name:
+        meter_display_name[ev_relabel_meter] = ev_label
     sub_meter_names = [k for k in summary_kwh if k not in ("electricity_main", "electricity_main_export")]
 
     total_import      = sum(v for k, v in summary_kwh.items()  if not k.endswith("_export") and v > 0)
@@ -2408,8 +2413,15 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         _ev_slot_map = _dispatch_ev_slot_map(store, blocks, cfg)
         _ev_fold_devices = None
         _ev_label = "EV (from dispatch)"
+    # Day tables use a GATED dispatch map so an ACTIVE EV meter shows its own metered EV
+    # (no phantom 'EV (from dispatch)' carve, no pre-seam bleed); the physical series is
+    # relabelled 'EV'. A no-EV-meter account keeps the dispatch split. The period bill
+    # summary still uses the hybrid fold-back above.
+    _ev_day_map = None if _ev_phys_id else _ev_slot_map
     if _ev_slot_map:
         meter_colors["ev_dispatch"] = "#8b5cf6"
+    if _ev_phys_id:
+        meter_colors[_ev_phys_id] = "#8b5cf6"
 
     # ── Billing periods ──
     # Use historically correct billing_day per block from config_periods join.
@@ -2760,7 +2772,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         # Daily charts
         day_charts_html = ""
         for day in ps["days"]:
-            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_slot_map, bill_rounding=_bill_rounding, fallback_vat=_vat_at(day))
+            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_day_map, bill_rounding=_bill_rounding, fallback_vat=_vat_at(day), ev_relabel_meter=_ev_phys_id, ev_label=("EV" if _ev_phys_id else None))
 
         open_attr    = "open" if charts_open else ""
         toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}"
@@ -2833,7 +2845,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
 
         day_charts_html = ""
         for day in gs["days"]:
-            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, chart_prefix=f"{pid_prefix}_", block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_slot_map, bill_rounding=_bill_rounding, fallback_vat=_vat_at(day))
+            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, chart_prefix=f"{pid_prefix}_", block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_day_map, bill_rounding=_bill_rounding, fallback_vat=_vat_at(day), ev_relabel_meter=_ev_phys_id, ev_label=("EV" if _ev_phys_id else None))
 
         toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}"
         # Quarter/year sections can hold 90–365 day charts; default the panel
