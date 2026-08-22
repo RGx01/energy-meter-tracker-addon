@@ -1360,7 +1360,7 @@ def _ev_meter_id(cfg):
     return None
 
 
-def _dispatch_ev_slot_map(store, blocks, cfg):
+def _dispatch_ev_slot_map(store, blocks, cfg, gated=True):
     """{slot_start(UTC ISO): {"kwh","cost","rate"}} — per-slot EV reconstructed from
     COMPLETED dispatches (Octopus's own per-slot EV energy), grid-clipped to that slot's
     main import and cost-apportioned from the slot's import cost. Gated to no-sub-meter
@@ -1376,7 +1376,7 @@ def _dispatch_ev_slot_map(store, blocks, cfg):
     _evm = _ev_meter_id(cfg)
     covered = ({b["start"] for b in blocks
                 if b and b.get("start") and _evm in (b.get("meters") or {})}
-               if _evm else set())
+               if (_evm and gated) else set())
     starts = [b["start"] for b in blocks if b and b.get("start")]
     if not starts:
         return {}
@@ -1450,8 +1450,65 @@ def _dispatch_ev_slot_map(store, blocks, cfg):
     return out
 
 
+def _hybrid_ev_slot_map(store, blocks, cfg):
+    """Per-slot HYBRID EV for the billing breakdown on a has-EV-meter account: SYNTHETIC
+    (dispatch / stored imp_kwh_ev / segments — bill-authoritative) wherever it exists,
+    else the RECORDED physical EV sub-meter's own metered slot. One continuous EV. The
+    synthetic map is taken UNGATED (the coverage gate is what kept it off for an active
+    meter); the recorded fallback fills the pre-seam slots. Total-safety is the caller's
+    (fold the physical EV line into the remainder before carving this out)."""
+    out = dict(_dispatch_ev_slot_map(store, blocks, cfg, gated=False))   # synthetic, all slots
+    evm = _ev_meter_id(cfg)
+    if evm:
+        for b in blocks:
+            slot = (b or {}).get("start")
+            if not slot or slot in out:                    # synthetic already owns this slot
+                continue
+            ch = (((b.get("meters") or {}).get(evm) or {}).get("channels", {}) or {}).get("import", {}) or {}
+            try:
+                k = float(ch.get("kwh_total", ch.get("kwh")) or 0.0)
+                c = float(ch.get("cost") or 0.0)
+                r = round(float(ch.get("rate_used", ch.get("rate")) or 0.0), 4)
+            except Exception:
+                continue
+            if k > 1e-9:
+                out[slot] = {"kwh": k, "cost": c, "rate": r}   # recorded physical (pre-seam)
+    return out
+
+
+def _fold_ev_submeter_into_remainder(summary, ev_devices):
+    """Move the physical EV sub-meter line(s) back into the main-import remainder so the
+    hybrid EV can be carved from it. TOTAL-SAFE: energy only moves between the EV line and
+    the remainder, so Total Import / total_cost are untouched. Matches sub-meter lines by
+    device name (or an ev/charger keyword). Returns True if anything folded."""
+    totals = summary.get("totals") or {}
+    meters = summary.get("meters") or {}
+    meta   = summary.get("meter_meta") or {}
+    rem_key = next((k for k in totals
+                    if k.endswith("/ Import") and not totals[k].get("is_submeter")), None)
+    if not rem_key:
+        return False
+    rem = meters.setdefault(rem_key, {})
+    def _is_ev_line(k):
+        d = str((meta.get(k, {}) or {}).get("device") or "")
+        return (d in ev_devices) or ("charger" in d.lower()) or ("charger" in k.lower())
+    folded = False
+    for key in [k for k in list(totals)
+                if totals[k].get("is_submeter") and k.endswith("/ Import") and _is_ev_line(k)]:
+        for rate, v in (meters.get(key) or {}).items():
+            _r = rem.setdefault(rate, {"kwh": 0.0, "cost": 0.0, "read_start": None, "read_end": None})
+            _r["kwh"]  = round(_r.get("kwh", 0.0)  + (v.get("kwh")  or 0.0), 3)
+            _r["cost"] = round(_r.get("cost", 0.0) + (v.get("cost") or 0.0), 2)
+        rt, rtr = totals[key], totals[rem_key]
+        rtr["kwh"]  = round(rtr["kwh"]  + rt["kwh"],  3)
+        rtr["cost"] = round(rtr["cost"] + rt["cost"], 2)
+        meters.pop(key, None); totals.pop(key, None); meta.pop(key, None)
+        folded = True
+    return folded
+
+
 def _inject_ev_breakdown_into_summary(summary, period_blocks, ev_slot_map,
-                                      label="EV (from dispatch)"):
+                                      label="EV (from dispatch)", fold_devices=None):
     """Split the 'Direct import' remainder in a billing summary into a reduced house
     slice + a synthetic '<label> / Import' sub-meter, from ev_slot_map. DISPLAY-ONLY:
     main_import_raw ('Import — total grid'), standing, and total_cost are untouched, so
@@ -1462,8 +1519,10 @@ def _inject_ev_breakdown_into_summary(summary, period_blocks, ev_slot_map,
     if not summary or not ev_slot_map:
         return False
     totals = summary.get("totals") or {}
-    if any(t.get("is_submeter") for t in totals.values()):
-        return False
+    if fold_devices:                              # hybrid: fold the physical EV line into remainder,
+        _fold_ev_submeter_into_remainder(summary, fold_devices)   # then carve the hybrid EV from it
+    elif any(t.get("is_submeter") for t in totals.values()):
+        return False                              # no-meter path: unchanged (byte-identical)
     remainder_key = next((k for k in totals
                           if k.endswith("/ Import") and not totals[k].get("is_submeter")), None)
     if not remainder_key:
@@ -2336,7 +2395,19 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     # Derived-EV split (display-only; BL-22): no-op unless this is a no-sub-meter
     # account with completed dispatches. Gives the Billing tab an "EV (from dispatch)"
     # breakdown line + per-day trace without moving any bill total.
-    _ev_slot_map = _dispatch_ev_slot_map(store, blocks, cfg)
+    # Hybrid EV for the billing breakdown (H6): a has-EV-meter account gets one continuous
+    # 'EV' line (synthetic post-seam, recorded physical pre-seam) via the fold-back; a no-EV-
+    # meter account keeps the display-only dispatch split labelled 'EV (from dispatch)'.
+    _ev_phys_id = _ev_meter_id(cfg)
+    if _ev_phys_id:
+        _ev_slot_map = _hybrid_ev_slot_map(store, blocks, cfg)
+        _ev_fold_devices = [((cfg.get("meters", {}).get(_ev_phys_id, {}).get("meta") or {}).get("device")
+                             or _ev_phys_id)]
+        _ev_label = "EV"
+    else:
+        _ev_slot_map = _dispatch_ev_slot_map(store, blocks, cfg)
+        _ev_fold_devices = None
+        _ev_label = "EV (from dispatch)"
     if _ev_slot_map:
         meter_colors["ev_dispatch"] = "#8b5cf6"
 
@@ -2417,7 +2488,8 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
             _blks_for_calc, _s, _e, store=store, tz_name=timezone_name)
         _period_blocks = _blocks_for_period(_s, _e)
         if _ev_slot_map:
-            _inject_ev_breakdown_into_summary(_sm, _period_blocks, _ev_slot_map)
+            _inject_ev_breakdown_into_summary(_sm, _period_blocks, _ev_slot_map,
+                                              label=_ev_label, fold_devices=_ev_fold_devices)
         if _bill_rounding:
             _bm = _bill_method_breakdown(_period_blocks, period_vat=_vat_at(_s),
                                          standing_inc_by_day=_sm.get("standing"))
