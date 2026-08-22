@@ -264,6 +264,31 @@
     slightly cheaper than your real Octopus bill. Settlement corrects the kWh; the dispatch rate stays
     a best estimate. Correct any that matter with the block correction tool.
   </div>
+  <div class="note-box">
+    ⓘ <strong>How the bill and the car/home split relate.</strong> Your bill is built from half-hour
+    blocks stacked up. Each block carries two different things, and it helps to keep them apart:
+    <ul style="margin:6px 0 8px 18px;">
+      <li><strong>The total</strong> — what that half-hour cost you. On Intelligent Octopus Go this is
+        Octopus's own billed figure, and it already has the car/home (and, on the capped tariff, the
+        4-rate) split <em>baked into it</em> — Octopus works out the split behind the scenes and hands
+        EMT the finished number. The totals stack up into your bill, so <strong>your bill is always
+        correct</strong>, whether the data was captured live or imported later.</li>
+      <li><strong>The split</strong> — how much of that total was the <em>car</em> versus the
+        <em>home</em>. EMT shows this by decomposing each block's total, and to do that it needs
+        Octopus's live smart-charge <strong>dispatch</strong> records (which slots the car charged, and
+        how much).</li>
+    </ul>
+    Octopus only exposes dispatch records in <strong>real time</strong>, so they can't be fetched for the
+    past. That's the whole limitation: for a <strong>backfilled or imported history</strong> EMT has each
+    block's correct total but not the dispatch behind it, so it can't pull the total back apart into car
+    versus home — <em>like trying to un-bake a cake to get the eggs back out</em>. The split (and the
+    capped cap-boundary rate breakdown) is therefore only precise from the day EMT started capturing
+    dispatch. If your EV was on a <strong>physical sub-meter already recording in Home Assistant</strong>,
+    the historical car/home <em>energy</em> split can be rebuilt from HA's recorder (see Device History) —
+    that's a second recording to lean on; the cap-boundary <em>rate</em> split still can't be recovered.
+    To be clear: <strong>nothing about your bill is affected</strong> — only the car/home split and
+    rate-band breakdown detail.
+  </div>
   <p style="font-size:12px;color:var(--muted);">
     Full detail: see the <a href="https://github.com/RGx01/energy-meter-tracker-addon/wiki/Intelligent-Octopus-Go" target="_blank" style="color:var(--accent);">Intelligent Octopus Go</a> wiki page.
   </p>

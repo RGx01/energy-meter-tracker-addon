@@ -2535,6 +2535,27 @@ def api_blocks_summary():
             except Exception:
                 _ev_day = {}
             _apply_ev_split_to_summary_rows(rows, meters_list, _ev_day)
+        elif _configured_ev_meter_id(cfg) is not None:
+            # ── Hybrid EV (H2): physical sub-meter pre-seam, synthetic dispatch post-seam,
+            # one continuous 'EV' series; per-bucket totals held invariant. ──────────────
+            _ev_mid = _configured_ev_meter_id(cfg)
+            try:
+                _main_ev = {}; _phys_ev = {}
+                for _rr in _raw_rows:
+                    if _rr["meter_id"] == _ev_mid:
+                        _gk = _rr["imp_kwh_grid"]
+                        _phys_ev[_rr["block_start"]] = (
+                            float(_gk if _gk is not None else (_rr["imp_kwh"] or 0.0)),
+                            float(_rr["imp_cost"] or 0.0))
+                    elif not _rr["is_sub_meter"]:
+                        _main_ev[_rr["block_start"]] = (_rr["imp_kwh_ev"], _rr["imp_cost_ev"])
+                _hyb_bucket = {}
+                for _bs, _v in _hybrid_ev_by_block(_main_ev, _phys_ev).items():
+                    _acc = _hyb_bucket.setdefault(_bucket_local_day(_bs), {"kwh": 0.0, "cost": 0.0})
+                    _acc["kwh"] += _v["kwh"]; _acc["cost"] += _v["cost"]
+            except Exception:
+                _hyb_bucket = {}
+            _apply_hybrid_ev_to_summary_rows(rows, meters_list, _ev_mid, _hyb_bucket)
 
         return jsonify({
             "currency":      currency,
@@ -2675,6 +2696,27 @@ def api_blocks_day():
                 _ev_by_slot = {}
             _apply_ev_split_to_summary_rows(
                 rows, meters_list, _ev_by_slot, key_fn=lambda _r: _r.get("slot"))
+        elif _configured_ev_meter_id(cfg) is not None:
+            # ── Hybrid EV (H2), half-hour view: same rule, bucketed by slot. ────────────
+            _ev_mid = _configured_ev_meter_id(cfg)
+            try:
+                _main_ev = {}; _phys_ev = {}
+                for _rr in _raw:
+                    if _rr["meter_id"] == _ev_mid:
+                        _gk = _rr["imp_kwh_grid"]
+                        _phys_ev[_rr["block_start"]] = (
+                            float(_gk if _gk is not None else (_rr["imp_kwh"] or 0.0)),
+                            float(_rr["imp_cost"] or 0.0))
+                    elif not _rr["is_sub_meter"]:
+                        _main_ev[_rr["block_start"]] = (_rr["imp_kwh_ev"], _rr["imp_cost_ev"])
+                _hyb_bucket = {}
+                for _bs, _v in _hybrid_ev_by_block(_main_ev, _phys_ev).items():
+                    _acc = _hyb_bucket.setdefault(_slot_of(_bs), {"kwh": 0.0, "cost": 0.0})
+                    _acc["kwh"] += _v["kwh"]; _acc["cost"] += _v["cost"]
+            except Exception:
+                _hyb_bucket = {}
+            _apply_hybrid_ev_to_summary_rows(
+                rows, meters_list, _ev_mid, _hyb_bucket, key_fn=lambda _r: _r.get("slot"))
 
         _postcode = ""
         for _md in cfg.get("meters", {}).values():
@@ -5820,7 +5862,30 @@ def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
     # the dispatch truth: the fixture reads 3129 kg physical vs 141 kg dispatch), net the SYNTHETIC
     # EV GRID carbon/kWh from the house remainder (the behind-meter saving never crossed the grid, so
     # it is NOT subtracted), and keep non-EV sub-meters. Non-IOG (no dispatch) ⇒ byte-identical.
+    _rec_ev_kwh = _rec_ev_carbon = _rec_ev_ci_kwh = 0.0
     if ev_carbon_block:
+        # H4 HYBRID: before dropping the physical EV sub-meter, fold in its PRE-SEAM portion
+        # (blocks with no dispatch split — imp_kwh_ev IS NULL) so a window straddling the seam
+        # counts RECORDED EV pre-seam + SYNTHETIC EV post-seam, not synthetic only. Post-seam-only
+        # windows and non-IOG accounts return 0 here → byte-identical.
+        _ev_mid = _configured_ev_meter_id(cfg)
+        if _ev_mid:
+            try:
+                _pr = store._conn.execute(
+                    "SELECT COALESCE(SUM(sub.imp_kwh),0.0) k, "
+                    "       COALESCE(SUM(sub.carbon_g),0.0) g, "
+                    "       COALESCE(SUM(CASE WHEN sub.carbon_g IS NOT NULL THEN sub.imp_kwh ELSE 0 END),0.0) ck "
+                    "FROM blocks sub JOIN blocks main "
+                    "  ON main.block_start=sub.block_start AND main.meter_id='electricity_main' "
+                    "  AND main.config_period_id=sub.config_period_id "
+                    "WHERE sub.meter_id=? AND main.imp_kwh_ev IS NULL "
+                    "  AND sub.block_start>=? AND sub.block_start<?",
+                    (_ev_mid, utc_start, utc_end)).fetchone()
+                _rec_ev_kwh    = float(_pr["k"]  or 0.0)
+                _rec_ev_carbon = float(_pr["g"]  or 0.0)
+                _rec_ev_ci_kwh = float(_pr["ck"] or 0.0)
+            except Exception:
+                logger.debug("insights: recorded pre-seam EV carbon unavailable", exc_info=True)
         for _m in [mid for mid, st in list(sub_totals.items())
                    if (st.get("meter_type") or "") == "ev_charger"
                    or any(k in mid.lower() for k in ("ev", "charger"))]:
@@ -5829,10 +5894,17 @@ def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
     total_sub_carbon_g = sum(st["carbon_g"]  for st in sub_totals.values())
     _syn_ev_kwh    = ev_carbon_block["clipped_kwh"] if ev_carbon_block else 0.0
     _syn_ev_carbon = ev_carbon_block["grid_g"]      if ev_carbon_block else 0.0
-    house_imp_kwh    = max(0.0, main_imp_kwh - total_sub_imp_kwh - _syn_ev_kwh)
+    _ev_kwh_total    = _syn_ev_kwh + _rec_ev_kwh          # hybrid EV axis (synthetic + recorded)
+    _ev_carbon_total = _syn_ev_carbon + _rec_ev_carbon
+    if ev_carbon_block:                                   # surface the hybrid split (additive keys)
+        ev_carbon_block["recorded_kwh"] = round(_rec_ev_kwh, 3)
+        ev_carbon_block["recorded_g"]   = round(_rec_ev_carbon, 1)
+        ev_carbon_block["ev_kwh_total"] = round(_ev_kwh_total, 3)
+        ev_carbon_block["grid_g_total"] = round(_ev_carbon_total, 1)
+    house_imp_kwh    = max(0.0, main_imp_kwh - total_sub_imp_kwh - _ev_kwh_total)
     house_ci_imp_kwh = max(0.0, main_ci_imp_kwh - sum(
-        st.get("ci_imp_kwh", 0.0) for st in sub_totals.values()) - _syn_ev_kwh)
-    house_carbon_g   = max(0.0, cg_imp - total_sub_carbon_g - _syn_ev_carbon) if has_carbon else None
+        st.get("ci_imp_kwh", 0.0) for st in sub_totals.values()) - _syn_ev_kwh - _rec_ev_ci_kwh)
+    house_carbon_g   = max(0.0, cg_imp - total_sub_carbon_g - _ev_carbon_total) if has_carbon else None
     house_avg_intensity = round(house_carbon_g / house_ci_imp_kwh, 1) \
         if house_carbon_g and house_ci_imp_kwh > 0 else None
 
@@ -6129,6 +6201,39 @@ def _dispatch_ev_split_by_bucket(main_by_slot, ev_by_slot, bucket_fn,
     return out
 
 
+def _hybrid_ev_by_block(main_ev_by_block, phys_ev_by_block=None):
+    """Single source of truth for the EV of a block, HYBRID across the dispatch seam —
+    shared by every surface (charts/spiral, Usage Stats, usage + carbon insights) so they
+    can never disagree. Per block:
+
+      * SYNTHETIC (dispatch) is authority WHENEVER it exists — the seam signal is
+        `imp_kwh_ev IS NOT NULL` (the BL-9 bill-authoritative column, written only on
+        dispatched IOG slots, so it is exactly the seam, per block, no date hard-coded).
+        Yields (imp_kwh_ev, imp_cost_ev, 'synthetic'); the physical EV meter is SUPERSEDED
+        for that block — its metered draw is the same car, so it is never added.
+      * else RECORDED — the physical EV sub-meter (HA-recorder / live Zappi) is authority:
+        its metered grid kWh + cost at the block's own rate. Yields (kwh, cost, 'recorded').
+      * neither → the block has no EV; omitted.
+
+    Pure/testable. `main_ev_by_block` is {block_start: (imp_kwh_ev|None, imp_cost_ev|None)};
+    `phys_ev_by_block` is {block_start: (kwh, cost)} or None (no physical EV meter). A
+    non-IOG / no-dispatch account has imp_kwh_ev NULL throughout, so with no physical EV
+    meter this returns {} and every caller stays byte-identical (the standing guard)."""
+    phys = phys_ev_by_block or {}
+    out: dict = {}
+    for _bs in (set(main_ev_by_block) | set(phys)):
+        _syn = main_ev_by_block.get(_bs)
+        if _syn is not None and _syn[0] is not None:      # imp_kwh_ev IS NOT NULL → synthetic wins
+            _k = float(_syn[0]); _c = float(_syn[1] or 0.0)
+            if _k > 1e-9 or abs(_c) > 1e-12:
+                out[_bs] = {"kwh": _k, "cost": _c, "source": "synthetic"}
+            continue                                       # synthetic is authority even at 0 — no fallback
+        _p = phys.get(_bs)                                 # else the recorded physical device
+        if _p is not None and float(_p[0] or 0.0) > 1e-9:
+            out[_bs] = {"kwh": float(_p[0]), "cost": float(_p[1] or 0.0), "source": "recorded"}
+    return out
+
+
 def _apply_ev_split_to_summary_rows(rows, meters_list, ev_by_bucket,
                                     color="#8b5cf6", label="EV (from dispatch)",
                                     key_fn=None) -> bool:
@@ -6169,6 +6274,54 @@ def _apply_ev_split_to_summary_rows(rows, meters_list, ev_by_bucket,
         meters_list.append({"id": "ev_dispatch", "label": label,
                             "color": color, "is_sub": True})
     return applied
+
+
+def _apply_hybrid_ev_to_summary_rows(rows, meters_list, ev_meter_id, hybrid_by_bucket,
+                                     key_fn=None, color="#8b5cf6", label="EV"):
+    """Fold a PHYSICAL EV sub-meter's chart series into the HYBRID EV series so every
+    surface tells one story. Per bucket the EV value becomes the resolver's hybrid figure
+    (synthetic post-seam, recorded physical pre-seam, via _hybrid_ev_by_block); the
+    DIFFERENCE against the physical value already in the row is moved to/from the 'Direct'
+    (electricity_main) segment, so the bucket TOTAL — and the bill — never move. The series
+    is relabelled to one continuous 'EV' identity (colour + label). Import kWh/cost only;
+    carbon is unified separately (its axis is grid-intensity derived, not a stored sub-meter
+    column). Mutates in place; returns True if any bucket's split changed. Pure/testable.
+
+    `hybrid_by_bucket` is {bucket: {'kwh','cost'}}. `key_fn(row)` -> bucket key; defaults to
+    the local date (daily/monthly/yearly); the HH view passes the slot key."""
+    def _date_key(_row):
+        return "%04d-%02d-%02d" % (_row["year"], _row["month"], _row["day"])
+    _key = key_fn or _date_key
+    changed = False
+    for _row in rows:
+        _meters = _row.get("meters")
+        if not _meters:
+            continue
+        _hv = hybrid_by_bucket.get(_key(_row))
+        _new_k = float(_hv["kwh"])  if _hv else 0.0
+        _new_c = float(_hv["cost"]) if _hv else 0.0
+        _mm = _meters.get(ev_meter_id)
+        _old_k = float(_mm["imp_kwh"])  if _mm else 0.0
+        _old_c = float(_mm["imp_cost"]) if _mm else 0.0
+        _dk = round(_new_k - _old_k, 6)
+        _dc = round(_new_c - _old_c, 6)
+        if _mm is not None and abs(_dk) <= 1e-9 and abs(_dc) <= 1e-9:
+            continue                                    # pre-seam / recorded: identical, no move
+        _main = _meters.get("electricity_main")
+        if _main is not None:                           # hold the bucket total invariant
+            _main["imp_kwh"]  = round(float(_main["imp_kwh"])  - _dk, 4)
+            _main["imp_cost"] = round(float(_main["imp_cost"]) - _dc, 4)
+        _meters[ev_meter_id] = {
+            "imp_kwh": round(_new_k, 4), "imp_cost": round(_new_c, 4),
+            "exp_kwh": 0.0, "exp_cost": 0.0, "carbon_g": (_mm or {}).get("carbon_g"),
+        }
+        changed = True
+    for _m in meters_list:                              # one continuous 'EV' identity
+        if _m.get("id") == ev_meter_id:
+            _m["label"] = label
+            _m["color"] = color
+            break
+    return changed
 
 
 def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
@@ -6368,13 +6521,16 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
             return mt in ("ev", "ev_charger") or any(
                 k in (mid or "").lower() for k in ("ev", "charger"))
 
-        # SYNTHETIC EV IS THE SPINE (design — synthetic-EV authority). The EV portion is taken
-        # from the block's dispatch-derived 'ev' SEGMENT (Octopus's own smart-charge energy,
-        # what they cost), NOT from a physical EV clamp's metered draw. A physical EV sub-meter
-        # is therefore SUPERSEDED here — surfaced as a posterity row (shown, not counted) — so
-        # it never double-counts. Non-dispatch home charging (granny cable / dumb charger) has
-        # no dispatch segment, so it stays in the house remainder by construction (accepted).
-        # Non-EV sub-meters (heat pump, …) keep their metered kWh, priced at the house band.
+        # HYBRID EV AUTHORITY (H3, per-block, one 'EV' identity — id 'ev_dispatch'):
+        #   * block HAS a dispatch 'ev' SEGMENT → SYNTHETIC is authority (Octopus's smart-charge
+        #     energy + what they cost); the physical EV sub-meter is superseded for that block.
+        #   * block has NO dispatch segment but a physical EV meter recorded it (pre-seam / HA
+        #     recorder) → that RECORDED draw is the EV, priced at the block band (not folded to
+        #     house). Both feed the SAME ev_dispatch row, so the seam is invisible and continuous.
+        # A physical EV clamp's excess over dispatch (granny top-up in a dispatched block) still
+        # lands in the house remainder. An account with NO physical EV meter keeps non-dispatch
+        # charging in house by construction (nothing recorded it). Non-EV sub-meters (heat pump,
+        # …) keep their metered kWh, priced at the house band.
         # Tariff-gated for free: a block has an 'ev' segment only while on a dispatch tariff, so
         # off-tariff blocks fall back to the sensor via the column path (BL-27 not entered).
         _ev_seg_k_by_block: dict = defaultdict(float)
@@ -6388,14 +6544,18 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
         _syn_ev_k = _syn_ev_c = 0.0
         for _bs, _segs in _segs_by_block.items():
             _devs = []
+            _phys_ev_grid = 0.0                    # H3: this block's recorded physical EV draw
             for (_m, _mt, _gk) in _dev_by_block.get(_bs, []):
                 if _is_ev_dev(_m, _mt):
-                    _phys_ev_ids.add(_m)          # superseded by synthetic → posterity
+                    _phys_ev_ids.add(_m)          # folded into the one hybrid EV row below
+                    _phys_ev_grid += float(_gk or 0.0)
                     continue
                 _devs.append({"meter_id": _m, "attribution": "house", "grid_kwh": _gk})
             _evk = _ev_seg_k_by_block.get(_bs, 0.0)
-            if _evk > 1e-9:                        # synthetic EV = the 'ev' segment kWh
+            if _evk > 1e-9:                        # SYNTHETIC (dispatch) is authority for this block
                 _devs.append({"meter_id": _EV_SYN_ID, "attribution": "ev", "grid_kwh": _evk})
+            elif _phys_ev_grid > 1e-9:            # H3 hybrid: pre-seam / no dispatch → RECORDED physical EV
+                _devs.append({"meter_id": _EV_SYN_ID, "attribution": "ev", "grid_kwh": _phys_ev_grid})
             _res = _ps.price_devices_hybrid(_segs, _devs)
             for _m, _v in _res["devices"].items():
                 if _m == _EV_SYN_ID:
@@ -6420,7 +6580,7 @@ def _aggregate_usage(store, cfg, utc_start: str, utc_end: str,
         if _syn_ev_k > 1e-9:
             sub_totals[_EV_SYN_ID] = {
                 "imp_kwh": round(_syn_ev_k, 6), "imp_cost": round(_syn_ev_c, 6), "exp_kwh": 0.0,
-                "label": "EV (from dispatch)", "meter_type": "ev_charger", "derived": True,
+                "label": "EV", "meter_type": "ev_charger", "derived": True,
                 "rate_tiers": defaultdict(lambda: {"kwh": 0.0, "cost": 0.0, "blocks": 0}),
             }
         house_imp_kwh  = _seg_house_k

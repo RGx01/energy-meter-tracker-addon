@@ -2,7 +2,8 @@ name: GraphQL deprecation check
 
 # Introspects the live Kraken (Octopus) GraphQL schema and opens/updates
 # `graphql-deprecation` issues for any field EMT selects that Octopus has marked
-# deprecated — the early-warning half of BL-16, mirroring BottlecapDave's
+# deprecated (BL-16), AND watches for NEW/removed fields on the IOG reconstruction types
+# (BL-28). The early-warning half of BL-16, mirroring BottlecapDave's
 # checkGraphqlDeprecations. Introspection is unauthenticated, so no secret is
 # needed; the job uses only the built-in GITHUB_TOKEN to manage issues.
 
@@ -78,3 +79,14 @@ jobs:
             gh issue create --title "$title" --label graphql-deprecation --body "$body"
             echo "Opened: $title"
           done
+
+      - name: Watch for new/changed fields on IOG reconstruction types
+        # Reddens this run if Octopus ADDS or removes a field on the dispatch/measurement/
+        # intelligent/cap types EMT could use for historical car/house + cap reconstruction
+        # (see docs/design/charger_derived_iog_split_design.md and roadmap BL-28). No-op until
+        # the baseline is seeded: run `python .build/check_graphql_field_watch.py --update-baseline`
+        # once against the live schema and commit `.build/graphql_field_watch_baseline.json`.
+        # NOTE: catches new schema SURFACE only — it CANNOT see `source` becoming populated on
+        # completed dispatches (that is a data-behaviour change; it needs an authenticated query).
+        run: |
+          python .build/check_graphql_field_watch.py --fail-on-change

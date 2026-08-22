@@ -97,6 +97,20 @@ class TestSyntheticEvAuthority(unittest.TestCase):
         self.assertAlmostEqual(sm["ev_dispatch"]["imp_kwh"] + sm["heat_pump"]["imp_kwh"]
                                + r["house_imp_kwh"], 10.0, places=3)
 
+    def test_hybrid_recorded_ev_when_no_dispatch(self):
+        # H3 HYBRID: physical EV meter present, NO dispatch segment (pre-seam) -> the RECORDED
+        # draw is the EV (priced at the block band), folded into the one 'EV' row, NOT house.
+        st = _store(ev_metered=4.0, ev_dispatch=0.0, hp_metered=2.0)
+        r = _agg(st, _cfg())
+        sm = r["sub_meters"]
+        self.assertAlmostEqual(sm["ev_dispatch"]["imp_kwh"], 4.0, places=6)    # recorded EV counted
+        self.assertEqual(sm["ev_dispatch"]["label"], "EV")                    # one identity
+        self.assertNotIn("ev_charger", sm)                                    # folded in, no ghost
+        self.assertAlmostEqual(sm["heat_pump"]["imp_kwh"], 2.0, places=6)
+        self.assertAlmostEqual(r["house_imp_kwh"], 4.0, places=3)             # 10 - 4 - 2
+        self.assertAlmostEqual(sm["ev_dispatch"]["imp_kwh"] + sm["heat_pump"]["imp_kwh"]
+                               + r["house_imp_kwh"], 10.0, places=3)          # reconciliation holds
+
     def test_retired_ev_device_gap_closed(self):
         # no EV sub-meter block at all (retired) but dispatch charged 3.5 → must show as EV
         st = _store(ev_metered=None, ev_dispatch=3.5, hp_metered=None)
