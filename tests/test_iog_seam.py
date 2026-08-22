@@ -81,11 +81,22 @@ class TestApplyIogSplit(unittest.TestCase):
         self.assertEqual(imp["ev_band"], "off_peak")  # uncapped: whole slot off-peak
 
     # ── capped: re-prices ───────────────────────────────────────────────────
+    def _house_pence(self):
+        # Production stores rate schedules in PENCE (RateSchedule / from_api_records keep the API's
+        # native value_inc_vat). compute_iog_split's capped branch converts pence→£, so the capped
+        # tests must feed pence; the £ assertions below then validate that conversion. (The uncapped
+        # / no-op tests take the overlay fall-through, not this branch, so `_house()` stays £.)
+        return RateSchedule([
+            ("2026-01-01T00:00:00", "2026-01-01T05:30:00", 7.0),    # night 7.0p
+            ("2026-01-01T05:30:00", "2026-01-01T23:30:00", 30.0),   # day  30.0p
+            ("2026-01-01T23:30:00", "2026-01-02T05:30:00", 7.0),    # night
+        ])
+
     def _capped(self):
         engine._kraken_rate_schedules = {
-            "import": self._house(),
-            "ev_device_off_peak": self._flat(0.05),
-            "ev_device_peak": self._flat(0.25)}
+            "import": self._house_pence(),
+            "ev_device_off_peak": self._flat(5.0),    # 5.0p
+            "ev_device_peak": self._flat(25.0)}       # 25.0p
 
     def test_capped_within_cap_freebie(self):
         self._capped()
