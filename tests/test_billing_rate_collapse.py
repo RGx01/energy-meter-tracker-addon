@@ -51,6 +51,31 @@ class TestBillMethodCollapse(unittest.TestCase):
                                              "cost": round(0.10 + 0.01 * h, 4)}}}}}
                 for h in range(n)]
 
+    def _rate_blocks(self, rate_kwhs):
+        # rate_kwhs: list of (inc_rate, kwh); builds one block each, cost = rate*kwh
+        out=[]
+        for i,(r,k) in enumerate(rate_kwhs):
+            out.append({"start": f"2026-02-12T{i%24:02d}:{'30' if i%2 else '00'}:00",
+                        "meters": {"electricity_main": {"meta": {}, "standing_charge": 0.5,
+                            "channels": {"import": {"kwh": k, "rate": r, "cost": round(r*k,6)}}}}})
+        return out
+
+    def test_B2_jitter_bands_merge_to_one_row(self):
+        # rate-from-cost jitter: 0.070000 vs 0.070003 (same off-peak tariff) + a peak band.
+        bm = ec._bill_method_breakdown(self._rate_blocks(
+            [(0.070000, 52.0), (0.070003, 855.0), (0.2812, 6.6)]), period_vat=0.05)
+        offpeak = [r for r in bm["rows"] if r["rate_exc"] < 0.15]
+        self.assertEqual(len(offpeak), 1)                       # one merged off-peak row, not two
+        self.assertAlmostEqual(offpeak[0]["kwh"], 907.0, places=1)   # 52 + 855
+        self.assertEqual(len([r for r in bm["rows"] if r["rate_exc"] >= 0.15]), 1)  # peak separate
+
+    def test_B2_real_rate_change_stays_separate(self):
+        # a genuine in-period off-peak change (>_SPLIT_BAND_EPS): 0.070 -> 0.085 must NOT merge.
+        bm = ec._bill_method_breakdown(self._rate_blocks(
+            [(0.070, 100.0), (0.085, 80.0)]), period_vat=0.05)
+        self.assertEqual(len(bm["rows"]), 2)                    # two distinct bands
+        self.assertLess(bm["rows"][0]["rate_exc"], bm["rows"][1]["rate_exc"])
+
     def test_collapses_and_keeps_total_exc(self):
         bm = ec._bill_method_breakdown(self._blocks(6))
         self.assertEqual(len(bm["rows"]), 1)

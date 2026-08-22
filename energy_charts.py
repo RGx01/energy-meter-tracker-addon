@@ -1280,16 +1280,30 @@ def _bill_method_breakdown(blocks, period_vat=None, standing_inc_by_day=None):
         band["inc"] += ic
     if not bands:
         return None
+    # B2: cluster adjacent band keys within _SPLIT_BAND_EPS before emitting rows. The band
+    # key is the CLEAN inc rate where the tariff supplies one, but rate-from-cost history
+    # (CSV import) derives it as cost÷kWh, which jitters (e.g. 0.070000 vs 0.070003 — the
+    # same off-peak tariff) and would otherwise show as two identical-looking rows. Sub-penny
+    # EPS, and PER-CLUSTER, so a genuine in-period rate change (≥ pence) stays its own row.
+    _keys = sorted(bands)
+    _clusters = []
+    for _k in _keys:
+        if _clusters and (_k - _clusters[-1][-1]) <= _SPLIT_BAND_EPS:
+            _clusters[-1].append(_k)
+        else:
+            _clusters.append([_k])
     rows, energy_raw, energy_inc = [], 0.0, 0.0
-    for key in sorted(bands):
-        bk, be = bands[key]["kwh"], bands[key]["exc"]
+    for _cl in _clusters:
+        bk = sum(bands[k]["kwh"] for k in _cl)
+        be = sum(bands[k]["exc"] for k in _cl)
+        bi = sum(bands[k]["inc"] for k in _cl)
         energy_raw += be
-        energy_inc += bands[key]["inc"]
-        # Displayed exc rate = the band's clean inc-scale key ÷ (1+VAT) — a deterministic
-        # ex-VAT label that matches the bill, NOT a derived effective cost ÷ kWh (which can
-        # land a rounding unit off). Cost to 3dp (mills), like the bill — the 4dp rate × kWh
-        # only reconciles to the cost at finer precision; the summed raw cost is authoritative.
-        rows.append({"rate_exc": round(key / (1.0 + vat), 4),
+        energy_inc += bi
+        # Displayed exc rate = the cluster's kWh-weighted inc-scale rate ÷ (1+VAT) — a
+        # deterministic ex-VAT label that matches the bill. Cost to 3dp (mills), like the
+        # bill — the summed raw cost is authoritative.
+        _wk = (sum(k * bands[k]["kwh"] for k in _cl) / bk) if bk > 1e-12 else _cl[0]
+        rows.append({"rate_exc": round(_wk / (1.0 + vat), 4),
                      "kwh": round(bk, 3), "cost_exc": round(be, 3)})
     # Collapse a long rate list (Agile: hundreds of distinct half-hourly rates across a
     # bill period) into ONE kWh-weighted average row so the ex-VAT summary stays
