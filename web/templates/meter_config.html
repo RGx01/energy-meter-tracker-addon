@@ -461,6 +461,11 @@ var DATA_SOURCE_MODE = {{ data_source_mode | tojson }};
 // restore onto a fresh install can leave mode=api with NO key — in which case
 // the "connected" UI is a lie and the user must re-enter the key.
 var HAS_CREDENTIALS = {{ has_credentials | tojson }};
+// #381: true when the loaded DB is stamped to a DIFFERENT Octopus account
+// than the stored credentials (from GET /api/kraken-config). Refreshed live by
+// refreshConnState(); gates the dormant-creds Reactivate prompt off (mismatch
+// has its own #357 flow).
+var CONN_MISMATCH = false;
 var OHME_DETECTION = {{ ohme_detection | tojson }};
 // Timezone select HTML — rendered server-side to avoid JS string escaping issues
 var TZ_SELECT_HTML = {{ tz_select_html | tojson }};
@@ -505,6 +510,11 @@ document.addEventListener('DOMContentLoaded', function() {
         if (!wizardOpen) {
           window.location.reload();
         }
+      } else {
+        // #381: no full DB restore, but the supplier connection state may have
+        // changed while away (reconnect/disconnect/reactivate elsewhere, or a
+        // mode promotion). Cheap re-read; only re-renders if something changed.
+        try { refreshConnState(false); } catch (e) {}
       }
       _hiddenAt = null;
     }
@@ -612,6 +622,14 @@ function buildMainCard(meterId, meter) {
   // install — creds aren't in backups). The "connected" UI would otherwise lie.
   var credsMissing = usesApi &&
     (typeof HAS_CREDENTIALS !== 'undefined') && !HAS_CREDENTIALS;
+  // #381: the OPPOSITE limbo — a valid key IS stored but the mode is local-only
+  // (cad/unset), e.g. after a Disconnect or a DB-swap parked the mode. The API
+  // controls are otherwise hidden, so it looks like the credentials are gone.
+  // Offer a one-click Reactivate (uses the stored key; the server promotes the
+  // mode). Suppressed on an account mismatch — that has its own #357 prompt.
+  var dormantCreds = !usesApi &&
+    (typeof HAS_CREDENTIALS !== 'undefined') && HAS_CREDENTIALS &&
+    !(typeof CONN_MISMATCH !== 'undefined' && CONN_MISMATCH);
   var supLabel = _mi.supLabel;
   var supPoss = supLabel + '\u2019s';     // "your supplier's" / "Octopus Energy's"
   var modeLabel = _mi.modeLabel;
@@ -641,6 +659,17 @@ function buildMainCard(meterId, meter) {
             '<strong>paused</strong> until you re-enter it.' +
             '<div style="margin-top:8px;">' +
               '<button class="btn btn-primary btn-sm js-reconnect-octopus">Re-enter API key</button>' +
+            '</div>' +
+          '</div>'
+        : '') +
+      (dormantCreds
+        ? '<div style="margin:-2px 0 12px;padding:10px 12px;border:1px solid var(--accent,#2563eb);border-radius:6px;background:rgba(37,99,235,0.08);color:var(--fg);font-size:12px;line-height:1.5;">' +
+            '\u26A1 <strong>' + esc(supLabel) + ' API is configured but inactive.</strong> ' +
+            'Your API key is stored, but the data source is set to local sensors only ' +
+            '(this can happen after a Disconnect or swapping databases). Import ' +
+            'settlement and dispatch pricing are <strong>paused</strong> until you reactivate.' +
+            '<div style="margin-top:8px;">' +
+              '<button class="btn btn-primary btn-sm js-reactivate-octopus">Reactivate ' + esc(supLabel) + '</button>' +
             '</div>' +
           '</div>'
         : '') +
@@ -1166,6 +1195,11 @@ function onContainerClick(e) {
     // would flip the mode if you'd disconnected first — cad→api — which needlessly
     // offered a full recalc.) Account is pre-filled from the DB's stored stamp.
     openReconnectModal();
+  } else if (el.classList.contains('js-reactivate-octopus')) {
+    // #381: reactivate using the STORED key (no re-type). The server runs a live
+    // connect and promotes the mode back to an API mode; we then re-read state
+    // and re-render the panel in place.
+    executeReactivate(el);
   }
 }
 
@@ -1223,6 +1257,97 @@ function closeDisconnectModal() {
 
 // Lightweight key-only reconnect (no wizard, no recalc). Account pre-filled from
 // the DB's stored stamp (surfaced by /api/kraken-config as db_account).
+function pollKrakenConnected(attempts, delayMs) {
+  // #381: a connect attempt can return not-connected on the first pass simply
+  // because discovery/poll hadn't settled yet (a transient — rate-limit, a
+  // network blip, or a DB mid-swap). Re-check /api/kraken-config a few times
+  // before declaring failure, so a slow-but-successful connect resolves silently
+  // instead of showing "failed" that the user has to manually retry. The server
+  // never drops the key on a failed verify, so this only ever upgrades a
+  // transient "failed" into the success it was about to become.
+  attempts = attempts || 3;
+  delayMs  = delayMs  || 1500;
+  return new Promise(function(resolve){
+    function attempt(n){
+      fetch(apiUrl('/api/kraken-config'))
+        .then(function(r){ return r.json(); })
+        .then(function(j){
+          if (j && j.connected) { resolve(true); return; }
+          if (n <= 1) { resolve(false); return; }
+          setTimeout(function(){ attempt(n - 1); }, delayMs);
+        })
+        .catch(function(){
+          if (n <= 1) { resolve(false); return; }
+          setTimeout(function(){ attempt(n - 1); }, delayMs);
+        });
+    }
+    attempt(attempts);
+  });
+}
+function refreshConnState(forceRender) {
+  // #381: re-read the live data-source mode + credential/connection state and,
+  // if anything changed, re-render the panel in place — so a reconnect,
+  // disconnect, reactivate, or a change made elsewhere (e.g. a DB swap) reflects
+  // without a manual page refresh. Cheap; only re-renders on an actual change.
+  return Promise.all([
+    fetch(apiUrl('/api/data-source-mode')).then(function(r){ return r.json(); }).catch(function(){ return null; }),
+    fetch(apiUrl('/api/kraken-config')).then(function(r){ return r.json(); }).catch(function(){ return null; })
+  ]).then(function(res){
+    var dsm = res[0], kc = res[1];
+    if (!dsm && !kc) return false;
+    var changed = false;
+    if (dsm && dsm.mode && dsm.mode !== DATA_SOURCE_MODE) { DATA_SOURCE_MODE = dsm.mode; changed = true; }
+    if (dsm && typeof dsm.has_credentials === 'boolean' && dsm.has_credentials !== HAS_CREDENTIALS) { HAS_CREDENTIALS = dsm.has_credentials; changed = true; }
+    var mm = !!(kc && kc.account_mismatch);
+    if (mm !== CONN_MISMATCH) { CONN_MISMATCH = mm; changed = true; }
+    if (changed || forceRender) {
+      var _wo = document.getElementById('wizard-overlay');
+      var wizardOpen = _wo && _wo.style.display !== 'none';
+      if (!wizardOpen) renderAll();
+    }
+    return changed;
+  });
+}
+function executeReactivate(btnEl) {
+  if (btnEl) { btnEl.disabled = true; btnEl.textContent = 'Reactivating\u2026'; }
+  fetch(apiUrl('/api/reactivate-kraken'), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({})
+  })
+    .then(function(r){ return r.text().then(function(t){
+      var j; try { j = t ? JSON.parse(t) : {}; } catch(e){ j = { error: 'Unexpected response (' + r.status + ')' }; }
+      return { ok: r.ok, j: j };
+    }); })
+    .then(function(res){
+      function onReactivated(acct){
+        // Connected — the server promoted the mode; re-read + re-render in place.
+        HAS_CREDENTIALS = true;
+        refreshConnState(true).then(function(){
+          document.getElementById('alert-success').textContent =
+            '\u2713 Reactivated ' + (acct ? '\u2014 ' + acct : 'Octopus') + '.';
+          show('alert-success');
+        });
+      }
+      function onReactFailed(detail){
+        if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Reactivate'; }
+        var errEl = document.getElementById('alert-error');
+        if (errEl) { errEl.textContent = '\u2717 Could not reactivate: ' + (detail ||
+          'connection could not be verified — your key was kept; try again shortly'); errEl.classList.add('show'); }
+      }
+      if (res.ok && !res.j.error && res.j.connected) { onReactivated(res.j.account_number); return; }
+      if (!res.ok || res.j.error) { onReactFailed(res.j.detail || res.j.error); return; }
+      // #381: re-poll before declaring failure (transient discovery/poll settle).
+      if (btnEl) { btnEl.textContent = 'Verifying\u2026'; }
+      pollKrakenConnected(3, 1500).then(function(connected){
+        if (connected) { onReactivated(res.j.account_number); }
+        else { onReactFailed(res.j.detail); }
+      });
+    })
+    .catch(function(e){
+      if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Reactivate'; }
+      var errEl = document.getElementById('alert-error');
+      if (errEl) { errEl.textContent = '\u2717 Reactivate failed: ' + e; errEl.classList.add('show'); }
+    });
+}
 function openReconnectModal() {
   var acct  = document.getElementById('reconnect-account');
   var key   = document.getElementById('reconnect-apikey');
@@ -1265,20 +1390,32 @@ function executeReconnect() {
       return { ok: r.ok, j: j };
     }); })
     .then(function(res){
-      if (btn) { btn.disabled = false; btn.textContent = 'Reconnect'; }
-      if (!res.ok || res.j.error || !res.j.connected) {
-        if (stat) { stat.style.color = 'var(--error-color,#c00)';
-          stat.textContent = 'Could not connect: ' + (res.j.detail || res.j.error || 'check key/account'); }
-        return;
+      function onConnected(acct){
+        // Connected — key is stored; refresh the card in place (no reload). The
+        // server may have promoted the mode (cad -> cad+api) on connect, so
+        // re-read state to reflect it without a manual page refresh.
+        HAS_CREDENTIALS = true;
+        if (btn) { btn.disabled = false; btn.textContent = 'Reconnect'; }
+        closeReconnectModal();
+        refreshConnState(true);
+        document.getElementById('alert-success').textContent =
+          '✓ Reconnected to Octopus' + (acct ? ' — ' + acct : '') + '.';
+        show('alert-success');
       }
-      // Connected — key is stored and API mode is unchanged, so just refresh the
-      // card in place (no reload, no recalc).
-      HAS_CREDENTIALS = true;
-      closeReconnectModal();
-      renderAll();
-      document.getElementById('alert-success').textContent =
-        '✓ Reconnected to Octopus' + (res.j.account_number ? ' — ' + res.j.account_number : '') + '.';
-      show('alert-success');
+      function onFailed(detail){
+        if (btn) { btn.disabled = false; btn.textContent = 'Reconnect'; }
+        if (stat) { stat.style.color = 'var(--error-color,#c00)';
+          stat.textContent = 'Could not connect: ' + (detail || 'check key/account'); }
+      }
+      if (res.ok && !res.j.error && res.j.connected) { onConnected(res.j.account_number); return; }
+      // Hard error (bad response / server error) — fail straight away.
+      if (!res.ok || res.j.error) { onFailed(res.j.detail || res.j.error || 'check key/account'); return; }
+      // #381: saved but not verified yet — re-poll before declaring failure.
+      if (stat) { stat.style.color = 'var(--muted)'; stat.textContent = 'Verifying connection\u2026'; }
+      pollKrakenConnected(3, 1500).then(function(connected){
+        if (connected) { onConnected(res.j.account_number); }
+        else { onFailed(res.j.detail || 'still connecting — your key was kept and will connect when reachable'); }
+      });
     })
     .catch(function(e){
       if (btn) { btn.disabled = false; btn.textContent = 'Reconnect'; }

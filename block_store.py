@@ -378,6 +378,26 @@ CREATE TABLE IF NOT EXISTS deleted_ranges (
     reason      TEXT                 -- 'user_delete' | 'user_purge' | free text
 );
 CREATE INDEX IF NOT EXISTS idx_deleted_ranges ON deleted_ranges (meter_id, start_utc, end_utc);
+
+-- BL-27: the priced-segment decomposition of a block's grid import. Each row is ONE
+-- homogeneously-priced slice; a block carries 1–4 (the 4-rate matrix). `band` and
+-- `attribution` are OPEN labels — storage and surfaces never switch on them, only the
+-- classifier assigns meaning (a new rate dimension is a new label, not a schema change).
+-- The legacy imp_rate/imp_cost/imp_*_ev/imp_*_exc columns are PROJECTIONS over these rows
+-- (see pricing_segments). Invariant: Σ block_segments.kwh == the block's grid kWh.
+CREATE TABLE IF NOT EXISTS block_segments (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    block_start  TEXT NOT NULL,
+    meter_id     TEXT NOT NULL,
+    channel      TEXT NOT NULL DEFAULT 'import',
+    seq          INTEGER NOT NULL,        -- order within the block (EV-off, EV-peak, house-off, house-day)
+    kwh          REAL NOT NULL,
+    inc_rate     REAL NOT NULL,
+    exc_rate     REAL,                    -- per-segment ex-VAT rate (NULL → view falls back to inc ÷ VAT)
+    band         TEXT NOT NULL,           -- open label: off_peak | day | peak | …
+    attribution  TEXT NOT NULL            -- open label: house | ev | …
+);
+CREATE INDEX IF NOT EXISTS idx_block_segments ON block_segments (block_start, meter_id, channel);
 """
 
 
@@ -2228,6 +2248,7 @@ class BlockStore:
 
         reads_deleted = 0
         mix_deleted   = 0
+        segments_deleted = 0
         with self._conn:
             if n_blocks:
                 # Children first (reads FK -> blocks(id) with foreign_keys=ON).
@@ -2244,6 +2265,15 @@ class BlockStore:
                     params,
                 )
                 mix_deleted = cur_m.rowcount
+                # P3.1: block_segments has no block_id FK (keyed by block_start) so it
+                # is NOT cascade-cleaned — delete it explicitly or the range leaves
+                # orphaned segments (breaks Σ segments == grid for the touched span).
+                cur_s = self._conn.execute(
+                    f"DELETE FROM block_segments WHERE (block_start, meter_id) IN "
+                    f"(SELECT block_start, meter_id FROM blocks WHERE {where})",
+                    params,
+                )
+                segments_deleted = cur_s.rowcount
                 self._conn.execute(f"DELETE FROM blocks WHERE {where}", params)
             if is_tail and n_blocks:
                 # Reseed live engine state so the next block starts cleanly.
@@ -2282,6 +2312,7 @@ class BlockStore:
             "dates":                  n_dates,
             "reads_deleted":          reads_deleted,
             "generation_mix_deleted": mix_deleted,
+            "segments_deleted":       segments_deleted,
             "reseeded":               bool(is_tail and n_blocks),
             # set only for a device-only delete with surviving parent blocks
             "recompute_parent":       recompute_parent if n_blocks else None,
@@ -2346,6 +2377,10 @@ class BlockStore:
             mix = self._conn.execute(
                 "DELETE FROM generation_mix WHERE block_id IN "
                 "(SELECT id FROM blocks WHERE source LIKE 'imported%')").rowcount
+            # P3.1: block_segments is keyed by block_start (no FK) — clean it too.
+            segs = self._conn.execute(
+                "DELETE FROM block_segments WHERE (block_start, meter_id) IN "
+                "(SELECT block_start, meter_id FROM blocks WHERE source LIKE 'imported%')").rowcount
             self._conn.execute("DELETE FROM blocks WHERE source LIKE 'imported%'")
             derivs = self._conn.execute(
                 "DELETE FROM historical_derivation WHERE source LIKE 'imported%'").rowcount
@@ -2363,6 +2398,7 @@ class BlockStore:
         logger.info("purge_imported_history: removed %d block(s), %d derivation(s)",
                     info["blocks"], derivs)
         return {"blocks": info["blocks"], "reads": reads, "generation_mix": mix,
+                "block_segments": segs,
                 "derivations": derivs, "from": info["from"], "to": info["to"]}
 
     # ── Recorder device attribution — reversible layer ────────────────────────
@@ -2400,6 +2436,10 @@ class BlockStore:
             self._conn.execute(
                 "DELETE FROM reads WHERE block_id IN "
                 f"(SELECT id FROM blocks WHERE {clause})", params)
+            # P3.1: block_segments keyed by block_start (no FK) — clean before blocks.
+            self._conn.execute(
+                f"DELETE FROM block_segments WHERE (block_start, meter_id) IN "
+                f"(SELECT block_start, meter_id FROM blocks WHERE {clause})", params)
             cur = self._conn.execute(f"DELETE FROM blocks WHERE {clause}", params)
         return {"deleted": cur.rowcount, "meters": meters, "parents": parents,
                 "from": span["lo"] if span else None,
@@ -2811,6 +2851,13 @@ class BlockStore:
                 f"WHERE block_start = ? AND meter_id = ? AND source LIKE 'imported%' "
                 f"AND (COALESCE({rcol}, -1) != ? OR COALESCE({ccol}, -1) != ?)",
                 (rate, cost, *extra, start, meter_id, rate, cost))
+            # G2: a real price change (a gap filled or a price corrected) invalidates any stale
+            # segment so the reprice sweep rebuilds it from the corrected column — keeps the block
+            # rewritable at any later date. Import-only (segments are import-only); no-op if none.
+            if cur.rowcount > 0 and channel == "import":
+                self._conn.execute(
+                    "DELETE FROM block_segments WHERE block_start = ? AND meter_id = ? "
+                    "AND channel = 'import'", (start, meter_id))
         return cur.rowcount > 0
 
     def set_block_carbon(self, block_start: str, meter_id: str,
@@ -2941,6 +2988,29 @@ class BlockStore:
         ).fetchone()
         return int(row["n"]) if row else 0
 
+    def repair_pence_inc_blocks(self, block_starts, threshold: float = 3.0) -> int:
+        """Q1 SELF-HEAL: ÷100 the INC columns (rate/cost + EV split) on MAIN + sub-meter rows for
+        blocks whose `imp_rate` is implausibly high (> `threshold` £/kWh = pence-not-pounds — the
+        legacy 4.3.0 capped `compute_iog_split` bug, watch #15). Deliberate force-repair: it
+        OVERWRITES (unlike the fill-null sweep writers), justified because an inc rate above the
+        ceiling is unambiguous corruption, not data worth keeping — the same ÷100 as the §4a guard
+        and the manual data-fix. exc columns are LEFT (already £, the trusted reference). Idempotent
+        (`imp_rate > threshold` self-gates), NULL split columns stay NULL. Returns rows repaired."""
+        if not block_starts:
+            return 0
+        ph = ",".join("?" * len(block_starts))
+        with self._conn:
+            cur = self._conn.execute(
+                f"UPDATE blocks SET "
+                f"  imp_rate           = imp_rate/100.0, "
+                f"  imp_cost           = imp_cost/100.0, "
+                f"  imp_cost_remainder = imp_cost_remainder/100.0, "
+                f"  imp_cost_ev        = imp_cost_ev/100.0, "
+                f"  imp_rate_ev        = imp_rate_ev/100.0 "
+                f"WHERE block_start IN ({ph}) AND imp_rate > ?",
+                list(block_starts) + [float(threshold)])
+        return cur.rowcount
+
     def set_blocks_iog_split(self, updates) -> int:
         """Batch EV/Home split writer: many UPDATEs in ONE transaction (one fsync per
         chunk, not per block — same event-loop-friendliness as set_blocks_exc).
@@ -2995,34 +3065,123 @@ class BlockStore:
         return {"examined": len(rows),
                 "repaired": (0 if dry_run else len(updates)), "dry_run": dry_run}
 
-    def repair_stale_iog_split(self, tol: float = 0.005, dry_run: bool = False) -> dict:
-        """One-off repair for a STALE IOG EV/house split on an UNCAPPED account. A reprice
-        (e.g. reconcile reverting a negligible smart-charge slot off-peak→peak) rewrote
-        imp_rate/imp_cost but NOT the split columns, so imp_rate_ev/imp_cost_ev kept the
-        OLD band. On an **uncapped** IOG tariff the EV and house share the block's rate, so
-        imp_rate_ev MUST equal imp_rate; when it doesn't, the home remainder
-        `(imp_cost − imp_cost_ev)/(imp_kwh − imp_kwh_ev)` derives a phantom rate above the
-        tariff peak.
+    # ── BL-27 priced segments — the block's grid import as priced slices ─────────────
 
-        Re-derives the split at the block's own rate: imp_rate_ev := imp_rate,
-        imp_cost_ev := imp_kwh_ev × imp_rate. Idempotent (a repaired row agrees, so it's no
-        longer selected). **Uncapped only** — on a capped tariff imp_rate_ev legitimately
-        differs from imp_rate, so the caller MUST gate this to uncapped accounts (the engine
-        runner does). Returns {examined, repaired, dry_run}."""
+    def set_block_segments(self, block_start: str, meter_id: str, segments,
+                           channel: str = "import") -> int:
+        """Replace the priced segments for one block/meter/channel. `segments` is an
+        iterable of (kwh, inc_rate, exc_rate, band, attribution) — e.g. a list of
+        pricing_segments.Segment. Written in ONE transaction (delete-then-insert, ordered
+        by position), so the set is always consistent. Returns the number of rows written."""
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM block_segments WHERE block_start = ? AND meter_id = ? "
+                "AND channel = ?", (block_start, meter_id, channel))
+            n = 0
+            for seq, seg in enumerate(segments or []):
+                kwh, inc_rate, exc_rate, band, attribution = seg
+                self._conn.execute(
+                    "INSERT INTO block_segments (block_start, meter_id, channel, seq, "
+                    "kwh, inc_rate, exc_rate, band, attribution) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (block_start, meter_id, channel, seq, kwh, inc_rate, exc_rate,
+                     band, attribution))
+                n += 1
+        return n
+
+    def get_block_segments(self, block_start: str, meter_id: str,
+                           channel: str = "import") -> list:
+        """Priced segments for one block/meter/channel, in position order — a list of
+        {kwh, inc_rate, exc_rate, band, attribution}. Empty when none stored (the caller
+        then falls back to the legacy imp_* columns during the migration)."""
         rows = self._conn.execute(
-            "SELECT block_start, meter_id, imp_rate, imp_rate_ev, imp_kwh_ev "
-            "FROM blocks WHERE imp_rate_ev IS NOT NULL AND imp_rate > 0 "
-            "AND ABS(imp_rate_ev - imp_rate) > ?", (float(tol),)).fetchall()
-        updates = [(r["imp_rate"], round((r["imp_kwh_ev"] or 0.0) * r["imp_rate"], 6),
-                    r["block_start"], r["meter_id"]) for r in rows]
-        if updates and not dry_run:
-            with self._conn:
-                for nrev, ncev, bs, mid in updates:
-                    self._conn.execute(
-                        "UPDATE blocks SET imp_rate_ev = ?, imp_cost_ev = ? "
-                        "WHERE block_start = ? AND meter_id = ?", (nrev, ncev, bs, mid))
-        return {"examined": len(rows),
-                "repaired": (0 if dry_run else len(updates)), "dry_run": dry_run}
+            "SELECT kwh, inc_rate, exc_rate, band, attribution FROM block_segments "
+            "WHERE block_start = ? AND meter_id = ? AND channel = ? ORDER BY seq",
+            (block_start, meter_id, channel)).fetchall()
+        return [{"kwh": r["kwh"], "inc_rate": r["inc_rate"], "exc_rate": r["exc_rate"],
+                 "band": r["band"], "attribution": r["attribution"]} for r in rows]
+
+    def count_block_segments(self) -> int:
+        """Total stored segment rows — the segment backfill's remaining-work signal."""
+        return int(self._conn.execute(
+            "SELECT COUNT(*) AS n FROM block_segments").fetchone()["n"])
+
+    def get_blocks_missing_segments(self, limit: int = 2000,
+                                    after_start: str | None = None) -> list:
+        """Page MAIN-meter import blocks that carry energy but have no priced segments yet
+        (BL-27 backfill). Sub-meters are excluded — segments live on the main import; a
+        device's share is attributed from them at read time. Ordered by block_start; pass
+        the last start back as `after_start` to continue. Returns the legacy columns each
+        block's segments are derived from."""
+        sql = ("SELECT b.block_start, b.meter_id, b.imp_kwh, b.imp_cost, b.imp_rate, "
+               "b.imp_kwh_ev, b.imp_cost_ev, b.imp_rate_ev, b.imp_ev_band, b.imp_home_band, "
+               "b.imp_rate_exc, b.source, b.imp_kwh_api FROM blocks b "
+               "WHERE b.imp_kwh IS NOT NULL AND b.imp_kwh > 0 "
+               "AND b.meter_id NOT IN (SELECT meter_id FROM meters WHERE is_sub_meter = 1) "
+               "AND NOT EXISTS (SELECT 1 FROM block_segments s "
+               "                WHERE s.block_start = b.block_start AND s.meter_id = b.meter_id "
+               "                AND s.channel = 'import')")
+        params: list = []
+        if after_start is not None:
+            sql += " AND b.block_start > ?"
+            params.append(after_start)
+        sql += " ORDER BY b.block_start LIMIT ?"
+        params.append(int(limit))
+        rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_blocks_missing_segments(self) -> int:
+        """Count of MAIN-meter blocks still lacking priced segments — remaining-work signal."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM blocks b "
+            "WHERE b.imp_kwh IS NOT NULL AND b.imp_kwh > 0 "
+            "AND b.meter_id NOT IN (SELECT meter_id FROM meters WHERE is_sub_meter = 1) "
+            "AND NOT EXISTS (SELECT 1 FROM block_segments s "
+            "                WHERE s.block_start = b.block_start AND s.meter_id = b.meter_id "
+            "                AND s.channel = 'import')").fetchone()
+        return int(row["n"]) if row else 0
+
+    # ── P3.3c: unified "needs reprice" coverage — a true SUPERSET of the three legacy backfills ──
+    _NEEDS_REPRICE_WHERE = (
+        "b.imp_kwh IS NOT NULL AND b.imp_kwh > 0 "
+        # G1: only PRICED blocks are segmentable. A gap (imp_cost NULL = unknown price) is left
+        # honestly unsegmented — never faked at £0, never stalls the sweep. A genuine free slot
+        # (imp_cost 0, not NULL) is still included. Filling a gap flips imp_cost non-NULL, which
+        # re-admits the block here so the sweep segments it from the real price (the fill-later door).
+        "AND b.imp_cost IS NOT NULL "
+        "AND b.meter_id NOT IN (SELECT meter_id FROM meters WHERE is_sub_meter = 1) "
+        "AND ("
+        "  NOT EXISTS (SELECT 1 FROM block_segments s WHERE s.block_start = b.block_start "
+        "              AND s.meter_id = b.meter_id AND s.channel = 'import') "
+        "  OR (b.imp_cost_exc IS NULL AND (b.source LIKE 'imported%' OR b.imp_kwh_api IS NOT NULL))"
+        ")")
+
+    def get_blocks_needing_reprice(self, limit: int = 2000,
+                                   after_start: str | None = None) -> list:
+        """Page MAIN-meter import blocks that need ANY derived field the sweep owns: missing
+        priced segments, OR (imported/DCC-settled) missing ex-VAT. This is the SUPERSET the
+        unified sweep walks so it fully covers the retired segment/iog_split/exc backfills.
+        Each row carries `needs_segments` (1 = no segments yet) so the driver only (re)writes
+        segments when they are ABSENT — split/exc use fill-null-only writers and are always safe."""
+        sql = ("SELECT b.block_start, b.meter_id, b.imp_kwh, b.imp_cost, b.imp_rate, "
+               "b.imp_kwh_ev, b.imp_cost_ev, b.imp_rate_ev, b.imp_ev_band, b.imp_home_band, "
+               "b.imp_rate_exc, b.source, b.imp_kwh_api, "
+               "(NOT EXISTS (SELECT 1 FROM block_segments s WHERE s.block_start = b.block_start "
+               "             AND s.meter_id = b.meter_id AND s.channel = 'import')) AS needs_segments "
+               "FROM blocks b WHERE " + self._NEEDS_REPRICE_WHERE)
+        params: list = []
+        if after_start is not None:
+            sql += " AND b.block_start > ?"
+            params.append(after_start)
+        sql += " ORDER BY b.block_start LIMIT ?"
+        params.append(int(limit))
+        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def count_blocks_needing_reprice(self) -> int:
+        """Remaining-work signal for the unified sweep (superset: missing segments OR
+        imported/settled missing exc)."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM blocks b WHERE " + self._NEEDS_REPRICE_WHERE).fetchone()
+        return int(row["n"]) if row else 0
 
     def get_vat_calendar(self) -> list:
         """Learned VAT-rate boundaries [(effective_from, rate), …] from store_meta.
@@ -3246,6 +3405,13 @@ class BlockStore:
                     changed_starts.append(start)
         if changed_starts:
             self.clear_reprice_queue_slots(channel, changed_starts)
+            # G2: invalidate segments for CSV-filled/corrected import blocks so the sweep rebuilds.
+            if channel == "import":
+                _ph = ",".join("?" * len(changed_starts))
+                with self._conn:
+                    self._conn.execute(
+                        f"DELETE FROM block_segments WHERE channel = 'import' AND meter_id = ? "
+                        f"AND block_start IN ({_ph})", [meter_id] + changed_starts)
         logger.info("reprice_imported_blocks_from_csv[%s]: %d changed of %d (%s..%s)",
                     channel, changed, checked, lo, hi)
         return {"checked": checked, "changed": changed, "from": lo, "to": hi}
@@ -6379,6 +6545,26 @@ class BlockStore:
                 b["totals"]["export_kwh"]  += exp
                 b["totals"]["import_cost"] += float(row["imp_cost"] or 0)
                 b["totals"]["export_cost"] += float(row["exp_cost"] or 0)
+
+        # BL-27: attach the priced segments (ONE query for the range) to each block's import
+        # channel, so readers can price from segments with a legacy-column fallback.
+        if block_map:
+            _sw, _sp = "WHERE channel = 'import'", []
+            if utc_start and utc_end:
+                _sw += " AND block_start >= ? AND block_start < ?"; _sp = [utc_start, utc_end]
+            elif utc_start:
+                _sw += " AND block_start >= ?"; _sp = [utc_start]
+            for sr in self._conn.execute(
+                "SELECT block_start, meter_id, kwh, inc_rate, exc_rate, band, attribution "
+                "FROM block_segments " + _sw + " ORDER BY block_start, meter_id, seq", _sp):
+                _b = block_map.get(sr["block_start"])
+                _m = _b["meters"].get(sr["meter_id"]) if _b else None
+                _ch = (_m.get("channels") or {}).get("import") if _m else None
+                if _ch is not None:
+                    _ch.setdefault("segments", []).append(
+                        {"kwh": sr["kwh"], "inc_rate": sr["inc_rate"],
+                         "exc_rate": sr["exc_rate"], "band": sr["band"],
+                         "attribution": sr["attribution"]})
 
         return [block_map[bs] for bs in block_order]
 

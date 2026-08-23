@@ -74,23 +74,22 @@ Consequences at the cap boundary:
 - **Outside the window, over-cap:** the freebie is gone, so **both** car and house
   are at their peak/day rates.
 
-### The cap measure — union of `completed` dispatch windows
-The cap is the **wall-clock union of `completed` dispatch intervals** (actual
-second-level start/end) within the noon→noon day — not a slot count, not delivered
-energy, not `planned`, not `started`. A `completed` dispatch is Octopus's own
-acknowledgement of a real dispatch, so keying on it sorts the three real shapes
-correctly: **planned/`started`-but-never-`completed` phantoms are excluded**
-(scheduled charges the car never took); **completed-only over-runs are included**
-(charger ran past its planned window); a **tiny completed counts at its true short
-length**, not a rounded block. Merge overlapping intervals; never sum per-row
-durations.
+### The cap measure — 6 hours of actual CHARGING (energy ÷ power)
+The cap is **6 hours of actual EV charging per noon→noon cap-day**, NOT 6 hours of
+dispatch wall-clock. Octopus dispatches in whole half-hour slots, but a slot only
+part-fills when the car nears full or draws below its peak, so the *charged* time of a
+slot is `|delivered_kWh| ÷ charge_power`. Charge power is inferred exactly as the charge
+card does (`_build_charge_sessions`): **2 × the cap-day's fullest delivered half-hour**
+(a saturated slot ≈ true power). Cumulative charged time is summed in time order; the
+boundary is the slot where it first reaches the cap, and that slot's **within-cap energy
+fraction** = `(cap − cumulative_before) ÷ slot_charge_hours` — so the boundary slot bills
+as a blend (off-peak + peak in one block). Slots before it are wholly within-cap, after
+wholly over-cap.
 
-The **actual-charging-time estimator** (`est_charge_hours = delivered_kWh ÷
-fullest-slot power`, surfaced on the overview) is **display / cross-check only and
-must never feed pricing** — dispatched hours and charged hours legitimately differ
-(e.g. 2.50 h dispatched vs 1.79 h charged on one prod session). A large gap between
-the two is the **under-delivery** signature (an acknowledged dispatch the car
-barely took) worth surfacing, but it doesn't move £.
+> Superseded (was): an earlier version measured the cap as the **wall-clock union of
+> completed dispatch windows** and deliberately excluded the charging-time estimator.
+> That's wrong — the IOG cap is 6 h of *charging*, so a part-filled slot must count as the
+> time it actually charged. Corrected here; the estimator now IS the cap basis.
 
 ### Boundary slot
 A mixed half-hour carries two rates at once — house portion on day/night, EV

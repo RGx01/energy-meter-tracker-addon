@@ -1,22 +1,35 @@
 """
 iog_cap.py — IOG 6-hour charge-cap math (pure, no I/O)
 ======================================================
-The cap is the **union of `completed` dispatch windows per noon→noon (local)
-cap-day**, capped at 6 hours: the EV portion of a slot bills off-peak up to the
-6-hour boundary and EV-peak beyond. See docs/iog_6hr_cap_design.md.
+The cap is **6 hours of actual EV CHARGING per noon→noon (local) cap-day**, measured
+from `completed` dispatch: the EV portion of a slot bills off-peak until cumulative
+charging reaches the boundary and EV-peak beyond. Charged time is `|energy| ÷ power`,
+with power inferred the way the charge card does (`2 ×` the cap-day's fullest delivered
+half-hour ≈ true charge power), so a part-filled slot counts as the fraction it charged
+and the boundary can fall MID-slot (a blended block). See docs/iog_6hr_cap_design.md.
 
-Everything here is a pure function of (completed dispatch intervals, timezone), so
-it is unit-testable and gives the *same* answer live and at settlement. It does NOT
-decide slot rates — it only measures cap usage and locates the boundary instant;
-the 4-rate classifier consumes that. Delivered energy and the actual-charging-time
-estimator are deliberately NOT inputs (dispatched time is the cap basis).
+Everything here is a pure function of (completed dispatch slots + delivered energy,
+timezone), so it is unit-testable and gives the *same* answer live and at settlement. It
+does NOT decide slot rates — it only measures cap usage and locates the boundary slot +
+its within-cap energy fraction; the 4-rate classifier consumes that.
 """
 
+import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Iterable, Optional
 
-CAP_HOURS = 6.0
+# IOG charge-cap length (hours of ACTUAL EV charging per noon→noon cap-day). Octopus's
+# current cap is 6 h; overridable at startup via IOG_CAP_HOURS so a variant/change can be
+# followed without a code edit. Read LIVE by the cap fns (default None → resolves here), so
+# setting iog_cap.CAP_HOURS at runtime takes effect too (the old float-default bound it at
+# import, which silently pinned the cap to 6 h).
+def _env_cap_hours() -> float:
+    try:
+        return float(os.environ.get("IOG_CAP_HOURS", "6.0"))
+    except (TypeError, ValueError):
+        return 6.0
+CAP_HOURS = _env_cap_hours()
 CAP_DAY_ANCHOR_HOUR = 12          # noon→noon cap-day
 _UTC = ZoneInfo("UTC")
 
@@ -59,66 +72,83 @@ def _hours(s: str, e: str) -> float:
     return (datetime.fromisoformat(e) - datetime.fromisoformat(s)).total_seconds() / 3600.0
 
 
-def cap_usage(completed_intervals: Iterable[tuple], tz_name: str,
-              cap_hours: float = CAP_HOURS) -> dict:
-    """Cap usage per noon→noon cap-day from COMPLETED dispatch windows.
+def cap_usage(completed_slots: Iterable[tuple], tz_name: str,
+              cap_hours: "float | None" = None) -> dict:
+    """Cap usage per noon→noon cap-day, measured in ACTUAL CHARGING TIME.
 
-    `completed_intervals` — iterable of (raw_start, raw_end) naive-UTC ISO for
-    `completed` dispatches (planned/started phantoms must already be excluded).
-    Returns `{cap_day: {"used_hours", "over", "boundary_utc"}}` where:
-      - `used_hours` — merged-union dispatch hours in that cap-day,
-      - `over` — whether the day exceeds `cap_hours`,
-      - `boundary_utc` — the naive-UTC instant the running union first reaches
-        `cap_hours` (None if the day never gets there). Everything at/after this
-        instant is over-cap → EV-peak.
+    The IOG cap is `cap_hours` of *charging*, NOT of dispatch wall-clock — a half-hour
+    slot that only part-filled counts as the time it actually charged. Charge power is
+    inferred the way the charge card does (`_build_charge_sessions`): 2× the cap-day's
+    fullest delivered half-hour (a saturated slot ≈ true power). Each slot then
+    contributes `|energy| / power` hours, so the cap boundary can fall MID-slot.
+
+    `completed_slots` — iterable of (raw_start, raw_end, energy_kwh); `completed` rows
+    only. Returns `{cap_day: {"used_hours", "over", "boundary_slot", "boundary_frac"}}`:
+      - `used_hours` — total charged hours in the cap-day,
+      - `over` — whether it exceeds `cap_hours`,
+      - `boundary_slot` — the slot_start whose running charge-time first reaches the cap
+        (None if never), with `boundary_frac` = the fraction of THAT slot's energy still
+        within the cap (so it bills as a blend). Slots before it are wholly within-cap,
+        slots after wholly over-cap.
     """
+    if cap_hours is None:
+        cap_hours = CAP_HOURS
     by_day: dict = {}
-    for s, e in completed_intervals:
-        if not s or not e or str(e) <= str(s):
+    for row in completed_slots:
+        s0 = row[0]; e0 = row[1] if len(row) > 1 else None
+        energy = row[2] if len(row) > 2 else None
+        if not s0 or energy is None:
             continue
-        by_day.setdefault(cap_day_key(s, tz_name), []).append((str(s), str(e)))
+        d = by_day.setdefault(cap_day_key(s0, tz_name), {})
+        d[str(s0)] = d.get(str(s0), 0.0) + abs(float(energy))   # one row/slot; sum defensively
 
     out: dict = {}
-    for day, ivs in by_day.items():
-        merged = merge_intervals(ivs)
+    for day, slots in by_day.items():
+        items = sorted(slots.items())                 # (slot_start, |energy|) in time order
+        max_e = max((e for _, e in items), default=0.0)
+        power = 2.0 * max_e                            # kW — charge-card basis (saturated slot)
         cum = 0.0
-        boundary = None
-        for s, e in merged:
-            d = _hours(s, e)
-            if boundary is None and cum + d >= cap_hours - 1e-12:
-                # the 6-hour mark falls inside this interval
+        b_slot = b_frac = None
+        for slot_start, e in items:
+            ct = (e / power) if power > 1e-9 else 0.0  # charge-hours this slot
+            if b_slot is None and cum + ct >= cap_hours - 1e-12:
                 need = max(0.0, cap_hours - cum)
-                boundary = (datetime.fromisoformat(s)
-                            + timedelta(hours=need)).isoformat()
-            cum += d
+                b_slot = slot_start
+                b_frac = max(0.0, min(1.0, (need / ct) if ct > 1e-12 else 0.0))
+            cum += ct
         out[day] = {"used_hours": round(cum, 4),
                     "over": cum > cap_hours + 1e-9,
-                    "boundary_utc": boundary}
+                    "boundary_slot": b_slot, "boundary_frac": b_frac}
     return out
 
 
-def cap_day_boundaries(completed_intervals: Iterable[tuple], tz_name: str,
-                       cap_hours: float = CAP_HOURS) -> dict:
-    """`{cap_day: boundary_utc}` — the per-cap-day 6-hour boundary instant (or
-    None where the day never reaches the cap). A thin projection of `cap_usage`
-    for the pricing seam: look a slot up with `boundaries.get(cap_day_key(ts))`."""
-    return {d: v["boundary_utc"]
-            for d, v in cap_usage(completed_intervals, tz_name, cap_hours).items()}
+def cap_day_boundaries(completed_slots: Iterable[tuple], tz_name: str,
+                       cap_hours: "float | None" = None) -> dict:
+    """`{cap_day: (boundary_slot, boundary_frac)}` — the per-cap-day charge-time boundary
+    (the slot the cap is reached in, and the within-cap energy fraction of that slot), or
+    absent where the day never reaches the cap. Projection of `cap_usage` for the pricing
+    seam: look a slot up with `boundaries.get(cap_day_key(ts))`."""
+    if cap_hours is None:
+        cap_hours = CAP_HOURS
+    return {d: (v["boundary_slot"], v["boundary_frac"])
+            for d, v in cap_usage(completed_slots, tz_name, cap_hours).items()}
 
 
-def _within_cap_frac(start: str, end: str, boundary_utc: Optional[str]) -> float:
-    """Fraction of slot [start, end) that lies WITHIN the 6-hour cap, by wall-clock.
-    `boundary_utc` None → 1.0 (the day never reached the cap). Slot fully before the
-    boundary → 1.0; fully at/after → 0.0; straddling → the time fraction before it.
-    (Naive-UTC ISO strings compare chronologically as strings.)"""
-    if boundary_utc is None:
+def _within_cap_frac(block_start: str, boundary) -> float:
+    """Fraction of this slot's EV energy WITHIN the cap. `boundary` is
+    (boundary_slot, boundary_frac) from `cap_usage`, or None / (None, ...) when the cap was
+    never reached. A slot before the boundary slot is wholly within-cap (1.0); the boundary
+    slot takes its energy fraction; a slot at/after is wholly over-cap (0.0)."""
+    if not boundary:
         return 1.0
-    if boundary_utc <= start:
-        return 0.0
-    if boundary_utc >= end:
+    b_slot, b_frac = boundary
+    if b_slot is None:
         return 1.0
-    total = _hours(start, end)
-    return _hours(start, boundary_utc) / total if total > 0 else 1.0
+    if block_start < b_slot:
+        return 1.0
+    if block_start == b_slot:
+        return float(b_frac if b_frac is not None else 0.0)
+    return 0.0
 
 
 def _band(frac: float, off: str = "off_peak", on: str = "peak") -> str:
@@ -131,7 +161,7 @@ def _band(frac: float, off: str = "off_peak", on: str = "peak") -> str:
 
 def classify_slot(block_start: str, block_end: str, *, in_off_peak_window: bool,
                   is_dispatch: bool, is_boost: bool = False,
-                  boundary_utc: Optional[str] = None) -> dict:
+                  boundary=None) -> dict:
     """4-rate classification for one half-hour (docs/iog_6hr_cap_design.md).
 
     Pure — the caller resolves the inputs:
@@ -139,7 +169,7 @@ def classify_slot(block_start: str, block_end: str, *, in_off_peak_window: bool,
                            window (RateSchedule.is_off_peak) — cap-independent.
       is_dispatch        : a `completed` dispatch overlaps this slot (EV charging).
       is_boost           : a bump/boost dispatch → EV always peak.
-      boundary_utc       : the cap-day's 6-hour boundary instant (cap_usage), or None.
+      boundary           : (boundary_slot, boundary_frac) from cap_usage, or None.
 
     Returns bands + off-peak fractions for the EV and HOUSE portions:
       ev    : "off_peak" | "peak" | "mixed" | None (None = no EV this slot)
@@ -157,7 +187,7 @@ def classify_slot(block_start: str, block_end: str, *, in_off_peak_window: bool,
                 "house": "off_peak" if in_off_peak_window else "day",
                 "house_offpeak_frac": 1.0 if in_off_peak_window else 0.0,
                 "boundary": False}
-    ev_frac = 0.0 if is_boost else _within_cap_frac(block_start, block_end, boundary_utc)
+    ev_frac = 0.0 if is_boost else _within_cap_frac(block_start, boundary)
     # Guaranteed window → house off-peak whatever the cap; else the freebie tracks
     # the within-cap fraction (whole slot when within cap, withdrawn when over).
     house_frac = 1.0 if in_off_peak_window else ev_frac
@@ -207,7 +237,7 @@ def price_import_split(classification: dict, *, ev_kwh: float, house_kwh: float,
 
 
 def price_slot(block_start: str, block_end: str, chosen_kwh: float, ev_kwh: float, *,
-               in_off_peak_window: bool, is_boost: bool, boundary_utc: Optional[str],
+               in_off_peak_window: bool, is_boost: bool, boundary=None,
                house_offpeak_rate: float, house_day_rate: float,
                ev_offpeak_rate: Optional[float] = None,
                ev_peak_rate: Optional[float] = None) -> dict:
@@ -229,7 +259,29 @@ def price_slot(block_start: str, block_end: str, chosen_kwh: float, ev_kwh: floa
     cls = classify_slot(block_start, block_end,
                         in_off_peak_window=in_off_peak_window,
                         is_dispatch=has_ev, is_boost=is_boost,
-                        boundary_utc=boundary_utc)
+                        boundary=boundary)
+    # BL-27: the slot's band SEGMENTS are the single source of truth — a boundary slot
+    # carries its true four bands (EV off/peak, house off/day), and the imp_* columns below
+    # are PROJECTIONS of them (one decomposition, one rounding). This is sub-penny vs the
+    # old independent arithmetic (≤3e-6, settlement-jitter scale); the bill (2dp) is
+    # unchanged. exc is left off the segments here; the persist seam applies the exc ratio.
+    segs = _slot_segments(cls, ev_kwh=ev_kwh, house_kwh=house_kwh,
+                          house_offpeak_rate=house_offpeak_rate,
+                          house_day_rate=house_day_rate,
+                          ev_offpeak_rate=ev_offpeak_rate,
+                          ev_peak_rate=ev_peak_rate) if has_ev else None
+    if segs:
+        _kwh = ev_kwh + house_kwh
+        _tot = round(sum(k * r for (k, r, b, a) in segs), 6)
+        _evc = round(sum(k * r for (k, r, b, a) in segs if a == "ev"), 6)
+        return {"imp_cost": _tot,
+                "imp_rate": round(_tot / _kwh, 6) if _kwh > 1e-12 else house_day_rate,
+                "imp_kwh_ev": round(ev_kwh, 6),
+                "imp_cost_ev": _evc,
+                "imp_rate_ev": round(_evc / ev_kwh, 6) if ev_kwh > 1e-12 else None,
+                "segments": segs,
+                "classification": cls}
+    # House-only slot (no EV): a single house band — price_import_split is exact here.
     priced = price_import_split(cls, ev_kwh=ev_kwh, house_kwh=house_kwh,
                                 house_offpeak_rate=house_offpeak_rate,
                                 house_day_rate=house_day_rate,
@@ -237,15 +289,44 @@ def price_slot(block_start: str, block_end: str, chosen_kwh: float, ev_kwh: floa
                                 ev_peak_rate=ev_peak_rate)
     return {"imp_cost": priced["total_cost"],
             "imp_rate": priced["effective_rate"],
-            "imp_kwh_ev": round(ev_kwh, 6) if has_ev else None,
-            "imp_cost_ev": priced["ev_cost"] if has_ev else None,
-            "imp_rate_ev": (round(priced["ev_cost"] / ev_kwh, 6) if has_ev else None),
+            "imp_kwh_ev": None,
+            "imp_cost_ev": None,
+            "imp_rate_ev": None,
+            "segments": None,
             "classification": cls}
+
+
+def _slot_segments(classification: dict, *, ev_kwh: float, house_kwh: float,
+                   house_offpeak_rate: float, house_day_rate: float,
+                   ev_offpeak_rate: Optional[float] = None,
+                   ev_peak_rate: Optional[float] = None) -> list:
+    """Decompose a priced slot into its band segments as (kwh, inc_rate, band,
+    attribution) tuples — the same split `price_import_split` costs, but kept per-band
+    so a boundary slot yields all four. Pure; mirrors `pricing_segments.import_segments`
+    (kept inline so `iog_cap` stays dependency-free). Zero-kWh bands are dropped."""
+    evf = float(classification.get("ev_offpeak_frac", 0.0))
+    hf = float(classification.get("house_offpeak_frac", 0.0))
+    out: list = []
+    if ev_kwh > 1e-9 and ev_offpeak_rate is not None and ev_peak_rate is not None:
+        k_off = ev_kwh * evf
+        k_pk = ev_kwh - k_off
+        if k_off > 1e-9:
+            out.append((round(k_off, 6), ev_offpeak_rate, "off_peak", "ev"))
+        if k_pk > 1e-9:
+            out.append((round(k_pk, 6), ev_peak_rate, "peak", "ev"))
+    if house_kwh > 1e-9:
+        k_off = house_kwh * hf
+        k_day = house_kwh - k_off
+        if k_off > 1e-9:
+            out.append((round(k_off, 6), house_offpeak_rate, "off_peak", "house"))
+        if k_day > 1e-9:
+            out.append((round(k_day, 6), house_day_rate, "day", "house"))
+    return out
 
 
 def compute_iog_split(block_start: str, block_end: str, *, chosen_kwh: float,
                       ev_kwh: float, overlay_rate: float, is_boost: bool,
-                      capped: bool, boundary_utc: Optional[str],
+                      capped: bool, boundary=None,
                       import_sched, ev_off_sched=None, ev_peak_sched=None):
     """Reconcile-seam entry: resolve the four rate bands and price one slot's
     house/EV split. Takes the RateSchedule objects (duck-typed — no import of
@@ -266,15 +347,24 @@ def compute_iog_split(block_start: str, block_end: str, *, chosen_kwh: float,
         ev_off = ev_off_sched.resolve(block_start)
         ev_peak = ev_peak_sched.resolve(block_start)
         if None not in (op, day, ev_off, ev_peak):
+            # UNIT FIX (watch #12 origin): these come from the pence-valued RateSchedules
+            # (Octopus API native pence; RateSchedule/from_api_records keep it raw), but
+            # price_slot wants £/kWh. Convert here, exactly as every other consumer does
+            # (_kraken_rate_resolver, _dispatch_overlay_rate → pence/100). Without it the capped
+            # 4-rate split priced in PENCE — the 2026-08-18 imp_rate_ev=6.9 break, otherwise only
+            # caught downstream by the §4a unit guard. Specified-rate/IOG only; Agile never caps
+            # (no ev_device schedules → capped=False → the £ overlay fall-through below).
+            op = round(op / 100.0, 6); day = round(day / 100.0, 6)
+            ev_off = round(ev_off / 100.0, 6); ev_peak = round(ev_peak / 100.0, 6)
             return price_slot(
                 block_start, block_end, chosen_kwh, ev_kwh,
                 in_off_peak_window=(import_sched.is_off_peak(block_start) is True),
-                is_boost=is_boost, boundary_utc=boundary_utc,
+                is_boost=is_boost, boundary=boundary,
                 house_offpeak_rate=op, house_day_rate=day,
                 ev_offpeak_rate=ev_off, ev_peak_rate=ev_peak)
         # fall through: an ev_device rate is missing for this slot
     # Uncapped IOG: whole slot on the resolved overlay rate → totals unchanged.
     return price_slot(block_start, block_end, chosen_kwh, ev_kwh,
-                      in_off_peak_window=True, is_boost=False, boundary_utc=None,
+                      in_off_peak_window=True, is_boost=False, boundary=None,
                       house_offpeak_rate=overlay_rate, house_day_rate=overlay_rate,
                       ev_offpeak_rate=overlay_rate, ev_peak_rate=overlay_rate)

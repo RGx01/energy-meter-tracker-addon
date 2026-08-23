@@ -5,6 +5,7 @@ except ImportError:
     from backports.zoneinfo import ZoneInfo
 from collections import defaultdict
 import json
+import carbon as _carbon
 import os
 import re
 
@@ -751,32 +752,55 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
                             # figure when the block settles and stamps cost_exc.
                             _vat = store.vat_rate_at(block.get("start")) if store is not None else 0.05
                             _ratio = 1.0 / (1.0 + _vat)
-                        _evk = float(channel.get("kwh_ev") or 0.0)
-                        _evc = float(channel.get("cost_ev") or 0.0)
-                        if _evk > 1e-9:
-                            _evx = _evc * _ratio
-                            if channel.get("ev_band") == "mixed":
-                                ev_transition["kwh"]      += _evk
-                                ev_transition["cost"]     += _evc
-                                ev_transition["cost_exc"] += _evx
-                            else:                          # clean band → exact rate row
-                                _evr = round(float(channel.get("rate_ev") or 0.0), 4)
-                                ev_by_rate[_evr]["kwh"]      += _evk
-                                ev_by_rate[_evr]["cost"]     += _evc
-                                ev_by_rate[_evr]["cost_exc"] += _evx
-                        _hk = kwh - _evk
-                        _hc = cost - _evc
-                        if _hk > 1e-9:
-                            _hx = _hc * _ratio
-                            if channel.get("home_band") == "mixed":
-                                home_transition["kwh"]      += _hk
-                                home_transition["cost"]     += _hc
-                                home_transition["cost_exc"] += _hx
-                            else:
-                                _hr = round(_hc / _hk, 4)
-                                home_by_rate[_hr]["kwh"]      += _hk
-                                home_by_rate[_hr]["cost"]     += _hc
-                                home_by_rate[_hr]["cost_exc"] += _hx
+                        # BL-27: price the split from the block's priced SEGMENTS when they
+                        # travel with it (block_store attaches them to the import channel).
+                        # Each segment already carries its own inc/exc rate + attribution, so
+                        # a boundary block simply presents its constituent rate rows — the
+                        # mixed-band "transition" special-case is retired for segment blocks.
+                        # Legacy blocks (pre-backfill / no segments) keep the column path.
+                        _segs = channel.get("segments")
+                        if _segs:
+                            for _s in _segs:
+                                _sk = float(_s.get("kwh") or 0.0)
+                                if _sk <= 1e-9:
+                                    continue
+                                _sr = round(float(_s.get("inc_rate") or 0.0), 4)
+                                _sc = _sk * float(_s.get("inc_rate") or 0.0)
+                                _sxr = _s.get("exc_rate")
+                                _sx = (_sk * float(_sxr)) if _sxr is not None \
+                                    else _sc * _ratio
+                                _grp = ev_by_rate if _s.get("attribution") == "ev" \
+                                    else home_by_rate
+                                _grp[_sr]["kwh"]      += _sk
+                                _grp[_sr]["cost"]     += _sc
+                                _grp[_sr]["cost_exc"] += _sx
+                        else:
+                            _evk = float(channel.get("kwh_ev") or 0.0)
+                            _evc = float(channel.get("cost_ev") or 0.0)
+                            if _evk > 1e-9:
+                                _evx = _evc * _ratio
+                                if channel.get("ev_band") == "mixed":
+                                    ev_transition["kwh"]      += _evk
+                                    ev_transition["cost"]     += _evc
+                                    ev_transition["cost_exc"] += _evx
+                                else:                          # clean band → exact rate row
+                                    _evr = round(float(channel.get("rate_ev") or 0.0), 4)
+                                    ev_by_rate[_evr]["kwh"]      += _evk
+                                    ev_by_rate[_evr]["cost"]     += _evc
+                                    ev_by_rate[_evr]["cost_exc"] += _evx
+                            _hk = kwh - _evk
+                            _hc = cost - _evc
+                            if _hk > 1e-9:
+                                _hx = _hc * _ratio
+                                if channel.get("home_band") == "mixed":
+                                    home_transition["kwh"]      += _hk
+                                    home_transition["cost"]     += _hc
+                                    home_transition["cost_exc"] += _hx
+                                else:
+                                    _hr = round(_hc / _hk, 4)
+                                    home_by_rate[_hr]["kwh"]      += _hk
+                                    home_by_rate[_hr]["cost"]     += _hc
+                                    home_by_rate[_hr]["cost_exc"] += _hx
                         # Use kwh_remainder directly when available. With no
                         # sub-meters this key is absent (NULL in DB, omitted by
                         # reconstruction), so the raw kwh is kept unchanged —
@@ -862,10 +886,19 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
     # like the statement (e.g. £8.001), while the section Total stays 2dp.
     for _grp in (ev_by_rate, home_by_rate):
         for _r in _grp:
+            # B6: keep the UNROUNDED cost for the per-band RATE derivation in
+            # _bill_split_rows. Rounding the cost to 3dp BEFORE the rate = Σcost ÷ Σkwh
+            # drifts a small-kWh band off its canonical rate (a 3.7 kWh peak band read
+            # 0.3076, not the tariff 0.3077, even with canonical segments post-M1). Costs
+            # are still SHOWN to 3dp (statement style); only the rate reads the raw.
+            _grp[_r]["cost_raw"]     = _grp[_r]["cost"]
+            _grp[_r]["cost_exc_raw"] = _grp[_r]["cost_exc"]
             _grp[_r]["kwh"]      = round(_grp[_r]["kwh"], 3)
             _grp[_r]["cost"]     = round(_grp[_r]["cost"], 3)
             _grp[_r]["cost_exc"] = round(_grp[_r]["cost_exc"], 3)
     for _t in (ev_transition, home_transition):
+        _t["cost_raw"]     = _t["cost"]
+        _t["cost_exc_raw"] = _t["cost_exc"]
         _t["kwh"]      = round(_t["kwh"], 3)
         _t["cost"]     = round(_t["cost"], 3)
         _t["cost_exc"] = round(_t["cost_exc"], 3)
@@ -1045,12 +1078,19 @@ def _bill_split_rows(summary, currency, exc=False):
     home_by_rate = summary.get("home_by_rate") or {}
     ev_tr        = summary.get("ev_transition") or {}
     home_tr      = summary.get("home_transition") or {}
-    _ck = "cost_exc" if exc else "cost"
+    _ck  = "cost_exc" if exc else "cost"
+    _ckr = _ck + "_raw"                       # B6: unrounded cost for the canonical rate
     if (sum(v["kwh"] for v in ev_by_rate.values()) + (ev_tr.get("kwh") or 0.0)) <= 1e-9:
         return None
 
-    def _row(label, kwh, cost, note=""):
-        rate = (cost / kwh) if kwh else 0.0
+    def _row(label, kwh, cost, note="", rate=None):
+        # B1: EV and Home in the SAME collapsed band are the same tariff rate. Show one
+        # shared per-band rate (passed in) rather than each row re-deriving cost/kWh, which
+        # diverges on small-kWh bands from independent per-block cost rounding. Per-band, so
+        # a genuine in-period rate change (> _SPLIT_BAND_EPS) is a separate band → separate
+        # rows at their own rates. kWh + cost printed here are unchanged (still exact).
+        if rate is None:
+            rate = (cost / kwh) if kwh else 0.0
         cs = f"({-cost:.3f})" if cost < 0 else f"{cost:.3f}"   # 3dp, as the bill
         return (f'\n        <tr><td>{label}</td><td>{rate:.4f}{note}</td>'
                 f'<td>{kwh:.3f}</td><td>{cs}</td></tr>')
@@ -1067,23 +1107,32 @@ def _bill_split_rows(summary, currency, exc=False):
 
     html = ""
     for band in _bands:
-        ek = ec = hk = hc = 0.0
+        ek = ec = hk = hc = 0.0        # kWh + displayed (3dp) cost
+        ecr = hcr = 0.0                # B6: unrounded cost, for the canonical band rate
         for r in band:
             e = ev_by_rate.get(r)
             if e:
-                ek += e["kwh"]; ec += e.get(_ck, 0.0)
+                ek += e["kwh"]; ec += e.get(_ck, 0.0); ecr += e.get(_ckr, e.get(_ck, 0.0))
             h = home_by_rate.get(r)
             if h:
-                hk += h["kwh"]; hc += h.get(_ck, 0.0)
+                hk += h["kwh"]; hc += h.get(_ck, 0.0); hcr += h.get(_ckr, h.get(_ck, 0.0))
+        # Shared band rate — kWh-weighted over BOTH series for THIS band only, so EV and
+        # Home always read identically within a band and a real in-period rate change (its
+        # own band) keeps its own rate. B6: derive it from the UNROUNDED cost so a small-kWh
+        # band reads the canonical tariff rate (not the 3dp-rounded-cost ÷ kWh drift); the
+        # displayed cost columns (ec/hc) stay 3dp.
+        _band_rate = ((ecr + hcr) / (ek + hk)) if (ek + hk) > 1e-9 else 0.0
         if ek > 1e-9:
-            html += _row("EV", ek, ec)
+            html += _row("EV", ek, ec, rate=_band_rate)
         if hk > 1e-9:
-            html += _row("Home", hk, hc)
+            html += _row("Home", hk, hc, rate=_band_rate)
     _note = ' <span style="opacity:0.6;">(transition)</span>'
     if (ev_tr.get("kwh") or 0.0) > 1e-9:
-        html += _row("EV", ev_tr["kwh"], ev_tr.get(_ck, 0.0), _note)
+        _r = (ev_tr.get(_ckr, ev_tr.get(_ck, 0.0)) / ev_tr["kwh"]) if ev_tr["kwh"] > 1e-9 else None
+        html += _row("EV", ev_tr["kwh"], ev_tr.get(_ck, 0.0), _note, rate=_r)
     if (home_tr.get("kwh") or 0.0) > 1e-9:
-        html += _row("Home", home_tr["kwh"], home_tr.get(_ck, 0.0), _note)
+        _r = (home_tr.get(_ckr, home_tr.get(_ck, 0.0)) / home_tr["kwh"]) if home_tr["kwh"] > 1e-9 else None
+        html += _row("Home", home_tr["kwh"], home_tr.get(_ck, 0.0), _note, rate=_r)
     return html
 
 
@@ -1246,16 +1295,30 @@ def _bill_method_breakdown(blocks, period_vat=None, standing_inc_by_day=None):
         band["inc"] += ic
     if not bands:
         return None
+    # B2: cluster adjacent band keys within _SPLIT_BAND_EPS before emitting rows. The band
+    # key is the CLEAN inc rate where the tariff supplies one, but rate-from-cost history
+    # (CSV import) derives it as cost÷kWh, which jitters (e.g. 0.070000 vs 0.070003 — the
+    # same off-peak tariff) and would otherwise show as two identical-looking rows. Sub-penny
+    # EPS, and PER-CLUSTER, so a genuine in-period rate change (≥ pence) stays its own row.
+    _keys = sorted(bands)
+    _clusters = []
+    for _k in _keys:
+        if _clusters and (_k - _clusters[-1][-1]) <= _SPLIT_BAND_EPS:
+            _clusters[-1].append(_k)
+        else:
+            _clusters.append([_k])
     rows, energy_raw, energy_inc = [], 0.0, 0.0
-    for key in sorted(bands):
-        bk, be = bands[key]["kwh"], bands[key]["exc"]
+    for _cl in _clusters:
+        bk = sum(bands[k]["kwh"] for k in _cl)
+        be = sum(bands[k]["exc"] for k in _cl)
+        bi = sum(bands[k]["inc"] for k in _cl)
         energy_raw += be
-        energy_inc += bands[key]["inc"]
-        # Displayed exc rate = the band's clean inc-scale key ÷ (1+VAT) — a deterministic
-        # ex-VAT label that matches the bill, NOT a derived effective cost ÷ kWh (which can
-        # land a rounding unit off). Cost to 3dp (mills), like the bill — the 4dp rate × kWh
-        # only reconciles to the cost at finer precision; the summed raw cost is authoritative.
-        rows.append({"rate_exc": round(key / (1.0 + vat), 4),
+        energy_inc += bi
+        # Displayed exc rate = the cluster's kWh-weighted inc-scale rate ÷ (1+VAT) — a
+        # deterministic ex-VAT label that matches the bill. Cost to 3dp (mills), like the
+        # bill — the summed raw cost is authoritative.
+        _wk = (sum(k * bands[k]["kwh"] for k in _cl) / bk) if bk > 1e-12 else _cl[0]
+        rows.append({"rate_exc": round(_wk / (1.0 + vat), 4),
                      "kwh": round(bk, 3), "cost_exc": round(be, 3)})
     # Collapse a long rate list (Agile: hundreds of distinct half-hourly rates across a
     # bill period) into ONE kWh-weighted average row so the ex-VAT summary stays
@@ -1336,7 +1399,7 @@ def _ev_meter_id(cfg):
     return None
 
 
-def _dispatch_ev_slot_map(store, blocks, cfg):
+def _dispatch_ev_slot_map(store, blocks, cfg, gated=True):
     """{slot_start(UTC ISO): {"kwh","cost","rate"}} — per-slot EV reconstructed from
     COMPLETED dispatches (Octopus's own per-slot EV energy), grid-clipped to that slot's
     main import and cost-apportioned from the slot's import cost. Gated to no-sub-meter
@@ -1352,7 +1415,7 @@ def _dispatch_ev_slot_map(store, blocks, cfg):
     _evm = _ev_meter_id(cfg)
     covered = ({b["start"] for b in blocks
                 if b and b.get("start") and _evm in (b.get("meters") or {})}
-               if _evm else set())
+               if (_evm and gated) else set())
     starts = [b["start"] for b in blocks if b and b.get("start")]
     if not starts:
         return {}
@@ -1395,8 +1458,21 @@ def _dispatch_ev_slot_map(store, blocks, cfg):
         # only where a block has no stored split — un-backfilled / older history. On an
         # uncapped account the two are identical (EV and house share the rate), so this
         # is byte-identical there.
+        # BL-27: prefer the EV-attributed SEGMENTS (the single source of truth) — imp_cost_ev
+        # is just their summed cost, so this is byte-identical to the stored split while
+        # letting the reconcile re-stamp of the EV columns retire. Fall back to the stored
+        # columns, then the dispatch pro-rata carve, for any block without segments.
+        _segs = imp.get("segments")
+        _seg_evk = (sum(float(x.get("kwh") or 0.0) for x in _segs
+                        if x.get("attribution") == "ev") if _segs else 0.0)
         _sk = imp.get("kwh_ev")
-        if _sk is not None and float(_sk) > 1e-9:
+        if _seg_evk > 1e-9:
+            _seg_evc = sum(float(x.get("kwh") or 0.0) * float(x.get("inc_rate") or 0.0)
+                           for x in _segs if x.get("attribution") == "ev")
+            ek = min(_seg_evk, mk)
+            ec = _seg_evc * (ek / _seg_evk) if _seg_evk > 0 else 0.0
+            rate = round(ec / ek, 4) if ek else rate
+        elif _sk is not None and float(_sk) > 1e-9:
             ek = min(float(_sk), mk)
             _sc = float(imp.get("cost_ev") or 0.0)
             ec = _sc * (ek / float(_sk)) if float(_sk) > 0 else 0.0
@@ -1413,8 +1489,65 @@ def _dispatch_ev_slot_map(store, blocks, cfg):
     return out
 
 
+def _hybrid_ev_slot_map(store, blocks, cfg):
+    """Per-slot HYBRID EV for the billing breakdown on a has-EV-meter account: SYNTHETIC
+    (dispatch / stored imp_kwh_ev / segments — bill-authoritative) wherever it exists,
+    else the RECORDED physical EV sub-meter's own metered slot. One continuous EV. The
+    synthetic map is taken UNGATED (the coverage gate is what kept it off for an active
+    meter); the recorded fallback fills the pre-seam slots. Total-safety is the caller's
+    (fold the physical EV line into the remainder before carving this out)."""
+    out = dict(_dispatch_ev_slot_map(store, blocks, cfg, gated=False))   # synthetic, all slots
+    evm = _ev_meter_id(cfg)
+    if evm:
+        for b in blocks:
+            slot = (b or {}).get("start")
+            if not slot or slot in out:                    # synthetic already owns this slot
+                continue
+            ch = (((b.get("meters") or {}).get(evm) or {}).get("channels", {}) or {}).get("import", {}) or {}
+            try:
+                k = float(ch.get("kwh_total", ch.get("kwh")) or 0.0)
+                c = float(ch.get("cost") or 0.0)
+                r = round(float(ch.get("rate_used", ch.get("rate")) or 0.0), 4)
+            except Exception:
+                continue
+            if k > 1e-9:
+                out[slot] = {"kwh": k, "cost": c, "rate": r}   # recorded physical (pre-seam)
+    return out
+
+
+def _fold_ev_submeter_into_remainder(summary, ev_devices):
+    """Move the physical EV sub-meter line(s) back into the main-import remainder so the
+    hybrid EV can be carved from it. TOTAL-SAFE: energy only moves between the EV line and
+    the remainder, so Total Import / total_cost are untouched. Matches sub-meter lines by
+    device name (or an ev/charger keyword). Returns True if anything folded."""
+    totals = summary.get("totals") or {}
+    meters = summary.get("meters") or {}
+    meta   = summary.get("meter_meta") or {}
+    rem_key = next((k for k in totals
+                    if k.endswith("/ Import") and not totals[k].get("is_submeter")), None)
+    if not rem_key:
+        return False
+    rem = meters.setdefault(rem_key, {})
+    def _is_ev_line(k):
+        d = str((meta.get(k, {}) or {}).get("device") or "")
+        return (d in ev_devices) or ("charger" in d.lower()) or ("charger" in k.lower())
+    folded = False
+    for key in [k for k in list(totals)
+                if totals[k].get("is_submeter") and k.endswith("/ Import") and _is_ev_line(k)]:
+        for rate, v in (meters.get(key) or {}).items():
+            _r = rem.setdefault(rate, {"kwh": 0.0, "cost": 0.0, "read_start": None, "read_end": None})
+            _r["kwh"]  = round(_r.get("kwh", 0.0)  + (v.get("kwh")  or 0.0), 3)
+            _r["cost"] = round(_r.get("cost", 0.0) + (v.get("cost") or 0.0), 2)
+        rt, rtr = totals[key], totals[rem_key]
+        rtr["kwh"]  = round(rtr["kwh"]  + rt["kwh"],  3)
+        rtr["cost"] = round(rtr["cost"] + rt["cost"], 2)
+        meters.pop(key, None); totals.pop(key, None); meta.pop(key, None)
+        folded = True
+    return folded
+
+
 def _inject_ev_breakdown_into_summary(summary, period_blocks, ev_slot_map,
-                                      label="EV (from dispatch)"):
+                                      label="EV (from dispatch)", fold_devices=None):
     """Split the 'Direct import' remainder in a billing summary into a reduced house
     slice + a synthetic '<label> / Import' sub-meter, from ev_slot_map. DISPLAY-ONLY:
     main_import_raw ('Import — total grid'), standing, and total_cost are untouched, so
@@ -1425,8 +1558,10 @@ def _inject_ev_breakdown_into_summary(summary, period_blocks, ev_slot_map,
     if not summary or not ev_slot_map:
         return False
     totals = summary.get("totals") or {}
-    if any(t.get("is_submeter") for t in totals.values()):
-        return False
+    if fold_devices:                              # hybrid: fold the physical EV line into remainder,
+        _fold_ev_submeter_into_remainder(summary, fold_devices)   # then carve the hybrid EV from it
+    elif any(t.get("is_submeter") for t in totals.values()):
+        return False                              # no-meter path: unchanged (byte-identical)
     remainder_key = next((k for k in totals
                           if k.endswith("/ Import") and not totals[k].get("is_submeter")), None)
     if not remainder_key:
@@ -1698,7 +1833,65 @@ def render_billing_summary(summary, currency='£', site_name=None):
 # Daily chart builder (returns HTML string for one day)
 # ─────────────────────────────────────────────────────────────
 
-def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_minutes=30, currency='£', site_name=None, ev_slot_map=None, bill_rounding=False, fallback_vat=0.05):
+def _day_segment_split(main_import, meters):
+    """BL-27: on a CAPPED block (EV pushed to PEAK, or straddling the cap boundary) return
+    the per-meter slot values driven by the block's dispatch SEGMENTS — the physical EV
+    device on the EV bands (grid-clipped dispatch: off-peak within cap, peak beyond), house
+    sub-devices at the house band rate, and 'Direct import' the house-segment remainder. So
+    the house stays cleanly off-peak and the EV carries the peak, with no metered-vs-dispatch
+    residual. Returns {meter_id: {"kwh","cost","rate"}} (incl. 'electricity_main' for the
+    house remainder), or None — uncapped blocks (EV off-peak == house) and sensor-less
+    accounts keep the column / synthetic paths, so they're byte-identical. Requires a
+    physical EV sub-meter to attribute the EV bands onto."""
+    segs = main_import.get("segments")
+    if not segs:
+        return None
+    if not any(s.get("attribution") == "ev" and s.get("band") in ("peak", "mixed")
+               for s in segs):
+        return None
+    _v = lambda x: float(x or 0.0)
+    ev_k = sum(_v(s.get("kwh")) for s in segs if s.get("attribution") == "ev")
+    ev_c = sum(_v(s.get("kwh")) * _v(s.get("inc_rate")) for s in segs if s.get("attribution") == "ev")
+    ho_k = sum(_v(s.get("kwh")) for s in segs if s.get("attribution") != "ev")
+    ho_c = sum(_v(s.get("kwh")) * _v(s.get("inc_rate")) for s in segs if s.get("attribution") != "ev")
+    house_rate = (ho_c / ho_k) if ho_k > 1e-9 else 0.0
+    ev_dev = None
+    house_devs = []
+    for _mn, _m in (meters or {}).items():
+        if not (((_m or {}).get("meta", {}) or {}).get("sub_meter")):
+            continue
+        _mt = (((_m.get("meta") or {}).get("meter_type")) or "").lower()
+        if _mt in ("ev", "ev_charger") or any(k in _mn.lower() for k in ("ev", "charger")):
+            ev_dev = _mn
+        else:
+            house_devs.append((_mn, _m))
+    if ev_dev is None or ev_k <= 1e-9:
+        return None                      # no physical EV to carry the bands → leave as-is
+    # The EV BAR is the physical charger's METERED grid kWh (the bar the user recognises);
+    # its COST/RATE come from the dispatch split (ev_c / dispatch rate). The house remainder
+    # absorbs the metered-vs-dispatch kWh difference, so Σ device kWh == grid import and the
+    # remainder can never go negative from dispatch over-attributing the grid (design:
+    # device-pricing "physical-EV-device question").
+    _evsub = ((meters.get(ev_dev, {}).get("channels", {}) or {}).get("import", {}) or {})
+    dev_ev = _v(_evsub.get("kwh_grid", _evsub.get("kwh"))) or ev_k   # metered; else dispatch
+    grid_k = ev_k + ho_k                                             # block grid import (Σ seg)
+    out = {ev_dev: {"kwh": round(dev_ev, 6), "cost": round(ev_c, 6),
+                    "rate": round(ev_c / ev_k, 6)}}
+    hk_used = hc_used = 0.0
+    for _mn, _m in house_devs:
+        _sub = ((_m.get("channels", {}) or {}).get("import", {}) or {})
+        _gk = _v(_sub.get("kwh_grid", _sub.get("kwh")))
+        _c = round(_gk * house_rate, 6)
+        out[_mn] = {"kwh": round(_gk, 6), "cost": _c, "rate": round(house_rate, 6)}
+        hk_used += _gk
+        hc_used += _c
+    out["electricity_main"] = {"kwh": round(grid_k - dev_ev - hk_used, 6),
+                               "cost": round(ho_c - hc_used, 6),
+                               "rate": round(house_rate, 6)}
+    return out
+
+
+def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_minutes=30, currency='£', site_name=None, ev_slot_map=None, bill_rounding=False, fallback_vat=0.05, ev_fold_meter=None, ev_label=None):
     slots = 1440 // block_minutes
     meter_kwh    = defaultdict(lambda: [0.0] * slots)
     meter_rate   = defaultdict(lambda: [0.0] * slots)
@@ -1762,6 +1955,7 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                 # plunge-price credit (negative cost) must survive, not clamp to 0.
                 main_cost = main_cost if _raw_main_cost < 0 else max(main_cost, 0.0)
             main_rate = _f(main_import.get("rate_used", main_import.get("rate")))
+            _seg_split = _day_segment_split(main_import, meters)  # BL-27: applied after exc
 
             # Per-slot ex-VAT ratio for the opt-in data-table Cost (exc) column.
             if bill_rounding:
@@ -1780,6 +1974,11 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                     slot_exc_approx[hh] = True
                 else:
                     slot_exc_ratio[hh]  = round(_ratio, 8)
+
+            if _seg_split is not None:                      # BL-27: house from house segments
+                _hh = _seg_split["electricity_main"]
+                main_kwh, main_cost = _hh["kwh"], _hh["cost"]
+                main_rate = _hh["rate"] or main_rate
 
             meter_kwh["electricity_main"][hh]  = main_kwh
             meter_rate["electricity_main"][hh] = main_rate
@@ -1803,6 +2002,45 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                     sub_kwh_grid = _f(sub.get("kwh_grid", sub_kwh))  # grid-attributed portion
                     sub_cost = _f(sub.get("cost"))
                     sub_rate = _f(sub.get("rate"))
+                    if _seg_split is not None and meter_name in _seg_split:
+                        _sv = _seg_split[meter_name]     # BL-27: EV on dispatch bands / house dev on house band
+                        sub_kwh_grid = _sv["kwh"]
+                        sub_cost = _sv["cost"]
+                        sub_rate = _sv["rate"]
+                    # H6b: the EV line shows the SYNTHETIC (dispatch) kWh wherever a dispatch
+                    # segment exists — matching Usage Stats / the bill — with the metered-vs-
+                    # dispatch difference pushed into the house remainder so the grid total is
+                    # unchanged. No dispatch segment (pre-seam) → the recorded metered value
+                    # stands. Display-only; the day total and the bill stay byte-identical.
+                    if ev_fold_meter and meter_name == ev_fold_meter:
+                        _segs = main_import.get("segments") or []
+                        _syn_k = sum(_f(x.get("kwh")) for x in _segs if x.get("attribution") == "ev")
+                        if _syn_k > 1e-9:
+                            _syn_c = sum(_f(x.get("kwh")) * _f(x.get("inc_rate")) for x in _segs
+                                         if x.get("attribution") == "ev")
+                            # H2-fix: don't push Direct (house) below zero on a battery-assist slot.
+                            # The dispatch-derived synthetic EV can exceed the grid actually available
+                            # to the car (the rest of its charge came from the battery, invisible to
+                            # dispatch); cap it to the grid available (its own grid draw + the current
+                            # house remainder) so the house never goes negative. Total preserved.
+                            _avail_ev = _f(meter_kwh["electricity_main"][hh]) + sub_kwh_grid
+                            if _syn_k > _avail_ev:
+                                # B5: EV claims the whole grid slot (its own draw + all house
+                                # remainder), so its COST must be the whole grid cost — not the
+                                # car-rate-scaled slice — else Direct (house) cost doesn't floor
+                                # with its kWh and renders a spurious negative £ bar.
+                                _syn_c = sub_cost + _f(meter_cost["electricity_main"][hh])
+                                _syn_k = _avail_ev
+                            _d_k = sub_kwh_grid - _syn_k
+                            _d_c = sub_cost - _syn_c
+                            meter_kwh["electricity_main"][hh]  += _d_k
+                            meter_cost["electricity_main"][hh] += _d_c
+                            summary_kwh["electricity_main"]    += _d_k
+                            summary_cost["electricity_main"]   += _d_c
+                            summary_rates["electricity_main"][round(main_rate, 4)] += _d_k
+                            sub_kwh_grid = _syn_k
+                            sub_cost     = _syn_c
+                            sub_rate     = (_syn_c / _syn_k) if _syn_k > 1e-9 else sub_rate
                     meter_kwh[meter_name][hh]  = sub_kwh_grid  # grid-attributed, matches usage stats
                     meter_rate[meter_name][hh] = sub_rate
                     meter_cost[meter_name][hh] = sub_cost
@@ -1851,7 +2089,17 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                         # on the validated synthetic split (grid total untouched); only
                         # the rate the EV line is plotted at, and its summary rate bucket,
                         # change. Absent (non-IOG / no split) → falls back to main_rate.
-                        _evr = _f(main_import.get("rate_ev")) or main_rate
+                        # BL-27: the EV rate LINE follows the EV-attributed SEGMENT rate
+                        # (full precision, == the old imp_rate_ev); the column is a dead
+                        # fallback for any un-backfilled block, so the re-stamp can retire.
+                        _segsr = main_import.get("segments")
+                        _segr_k = (sum(_f(x.get("kwh")) for x in _segsr
+                                       if x.get("attribution") == "ev") if _segsr else 0.0)
+                        if _segr_k > 1e-9:
+                            _evr = (sum(_f(x.get("kwh")) * _f(x.get("inc_rate")) for x in _segsr
+                                        if x.get("attribution") == "ev") / _segr_k) or main_rate
+                        else:
+                            _evr = _f(main_import.get("rate_ev")) or main_rate
                         _r4e = round(_evr, 4)
                         meter_kwh["electricity_main"][hh]  = _mk - _ek
                         meter_cost["electricity_main"][hh] = _mc - _ec
@@ -1881,6 +2129,21 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
         except Exception:
             pass
 
+    # ── BL-27: the rate LINES come from the day-level emit (chart_emit.day_rate_series) —
+    # ONE tested place for "what rate applies each half-hour"; the chart only plots it. See
+    # the presentation read-contract in docs/design/4.4.0_iog_pricing_and_reprice_design.md.
+    import chart_emit
+    _series = chart_emit.day_rate_series(day_blocks, slots=slots, block_minutes=block_minutes)
+    for _mid in list(meter_rate.keys()):
+        if _mid.endswith("_export"):
+            continue
+        _is_ev = (_mid == "ev_dispatch" or "charger" in _mid.lower()
+                  or _mid.lower().startswith("ev_") or _mid.lower().startswith("ev "))
+        _curve = _series["ev"] if _is_ev else _series["house"]
+        for hh in range(slots):
+            if _curve[hh] is not None:
+                meter_rate[_mid][hh] = _curve[hh]
+
     # ── x axis labels — outside the loop ──
     total_hh_kwh = [sum(meter_kwh[m][i] for m in meter_kwh if not m.endswith('_export')) for i in range(slots)]
     x_labels = []
@@ -1894,6 +2157,9 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
         x_ranges.append(f"{h_s:02d}:{m_s:02d} - {h_e:02d}:{m_e:02d}")
 
     # ── Summary panel ──
+    # H6b: one continuous 'EV' identity on a has-EV-meter account (matches Usage Stats).
+    if ev_fold_meter and ev_label and ev_fold_meter in meter_display_name:
+        meter_display_name[ev_fold_meter] = ev_label
     sub_meter_names = [k for k in summary_kwh if k not in ("electricity_main", "electricity_main_export")]
 
     total_import      = sum(v for k, v in summary_kwh.items()  if not k.endswith("_export") and v > 0)
@@ -2205,9 +2471,28 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
     # Derived-EV split (display-only; BL-22): no-op unless this is a no-sub-meter
     # account with completed dispatches. Gives the Billing tab an "EV (from dispatch)"
     # breakdown line + per-day trace without moving any bill total.
-    _ev_slot_map = _dispatch_ev_slot_map(store, blocks, cfg)
+    # Hybrid EV for the billing breakdown (H6): a has-EV-meter account gets one continuous
+    # 'EV' line (synthetic post-seam, recorded physical pre-seam) via the fold-back; a no-EV-
+    # meter account keeps the display-only dispatch split labelled 'EV (from dispatch)'.
+    _ev_phys_id = _ev_meter_id(cfg)
+    if _ev_phys_id:
+        _ev_slot_map = _hybrid_ev_slot_map(store, blocks, cfg)
+        _ev_fold_devices = [((cfg.get("meters", {}).get(_ev_phys_id, {}).get("meta") or {}).get("device")
+                             or _ev_phys_id)]
+        _ev_label = "EV"
+    else:
+        _ev_slot_map = _dispatch_ev_slot_map(store, blocks, cfg)
+        _ev_fold_devices = None
+        _ev_label = "EV (from dispatch)"
+    # Day tables: has-EV-meter accounts fold the metered EV line to the SYNTHETIC segment
+    # value in-place (ev_fold_meter) rather than carving a separate dispatch line, so the EV
+    # bar matches Usage Stats. No-EV-meter accounts keep the dispatch carve. Grid totals hold.
+    _ev_day_map = None if _ev_phys_id else _ev_slot_map
     if _ev_slot_map:
         meter_colors["ev_dispatch"] = "#8b5cf6"
+    # H6c: the EV line keeps its DEVICE-INDEX palette colour (the colour the physical meter
+    # had before), synthetic or recorded — not the synthetic purple — so it stays distinct
+    # from the blue house line (accessibility — see roadmap BL-29).
 
     # ── Billing periods ──
     # Use historically correct billing_day per block from config_periods join.
@@ -2286,7 +2571,8 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
             _blks_for_calc, _s, _e, store=store, tz_name=timezone_name)
         _period_blocks = _blocks_for_period(_s, _e)
         if _ev_slot_map:
-            _inject_ev_breakdown_into_summary(_sm, _period_blocks, _ev_slot_map)
+            _inject_ev_breakdown_into_summary(_sm, _period_blocks, _ev_slot_map,
+                                              label=_ev_label, fold_devices=_ev_fold_devices)
         if _bill_rounding:
             _bm = _bill_method_breakdown(_period_blocks, period_vat=_vat_at(_s),
                                          standing_inc_by_day=_sm.get("standing"))
@@ -2557,7 +2843,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         # Daily charts
         day_charts_html = ""
         for day in ps["days"]:
-            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_slot_map, bill_rounding=_bill_rounding, fallback_vat=_vat_at(day))
+            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_day_map, bill_rounding=_bill_rounding, fallback_vat=_vat_at(day), ev_fold_meter=_ev_phys_id, ev_label=("EV" if _ev_phys_id else None))
 
         open_attr    = "open" if charts_open else ""
         toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}"
@@ -2630,7 +2916,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
 
         day_charts_html = ""
         for day in gs["days"]:
-            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, chart_prefix=f"{pid_prefix}_", block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_slot_map, bill_rounding=_bill_rounding, fallback_vat=_vat_at(day))
+            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, chart_prefix=f"{pid_prefix}_", block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_day_map, bill_rounding=_bill_rounding, fallback_vat=_vat_at(day), ev_fold_meter=_ev_phys_id, ev_label=("EV" if _ev_phys_id else None))
 
         toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}"
         # Quarter/year sections can hold 90–365 day charts; default the panel
@@ -4235,11 +4521,11 @@ def generate_net_heatmap(blocks, timezone_name="UTC", block_minutes=None, curren
                 # stored at write time (3.0.0+), which is defined even for a
                 # zero-net block (so it no longer leaves an empty cell); fall back
                 # to carbon_g/net for pre-3.0.0 blocks that predate the column.
-                ci = md.get("carbon_intensity_g")
-                if ci is not None:
-                    days_intensity[day][hh_index] = round(abs(float(ci)), 1)
-                elif net != 0:
-                    days_intensity[day][hh_index] = round(abs(cg / net), 1)
+                # Δ5c: intensity resolution lives in the carbon emit — the heatmap plots
+                # what carbon.slot_intensity returns rather than deriving it inline.
+                _it = _carbon.slot_intensity(cg, md.get("carbon_intensity_g"), net)
+                if _it is not None:
+                    days_intensity[day][hh_index] = _it
                 break
         except Exception:
             continue

@@ -541,6 +541,11 @@
           <div class="insight-metric-value" id="ev-carbon"></div>
           <div class="insight-metric-unit">kgCO₂</div>
         </div>
+        <div class="insight-metric" id="ev-saving-wrap" style="display:none;">
+          <div class="insight-metric-label">Behind-meter avoided</div>
+          <div class="insight-metric-value" id="ev-saving"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
         <div class="insight-metric">
           <div class="insight-metric-label">AC delivered</div>
           <div class="insight-metric-value" id="ev-kwh"></div>
@@ -564,7 +569,9 @@
       </div>
       <div class="insight-equiv" id="ev-equiv"></div>
       <div class="insight-footnote">
-        EV carbon based on device AC import × grid intensity at time of charging.
+        EV carbon based on AC import × grid intensity at time of charging (smart-charge dispatch
+        on Intelligent Octopus, single-source). "Behind-meter avoided" is energy the car drew from
+        battery/solar that never crossed the grid meter — counted as avoided grid carbon.
         Mileage: AC import × charge efficiency (AC→DC loss) × EV efficiency (miles/kWh battery).
         Efficiency figure should be from your trip computer or manufacturer spec — not derived
         from wall/smart meter energy, which would double-count the charging loss.
@@ -1302,6 +1309,40 @@ function renderInsights(d, _cmp) {
     }
     evEquiv.innerHTML = evLines.join('<br>');
   }
+  else if (d.ev_carbon) {
+    // Δ5b: device-less IOG (no physical charger) — render the EV carbon card from the
+    // SYNTHETIC dispatch figure (single-source). Grid carbon = clipped × intensity; the
+    // behind-meter saving is shown separately below. Mileage/efficiency lines need a device
+    // AC meter, so they are skipped here.
+    var evc0 = d.ev_carbon;
+    var ev_kg0  = (evc0.grid_g || 0) / 1000;
+    var ev_int0 = evc0.clipped_kwh > 0 ? Math.round(evc0.grid_g / evc0.clipped_kwh) : null;
+    var ce0     = a.ev_charge_efficiency || 0.88;
+    document.getElementById('card-ev').style.display = 'block';
+    document.getElementById('ev-headline').textContent = ev_kg0.toFixed(2) + ' kgCO₂';
+    document.getElementById('ev-sub').textContent = 'EV charging carbon (smart-charge dispatch).';
+    document.getElementById('ev-carbon').textContent    = ev_kg0.toFixed(2);
+    document.getElementById('ev-kwh').textContent       = fmtKwh(evc0.clipped_kwh || 0);
+    document.getElementById('ev-dc-kwh').textContent    = fmtKwh((evc0.clipped_kwh || 0) * ce0);
+    document.getElementById('ev-intensity').textContent = ev_int0 != null ? ev_int0 : '—';
+    document.getElementById('ev-vs-grid').textContent   = d.grid_avg_intensity != null ? Math.round(d.grid_avg_intensity) : '—';
+    document.getElementById('ev-equiv').innerHTML = '';
+  }
+
+  // Δ5b: behind-meter avoided (synthetic dispatch) — additive, feature-detected. The credit is
+  // the draw gap (car's full completed-dispatch draw − grid-clipped billing kWh) × grid
+  // intensity: energy the car took from battery/solar that never crossed the grid meter.
+  (function(){
+    var wrap = document.getElementById('ev-saving-wrap');
+    var val  = document.getElementById('ev-saving');
+    if (!wrap || !val) return;
+    if (d.ev_carbon && d.ev_carbon.saving_g != null && d.ev_carbon.saving_g > 0) {
+      val.textContent = (d.ev_carbon.saving_g / 1000).toFixed(2);
+      wrap.style.display = 'block';
+    } else {
+      wrap.style.display = 'none';
+    }
+  })();
 
   // Render comparison deltas if _cmp provided — must happen before renderTrend
   try {
