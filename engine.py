@@ -5122,6 +5122,27 @@ async def connect_kraken_now() -> dict:
         await _refresh_kraken_rate_schedules()
     except Exception:
         pass
+    # Mode promotion (#381): a live in-app connect just SUCCEEDED. If the
+    # persisted data-source mode does not use the API — e.g. a prior disconnect
+    # or a DB-swap left it parked on 'cad'/'unset' while the credentials
+    # survived — promote it now. Otherwise the startup mode-gate
+    # (mode_uses_api()) skips auto-activation on the NEXT restart and the user
+    # falls straight back into the "creds present but API off" limbo, so
+    # Reconnect appears to "not stick" and silently reverts to cad. Promote to
+    # 'cad+api' when a local import sensor exists (keep the CAD feed), else
+    # 'api'. A successful connect means the supplier IS API-capable, so this
+    # never strands an api mode without a reachable API.
+    try:
+        _prev_mode = get_data_source_mode()
+        if not mode_uses_api(_prev_mode):
+            _promoted = "cad+api" if _has_local_import_sensor() else "api"
+            set_data_source_mode(_promoted)
+            logger.info(
+                "connect_kraken_now: live connect succeeded while mode did not "
+                "use the API — promoted data-source mode %r -> %r so activation "
+                "persists across restart.", _prev_mode, _promoted)
+    except Exception as _pm:
+        logger.warning("connect_kraken_now: mode promotion failed: %s", _pm)
     # NB: the DCC poll task is launched at the END of engine_startup (after the
     # store + client are rebuilt), NOT here — launching it mid-connect raced the
     # config-save's engine_startup teardown of those shared resources.

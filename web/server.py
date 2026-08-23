@@ -3946,6 +3946,35 @@ def api_disconnect_kraken():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/reactivate-kraken", methods=["POST"])
+def api_reactivate_kraken():
+    """Reactivate the supplier API using the ALREADY-STORED credentials (#381).
+
+    The limbo this escapes: a prior Disconnect or a DB-swap can leave the
+    data-source mode on 'cad'/'unset' while a valid API key still lives in its
+    own file. Startup's mode-gate then skips auto-activation, so the app looks
+    like the credentials are missing even though they are present. This runs a
+    live connect from the stored key WITHOUT the user re-typing it; on success
+    engine.connect_kraken_now() promotes the mode back to an API mode, so the
+    fix persists across restarts. It never writes or changes the key, so it can
+    only ever move the user from local-only back to their own configured API.
+    A transient failure keeps everything as-is (the key is untouched)."""
+    try:
+        import engine as _eng
+        if not _eng.has_kraken_credentials():
+            return jsonify({"ok": False, "connected": False,
+                            "detail": "no_credentials"}), 400
+        result = _run_on_engine_loop(_eng.connect_kraken_now(), timeout=45.0)
+        # Report the (possibly promoted) mode so the UI can re-render in place.
+        try:
+            result["mode"] = _eng.get_data_source_mode()
+        except Exception:
+            pass
+        return jsonify(result), (200 if result.get("ok") else 400)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 def _parse_version(v: str):
     """'3.2.0' -> (3, 2, 0). Non-numeric parts sort as 0. Tolerates a 'v' prefix."""
     v = (v or "").strip().lstrip("vV")
@@ -6308,11 +6337,22 @@ def _apply_hybrid_ev_to_summary_rows(rows, meters_list, ev_meter_id, hybrid_by_b
         if _mm is not None and abs(_dk) <= 1e-9 and abs(_dc) <= 1e-9:
             continue                                    # pre-seam / recorded: identical, no move
         _main = _meters.get("electricity_main")
+        # H2-fix: never push the house remainder (Direct import) below zero. On a slot where
+        # the BATTERY also drew from the grid, the dispatch-derived synthetic EV can exceed the
+        # grid actually available to the car (the rest of its charge came from the battery, which
+        # dispatch can't see); moving that excess out of Direct would render a spurious NEGATIVE
+        # bar. Cap the move to what Direct holds (kWh + its proportional cost); the EV then shows
+        # the grid-available amount and the bucket total is still preserved.
+        if _main is not None and _dk > 0:
+            _avail = max(float(_main["imp_kwh"]), 0.0)
+            if _dk > _avail:
+                _dc = round(_dc * (_avail / _dk), 6) if _dk > 1e-9 else 0.0
+                _dk = round(_avail, 6)
         if _main is not None:                           # hold the bucket total invariant
             _main["imp_kwh"]  = round(float(_main["imp_kwh"])  - _dk, 4)
             _main["imp_cost"] = round(float(_main["imp_cost"]) - _dc, 4)
         _meters[ev_meter_id] = {
-            "imp_kwh": round(_new_k, 4), "imp_cost": round(_new_c, 4),
+            "imp_kwh": round(_old_k + _dk, 4), "imp_cost": round(_old_c + _dc, 4),
             "exp_kwh": 0.0, "exp_cost": 0.0, "carbon_g": (_mm or {}).get("carbon_g"),
         }
         changed = True

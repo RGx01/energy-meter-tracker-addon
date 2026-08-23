@@ -14,11 +14,22 @@ does NOT decide slot rates — it only measures cap usage and locates the bounda
 its within-cap energy fraction; the 4-rate classifier consumes that.
 """
 
+import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Iterable, Optional
 
-CAP_HOURS = 6.0
+# IOG charge-cap length (hours of ACTUAL EV charging per noon→noon cap-day). Octopus's
+# current cap is 6 h; overridable at startup via IOG_CAP_HOURS so a variant/change can be
+# followed without a code edit. Read LIVE by the cap fns (default None → resolves here), so
+# setting iog_cap.CAP_HOURS at runtime takes effect too (the old float-default bound it at
+# import, which silently pinned the cap to 6 h).
+def _env_cap_hours() -> float:
+    try:
+        return float(os.environ.get("IOG_CAP_HOURS", "6.0"))
+    except (TypeError, ValueError):
+        return 6.0
+CAP_HOURS = _env_cap_hours()
 CAP_DAY_ANCHOR_HOUR = 12          # noon→noon cap-day
 _UTC = ZoneInfo("UTC")
 
@@ -62,7 +73,7 @@ def _hours(s: str, e: str) -> float:
 
 
 def cap_usage(completed_slots: Iterable[tuple], tz_name: str,
-              cap_hours: float = CAP_HOURS) -> dict:
+              cap_hours: "float | None" = None) -> dict:
     """Cap usage per noon→noon cap-day, measured in ACTUAL CHARGING TIME.
 
     The IOG cap is `cap_hours` of *charging*, NOT of dispatch wall-clock — a half-hour
@@ -80,6 +91,8 @@ def cap_usage(completed_slots: Iterable[tuple], tz_name: str,
         within the cap (so it bills as a blend). Slots before it are wholly within-cap,
         slots after wholly over-cap.
     """
+    if cap_hours is None:
+        cap_hours = CAP_HOURS
     by_day: dict = {}
     for row in completed_slots:
         s0 = row[0]; e0 = row[1] if len(row) > 1 else None
@@ -110,11 +123,13 @@ def cap_usage(completed_slots: Iterable[tuple], tz_name: str,
 
 
 def cap_day_boundaries(completed_slots: Iterable[tuple], tz_name: str,
-                       cap_hours: float = CAP_HOURS) -> dict:
+                       cap_hours: "float | None" = None) -> dict:
     """`{cap_day: (boundary_slot, boundary_frac)}` — the per-cap-day charge-time boundary
     (the slot the cap is reached in, and the within-cap energy fraction of that slot), or
     absent where the day never reaches the cap. Projection of `cap_usage` for the pricing
     seam: look a slot up with `boundaries.get(cap_day_key(ts))`."""
+    if cap_hours is None:
+        cap_hours = CAP_HOURS
     return {d: (v["boundary_slot"], v["boundary_frac"])
             for d, v in cap_usage(completed_slots, tz_name, cap_hours).items()}
 

@@ -12,6 +12,42 @@ import iog_cap as cap
 from kraken_rates import RateSchedule
 
 
+class TestCapHoursConfigurable(unittest.TestCase):
+    """B3: the cap length is live-configurable — settable at startup via IOG_CAP_HOURS and
+    respected when CAP_HOURS is changed at runtime (the old float-default bound it at import,
+    silently pinning the cap to 6h so the value could never change)."""
+    def setUp(self): self._orig = cap.CAP_HOURS
+    def tearDown(self): cap.CAP_HOURS = self._orig
+
+    def _slots(self):
+        # ~5 charge-hours in one cap-day (10 half-hours, power ~ 2×fullest slot)
+        return [(f"2026-08-10T0{h}:{m:02d}:00", f"2026-08-10T0{h}:{m+29:02d}:59", 2.0)
+                for h in range(1, 6) for m in (0, 30)]
+
+    def test_runtime_cap_hours_changes_boundary(self):
+        slots = self._slots()
+        cap.CAP_HOURS = 6.0                      # 5h < 6h → never reaches the cap
+        self.assertFalse(any(v["over"] for v in cap.cap_usage(slots, "Europe/London").values()))
+        cap.CAP_HOURS = 3.0                      # 5h > 3h → cap reached, boundary set
+        u = cap.cap_usage(slots, "Europe/London")
+        self.assertTrue(any(v["over"] for v in u.values()))
+        b = cap.cap_day_boundaries(slots, "Europe/London")   # no cap_hours arg → live value
+        self.assertTrue(any(bs is not None for (bs, bf) in b.values()))
+
+    def test_explicit_cap_hours_still_overrides(self):
+        slots = self._slots()
+        cap.CAP_HOURS = 6.0
+        self.assertTrue(any(v["over"] for v in cap.cap_usage(slots, "Europe/London", cap_hours=3.0).values()))
+
+    def test_env_sets_default(self):
+        os.environ["IOG_CAP_HOURS"] = "4"
+        try:
+            self.assertEqual(cap._env_cap_hours(), 4.0)
+        finally:
+            os.environ.pop("IOG_CAP_HOURS", None)
+        self.assertEqual(cap._env_cap_hours(), 6.0)   # default when unset
+
+
 class TestCapDayKey(unittest.TestCase):
     def test_before_noon_is_previous_day(self):
         # 10:00 local (UTC, so same) → belongs to the previous noon→noon window
