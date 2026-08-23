@@ -2010,7 +2010,11 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                             # house remainder) so the house never goes negative. Total preserved.
                             _avail_ev = _f(meter_kwh["electricity_main"][hh]) + sub_kwh_grid
                             if _syn_k > _avail_ev:
-                                _syn_c = (_syn_c * (_avail_ev / _syn_k)) if _syn_k > 1e-9 else 0.0
+                                # B5: EV claims the whole grid slot (its own draw + all house
+                                # remainder), so its COST must be the whole grid cost — not the
+                                # car-rate-scaled slice — else Direct (house) cost doesn't floor
+                                # with its kWh and renders a spurious negative £ bar.
+                                _syn_c = sub_cost + _f(meter_cost["electricity_main"][hh])
                                 _syn_k = _avail_ev
                             _d_k = sub_kwh_grid - _syn_k
                             _d_c = sub_cost - _syn_c
