@@ -1,6 +1,6 @@
 # Changelog
  
-## [4.4.0] — 2026-08-21
+## [4.4.0] — 2026-08-23
 
 *Theme: **Priced Segments**. The house-vs-car pricing that 4.3.0 stored as layered, drift-prone columns now lives in a single, extensible **priced-segment** model — each half-hour's price is stored as its real rate bands, and that one record is the source of truth for **every** surface and tool: Billing, Usage Stats, Usage Insights, the charts, the carbon view, and the Cost Corrections tool all read the same segments, so a figure can no longer disagree between screens. Your history is migrated automatically the first time you run 4.4.0 — with a progress banner while it works and a one-file report when it's done — and it self-repairs any block a previous version left mispriced. The headline fix: **capped Intelligent Octopus Go charging that a prior version could price in pence is now priced correctly in pounds.** Additive for existing tariffs — inc-VAT totals and the Total Bill are unchanged. (The 4-rate cap model remains **experimental** pending validation against a real settled capped statement.)*
 

@@ -99,10 +99,21 @@ def segments_from_legacy(*, imp_kwh: float, imp_cost: float, imp_rate: float,
     def _exc(inc):
         return round(inc * exc_ratio, 6) if (exc_ratio is not None and inc is not None) else None
 
-    # Rates are derived from the stored COSTS (not the stored tariff rate), so the segments
-    # reproduce imp_cost/imp_cost_ev EXACTLY even on a block where cost ≠ kWh × rate (a
-    # settlement-adjusted or stale-split block). On a consistent block the derived rate
-    # equals the tariff rate; the small settlement jitter is collapsed at display.
+    def _rate(kwh, cost, tariff_rate):  # used for the no-EV single house segment only
+        # Prefer the block's stored TARIFF rate when it reproduces the stored cost at
+        # storage precision (a CLEAN block: round(kWh×rate) == round(cost)). Only when it
+        # does NOT — a genuinely settlement-adjusted / stale-split block where cost ≠
+        # kWh×rate — fall back to deriving the rate from the cost, which keeps Σ cost ==
+        # imp_cost on those blocks. Back-computing a CLEAN block instead (the old
+        # unconditional path) turned the stored cost's 6-dp rounding into 1/kWh rate
+        # SCATTER — e.g. a 0.006 kWh peak block priced a clean 0.323092 stored a segment
+        # at 0.323167 → exc 0.307778 — which then showed a spurious ex-VAT rate tick on
+        # small billing bands. The migrated segment must be as faithful as the block.
+        if tariff_rate and kwh > _EPS \
+                and abs(round(kwh * tariff_rate, 6) - round(cost, 6)) < 1e-9:
+            return round(tariff_rate, 6)
+        return round(cost / kwh, 6) if kwh > _EPS else (tariff_rate or 0.0)
+
     segs: List[Segment] = []
     if kwh_ev is not None and kwh_ev > _EPS:
         hk = imp_kwh - kwh_ev
@@ -111,13 +122,19 @@ def segments_from_legacy(*, imp_kwh: float, imp_cost: float, imp_rate: float,
         # so a stale/settlement-adjusted cost_ev can never leave an unreconciled residual.
         ev_c = imp_cost if hk <= _EPS else (
             cost_ev if cost_ev is not None else kwh_ev * (rate_ev or 0.0))
+        # EV segment stays cost-derived (byte-identical): an EV charge is always a
+        # substantial kWh, so cost/kWh never scatters the way a tiny house-only block does,
+        # and keeping it cost-derived preserves Σ cost == imp_cost with no residual drift.
         er = round(ev_c / kwh_ev, 6)
         segs.append(Segment(round(kwh_ev, 6), er, _exc(er), ev_band or "standard", "ev"))
         if hk > _EPS:
+            # House remainder = residual absorber; legacy columns carry no separate house
+            # tariff rate, so this stays cost-derived (its own scatter is bounded by the
+            # remainder kWh, and on a clean split reduces to the house day rate).
             hr = round((imp_cost - ev_c) / hk, 6)
             segs.append(Segment(round(hk, 6), hr, _exc(hr), home_band or "standard", "house"))
     elif imp_kwh > _EPS:
-        r = round(imp_cost / imp_kwh, 6) if imp_kwh > _EPS else imp_rate
+        r = _rate(imp_kwh, imp_cost, imp_rate)
         segs.append(Segment(round(imp_kwh, 6), r, _exc(r), home_band or "standard", "house"))
     return segs
 
