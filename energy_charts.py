@@ -2003,6 +2003,15 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                         if _syn_k > 1e-9:
                             _syn_c = sum(_f(x.get("kwh")) * _f(x.get("inc_rate")) for x in _segs
                                          if x.get("attribution") == "ev")
+                            # H2-fix: don't push Direct (house) below zero on a battery-assist slot.
+                            # The dispatch-derived synthetic EV can exceed the grid actually available
+                            # to the car (the rest of its charge came from the battery, invisible to
+                            # dispatch); cap it to the grid available (its own grid draw + the current
+                            # house remainder) so the house never goes negative. Total preserved.
+                            _avail_ev = _f(meter_kwh["electricity_main"][hh]) + sub_kwh_grid
+                            if _syn_k > _avail_ev:
+                                _syn_c = (_syn_c * (_avail_ev / _syn_k)) if _syn_k > 1e-9 else 0.0
+                                _syn_k = _avail_ev
                             _d_k = sub_kwh_grid - _syn_k
                             _d_c = sub_cost - _syn_c
                             meter_kwh["electricity_main"][hh]  += _d_k

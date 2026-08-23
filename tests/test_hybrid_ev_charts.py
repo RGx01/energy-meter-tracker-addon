@@ -69,6 +69,18 @@ class TestApplyHybridEvCharts(unittest.TestCase):
         self.assertAlmostEqual(r["meters"]["ev_charger"]["imp_kwh"], 3.0)
         self.assertAlmostEqual(r["meters"]["electricity_main"]["imp_kwh"], 5.0)  # 8-3
 
+    def test_synthetic_over_grid_floors_direct_at_zero(self):
+        # B4: battery-assist slot — synthetic EV (2.31) exceeds grid available (Direct 0 +
+        # metered 2.18); the excess is battery-sourced, so Direct must floor at 0, EV caps to
+        # the grid-available 2.18, and the total is preserved (no spurious negative bar).
+        r = _row(2026, 8, 19, house_k=0.0, house_c=0.0, ev_k=2.18, ev_c=0.12)
+        before = _total(r)
+        A([r], self._mlist(), "ev_charger", {"2026-08-19": {"kwh": 2.31, "cost": 0.126}})
+        self.assertGreaterEqual(r["meters"]["electricity_main"]["imp_kwh"], 0.0)   # Direct not negative
+        self.assertAlmostEqual(r["meters"]["electricity_main"]["imp_kwh"], 0.0)
+        self.assertAlmostEqual(r["meters"]["ev_charger"]["imp_kwh"], 2.18)          # capped to grid
+        self.assertEqual(_total(r), before)                                        # total invariant
+
     def test_slot_key_fn(self):
         r = {"slot": "2026-08-01T23:00:00",
              "meters": {"electricity_main": {"imp_kwh": 6.0, "imp_cost": 0.6},
