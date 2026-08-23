@@ -6346,7 +6346,12 @@ def _apply_hybrid_ev_to_summary_rows(rows, meters_list, ev_meter_id, hybrid_by_b
         if _main is not None and _dk > 0:
             _avail = max(float(_main["imp_kwh"]), 0.0)
             if _dk > _avail:
-                _dc = round(_dc * (_avail / _dk), 6) if _dk > 1e-9 else 0.0
+                # B5 (H2-cost-fix): the kWh cap floors Direct to 0 — its COST must floor with
+                # it. Move ALL of Direct's held cost, not the kWh-proportional slice (which
+                # prices the excess at the car's rate and leaves a spurious ± residual — a
+                # negative Direct £ bar — when the car's rate differs from the displaced house
+                # rate). EV absorbs the whole grid slot; the bucket total is still preserved.
+                _dc = round(float(_main["imp_cost"]), 6)
                 _dk = round(_avail, 6)
         if _main is not None:                           # hold the bucket total invariant
             _main["imp_kwh"]  = round(float(_main["imp_kwh"])  - _dk, 4)
