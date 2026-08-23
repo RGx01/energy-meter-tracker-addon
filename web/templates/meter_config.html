@@ -1257,6 +1257,33 @@ function closeDisconnectModal() {
 
 // Lightweight key-only reconnect (no wizard, no recalc). Account pre-filled from
 // the DB's stored stamp (surfaced by /api/kraken-config as db_account).
+function pollKrakenConnected(attempts, delayMs) {
+  // #381: a connect attempt can return not-connected on the first pass simply
+  // because discovery/poll hadn't settled yet (a transient — rate-limit, a
+  // network blip, or a DB mid-swap). Re-check /api/kraken-config a few times
+  // before declaring failure, so a slow-but-successful connect resolves silently
+  // instead of showing "failed" that the user has to manually retry. The server
+  // never drops the key on a failed verify, so this only ever upgrades a
+  // transient "failed" into the success it was about to become.
+  attempts = attempts || 3;
+  delayMs  = delayMs  || 1500;
+  return new Promise(function(resolve){
+    function attempt(n){
+      fetch(apiUrl('/api/kraken-config'))
+        .then(function(r){ return r.json(); })
+        .then(function(j){
+          if (j && j.connected) { resolve(true); return; }
+          if (n <= 1) { resolve(false); return; }
+          setTimeout(function(){ attempt(n - 1); }, delayMs);
+        })
+        .catch(function(){
+          if (n <= 1) { resolve(false); return; }
+          setTimeout(function(){ attempt(n - 1); }, delayMs);
+        });
+    }
+    attempt(attempts);
+  });
+}
 function refreshConnState(forceRender) {
   // #381: re-read the live data-source mode + credential/connection state and,
   // if anything changed, re-render the panel in place — so a reconnect,
@@ -1291,22 +1318,28 @@ function executeReactivate(btnEl) {
       return { ok: r.ok, j: j };
     }); })
     .then(function(res){
-      if (!res.ok || res.j.error || !res.j.connected) {
+      function onReactivated(acct){
+        // Connected — the server promoted the mode; re-read + re-render in place.
+        HAS_CREDENTIALS = true;
+        refreshConnState(true).then(function(){
+          document.getElementById('alert-success').textContent =
+            '\u2713 Reactivated ' + (acct ? '\u2014 ' + acct : 'Octopus') + '.';
+          show('alert-success');
+        });
+      }
+      function onReactFailed(detail){
         if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Reactivate'; }
         var errEl = document.getElementById('alert-error');
-        if (errEl) {
-          errEl.textContent = '\u2717 Could not reactivate: ' +
-            (res.j.detail || res.j.error || 'connection could not be verified — your key was kept; try again shortly');
-          errEl.classList.add('show');
-        }
-        return;
+        if (errEl) { errEl.textContent = '\u2717 Could not reactivate: ' + (detail ||
+          'connection could not be verified — your key was kept; try again shortly'); errEl.classList.add('show'); }
       }
-      // Connected — the server promoted the mode; re-read + re-render in place.
-      HAS_CREDENTIALS = true;
-      refreshConnState(true).then(function(){
-        document.getElementById('alert-success').textContent =
-          '\u2713 Reactivated ' + (res.j.account_number ? '\u2014 ' + res.j.account_number : 'Octopus') + '.';
-        show('alert-success');
+      if (res.ok && !res.j.error && res.j.connected) { onReactivated(res.j.account_number); return; }
+      if (!res.ok || res.j.error) { onReactFailed(res.j.detail || res.j.error); return; }
+      // #381: re-poll before declaring failure (transient discovery/poll settle).
+      if (btnEl) { btnEl.textContent = 'Verifying\u2026'; }
+      pollKrakenConnected(3, 1500).then(function(connected){
+        if (connected) { onReactivated(res.j.account_number); }
+        else { onReactFailed(res.j.detail); }
       });
     })
     .catch(function(e){
@@ -1357,22 +1390,32 @@ function executeReconnect() {
       return { ok: r.ok, j: j };
     }); })
     .then(function(res){
-      if (btn) { btn.disabled = false; btn.textContent = 'Reconnect'; }
-      if (!res.ok || res.j.error || !res.j.connected) {
-        if (stat) { stat.style.color = 'var(--error-color,#c00)';
-          stat.textContent = 'Could not connect: ' + (res.j.detail || res.j.error || 'check key/account'); }
-        return;
+      function onConnected(acct){
+        // Connected — key is stored; refresh the card in place (no reload). The
+        // server may have promoted the mode (cad -> cad+api) on connect, so
+        // re-read state to reflect it without a manual page refresh.
+        HAS_CREDENTIALS = true;
+        if (btn) { btn.disabled = false; btn.textContent = 'Reconnect'; }
+        closeReconnectModal();
+        refreshConnState(true);
+        document.getElementById('alert-success').textContent =
+          '✓ Reconnected to Octopus' + (acct ? ' — ' + acct : '') + '.';
+        show('alert-success');
       }
-      // Connected — key is stored and API mode is unchanged, so just refresh the
-      // card in place (no reload, no recalc).
-      HAS_CREDENTIALS = true;
-      closeReconnectModal();
-      // #381: the server may have promoted the mode (cad -> cad+api) on connect;
-      // re-read state so the panel reflects it without a manual page refresh.
-      refreshConnState(true);
-      document.getElementById('alert-success').textContent =
-        '✓ Reconnected to Octopus' + (res.j.account_number ? ' — ' + res.j.account_number : '') + '.';
-      show('alert-success');
+      function onFailed(detail){
+        if (btn) { btn.disabled = false; btn.textContent = 'Reconnect'; }
+        if (stat) { stat.style.color = 'var(--error-color,#c00)';
+          stat.textContent = 'Could not connect: ' + (detail || 'check key/account'); }
+      }
+      if (res.ok && !res.j.error && res.j.connected) { onConnected(res.j.account_number); return; }
+      // Hard error (bad response / server error) — fail straight away.
+      if (!res.ok || res.j.error) { onFailed(res.j.detail || res.j.error || 'check key/account'); return; }
+      // #381: saved but not verified yet — re-poll before declaring failure.
+      if (stat) { stat.style.color = 'var(--muted)'; stat.textContent = 'Verifying connection\u2026'; }
+      pollKrakenConnected(3, 1500).then(function(connected){
+        if (connected) { onConnected(res.j.account_number); }
+        else { onFailed(res.j.detail || 'still connecting — your key was kept and will connect when reachable'); }
+      });
     })
     .catch(function(e){
       if (btn) { btn.disabled = false; btn.textContent = 'Reconnect'; }
