@@ -2325,9 +2325,24 @@ def _blocks_data_version(store) -> str:
             _mt.append(f"{os.path.getmtime(os.path.join(CHART_DIR, _cf)):.3f}")
         except (OSError, TypeError):   # missing file, or CHART_DIR unset (tests)
             _mt.append("0")
+    # BL-32: a cost-neutral RE-PRICE (the first-upgrade migration, or a settlement rate
+    # correction) changes segment/displayed RATES but leaves imp_kwh/imp_cost byte-identical
+    # (the reconciliation invariant), so the cost fingerprint above does NOT move — and the
+    # Charts/Bill UI kept its cached render until a manual refresh. Fingerprint the priced
+    # segments' rates too, so any rate-only re-price busts the cache. Guarded: a pre-4.4.0 DB
+    # (no block_segments table) contributes '0'. SUM ignores NULL exc (unsettled) rows.
+    try:
+        _seg = store._conn.execute(
+            "SELECT COUNT(*) AS n, "
+            "ROUND(COALESCE(SUM(inc_rate), 0), 4) AS ir, "
+            "ROUND(COALESCE(SUM(exc_rate), 0), 4) AS er "
+            "FROM block_segments").fetchone()
+        _sf = f"{_seg['n']}:{_seg['ir']}:{_seg['er']}"
+    except Exception:
+        _sf = "0"
     return (f"{row['c']}:{row['m'] or ''}:"
             f"{row['ik']}:{row['ic']}:{row['ek']}:{row['ec']}:{row['cg']}:"
-            f"{':'.join(_mt)}")
+            f"{':'.join(_mt)}:{_sf}")
 
 
 @app.route("/api/charts/data-version")

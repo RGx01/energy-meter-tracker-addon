@@ -886,10 +886,19 @@ def calculate_billing_summary_for_period(blocks, period_start, period_end, store
     # like the statement (e.g. £8.001), while the section Total stays 2dp.
     for _grp in (ev_by_rate, home_by_rate):
         for _r in _grp:
+            # B6: keep the UNROUNDED cost for the per-band RATE derivation in
+            # _bill_split_rows. Rounding the cost to 3dp BEFORE the rate = Σcost ÷ Σkwh
+            # drifts a small-kWh band off its canonical rate (a 3.7 kWh peak band read
+            # 0.3076, not the tariff 0.3077, even with canonical segments post-M1). Costs
+            # are still SHOWN to 3dp (statement style); only the rate reads the raw.
+            _grp[_r]["cost_raw"]     = _grp[_r]["cost"]
+            _grp[_r]["cost_exc_raw"] = _grp[_r]["cost_exc"]
             _grp[_r]["kwh"]      = round(_grp[_r]["kwh"], 3)
             _grp[_r]["cost"]     = round(_grp[_r]["cost"], 3)
             _grp[_r]["cost_exc"] = round(_grp[_r]["cost_exc"], 3)
     for _t in (ev_transition, home_transition):
+        _t["cost_raw"]     = _t["cost"]
+        _t["cost_exc_raw"] = _t["cost_exc"]
         _t["kwh"]      = round(_t["kwh"], 3)
         _t["cost"]     = round(_t["cost"], 3)
         _t["cost_exc"] = round(_t["cost_exc"], 3)
@@ -1069,7 +1078,8 @@ def _bill_split_rows(summary, currency, exc=False):
     home_by_rate = summary.get("home_by_rate") or {}
     ev_tr        = summary.get("ev_transition") or {}
     home_tr      = summary.get("home_transition") or {}
-    _ck = "cost_exc" if exc else "cost"
+    _ck  = "cost_exc" if exc else "cost"
+    _ckr = _ck + "_raw"                       # B6: unrounded cost for the canonical rate
     if (sum(v["kwh"] for v in ev_by_rate.values()) + (ev_tr.get("kwh") or 0.0)) <= 1e-9:
         return None
 
@@ -1097,27 +1107,32 @@ def _bill_split_rows(summary, currency, exc=False):
 
     html = ""
     for band in _bands:
-        ek = ec = hk = hc = 0.0
+        ek = ec = hk = hc = 0.0        # kWh + displayed (3dp) cost
+        ecr = hcr = 0.0                # B6: unrounded cost, for the canonical band rate
         for r in band:
             e = ev_by_rate.get(r)
             if e:
-                ek += e["kwh"]; ec += e.get(_ck, 0.0)
+                ek += e["kwh"]; ec += e.get(_ck, 0.0); ecr += e.get(_ckr, e.get(_ck, 0.0))
             h = home_by_rate.get(r)
             if h:
-                hk += h["kwh"]; hc += h.get(_ck, 0.0)
+                hk += h["kwh"]; hc += h.get(_ck, 0.0); hcr += h.get(_ckr, h.get(_ck, 0.0))
         # Shared band rate — kWh-weighted over BOTH series for THIS band only, so EV and
         # Home always read identically within a band and a real in-period rate change (its
-        # own band) keeps its own rate.
-        _band_rate = ((ec + hc) / (ek + hk)) if (ek + hk) > 1e-9 else 0.0
+        # own band) keeps its own rate. B6: derive it from the UNROUNDED cost so a small-kWh
+        # band reads the canonical tariff rate (not the 3dp-rounded-cost ÷ kWh drift); the
+        # displayed cost columns (ec/hc) stay 3dp.
+        _band_rate = ((ecr + hcr) / (ek + hk)) if (ek + hk) > 1e-9 else 0.0
         if ek > 1e-9:
             html += _row("EV", ek, ec, rate=_band_rate)
         if hk > 1e-9:
             html += _row("Home", hk, hc, rate=_band_rate)
     _note = ' <span style="opacity:0.6;">(transition)</span>'
     if (ev_tr.get("kwh") or 0.0) > 1e-9:
-        html += _row("EV", ev_tr["kwh"], ev_tr.get(_ck, 0.0), _note)
+        _r = (ev_tr.get(_ckr, ev_tr.get(_ck, 0.0)) / ev_tr["kwh"]) if ev_tr["kwh"] > 1e-9 else None
+        html += _row("EV", ev_tr["kwh"], ev_tr.get(_ck, 0.0), _note, rate=_r)
     if (home_tr.get("kwh") or 0.0) > 1e-9:
-        html += _row("Home", home_tr["kwh"], home_tr.get(_ck, 0.0), _note)
+        _r = (home_tr.get(_ckr, home_tr.get(_ck, 0.0)) / home_tr["kwh"]) if home_tr["kwh"] > 1e-9 else None
+        html += _row("Home", home_tr["kwh"], home_tr.get(_ck, 0.0), _note, rate=_r)
     return html
 
 
