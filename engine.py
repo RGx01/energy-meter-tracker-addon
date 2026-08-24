@@ -4603,6 +4603,29 @@ def _maybe_backfill_historical_exc() -> None:
         _exc_backfill_running = False
 
 
+def _ci_slot_plausible(mix, intensity, ci_index) -> bool:
+    """BL-38: reject a physically-impossible regional generation-mix / intensity slot.
+
+    National Grid's *regional* generation mix is a MODELLED estimate (embedded solar is
+    inferred, not metered) and for a small region it occasionally emits a degenerate slot —
+    one fuel ~100% with the rest ~0, and a collapsed 0 gCO2/kWh — e.g. 'solar 97% at 21:30'.
+    Stored verbatim it corrupts the donut, the 48h chart AND (via intensity) the block carbon.
+    Reject the glitch signature so the previous good slot stands; genuine mixes never trip it
+    (real single-fuel maxima sit ~70-80%; GB intensity is never 0). Never rejects on a parse
+    error (returns True). Pure — unit-tested.
+    """
+    try:
+        if mix:
+            top = max((float(f.get("perc") or 0.0) for f in mix), default=0.0)
+            if top >= 95.0:
+                return False
+        if intensity is not None and float(intensity) <= 0.0:
+            return False
+    except Exception:
+        return True
+    return True
+
+
 async def _tick_carbon_intensity() -> float | None:
     """
     Fetch and store carbon intensity if 15 minutes have elapsed since last fetch.
@@ -4625,6 +4648,18 @@ async def _tick_carbon_intensity() -> float | None:
     try:
         slots = _fetch_carbon_intensity(postcode)
         for slot in slots:
+            # BL-38: drop an implausible regional-model glitch slot (one fuel ~100% /
+            # 0 gCO2/kWh) so it never reaches the donut, the 48h chart or block carbon —
+            # the previous good slot stands (get_nearest_carbon_intensity falls back).
+            if not _ci_slot_plausible(slot.get("generationmix"),
+                                      slot.get("intensity_forecast"),
+                                      slot.get("ci_index")):
+                _tf = max((float(f.get("perc") or 0.0)
+                           for f in (slot.get("generationmix") or [])), default=None)
+                logger.warning("_tick_carbon_intensity: implausible CI slot %s skipped "
+                               "(intensity=%s, top_fuel=%s%%) — regional-model glitch (BL-38)",
+                               slot.get("captured_at"), slot.get("intensity_forecast"), _tf)
+                continue
             _store.upsert_carbon_intensity(
                 slot["captured_at"], postcode,
                 slot["intensity_forecast"], slot["ci_index"],
