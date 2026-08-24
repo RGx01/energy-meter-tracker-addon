@@ -1739,6 +1739,7 @@ def detect_ohme_charge_mode(states: list[dict]) -> dict:
     result: dict[str, Any] = {
         "found": False, "integration": None, "charge_mode_entity": None,
         "mode": None, "is_boost": None, "status_entity": None,
+        "slot_list_entity": None,
     }
     if not states:
         return result
@@ -1774,4 +1775,12 @@ def detect_ohme_charge_mode(states: list[dict]) -> dict:
                 result["charge_mode_entity"] = eid
                 result["mode"] = state
                 result["is_boost"] = None
+        # Ohme's OWN plan (BL-31 card upgrade): the official `slot_list` sensor
+        # (state = "HH:MM-HH:MM, ..."), or the dan-r "planned/charge slots" sensor.
+        # Recorded independently of found — it feeds the card/lifecycle, not the veto.
+        elif (leid.startswith("sensor.")
+              and ("slot_list" in leid or "charge_slots" in leid
+                   or "planned_slots" in leid)
+              and result["slot_list_entity"] is None):
+            result["slot_list_entity"] = eid
     return result

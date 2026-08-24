@@ -448,6 +448,34 @@ class TestReconcileDecision(unittest.TestCase):
         self.assertEqual(
             engine._reconcile_decision(False, True, -3.0, True, has_planned=False)[0], "ok")
 
+    def test_completed_only_online_is_bump_peak(self):
+        # 4.5.0: COMPLETED-ONLY on a LIVE block (was_online=True) → EMT was online and
+        # polling, so an unplanned completed dispatch is an out-of-app BUMP, not a
+        # missed smart charge → peak (freebie withheld, cap untouched).
+        self.assertEqual(
+            engine._reconcile_decision(False, True, -3.48, True, has_planned=False,
+                                       was_online=True)[0], "peak")
+        # already peak → nothing to do (no spurious change/flag)
+        self.assertEqual(
+            engine._reconcile_decision(False, True, -3.48, False, has_planned=False,
+                                       was_online=True)[0], "ok")
+        # OFFLINE counterpart (was_online=False) still off-peak — genuine missed smart
+        # (currently peak, so the off_peak target is a real restore, not an 'ok')
+        self.assertEqual(
+            engine._reconcile_decision(False, True, -3.48, False, has_planned=False,
+                                       was_online=False)[0], "off_peak")
+
+    def test_online_bump_needs_contemporaneous(self):
+        # 4.5.0 fix: completed-only + online BUT the completed was re-fetched long after
+        # the slot (rebuild/re-import lost the accumulated 'started') → NOT a bump.
+        self.assertEqual(
+            engine._reconcile_decision(False, True, -3.48, False, has_planned=False,
+                                       was_online=True, contemporaneous=False)[0], "off_peak")
+        # contemporaneous evidence present → still a confident bump → peak
+        self.assertEqual(
+            engine._reconcile_decision(False, True, -3.48, True, has_planned=False,
+                                       was_online=True, contemporaneous=True)[0], "peak")
+
     def test_completed_with_planned_not_started_stays_review(self):
         # §11.1: we WERE online (a 'planned' was captured) but the slot never started
         # → ambiguous (bump vs paused smart). Left at peak, flagged for review — we do
