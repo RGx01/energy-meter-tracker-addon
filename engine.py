@@ -10594,6 +10594,35 @@ async def reconcile_dispatch_overlay() -> dict:
                                     bs, _want_ev, _want_home)
                 except Exception as _be:
                     logger.warning("reconcile: band relabel failed for %s: %s", bs, _be)
+                # 4.5.0 fix (companion to the band sweep): the same stale-provisional
+                # problem hits the legacy EV columns Usage Stats reads (imp_rate_ev /
+                # imp_cost_ev / bands / imp_cost_remainder). An OLDER reconcile that
+                # rewrote the segments but not these columns leaves imp_rate_ev != the
+                # block rate — so Usage Stats keeps the old EV cost and spills the
+                # difference into Direct, diverging from Billing. Re-stamp to the block
+                # rate (uncapped: EV shares it). Self-limiting: re-stamps once, then matches.
+                try:
+                    _evrow = store._conn.execute(
+                        "SELECT imp_kwh, imp_kwh_ev, imp_rate_ev FROM blocks "
+                        "WHERE block_start = ? AND meter_id = 'electricity_main' "
+                        "AND imp_kwh_ev IS NOT NULL", (bs,)).fetchone()
+                    if _evrow is not None and \
+                       abs(float(_evrow["imp_rate_ev"] or 0.0) - cur_rate) > 1e-6:
+                        with store._conn:
+                            store._conn.execute(
+                                "UPDATE blocks SET imp_rate_ev = ?, "
+                                "imp_cost_ev = ROUND(COALESCE(imp_kwh_ev, 0) * ?, 6), "
+                                "imp_ev_band = ?, imp_home_band = ?, "
+                                "imp_cost_remainder = ROUND("
+                                "  (COALESCE(imp_kwh, 0) - COALESCE(imp_kwh_ev, 0)) * ?, 6) "
+                                "WHERE block_start = ? AND meter_id = 'electricity_main'",
+                                (cur_rate, cur_rate, _want_ev, _want_home, cur_rate, bs))
+                        n_band += 1
+                        changed = True
+                        logger.info("reconcile: %s EV-cols re-stamp rate_ev->%.5f "
+                                    "(Usage-Stats/segments drift heal, 4.5.0)", bs, cur_rate)
+                except Exception as _ee:
+                    logger.warning("reconcile: EV-col re-stamp failed for %s: %s", bs, _ee)
             continue
         new_rate = off_peak if target == "off_peak" else base
         if not _DISPATCH_RECONCILE_APPLY:
@@ -10646,12 +10675,35 @@ async def reconcile_dispatch_overlay() -> dict:
                 "WHERE block_start = ? AND rate_corrected = 0 AND meter_id IN "
                 "(SELECT meter_id FROM meters WHERE is_sub_meter = 1)",
                 (new_rate, new_rate, _exc_rate, _exc_rate, _exc_src, bs))
-        # BL-27: the bill split / Usage Stats / chart all price from block_segments now, so
-        # the reconcile REWRITES THE SEGMENTS as the source of truth — the old dedicated
-        # re-stamp of the imp_rate_ev/imp_cost_ev columns is retired (nothing reads them but
-        # the one-time backfill). An uncapped revert/restore puts the whole block on the new
-        # rate, so EV and house share it; build those bands directly at new_rate. Runs AFTER
-        # the column txn commits (set_block_segments opens its own). Capped left to the seam.
+            # 4.5.0 fix: Usage Stats (/blocks-summary, /blocks-day) reads the legacy EV-split
+            # columns imp_kwh_ev / imp_cost_ev (+ imp_rate_ev, bands, imp_cost_remainder) for
+            # its device breakdown, so a reconcile that rewrites the SEGMENTS must ALSO
+            # re-stamp these columns — otherwise Usage Stats keeps the OLD (e.g. off-peak) EV
+            # cost and spills the shortfall into Direct import, diverging from Billing (which
+            # reads segments). Surfaced by a reverted BUMP: segments went to peak but EV cost
+            # stayed off-peak. Uncapped only (EV shares the block rate); capped's EV≠house rate
+            # rides the seam and is left alone.
+            _capped_ev = ("ev_device_off_peak" in _kraken_rate_schedules
+                          and "ev_device_peak" in _kraken_rate_schedules)
+            if not _capped_ev:
+                _ev_band_col = "off_peak" if target == "off_peak" else "peak"
+                _home_band_col = "off_peak" if target == "off_peak" else "day"
+                store._conn.execute(
+                    "UPDATE blocks SET "
+                    "imp_rate_ev = ?, "
+                    "imp_cost_ev = ROUND(COALESCE(imp_kwh_ev, 0) * ?, 6), "
+                    "imp_ev_band = ?, imp_home_band = ?, "
+                    "imp_cost_remainder = ROUND("
+                    "  (COALESCE(imp_kwh, 0) - COALESCE(imp_kwh_ev, 0)) * ?, 6) "
+                    "WHERE block_start = ? AND meter_id = 'electricity_main' "
+                    "AND imp_kwh_ev IS NOT NULL",
+                    (new_rate, new_rate, _ev_band_col, _home_band_col, new_rate, bs))
+        # BL-27: the bill split / Usage Stats / chart price from block_segments (source of
+        # truth), so the reconcile REWRITES THE SEGMENTS too. (The legacy EV columns above are
+        # re-stamped in lock-step because /blocks-summary + /blocks-day still read them.) An
+        # uncapped revert/restore puts the whole block on the new rate, so EV and house share
+        # it; build those bands directly at new_rate. Runs AFTER the column txn commits
+        # (set_block_segments opens its own). Capped left to the seam.
         try:
             import pricing_segments as _ps_rc
             _mrow = store._conn.execute(
