@@ -5943,7 +5943,7 @@ def _aggregate_insights(store, cfg, utc_start: str, utc_end: str) -> dict:
             except Exception:
                 logger.debug("insights: recorded pre-seam EV carbon unavailable", exc_info=True)
         for _m in [mid for mid, st in list(sub_totals.items())
-                   if (st.get("meter_type") or "") == "ev_charger"
+                   if (st.get("meter_type") or "") in ("ev", "ev_charger")
                    or any(k in mid.lower() for k in ("ev", "charger"))]:
             sub_totals.pop(_m, None)
     total_sub_imp_kwh  = sum(st["imp_kwh"]   for st in sub_totals.values())
@@ -6199,7 +6199,7 @@ def _configured_ev_meter_id(cfg):
         meta = md.get("meta") or {}
         if not meta.get("sub_meter"):
             continue
-        if (meta.get("meter_type") == "ev_charger"
+        if (meta.get("meter_type") in ("ev", "ev_charger")   # BL-40: config UI writes 'ev'
                 or any(kw in mid.lower() for kw in ("ev", "charger"))):
             return mid
     return None
