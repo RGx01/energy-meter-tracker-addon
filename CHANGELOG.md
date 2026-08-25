@@ -1,5 +1,13 @@
 # Changelog
  
+## [4.5.1] — 2026-08-25
+
+*Hotfix: a charger added as an **"EV Charger"** device could show **two** EV lines — the physical charger *and* the synthetic **"EV (from dispatch)"** — double-representing the same charge. Reported on an Indra Smart Pro that is also the Octopus dispatch source.*
+
+### Fixed
+
+- **A charger added as an "EV Charger" device no longer double-counts against the dispatch EV.** The config screen writes the device type as `ev`, but three of EMT's EV-recognition checks only accepted the internal `ev_charger` spelling (otherwise matching on the meter's *name* containing "ev"/"charger"). A charger added through the UI gets a random meter id, so on IOG accounts where that charger is **also** the Octopus dispatch source (Indra, Hypervolt, Pod Point, …), EMT failed to recognise it as the EV, didn't let the synthetic "EV (from dispatch)" supersede it, and drew **both** — the same charge on two device lines. The checks now accept both spellings, so the two fold into one EV line. Display / attribution only — grand totals were always correct; no reprice or migration (it re-renders correctly on the next load).
+
 ## [4.5.0] — 2026-08-25
 
 *Theme: **Honest bump pricing.** When you force a charge outside Octopus's smart schedule — a Zappi **Fast** boost, an in-app **bump** — Octopus bills it at the **peak** rate (and credits any Free Electricity to your balance separately). EMT's live estimate was doing the opposite on those slots, showing them as cheap **off-peak** until settlement corrected them. 4.5.0 teaches the estimate to tell an out-of-app bump from a genuine smart charge, so your provisional numbers read right the first time — and it stops EMT ever discarding the dispatch history it needs to do so. Estimate/display only on API-connected IOG accounts; settlement was, and remains, the final authority, so no settled bill figure changes.*
