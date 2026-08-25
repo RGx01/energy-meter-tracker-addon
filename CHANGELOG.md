@@ -1,5 +1,13 @@
 # Changelog
  
+## [4.5.2] — 2026-08-25
+
+*Hotfix: on Octopus **API / Home Mini** accounts **with sub-meters** (an EV charger, a house battery, a CT-clamped device), the most recent day or two of **Usage Stats** could read too high — a device's energy counted once inside "Direct/house" and again on its own line — until the half-hourly reads settled. Reported on an Indra + Fox battery setup whose Mini had just come back online.*
+
+### Fixed
+
+- **The live house/device split now runs for API/Mini sub-meter setups, not only on settled days.** When EMT rebuilds the in-progress block from its saved reads (`load_current_block`), it was dropping each meter's configuration — including which meters are sub-meters and what they hang off. On a local-sensor (CAD) setup this never showed, because the live sampling loop re-applies that config every few seconds before the block closes. But on an API/Home-Mini setup the block is closed by the Mini's boundary read, which uses the rebuilt (config-less) block — so the grid-authoritative sub-meter split silently did nothing, and the day's "Direct" import kept the devices inside it *and* listed them separately, inflating the Usage-Stats total. EMT now restores each meter's configuration when it rebuilds the block, so the split lands live (as it does on CAD). Display / aggregation only — grand totals and the bill were always correct, and already-affected recent days self-correct as they settle (settlement always carried the configuration). Long-standing behaviour that surfaces when a Mini drives block finalisation with sub-meters present — not a regression from a specific release.
+
 ## [4.5.1] — 2026-08-25
 
 *Hotfix: a charger added as an **"EV Charger"** device could show **two** EV lines — the physical charger *and* the synthetic **"EV (from dispatch)"** — double-representing the same charge. Reported on an Indra Smart Pro that is also the Octopus dispatch source.*
