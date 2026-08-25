@@ -10334,7 +10334,8 @@ def _attribute_missing_ev_split() -> int:
     the reconcile's segment resync only rewrites blocks that already have a split. Whichever
     instance priced a block before its completed record arrived diverges permanently (the
     prod vs prod-dev split mismatch). This re-runs the IOG split (`_apply_iog_split`) on every
-    main block that now has a completed dispatch but a NULL split, writes the columns AND
+    main block that now has a completed dispatch but a NULL split (or a GAP-FILLED block whose
+    split materially disagrees with that completed dispatch — BL-39), writes the columns AND
     rewrites the block's SEGMENTS (BL-27's source of truth, so the bill split / Usage Stats /
     chart all follow), and both instances converge deterministically. Idempotent; imported
     history left alone; gated to UNCAPPED (the capped 4-rate attribution rides the seam).
@@ -10348,13 +10349,26 @@ def _attribute_missing_ev_split() -> int:
             and "ev_device_peak" in _kraken_rate_schedules):
         return 0        # capped: the 4-rate attribution is priced at the seam
     try:
+        # 4.5.0 (BL-39): also re-attribute a GAP-FILLED block (interpolated=1) whose stored EV
+        # kWh materially disagrees with its completed dispatch. A gap-fill can stamp a WRONG
+        # (non-NULL) split from a stale/planned fragment; the real completed lands hours later,
+        # and the NULL-only rule never revisits it. Forward-hardening — runs every reconcile
+        # pass, so any outage self-heals once the completed dispatch arrives; idempotent after.
+        # rate_corrected blocks are excluded so a manual correction is never stomped.
         rows = _store._conn.execute(
             "SELECT b.block_start, b.imp_kwh, b.imp_cost, b.imp_rate FROM blocks b "
-            "WHERE b.meter_id = 'electricity_main' AND b.imp_kwh_ev IS NULL "
+            "WHERE b.meter_id = 'electricity_main' "
             "AND COALESCE(b.imp_kwh, 0) > 0 "
             "AND (b.source IS NULL OR b.source NOT LIKE 'imported%') "
+            "AND COALESCE(b.rate_corrected, 0) = 0 "
             "AND EXISTS (SELECT 1 FROM dispatch_history h WHERE h.slot_start = b.block_start "
-            "AND h.kind = 'completed' AND h.energy_kwh IS NOT NULL)").fetchall()
+            "            AND h.kind = 'completed' AND h.energy_kwh IS NOT NULL) "
+            "AND (b.imp_kwh_ev IS NULL "
+            "     OR (b.interpolated = 1 AND EXISTS ("
+            "           SELECT 1 FROM dispatch_history h2 WHERE h2.slot_start = b.block_start "
+            "           AND h2.kind = 'completed' AND h2.energy_kwh IS NOT NULL "
+            "           AND ABS(MIN(ABS(h2.energy_kwh), COALESCE(b.imp_kwh, 0)) "
+            "                   - COALESCE(b.imp_kwh_ev, 0)) > 0.1)))").fetchall()
     except Exception as e:
         logger.warning("_attribute_missing_ev_split: query failed: %s", e)
         return 0
