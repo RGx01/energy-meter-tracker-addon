@@ -4945,6 +4945,25 @@ class BlockStore:
 
         _block_date = (row["block_start"] or "")[:10]  # YYYY-MM-DD
 
+        # BL-42: repopulate each meter's meta from config. load_current_block
+        # reconstructs meters purely from current_reads with empty meta; the
+        # api/Mini boundary-finalise path then hands finalise_block/_apply_pass2 a
+        # block with no sub_meter/parent_meter, so the grid-authoritative device
+        # split silently no-ops and imp_kwh_remainder is left NULL (the split only
+        # re-lands at DCC settlement, via the get_block_dict join). Carry the
+        # config meta here so the live provisional split works for sub-meter setups.
+        _meta_by_id = {}
+        try:
+            _cp = self._conn.execute(
+                "SELECT id FROM config_periods WHERE effective_to IS NULL "
+                "ORDER BY effective_from DESC LIMIT 1").fetchone()
+            if _cp:
+                _cfg = self.config_from_db(_cp["id"])
+                _meta_by_id = {_mid: (_m.get("meta") or {})
+                               for _mid, _m in (_cfg.get("meters") or {}).items()}
+        except Exception as _me:
+            logger.warning("load_current_block: meta repopulate failed: %s", _me)
+
         all_meter_ids = set(list(meter_reads.keys()) + list(meter_rates.keys()))
         for mid in all_meter_ids:
             # Skip retired sub-meters — don't load their stale reads back into the block
@@ -4959,7 +4978,7 @@ class BlockStore:
             block["meters"][mid] = {
                 "channels": channels,
                 "standing_charge": meter_sc.get(mid, 0.0),
-                "meta": {},
+                "meta": _meta_by_id.get(mid, {}),
             }
 
         # Reconstruct _gap_marker from gap_detected_at + gap seed rows
