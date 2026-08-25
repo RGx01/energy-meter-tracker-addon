@@ -1259,19 +1259,31 @@ def api_power():
             except Exception:
                 pass
 
-        # Current generation mix from latest block
+        # Current generation mix — read the SAME source as the 48h chart (mix_history,
+        # latest CI-tick slot) so the donut and the chart can never disagree (BL-38).
+        # The old path read the latest block-stamped generation_mix, which lagged/diverged
+        # from the live mix and could grab two blocks (fragile LIMIT 9).
         current_mix = []
         try:
             _mix_store = _get_store()
             _mix_rows = _mix_store._conn.execute(
-                """SELECT gm.fuel, gm.perc
-                   FROM generation_mix gm
-                   JOIN blocks b ON b.id = gm.block_id
-                   WHERE b.meter_id = 'electricity_main'
-                   ORDER BY b.block_start DESC
-                   LIMIT 9"""
+                """SELECT fuel, perc FROM mix_history
+                   WHERE captured_at = (SELECT MAX(captured_at) FROM mix_history)"""
             ).fetchall()
             current_mix = [{"fuel": r["fuel"], "perc": r["perc"]} for r in _mix_rows]
+            if not current_mix:
+                # Fallback (mix_history empty / pre-2.8.0 data): the latest single block
+                # that actually has a stamped mix — all its fuel rows, not a LIMIT slice.
+                _mix_rows = _mix_store._conn.execute(
+                    """SELECT gm.fuel, gm.perc FROM generation_mix gm
+                       WHERE gm.block_id = (
+                           SELECT b.id FROM blocks b
+                           WHERE b.meter_id = 'electricity_main'
+                             AND EXISTS (SELECT 1 FROM generation_mix g2
+                                         WHERE g2.block_id = b.id)
+                           ORDER BY b.block_start DESC LIMIT 1)"""
+                ).fetchall()
+                current_mix = [{"fuel": r["fuel"], "perc": r["perc"]} for r in _mix_rows]
         except Exception:
             pass
 

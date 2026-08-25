@@ -2988,6 +2988,7 @@ class BlockStore:
         ).fetchone()
         return int(row["n"]) if row else 0
 
+    # DEPRECATED — remove in 5.0.0 (BL-33): one-time pre-4.4.0 legacy migration; retired once 5.0.0 requires a 4.4.0-migrated DB.
     def repair_pence_inc_blocks(self, block_starts, threshold: float = 3.0) -> int:
         """Q1 SELF-HEAL: ÷100 the INC columns (rate/cost + EV split) on MAIN + sub-meter rows for
         blocks whose `imp_rate` is implausibly high (> `threshold` £/kWh = pence-not-pounds — the

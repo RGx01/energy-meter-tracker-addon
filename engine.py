@@ -285,6 +285,7 @@ def set_data_source_mode(mode: str) -> str:
     return mode
 
 
+# DEPRECATED — remove in 5.0.0 (BL-33): one-time pre-4.4.0 legacy migration; retired once 5.0.0 requires a 4.4.0-migrated DB.
 def _detect_upgrade_mode(config: dict) -> str | None:
     """Upgrade bridge: decide the mode for an install that has no stored mode.
 
@@ -4537,6 +4538,7 @@ def _maybe_backfill_historical_carbon() -> None:
         _carbon_backfill_running = False
 
 
+# DEPRECATED — remove in 5.0.0 (BL-33): one-time pre-4.4.0 legacy migration; retired once 5.0.0 requires a 4.4.0-migrated DB.
 def _maybe_backfill_historical_exc() -> None:
     """Schedule the one-shot 4.2 ex-VAT historical backfill if API tariff data is
     available and it hasn't completed. Safe to call repeatedly (engine startup +
@@ -4601,6 +4603,29 @@ def _maybe_backfill_historical_exc() -> None:
         _exc_backfill_running = False
 
 
+def _ci_slot_plausible(mix, intensity, ci_index) -> bool:
+    """BL-38: reject a physically-impossible regional generation-mix / intensity slot.
+
+    National Grid's *regional* generation mix is a MODELLED estimate (embedded solar is
+    inferred, not metered) and for a small region it occasionally emits a degenerate slot —
+    one fuel ~100% with the rest ~0, and a collapsed 0 gCO2/kWh — e.g. 'solar 97% at 21:30'.
+    Stored verbatim it corrupts the donut, the 48h chart AND (via intensity) the block carbon.
+    Reject the glitch signature so the previous good slot stands; genuine mixes never trip it
+    (real single-fuel maxima sit ~70-80%; GB intensity is never 0). Never rejects on a parse
+    error (returns True). Pure — unit-tested.
+    """
+    try:
+        if mix:
+            top = max((float(f.get("perc") or 0.0) for f in mix), default=0.0)
+            if top >= 95.0:
+                return False
+        if intensity is not None and float(intensity) <= 0.0:
+            return False
+    except Exception:
+        return True
+    return True
+
+
 async def _tick_carbon_intensity() -> float | None:
     """
     Fetch and store carbon intensity if 15 minutes have elapsed since last fetch.
@@ -4623,6 +4648,18 @@ async def _tick_carbon_intensity() -> float | None:
     try:
         slots = _fetch_carbon_intensity(postcode)
         for slot in slots:
+            # BL-38: drop an implausible regional-model glitch slot (one fuel ~100% /
+            # 0 gCO2/kWh) so it never reaches the donut, the 48h chart or block carbon —
+            # the previous good slot stands (get_nearest_carbon_intensity falls back).
+            if not _ci_slot_plausible(slot.get("generationmix"),
+                                      slot.get("intensity_forecast"),
+                                      slot.get("ci_index")):
+                _tf = max((float(f.get("perc") or 0.0)
+                           for f in (slot.get("generationmix") or [])), default=None)
+                logger.warning("_tick_carbon_intensity: implausible CI slot %s skipped "
+                               "(intensity=%s, top_fuel=%s%%) — regional-model glitch (BL-38)",
+                               slot.get("captured_at"), slot.get("intensity_forecast"), _tf)
+                continue
             _store.upsert_carbon_intensity(
                 slot["captured_at"], postcode,
                 slot["intensity_forecast"], slot["ci_index"],
@@ -6468,6 +6505,7 @@ def reprice_history_conformance(from_iso: str, to_iso: str,
     return report
 
 
+# DEPRECATED — remove in 5.0.0 (BL-33): one-time pre-4.4.0 legacy migration; retired once 5.0.0 requires a 4.4.0-migrated DB.
 async def _run_historical_exc_backfill(max_blocks: int = 20000,
                                        batch: int = 500,
                                        pace_s: float = 0.02) -> int:
@@ -6586,6 +6624,7 @@ _IOG_SPLIT_BACKFILL_PASS_PACE = 1.0   # seconds between drain passes (test-overr
 _iog_split_backfill_running = False   # BL-9 split backfill re-entry guard
 
 
+# DEPRECATED — remove in 5.0.0 (BL-33): one-time pre-4.4.0 legacy migration; retired once 5.0.0 requires a 4.4.0-migrated DB.
 async def _run_historical_iog_split_backfill(max_blocks: int = 20000,
                                              batch: int = 500,
                                              pace_s: float = 0.02) -> int:
@@ -6690,6 +6729,7 @@ async def _run_historical_iog_split_backfill(max_blocks: int = 20000,
     return filled
 
 
+# DEPRECATED — remove in 5.0.0 (BL-33): one-time pre-4.4.0 legacy migration; retired once 5.0.0 requires a 4.4.0-migrated DB.
 def _maybe_backfill_historical_iog_split() -> None:
     """Schedule the one-shot BL-9 IOG split backfill as a loop TASK (all BlockStore
     access stays on the event-loop thread — single SQLite connection — exactly like
@@ -7130,6 +7170,7 @@ def _maybe_reprice_history() -> None:
 
 
 
+# DEPRECATED — remove in 5.0.0 (BL-33): one-time pre-4.4.0 legacy migration; retired once 5.0.0 requires a 4.4.0-migrated DB.
 async def _run_historical_segment_backfill(max_blocks: int = 20000,
                                            batch: int = 500,
                                            pace_s: float = 0.02) -> int:
@@ -9435,6 +9476,95 @@ def _ohme_slot_for_now(now) -> str:
     return slot.isoformat()
 
 
+def _parse_ohme_slots(raw, now_utc, tz_name: str) -> list:
+    """Parse Ohme's OWN charge-slot plan into naive-UTC 30-min slot_start ISO strings.
+
+    UNVALIDATED end-to-end (no Ohme tester; author is on Zappi) — but this parser is
+    pure and unit-tested. Accepts either Ohme HA integration shape, defensively:
+
+      * OFFICIAL `sensor.<ohme>_slot_list` STATE — a string like ``"01:00-02:30, 03:30-04:00"``
+        in **local** time (merged half-hour slots; ohmepy ``ChargeSlot.__str__`` is
+        ``f"{start:%H:%M}-{end:%H:%M}"``). HH:MM carries no date, so each range is anchored to
+        the local date that places its start nearest ``now`` (within ±12h); a range whose end
+        ``<=`` start crosses midnight (+1 day). Shape confirmed against home-assistant/core
+        ``ohme/sensor.py`` + ohmepy ``utils.ChargeSlot``.
+      * dan-r attribute shape — a list of dicts carrying ISO ``start``/``end`` (ohmepy
+        ``ChargeSlot.to_dict``). Unambiguous, no anchoring; authoritative for pricing.
+
+    Returns sorted unique naive-UTC 30-min slot_start ISO strings the ranges cover.
+    Best-effort: returns [] on anything unparseable (never raises).
+    """
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz, time as _time
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = _tz.utc
+
+    def _expand(start_naive, end_naive):
+        out = []
+        cur = start_naive.replace(second=0, microsecond=0)
+        cur = cur.replace(minute=(0 if cur.minute < 30 else 30))
+        while cur < end_naive:
+            out.append(cur.isoformat())
+            cur = cur + _td(minutes=30)
+        return out
+
+    slots = []
+    # dan-r attribute shape: list of {'start','end'} ISO dicts (authoritative)
+    if isinstance(raw, (list, tuple)):
+        for d in raw:
+            try:
+                sd = _dt.fromisoformat(str(d.get("start")))
+                ed = _dt.fromisoformat(str(d.get("end")))
+                if sd.tzinfo is not None:
+                    sd = sd.astimezone(_tz.utc).replace(tzinfo=None)
+                if ed.tzinfo is not None:
+                    ed = ed.astimezone(_tz.utc).replace(tzinfo=None)
+                if ed > sd:
+                    slots += _expand(sd, ed)
+            except Exception:
+                continue
+        return sorted(set(slots))
+
+    # official HH:MM string shape (local time; anchor + convert)
+    txt = str(raw or "").strip()
+    if not txt or txt.lower() in ("unknown", "unavailable", "none", "-"):
+        return []
+    try:
+        now_local = now_utc.replace(tzinfo=_tz.utc).astimezone(tz)
+    except Exception:
+        return []
+    for part in txt.split(","):
+        part = part.strip()
+        if "-" not in part:
+            continue
+        a, _, b = part.partition("-")
+        try:
+            ah, am = (int(x) for x in a.strip().split(":")[:2])
+            bh, bm = (int(x) for x in b.strip().split(":")[:2])
+        except Exception:
+            continue
+        try:
+            start_local = _dt.combine(now_local.date(), _time(ah, am), tzinfo=tz)
+            end_local = _dt.combine(now_local.date(), _time(bh, bm), tzinfo=tz)
+        except Exception:
+            continue
+        if end_local <= start_local:
+            end_local += _td(days=1)
+        # shift by whole days so the slot start sits nearest now (±12h window)
+        guard = 0
+        while start_local < now_local - _td(hours=12) and guard < 3:
+            start_local += _td(days=1); end_local += _td(days=1); guard += 1
+        guard = 0
+        while start_local >= now_local + _td(hours=12) and guard < 3:
+            start_local -= _td(days=1); end_local -= _td(days=1); guard += 1
+        su = start_local.astimezone(_tz.utc).replace(tzinfo=None)
+        eu = end_local.astimezone(_tz.utc).replace(tzinfo=None)
+        slots += _expand(su, eu)
+    return sorted(set(slots))
+
+
 def _ohme_capture_slots(provider, planned, sensor_present, mode, status, now):
     """Decide which dispatch slots OHME should persist this tick. PURE — all I/O
     (sensor read, persistence, logging) stays in the caller.
@@ -9528,6 +9658,17 @@ def _capture_ohme_slots(provider, planned) -> int:
                 slot_start, off_peak=True, provider=provider, source=source,
                 state="planned")
             captured += 1
+            # 4.5.0 (BL-31, UNVALIDATED): a sensor-VERIFIED smart slot is a real
+            # smart-charge-in-progress → record 'started' so the reconcile confirms
+            # off-peak instead of flagging it 'review' (the OHME review-churn). The
+            # optimistic (no-sensor) source is NOT started — it stays review-eligible.
+            if source == "ohme_verified":
+                try:
+                    _store.record_dispatch_history(
+                        slot_start, "started", provider=provider,
+                        source="ohme", energy_kwh=None)
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning("_capture_ohme_slots: persist %s failed: %s",
                            slot_start, e)
@@ -9536,10 +9677,9 @@ def _capture_ohme_slots(provider, planned) -> int:
         "status=%r %s — captured %d slot(s) planned=%d source_dist=%s",
         provider, ohme.get("integration") or "none", mode or "n/a", raw,
         status_raw, decision, captured, len(planned or []), dist)
-    try:
-        _store.prune_dispatch_slots(days=90)
-    except Exception:
-        pass
+    # Retention invariant (4.5.0, BL-35): NEVER trim dispatch_slots / dispatch_history.
+    # The planned/started/completed lifecycle is the canonical reprice ingredient —
+    # EMT keeps it for the life of the DB (no Octopus-style 90-day amnesia).
     return captured
 
 
@@ -9557,14 +9697,43 @@ def _record_ohme_dispatch_history(provider, planned, completed) -> int:
     if _store is None:
         return 0
     n = 0
-    slot_energy = _planned_dispatch_slot_energy(planned, include_all=True)
-    slot_bounds = _planned_dispatch_slot_bounds(planned, include_all=True)
-    for slot_start in sorted(slot_energy):
-        rb = slot_bounds.get(slot_start) or (None, None)
-        _store.record_dispatch_history(
-            slot_start, "planned", provider=provider, source="ohme",
-            energy_kwh=slot_energy.get(slot_start), raw_start=rb[0], raw_end=rb[1])
-        n += 1
+    # 4.5.0 (BL-31, UNVALIDATED — pending an Ohme tester; author is on Zappi): prefer
+    # Ohme's OWN plan (authoritative — not Octopus's unreliable superset) for 'planned'.
+    # This is what lets the smart-charging card show the real forward plan for a
+    # charger-connected Ohme user, and gives the reconcile a real plan to key on.
+    # Guarded: only when the slot_list sensor is present AND parses to non-empty;
+    # otherwise the pre-existing superset behaviour is unchanged.
+    own_slots = []
+    try:
+        _ohme = (_detected_integrations or {}).get("ohme") or {}
+        _sl_ent = _ohme.get("slot_list_entity")
+        if _sl_ent and _engine_ha is not None:
+            _raw = _engine_ha.get_state(_sl_ent)
+            if _raw in (None, "", "unknown", "unavailable"):
+                _attrs = _engine_ha.get_attributes(_sl_ent) or {}
+                _raw = (_attrs.get("slots") or _attrs.get("charge_slots")
+                        or _attrs.get("planned_dispatches") or _raw)
+            _now2 = datetime.now(timezone.utc).replace(tzinfo=None)
+            own_slots = _parse_ohme_slots(_raw, _now2, _iog_site_tz())
+    except Exception as _oe:
+        logger.debug("_record_ohme_dispatch_history: own-plan read failed: %s", _oe)
+    if own_slots:
+        for slot_start in own_slots:
+            _store.record_dispatch_history(
+                slot_start, "planned", provider=provider, source="ohme_plan",
+                energy_kwh=None)
+            n += 1
+        logger.info("_record_ohme_dispatch_history: using Ohme's OWN plan "
+                    "(%d slot(s), UNVALIDATED) for card + lifecycle", len(own_slots))
+    else:
+        slot_energy = _planned_dispatch_slot_energy(planned, include_all=True)
+        slot_bounds = _planned_dispatch_slot_bounds(planned, include_all=True)
+        for slot_start in sorted(slot_energy):
+            rb = slot_bounds.get(slot_start) or (None, None)
+            _store.record_dispatch_history(
+                slot_start, "planned", provider=provider, source="ohme",
+                energy_kwh=slot_energy.get(slot_start), raw_start=rb[0], raw_end=rb[1])
+            n += 1
     comp_bounds = _completed_dispatch_slot_bounds(completed)  # actual window
     for slot_start, e_comp in _completed_dispatch_slot_energy(completed).items():
         rb = comp_bounds.get(slot_start) or (None, None)
@@ -9731,11 +9900,9 @@ async def _capture_dispatch_slots() -> int:
     except Exception as e:
         logger.warning("_capture_dispatch_slots: started derivation failed: %s", e)
 
-    try:
-        _store.prune_dispatch_slots(days=90)
-        _store.prune_dispatch_history(days=90)
-    except Exception:
-        pass
+    # Retention invariant (4.5.0, BL-35): NEVER trim dispatch_slots / dispatch_history —
+    # the planned/started/completed lifecycle is the canonical reprice ingredient,
+    # kept for the life of the DB (no Octopus-style 90-day amnesia).
     return captured
 
 
@@ -10075,7 +10242,8 @@ _RECONCILE_SMALL_COMPLETED_KWH = 0.4
 
 def _reconcile_decision(has_started: bool, has_completed: bool,
                         completed_energy, currently_off_peak: bool,
-                        has_planned: bool = True,
+                        has_planned: bool = True, was_online: bool = False,
+                        contemporaneous: bool = True,
                         small_kwh: float = _RECONCILE_SMALL_COMPLETED_KWH) -> tuple:
     """Settlement-time reconciliation of the dispatch overlay against the
     accumulated lifecycle (design §12, §14). Keys on whether the slot STARTED
@@ -10086,16 +10254,16 @@ def _reconcile_decision(has_started: bool, has_completed: bool,
     Returns (target, reason) where target is one of:
       - 'off_peak' : (a) started present → genuine smart charge (restore, incl. solar
                      slots the meter floor wrongly rejected); or (b) COMPLETED-ONLY
-                     with substantial energy and NO planned/started ever captured —
-                     EMT was offline / this is a re-import, so 'started' was never
-                     capturable. We accept Octopus's completed dispatch as authoritative
-                     (design §14). NOTE this can over-credit a genuine offline BUMP —
-                     completed alone can't tell smart from bump (§11.1) — but under-
-                     crediting a missed smart charge is the worse default, and a bump
-                     is correctable via the corrections tool.
+                     with substantial energy, NO planned/started ever captured, AND the
+                     block is OFFLINE/imported (was_online=False) — EMT was down / it's a
+                     re-import, so 'started' was never capturable. We accept Octopus's
+                     completed dispatch as authoritative (design §14).
       - 'peak'     : (a) neither started nor completed → planned but never charged;
-                     or (b) completed-without-started with NEGLIGIBLE energy
-                     (|completed| < small_kwh) — the dispatch didn't materially run.
+                     (b) completed-without-started with NEGLIGIBLE energy
+                     (|completed| < small_kwh) — the dispatch didn't materially run;
+                     or (c) COMPLETED-ONLY on a LIVE block (was_online=True) — EMT was
+                     online and polling, so an unplanned completed dispatch is an
+                     out-of-app BUMP, not a missed smart charge (4.5.0, design §14a).
       - 'review'   : we WERE online (a 'planned' was captured) but the slot never
                      STARTED, yet completed with substantial energy — genuinely
                      ambiguous (a bump vs a paused smart charge), §11.1. Price left
@@ -10124,17 +10292,29 @@ def _reconcile_decision(has_started: bool, has_completed: bool,
             return ("review",
                     f"completed ({mag:.2f} kWh) but not started, planned was seen — "
                     "ambiguous (bump vs paused smart)")
+        elif was_online and contemporaneous:
+            # 4.5.0: COMPLETED-ONLY on a LIVE block (interpolated=0, not imported), and
+            # the completed was seen CONTEMPORANEOUSLY → EMT was online AND accumulating
+            # dispatch history for this slot, yet no 'planned'/'started' was ever seen. A
+            # genuine smart charge is always planned (and we accumulate polls, so we'd
+            # have caught it); the only completed-only dispatch that appears while we were
+            # watching is an out-of-app BUMP/boost — peak, never sipped the cap. Confident,
+            # not 'review': a bump is unplanned by construction, so revert to peak. (The
+            # rare meter-up/dispatch-poller-down miss stays a fast-follow, BL-37.)
+            target = "peak"
+            reason = (f"completed ({mag:.2f} kWh) not started, no plan, EMT online "
+                      "→ out-of-app bump → peak")
         else:
-            # COMPLETED-ONLY: no planned/started ever captured → EMT was offline for
-            # this slot or it's a historical re-import, so 'started' was never
-            # capturable. Accept Octopus's authoritative completed dispatch as
-            # off-peak (design §14). rate_reconciled + the slot's
-            # source='smart-charge-completed' record that this came from a completed
-            # dispatch (reconciled, not live-verified) for audit. (Previously 'review'
-            # — left at peak — which silently under-credited a missed smart charge.)
+            # COMPLETED-ONLY but NOT a confident bump: either an OFFLINE block
+            # (interpolated/gap), or the completed was re-fetched long after the slot
+            # (rebuild / re-import → the locally-accumulated 'started' is LOST, not
+            # absent). In both cases absence-of-started is not evidence of a bump, so
+            # accept Octopus's completed dispatch as off-peak (design §14; §11.3). The
+            # optimistic default matches pre-4.5.0; settlement stays authoritative.
             target = "off_peak"
-            reason = (f"completed ({mag:.2f} kWh) but not started — off-peak from "
-                      "Octopus completed dispatch (authoritative; not live-verified)")
+            reason = (f"completed ({mag:.2f} kWh) not started, "
+                      f"{'offline/import' if not was_online else 'history re-fetched (not contemporaneous)'}"
+                      " — off-peak from Octopus completed dispatch (not live-verified)")
     if (target == "off_peak" and currently_off_peak) or \
        (target == "peak" and not currently_off_peak):
         return ("ok", "already correct")
@@ -10154,7 +10334,8 @@ def _attribute_missing_ev_split() -> int:
     the reconcile's segment resync only rewrites blocks that already have a split. Whichever
     instance priced a block before its completed record arrived diverges permanently (the
     prod vs prod-dev split mismatch). This re-runs the IOG split (`_apply_iog_split`) on every
-    main block that now has a completed dispatch but a NULL split, writes the columns AND
+    main block that now has a completed dispatch but a NULL split (or a GAP-FILLED block whose
+    split materially disagrees with that completed dispatch — BL-39), writes the columns AND
     rewrites the block's SEGMENTS (BL-27's source of truth, so the bill split / Usage Stats /
     chart all follow), and both instances converge deterministically. Idempotent; imported
     history left alone; gated to UNCAPPED (the capped 4-rate attribution rides the seam).
@@ -10168,13 +10349,26 @@ def _attribute_missing_ev_split() -> int:
             and "ev_device_peak" in _kraken_rate_schedules):
         return 0        # capped: the 4-rate attribution is priced at the seam
     try:
+        # 4.5.0 (BL-39): also re-attribute a GAP-FILLED block (interpolated=1) whose stored EV
+        # kWh materially disagrees with its completed dispatch. A gap-fill can stamp a WRONG
+        # (non-NULL) split from a stale/planned fragment; the real completed lands hours later,
+        # and the NULL-only rule never revisits it. Forward-hardening — runs every reconcile
+        # pass, so any outage self-heals once the completed dispatch arrives; idempotent after.
+        # rate_corrected blocks are excluded so a manual correction is never stomped.
         rows = _store._conn.execute(
             "SELECT b.block_start, b.imp_kwh, b.imp_cost, b.imp_rate FROM blocks b "
-            "WHERE b.meter_id = 'electricity_main' AND b.imp_kwh_ev IS NULL "
+            "WHERE b.meter_id = 'electricity_main' "
             "AND COALESCE(b.imp_kwh, 0) > 0 "
             "AND (b.source IS NULL OR b.source NOT LIKE 'imported%') "
+            "AND COALESCE(b.rate_corrected, 0) = 0 "
             "AND EXISTS (SELECT 1 FROM dispatch_history h WHERE h.slot_start = b.block_start "
-            "AND h.kind = 'completed' AND h.energy_kwh IS NOT NULL)").fetchall()
+            "            AND h.kind = 'completed' AND h.energy_kwh IS NOT NULL) "
+            "AND (b.imp_kwh_ev IS NULL "
+            "     OR (b.interpolated = 1 AND EXISTS ("
+            "           SELECT 1 FROM dispatch_history h2 WHERE h2.slot_start = b.block_start "
+            "           AND h2.kind = 'completed' AND h2.energy_kwh IS NOT NULL "
+            "           AND ABS(MIN(ABS(h2.energy_kwh), COALESCE(b.imp_kwh, 0)) "
+            "                   - COALESCE(b.imp_kwh_ev, 0)) > 0.1)))").fetchall()
     except Exception as e:
         logger.warning("_attribute_missing_ev_split: query failed: %s", e)
         return 0
@@ -10266,7 +10460,7 @@ async def reconcile_dispatch_overlay() -> dict:
     try:
         rows = store._conn.execute(
             """SELECT b.block_start, b.imp_kwh, b.imp_rate, b.needs_review,
-                      b.imp_kwh_api
+                      b.imp_kwh_api, b.interpolated
                FROM blocks b
                WHERE b.meter_id = 'electricity_main' AND b.rate_corrected = 0
                  -- NEVER reconcile IMPORTED history. Imported blocks carry Octopus's
@@ -10289,19 +10483,35 @@ async def reconcile_dispatch_overlay() -> dict:
     except Exception as e:
         logger.warning("reconcile_dispatch_overlay: query failed: %s", e)
         return {}
-    n_restore = n_revert = n_review = n_deferred = 0
+    n_restore = n_revert = n_review = n_deferred = n_band = 0
     changed = bool(_n_attr)          # back-attribution alone should refresh the charts
     n_candidates = len(rows)
     for r in rows:
         bs = r["block_start"]
         drows = store._conn.execute(
-            "SELECT kind, energy_kwh FROM dispatch_history WHERE slot_start = ?",
+            "SELECT kind, energy_kwh, first_seen FROM dispatch_history WHERE slot_start = ?",
             (bs,)).fetchall()
         kinds = {x[0] for x in drows}
         # Octopus's completed energy for the slot (negative = charged); drives the
         # negligible-completion → peak decision. None if no completed record yet.
         completed_energy = next(
             (x[1] for x in drows if x[0] == "completed" and x[1] is not None), None)
+        # 4.5.0 fix: a bump verdict needs CONTEMPORANEOUS evidence — the completed
+        # dispatch must have been first seen close to the slot (EMT live AND accumulating
+        # then). A rebuild/re-import re-fetches 'completed' from the API but the locally-
+        # accumulated 'planned'/'started' are gone (Octopus serves neither historically),
+        # so an old genuine smart charge would look completed-only and be mis-flagged a
+        # bump. If the completed was first seen >36h after the slot, treat absence-of-
+        # started as LOST HISTORY, not a bump (§11.3 accumulation principle).
+        _comp_fs = min((x[2] for x in drows
+                        if x[0] == "completed" and x[2]), default=None)
+        contemporaneous = True
+        if _comp_fs:
+            try:
+                _fs = datetime.fromisoformat(str(_comp_fs).split(".")[0].replace("Z", ""))
+                contemporaneous = (_fs - datetime.fromisoformat(bs)) <= timedelta(hours=36)
+            except Exception:
+                contemporaneous = True
         has_started = "started" in kinds
         # A no-started slot's fate (revert vs review) hinges on completed, which
         # lands late — defer it until it clears the settle gate. A started slot is
@@ -10329,7 +10539,9 @@ async def reconcile_dispatch_overlay() -> dict:
         currently_off_peak = abs(cur_rate - off_peak) < 1e-6
         target, reason = _reconcile_decision(
             has_started, "completed" in kinds, completed_energy, currently_off_peak,
-            has_planned=("planned" in kinds))
+            has_planned=("planned" in kinds),
+            was_online=(not bool(r["interpolated"])),
+            contemporaneous=contemporaneous)
         if target == "review":
             # A review flag invites a manual correction, but the correction tool
             # can only touch DCC-settled blocks. Dispatch `completed` arrives at
@@ -10357,6 +10569,74 @@ async def reconcile_dispatch_overlay() -> dict:
             # become decidable, clear the stale review flag.
             if r["needs_review"]:
                 store.clear_block_review(bs)
+            # BL-34 sweep: a block already at the correct RATE can still carry a stale
+            # segment band from provisional pricing (e.g. a negligible or settled
+            # completed-only slot priced peak but left band='off_peak' — the reverting
+            # code that stamps the band never ran because the rate did not change).
+            # Relabel the band to match the rate so label and rate agree on every
+            # band-keyed display. Uncapped only (a capped block's bands are legitimately
+            # mixed off_peak+peak). Pure label update — kwh/rate/exc/attribution are
+            # untouched, so the reconciliation invariant holds; self-limiting (rewrites
+            # once, then matches and is skipped). Because these blocks stay reconcile
+            # candidates, the hourly pass sweeps all legacy stale bands — no separate
+            # migration needed.
+            _capped_band = ("ev_device_off_peak" in _kraken_rate_schedules
+                            and "ev_device_peak" in _kraken_rate_schedules)
+            if not _capped_band:
+                _want_ev = "off_peak" if currently_off_peak else "peak"
+                _want_home = "off_peak" if currently_off_peak else "day"
+                try:
+                    _stale = store._conn.execute(
+                        "SELECT COUNT(*) FROM block_segments "
+                        "WHERE block_start = ? AND meter_id = 'electricity_main' "
+                        "AND ((attribution = 'ev' AND band != ?) "
+                        "     OR (attribution = 'house' AND band != ?))",
+                        (bs, _want_ev, _want_home)).fetchone()[0]
+                    if _stale:
+                        with store._conn:
+                            store._conn.execute(
+                                "UPDATE block_segments SET band = CASE attribution "
+                                "WHEN 'ev' THEN ? WHEN 'house' THEN ? ELSE band END "
+                                "WHERE block_start = ? AND meter_id = 'electricity_main' "
+                                "AND ((attribution = 'ev' AND band != ?) "
+                                "     OR (attribution = 'house' AND band != ?))",
+                                (_want_ev, _want_home, bs, _want_ev, _want_home))
+                        n_band += 1
+                        changed = True
+                        logger.info("reconcile: %s band relabel -> ev=%s home=%s "
+                                    "(rate unchanged; label was stale, BL-34)",
+                                    bs, _want_ev, _want_home)
+                except Exception as _be:
+                    logger.warning("reconcile: band relabel failed for %s: %s", bs, _be)
+                # 4.5.0 fix (companion to the band sweep): the same stale-provisional
+                # problem hits the legacy EV columns Usage Stats reads (imp_rate_ev /
+                # imp_cost_ev / bands / imp_cost_remainder). An OLDER reconcile that
+                # rewrote the segments but not these columns leaves imp_rate_ev != the
+                # block rate — so Usage Stats keeps the old EV cost and spills the
+                # difference into Direct, diverging from Billing. Re-stamp to the block
+                # rate (uncapped: EV shares it). Self-limiting: re-stamps once, then matches.
+                try:
+                    _evrow = store._conn.execute(
+                        "SELECT imp_kwh, imp_kwh_ev, imp_rate_ev FROM blocks "
+                        "WHERE block_start = ? AND meter_id = 'electricity_main' "
+                        "AND imp_kwh_ev IS NOT NULL", (bs,)).fetchone()
+                    if _evrow is not None and \
+                       abs(float(_evrow["imp_rate_ev"] or 0.0) - cur_rate) > 1e-6:
+                        with store._conn:
+                            store._conn.execute(
+                                "UPDATE blocks SET imp_rate_ev = ?, "
+                                "imp_cost_ev = ROUND(COALESCE(imp_kwh_ev, 0) * ?, 6), "
+                                "imp_ev_band = ?, imp_home_band = ?, "
+                                "imp_cost_remainder = ROUND("
+                                "  (COALESCE(imp_kwh, 0) - COALESCE(imp_kwh_ev, 0)) * ?, 6) "
+                                "WHERE block_start = ? AND meter_id = 'electricity_main'",
+                                (cur_rate, cur_rate, _want_ev, _want_home, cur_rate, bs))
+                        n_band += 1
+                        changed = True
+                        logger.info("reconcile: %s EV-cols re-stamp rate_ev->%.5f "
+                                    "(Usage-Stats/segments drift heal, 4.5.0)", bs, cur_rate)
+                except Exception as _ee:
+                    logger.warning("reconcile: EV-col re-stamp failed for %s: %s", bs, _ee)
             continue
         new_rate = off_peak if target == "off_peak" else base
         if not _DISPATCH_RECONCILE_APPLY:
@@ -10409,12 +10689,35 @@ async def reconcile_dispatch_overlay() -> dict:
                 "WHERE block_start = ? AND rate_corrected = 0 AND meter_id IN "
                 "(SELECT meter_id FROM meters WHERE is_sub_meter = 1)",
                 (new_rate, new_rate, _exc_rate, _exc_rate, _exc_src, bs))
-        # BL-27: the bill split / Usage Stats / chart all price from block_segments now, so
-        # the reconcile REWRITES THE SEGMENTS as the source of truth — the old dedicated
-        # re-stamp of the imp_rate_ev/imp_cost_ev columns is retired (nothing reads them but
-        # the one-time backfill). An uncapped revert/restore puts the whole block on the new
-        # rate, so EV and house share it; build those bands directly at new_rate. Runs AFTER
-        # the column txn commits (set_block_segments opens its own). Capped left to the seam.
+            # 4.5.0 fix: Usage Stats (/blocks-summary, /blocks-day) reads the legacy EV-split
+            # columns imp_kwh_ev / imp_cost_ev (+ imp_rate_ev, bands, imp_cost_remainder) for
+            # its device breakdown, so a reconcile that rewrites the SEGMENTS must ALSO
+            # re-stamp these columns — otherwise Usage Stats keeps the OLD (e.g. off-peak) EV
+            # cost and spills the shortfall into Direct import, diverging from Billing (which
+            # reads segments). Surfaced by a reverted BUMP: segments went to peak but EV cost
+            # stayed off-peak. Uncapped only (EV shares the block rate); capped's EV≠house rate
+            # rides the seam and is left alone.
+            _capped_ev = ("ev_device_off_peak" in _kraken_rate_schedules
+                          and "ev_device_peak" in _kraken_rate_schedules)
+            if not _capped_ev:
+                _ev_band_col = "off_peak" if target == "off_peak" else "peak"
+                _home_band_col = "off_peak" if target == "off_peak" else "day"
+                store._conn.execute(
+                    "UPDATE blocks SET "
+                    "imp_rate_ev = ?, "
+                    "imp_cost_ev = ROUND(COALESCE(imp_kwh_ev, 0) * ?, 6), "
+                    "imp_ev_band = ?, imp_home_band = ?, "
+                    "imp_cost_remainder = ROUND("
+                    "  (COALESCE(imp_kwh, 0) - COALESCE(imp_kwh_ev, 0)) * ?, 6) "
+                    "WHERE block_start = ? AND meter_id = 'electricity_main' "
+                    "AND imp_kwh_ev IS NOT NULL",
+                    (new_rate, new_rate, _ev_band_col, _home_band_col, new_rate, bs))
+        # BL-27: the bill split / Usage Stats / chart price from block_segments (source of
+        # truth), so the reconcile REWRITES THE SEGMENTS too. (The legacy EV columns above are
+        # re-stamped in lock-step because /blocks-summary + /blocks-day still read them.) An
+        # uncapped revert/restore puts the whole block on the new rate, so EV and house share
+        # it; build those bands directly at new_rate. Runs AFTER the column txn commits
+        # (set_block_segments opens its own). Capped left to the seam.
         try:
             import pricing_segments as _ps_rc
             _mrow = store._conn.execute(
@@ -10423,16 +10726,23 @@ async def reconcile_dispatch_overlay() -> dict:
             if _mrow is not None and (_mrow["imp_kwh"] or 0) > 0 and not _capped:
                 _evk = _mrow["imp_kwh_ev"]
                 _segs_rc = []
+                # BL-34 (4.5.0): the segment band must follow the reconciled RATE, not the
+                # stale provisional label. A revert-to-peak block kept band='off_peak' while
+                # its rate became peak (label ≠ rate on every band-keyed display). Derive it
+                # from the verdict: off-peak restore → off_peak; peak revert → EV 'peak',
+                # house 'day' (the IOG EV=off_peak|peak / house=off_peak|day convention).
+                _ev_band_rc = "off_peak" if target == "off_peak" else "peak"
+                _home_band_rc = "off_peak" if target == "off_peak" else "day"
                 if _evk is not None and float(_evk) > 1e-9:
                     _segs_rc.append(_ps_rc.Segment(round(float(_evk), 6), new_rate,
-                                    _exc_rate, _mrow["imp_ev_band"] or "standard", "ev"))
+                                    _exc_rate, _ev_band_rc, "ev"))
                     _hk = float(_mrow["imp_kwh"]) - float(_evk)
                     if _hk > 1e-9:
                         _segs_rc.append(_ps_rc.Segment(round(_hk, 6), new_rate, _exc_rate,
-                                        _mrow["imp_home_band"] or "standard", "house"))
+                                        _home_band_rc, "house"))
                 else:
                     _segs_rc.append(_ps_rc.Segment(round(float(_mrow["imp_kwh"]), 6), new_rate,
-                                    _exc_rate, _mrow["imp_home_band"] or "standard", "house"))
+                                    _exc_rate, _home_band_rc, "house"))
                 store.set_block_segments(bs, "electricity_main", _segs_rc)
         except Exception as _rc_e:
             logger.warning("reconcile: segment resync failed for %s: %s", bs, _rc_e)
@@ -10456,11 +10766,11 @@ async def reconcile_dispatch_overlay() -> dict:
     # log — "0 candidates" vs "N candidates, 0 changed" tells very different
     # stories when a block isn't being corrected.
     logger.info("reconcile: scanned %d candidate(s) — %d restored, %d reverted, "
-                "%d review, %d deferred (settle=%dh)",
-                n_candidates, n_restore, n_revert, n_review, n_deferred,
+                "%d review, %d deferred, %d band-relabelled (settle=%dh)",
+                n_candidates, n_restore, n_revert, n_review, n_deferred, n_band,
                 int(_RECONCILE_SETTLE_HOURS))
     return {"restored": n_restore, "reverted": n_revert, "review": n_review,
-            "deferred": n_deferred}
+            "deferred": n_deferred, "band_relabelled": n_band}
 
 
 async def resolve_history_gaps(now=None, meter_id: str = "electricity_main",

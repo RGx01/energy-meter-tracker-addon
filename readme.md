@@ -22,6 +22,13 @@
 [aarch64-shield]: https://img.shields.io/badge/aarch64-yes-green.svg
 [amd64-shield]: https://img.shields.io/badge/amd64-yes-green.svg
 
+>  ⚠️ **Upgrade notice — v5.0.0 will not support pre‑v4.4.0 databases.**
+>  v4.4.0 moves pricing to the priced‑segment model and migrates your history **once** on first run.
+>  From **v5.0.0** the one‑time legacy migrations are removed, so a database that has **not** already
+>  been opened by **v4.4.x** cannot be upgraded directly. **If you are on a version older than 4.4.0,
+>  upgrade *through* 4.4.x first** (let it finish migrating — a one‑time background pass), *then* move to
+>  5.0.0. Already on 4.4.0+? Nothing to do.
+
 A Home Assistant add-on that records your electricity usage in precise configurable intervals — matching your energy supplier's meter reconciliation period for accurate billing.
 
 <table>

@@ -459,3 +459,94 @@ unchanged, touched zero historical slots.
 **Still to observe on prod_dev:** a genuine bump (completed-without-started) hitting
 the `review` branch, and confirmation the reconciliation log reads correctly
 against the real Octopus bill across several charges before promotion to main.
+
+
+---
+
+## 14. FIRST OBSERVED BUMP — the completed-only ambiguity resolved (2026-08-23, prod)
+
+The long-open item (§12 *"still no directly observed bump"*; §13 *"Still to observe: a genuine
+bump"*) is **closed**. On **2026-08-23** a manual **Zappi Fast** bump during a Free Electricity
+hour (11:00–12:00 BST = 10:00 & 10:30 UTC, 5.72 kWh) was captured on prod. It exercised the
+`completed-only → off-peak` branch and mispriced both blocks off-peak (£0.05493) where they
+should read **peak** (£0.32309) — Octopus bills a bump at peak and credits the free hour to the
+account balance *separately*.
+
+**What the capture confirmed:**
+- **`started`-capture works.** The bump slots are `planned=0, started=0, completed=1`; the same
+  night's real smart charges (03:00/03:30/04:30) are `planned=1, started=1, completed=1`. So
+  `started` correctly did **not** fire for the bump — §11.2 holds.
+- **The mislabel was the reconcile, not capture.** Both blocks carry `rate_reconciled=1`: the
+  settlement pass *promoted* them off-peak via the completed-only branch.
+
+**The ambiguity the bump exposes.** §11.1 established `completed` cannot tell smart from bump.
+The reconcile's completed-only branch (§13; 4.4.0 pricing §3c) resolved that by assuming *no plan
+captured ⇒ EMT was offline ⇒ a smart charge we missed ⇒ off-peak*, explicitly accepting it "can
+over-credit a genuine offline bump." But a bump is completed-only **whether or not EMT was
+online** — Octopus never plans a bump. So `has_planned` is **not** a proxy for "were we online";
+it conflates two distinct situations:
+
+- **Offline / re-import** — EMT was down, so it never saw the plan of a *genuine smart charge*.
+  Optimistic off-peak is right.
+- **Online bump** — EMT was up and polling, and saw no plan because *there was none*. This is a
+  bump; off-peak is wrong.
+
+### 14a. The online-gate — `interpolated` distinguishes bump from missed-smart
+
+EMT already records its own downtime, so the two cases separate **without any new signal**:
+
+- A block EMT built live from real-time reads is `interpolated=0`, `source` NULL.
+- A block reconstructed after downtime (gap-fill) is `interpolated=1`; API/CSV backfill is
+  `source LIKE 'imported%'` (the reconcile already excludes `imported%`).
+
+So **a live block (`interpolated=0`, not imported) ⇒ EMT was online and polling dispatches for
+that slot.** A genuine smart charge is always *planned* (and, with permanent dispatch retention —
+§3d / pricing-doc, BL-35 — accumulated across polls), so it would have been caught; the only
+completed-only dispatch that appears *while EMT was watching* is an **out-of-app bump**. The
+reconcile decision (4.5.0):
+
+| completed-only slot | `was_online` (`interpolated=0`) | decision |
+|---|---|---|
+| live block | **True** | **peak** — out-of-app bump (confident; not `review`) |
+| gap / interpolated / imported | False | off-peak — genuine missed smart charge (§14/offline) |
+
+Implemented as `_reconcile_decision(..., was_online = not interpolated)`; the completed-only
+branch splits on `was_online`. **Confident enough to auto-revert** (not `review`) because a bump
+is unplanned *by construction*; an already-peak live bump is a no-op, so no spurious review
+flags. This fixes the observed Zappi case **and** the pure car-side **EV-integration** case,
+where no charge-mode sensor can ever exist — the mode sensors (Zappi Fast / Ohme Max / Hypervolt
+Boost) are optional confirmation only.
+
+**Scope — provisional/estimate only.** The reconcile promotes only provisional blocks; a settled
+block takes Octopus's authoritative API cost (peak for a bump). Prod confirms it: every *settled*
+completed-only orphan (14–22 Aug) is priced peak (`rate_reconciled=0`); only the *unsettled* 23rd
+was promoted. **Settlement remains the final authority**; the gate only corrects the
+pre-settlement estimate.
+
+**Contemporaneity guard (4.5.0 fix).** Observed on prod_dev (12 Aug): a genuine evening smart
+charge lost its `planned`/`started` when the DB was **rebuilt** — those accumulate locally and
+Octopus serves neither historically — leaving completed-only, which the gate mis-flagged as a
+bump and reverted to peak. Fix: the bump verdict now also requires the `completed` dispatch to
+have been **first seen contemporaneously** (within 36h of the slot). A rebuild/re-import re-fetches
+`completed` days later, so `first_seen ≫ slot_start` → absence-of-`started` is **lost accumulation,
+not a bump** → the block keeps its optimistic off-peak (§11.3). This closes the common real-world
+case.
+
+**Residual edge (BL-37).** What the guard does *not* catch is the narrower live case: a block
+`interpolated=0`, the completed seen contemporaneously, yet the *dispatch poller specifically*
+missed heartbeats over that slot (meter/HA up, Kraken poll down) so a genuine smart charge's plan
+was never captured. That still prices peak and settlement corrects it — safe but slightly
+pessimistic. Closing it precisely wants a lightweight **dispatch-poll heartbeat log** so reconcile
+can see the poller had a gap and stay optimistic only then. Deferred: Kraken polling is dependable
+and settlement backstops it.
+
+
+---
+
+## 15. OHME plan-from-charger — read Ohme's own schedule (4.5.0, UNVALIDATED — BL-31)
+
+For a **charger-connected** Ohme IOG setup, Octopus does not author the plan — **Ohme does**, optimising to Octopus's tariff/target — so Octopus exposes no reliable `planned`/`started`, only completed-in-reverse (§11.4, §14a). The plan lives in Ohme's cloud, and its HA integration surfaces it: the **official** `sensor.<ohme>_slot_list` state is ``"HH:MM-HH:MM, ..."`` (local, merged half-hour slots — `ohmepy` `ChargeSlot.__str__`); the **dan-r** integration exposes the same as Planned Slots / Charge Slot Active with ISO datetimes.
+
+4.5.0 reads it: `_parse_ohme_slots` parses either shape into naive-UTC 30-min slot starts (HH:MM anchored to the nearest local date ±12h, midnight-safe, DST-aware; ISO used directly where present). Those are written as `dispatch_history` `planned` (`source='ohme_plan'`) in place of Octopus's unreliable superset, and a **sensor-verified** smart slot also records `started`. Effects: (a) the smart-charging card shows Ohme's **real forward plan**, not the superset (the "pointless card" for charger-connected Ohme users); (b) a verified OHME smart charge reconciles **off-peak** instead of `review` (kills the OHME review-churn); and (c) an OHME bump (not in Ohme's plan, no started) then falls to the online-gate → peak, consistent with the rest of the model.
+
+Guarded: only active when the `slot_list` sensor is detected AND parses non-empty (else the pre-existing superset behaviour is unchanged); OHME-only; non-fatal; richly logged. The **parser is unit-tested** (`tests/test_ohme_slot_list.py`), but the **end-to-end path is UNVALIDATED** — the author is on Zappi, so it ships flagged pending an Ohme tester. Settlement remains the final authority throughout.
