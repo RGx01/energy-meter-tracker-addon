@@ -1393,7 +1393,7 @@ def _ev_meter_id(cfg):
     'ev'/'charger' id), or None. Used for the coverage-based synthetic-EV gate."""
     for mid, md in ((cfg or {}).get("meters") or {}).items():
         meta = md.get("meta") or {}
-        if (meta.get("meter_type") == "ev_charger"
+        if (meta.get("meter_type") in ("ev", "ev_charger")   # BL-40: config UI writes 'ev'
                 or any(kw in str(mid).lower() for kw in ("ev", "charger"))):
             return mid
     return None
