@@ -21,6 +21,11 @@ We keep discovering a missing pair only when a user hits it in the field (the
 the "wrote 0" heal failure was a *different* seam issue on the same flow). The
 pairwise approach does not scale and is not auditable.
 
+### 1a. Real-world instances observed
+
+- **`float * NoneType` in device re-attribution (4.5.4)** — attribution ran PASS 2 over blocks a concurrent verify hadn't repriced yet.
+- **`GET /api/config` 500 (`'<' not supported between 'str' and 'NoneType'`), 26 Aug 2026 prod-dev** — config read on a Flask worker thread against the SQLite connection the engine was using under load; the cross-thread read returned a garbled row (a column as `None`) → a `None` dict key → jsonify key-sort crash. No data corruption; transient. Fixed for this endpoint by marshalling the read onto the engine loop. Key lesson: **BL-50 must serialise reads too, not just mutating jobs** — a write-job coordinator alone wouldn't have caught this.
+
 ## 2. Goal
 
 Replace the web of pairwise guards with a **single invariant**:
