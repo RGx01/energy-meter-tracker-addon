@@ -15,8 +15,7 @@ class TestRunExclusive(unittest.TestCase):
         def op(a, b=0):
             seen["held"] = engine._engine_loop_lock.locked()   # lock held while we run
             return a + b
-        out = asyncio.get_event_loop().run_until_complete(
-            engine.run_exclusive(op, 40, b=2))
+        out = asyncio.run(engine.run_exclusive(op, 40, b=2))
         self.assertEqual(out, 42)
         self.assertTrue(seen["held"])
         self.assertFalse(engine._engine_loop_lock.locked())    # released afterwards
@@ -34,13 +33,12 @@ class TestRunExclusive(unittest.TestCase):
             order.append("before-release")     # op must NOT have run yet
             engine._engine_loop_lock.release()
             await task
-        asyncio.get_event_loop().run_until_complete(scenario())
+        asyncio.run(scenario())
         self.assertEqual(order, ["before-release", "op"])
 
     def test_fallback_without_lock(self):
         engine._engine_loop_lock = None
-        out = asyncio.get_event_loop().run_until_complete(
-            engine.run_exclusive(lambda x: x * 2, 21))
+        out = asyncio.run(engine.run_exclusive(lambda x: x * 2, 21))
         self.assertEqual(out, 42)
 
 
