@@ -26,6 +26,7 @@ Design notes
 from __future__ import annotations
 
 import logging
+import asyncio
 from typing import Optional
 
 from kraken_ingester import normalise_to_naive_utc
@@ -230,6 +231,48 @@ class RateSchedule:
         return cls(periods, exc_periods or None)
 
 
+def _build_schedule_and_diag(records, product_code, tariff_code):
+    """CPU-bound: build the RateSchedule from API records and log diagnostics.
+
+    Runs in a worker thread (via run_in_executor) so a long half-hourly tariff
+    history — Agile is ~34k periods over a couple of years — can't run inline on
+    the engine event loop during a rate refresh / first-time connect and stall
+    the HA WebSocket heartbeat (the observed PONG timeout → setup "Could not
+    connect" timeout). Pure CPU, no awaits, safe off-loop. For a large schedule
+    the per-period distinct/date-span walk (O(n) + a multi-KB log line) is capped
+    to a count, keeping both the CPU and the log cheap.
+    """
+    sched = RateSchedule.from_api_records(records)
+    try:
+        _p = sched._periods
+        n = len(_p)
+        _first = [(x[0], x[1], round(x[2], 4)) for x in _p[:3]]
+        _last = [(x[0], x[1], round(x[2], 4)) for x in _p[-3:]]
+        if n > 2000:
+            logger.info("build_rate_schedule: %s/%s \u2192 %d periods (large; diag capped)",
+                        product_code, tariff_code, n)
+            logger.info("build_rate_schedule: FIRST=%s LAST=%s", _first, _last)
+        else:
+            _vals = sorted({round(x[2], 4) for x in _p})
+            _span = {}
+            for vf, vt, rate in _p:
+                k = round(rate, 4)
+                if k not in _span:
+                    _span[k] = [vf, vf]
+                else:
+                    _span[k][1] = vf
+            _span_s = {k: (v[0][:10], v[1][:10]) for k, v in _span.items()}
+            logger.info("build_rate_schedule: %s/%s \u2192 %d periods, distinct=%s",
+                        product_code, tariff_code, n, _vals)
+            logger.info("build_rate_schedule: FIRST=%s LAST=%s", _first, _last)
+            logger.info("build_rate_schedule: rate date-span (earliest..latest "
+                        "valid_from per rate)=%s", _span_s)
+    except Exception as _de:
+        logger.info("build_rate_schedule: %s/%s \u2192 %d periods (diag failed: %s)",
+                    product_code, tariff_code, len(sched), _de)
+    return sched
+
+
 async def build_rate_schedule(
     client, product_code: str, tariff_code: str,
     *, period_from: Optional[str] = None, period_to: Optional[str] = None,
@@ -291,33 +334,12 @@ async def build_rate_schedule(
                     f"day/night rate fetch failed for {product_code}/"
                     f"{tariff_code}: {e}"
                 ) from e
-    sched = RateSchedule.from_api_records(records)
-    # Diagnostic: surface DISTINCT rate values, plus the FIRST and LAST few
-    # periods and the date-span each distinct rate covers. This reveals whether
-    # the CURRENT off-peak rate has daily windows reaching "now" or is orphaned
-    # in stale early periods (the IOG flat-overnight bug).
-    try:
-        _p = sched._periods
-        _vals = sorted({round(x[2], 4) for x in _p})
-        _first = [(x[0], x[1], round(x[2], 4)) for x in _p[:3]]
-        _last = [(x[0], x[1], round(x[2], 4)) for x in _p[-3:]]
-        # For each distinct rate, the earliest valid_from and latest valid_from
-        _span = {}
-        for vf, vt, rate in _p:
-            k = round(rate, 4)
-            if k not in _span:
-                _span[k] = [vf, vf]
-            else:
-                _span[k][1] = vf
-        _span_s = {k: (v[0][:10], v[1][:10]) for k, v in _span.items()}
-        logger.info("build_rate_schedule: %s/%s → %d periods, distinct=%s",
-                    product_code, tariff_code, len(sched), _vals)
-        logger.info("build_rate_schedule: FIRST=%s LAST=%s", _first, _last)
-        logger.info("build_rate_schedule: rate date-span (earliest..latest "
-                    "valid_from per rate)=%s", _span_s)
-    except Exception as _de:
-        logger.info("build_rate_schedule: %s/%s → %d periods (diag failed: %s)",
-                    product_code, tariff_code, len(sched), _de)
+    # 4.5.3-A: build the schedule + diagnostics OFF the event loop. Both are pure
+    # CPU and O(number of periods); a long half-hourly history (Agile ~34k periods)
+    # would otherwise stall the engine loop / HA WebSocket heartbeat here during a
+    # rate refresh or first-time connect (the reported setup timeout).
+    sched = await asyncio.get_event_loop().run_in_executor(
+        None, _build_schedule_and_diag, records, product_code, tariff_code)
     return sched
 
 
