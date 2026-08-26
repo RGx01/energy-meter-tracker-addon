@@ -1852,6 +1852,15 @@ def api_meter_delete_data(meter_id: str):
     Returns: { deleted: {blocks, sub_meter_history, current_reads}, ok: true }
     """
     try:
+        # 4.5.3 (BL-46 pending): device delete is TEMPORARILY DISABLED. The delete
+        # removes the device's blocks/segments but does NOT recompute the parent
+        # meter's house/EV split (imp_kwh_remainder is left stale), corrupting
+        # Usage Stats and Billing. Refuse until the recompute-on-delete fix lands.
+        return jsonify({"ok": False,
+                        "error": "Deleting a device is temporarily disabled pending a "
+                                 "split-recalculation fix \u2014 re-enabling in a coming "
+                                 "release. Use Retire to stop a device without deleting "
+                                 "its history."}), 409
         store    = _get_store()
         payload  = request.get_json(force=True) or {}
         new_cfg  = payload.get("config")
