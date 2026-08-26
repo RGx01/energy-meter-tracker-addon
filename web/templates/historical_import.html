@@ -866,6 +866,7 @@ var _lastImportStatus = 'idle';  // last status seen, so we know if a live run i
 var _pollExpectUntil = 0;        // while > now, a just-started job may not have flipped to 'running' yet
 var _expectingJob = false;       // set on kickoff; stays true until the job is first seen active (survives a slow pre-import backup)
 var _expectStartedAt = 0;        // safety: stop expecting after a bounded wait even if nothing appears
+var _lastActiveAt = 0;           // last time EITHER the import OR a verify looked active — bridges phase gaps so the poll doesn't die between import→recovery→verify
 var _freshFlow = false;          // user picked a source to start fresh → suppress the previous run's panels until a new job is kicked off
 var _importActive = false, _verifyActive = false;   // live server-side job state → drives the start lock
 var _prevImportActive = false;   // to detect the import→verify handoff
@@ -993,6 +994,7 @@ function pollStatus(expectStart){
       if(!_verifyTimer) _verifyTimer = setTimeout(loadPricingHealth, 1500); }
     _prevImportActive = nowActive;
     _importActive = nowActive;                       // feed the start lock
+    if(nowActive) _lastActiveAt = Date.now();
     var _lbl = document.getElementById('api-confirm-label');
     if(_lbl) _lbl.style.display = nowActive ? 'none' : '';   // don't show an unchecked 'arm' box next to a running job
     _importChecked = true;
@@ -1043,6 +1045,12 @@ function pollStatus(expectStart){
     } else {
       if(_health) _health.style.display = '';
       loadImportGaps(); loadPricingHealth();          // refresh once it settles
+      // The job's verify/recovery tail outlives the import-write phase; keep
+      // polling while a verify is active or activity was recent, so the banner
+      // and health panel track the tail instead of freezing on a stale 'done'.
+      if(_verifyActive || _settling || (Date.now() - _lastActiveAt < 90000)){
+        _statusTimer = setTimeout(pollStatus, 4000);
+      }
     }
   }).catch(function(){
     // A transient error mid-startup shouldn't abandon the wait.
@@ -1272,9 +1280,11 @@ function loadPricingHealth(){
     el.innerHTML = '<div style="border:1px solid var(--border);border-radius:8px;padding:12px 14px;">'
       + inner + '</div>';
 
+    if(vActive) _lastActiveAt = Date.now();
     if(_verifyTimer){ clearTimeout(_verifyTimer); _verifyTimer = null; }
     if(vActive){ _verifyWatchUntil = 0; _verifyTimer = setTimeout(loadPricingHealth, 4000); }  // #391: caught it — hand off to the verify poll
     else if(Date.now() < _verifyWatchUntil){ _verifyTimer = setTimeout(loadPricingHealth, 2000); }  // #391: still watching for the verify to start
+    else if(_importActive || _settling || (Date.now() - _lastActiveAt < 90000)){ _verifyTimer = setTimeout(loadPricingHealth, 5000); }  // job still has a tail → keep watching for a later verify phase
   }).catch(function(){});
 }
 // Back-compat aliases (older call sites / post-action refreshes).
