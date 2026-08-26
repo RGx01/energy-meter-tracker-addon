@@ -119,6 +119,7 @@ _read_queue:               list         = []
 _last_known_sensor_values: dict         = {}
 _engine_loop_lock:         asyncio.Lock = None   # initialised in setup()
 _engine_paused:            bool         = False
+_pass2_quiet:              bool         = False   # suppress per-block PASS 2 INFO logs during bulk recompute
 _last_ci_fetch:            datetime | None = None   # UTC — last carbon intensity fetch
 _last_dispatch_capture:    datetime | None = None   # UTC — last dispatch-slot capture (5-min cadence)
 _last_reconcile:           datetime | None = None   # UTC — last dispatch reconciliation (hourly cadence)
@@ -980,6 +981,28 @@ def resume_engine():
     global _engine_paused
     _engine_paused = False
     logger.info("engine: resumed")
+
+
+async def run_exclusive(fn, *args, **kwargs):
+    """BL-46/BL-48: run a blocking DB op on the engine loop while holding the tick
+    lock, so it can't overlap an in-flight capture/finalise tick. The store is a
+    single SQLite connection shared across the web + engine threads; pausing the
+    engine only stops the NEXT tick, not one already running, so a delete/recompute
+    fired on a block boundary could otherwise touch the connection concurrently with
+    a finalise (logical race + the two-threads-one-connection segfault the restore
+    path already guards against). Acquiring _engine_loop_lock here drains any
+    in-flight tick and blocks the next one, giving the op exclusive DB access.
+    Caller must pause_engine() and drain any running import first. Falls back to a
+    direct call when the loop lock isn't set up (no engine — nothing to race)."""
+    if _engine_loop_lock is None:
+        return fn(*args, **kwargs)
+    import functools as _ft
+    async with _engine_loop_lock:
+        # Run in an executor, not inline: a heavy fn run directly on the loop thread
+        # would freeze the loop (HA websocket drops, request queue backs up). Holding
+        # the lock still serialises against the tick; the executor keeps the loop live.
+        return await asyncio.get_event_loop().run_in_executor(
+            None, _ft.partial(fn, *args, **kwargs))
 
 
 def reset_store():
@@ -2183,6 +2206,26 @@ def _schedule_chart_regen() -> None:
 # Block finalise
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _import_rate_or_fallback(block_start: str, meter_id: str, imp_ch: dict) -> float:
+    """Resolve an import block's unit rate when the legacy `imp_rate` column is NULL —
+    which happens transiently while a gap-fill's verify pass hasn't yet repriced the
+    range. Prefer the priced `block_segments` (the source of truth; kWh-weighted inc
+    rate), else derive cost/kWh, else 0.0 (genuinely unpriced). Never returns None, so
+    `kwh * rate` in PASS 2 can't raise `float * NoneType` during device re-attribution."""
+    try:
+        segs = get_store().get_block_segments(block_start, meter_id, "import") or []
+        tot = sum((sg.get("kwh") or 0.0) for sg in segs)
+        if tot > 0:
+            return sum((sg.get("kwh") or 0.0) * (sg.get("inc_rate") or 0.0) for sg in segs) / tot
+    except Exception:
+        pass
+    k = imp_ch.get("kwh") or 0.0
+    c = imp_ch.get("cost")
+    if c is not None and k > 0:
+        return c / k
+    return 0.0
+
+
 def _apply_pass2(block: dict) -> None:
     """
     PASS 2 — grid-authoritative sub-meter distribution.
@@ -2211,8 +2254,15 @@ def _apply_pass2(block: dict) -> None:
         if not parent_import:
             continue
 
-        grid_kwh       = parent_import.get("kwh", 0.0)
-        parent_rate    = parent_import.get("rate", 0.0)
+        grid_kwh       = parent_import.get("kwh") or 0.0
+        # Legacy `imp_rate` can be NULL (block imported but its verify reprice hasn't
+        # landed yet — device re-attribution over a fresh gap fill hits this). Resolve
+        # from segments / cost-per-kWh so `claimed * parent_rate` never sees None, and
+        # the device is costed at the real rate rather than crashing or zeroing.
+        parent_rate    = parent_import.get("rate")
+        if parent_rate is None:
+            parent_rate = _import_rate_or_fallback(block.get("start", ""),
+                                                   parent_meter_name, parent_import)
         grid_remaining = grid_kwh
         # BL-19: is the main's grid import authoritative? A DCC-settled main
         # (imp_kwh_api present) is the true grid boundary for the block, so the
@@ -2353,7 +2403,7 @@ def _apply_pass2(block: dict) -> None:
             # rate source.
             entry["sub_import"]["rate"]        = parent_rate
             entry["sub_import"]["cost"]        = round(claimed * parent_rate, 6)
-            logger.info(
+            if not _pass2_quiet: logger.info(
                 "PASS 2: %s protected  grid=%.4f  battery=%.4f",
                 entry["meter_name"], claimed, entry["sub_import"]["kwh_battery"],
             )
@@ -2384,7 +2434,7 @@ def _apply_pass2(block: dict) -> None:
             entry["sub_import"]["kwh_battery"] = battery
             entry["sub_import"]["rate"]        = parent_rate
             entry["sub_import"]["cost"]        = round(claimed * parent_rate, 6)
-            logger.info(
+            if not _pass2_quiet: logger.info(
                 "PASS 2: %s unprotected  grid=%.4f  battery=%.4f",
                 entry["meter_name"], claimed, battery,
             )
@@ -2417,7 +2467,7 @@ def _apply_pass2(block: dict) -> None:
         parent_import["kwh_remainder"]  = remainder_kwh
         parent_import["cost_remainder"] = remainder_cost
         parent_import["rate_used"]      = parent_rate
-        logger.info(
+        if not _pass2_quiet: logger.info(
             "PASS 2: %s  grid=%.4f kWh  remainder=%.4f kWh",
             parent_meter_name, grid_kwh, remainder_kwh,
         )
@@ -2754,6 +2804,9 @@ def recompute_remainders_for_window(parent_meter_id: str, utc_start: str,
     """
     if not parent_meter_id:
         return 0
+    global _pass2_quiet
+    _prev_quiet = _pass2_quiet
+    _pass2_quiet = True          # a whole-history delete can hit tens of thousands of blocks
     store = get_store()
     starts = [r["block_start"] for r in store._conn.execute(
         "SELECT DISTINCT block_start FROM blocks "
@@ -2776,8 +2829,14 @@ def recompute_remainders_for_window(parent_meter_id: str, utc_start: str,
             if pm:
                 pic = (pm.get("channels") or {}).get("import")
                 if pic is not None:
-                    pic["kwh_remainder"]  = pic.get("kwh")
-                    pic["cost_remainder"] = pic.get("cost")
+                    # BL-46: subtract the dispatch EV (imp_kwh_ev) too, so a device
+                    # delete re-derives the house remainder as grid - EV - surviving
+                    # subs. Without this the EV energy folds into the house line and
+                    # imp_kwh_remainder reads wrong after a delete (dev: kwh/2).
+                    _ev_k = pic.get("kwh_ev") or 0.0
+                    _ev_c = pic.get("cost_ev") or 0.0
+                    pic["kwh_remainder"]  = max((pic.get("kwh") or 0.0) - _ev_k, 0.0)
+                    pic["cost_remainder"] = (pic.get("cost") or 0.0) - _ev_c
             _apply_pass2(block)
             _recompute_pass3_totals(block)
             _recompute_block_carbon(block)
@@ -2786,6 +2845,7 @@ def recompute_remainders_for_window(parent_meter_id: str, utc_start: str,
         except Exception as e:
             logger.error(
                 "recompute_remainders_for_window: block %s failed: %s", bs, e)
+    _pass2_quiet = _prev_quiet
     if done:
         try:
             generate_charts(store)
@@ -3152,19 +3212,31 @@ async def run_attribution_job(device_meter_id: str, sensor_ids: list, *,
         # gap), and we stop walking at the seam rather than running to 'now'.
         # When the device has no live history yet (never configured), seam is None
         # and we fill the full available range.
+        # BL-49: the seam (device's first live block) is kept for diagnostics only —
+        # it must NOT be a blanket cutoff. Filtering to `< seam` made attribution skip
+        # the entire live region, so a gap deleted after the device started recording
+        # (a delete-data + re-attribute heal, or BL-47 gap-fill) could never be
+        # refilled — it wrote 0. The per-block guard in _write_device_into_block already
+        # protects live data: it fills only an ABSENT row or a zero-hole and never
+        # overwrites a real non-zero device reading. So we walk the full recorded range
+        # and let that guard decide, healing mid/late holes too without clobbering live.
         seam = get_store().get_device_live_coverage_start(device_meter_id)
-        if seam:
-            seam_cmp = _naive_iso(seam)
-            hours = [h for h in hours if _naive_iso(h) < seam_cmp]
         j["seam"] = seam
         bm = int(get_block_minutes() or 30)
         j.update({"phase": "attributing", "total_hours": len(hours)})
         written = skipped = gaps = 0
+        global _pass2_quiet
+        _prev_p2q = _pass2_quiet
+        _pass2_quiet = True          # bulk attribution writes thousands of blocks — suppress the per-block PASS 2 INFO churn
         for i, hour in enumerate(hours):
             if j.get("control") == "cancel":
                 j["status"] = "cancelled"
                 break
-            while j.get("control") == "pause" or delete_in_progress():
+            # Wait out a running import OR verify too: both write the pricing the
+            # attribution reads, and attributing over a not-yet-verified (imp_rate
+            # NULL) block used to crash PASS 2 and could cost the device at 0.
+            while (j.get("control") == "pause" or delete_in_progress()
+                   or api_import_running() or _verify_running()):
                 j["status"] = "paused"
                 await _aio.sleep(1.0)
                 if j.get("control") == "cancel":
@@ -3180,6 +3252,7 @@ async def run_attribution_job(device_meter_id: str, sensor_ids: list, *,
                 j.update({"written": written, "skipped": skipped, "gaps": gaps,
                           "done_hours": i})
                 await _aio.sleep(pace_s)        # yield to the live tick / drain
+        _pass2_quiet = _prev_p2q
         j.update({"written": written, "skipped": skipped, "gaps": gaps,
                   "done_hours": len(hours)})
         if written:
@@ -3209,6 +3282,8 @@ async def run_attribution_job(device_meter_id: str, sensor_ids: list, *,
         logger.warning("run_attribution_job failed: %s", e)
         j.update({"status": "error", "error": str(e)})
         return {"ok": False, "error": str(e)}
+    finally:
+        _pass2_quiet = False          # never leave bulk-suppression on after the job
 
 
 def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricity_main",
@@ -8559,6 +8634,13 @@ def _persist_verify_summary(j: dict) -> None:
         }))
     except Exception as e:
         logger.warning("verify pricing: persist summary failed: %s", e)
+
+
+def _verify_running() -> bool:
+    """A deferred pricing-verification pass is actively repricing (running/waiting/
+    paused). Device attribution must wait for it — it backfills the legacy imp_rate
+    the attribution reads."""
+    return _verify_job.get("status") in ("running", "waiting", "paused")
 
 
 def api_verify_pricing_status() -> dict:

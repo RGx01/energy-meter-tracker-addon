@@ -1846,86 +1846,160 @@ def api_meter_main_reset():
 @app.route("/api/meter/<meter_id>/delete-data", methods=["POST"])
 def api_meter_delete_data(meter_id: str):
     """
-    Atomically remove a meter from config AND delete all its data.
+    Atomically remove a meter from config AND delete all its data, then re-derive
+    the parent meter's house/EV split (BL-46). The DB work runs serialized against
+    the engine tick (BL-48) so it can't overlap an in-flight block finalise on the
+    shared SQLite connection.
     Body: { config: <full config object> }
-    Both operations run in a single DB transaction — all-or-nothing.
-    Returns: { deleted: {blocks, sub_meter_history, current_reads}, ok: true }
+    Returns: { deleted: {...}, ok: true }
     """
     try:
         store    = _get_store()
         payload  = request.get_json(force=True) or {}
-        new_cfg  = payload.get("config")
-        deleted  = {}
+        new_cfg  = payload.get("config")          # read on THIS (web) thread — request is thread-local
 
-        # Pause engine before modifying DB — prevents mid-tick inconsistency
+        import engine as _eng_d
+
+        # Pause the engine tick. NB: pause only stops the NEXT tick — a tick already
+        # running (e.g. a boundary finalise) keeps going, and the API import writes on
+        # the engine loop too. Both share this one SQLite connection, so we must also
+        # (a) drain a running import and (b) run the delete under the tick lock below,
+        # or a delete fired on a block boundary races a finalise (logical corruption +
+        # the two-threads-one-connection segfault the restore path already guards).
         try:
-            import engine as _eng_d
             _eng_d.pause_engine()
         except Exception:
             pass
 
-        with store._conn:
-            # 1. Delete all data for this meter
-            cur = store._conn.execute(
-                "DELETE FROM blocks WHERE meter_id = ?", (meter_id,)
-            )
-            deleted["blocks"] = cur.rowcount
+        # (a) Drain any running API import before touching the DB (mirrors the restore
+        # path). If it won't stop, abort rather than risk a concurrent writer.
+        try:
+            if getattr(_eng_d, "api_import_running", None) and _eng_d.api_import_running():
+                try: _eng_d.api_import_control("cancel")
+                except Exception: pass
+                import time as _t_d
+                _stopped = False
+                for _ in range(120):                      # up to ~60s
+                    if not _eng_d.api_import_running():
+                        _stopped = True
+                        break
+                    _t_d.sleep(0.5)
+                if not _stopped:
+                    try: _eng_d.resume_engine()
+                    except Exception: pass
+                    return jsonify({"error": "An import was still finishing — delete "
+                                    "aborted. Try again in a moment."}), 409
+        except Exception as _ie:
+            logger.warning("api_meter_delete_data: import-drain check failed: %s", _ie)
 
-            # P3.1: block_segments keyed by block_start (no block_id FK) → not
-            # cascade-cleaned; remove this meter's segments so none are orphaned.
-            cur = store._conn.execute(
-                "DELETE FROM block_segments WHERE meter_id = ?", (meter_id,)
-            )
-            deleted["block_segments"] = cur.rowcount
+        # The whole DB mutation (capture window → delete → EV-aware parent recompute)
+        # as one callable, run with exclusive DB access. Uses `store`/`new_cfg`/`meter_id`
+        # from the closure — never `request` (not valid off the web thread).
+        def _do_delete_and_recompute():
+            deleted = {}
 
-            cur = store._conn.execute(
-                "DELETE FROM sub_meter_history WHERE meter_id = ?", (meter_id,)
-            )
-            deleted["sub_meter_history"] = cur.rowcount
-
-            cur = store._conn.execute(
-                "DELETE FROM current_reads WHERE meter_id = ?", (meter_id,)
-            )
-            deleted["current_reads"] = cur.rowcount
-
-            # Remove from current_block JSON if present
+            # BL-46: capture the deleted device's parent + block window BEFORE deleting.
+            _bl46_parent = _bl46_lo = _bl46_hi = None
             try:
-                cb_row = store._conn.execute(
-                    "SELECT id, last_checkpoint FROM current_block WHERE id = 1"
-                ).fetchone()
-                if cb_row and cb_row["last_checkpoint"]:
-                    import json as _json
-                    cb = _json.loads(cb_row["last_checkpoint"])
-                    if meter_id in (cb.get("meters") or {}):
-                        del cb["meters"][meter_id]
-                        store._conn.execute(
-                            "UPDATE current_block SET last_checkpoint = ? WHERE id = 1",
-                            (_json.dumps(cb),)
-                        )
-                        deleted["current_block"] = 1
+                _pr = store._conn.execute(
+                    "SELECT parent_meter_id FROM meters WHERE meter_id = ?", (meter_id,)).fetchone()
+                _bl46_parent = ((_pr["parent_meter_id"] if _pr else None) or "electricity_main")
+                _rng = store._conn.execute(
+                    "SELECT MIN(block_start) lo, MAX(block_start) hi FROM blocks WHERE meter_id = ?",
+                    (meter_id,)).fetchone()
+                if _rng:
+                    _bl46_lo, _bl46_hi = _rng["lo"], _rng["hi"]
             except Exception:
                 pass
 
-            # 2. Save updated config (meter removed) in same transaction
-            # Must delete existing meter rows first — _write_meters only upserts,
-            # it won't remove meters that are no longer in the config.
-            if new_cfg:
-                period_id = store.get_current_config_period_id()
-                old_meter_ids = [r["id"] for r in store._conn.execute(
-                    "SELECT id FROM meters WHERE config_period_id=?", (period_id,)
-                ).fetchall()]
-                for old_mid in old_meter_ids:
-                    store._conn.execute(
-                        "DELETE FROM meter_channels WHERE meter_id=?", (old_mid,)
-                    )
-                store._conn.execute(
-                    "DELETE FROM meters WHERE config_period_id=?", (period_id,)
-                )
-                store._write_meters(new_cfg, period_id)
+            with store._conn:
+                # 1. Delete all data for this meter
+                cur = store._conn.execute("DELETE FROM blocks WHERE meter_id = ?", (meter_id,))
+                deleted["blocks"] = cur.rowcount
 
-        logger.info("api_meter_delete_data: deleted %s for meter %s", deleted, meter_id)
+                # P3.1: block_segments keyed by block_start (no block_id FK) → not
+                # cascade-cleaned; remove this meter's segments so none are orphaned.
+                cur = store._conn.execute("DELETE FROM block_segments WHERE meter_id = ?", (meter_id,))
+                deleted["block_segments"] = cur.rowcount
 
-        # Restart engine to pick up config change
+                cur = store._conn.execute("DELETE FROM sub_meter_history WHERE meter_id = ?", (meter_id,))
+                deleted["sub_meter_history"] = cur.rowcount
+
+                cur = store._conn.execute("DELETE FROM current_reads WHERE meter_id = ?", (meter_id,))
+                deleted["current_reads"] = cur.rowcount
+
+                # Remove from current_block JSON if present
+                try:
+                    cb_row = store._conn.execute(
+                        "SELECT id, last_checkpoint FROM current_block WHERE id = 1").fetchone()
+                    if cb_row and cb_row["last_checkpoint"]:
+                        import json as _json
+                        cb = _json.loads(cb_row["last_checkpoint"])
+                        if meter_id in (cb.get("meters") or {}):
+                            del cb["meters"][meter_id]
+                            store._conn.execute(
+                                "UPDATE current_block SET last_checkpoint = ? WHERE id = 1",
+                                (_json.dumps(cb),))
+                            deleted["current_block"] = 1
+                except Exception:
+                    pass
+
+                # 2. Save updated config (meter removed) in the same transaction.
+                if new_cfg:
+                    period_id = store.get_current_config_period_id()
+                    old_meter_ids = [r["id"] for r in store._conn.execute(
+                        "SELECT id FROM meters WHERE config_period_id=?", (period_id,)).fetchall()]
+                    for old_mid in old_meter_ids:
+                        store._conn.execute("DELETE FROM meter_channels WHERE meter_id=?", (old_mid,))
+                    store._conn.execute("DELETE FROM meters WHERE config_period_id=?", (period_id,))
+                    store._write_meters(new_cfg, period_id)
+
+            logger.info("api_meter_delete_data: deleted %s for meter %s", deleted, meter_id)
+
+            # BL-46: re-derive the parent's house/EV remainder over the deleted window
+            # (EV-aware recompute; keeps imp_kwh_remainder consistent with the segments).
+            try:
+                if _bl46_parent and _bl46_lo and _bl46_hi:
+                    from datetime import datetime as _dt46, timedelta as _td46
+                    try:
+                        _hi_excl = (_dt46.fromisoformat(_bl46_hi)
+                                    + _td46(minutes=int(_eng_d.get_block_minutes() or 30))).isoformat()
+                    except Exception:
+                        _hi_excl = _bl46_hi
+                    _n46 = _eng_d.recompute_remainders_for_window(_bl46_parent, _bl46_lo, _hi_excl)
+                    logger.info("api_meter_delete_data: recomputed %s parent block(s) after removing %s",
+                                _n46, meter_id)
+            except Exception as _re46:
+                logger.warning("api_meter_delete_data: parent recompute failed: %s", _re46)
+
+            return deleted
+
+        # (b) Drain any in-flight tick, then run the work on THIS (web) thread.
+        # A no-op run under the tick lock waits for the current tick to finish; the
+        # engine is paused, so no NEW tick does DB work (it returns at the pause check
+        # before touching the connection). With the in-flight tick drained and new ones
+        # inert, the web thread has the SQLite connection to itself. We deliberately do
+        # NOT run the recompute on the engine loop — a whole-history device delete can
+        # touch tens of thousands of blocks and take minutes; on the loop that would
+        # freeze HA comms and blow the request timeout (observed: WS reconnect storm +
+        # queue backlog + a spurious empty-message 500 while the job actually finished).
+        if _event_loop and _event_loop.is_running():
+            try:
+                import asyncio as _asyncio
+                _asyncio.run_coroutine_threadsafe(
+                    _eng_d.run_exclusive(lambda: None), _event_loop).result(timeout=30)
+            except Exception as _de:
+                logger.warning("api_meter_delete_data: tick-drain barrier failed: %s", _de)
+        deleted = _do_delete_and_recompute()
+
+        # Data is committed & consistent → clear the pause so the tick runs again.
+        # (engine_startup does NOT resume on its own — every pause caller must.)
+        try:
+            _eng_d.resume_engine()
+        except Exception:
+            pass
+
+        # Restart engine to pick up the config change.
         try:
             import asyncio as _asyncio
             from engine import engine_startup as _engine_startup_d
@@ -1935,13 +2009,18 @@ def api_meter_delete_data(meter_id: str):
             pass
 
         # Regenerate the pre-built charts so the removed meter's data disappears
-        # immediately, rather than after the next block finalises (same regen gap
-        # as the corrections and restore paths).
+        # immediately, rather than after the next block finalises.
         _regen_charts_safely()
 
         return jsonify({"ok": True, "deleted": deleted, "meter_id": meter_id})
     except Exception as e:
         logger.error("api_meter_delete_data: %s", e)
+        # Best-effort: never leave the engine paused on an error path.
+        try:
+            import engine as _eng_e
+            _eng_e.resume_engine()
+        except Exception:
+            pass
         return jsonify({"error": str(e)}), 500
 
 
@@ -2827,7 +2906,23 @@ def api_entities():
 
 @app.route("/api/config", methods=["GET"])
 def api_get_config():
-    return jsonify(load_config())
+    # Read the config on the engine loop (single-threaded owner of the engine's SQLite
+    # connection), NOT the Flask request thread. Concurrent web requests otherwise use
+    # one connection cross-thread, and a garbled read under load can surface a column as
+    # None -> a None dict key -> jsonify's key-sort crashes
+    # (`'<' not supported between 'str' and 'NoneType'`). Mirrors _regen_charts_safely.
+    try:
+        if _event_loop is not None and _event_loop.is_running():
+            import asyncio as _a, engine as _eng_c
+            async def _load():
+                return _eng_c.load_config()
+            cfg = _a.run_coroutine_threadsafe(_load(), _event_loop).result(timeout=15)
+        else:
+            cfg = load_config()
+    except Exception as e:
+        logger.warning("api_get_config: loop-serialised load failed (%s) — inline fallback", e)
+        cfg = load_config()
+    return jsonify(cfg)
 
 
 @app.route("/api/config/history")

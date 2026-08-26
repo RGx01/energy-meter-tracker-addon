@@ -109,7 +109,7 @@
         </div>
         <div id="site-plan-rows"></div>
       </div>
-      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:8px;cursor:pointer;">
+      <label id="api-confirm-label" style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:8px;cursor:pointer;">
         <input type="checkbox" id="api-confirm" onchange="document.getElementById('btn-api-start').disabled=!this.checked;">
         Import these blocks (a backup is taken first). Runs in the background — you can
         leave this page; pause, resume or cancel any time.
@@ -864,6 +864,9 @@ var _statusTimer = null;
 var _apiTermHandled = false;   // guards against an accidental repeat run after completion
 var _lastImportStatus = 'idle';  // last status seen, so we know if a live run is in flight
 var _pollExpectUntil = 0;        // while > now, a just-started job may not have flipped to 'running' yet
+var _expectingJob = false;       // set on kickoff; stays true until the job is first seen active (survives a slow pre-import backup)
+var _expectStartedAt = 0;        // safety: stop expecting after a bounded wait even if nothing appears
+var _lastActiveAt = 0;           // last time EITHER the import OR a verify looked active — bridges phase gaps so the poll doesn't die between import→recovery→verify
 var _freshFlow = false;          // user picked a source to start fresh → suppress the previous run's panels until a new job is kicked off
 var _importActive = false, _verifyActive = false;   // live server-side job state → drives the start lock
 var _prevImportActive = false;   // to detect the import→verify handoff
@@ -961,6 +964,7 @@ function pollStatus(expectStart){
   if(expectStart){
     // A new job is being kicked off in THIS flow → panels are allowed again.
     _freshFlow = false;
+    _expectingJob = true; _expectStartedAt = Date.now();
     _pollExpectUntil = Date.now() + 12000;
     var _r0 = document.getElementById('api-apply-row'); if(_r0) _r0.style.display = 'block';
     var _s0 = document.getElementById('api-apply-status'); if(_s0) _s0.textContent = 'Starting…';
@@ -975,15 +979,24 @@ function pollStatus(expectStart){
     // no job behind it and no way to cancel. (Un-sticks anyone already frozen.)
     var active = !d.persisted && (status==='running' || status==='paused'
       || status==='rate_limited' || status==='finalising');
-    if(active) _pollExpectUntil = 0;                 // the job has appeared; stop waiting
-    var awaiting = !active && (Date.now() < _pollExpectUntil);
+    if(active){ _pollExpectUntil = 0; _expectingJob = false; }   // the job has appeared; stop waiting
+    if(_expectingJob && (Date.now() - _expectStartedAt > 120000)) _expectingJob = false;  // safety cap
+    // Keep 'awaiting' true until the job is first seen active — a gap fill's pre-import
+    // backup can outlast the 12s window; without this the poll stopped and the panel
+    // showed a stale plan/verdict until a manual refresh.
+    var awaiting = !active && (_expectingJob || Date.now() < _pollExpectUntil);
     var nowActive = active || awaiting;
     // Import just finished writing → the background verify launches server-side
     // immediately. Hold the lock ("settling") until loadPricingHealth confirms the
     // verify state, so the lock never drops in the handoff gap.
-    if(_prevImportActive && !nowActive) _settling = true;
+    if(_prevImportActive && !nowActive){ _settling = true;
+      _verifyWatchUntil = Date.now() + 20000;   // #391: watch ~20s for the post-import verify to appear
+      if(!_verifyTimer) _verifyTimer = setTimeout(loadPricingHealth, 1500); }
     _prevImportActive = nowActive;
     _importActive = nowActive;                       // feed the start lock
+    if(nowActive) _lastActiveAt = Date.now();
+    var _lbl = document.getElementById('api-confirm-label');
+    if(_lbl) _lbl.style.display = nowActive ? 'none' : '';   // don't show an unchecked 'arm' box next to a running job
     _importChecked = true;
     applyRunLock();
     // While a fresh flow is armed (source picked, nothing kicked off yet) never
@@ -1003,6 +1016,7 @@ function pollStatus(expectStart){
       var st = document.getElementById('api-apply-status'); if(st) st.textContent = 'Starting…';
       var out = document.getElementById('api-apply-out'); if(out) out.innerHTML = '';
     } else if(status !== 'idle'){
+      _expectingJob = false;   // terminal (done/cancelled/error) — stop expecting
       // Terminal / persisted run (done / cancelled / error). Show the SUMMARY only,
       // never the arm/Start control — that must come from the deliberate picker →
       // Preview-plan flow (which sets the import window). Otherwise a poll-on-load of
@@ -1031,6 +1045,12 @@ function pollStatus(expectStart){
     } else {
       if(_health) _health.style.display = '';
       loadImportGaps(); loadPricingHealth();          // refresh once it settles
+      // The job's verify/recovery tail outlives the import-write phase; keep
+      // polling while a verify is active or activity was recent, so the banner
+      // and health panel track the tail instead of freezing on a stale 'done'.
+      if(_verifyActive || _settling || (Date.now() - _lastActiveAt < 90000)){
+        _statusTimer = setTimeout(pollStatus, 4000);
+      }
     }
   }).catch(function(){
     // A transient error mid-startup shouldn't abandon the wait.
@@ -1087,6 +1107,11 @@ function loadImportGaps(){
 //       (newest first) so smart-charge slots the bulk import couldn't label get their
 //       real off-peak price. Bills keep settling until this finishes.
 var _verifyTimer = null;
+// #391: bounded window after an import settles during which the health poll keeps
+// re-arming even when the verify isn't active YET — so a verify that launches
+// server-side just after the import→verify handoff is picked up live, instead of
+// the panel sitting on the PREVIOUS run's 'Up to date' verdict until a manual reload.
+var _verifyWatchUntil = 0;
 function _fmtDur(s){
   s = Math.max(0, parseInt(s,10)||0);
   if(s < 60) return s + 's';
@@ -1255,8 +1280,11 @@ function loadPricingHealth(){
     el.innerHTML = '<div style="border:1px solid var(--border);border-radius:8px;padding:12px 14px;">'
       + inner + '</div>';
 
+    if(vActive) _lastActiveAt = Date.now();
     if(_verifyTimer){ clearTimeout(_verifyTimer); _verifyTimer = null; }
-    if(vActive){ _verifyTimer = setTimeout(loadPricingHealth, 4000); }
+    if(vActive){ _verifyWatchUntil = 0; _verifyTimer = setTimeout(loadPricingHealth, 4000); }  // #391: caught it — hand off to the verify poll
+    else if(Date.now() < _verifyWatchUntil){ _verifyTimer = setTimeout(loadPricingHealth, 2000); }  // #391: still watching for the verify to start
+    else if(_importActive || _settling || (Date.now() - _lastActiveAt < 90000)){ _verifyTimer = setTimeout(loadPricingHealth, 5000); }  // job still has a tail → keep watching for a later verify phase
   }).catch(function(){});
 }
 // Back-compat aliases (older call sites / post-action refreshes).

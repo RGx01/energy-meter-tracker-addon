@@ -1182,17 +1182,6 @@ function onContainerClick(e) {
     var mData = config.meters[mid] || {};
     var isSub = (mData.meta || {}).sub_meter;
     var devName = (mData.meta || {}).device || mid;
-    if (isSub) {
-      // 4.5.3 (BL-46 pending): deleting a device leaves the parent's house/EV
-      // split stale, so device delete is temporarily disabled. Use Retire to
-      // stop a device without deleting its history; delete returns in a coming release.
-      var _de = document.getElementById('alert-error');
-      if (_de) {
-        _de.textContent = 'Deleting a device is temporarily disabled while we fix a split-recalculation issue \u2014 it will be re-enabled in a coming release. To stop a device without deleting its history, use Retire.';
-        _de.classList.add('show');
-      }
-      return;
-    }
     openDeleteModal(mid, devName, isSub);
   } else if (el.classList.contains('js-clear-entity')) {
     var t = document.getElementById(el.dataset.target);
