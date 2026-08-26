@@ -982,6 +982,23 @@ def resume_engine():
     logger.info("engine: resumed")
 
 
+async def run_exclusive(fn, *args, **kwargs):
+    """BL-46/BL-48: run a blocking DB op on the engine loop while holding the tick
+    lock, so it can't overlap an in-flight capture/finalise tick. The store is a
+    single SQLite connection shared across the web + engine threads; pausing the
+    engine only stops the NEXT tick, not one already running, so a delete/recompute
+    fired on a block boundary could otherwise touch the connection concurrently with
+    a finalise (logical race + the two-threads-one-connection segfault the restore
+    path already guards against). Acquiring _engine_loop_lock here drains any
+    in-flight tick and blocks the next one, giving the op exclusive DB access.
+    Caller must pause_engine() and drain any running import first. Falls back to a
+    direct call when the loop lock isn't set up (no engine — nothing to race)."""
+    if _engine_loop_lock is None:
+        return fn(*args, **kwargs)
+    async with _engine_loop_lock:
+        return fn(*args, **kwargs)
+
+
 def reset_store():
     """
     Close the current BlockStore and reopen it from BLOCKS_DB_PATH.
