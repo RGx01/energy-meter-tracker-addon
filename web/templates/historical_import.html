@@ -981,7 +981,9 @@ function pollStatus(expectStart){
     // Import just finished writing → the background verify launches server-side
     // immediately. Hold the lock ("settling") until loadPricingHealth confirms the
     // verify state, so the lock never drops in the handoff gap.
-    if(_prevImportActive && !nowActive) _settling = true;
+    if(_prevImportActive && !nowActive){ _settling = true;
+      _verifyWatchUntil = Date.now() + 20000;   // #391: watch ~20s for the post-import verify to appear
+      if(!_verifyTimer) _verifyTimer = setTimeout(loadPricingHealth, 1500); }
     _prevImportActive = nowActive;
     _importActive = nowActive;                       // feed the start lock
     _importChecked = true;
@@ -1087,6 +1089,11 @@ function loadImportGaps(){
 //       (newest first) so smart-charge slots the bulk import couldn't label get their
 //       real off-peak price. Bills keep settling until this finishes.
 var _verifyTimer = null;
+// #391: bounded window after an import settles during which the health poll keeps
+// re-arming even when the verify isn't active YET — so a verify that launches
+// server-side just after the import→verify handoff is picked up live, instead of
+// the panel sitting on the PREVIOUS run's 'Up to date' verdict until a manual reload.
+var _verifyWatchUntil = 0;
 function _fmtDur(s){
   s = Math.max(0, parseInt(s,10)||0);
   if(s < 60) return s + 's';
@@ -1256,7 +1263,8 @@ function loadPricingHealth(){
       + inner + '</div>';
 
     if(_verifyTimer){ clearTimeout(_verifyTimer); _verifyTimer = null; }
-    if(vActive){ _verifyTimer = setTimeout(loadPricingHealth, 4000); }
+    if(vActive){ _verifyWatchUntil = 0; _verifyTimer = setTimeout(loadPricingHealth, 4000); }  // #391: caught it — hand off to the verify poll
+    else if(Date.now() < _verifyWatchUntil){ _verifyTimer = setTimeout(loadPricingHealth, 2000); }  // #391: still watching for the verify to start
   }).catch(function(){});
 }
 // Back-compat aliases (older call sites / post-action refreshes).
