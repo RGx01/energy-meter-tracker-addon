@@ -1,5 +1,13 @@
 # Changelog
  
+## [4.5.4] — 2026-08-26
+
+*Fix + re-enable: deleting a device (BL-46) now recomputes the parent meter's house/EV split, so the "Remove" button is back.*
+
+### Fixed
+
+- **Deleting a device no longer corrupts the parent's house/EV split (BL-46); the "Remove" button is re-enabled.** The device-delete path removed the device's data but never recomputed the parent meter, leaving `imp_kwh_remainder` stale — so Usage Stats and Billing read a wrong house/EV split for the deleted device's window (dev showed `imp_kwh_remainder = imp_kwh/2`). Two fixes: the delete now recomputes the parent over the affected window, and that recompute is **EV-aware** — it re-derives the house remainder as `grid − dispatch EV − surviving sub-meters` (previously it reset to the full grid and subtracted only physical sub-meters, folding the EV back into house). Validated on a real capped IOG DB: every block collapses to the correct segment house. Already-corrupted history (from a delete on 4.5.2/earlier) can be healed by deleting + re-importing that range.
+
 ## [4.5.3] — 2026-08-26
 
 *Hotfix: first-time setup on an Agile account (or any long half-hourly tariff history) could time out at "Connect your supplier" with "Could not connect: check key/account" even with a valid key; an API-only account with no live source could get stuck with blocks never forming; and the "Current grid generation mix" donut could show a forecast slot up to ~48h ahead.*

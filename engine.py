@@ -2776,8 +2776,14 @@ def recompute_remainders_for_window(parent_meter_id: str, utc_start: str,
             if pm:
                 pic = (pm.get("channels") or {}).get("import")
                 if pic is not None:
-                    pic["kwh_remainder"]  = pic.get("kwh")
-                    pic["cost_remainder"] = pic.get("cost")
+                    # BL-46: subtract the dispatch EV (imp_kwh_ev) too, so a device
+                    # delete re-derives the house remainder as grid - EV - surviving
+                    # subs. Without this the EV energy folds into the house line and
+                    # imp_kwh_remainder reads wrong after a delete (dev: kwh/2).
+                    _ev_k = pic.get("kwh_ev") or 0.0
+                    _ev_c = pic.get("cost_ev") or 0.0
+                    pic["kwh_remainder"]  = max((pic.get("kwh") or 0.0) - _ev_k, 0.0)
+                    pic["cost_remainder"] = (pic.get("cost") or 0.0) - _ev_c
             _apply_pass2(block)
             _recompute_pass3_totals(block)
             _recompute_block_carbon(block)
