@@ -5564,6 +5564,8 @@ class BlockStore:
         for a config period from a config dict.
         """
         for meter_id, meter_cfg in (config_json.get("meters") or {}).items():
+            if not meter_id:
+                continue          # never write a NULL/empty meter_id row
             meta = meter_cfg.get("meta") or {}
             is_sub      = 1 if meta.get("sub_meter") else 0
             parent      = meta.get("parent_meter")
@@ -5627,6 +5629,8 @@ class BlockStore:
             ).fetchone()["id"]
 
             for channel, ch_cfg in (meter_cfg.get("channels") or {}).items():
+                if not channel:
+                    continue          # never write a NULL/empty channel name
                 ch_meta = ch_cfg.get("meta") or {}
                 self._conn.execute(
                     """INSERT INTO meter_channels
@@ -5671,6 +5675,9 @@ class BlockStore:
 
         for m in m_rows:
             mid = m["meter_id"]
+            if not mid:
+                continue          # skip a NULL/empty meter_id row (legacy/pre-constraint) — a None dict key crashes jsonify
+
             meta = {
                 "billing_day":    cp["billing_day"],
                 "block_minutes":  cp["block_minutes"],
@@ -5762,6 +5769,8 @@ class BlockStore:
                     ch_meta["tariff"] = ch["tariff"]
                 if ch_meta:
                     ch_dict["meta"] = ch_meta
+                if not ch["channel"]:
+                    continue          # skip a NULL/empty channel (legacy pre-constraint row) — a None dict key crashes jsonify
                 channels[ch["channel"]] = ch_dict
 
             # Engine compatibility: the overlay path reads meta["rate_source"].

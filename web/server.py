@@ -2906,7 +2906,23 @@ def api_entities():
 
 @app.route("/api/config", methods=["GET"])
 def api_get_config():
-    return jsonify(load_config())
+    # Read the config on the engine loop (single-threaded owner of the engine's SQLite
+    # connection), NOT the Flask request thread. Concurrent web requests otherwise use
+    # one connection cross-thread, and a garbled read under load can surface a column as
+    # None -> a None dict key -> jsonify's key-sort crashes
+    # (`'<' not supported between 'str' and 'NoneType'`). Mirrors _regen_charts_safely.
+    try:
+        if _event_loop is not None and _event_loop.is_running():
+            import asyncio as _a, engine as _eng_c
+            async def _load():
+                return _eng_c.load_config()
+            cfg = _a.run_coroutine_threadsafe(_load(), _event_loop).result(timeout=15)
+        else:
+            cfg = load_config()
+    except Exception as e:
+        logger.warning("api_get_config: loop-serialised load failed (%s) — inline fallback", e)
+        cfg = load_config()
+    return jsonify(cfg)
 
 
 @app.route("/api/config/history")
