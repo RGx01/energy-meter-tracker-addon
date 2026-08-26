@@ -3891,10 +3891,12 @@ class TestRunAttributionJob(unittest.IsolatedAsyncioTestCase):
                          ["2025-03-01T00:00:00", "2025-03-01T01:00:00"])   # oldest first
         self.assertEqual([c[1] for c in calls], [1.0, 2.0])               # stitched energy
 
-    async def test_stops_at_live_history_seam(self):
-        # The device already has real history from 2025-03-01T01:00:00 onward, so
-        # attribution fills up to (not into) that seam: only the 00:00 hour is
-        # attributed, and the 01:00 hour (which belongs to the live period) is left.
+    async def test_walks_full_range_not_just_pre_seam(self):
+        # BL-49: attribution no longer STOPS at the live-coverage seam — that blanket
+        # cutoff silently skipped a gap deleted in the live region. It now walks the
+        # full recorded range (both hours here); per-block protection against
+        # overwriting real readings lives in _write_device_into_block. The seam is
+        # retained for diagnostics only.
         ha = MagicMock()
         async def _stats(ids, s, e, period="hour", timeout=45.0):
             return {ids[0]: [{"start": "2025-03-01T00:00:00+00:00", "change": 1.0},
@@ -3914,9 +3916,9 @@ class TestRunAttributionJob(unittest.IsolatedAsyncioTestCase):
 
         res = await engine.run_attribution_job("house_battery", ["sensor.bat"])
         self.assertTrue(res["ok"])
-        self.assertEqual(calls, ["2025-03-01T00:00:00"])        # only the pre-seam hour
-        self.assertEqual(res["written"], 2)                     # 1 hour × 2 blocks
-        self.assertEqual(engine._attribution_job.get("seam"), "2025-03-01T01:00:00")
+        self.assertEqual(calls, ["2025-03-01T00:00:00", "2025-03-01T01:00:00"])  # both hours walked
+        self.assertEqual(res["written"], 4)                     # 2 hours × 2 blocks (mock)
+        self.assertEqual(engine._attribution_job.get("seam"), "2025-03-01T01:00:00")  # still reported
 
 
 class TestAttributionPreflight(unittest.IsolatedAsyncioTestCase):

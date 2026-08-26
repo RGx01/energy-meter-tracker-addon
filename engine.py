@@ -3225,6 +3225,9 @@ async def run_attribution_job(device_meter_id: str, sensor_ids: list, *,
         bm = int(get_block_minutes() or 30)
         j.update({"phase": "attributing", "total_hours": len(hours)})
         written = skipped = gaps = 0
+        global _pass2_quiet
+        _prev_p2q = _pass2_quiet
+        _pass2_quiet = True          # bulk attribution writes thousands of blocks — suppress the per-block PASS 2 INFO churn
         for i, hour in enumerate(hours):
             if j.get("control") == "cancel":
                 j["status"] = "cancelled"
@@ -3249,6 +3252,7 @@ async def run_attribution_job(device_meter_id: str, sensor_ids: list, *,
                 j.update({"written": written, "skipped": skipped, "gaps": gaps,
                           "done_hours": i})
                 await _aio.sleep(pace_s)        # yield to the live tick / drain
+        _pass2_quiet = _prev_p2q
         j.update({"written": written, "skipped": skipped, "gaps": gaps,
                   "done_hours": len(hours)})
         if written:
@@ -3278,6 +3282,8 @@ async def run_attribution_job(device_meter_id: str, sensor_ids: list, *,
         logger.warning("run_attribution_job failed: %s", e)
         j.update({"status": "error", "error": str(e)})
         return {"ok": False, "error": str(e)}
+    finally:
+        _pass2_quiet = False          # never leave bulk-suppression on after the job
 
 
 def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricity_main",
