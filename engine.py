@@ -2206,6 +2206,26 @@ def _schedule_chart_regen() -> None:
 # Block finalise
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _import_rate_or_fallback(block_start: str, meter_id: str, imp_ch: dict) -> float:
+    """Resolve an import block's unit rate when the legacy `imp_rate` column is NULL —
+    which happens transiently while a gap-fill's verify pass hasn't yet repriced the
+    range. Prefer the priced `block_segments` (the source of truth; kWh-weighted inc
+    rate), else derive cost/kWh, else 0.0 (genuinely unpriced). Never returns None, so
+    `kwh * rate` in PASS 2 can't raise `float * NoneType` during device re-attribution."""
+    try:
+        segs = get_store().get_block_segments(block_start, meter_id, "import") or []
+        tot = sum((sg.get("kwh") or 0.0) for sg in segs)
+        if tot > 0:
+            return sum((sg.get("kwh") or 0.0) * (sg.get("inc_rate") or 0.0) for sg in segs) / tot
+    except Exception:
+        pass
+    k = imp_ch.get("kwh") or 0.0
+    c = imp_ch.get("cost")
+    if c is not None and k > 0:
+        return c / k
+    return 0.0
+
+
 def _apply_pass2(block: dict) -> None:
     """
     PASS 2 — grid-authoritative sub-meter distribution.
@@ -2234,8 +2254,15 @@ def _apply_pass2(block: dict) -> None:
         if not parent_import:
             continue
 
-        grid_kwh       = parent_import.get("kwh", 0.0)
-        parent_rate    = parent_import.get("rate", 0.0)
+        grid_kwh       = parent_import.get("kwh") or 0.0
+        # Legacy `imp_rate` can be NULL (block imported but its verify reprice hasn't
+        # landed yet — device re-attribution over a fresh gap fill hits this). Resolve
+        # from segments / cost-per-kWh so `claimed * parent_rate` never sees None, and
+        # the device is costed at the real rate rather than crashing or zeroing.
+        parent_rate    = parent_import.get("rate")
+        if parent_rate is None:
+            parent_rate = _import_rate_or_fallback(block.get("start", ""),
+                                                   parent_meter_name, parent_import)
         grid_remaining = grid_kwh
         # BL-19: is the main's grid import authoritative? A DCC-settled main
         # (imp_kwh_api present) is the true grid boundary for the block, so the
@@ -3185,10 +3212,15 @@ async def run_attribution_job(device_meter_id: str, sensor_ids: list, *,
         # gap), and we stop walking at the seam rather than running to 'now'.
         # When the device has no live history yet (never configured), seam is None
         # and we fill the full available range.
+        # BL-49: the seam (device's first live block) is kept for diagnostics only —
+        # it must NOT be a blanket cutoff. Filtering to `< seam` made attribution skip
+        # the entire live region, so a gap deleted after the device started recording
+        # (a delete-data + re-attribute heal, or BL-47 gap-fill) could never be
+        # refilled — it wrote 0. The per-block guard in _write_device_into_block already
+        # protects live data: it fills only an ABSENT row or a zero-hole and never
+        # overwrites a real non-zero device reading. So we walk the full recorded range
+        # and let that guard decide, healing mid/late holes too without clobbering live.
         seam = get_store().get_device_live_coverage_start(device_meter_id)
-        if seam:
-            seam_cmp = _naive_iso(seam)
-            hours = [h for h in hours if _naive_iso(h) < seam_cmp]
         j["seam"] = seam
         bm = int(get_block_minutes() or 30)
         j.update({"phase": "attributing", "total_hours": len(hours)})
@@ -3197,7 +3229,11 @@ async def run_attribution_job(device_meter_id: str, sensor_ids: list, *,
             if j.get("control") == "cancel":
                 j["status"] = "cancelled"
                 break
-            while j.get("control") == "pause" or delete_in_progress():
+            # Wait out a running import OR verify too: both write the pricing the
+            # attribution reads, and attributing over a not-yet-verified (imp_rate
+            # NULL) block used to crash PASS 2 and could cost the device at 0.
+            while (j.get("control") == "pause" or delete_in_progress()
+                   or api_import_running() or _verify_running()):
                 j["status"] = "paused"
                 await _aio.sleep(1.0)
                 if j.get("control") == "cancel":
@@ -8592,6 +8628,13 @@ def _persist_verify_summary(j: dict) -> None:
         }))
     except Exception as e:
         logger.warning("verify pricing: persist summary failed: %s", e)
+
+
+def _verify_running() -> bool:
+    """A deferred pricing-verification pass is actively repricing (running/waiting/
+    paused). Device attribution must wait for it — it backfills the legacy imp_rate
+    the attribution reads."""
+    return _verify_job.get("status") in ("running", "waiting", "paused")
 
 
 def api_verify_pricing_status() -> dict:
