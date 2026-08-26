@@ -1857,6 +1857,22 @@ def api_meter_delete_data(meter_id: str):
         new_cfg  = payload.get("config")
         deleted  = {}
 
+        # BL-46: capture the deleted device's parent + block window BEFORE deleting,
+        # so we can re-derive the parent's house/EV remainder afterwards (the delete
+        # otherwise leaves imp_kwh_remainder stale - still subtracting the gone device).
+        _bl46_parent = _bl46_lo = _bl46_hi = None
+        try:
+            _pr = store._conn.execute(
+                "SELECT parent_meter_id FROM meters WHERE meter_id = ?", (meter_id,)).fetchone()
+            _bl46_parent = ((_pr["parent_meter_id"] if _pr else None) or "electricity_main")
+            _rng = store._conn.execute(
+                "SELECT MIN(block_start) lo, MAX(block_start) hi FROM blocks WHERE meter_id = ?",
+                (meter_id,)).fetchone()
+            if _rng:
+                _bl46_lo, _bl46_hi = _rng["lo"], _rng["hi"]
+        except Exception:
+            pass
+
         # Pause engine before modifying DB — prevents mid-tick inconsistency
         try:
             import engine as _eng_d
@@ -1924,6 +1940,24 @@ def api_meter_delete_data(meter_id: str):
                 store._write_meters(new_cfg, period_id)
 
         logger.info("api_meter_delete_data: deleted %s for meter %s", deleted, meter_id)
+
+        # BL-46: re-derive the parent's house/EV remainder over the deleted device's
+        # window now the device is gone (EV-aware recompute; keeps imp_kwh_remainder
+        # consistent with the segments). Runs on the committed state, engine paused.
+        try:
+            if _bl46_parent and _bl46_lo and _bl46_hi:
+                import engine as _eng_r
+                from datetime import datetime as _dt46, timedelta as _td46
+                try:
+                    _hi_excl = (_dt46.fromisoformat(_bl46_hi)
+                                + _td46(minutes=int(_eng_r.get_block_minutes() or 30))).isoformat()
+                except Exception:
+                    _hi_excl = _bl46_hi
+                _n46 = _eng_r.recompute_remainders_for_window(_bl46_parent, _bl46_lo, _hi_excl)
+                logger.info("api_meter_delete_data: recomputed %s parent block(s) after removing %s",
+                            _n46, meter_id)
+        except Exception as _re46:
+            logger.warning("api_meter_delete_data: parent recompute failed: %s", _re46)
 
         # Restart engine to pick up config change
         try:
