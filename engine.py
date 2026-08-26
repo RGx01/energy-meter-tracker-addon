@@ -119,6 +119,7 @@ _read_queue:               list         = []
 _last_known_sensor_values: dict         = {}
 _engine_loop_lock:         asyncio.Lock = None   # initialised in setup()
 _engine_paused:            bool         = False
+_pass2_quiet:              bool         = False   # suppress per-block PASS 2 INFO logs during bulk recompute
 _last_ci_fetch:            datetime | None = None   # UTC — last carbon intensity fetch
 _last_dispatch_capture:    datetime | None = None   # UTC — last dispatch-slot capture (5-min cadence)
 _last_reconcile:           datetime | None = None   # UTC — last dispatch reconciliation (hourly cadence)
@@ -995,8 +996,13 @@ async def run_exclusive(fn, *args, **kwargs):
     direct call when the loop lock isn't set up (no engine — nothing to race)."""
     if _engine_loop_lock is None:
         return fn(*args, **kwargs)
+    import functools as _ft
     async with _engine_loop_lock:
-        return fn(*args, **kwargs)
+        # Run in an executor, not inline: a heavy fn run directly on the loop thread
+        # would freeze the loop (HA websocket drops, request queue backs up). Holding
+        # the lock still serialises against the tick; the executor keeps the loop live.
+        return await asyncio.get_event_loop().run_in_executor(
+            None, _ft.partial(fn, *args, **kwargs))
 
 
 def reset_store():
@@ -2370,7 +2376,7 @@ def _apply_pass2(block: dict) -> None:
             # rate source.
             entry["sub_import"]["rate"]        = parent_rate
             entry["sub_import"]["cost"]        = round(claimed * parent_rate, 6)
-            logger.info(
+            if not _pass2_quiet: logger.info(
                 "PASS 2: %s protected  grid=%.4f  battery=%.4f",
                 entry["meter_name"], claimed, entry["sub_import"]["kwh_battery"],
             )
@@ -2401,7 +2407,7 @@ def _apply_pass2(block: dict) -> None:
             entry["sub_import"]["kwh_battery"] = battery
             entry["sub_import"]["rate"]        = parent_rate
             entry["sub_import"]["cost"]        = round(claimed * parent_rate, 6)
-            logger.info(
+            if not _pass2_quiet: logger.info(
                 "PASS 2: %s unprotected  grid=%.4f  battery=%.4f",
                 entry["meter_name"], claimed, battery,
             )
@@ -2434,7 +2440,7 @@ def _apply_pass2(block: dict) -> None:
         parent_import["kwh_remainder"]  = remainder_kwh
         parent_import["cost_remainder"] = remainder_cost
         parent_import["rate_used"]      = parent_rate
-        logger.info(
+        if not _pass2_quiet: logger.info(
             "PASS 2: %s  grid=%.4f kWh  remainder=%.4f kWh",
             parent_meter_name, grid_kwh, remainder_kwh,
         )
@@ -2771,6 +2777,9 @@ def recompute_remainders_for_window(parent_meter_id: str, utc_start: str,
     """
     if not parent_meter_id:
         return 0
+    global _pass2_quiet
+    _prev_quiet = _pass2_quiet
+    _pass2_quiet = True          # a whole-history delete can hit tens of thousands of blocks
     store = get_store()
     starts = [r["block_start"] for r in store._conn.execute(
         "SELECT DISTINCT block_start FROM blocks "
@@ -2809,6 +2818,7 @@ def recompute_remainders_for_window(parent_meter_id: str, utc_start: str,
         except Exception as e:
             logger.error(
                 "recompute_remainders_for_window: block %s failed: %s", bs, e)
+    _pass2_quiet = _prev_quiet
     if done:
         try:
             generate_charts(store)

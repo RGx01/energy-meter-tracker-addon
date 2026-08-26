@@ -1974,15 +1974,23 @@ def api_meter_delete_data(meter_id: str):
 
             return deleted
 
-        # (b) Run it with exclusive DB access — serialized against the engine tick.
-        # Marshal onto the engine loop (holds _engine_loop_lock there); the web thread
-        # can't hold an asyncio lock. No loop running → nothing to race, run inline.
+        # (b) Drain any in-flight tick, then run the work on THIS (web) thread.
+        # A no-op run under the tick lock waits for the current tick to finish; the
+        # engine is paused, so no NEW tick does DB work (it returns at the pause check
+        # before touching the connection). With the in-flight tick drained and new ones
+        # inert, the web thread has the SQLite connection to itself. We deliberately do
+        # NOT run the recompute on the engine loop — a whole-history device delete can
+        # touch tens of thousands of blocks and take minutes; on the loop that would
+        # freeze HA comms and blow the request timeout (observed: WS reconnect storm +
+        # queue backlog + a spurious empty-message 500 while the job actually finished).
         if _event_loop and _event_loop.is_running():
-            import asyncio as _asyncio
-            deleted = _asyncio.run_coroutine_threadsafe(
-                _eng_d.run_exclusive(_do_delete_and_recompute), _event_loop).result(timeout=180)
-        else:
-            deleted = _do_delete_and_recompute()
+            try:
+                import asyncio as _asyncio
+                _asyncio.run_coroutine_threadsafe(
+                    _eng_d.run_exclusive(lambda: None), _event_loop).result(timeout=30)
+            except Exception as _de:
+                logger.warning("api_meter_delete_data: tick-drain barrier failed: %s", _de)
+        deleted = _do_delete_and_recompute()
 
         # Data is committed & consistent → clear the pause so the tick runs again.
         # (engine_startup does NOT resume on its own — every pause caller must.)
