@@ -1725,13 +1725,18 @@ class BlockStore:
     def get_mix_history(self, hours: int = 48) -> list:
         """Return mix_history slots for the last `hours` hours."""
         from datetime import datetime, timezone, timedelta
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M")
+        _now = datetime.now(timezone.utc)
+        cutoff  = (_now - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M")
+        # #408: mix_history also holds fw48h FORECAST slots (future captured_at).
+        # Bound the upper edge to now so a forecast slot can never bleed into the
+        # 48h chart (the donut hit the same bug via MAX(captured_at)).
+        now_str = _now.strftime("%Y-%m-%dT%H:%M")
         rows = self._conn.execute(
             """SELECT captured_at, fuel, perc
                FROM mix_history
-               WHERE captured_at >= ?
+               WHERE captured_at >= ? AND captured_at <= ?
                ORDER BY captured_at ASC, fuel ASC""",
-            (cutoff,)
+            (cutoff, now_str)
         ).fetchall()
         slots: dict = {}
         order: list = []

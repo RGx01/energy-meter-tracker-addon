@@ -1266,9 +1266,17 @@ def api_power():
         current_mix = []
         try:
             _mix_store = _get_store()
+            # #408: mix_history also holds fw48h FORECAST rows, so MAX(captured_at)
+            # alone grabbed a slot up to ~48h ahead (a gas-heavy forecast night read
+            # ~56% gas vs ~30% now, while the 48h chart showed the real slot). Bound
+            # the latest-slot pick to <= now.
+            _now_ci = datetime.utcnow().strftime("%Y-%m-%dT%H:%M")  # api_power imports datetime only (no timezone)
             _mix_rows = _mix_store._conn.execute(
                 """SELECT fuel, perc FROM mix_history
-                   WHERE captured_at = (SELECT MAX(captured_at) FROM mix_history)"""
+                   WHERE captured_at = (SELECT MAX(captured_at) FROM mix_history
+                                        WHERE captured_at <= ?)
+                   ORDER BY perc DESC""",
+                (_now_ci,)
             ).fetchall()
             current_mix = [{"fuel": r["fuel"], "perc": r["perc"]} for r in _mix_rows]
             if not current_mix:
