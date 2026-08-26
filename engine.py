@@ -1489,9 +1489,36 @@ def ensure_correct_block(ha: HAClient, current_block: dict, now: datetime,
                    last_known_rates=last_known_rates)
 
     new_block = _store.load_current_block()
+    _seed = False
+    try:
+        _seed = mode_uses_api() and not _has_local_import_sensor()
+    except Exception:
+        _seed = False
     if not new_block or not new_block.get("start"):
         logger.warning("ensure_correct_block: pruned buffer missing, creating fresh")
-        return create_block(start, end, block_minutes=int(get_block_minutes()))
+        return create_block(start, end, block_minutes=int(get_block_minutes()),
+                            seed_meters=_seed)
+    # 4.5.3-B: an EMPTY block at a passed boundary finalises as "nothing to
+    # finalise" WITHOUT advancing the opener, so on an API-only account with no
+    # live source (no Mini device AND no local sensor) the opener stays behind
+    # `now` and every tick re-rolls the SAME boundary — the observed loop
+    # ("no post-boundary read after {N}s ... nothing to finalise", every ~10s,
+    # never advancing). If the opener did NOT move (unchanged from the block we
+    # just finalised), roll it forward to the current window so we advance one
+    # block per boundary and let DCC settlement backfill, rather than thrashing.
+    # NOTE keyed on "unchanged", not "< start", so genuine gap catch-up (which
+    # advances one window per call) is never skipped.
+    try:
+        if new_block["start"] == current_block.get("start"):
+            logger.info("ensure_correct_block: opener did not advance past %s "
+                        "(empty block / no live source) — rolling forward to break "
+                        "the re-roll loop", iso(start))
+            fresh = create_block(start, end, block_minutes=int(get_block_minutes()),
+                                 seed_meters=_seed)
+            _store.save_current_block(fresh)
+            return fresh
+    except Exception as _ae:
+        logger.warning("ensure_correct_block: forward-roll check failed: %s", _ae)
     return new_block
 
 
