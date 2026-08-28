@@ -10535,6 +10535,25 @@ _MEASURED_FLOOR = "2026-08-01T00:00:00"
 _MEASURED_MATERIAL_GBP = 0.02      # a same-band £ delta below this is rounding noise (skip)
 
 
+def _measured_floor() -> str:
+    """Effective floor for the measured-cost pass — the START of the current
+    (capped IOG-SMB) agreement, never earlier.
+
+    The measured fetch exists to reconcile Octopus's 6-hour-cap accounting, which is
+    an SMB-tariff concept. Pre-migration dispatched slots were priced correctly by the
+    prior (uncapped, e.g. INTELLI) tariff's schedule and are owned by reconcile — the
+    measured pass must not reach into them (that is what pulled 2026-08-14 and other
+    pre-cap days into scope). `_kraken_current_agreement_from` is the live import
+    agreement's valid_from (naive-UTC iso), maintained on every schedule refresh; for
+    a single SMB agreement that is the migration boundary. Falls back to the blunt
+    `_MEASURED_FLOOR` only when the boundary is unknown. (A future account with more
+    than one SMB agreement would instead take the earliest SMB valid_from.)"""
+    caf = _kraken_current_agreement_from
+    if caf:
+        return str(caf)
+    return _MEASURED_FLOOR
+
+
 async def measure_settled_dispatched_blocks() -> dict:
     """Fetch Octopus's billed per-slot cost/label for recently-settled IOG
     dispatched blocks, cache it in measured_cost, and — unless _MEASURED_APPLY —
@@ -10560,7 +10579,7 @@ async def measure_settled_dispatched_blocks() -> dict:
                  AND b.block_start >= ?
                  AND EXISTS (SELECT 1 FROM dispatch_slots s
                              WHERE s.slot_start = b.block_start AND s.off_peak = 1)
-               ORDER BY b.block_start DESC""", (_MEASURED_FLOOR,)).fetchall()
+               ORDER BY b.block_start DESC""", (_measured_floor(),)).fetchall()
     except Exception as e:
         logger.warning("measure_settled: query failed: %s", e)
         return {}
@@ -10660,7 +10679,7 @@ def audit_measured_costs() -> dict:
                WHERE b.meter_id = 'electricity_main' AND b.rate_corrected = 0
                  AND (b.rate_source IS NULL OR b.rate_source NOT IN ('measured','corrected'))
                  AND b.block_start >= ?
-               ORDER BY b.block_start""", (mpan, _MEASURED_FLOOR)).fetchall()
+               ORDER BY b.block_start""", (mpan, _measured_floor())).fetchall()
     except Exception as e:
         logger.warning("measure_audit: query failed: %s", e)
         return {}
@@ -10760,7 +10779,7 @@ def apply_measured_settled() -> dict:
                WHERE b.meter_id = 'electricity_main' AND b.rate_corrected = 0
                  AND (b.rate_source IS NULL OR b.rate_source NOT IN ('measured','corrected'))
                  AND b.block_start >= ? AND m.cost_incl IS NOT NULL
-               ORDER BY b.block_start""", (mpan, _MEASURED_FLOOR)).fetchall()
+               ORDER BY b.block_start""", (mpan, _measured_floor())).fetchall()
     except Exception as e:
         logger.warning("apply_measured: query failed: %s", e)
         return {}
