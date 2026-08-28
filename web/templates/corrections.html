@@ -204,8 +204,13 @@ document.addEventListener('DOMContentLoaded', function() {
       corrSetType('standing');
     })
     .catch(function() {});
-  loadReviewBlocks();
+  loadReviewBlocks(1);
   loadBillingSource();
+  // BL-18b: re-pull the review list when returning to the tool (HA re-shows the
+  // iframe) so it self-heals without a manual page refresh.
+  document.addEventListener('visibilitychange', function() {
+    if (!document.hidden) loadReviewBlocks(1);
+  });
   // #270: refresh the nearby-rate picker whenever the date range changes.
   ['corr-from', 'corr-to'].forEach(function(id) {
     var el = document.getElementById(id);
@@ -216,13 +221,14 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 // ── BL-18: "Flagged for review" list ────────────────────────────────────────
-function loadReviewBlocks() {
-  fetch(apiUrl('/api/review-blocks'))
-    .then(function(r) { return r.json(); })
+function loadReviewBlocks(attempt) {
+  attempt = attempt || 1;
+  var card = document.getElementById('review-card');
+  var list = document.getElementById('review-list');
+  var cnt  = document.getElementById('review-count');
+  fetch(apiUrl('/api/review-blocks'), {cache: 'no-store'})
+    .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
     .then(function(d) {
-      var card = document.getElementById('review-card');
-      var list = document.getElementById('review-list');
-      var cnt  = document.getElementById('review-count');
       var blocks = (d && d.blocks) || [];
       if (!blocks.length) { card.style.display = 'none'; return; }
       card.style.display = '';
@@ -249,7 +255,22 @@ function loadReviewBlocks() {
                '</div>';
       }).join('');
     })
-    .catch(function() {});
+    .catch(function() {
+      // BL-18b: never fail silently. A transient hiccup (server busy during a chart
+      // regen or the measured-apply pass, or an ingress blip) used to drop the list to
+      // blank with no retry — the "hit-and-miss load". Retry with backoff, then show a
+      // visible Retry rather than nothing.
+      if (attempt < 4) {
+        setTimeout(function() { loadReviewBlocks(attempt + 1); },
+                   400 * Math.pow(2, attempt - 1));
+        return;
+      }
+      card.style.display = '';
+      cnt.textContent = '!';
+      list.innerHTML = '<div style="font-size:12px;color:var(--muted);padding:8px 0;">' +
+        'Could not load the review list — the server may be busy. ' +
+        '<a href="#" onclick="loadReviewBlocks(1);return false;">Retry</a></div>';
+    });
 }
 
 function reviewLoadIntoTool(localDate, fromTime, toTime) {

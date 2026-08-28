@@ -398,6 +398,20 @@ CREATE TABLE IF NOT EXISTS block_segments (
     attribution  TEXT NOT NULL            -- open label: house | ev | …
 );
 CREATE INDEX IF NOT EXISTS idx_block_segments ON block_segments (block_start, meter_id, channel);
+
+-- BL-53: permanent cache of Octopus's BILLED per-slot cost/label (measurements API).
+-- A settled slot's billed cost is immutable, so this is never re-fetched once stored.
+CREATE TABLE IF NOT EXISTS measured_cost (
+    slot_start  TEXT NOT NULL,
+    mpan        TEXT NOT NULL DEFAULT '',
+    direction   TEXT NOT NULL DEFAULT 'CONSUMPTION',
+    cost_incl   REAL,
+    cost_excl   REAL,
+    label       TEXT,                    -- OFF_PEAK | STANDARD_RATE | mixed
+    kwh         REAL,
+    fetched_at  TEXT,
+    PRIMARY KEY (slot_start, mpan, direction)
+);
 """
 
 
@@ -1151,6 +1165,9 @@ class BlockStore:
             ("carbon_intensity_g", "blocks",        "REAL",                       _b_cols),
             ("rate_corrected",     "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
             ("rate_reconciled",    "blocks",        "INTEGER NOT NULL DEFAULT 0", _b_cols),
+            # ── BL-53: rate provenance / authority (schedule<reconciled<measured<corrected).
+            # A lower authority never overwrites a higher one; the sweep skips measured/corrected.
+            ("rate_source",        "blocks",        "TEXT",                       _b_cols),
             # ── 3.5.0 historical-import: link a reconstructed block to its derivation
             ("derivation_id",      "blocks",        "INTEGER",                    _b_cols),
             # ── 4.1.x BL-23: exc-VAT import cost (additive; NULL until captured)
@@ -1190,6 +1207,22 @@ class BlockStore:
                     self._conn.commit()
                 except Exception:
                     pass  # already exists or table missing — migrate will handle it
+
+        # ── BL-53: backfill rate_source from the existing flags (pure derivation,
+        # no data invented). corrected > reconciled > schedule. One-shot: only
+        # rows still NULL, so a re-run is a no-op and a measured row (set later) is
+        # never downgraded.
+        try:
+            if "rate_source" in _b_cols:
+                self._conn.execute(
+                    "UPDATE blocks SET rate_source = CASE "
+                    "  WHEN rate_corrected = 1 THEN 'corrected' "
+                    "  WHEN rate_reconciled = 1 THEN 'reconciled' "
+                    "  WHEN imp_rate IS NOT NULL THEN 'schedule' END "
+                    "WHERE rate_source IS NULL")
+                self._conn.commit()
+        except Exception:
+            pass
 
         # ── 3.5.x: tag existing (hand-entered) postcode prefixes as user-sourced ──
         # A pre-existing postcode_prefix was typed in Settings, so record its
@@ -1519,6 +1552,47 @@ class BlockStore:
         return cur.rowcount
 
     # ── 3.1.0 Intelligent dispatch slots ────────────────────────────────────────
+
+    # ── BL-53: measured-cost cache (Octopus billed per-slot cost/label) ─────
+    def get_measured_cost(self, slot_start: str, mpan: str = "",
+                          direction: str = "CONSUMPTION") -> "dict | None":
+        row = self._conn.execute(
+            "SELECT slot_start, mpan, direction, cost_incl, cost_excl, label, kwh, "
+            "fetched_at FROM measured_cost WHERE slot_start=? AND mpan=? AND direction=?",
+            (slot_start, mpan or "", direction)).fetchone()
+        return dict(row) if row else None
+
+    def upsert_measured_cost(self, slot_start: str, *, mpan: str = "",
+                             direction: str = "CONSUMPTION", cost_incl=None,
+                             cost_excl=None, label=None, kwh=None,
+                             fetched_at: str = "") -> None:
+        self._conn.execute(
+            "INSERT INTO measured_cost (slot_start, mpan, direction, cost_incl, "
+            "cost_excl, label, kwh, fetched_at) VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(slot_start, mpan, direction) DO UPDATE SET "
+            "cost_incl=excluded.cost_incl, cost_excl=excluded.cost_excl, "
+            "label=excluded.label, kwh=excluded.kwh, fetched_at=excluded.fetched_at",
+            (slot_start, mpan or "", direction, cost_incl, cost_excl, label, kwh,
+             fetched_at or _utc_now_iso()))
+        self._conn.commit()
+
+    def measured_slots_missing(self, starts, mpan: str = "",
+                               direction: str = "CONSUMPTION") -> list:
+        """Of `starts`, the slot_starts with NO measured_cost row yet (so the
+        caller only fetches what it hasn't already got)."""
+        starts = [s for s in dict.fromkeys(starts or []) if s]
+        if not starts:
+            return []
+        have = set()
+        for i in range(0, len(starts), 500):
+            chunk = starts[i:i + 500]
+            ph = ",".join("?" * len(chunk))
+            for r in self._conn.execute(
+                    f"SELECT slot_start FROM measured_cost WHERE mpan=? AND "
+                    f"direction=? AND slot_start IN ({ph})",
+                    [mpan or "", direction] + chunk):
+                have.add(r[0])
+        return [s for s in starts if s not in have]
 
     def upsert_dispatch_slot(self, slot_start: str, *, off_peak: bool = True,
                              provider: Optional[str] = None,
@@ -3213,6 +3287,35 @@ class BlockStore:
         the fallback rate used where no per-slot inc/exc pair is available."""
         import vat_calendar as _vc
         return _vc.resolve_vat(date_iso, self.get_vat_calendar())
+
+    def set_import_exc_from_inc(self, block_starts, meter_id: str = "electricity_main") -> int:
+        """BL-57b: authoritatively (re)derive block + segment ex-VAT from the stored INC
+        via the VAT calendar (per-block `vat_rate_at`). The Cost-Corrections tool takes an
+        inc-VAT rate; this yields a correct, EXPLICITLY-stored exc rather than a proportional
+        rescale of the old ratio — and, crucially, sets exc even when it was NULL (so the
+        view no longer falls back to the inc÷1.05 approximation). Exact for a flat charge and
+        correct across a VAT-rate change (each block uses its own date's rate). Import main
+        meter + its import segments. Returns the number of block rows updated."""
+        if not block_starts:
+            return 0
+        seg = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='block_segments'").fetchone()
+        n = 0
+        with self._conn:
+            for bs in block_starts:
+                f = 1.0 / (1.0 + self.vat_rate_at(bs))
+                cur = self._conn.execute(
+                    "UPDATE blocks SET imp_rate_exc = ROUND(imp_rate * ?, 6), "
+                    "imp_cost_exc = ROUND(imp_cost * ?, 6), exc_source = 'tariff' "
+                    "WHERE block_start = ? AND meter_id = ? AND imp_rate IS NOT NULL",
+                    (f, f, bs, meter_id))
+                n += cur.rowcount
+                if seg:
+                    self._conn.execute(
+                        "UPDATE block_segments SET exc_rate = ROUND(inc_rate * ?, 6) "
+                        "WHERE channel = 'import' AND block_start = ?", (f, bs))
+        return n
 
     def retag_untagged_imports(self) -> dict:
         """Repair blocks the carbon round-trip bug wiped from 'imported_api' to

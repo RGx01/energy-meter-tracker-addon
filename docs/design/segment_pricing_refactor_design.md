@@ -1,5 +1,7 @@
 # Priced-segment pricing model — refactor design (BL-27)
 
+> **STATUS — SHIPPED (verified 4.5.5 audit).** The priced-segment model is the live source of truth: `block_segments` is written/read by `block_store.py` and `engine.py` and underpins all IOG multi-rate pricing. This document is retained as the architecture record.
+
 *Strategic follow-on to BL-9. Captures why the IOG 4-rate work keeps producing the same
 class of bug, and the one structural change that removes it. Not a point-release item —
 this is a deliberate refactor of the pricing layer, to be done with a capped multi-device
