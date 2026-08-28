@@ -1,6 +1,6 @@
 # Deliberate-deletion persistence (deleted_ranges tombstone) — design note
 
-> _Status: **SIGNED OFF — ready to build.** BL-8 **phase 2**. All sign-off questions
+> _Status: **SHIPPED (verified 4.5.5 audit).** Built as the `deleted_ranges` tombstone table (schema + INSERT on deliberate delete + `override_tombstone` re-create gate in `block_store.py`). Originally signed off ready-to-build; BL-8 **phase 2**. All sign-off questions
 > resolved (Q1–Q6 below; Q3 confirmed: all deletes tombstone, fillability advisory
 > only). Additive and **billing byte-identical**: the tombstone gates only block
 > *creation* paths and never touches a stored per-slot figure or any billing/chart

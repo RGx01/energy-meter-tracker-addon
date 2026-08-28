@@ -163,13 +163,18 @@ class TestNewIOGTariffFallback(unittest.TestCase):
         return C()
 
     def test_day_night_merge_when_no_standard(self):
-        day = [{"value_inc_vat": 32.0, "valid_from": "2026-07-01T05:30:00Z",
-                "valid_to": "2026-07-01T23:30:00Z"}]
-        night = [{"value_inc_vat": 7.0, "valid_from": "2026-07-01T23:30:00Z",
-                  "valid_to": "2026-07-02T05:30:00Z"}]
+        # BL-52: the real IOG-SMB API returns day/night as FLAT, windowless rates
+        # (single record, valid_to null) — the window is NOT in the feed. The
+        # reconstruction rebuilds the 23:30-05:30 (local) window so resolve()
+        # is time-of-day correct again (was degenerate: off-peak for all times).
+        day = [{"value_inc_vat": 32.0, "valid_from": "2026-07-01T00:00:00Z",
+                "valid_to": None}]
+        night = [{"value_inc_vat": 7.0, "valid_from": "2026-07-01T00:00:00Z",
+                  "valid_to": None}]
         sched = asyncio.get_event_loop().run_until_complete(
             build_rate_schedule(self._client([], day, night), "IOG-SMB-TOU", "E-1R-IOG-SMB-TOU-H"))
         self.assertFalse(sched.is_empty())
+        self.assertGreater(len(sched), 2)                              # windowed, not flat concat
         self.assertEqual(sched.resolve("2026-07-01T12:00:00"), 32.0)   # day
         self.assertEqual(sched.resolve("2026-07-02T02:00:00"), 7.0)    # night
         self.assertEqual(sched.off_peak_rate_near("2026-07-01T23:45:00"), 7.0)

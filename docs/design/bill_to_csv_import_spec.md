@@ -1,5 +1,7 @@
 # Octopus bill → EMT CSV import — spec
 
+> **STATUS — BUILT (verified 4.5.5 audit).** Implemented in `bill_parser.py` (`_parse_import_periods` / `_parse_export_periods` / `_reconcile`) and wired into `web/server.py`. Retained as the format/behaviour spec.
+
 Reads Octopus PDF bills and produces CSVs EMT imports (Historical Import → CSV).
 
 > **Placement (revised):** the parser now lives **inside EMT** as `bill_parser.py`,
