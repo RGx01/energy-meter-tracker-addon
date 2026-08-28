@@ -216,6 +216,33 @@ def _get_store() -> BlockStore:
     return _store
 
 
+# BL-18c: per-THREAD read-only store. Waitress serves requests on multiple threads;
+# sharing the single RW `_store` connection across them caused intermittent
+# SQLITE_MISUSE ("bad parameter or other API misuse") when concurrent page-load
+# reads (e.g. the corrections page's review-blocks + billing-source) hit the same
+# connection at once. Each thread gets its OWN read snapshot connection (query_only +
+# busy_timeout), safe alongside the engine's writer under WAL. Reads only — writes
+# still go through _get_store().
+_read_local = threading.local()
+
+
+def _get_read_store() -> BlockStore:
+    """A per-thread READ-ONLY BlockStore for GET endpoints (see BL-18c note above)."""
+    st = getattr(_read_local, "store", None)
+    if st is None:
+        if DATA_DIR is None:
+            raise RuntimeError("server.init() has not been called")
+        db_path = _os.path.join(DATA_DIR, "blocks.db")
+        try:
+            st = BlockStore(db_path, read_only=True)
+        except Exception:
+            # Fall back to the shared RW store if a read companion can't open
+            # (e.g. DB not yet created) — correctness over the concurrency win.
+            return _get_store()
+        _read_local.store = st
+    return st
+
+
 def _config_timezone() -> str:
     """The main meter's configured timezone (for wall-clock display of UTC
     block_start values in the gap / deleted-ranges lists). Falls back to UTC."""
@@ -8418,7 +8445,7 @@ def api_review_blocks():
     Each entry carries block_start, meter_id, a human reason, and the kWh figures.
     """
     try:
-        store = _get_store()
+        store = _get_read_store()   # BL-18c: per-thread read connection (no SQLITE_MISUSE)
         alerts = store.get_review_blocks()
         # Enrich each block with the LOCAL date + 30-min window so the UI can
         # pre-fill the correction tool exactly (block_start is naive UTC). Doing
@@ -8710,7 +8737,8 @@ def api_corrections_apply():
             # reconciliation pass never overwrites a user's override. A manual
             # correction is also a definite human decision, so it clears any
             # ambiguous-review flag on the block (BL-18).
-            _mark = (", rate_corrected = 1, needs_review = 0, review_reason = NULL"
+            _mark = (", rate_corrected = 1, rate_source = 'corrected', "
+                     "needs_review = 0, review_reason = NULL"
                      if col in ("imp_rate", "exp_rate") else "")
             if recalc_cost and channel == "import":
                 # P4.6 (watch #11) — the corrected rate applies to the WHOLE block: imp_cost
@@ -8731,9 +8759,20 @@ def api_corrections_apply():
                                                ELSE imp_cost_ev END,
                             imp_cost_remainder = CASE WHEN imp_kwh_ev IS NOT NULL
                                                THEN ROUND(imp_kwh * ? - ROUND(imp_kwh_ev * ?, 6), 6)
-                                               ELSE imp_cost_remainder END{_mark}
+                                               ELSE imp_cost_remainder END,
+                            -- BL-57: block-level exc must follow the corrected inc (the
+                            -- reconcile already does this; the corrections tool didn't, so a
+                            -- corrected block kept a stale ex-VAT figure). Rescale by
+                            -- new/old inc to preserve the block's VAT ratio; leave NULL exc
+                            -- (view falls back to inc / VAT).
+                            imp_rate_exc = CASE WHEN imp_rate_exc IS NOT NULL AND imp_rate != 0
+                                               THEN ROUND(imp_rate_exc * ? / imp_rate, 6)
+                                               ELSE imp_rate_exc END,
+                            imp_cost_exc = CASE WHEN imp_cost_exc IS NOT NULL AND imp_rate != 0
+                                               THEN ROUND(imp_cost_exc * ? / imp_rate, 6)
+                                               ELSE imp_cost_exc END{_mark}
                         WHERE {where}""",
-                    [value, value, value, value, value, value] + params
+                    [value, value, value, value, value, value, value, value] + params
                 )
             elif recalc_cost:
                 cost_col = "imp_cost" if channel == "import" else "exp_cost"
@@ -8805,6 +8844,14 @@ def api_corrections_apply():
                             f"WHERE channel = 'import' AND block_start IN ({ph})",
                             [value, value] + bs_list)
                         store._conn.commit()
+
+                    # BL-57b: SUPERSEDES the proportional exc rescales above with an
+                    # AUTHORITATIVE re-derivation of block + segment ex-VAT from the corrected
+                    # inc via the VAT calendar (per-block vat_rate_at). Sets exc explicitly even
+                    # when it was NULL (no more inc÷1.05 view-approximation) and stays correct
+                    # across a VAT-rate change. Import rate corrections only.
+                    if recalc_cost:
+                        store.set_import_exc_from_inc(bs_list, meter_id)
 
             logger.info(
                 "api_corrections_apply: %s %s_rate=%.6f recalc=%s %d main block(s) "

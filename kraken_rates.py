@@ -27,9 +27,15 @@ from __future__ import annotations
 
 import logging
 import asyncio
+import bisect
 from typing import Optional
 
 from kraken_ingester import normalise_to_naive_utc
+from datetime import datetime, timedelta, timezone
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - zoneinfo is stdlib on 3.9+
+    ZoneInfo = None
 
 logger = logging.getLogger("kraken_rates")
 
@@ -58,6 +64,20 @@ class RateSchedule:
                  exc_periods: Optional[list[tuple[str, Optional[str], float]]] = None):
         # Sorted by valid_from ascending; each entry (from, to|None, rate).
         self._periods = sorted(periods, key=lambda p: p[0])
+        # BL-56: bisect index + a "safe to bisect" flag. Resolution is O(log n)
+        # for a non-overlapping/contiguous schedule (every real schedule — Agile,
+        # standard-unit-rates, the BL-52 reconstruction, the BL-54 stitch), which
+        # matters now the stitch can reach 100k+ periods. An OVERLAPPING schedule
+        # (a period's vto extends past the next period's vfrom, or an open-ended
+        # period that isn't last) keeps the exact linear "last-overlap-wins" scan.
+        self._vfroms = [p[0] for p in self._periods]
+        _mono = True
+        for _i in range(len(self._periods) - 1):
+            _vt = self._periods[_i][1]
+            if _vt is None or _vt > self._periods[_i + 1][0]:
+                _mono = False
+                break
+        self._monotonic = _mono
         # BL-23 (4.2): optional parallel EX-VAT schedule, exposed as `.exc`. It's a
         # sibling RateSchedule, so every resolver (resolve / day_rate_bounds /
         # off_peak_rate_near / flat_rate) works on exc for free — no duplicated logic
@@ -74,15 +94,54 @@ class RateSchedule:
 
     def resolve(self, ts: str) -> Optional[float]:
         """Return the rate active at naive-UTC ts, or None if uncovered."""
+        p = self._periods
+        if not p:
+            return None
+        if self._monotonic:
+            # rightmost period with vfrom <= ts; it covers ts unless ts is in a gap
+            k = bisect.bisect_right(self._vfroms, ts) - 1
+            if k < 0:
+                return None
+            vfrom, vto, rate = p[k]
+            return rate if (vto is None or ts < vto) else None
+        # overlapping/degenerate schedule — exact last-overlap-wins linear scan
         match: Optional[float] = None
-        for vfrom, vto, rate in self._periods:
+        for vfrom, vto, rate in p:
             if ts < vfrom:
-                break  # periods are sorted; no earlier-starting match remains
+                break
             if vto is None or ts < vto:
                 match = rate
-                # don't break: a later period may also start <= ts (overlap);
-                # last one wins, which matches "most recent change takes effect".
         return match
+
+    def _day_rates(self, ts: str) -> list:
+        """Rates of every period overlapping ts's calendar day. Bisects to the day
+        for a monotonic schedule (O(log n + periods-in-day)); exact linear scan
+        otherwise. Shared by off_peak_rate_near / day_rate_bounds."""
+        p = self._periods
+        if not p:
+            return []
+        day = str(ts)[:10]
+        day_start, day_end = day + "T00:00:00", day + "T23:59:59"
+        rates = []
+        if self._monotonic:
+            i = bisect.bisect_right(self._vfroms, day_start) - 1
+            if i < 0:
+                i = 0
+            n = len(p)
+            while i < n:
+                vfrom, vto, rate = p[i]
+                if vfrom > day_end:
+                    break
+                if vto is None or vto > day_start:
+                    rates.append(rate)
+                i += 1
+            return rates
+        for vfrom, vto, rate in p:
+            if vfrom > day_end:
+                break
+            if vto is None or vto > day_start:
+                rates.append(rate)
+        return rates
 
     def off_peak_rate_near(self, ts: str) -> Optional[float]:
         """The minimum rate among periods active on the same calendar day as ts.
@@ -99,19 +158,7 @@ class RateSchedule:
         genuine dispatch slots, and a dispatched Agile slot getting the day's
         cheapest rate is defensible.
         """
-        if not self._periods:
-            return None
-        day = str(ts)[:10]  # YYYY-MM-DD
-        day_start = day + "T00:00:00"
-        day_end = day + "T23:59:59"
-        rates = []
-        for vfrom, vto, rate in self._periods:
-            # period overlaps the day if it starts before day_end and ends after
-            # day_start (or is open-ended)
-            if vfrom > day_end:
-                break
-            if vto is None or vto > day_start:
-                rates.append(rate)
+        rates = self._day_rates(ts)
         return min(rates) if rates else None
 
     def day_rate_bounds(self, ts: str):
@@ -119,16 +166,7 @@ class RateSchedule:
         peak) for a banded tariff, or (r, r) for a flat one. (None, None) if the
         day isn't covered. Used to give imported blocks a CLEAN tariff rate keyed
         by their OFF_PEAK/STANDARD label instead of a jittery cost÷kWh."""
-        if not self._periods:
-            return (None, None)
-        day = str(ts)[:10]
-        day_start, day_end = day + "T00:00:00", day + "T23:59:59"
-        rates = []
-        for vfrom, vto, rate in self._periods:
-            if vfrom > day_end:
-                break
-            if vto is None or vto > day_start:
-                rates.append(rate)
+        rates = self._day_rates(ts)
         return (min(rates), max(rates)) if rates else (None, None)
 
     def is_off_peak(self, ts: str, tol: float = 1e-9) -> Optional[bool]:
@@ -273,6 +311,186 @@ def _build_schedule_and_diag(records, product_code, tariff_code):
     return sched
 
 
+
+
+# ── BL-54: agreement-stitched import schedule ────────────────────────────────
+# The overlay and the reconcile price a HISTORICAL block with the CURRENT import
+# schedule (RateSchedule for the current tariff only). For any account whose
+# current tariff differs in rate from the tariff that actually applied on a
+# block's date, that misprices pre-migration blocks. Stitch ONE schedule across
+# ALL agreements — each agreement's rates (via build_rate_schedule, incl. the
+# BL-52 window reconstruction) clipped to its [valid_from, valid_to) — so
+# resolve(ts) returns the tariff that applied on ts. Historical (closed)
+# agreements are immutable and cached by (tariff, from, to).
+_AGREEMENT_SCHED_CACHE: dict = {}
+
+
+def _clip_periods(periods, ag_vf, ag_vt):
+    """Clip (vfrom, vto, rate) periods to the agreement window [ag_vf, ag_vt)."""
+    out = []
+    for pvf, pvt, rate in periods:
+        cvf = max(pvf, ag_vf) if ag_vf else pvf
+        ends = [x for x in (pvt, ag_vt) if x is not None]
+        cvt = min(ends) if ends else None
+        if cvt is not None and cvf >= cvt:
+            continue
+        out.append((cvf, cvt, rate))
+    return out
+
+
+async def build_agreement_stitched_schedule(client, agreements) -> "RateSchedule":
+    """Stitch a single import RateSchedule across ALL agreements so resolve(ts)
+    prices ts on the tariff that applied then. Reuses build_rate_schedule per
+    agreement; closed agreements cached by (tariff, from, to). On total failure
+    returns an empty schedule (caller keeps its last-known)."""
+    if not agreements:
+        return RateSchedule([])
+    ttp = getattr(client, "_tariff_to_product_code", None)
+    ags = sorted(agreements, key=lambda a: a.get("valid_from") or "")
+    inc, exc = [], []
+    n_ok = 0
+    for ag in ags:
+        tc = ag.get("tariff_code")
+        if not tc:
+            continue
+        vf_raw, vt_raw = ag.get("valid_from"), ag.get("valid_to")
+        try:
+            ag_vf = normalise_to_naive_utc(vf_raw) if vf_raw else None
+        except ValueError:
+            ag_vf = None
+        ag_vt = None
+        if vt_raw:
+            try:
+                ag_vt = normalise_to_naive_utc(vt_raw)
+            except ValueError:
+                ag_vt = None
+        is_open = ag_vt is None
+        ckey = (tc, vf_raw, vt_raw)
+        ag_sched = None if is_open else _AGREEMENT_SCHED_CACHE.get(ckey)
+        if ag_sched is None:
+            pc = ttp(tc) if ttp else None
+            if not pc:
+                logger.warning("stitch: no product for tariff %s — skipped", tc)
+                continue
+            try:
+                ag_sched = await build_rate_schedule(
+                    client, pc, tc, period_from=vf_raw, period_to=vt_raw)
+            except Exception as e:
+                logger.warning("stitch: %s fetch failed (%s) — span uncovered", tc, e)
+                continue
+            if not is_open and not ag_sched.is_empty():
+                _AGREEMENT_SCHED_CACHE[ckey] = ag_sched
+        if ag_sched.is_empty():
+            continue
+        inc.extend(_clip_periods(ag_sched._periods, ag_vf, ag_vt))
+        if ag_sched.exc is not None:
+            exc.extend(_clip_periods(ag_sched.exc._periods, ag_vf, ag_vt))
+        n_ok += 1
+    if not inc:
+        return RateSchedule([])
+    logger.info("build_agreement_stitched_schedule: stitched %d/%d agreement(s) "
+                "→ %d periods", n_ok, len(ags), len(inc))
+    return RateSchedule(inc, exc or None)
+
+
+# ── BL-52: reconstruct the windowed periods IOG's old standard-unit-rates gave ──
+# The uncapped IOG tariff delivered its day/night split via `standard-unit-rates`
+# as time-boundaried periods (night 23:30-05:30 local, day otherwise), so
+# RateSchedule.resolve()/is_off_peak() worked for free. The new 4-rate
+# IOG-SMB tariff drops standard-unit-rates and returns day/night as two FLAT,
+# windowless rates — collapsing resolve() to a single all-day rate. We rebuild the
+# missing windowed periods here; nothing downstream changes.
+_IOG_OFFPEAK_START = (23, 30)   # local (UK) time the off-peak (night) band begins
+_IOG_OFFPEAK_END   = (5, 30)    # local (UK) time it ends (day band begins)
+_IOG_TZ_NAME       = "Europe/London"   # IOG is UK-only; the window is UK local time
+_IOG_SYNTH_HORIZON_DAYS = 2
+
+
+def _synthesize_iog_tou_windowed(day_records, night_records,
+                                 *, tz_name: str = _IOG_TZ_NAME,
+                                 horizon_days: int = _IOG_SYNTH_HORIZON_DAYS,
+                                 now: "datetime | None" = None) -> list:
+    """Rebuild time-windowed day/night unit-rate records from IOG's flat 4-rate
+    day/night buckets, so the schedule has the SAME shape the old
+    standard-unit-rates feed produced. Night rate inside 23:30-05:30 local, day
+    rate outside; DST-aware; across the span the buckets cover. Returns records in
+    the shape RateSchedule.from_api_records consumes. On ANY problem returns the
+    plain concatenation (windowless) so pricing degrades to the rates, never to
+    nothing."""
+    day_records = day_records or []
+    night_records = night_records or []
+    try:
+        if ZoneInfo is None:
+            return day_records + night_records
+        tz = ZoneInfo(tz_name)
+        day_sched = RateSchedule.from_api_records(day_records)
+        night_sched = RateSchedule.from_api_records(night_records)
+        if day_sched.is_empty() and night_sched.is_empty():
+            return []
+        froms = []
+        for r in day_records + night_records:
+            vf = r.get("valid_from")
+            if not vf:
+                continue
+            try:
+                froms.append(normalise_to_naive_utc(vf))
+            except ValueError:
+                pass
+        if not froms:
+            return day_records + night_records
+        start_dt = datetime.fromisoformat(min(froms))
+        _now = now or datetime.utcnow()
+        horizon = _now.replace(microsecond=0) + timedelta(days=max(1, horizon_days))
+        # 05:30 (day begins) + 23:30 (night begins) LOCAL boundaries, day by day.
+        # Both are clear of the 01:00-02:00 DST fold/gap, so no ambiguous times.
+        first_local = ((start_dt.replace(tzinfo=timezone.utc)).astimezone(tz).date()
+                       - timedelta(days=1))
+        bounds = []            # (naive-UTC datetime, band)
+        d, guard = first_local, 0
+        while guard < 4000:    # safety cap (~5.5 yr of day/night boundaries)
+            guard += 1
+            day_begin = datetime(d.year, d.month, d.day,
+                                 _IOG_OFFPEAK_END[0], _IOG_OFFPEAK_END[1], tzinfo=tz)
+            night_begin = datetime(d.year, d.month, d.day,
+                                   _IOG_OFFPEAK_START[0], _IOG_OFFPEAK_START[1], tzinfo=tz)
+            bounds.append((day_begin.astimezone(timezone.utc).replace(tzinfo=None), "day"))
+            bounds.append((night_begin.astimezone(timezone.utc).replace(tzinfo=None), "night"))
+            d = d + timedelta(days=1)
+            probe = (datetime(d.year, d.month, d.day, tzinfo=tz)
+                     .astimezone(timezone.utc).replace(tzinfo=None))
+            if probe > horizon:
+                break
+        bounds.sort(key=lambda b: b[0])
+        out = []
+        for i in range(len(bounds) - 1):
+            vf, band = bounds[i]
+            vt = bounds[i + 1][0]
+            if vt <= start_dt:          # wholly before the agreement start
+                continue
+            if vf >= horizon:
+                break
+            src = day_sched if band == "day" else night_sched
+            inc = src.resolve(vf.isoformat())
+            if inc is None:             # one bucket empty → use the other
+                src = night_sched if band == "day" else day_sched
+                inc = src.resolve(vf.isoformat())
+            if inc is None:
+                continue
+            rec = {"value_inc_vat": inc,
+                   "valid_from": vf.isoformat(),
+                   "valid_to": vt.isoformat(),
+                   "payment_method": None}
+            exc = src.exc.resolve(vf.isoformat()) if src.exc is not None else None
+            if exc is not None:
+                rec["value_exc_vat"] = exc
+            out.append(rec)
+        return out or (day_records + night_records)
+    except Exception as e:
+        logger.warning("_synthesize_iog_tou_windowed: failed (%s) — falling back "
+                       "to windowless day/night rates", e)
+        return day_records + night_records
+
+
 async def build_rate_schedule(
     client, product_code: str, tariff_code: str,
     *, period_from: Optional[str] = None, period_to: Optional[str] = None,
@@ -321,11 +539,20 @@ async def build_rate_schedule(
             night = await client.get_unit_rates(
                 product_code, tariff_code, rate_type="night-unit-rates",
                 period_from=period_from, period_to=period_to)
-            records = (day or []) + (night or [])
-            if records:
-                logger.info("build_rate_schedule: %s — no standard rates; built "
-                            "from day(%d)+night(%d) TOU buckets (new IOG structure)",
-                            tariff_code, len(day or []), len(night or []))
+            _is_iog = "IOG" in (tariff_code or "").upper()
+            if (day or night) and _is_iog:
+                # BL-52: rebuild the windowed periods the new 4-rate feed omits.
+                records = _synthesize_iog_tou_windowed(day, night)
+                logger.info("build_rate_schedule: %s — no standard rates; "
+                            "reconstructed %d windowed period(s) from day(%d)+"
+                            "night(%d) TOU buckets (IOG 23:30-05:30 local)",
+                            tariff_code, len(records), len(day or []), len(night or []))
+            else:
+                records = (day or []) + (night or [])
+                if records:
+                    logger.info("build_rate_schedule: %s — no standard rates; built "
+                                "from day(%d)+night(%d) TOU buckets (new IOG structure)",
+                                tariff_code, len(day or []), len(night or []))
         except Exception as e:
             logger.warning("build_rate_schedule: day/night fallback failed for "
                            "%s/%s: %s", product_code, tariff_code, e)
