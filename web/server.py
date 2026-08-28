@@ -227,12 +227,23 @@ _read_local = threading.local()
 
 
 def _get_read_store() -> BlockStore:
-    """A per-thread READ-ONLY BlockStore for GET endpoints (see BL-18c note above)."""
+    """A per-thread READ-ONLY BlockStore for GET endpoints (see BL-18c note above).
+
+    A separate read companion is only valid when it opens the *same on-disk file*
+    the writer holds (WAL lets readers share it). It is NOT valid for an in-memory
+    store or any injected store (e.g. tests set `_store` to a `:memory:` DB): each
+    such connection is a distinct, empty database, so a companion would see "no
+    such table: blocks". In those cases reuse the shared `_store` connection.
+    """
+    if DATA_DIR is None:
+        raise RuntimeError("server.init() has not been called")
+    db_path = _os.path.join(DATA_DIR, "blocks.db")
+    shared = _store
+    if shared is not None and getattr(shared, "_path", None) != db_path:
+        # In-memory or injected store — no shareable file; reuse the primary.
+        return shared
     st = getattr(_read_local, "store", None)
     if st is None:
-        if DATA_DIR is None:
-            raise RuntimeError("server.init() has not been called")
-        db_path = _os.path.join(DATA_DIR, "blocks.db")
         try:
             st = BlockStore(db_path, read_only=True)
         except Exception:
