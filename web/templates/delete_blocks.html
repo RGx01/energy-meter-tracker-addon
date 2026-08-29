@@ -188,6 +188,12 @@ function deleteBlocksPreview() {
       return;
     }
     prevEl.style.display = 'block';
+    if (d.iog_locked) {
+      prevText.innerHTML    = '<strong>Deletion is disabled for this period.</strong><br>' +
+                              (d.iog_message || 'This range includes time on Intelligent Octopus Go.');
+      confRow.style.display = 'none';
+      return;
+    }
     if (d.blocks === 0) {
       prevText.textContent  = 'No blocks found for the selected date range.';
       confRow.style.display = 'none';

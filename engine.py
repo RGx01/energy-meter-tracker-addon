@@ -9054,6 +9054,22 @@ async def run_gap_fill_job(from_ts, to_ts, *, channels=("import", "export"),
     Drives its own newest→oldest frontier (each slice's 'oldest') across iterations
     rather than the full-import checkpoint, so a bounded gap fill never disturbs a
     full-import resume point. One contiguous span; never raises."""
+    # 4.5.6 IOG corruption guard: refuse to API-fill any window overlapping an
+    # Intelligent Octopus Go agreement. Octopus removed the per-slot OFF_PEAK label,
+    # so a re-fill re-prices out-of-core smart charges at PEAK and permanently
+    # corrupts the bill. The UI gates this too; this is the engine-level safety net
+    # so no caller (per-gap button, range re-import, reconnect) can slip one through.
+    if _range_overlaps_iog(from_ts, to_ts):
+        _api_import_job.clear()
+        _api_import_job.update({
+            "status": "refused", "reason": "iog_locked", "done": True,
+            "error": ("API import/gap-fill is disabled for Intelligent Octopus Go "
+                      "periods (Octopus removed the per-slot off-peak label; a re-import "
+                      "would re-price smart charges at peak). Import from a CSV bill "
+                      "instead.")})
+        logger.warning("run_gap_fill_job: REFUSED %s..%s — overlaps an IOG agreement "
+                       "window (4.5.6 corruption guard)", from_ts, to_ts)
+        return
     j = _api_import_job
     j.clear()
     j.update({"status": "running", "phase": "importing", "control": "run",
@@ -9171,6 +9187,21 @@ async def run_api_import_job(requested_from=None, *, chunk_days: int = 60,
     """Background worker: loop `import_api_history` slices until done, honouring
     the pause/cancel control flag between slices and during rate-limit cooldown.
     Updates `_api_import_job` for the status endpoint. Never raises."""
+    # 4.5.6 IOG corruption guard (see run_gap_fill_job). A whole-history import
+    # (requested_from=None) necessarily reaches into any IOG window, so refuse when
+    # the account has an IOG agreement; a bounded start still checks the overlap.
+    if _iog_agreement_windows() and (requested_from is None
+                                     or _range_overlaps_iog(requested_from, None)):
+        _api_import_job.clear()
+        _api_import_job.update({
+            "status": "refused", "reason": "iog_locked", "done": True,
+            "error": ("API history import is disabled for Intelligent Octopus Go "
+                      "periods (Octopus removed the per-slot off-peak label; a re-import "
+                      "would re-price smart charges at peak). Import from a CSV bill "
+                      "instead.")})
+        logger.warning("run_api_import_job: REFUSED (from=%s) — account has an IOG "
+                       "agreement window (4.5.6 corruption guard)", requested_from)
+        return
     j = _api_import_job
     j.clear()
     j.update({"status": "running", "phase": "importing", "control": "run",
@@ -9391,6 +9422,80 @@ def _agreement_priced_ok(block_start: str) -> bool:
     if not caf or not block_start:
         return True
     return str(block_start) >= caf
+
+
+def _iog_agreement_windows() -> list:
+    """4.5.6: [(valid_from, valid_to)] naive-UTC iso for every IOG agreement on the
+    import channel — the periods where a dispatched off-peak slot cannot be recovered
+    from the API (Octopus removed the per-slot OFF_PEAK label; measurements return the
+    gross STANDARD rate). `valid_to` None = open-ended (current). Empty if the account
+    was never on IOG, or if the agreement history is unknown. Reads the discovered
+    agreement history (no network). Intelligent Octopus Go is coded 'INTELLI' in the
+    Octopus tariff string (e.g. E-1R-INTELLI-VAR-24-10-29-B); the SMB/TOU cap variant
+    is the same family — both carry dispatched off-peak we can no longer recover from
+    the API, so match either 'INTELLI' or 'IOG'."""
+    info = (_kraken_discovery or {}).get("import") or {}
+    try:
+        from kraken_ingester import normalise_to_naive_utc as _nn
+    except Exception:
+        _nn = lambda x: x  # noqa: E731 — degrade to raw iso compare
+    out = []
+    for a in (info.get("agreements") or []):
+        tariff = a.get("tariff_code") or a.get("tariff") or ""
+        _u = str(tariff).upper()
+        if "IOG" not in _u and "INTELLI" not in _u:
+            continue
+        vf, vt = a.get("valid_from"), a.get("valid_to")
+        try:
+            nvf = _nn(vf) if vf else None
+        except Exception:
+            nvf = None
+        try:
+            nvt = _nn(vt) if vt else None
+        except Exception:
+            nvt = None
+        out.append((nvf, nvt))
+    return out
+
+
+def _range_overlaps_iog(frm, to=None) -> bool:
+    """4.5.6: True if the half-open range [frm, to) overlaps any IOG agreement window.
+    Gates API import / gap-fill and block DELETE for IOG periods, where a re-import
+    would silently re-price out-of-core dispatched bumps at peak (unrecoverable). `to`
+    None = open-ended (from `frm` onward). Conservative: unknown/unparseable input that
+    still has an IOG window returns True (better to gate than to corrupt)."""
+    wins = _iog_agreement_windows()
+    if not wins or not frm:
+        return False
+    try:
+        from kraken_ingester import normalise_to_naive_utc as _nn
+        f = _nn(frm); t = _nn(to) if to else None
+    except Exception:
+        f = str(frm); t = str(to) if to else None
+    for vf, vt in wins:
+        lo = vf or "0000-01-01T00:00:00"
+        hi = vt  # None = open-ended current agreement
+        if (hi is None or f < hi) and (t is None or t > lo):
+            return True
+    return False
+
+
+def _block_start_in_iog(block_start: str) -> bool:
+    """4.5.6: True if a single block-start falls inside an IOG agreement window
+    (lo <= start < hi). Point membership, not range overlap."""
+    wins = _iog_agreement_windows()
+    if not wins or not block_start:
+        return False
+    try:
+        from kraken_ingester import normalise_to_naive_utc as _nn
+        b = _nn(block_start)
+    except Exception:
+        b = str(block_start)
+    for vf, vt in wins:
+        lo = vf or "0000-01-01T00:00:00"
+        if b >= lo and (vt is None or b < vt):
+            return True
+    return False
 
 
 async def _refresh_kraken_rate_schedules() -> None:
@@ -10524,8 +10629,15 @@ _DISPATCH_RECONCILE_APPLY = True  # write (risk accepted; soaked on prod_dev fir
 
 # ── BL-53 step 2: measured-cost fetch (Octopus BILLED cost for settled dispatched
 # slots — the authoritative figure the 4-rate cap total is hardest to re-derive) ──
-_MEASURED_FETCH_ENABLED = True     # master switch for the settlement-time measurements fetch
-_MEASURED_APPLY = True             # BL-53 step 3: WRITE measured rates (user-directed auto-apply)
+# 4.5.6: Octopus removed the per-slot OFF_PEAK label from the Measurements API — a
+# dispatched off-peak slot now returns the GROSS STANDARD (peak) rate with no way to
+# tell it from a genuine peak slot (verified: STANDARD_RATE for 2026-07-21 16:00 BST,
+# which the bill charged off-peak). With the label gone, the settlement-time fetch can
+# only ever return peak, and applying it STAMPS SETTLED OFF-PEAK BLOCKS TO PEAK —
+# the 4.5.5 corruption. Both switches are held OFF until Octopus re-exposes a per-slot
+# band signal; the dispatch overlay (live capture) remains the per-slot off-peak truth.
+_MEASURED_FETCH_ENABLED = False    # 4.5.6: OFF — measurements no longer carry the off-peak band
+_MEASURED_APPLY = False            # 4.5.6: OFF — never write gross STANDARD rate over a settled block
 _MEASURED_MAX_PER_PASS = 40        # bound the rate-limited fetch per hourly pass
 # Tariff-era floor: the IOG-SMB rollout began ~1 Aug 2026, so measured pricing only
 # needs to reach back to there (matches the BL-55 heal floor). Older dispatched slots
@@ -11099,6 +11211,7 @@ async def reconcile_dispatch_overlay() -> dict:
         logger.warning("reconcile_dispatch_overlay: query failed: %s", e)
         return {}
     n_restore = n_revert = n_review = n_deferred = n_band = n_boundary = 0
+    n_settled_guard = 0
     changed = bool(_n_attr)          # back-attribution alone should refresh the charts
     n_candidates = len(rows)
     for r in rows:
@@ -11162,6 +11275,22 @@ async def reconcile_dispatch_overlay() -> dict:
             has_planned=("planned" in kinds),
             was_online=(not bool(r["interpolated"])),
             contemporaneous=contemporaneous)
+        # 4.5.6 SETTLED-BLOCK GUARD: never REVERT a SETTLED, COMPLETED-dispatch block
+        # toward peak. A `completed` dispatch is Octopus's OWN signal that it ran the
+        # slot as a smart charge (→ off-peak on the bill); once such a block is SETTLED
+        # (imp_kwh_api present) its billed band is authoritative. The dispatch-lifecycle
+        # heuristic must not flip it to peak on a "we never saw it START" inference (nor
+        # the negligible-completed-energy revert) — that silently over-charged genuine
+        # off-peak dispatched bumps the bill priced off-peak (2026-07-21 16:00 BST,
+        # completed -0.09 kWh < the negligible gate). A PLANNED-ONLY slot (no `completed`)
+        # genuinely never charged, so its peak revert is correct and NOT guarded.
+        # `_reconcile_decision` only returns target=="peak" when the block is currently
+        # off-peak, so this is exactly the toward-peak revert; off-peak RESTORES and
+        # unsettled predictions are unaffected.
+        if (target == "peak" and r["imp_kwh_api"] is not None
+                and "completed" in kinds):
+            n_settled_guard += 1
+            continue
         if target == "review":
             # A review flag invites a manual correction, but the correction tool
             # can only touch DCC-settled blocks. Dispatch `completed` arrives at
@@ -11453,10 +11582,10 @@ async def reconcile_dispatch_overlay() -> dict:
     # log — "0 candidates" vs "N candidates, 0 changed" tells very different
     # stories when a block isn't being corrected.
     logger.info("reconcile: scanned %d candidate(s) — %d restored, %d reverted, "
-                "%d review, %d deferred, %d band-relabelled, %d agreement-guarded "
-                "(settle=%dh)",
+                "%d review, %d deferred, %d band-relabelled, %d agreement-guarded, "
+                "%d settled-guarded (settle=%dh)",
                 n_candidates, n_restore, n_revert, n_review, n_deferred, n_band,
-                n_boundary, int(_RECONCILE_SETTLE_HOURS))
+                n_boundary, n_settled_guard, int(_RECONCILE_SETTLE_HOURS))
     return {"restored": n_restore, "reverted": n_revert, "review": n_review,
             "deferred": n_deferred, "band_relabelled": n_band,
             "agreement_guarded": n_boundary}
