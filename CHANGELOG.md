@@ -2,35 +2,38 @@
  
 ## [4.5.6] — 2026-08-29
 
-> ⚠️ **Important — Intelligent Octopus Go users.** Octopus has changed IOG so that
-> per-slot rate data can **no longer be relied on from the API — both for historical
-> data and going forward** (the off-peak label is gone; the Measurements API now
-> returns the gross standard/peak rate for smart-charge slots, indistinguishable from
-> a genuine peak slot). To prevent any further corruption of your EMT data, **API
-> imports and block deletion are disabled for all IOG tariff periods** until a
-> workaround is found. Live tracking is unaffected — EMT continues to price your
-> ongoing usage correctly from its own dispatch capture. **CSV import from a bill and
-> manual block corrections both still work**, so you can still fix or fill data by hand.
+> ℹ️ **Note for Intelligent Octopus Go users.** IOG per-slot rate data from the API
+> is **not reliable enough to safely re-import or re-price against right now**.
+> Recently-settled slots come back at the standard (peak) rate until they finish
+> settling with Octopus (a few days later they show as off-peak), and some out-of-core
+> smart-charge slots don't carry an off-peak label at all — the off-peak comes from a
+> dispatch credit the raw rate data doesn't reflect. Because EMT can't reliably tell
+> those apart from a genuine peak slot at import time, **API imports and block deletion
+> are disabled for IOG periods as a precaution** until the import/settlement timing is
+> handled properly. Live tracking is unaffected — EMT keeps pricing your ongoing usage
+> from its own dispatch capture — and **CSV import from a bill and manual block
+> corrections both still work**, so you can fix or fill data by hand.
 
-*A stop-gap that protects the bill after the IOG API change above. The measured-cost
-pass — which could now only ever fetch the gross peak rate — is turned off, a
-settled-block guard stops the dispatch reconcile reverting genuine off-peak bumps, and
-API import + block delete are gated for IOG periods.*
+*A precautionary stop-gap while IOG API rate reliability is worked through. The
+measured-cost pass (which could apply an unsettled/provisional rate over a block that
+later settles off-peak) is turned off, a settled-block guard stops the dispatch
+reconcile reverting genuine off-peak bumps, and API import + block delete are gated for
+IOG periods.*
 
 ### Fixed
 
-- **The 4.5.5 measured-cost corruption is stopped at the source.** Octopus removed the per-slot `OFF_PEAK` label from the Measurements API: a dispatched off-peak slot now returns the **gross STANDARD (peak) rate** with nothing to distinguish it from a genuine peak slot (confirmed — `STANDARD_RATE` for 2026-07-21 16:00 BST, which the bill charged off-peak). With the label gone, the settlement-time measured fetch can only ever return peak, and applying it **stamped settled off-peak blocks to peak** — the drift seen between prod and prod-dev on the July bill. Both switches (`_MEASURED_FETCH_ENABLED`, `_MEASURED_APPLY`) are now held **off** until Octopus re-exposes a per-slot band signal. The dispatch overlay (captured live) remains the per-slot off-peak truth for pricing.
-- **The dispatch reconcile no longer reverts a settled, dispatched off-peak block to peak.** A completed dispatch is Octopus's own signal that it ran the slot as a smart charge (→ off-peak on the bill); once such a block is **settled** (`imp_kwh_api` present) its billed band is authoritative. The lifecycle heuristic used to flip it to peak on a "we never saw it start" inference or a negligible-completed-energy revert — silently over-charging genuine off-peak bumps the bill priced off-peak (2026-07-21 16:00 BST, completed −0.09 kWh, under the negligible gate). A planned-only slot (never completed = never charged) is still correctly reverted. Tests: `tests/test_reconcile_settled_guard.py`, `test_dispatch_overlay_follow_main.py`.
+- **The measured-cost pass no longer over-writes a settled off-peak block with a provisional rate.** The settlement-time fetch could read a slot before it had finished settling with Octopus — getting the provisional **standard (peak)** rate — and then apply it, stamping a genuinely off-peak block to peak (the drift seen between prod and prod-dev on the July/August blocks). It also can't recover the off-peak on some out-of-core smart-charge slots, where the off-peak comes from a dispatch credit the rate data doesn't carry. Both switches (`_MEASURED_FETCH_ENABLED`, `_MEASURED_APPLY`) are held **off** until the pass can reliably wait for settlement. The dispatch overlay (captured live) remains the per-slot off-peak truth for pricing.
+- **The dispatch reconcile no longer reverts a settled, dispatched off-peak block to peak.** A completed dispatch is Octopus's own signal that it ran the slot as a smart charge (→ off-peak on the bill); once such a block is **settled** (`imp_kwh_api` present) its billed band is authoritative. The lifecycle heuristic used to flip it to peak on a "we never saw it start" inference or a negligible-completed-energy revert — over-charging genuine off-peak bumps the bill priced off-peak (2026-07-21 16:00 BST, completed −0.09 kWh, under the negligible gate). A planned-only slot (never completed = never charged) is still correctly reverted. Tests: `tests/test_reconcile_settled_guard.py`, `test_dispatch_overlay_follow_main.py`.
 
 ### Changed
 
-- **API import / gap-fill is disabled for Intelligent Octopus Go periods.** Re-importing an IOG window re-prices out-of-core smart-charge slots at peak with no way to tell them from a genuine peak slot — a permanent, silent corruption of the bill — because Octopus no longer exposes the per-slot off-peak label. The gate fires on every API import path (whole-history, range, per-gap fill, targeted re-import, background controller) and at the engine chokepoints as a safety net. **CSV import from a bill/statement stays allowed** (it is black-and-white). Import over pre-IOG (e.g. flat) history is unaffected. IOG here covers the whole Intelligent Octopus Go family — the `INTELLI` agreements and the SMB/TOU cap variant.
-- **Deleting blocks is disabled for Intelligent Octopus Go periods.** The only way to restore a deleted block — re-importing — now corrupts (see above), so deleting an IOG block would destroy live-captured history that can't be regenerated. The delete preview shows an explainer and the delete is refused; non-IOG history stays deletable. Manual Cost Corrections are unaffected. Tests: `tests/test_iog_gate.py`.
-- **The Deleted-ranges list self-heals orphaned tombstones.** A range you deleted in the past and that was later re-created by another path (live poll / an older refill) left a "deleted" tombstone behind even though the gap no longer exists — cluttering the Data Management list and making a present, correctly-priced block read as deleted (`is_deleted_range`). The list now prunes any tombstone whose range is **fully populated with blocks** when it loads; genuinely still-empty and partially-filled deletions are kept. This also sidesteps the fact that the normal clear path (re-import) is now IOG-gated. Test: `tests/test_stale_tombstones.py`.
+- **API import / gap-fill is disabled for Intelligent Octopus Go periods (precaution).** IOG rate data can be provisional for recently-settled slots and absent for some out-of-core smart-charge slots, so a re-import can't reliably reprice every slot and could quietly mis-price the bill. Rather than risk silent errors, API import is gated on every path (whole-history, range, per-gap fill, targeted re-import, background controller) plus the engine chokepoints as a safety net. **CSV import from a bill/statement stays allowed.** Import over pre-IOG (e.g. flat) history is unaffected. IOG here covers the whole Intelligent Octopus Go family — the `INTELLI` agreements and the SMB/TOU cap variant.
+- **Deleting blocks is disabled for Intelligent Octopus Go periods (precaution).** The only way to restore a deleted block is to re-import it — and while IOG re-import isn't reliable, deleting risks losing data that can't be cleanly restored. The delete preview shows an explainer and the delete is refused; non-IOG history stays deletable, and manual Cost Corrections are unaffected. Tests: `tests/test_iog_gate.py`.
+- **The Deleted-ranges list self-heals orphaned tombstones.** A range deleted in the past and later re-created by another path (live poll / an older refill) left a "deleted" tombstone behind even though the gap no longer exists — cluttering the Data Management list and making a present, correctly-priced block read as deleted (`is_deleted_range`). The list now prunes any tombstone whose range is **fully populated with blocks** when it loads; still-empty and partially-filled deletions are kept. This also sidesteps the fact that the normal clear path (re-import) is now IOG-gated. Test: `tests/test_stale_tombstones.py`.
 
 ### Known limitation
 
-- **Out-of-core smart-charge bumps in history from before EMT was running cannot be recovered.** The per-slot off-peak signal now exists only in EMT's own live-captured dispatch overlay; Octopus's `completedDispatches` serves only the current session, and the Measurements and Transactions APIs no longer carry the band. Core-window charging still imports correctly (Octopus keeps labelling it off-peak) and non-dispatched daytime is genuinely peak; only occasional out-of-core dispatched bumps on pre-install history price at peak. This is an Octopus API limitation with no local remedy — the reason import and delete are gated rather than "fixed."
+- **Some IOG slots can't be reliably priced from the API on import: recently-settled slots (until they settle, a few days) and out-of-core smart-charge bumps (where the off-peak is a dispatch credit the rate data doesn't reflect).** For everything else the API's off-peak data settles in correctly. This is why import and delete are gated for IOG rather than left on — a follow-up will let the import respect settlement timing and re-enable it for settled history.
 
 ## [4.5.5] — 2026-08-28
 
