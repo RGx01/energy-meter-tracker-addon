@@ -35,7 +35,8 @@ class _MockClient:
 class TestMeasureSettled(unittest.TestCase):
     def setUp(self):
         self._save = (engine._store, engine._kraken_client, engine._kraken_discovery,
-                      engine._MEASURED_APPLY, engine._kraken_rate_schedules)
+                      engine._MEASURED_APPLY, engine._kraken_rate_schedules,
+                      engine._MEASURED_FETCH_ENABLED)
         self.p = tempfile.mktemp(suffix=".db")
         st = BlockStore(self.p); st._conn.execute("PRAGMA foreign_keys=OFF")
         c = st._conn
@@ -52,6 +53,8 @@ class TestMeasureSettled(unittest.TestCase):
         engine._store = st
         engine._kraken_discovery = {"import": {"mpan": "M", "tariff_code": "E-1R-IOG-SMB-FIX-12M-26-03-17-B"}}
         engine._MEASURED_APPLY = False
+        engine._MEASURED_FETCH_ENABLED = True   # 4.5.6: fetch is OFF by default;
+        # these tests exercise the fetch function itself, so opt it on locally.
         engine._kraken_rate_schedules = {"import": RateSchedule([
             ("2026-08-22T22:30:00", "2026-08-23T04:30:00", 5.493),
             ("2026-08-23T04:30:00", "2026-08-23T22:30:00", 32.3092),
@@ -66,7 +69,8 @@ class TestMeasureSettled(unittest.TestCase):
 
     def tearDown(self):
         (engine._store, engine._kraken_client, engine._kraken_discovery,
-         engine._MEASURED_APPLY, engine._kraken_rate_schedules) = self._save
+         engine._MEASURED_APPLY, engine._kraken_rate_schedules,
+         engine._MEASURED_FETCH_ENABLED) = self._save
         try: os.remove(self.p)
         except OSError: pass
 

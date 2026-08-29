@@ -4560,6 +4560,48 @@ class BlockStore:
                 "SELECT * FROM deleted_ranges ORDER BY start_utc DESC").fetchall()
         return [dict(r) for r in rows]
 
+    def prune_stale_deleted_ranges(self) -> int:
+        """4.5.6: delete tombstones whose range is ALREADY fully populated with
+        blocks. Such rows are orphaned — the range was deleted in the past, then
+        re-created by another path (live poll / an older refill) that didn't clear
+        the tombstone. A stale tombstone makes a present, correctly-priced block
+        look 'deleted' (`is_deleted_range`) and clutters the Data Management list,
+        and the normal clear path (re-import) may be gated (IOG). Only removes a row
+        when EVERY 30-min slot in [start,end) has a block for the row's meter — a
+        genuinely still-empty deletion is left untouched. Returns rows pruned."""
+        rows = self._conn.execute(
+            "SELECT id, meter_id, start_utc, end_utc FROM deleted_ranges").fetchall()
+        pruned = 0
+        with self._conn:
+            for r in rows:
+                mid = r["meter_id"]
+                check_mid = "electricity_main" if mid == "*" else mid
+                try:
+                    s = datetime.fromisoformat(r["start_utc"])
+                    e = datetime.fromisoformat(r["end_utc"])
+                except Exception:
+                    continue
+                try:
+                    _cp = self.get_config_period_for_date(r["start_utc"])
+                    step = int((_cp or {}).get("block_minutes") or 30)
+                except Exception:
+                    step = 30
+                span_min = (e - s).total_seconds() / 60.0
+                if span_min <= 0 or step <= 0:
+                    continue
+                expected = int(round(span_min / step))
+                if expected <= 0:
+                    continue
+                have = self._conn.execute(
+                    "SELECT COUNT(DISTINCT block_start) FROM blocks "
+                    "WHERE meter_id = ? AND block_start >= ? AND block_start < ?",
+                    (check_mid, r["start_utc"], r["end_utc"])).fetchone()[0]
+                if have >= expected:
+                    self._conn.execute(
+                        "DELETE FROM deleted_ranges WHERE id = ?", (r["id"],))
+                    pruned += 1
+        return pruned
+
     def clear_deleted_range(self, meter_id: str, start_utc: str,
                             end_utc: str) -> int:
         """Lift the tombstone over [start_utc, end_utc) for a TARGETED re-import.

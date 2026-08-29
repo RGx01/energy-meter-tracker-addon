@@ -25,7 +25,8 @@ SCOPES = ("whole_history", "gaps", "range")
 SOURCES = ("api", "csv")
 
 
-def evaluate_gates(scope, source, *, api_available, has_blocks, gaps_present):
+def evaluate_gates(scope, source, *, api_available, has_blocks, gaps_present,
+                   iog_locked=False):
     """Is this scope+source allowed for the user's setup?
 
     Returns {'allowed': bool, 'reason': str|None, 'message': str, 'warnings': [str]}.
@@ -45,6 +46,22 @@ def evaluate_gates(scope, source, *, api_available, has_blocks, gaps_present):
         return {"allowed": False, "reason": "no_api",
                 "message": ("No supplier API is configured, so readings can't be "
                             "fetched. Use a CSV instead, or add an API key in Settings."),
+                "warnings": []}
+
+    # 4.5.6: API import/gap-fill is disabled for any window that overlaps an
+    # Intelligent Octopus Go agreement. Octopus removed the per-slot OFF_PEAK
+    # label from the Measurements API, so re-fetching an IOG period re-prices
+    # out-of-core smart-charge slots at PEAK with no way to tell them from a
+    # genuine peak slot — a permanent, silent corruption of the bill. CSV import
+    # (from a bill/statement, which is black-and-white) stays allowed; the caller
+    # computes the overlap from the agreement history (engine._range_overlaps_iog).
+    if source == "api" and iog_locked:
+        return {"allowed": False, "reason": "iog_locked",
+                "message": ("This period includes time on Intelligent Octopus Go. "
+                            "Octopus no longer exposes the per-slot off-peak label, "
+                            "so an API import would re-price smart charges at peak and "
+                            "permanently corrupt the bill. API import is disabled for "
+                            "IOG periods — a CSV import from your bill is still fine."),
                 "warnings": []}
 
     if scope == "gaps" and not gaps_present:
@@ -104,7 +121,8 @@ def classify_windows(target_starts, occupied_starts):
 
 
 def plan_backfill(*, scope, source, api_available, has_blocks,
-                  gaps=None, target_starts=None, occupied_starts=None):
+                  gaps=None, target_starts=None, occupied_starts=None,
+                  iog_locked=False):
     """Compose gates + dispatch + window classification into a preview dict.
 
     Pure — performs no writes. Inputs:
@@ -119,7 +137,8 @@ def plan_backfill(*, scope, source, api_available, has_blocks,
     """
     gaps = gaps or []
     gates = evaluate_gates(scope, source, api_available=api_available,
-                           has_blocks=has_blocks, gaps_present=bool(gaps))
+                           has_blocks=has_blocks, gaps_present=bool(gaps),
+                           iog_locked=iog_locked)
     if not gates["allowed"]:
         return {"ok": False, "scope": scope, "source": source,
                 "reason": gates["reason"], "message": gates["message"]}

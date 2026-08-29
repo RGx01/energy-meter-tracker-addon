@@ -4368,6 +4368,29 @@ def _bf_range_starts(from_iso, to_iso, step_min, cap=20000):
     return out
 
 
+_IOG_IMPORT_MSG = ("API import/gap-fill is disabled for Intelligent Octopus Go "
+                   "periods. Octopus removed the per-slot off-peak label, so a "
+                   "re-import would re-price smart charges at peak and permanently "
+                   "corrupt the bill. Import from a CSV bill instead.")
+
+
+def _iog_import_locked(_eng, *, scope=None, frm=None, to=None, target_starts=None):
+    """4.5.6: is this API import/gap-fill target inside an IOG agreement window?
+    True => refuse (Octopus dropped the per-slot off-peak label; a re-import re-prices
+    smart charges at peak). CSV is never gated by this. Fail-open on error — the
+    engine chokepoint guard (run_gap_fill_job / run_api_import_job) is the backstop."""
+    try:
+        if not _eng._iog_agreement_windows():
+            return False
+        if scope == "whole_history":
+            return True
+        if scope == "gaps":
+            return any(_eng._block_start_in_iog(x) for x in (target_starts or []))
+        return _eng._range_overlaps_iog(frm, to)
+    except Exception:
+        return False
+
+
 @app.route("/api/backfill/plan", methods=["POST"])
 def api_backfill_plan():
     """Preview a unified backfill: gate + dispatch + window classification.
@@ -4403,10 +4426,14 @@ def api_backfill_plan():
                 (_from, _to))]
             target_starts = _bf_range_starts(_from, _to, _bf_step_minutes(store))
 
+        iog_locked = _iog_import_locked(
+            _eng, scope=scope, frm=body.get("from"), to=body.get("to"),
+            target_starts=target_starts)
         plan = _bf.plan_backfill(
             scope=scope, source=source, api_available=api_available,
             has_blocks=has_blocks, gaps=gaps,
-            target_starts=target_starts, occupied_starts=occupied_starts)
+            target_starts=target_starts, occupied_starts=occupied_starts,
+            iog_locked=iog_locked)
         plan.update({"api_available": api_available, "has_blocks": has_blocks,
                      "gaps_present": bool(gaps),
                      "gap_slots_total": sum(g.get("slots", 0) for g in gaps)})
@@ -4443,8 +4470,14 @@ def api_backfill_run():
         has_blocks    = bool(store.count_blocks())
         gaps          = store.find_block_gaps()
 
+        _ts_run = (_bf_flatten_gap_starts(gaps, _bf_step_minutes(store))
+                   if scope == "gaps" else None)
+        iog_locked = _iog_import_locked(
+            _eng, scope=scope, frm=body.get("from"), to=body.get("to"),
+            target_starts=_ts_run)
         gate = _bf.evaluate_gates(scope, source, api_available=api_available,
-                                  has_blocks=has_blocks, gaps_present=bool(gaps))
+                                  has_blocks=has_blocks, gaps_present=bool(gaps),
+                                  iog_locked=iog_locked)
         if not gate["allowed"]:
             return jsonify({"ok": False, "reason": gate["reason"],
                             "message": gate["message"]}), 400
@@ -4560,6 +4593,9 @@ def api_backfill_fill_gap():
         if not frm or not to:
             return jsonify({"ok": False, "reason": "bad_range",
                             "message": "from and to are required."}), 400
+        if _iog_import_locked(_eng, frm=frm, to=to):
+            return jsonify({"ok": False, "reason": "iog_locked",
+                            "message": _IOG_IMPORT_MSG}), 400
         if not body.get("confirmed"):
             return jsonify({"ok": False, "reason": "unconfirmed",
                             "message": "Confirmation required before writing."}), 400
@@ -4641,6 +4677,9 @@ def api_blocks_reimport():
         meter_id = body.get("meter_id") or "electricity_main"
         ch = body.get("channel")
         channels = (ch,) if ch in ("import", "export") else ("import", "export")
+        if _iog_import_locked(_eng, frm=utc_start, to=utc_end):
+            return jsonify({"ok": False, "reason": "iog_locked",
+                            "message": _IOG_IMPORT_MSG}), 400
         _asyncio.run_coroutine_threadsafe(
             _eng.run_gap_fill_job(utc_start, utc_end, channels=channels,
                                   meter_id=meter_id), _event_loop)
@@ -4662,6 +4701,17 @@ def api_blocks_deleted_ranges():
         import engine as _eng
         from datetime import datetime, timezone, timedelta
         store = _get_store()
+        # 4.5.6: self-heal orphaned tombstones — rows whose range is already fully
+        # populated with blocks (deleted in the past, then re-created by another
+        # path that didn't clear the tombstone). They clutter the list and make a
+        # present block look deleted; the re-import clear path may be IOG-gated.
+        try:
+            _npr = store.prune_stale_deleted_ranges()
+            if _npr:
+                logger.info("deleted-ranges: pruned %d stale tombstone(s) whose "
+                            "range is already fully populated", _npr)
+        except Exception as _pe:
+            logger.warning("deleted-ranges: stale-tombstone prune failed: %s", _pe)
         api_ok = _eng.kraken_available()
         horizon_days = getattr(_eng, "_KRAKEN_BACKFILL_DAYS", 400) or 400
         floor = (datetime.now(timezone.utc).replace(tzinfo=None)
@@ -5232,6 +5282,11 @@ def api_historical_api_start():
             pace_s = min(max(float(body.get("pace_s", 1.5)), 0.0), 10.0)
         except (TypeError, ValueError):
             pace_s = 1.5
+        if _iog_import_locked(_eng,
+                              scope=("range" if body.get("from") else "whole_history"),
+                              frm=body.get("from"), to=None):
+            return jsonify({"ok": False, "reason": "iog_locked",
+                            "error": _IOG_IMPORT_MSG}), 400
         backup = None
         try:
             backup = os.path.basename(_create_backup_zip(label="pre-api-import"))
@@ -7618,6 +7673,27 @@ def api_db_vacuum():
 
 # ── Block deletion ────────────────────────────────────────────────────────────────────────────────
 
+_IOG_DELETE_MSG = ("Deleting blocks is disabled for Intelligent Octopus Go periods. "
+                   "Octopus removed the per-slot off-peak label, so the only way to "
+                   "restore a deleted IOG block — re-importing — now re-prices smart "
+                   "charges at peak and permanently corrupts the bill. Deletion is "
+                   "blocked here until this is resolved.")
+
+
+def _iog_delete_locked(_eng, from_date, to_date, tz_name):
+    """4.5.6: True if a delete range overlaps an IOG agreement window. Deletion is
+    disabled there because the only recovery (re-import) now corrupts. Fail-open on
+    error (a delete the guard cannot classify is allowed — matches prior behaviour)."""
+    try:
+        if not _eng._iog_agreement_windows():
+            return False
+        from block_store import local_date_range_to_utc_bounds
+        us, ue = local_date_range_to_utc_bounds(from_date, to_date, tz_name or "UTC")
+        return _eng._range_overlaps_iog(us, ue)
+    except Exception:
+        return False
+
+
 def _delete_window_to_utc_times(from_time, to_time, tz_name, from_date, to_date):
     """Resolve the delete's time-of-day window to the UTC HH:MM the store filters on.
 
@@ -7664,6 +7740,10 @@ def api_blocks_delete_preview():
         # Pass LOCAL times: the store treats from/to as the ends of ONE contiguous
         # span (from_date+from_time .. to_date+to_time), not a per-day window.
         result = store.count_blocks_for_date_range(from_date, to_date, meter_id, from_time, to_time, _tz_name, reconstructed_only)
+        import engine as _eng_iog
+        if isinstance(result, dict) and _iog_delete_locked(_eng_iog, from_date, to_date, _tz_name):
+            result["iog_locked"] = True
+            result["iog_message"] = _IOG_DELETE_MSG
         return jsonify(result)
     except Exception as e:
         logger.error("api_blocks_delete_preview: %s", e)
@@ -7800,6 +7880,8 @@ def api_blocks_delete():
                 _tz_name = (_md.get("meta") or {}).get("timezone", "UTC")
                 break
         reconstructed_only = bool(data.get("reconstructed_only"))
+        if _iog_delete_locked(_eng, from_date, to_date, _tz_name):
+            return jsonify({"error": _IOG_DELETE_MSG, "reason": "iog_locked"}), 400
         _delete_job.clear()
         _delete_job.update({"status": "running", "kind": "delete",
                             "step": "starting", "result": None, "error": None})
