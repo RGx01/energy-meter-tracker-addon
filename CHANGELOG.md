@@ -1,5 +1,20 @@
 # Changelog
- 
+
+## [4.5.6] — 2026-08-29
+
+### Fixed
+- **The settlement reconcile no longer reverts a settled, dispatched slot to peak.**
+  A completed dispatch is Octopus's own off-peak signal; once a block is settled its
+  billed band is authoritative. The overlay previously flipped genuine off-peak
+  dispatched bumps to peak on a "never saw it start" inference (2026-07-21 16:00 BST),
+  over-charging them. Reconcile now leaves settled completed-dispatch blocks to the
+  bill; planned-only (never-charged) slots still revert correctly.
+- **Silent one-time heal (`bill_resettle_v1`) for affected history.** On upgrade,
+  settled dispatched slots a pre-4.5.6 reconcile wrongly peaked are corrected from
+  Octopus's authoritative billed band — no review flags, no user action. Rate/tariff-
+  agnostic (band from each block's own schedule), uses the reliable bulk Measurements
+  read, and never touches user corrections.
+   
 ## [4.5.5] — 2026-08-28
 
 *Completes Intelligent Octopus Go **SMB / time-of-use ("6-hour cap")** pricing. EMT now reconstructs the windowed day/night schedule the new tariff drops, prices every block on the tariff that applied on **its own date**, and — for settled EV-dispatch blocks it can't price with confidence locally — **defers to Octopus's own billed cost** to settle the band, while keeping EMT's canonical clean tariff rates. Plus the settlement-reconcile fixes that make all of that actually run, and Cost-Corrections + review-list hardening.*
