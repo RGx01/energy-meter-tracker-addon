@@ -10143,6 +10143,13 @@ async def _tick_dispatch_capture() -> None:
             audit_measured_costs()
         except Exception as e:
             logger.warning("_tick_dispatch_capture: measured audit failed: %s", e)
+        # 4.5.6 one-time silent heal: correct settled dispatched slots a pre-4.5.6
+        # reconcile wrongly reverted to peak, from Octopus's authoritative bill. Self-
+        # gates on a store_meta marker (runs once), independent of the current tariff.
+        try:
+            await bill_resettle_v1()
+        except Exception as e:
+            logger.warning("_tick_dispatch_capture: bill_resettle_v1 failed: %s", e)
 
 
 async def _log_dispatches_observe_only() -> None:
@@ -10552,6 +10559,126 @@ def _measured_floor() -> str:
     if caf:
         return str(caf)
     return _MEASURED_FLOOR
+
+
+# store_meta: one-time 4.5.6 heal. Bumped v1->v2 when the heal became BIDIRECTIONAL
+# (v1 only flipped peak->off-peak; v2 also flips off-peak->peak, the #286 direction),
+# so a box that already ran v1 gets one more pass with the complete logic. Idempotent:
+# v2 only writes where the bill disagrees with the stored band, so a clean box no-ops.
+_BILL_RESETTLE_MARKER = "bill_resettle_v2_done"
+
+
+async def bill_resettle_v1() -> dict:
+    """One-time, SILENT heal (4.5.6). Pre-4.5.6 the settlement reconcile could REVERT a
+    settled dispatched slot to peak on a "we never saw it start" inference — over-charging
+    genuine off-peak dispatched bumps that Octopus actually billed off-peak (the
+    2026-07-21 16:00 BST case). This corrects those slots from Octopus's AUTHORITATIVE
+    billed band, with NO review flags (the bill is truth, nothing to confirm).
+
+    Runs once (store_meta marker), gated on the 4.5.5+ schema being present. Rate-agnostic:
+    the band is derived from each block's OWN-date `day_rate_bounds`, never a literal, so it
+    is correct across tariffs, regions and rate changes. Candidate = SETTLED + DISPATCHED +
+    overlay-authored + stored band == peak (by its own schedule). Uses the reliable BULK
+    `get_measurements` read (never the recover ladder), and only flips a slot the bill
+    prices OFF-PEAK — a bill that agrees it's peak is left untouched. Never touches
+    rate_source='corrected' (user corrections outrank). Idempotent."""
+    store = _store
+    if store is None or _kraken_client is None:
+        return {}
+    if store.get_meta(_BILL_RESETTLE_MARKER):
+        return {}
+    imp = (_kraken_discovery or {}).get("import") or {}
+    mpan = imp.get("mpan")
+    acct = imp.get("account_number") or (_kraken_discovery or {}).get("account_number")
+    sched = _kraken_rate_schedules.get("import")
+    if not mpan or sched is None or sched.is_empty():
+        return {}   # not ready yet — leave the marker unset; retry next pass
+    try:
+        rows = store._conn.execute(
+            """SELECT b.block_start, b.imp_kwh, b.imp_rate
+               FROM blocks b
+               WHERE b.meter_id = 'electricity_main' AND b.imp_kwh_api IS NOT NULL
+                 AND b.rate_corrected = 0
+                 AND (b.rate_source IS NULL OR b.rate_source NOT IN ('measured','corrected'))
+                 AND (b.source IS NULL OR b.source NOT LIKE 'imported%')
+                 AND EXISTS (SELECT 1 FROM dispatch_slots s
+                             WHERE s.slot_start = b.block_start AND s.off_peak = 1)
+               ORDER BY b.block_start""").fetchall()
+    except Exception as e:
+        logger.warning("bill_resettle_v1: query failed: %s", e)
+        return {}
+
+    def _bounds(bs):
+        try:
+            lo, hi = sched.day_rate_bounds(bs)
+        except Exception:
+            return (None, None)
+        if lo is None or hi is None:
+            return (None, None)
+        lo, hi = lo / 100.0, hi / 100.0
+        return (None, None) if abs(hi - lo) < 1e-9 else (lo, hi)   # flat day → no band
+
+    # BIDIRECTIONAL: keep every candidate on a BANDED schedule day (skip flat days,
+    # which have no off-peak/peak distinction to correct). We compare the STORED band
+    # to the BILLED band per slot and flip EITHER way — peak->off-peak (the 2026-07-21
+    # over-charge) AND off-peak->peak (the #286-style over-credit) — so the bill, not
+    # the heuristic, decides every settled dispatched slot.
+    cand = []
+    for r in rows:
+        lo, hi = _bounds(r["block_start"])
+        if lo is None:
+            continue
+        cand.append(r)
+    if not cand:
+        store.set_meta(_BILL_RESETTLE_MARKER, {"done": True, "healed": 0, "examined": 0})
+        return {"healed": 0, "examined": 0}
+
+    from datetime import datetime as _dt2, timedelta as _td2
+    by_day = {}
+    for r in cand:
+        by_day.setdefault(str(r["block_start"])[:10], []).append(r)
+    n_heal = 0
+    for day, drows in sorted(by_day.items()):
+        try:
+            ws = day + "T00:00:00Z"
+            we = (_dt2.fromisoformat(day) + _td2(days=1)).strftime("%Y-%m-%dT00:00:00") + "Z"
+            bill = await _kraken_client.get_measurements(
+                mpan, ws, we, account_number=acct, direction="CONSUMPTION", quiet=True)
+        except Exception as e:
+            logger.info("bill_resettle: bill fetch for %s skipped (%s)", day, e)
+            continue
+        billmap = {n["start"]: n for n in (bill or []) if n.get("start")}
+        for r in drows:
+            bs = r["block_start"]
+            node = billmap.get(bs)
+            if not node or node.get("cost_incl") is None:
+                continue
+            kwh = r["imp_kwh"] or 0.0
+            lo, hi = _bounds(bs)
+            if kwh <= 1e-9 or lo is None:
+                continue
+            cur = r["imp_rate"] or 0.0
+            stored_band = "peak" if abs(cur - hi) < abs(cur - lo) else "off_peak"
+            bill_rate = node["cost_incl"] / kwh
+            bill_band = "off_peak" if abs(bill_rate - lo) <= abs(bill_rate - hi) else "peak"
+            if bill_band == stored_band:            # bill agrees → leave exactly as-is
+                continue
+            _lbl = "OFF_PEAK" if bill_band == "off_peak" else "STANDARD_RATE"
+            if apply_measured_to_block(bs, cost_incl=node.get("cost_incl"),
+                                       cost_excl=node.get("cost_excl"), label=_lbl):
+                n_heal += 1
+                logger.info("bill_resettle: %s %s->%s from bill (£%.4f)",
+                            bs, stored_band, bill_band, node.get("cost_incl"))
+    store.set_meta(_BILL_RESETTLE_MARKER,
+                   {"done": True, "healed": n_heal, "examined": len(cand)})
+    logger.info("bill_resettle: corrected %d settled slot(s) from the bill "
+                "(examined %d)", n_heal, len(cand))
+    if n_heal:
+        try:
+            _regen_charts_safely()
+        except Exception:
+            pass
+    return {"healed": n_heal, "examined": len(cand)}
 
 
 async def measure_settled_dispatched_blocks() -> dict:
@@ -11099,6 +11226,7 @@ async def reconcile_dispatch_overlay() -> dict:
         logger.warning("reconcile_dispatch_overlay: query failed: %s", e)
         return {}
     n_restore = n_revert = n_review = n_deferred = n_band = n_boundary = 0
+    n_settled_guard = 0
     changed = bool(_n_attr)          # back-attribution alone should refresh the charts
     n_candidates = len(rows)
     for r in rows:
@@ -11162,6 +11290,21 @@ async def reconcile_dispatch_overlay() -> dict:
             has_planned=("planned" in kinds),
             was_online=(not bool(r["interpolated"])),
             contemporaneous=contemporaneous)
+        # 4.5.6 SETTLED-BLOCK GUARD: never REVERT a SETTLED, COMPLETED-dispatch block
+        # toward peak. A `completed` dispatch is Octopus's OWN signal that it ran the
+        # slot as a smart charge (→ off-peak on the bill); once such a block is SETTLED
+        # (imp_kwh_api present) its billed band is authoritative and owned by the
+        # measured/bill path. The dispatch-lifecycle heuristic must not flip it to peak
+        # on a "we never saw it START" inference — that silently over-charged genuine
+        # off-peak dispatched bumps the bill actually priced off-peak (2026-07-21 16:00
+        # BST). A PLANNED-ONLY slot (no `completed`) genuinely never charged, so its
+        # peak revert is correct and NOT guarded. `_reconcile_decision` only returns
+        # target=="peak" when the block is currently off-peak, so this is exactly the
+        # toward-peak revert; off-peak RESTORES and unsettled predictions are unaffected.
+        if (target == "peak" and r["imp_kwh_api"] is not None
+                and "completed" in kinds):
+            n_settled_guard += 1
+            continue
         if target == "review":
             # A review flag invites a manual correction, but the correction tool
             # can only touch DCC-settled blocks. Dispatch `completed` arrives at
@@ -11453,10 +11596,10 @@ async def reconcile_dispatch_overlay() -> dict:
     # log — "0 candidates" vs "N candidates, 0 changed" tells very different
     # stories when a block isn't being corrected.
     logger.info("reconcile: scanned %d candidate(s) — %d restored, %d reverted, "
-                "%d review, %d deferred, %d band-relabelled, %d agreement-guarded "
-                "(settle=%dh)",
+                "%d review, %d deferred, %d band-relabelled, %d agreement-guarded, "
+                "%d settled-guarded (settle=%dh)",
                 n_candidates, n_restore, n_revert, n_review, n_deferred, n_band,
-                n_boundary, int(_RECONCILE_SETTLE_HOURS))
+                n_boundary, n_settled_guard, int(_RECONCILE_SETTLE_HOURS))
     return {"restored": n_restore, "reverted": n_revert, "review": n_review,
             "deferred": n_deferred, "band_relabelled": n_band,
             "agreement_guarded": n_boundary}

@@ -795,18 +795,36 @@ class TestReconcilePass(unittest.IsolatedAsyncioTestCase):
             ("2020-01-01T13:30:00",)).fetchone()
         self.assertEqual(r["needs_review"], 0)
 
-    async def test_negligible_completed_reverts_to_peak(self):
+    async def test_negligible_completed_reverts_to_peak_when_unsettled(self):
         from block_store import BlockStore
         st = BlockStore(":memory:")
         # #286 / 10-Jul over-credit: tiny completion (−0.26 kWh), no started, block
-        # currently off-peak -> did not materially run -> revert to peak.
+        # currently off-peak -> did not materially run -> revert to peak. As of 4.5.6
+        # this is a PRE-SETTLEMENT prediction only: once a block is SETTLED, its band is
+        # owned by the bill (a tiny completed slot can be billed peak — 10-Jul 17:30 — OR
+        # off-peak — 21-Jul 16:00 — and only the bill knows), so the reconcile no longer
+        # reverts a settled completed slot (see test_reconcile_settled_guard). Here the
+        # block is UNSETTLED, so the heuristic still predicts peak.
         self._seed(st, "2020-01-01T20:00:00", 0.05493, ["planned", "completed"],
-                   completed_kwh=-0.26)
+                   completed_kwh=-0.26, settled=False)
         res = await self._run(st)
         self.assertEqual(res["reverted"], 1)
         r = st._conn.execute("SELECT imp_rate FROM blocks WHERE block_start=?",
                              ("2020-01-01T20:00:00",)).fetchone()
         self.assertAlmostEqual(r["imp_rate"], 0.323092, places=5)  # peak
+
+    async def test_negligible_completed_settled_is_deferred_to_bill(self):
+        # 4.5.6: the SAME tiny-completed/no-started slot, but SETTLED, is NOT reverted —
+        # the bill owns a settled dispatched block's band (bill_resettle_v1 / measured).
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        self._seed(st, "2020-01-01T20:00:00", 0.05493, ["planned", "completed"],
+                   completed_kwh=-0.26, settled=True)
+        res = await self._run(st)
+        self.assertEqual(res["reverted"], 0)                       # guarded, not reverted
+        r = st._conn.execute("SELECT imp_rate FROM blocks WHERE block_start=?",
+                             ("2020-01-01T20:00:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)   # left for the bill
 
 
 class TestBL11RawDispatchBounds(unittest.TestCase):
