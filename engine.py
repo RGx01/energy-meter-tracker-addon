@@ -10561,7 +10561,11 @@ def _measured_floor() -> str:
     return _MEASURED_FLOOR
 
 
-_BILL_RESETTLE_MARKER = "bill_resettle_v1_done"   # store_meta: one-time 4.5.6 heal
+# store_meta: one-time 4.5.6 heal. Bumped v1->v2 when the heal became BIDIRECTIONAL
+# (v1 only flipped peak->off-peak; v2 also flips off-peak->peak, the #286 direction),
+# so a box that already ran v1 gets one more pass with the complete logic. Idempotent:
+# v2 only writes where the bill disagrees with the stored band, so a clean box no-ops.
+_BILL_RESETTLE_MARKER = "bill_resettle_v2_done"
 
 
 async def bill_resettle_v1() -> dict:
@@ -10614,15 +10618,17 @@ async def bill_resettle_v1() -> dict:
         lo, hi = lo / 100.0, hi / 100.0
         return (None, None) if abs(hi - lo) < 1e-9 else (lo, hi)   # flat day → no band
 
-    # Keep only blocks whose STORED band is peak by their own schedule (rate-agnostic).
+    # BIDIRECTIONAL: keep every candidate on a BANDED schedule day (skip flat days,
+    # which have no off-peak/peak distinction to correct). We compare the STORED band
+    # to the BILLED band per slot and flip EITHER way — peak->off-peak (the 2026-07-21
+    # over-charge) AND off-peak->peak (the #286-style over-credit) — so the bill, not
+    # the heuristic, decides every settled dispatched slot.
     cand = []
     for r in rows:
         lo, hi = _bounds(r["block_start"])
         if lo is None:
             continue
-        cur = r["imp_rate"] or 0.0
-        if abs(cur - hi) < abs(cur - lo):        # nearer peak than off-peak → stored peak
-            cand.append(r)
+        cand.append(r)
     if not cand:
         store.set_meta(_BILL_RESETTLE_MARKER, {"done": True, "healed": 0, "examined": 0})
         return {"healed": 0, "examined": 0}
@@ -10639,7 +10645,7 @@ async def bill_resettle_v1() -> dict:
             bill = await _kraken_client.get_measurements(
                 mpan, ws, we, account_number=acct, direction="CONSUMPTION", quiet=True)
         except Exception as e:
-            logger.info("bill_resettle_v1: bill fetch for %s skipped (%s)", day, e)
+            logger.info("bill_resettle: bill fetch for %s skipped (%s)", day, e)
             continue
         billmap = {n["start"]: n for n in (bill or []) if n.get("start")}
         for r in drows:
@@ -10651,19 +10657,21 @@ async def bill_resettle_v1() -> dict:
             lo, hi = _bounds(bs)
             if kwh <= 1e-9 or lo is None:
                 continue
+            cur = r["imp_rate"] or 0.0
+            stored_band = "peak" if abs(cur - hi) < abs(cur - lo) else "off_peak"
             bill_rate = node["cost_incl"] / kwh
-            # Only heal when the BILL prices it OFF-PEAK (the flip we over-charged). A bill
-            # that agrees it is peak is left exactly as-is.
-            if abs(bill_rate - lo) > abs(bill_rate - hi):
+            bill_band = "off_peak" if abs(bill_rate - lo) <= abs(bill_rate - hi) else "peak"
+            if bill_band == stored_band:            # bill agrees → leave exactly as-is
                 continue
+            _lbl = "OFF_PEAK" if bill_band == "off_peak" else "STANDARD_RATE"
             if apply_measured_to_block(bs, cost_incl=node.get("cost_incl"),
-                                       cost_excl=node.get("cost_excl"), label="OFF_PEAK"):
+                                       cost_excl=node.get("cost_excl"), label=_lbl):
                 n_heal += 1
-                logger.info("bill_resettle_v1: %s peak->off-peak from bill (£%.4f)",
-                            bs, node.get("cost_incl"))
+                logger.info("bill_resettle: %s %s->%s from bill (£%.4f)",
+                            bs, stored_band, bill_band, node.get("cost_incl"))
     store.set_meta(_BILL_RESETTLE_MARKER,
                    {"done": True, "healed": n_heal, "examined": len(cand)})
-    logger.info("bill_resettle_v1: corrected %d settled slot(s) from the bill "
+    logger.info("bill_resettle: corrected %d settled slot(s) from the bill "
                 "(examined %d)", n_heal, len(cand))
     if n_heal:
         try:
