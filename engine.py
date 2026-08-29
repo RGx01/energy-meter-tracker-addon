@@ -10565,7 +10565,9 @@ def _measured_floor() -> str:
 # (v1 only flipped peak->off-peak; v2 also flips off-peak->peak, the #286 direction),
 # so a box that already ran v1 gets one more pass with the complete logic. Idempotent:
 # v2 only writes where the bill disagrees with the stored band, so a clean box no-ops.
-_BILL_RESETTLE_MARKER = "bill_resettle_v2_done"
+_BILL_RESETTLE_MARKER = "bill_resettle_v3_done"
+_BILL_RESETTLE_ATTEMPTS = "bill_resettle_attempts"   # retry budget for skipped days
+_BILL_RESETTLE_MAX_ATTEMPTS = 8
 
 
 async def bill_resettle_v1() -> dict:
@@ -10638,6 +10640,7 @@ async def bill_resettle_v1() -> dict:
     for r in cand:
         by_day.setdefault(str(r["block_start"])[:10], []).append(r)
     n_heal = 0
+    n_skipped = 0                                   # days whose bill fetch failed this pass
     for day, drows in sorted(by_day.items()):
         try:
             ws = day + "T00:00:00Z"
@@ -10645,8 +10648,13 @@ async def bill_resettle_v1() -> dict:
             bill = await _kraken_client.get_measurements(
                 mpan, ws, we, account_number=acct, direction="CONSUMPTION", quiet=True)
         except Exception as e:
-            logger.info("bill_resettle: bill fetch for %s skipped (%s)", day, e)
+            # A transient API timeout must NOT permanently skip these slots — count it and
+            # DON'T mark the heal done, so the next pass retries the missed day.
+            n_skipped += 1
+            logger.info("bill_resettle: bill fetch for %s skipped (%s) — will retry", day, e)
             continue
+        finally:
+            await asyncio.sleep(0.3)                # pace the fetch to ease rate limits
         billmap = {n["start"]: n for n in (bill or []) if n.get("start")}
         for r in drows:
             bs = r["block_start"]
@@ -10669,16 +10677,30 @@ async def bill_resettle_v1() -> dict:
                 n_heal += 1
                 logger.info("bill_resettle: %s %s->%s from bill (£%.4f)",
                             bs, stored_band, bill_band, node.get("cost_incl"))
-    store.set_meta(_BILL_RESETTLE_MARKER,
-                   {"done": True, "healed": n_heal, "examined": len(cand)})
-    logger.info("bill_resettle: corrected %d settled slot(s) from the bill "
-                "(examined %d)", n_heal, len(cand))
     if n_heal:
         try:
             _regen_charts_safely()
         except Exception:
             pass
-    return {"healed": n_heal, "examined": len(cand)}
+    _attempts = int(store.get_meta(_BILL_RESETTLE_ATTEMPTS) or 0) + 1
+    if n_skipped == 0 or _attempts >= _BILL_RESETTLE_MAX_ATTEMPTS:
+        # Complete: every day fetched (or we've exhausted the retry budget). Mark done so
+        # the heal never runs again.
+        store.set_meta(_BILL_RESETTLE_MARKER,
+                       {"done": True, "healed": n_heal, "examined": len(cand),
+                        "skipped_days": n_skipped, "attempts": _attempts})
+        logger.info("bill_resettle: corrected %d settled slot(s) from the bill "
+                    "(examined %d, skipped-days %d, attempt %d) — done",
+                    n_heal, len(cand), n_skipped, _attempts)
+    else:
+        # Some days timed out — leave the marker UNSET so the next reconcile pass retries
+        # them; only bump the attempt counter (capped so a permanently-unfetchable day
+        # can't loop forever).
+        store.set_meta(_BILL_RESETTLE_ATTEMPTS, _attempts)
+        logger.info("bill_resettle: corrected %d so far (examined %d, %d day(s) timed out "
+                    "— will retry, attempt %d/%d)",
+                    n_heal, len(cand), n_skipped, _attempts, _BILL_RESETTLE_MAX_ATTEMPTS)
+    return {"healed": n_heal, "examined": len(cand), "skipped_days": n_skipped}
 
 
 async def measure_settled_dispatched_blocks() -> dict:
