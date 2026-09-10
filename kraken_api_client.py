@@ -141,6 +141,9 @@ _EMT_GRAPHQL_FIELDS = {
     "properties", "measurements", "startAt", "endAt",
     "metaData", "statistics", "label", "costInclTax", "costExclTax",
     "estimatedAmount",
+    # four-bucket device breakdown (get_device_breakdown): the applied unit rate on
+    # each bucket's cost (value/edges/node are relay generics handled elsewhere).
+    "pricePerUnit", "amount",
     # rate-limit pacing (import back-off watches the points allowance) + IOG state
     "pointsAllowanceRateLimit", "usedPoints", "remainingPoints", "isBlocked",
     "currentState",
@@ -1097,7 +1100,7 @@ class KrakenAPIClient:
     async def recover_measurement_costs(
         self, mpan: str, starts, *, account_number: Optional[str] = None,
         direction: str = "CONSUMPTION", timezone_name: str = "Europe/London",
-        lookback_ladder=(1, 3, 6), pace_s: float = 0.4, max_attempts: int = 2,
+        lookahead_ladder=(2, 3), pace_s: float = 0.4, max_attempts: int = 2,
     ) -> dict:
         """Recover the billed cost + dispatch-aware label for slots the bulk fetch
         returned with kWh but NO cost. Built around two proven facts (cost probe):
@@ -1109,20 +1112,23 @@ class KrakenAPIClient:
            back empty 100% of the time (too many heavy nodes → over the per-query
            complexity budget). A window over quiet data is fine at any size. So the
            cure is a SMALL window — never a wide one over a charging run.
-        2. WINDOW CONTEXT — for an IOG dispatched slot OUTSIDE the core off-peak
-           window (e.g. a morning charge), the OFF_PEAK label only appears once the
-           window reaches back to the run's start (≤3h observed); a too-narrow
-           window returns the raw STANDARD (peak) tariff. Core-off-peak overnight
-           slots need NO look-back — a ±1h window already labels them OFF_PEAK.
+        2. FORWARD CONTEXT — for an IOG dispatched slot OUTSIDE the core off-peak
+           window (e.g. a daytime charge), the OFF_PEAK label only appears once the
+           query window extends ~2h PAST the slot; look-BACK is irrelevant. Proven by
+           a window-sweep on 2026-07-21/-23 & 08-14: look-ahead 0.5h/1h → STANDARD,
+           2h → OFF_PEAK, at every look-back value. It reads like a fixed ~2h forward
+           attribution window Octopus applies to the TOU bucket (independent of the
+           charge's own size/duration — a 0.09 kWh single-slot bump still needs 2h).
+           Core-off-peak overnight slots already label OFF_PEAK on a tight window.
 
-        Reconciling the two: a LOOK-BACK LADDER. Try the smallest window first
-        (`lookback_ladder[0]`h before → slot+1h); accept immediately on OFF_PEAK
-        (the truth, and reliable at small sizes); only widen to the next rung if it
-        came back STANDARD (might just lack context) — stopping the instant a rung
-        returns OFF_PEAK. This never sends a wide window over a dense run (those
-        resolve OFF_PEAK on the first rung), so it dodges the strip. A rung that
-        DOES come back empty is skipped; whatever STANDARD the smallest rung gave is
-        kept as the fallback. One fetch opportunistically claims any other pending
+        Reconciling the two: a FORWARD LADDER. Fetch a tight 30-min look-back and
+        ladder the FORWARD edge (`lookahead_ladder`h past the slot); accept
+        immediately on OFF_PEAK (the truth); only widen forward if a rung came back
+        STANDARD, stopping the instant one returns OFF_PEAK. The first rung (2h) is
+        the minimum that flips the label and is small enough to dodge the strip; a
+        rung that comes back EMPTY (stripped on a dense run) is skipped, and whatever
+        STANDARD a rung gave is kept as the fallback. (Widening BACK was the old
+        design — it tuned the wrong axis and, wide, tripped the strip.) One fetch opportunistically claims any other pending
         slot it returns OFF_PEAK for. Newest-first so a run's later slots sweep up
         earlier ones. Returns {start: parsed_node} for slots recovered WITH a cost;
         the rest are omitted so the caller keeps its fallback.
@@ -1142,11 +1148,13 @@ class KrakenAPIClient:
                 continue
             pending.add(s)
         total = len(pending)
-        ladder = [max(1, int(h)) for h in (lookback_ladder or (1,))]
+        ladder = [max(1, int(h)) for h in (lookahead_ladder or (2,))]
 
-        async def _fetch(base, lb_h):
-            ws = (base - _td(hours=lb_h)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
-            we = (base + _td(hours=1)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+        async def _fetch(base, la_h):
+            # 4.5.7: the OFF_PEAK label is FORWARD-anchored (see docstring §2) —
+            # ladder the FORWARD edge; a tight 30-min look-back just brackets the slot.
+            ws = (base - _td(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+            we = (base + _td(hours=la_h)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
             try:
                 rows = await self.get_measurements(
                     mpan, ws, we, account_number=account_number,
@@ -1163,8 +1171,8 @@ class KrakenAPIClient:
                     continue
                 base = _dt.fromisoformat(s)
                 chosen = None                          # first STANDARD seen (fallback)
-                for lb_h in ladder:
-                    by_start = await _fetch(base, lb_h)
+                for la_h in ladder:
+                    by_start = await _fetch(base, la_h)
                     # Opportunistically claim any pending slot this window proves
                     # OFF_PEAK (OFF_PEAK is the truth; a STANDARD for another slot
                     # might just lack ITS context, so don't claim those here).
@@ -1193,6 +1201,179 @@ class KrakenAPIClient:
                 _mask(mpan), len(recovered), total, tuple(ladder),
                 total - len(recovered))
         return recovered
+
+    async def get_device_breakdown(
+        self, mpan: str, start: str, end: str, *,
+        account_number: Optional[str] = None, timezone_name: str = "Europe/London",
+        page_size: int = 500, max_pages: int = 400, quiet: bool = False,
+    ) -> dict:
+        """Per-slot Home/EV SETTLED split + per-bucket rate from the four IOG-SMB
+        device buckets (design §4). Same Measurements connection as
+        get_measurements, but reads each statistic's `value` (kWh in that bucket) and
+        `pricePerUnit` — recovering the split and applied unit rate that the summed
+        cost discards. Returns {start: parsed_breakdown}. Amounts pence → £."""
+        acct = account_number or self.account_number
+        if not acct:
+            raise ValueError("account_number required for get_device_breakdown")
+        query = (
+            "query breakdown($acc: String!, $mpan: String!, $start: DateTime!, "
+            "$end: DateTime!, $first: Int!, $after: String) {"
+            "  account(accountNumber: $acc) {"
+            "    properties {"
+            "      measurements(first: $first, after: $after, startAt: $start, "
+            "        endAt: $end, timezone: \"" + timezone_name + "\", "
+            "        utilityFilters: [{ electricityFilters: { "
+            "          readingFrequencyType: THIRTY_MIN_INTERVAL, "
+            "          marketSupplyPointId: $mpan, readingDirection: CONSUMPTION } }]) {"
+            "        edges { node { value "
+            "          ... on IntervalMeasurementType { startAt endAt "
+            "            metaData { statistics { type label value "
+            "              costInclTax { estimatedAmount pricePerUnit { amount } } "
+            "              costExclTax { estimatedAmount pricePerUnit { amount } } } } } } }"
+            "        pageInfo { hasNextPage endCursor } } } } }"
+        )
+        out: dict = {}
+        after: Optional[str] = None
+        for _ in range(max(1, max_pages)):
+            data = await self._graphql(query, {
+                "acc": acct, "mpan": mpan, "start": start, "end": end,
+                "first": page_size, "after": after})
+            props = ((data.get("account") or {}).get("properties")) or []
+            conn = None
+            for p in props:
+                m = p.get("measurements")
+                if m and (m.get("edges") or m.get("pageInfo")):
+                    conn = m
+                    break
+            if conn is None:
+                break
+            for edge in (conn.get("edges") or []):
+                parsed = self._parse_breakdown_node(edge.get("node") or {})
+                if parsed is not None:
+                    out[parsed["start"]] = parsed
+            page = conn.get("pageInfo") or {}
+            if not page.get("hasNextPage"):
+                break
+            after = page.get("endCursor")
+            if not after:
+                break
+        if not quiet:
+            logger.info("get_device_breakdown: mpan=%s %s..%s → %d interval(s)",
+                        _mask(mpan), start, end, len(out))
+        return out
+
+    async def recover_device_breakdown(
+        self, mpan: str, starts, *, account_number: Optional[str] = None,
+        timezone_name: str = "Europe/London", chunk_slots: int = 12, pace_s: float = 0.4,
+    ) -> dict:
+        """Fetch the four-bucket Home/EV split for a set of SETTLED slots. Chunks the
+        request into small windows (<= `chunk_slots` half-hours) to dodge the
+        Measurements complexity-strip (see recover_measurement_costs §1), newest
+        chunk first. Returns {start: parsed_breakdown} for the requested slots only.
+        `starts` are naive-UTC iso strings. Read-only, paced."""
+        from datetime import datetime as _dt, timedelta as _td
+        want = []
+        for s in dict.fromkeys(starts or []):
+            try:
+                _dt.fromisoformat(s)
+            except (TypeError, ValueError):
+                continue
+            want.append(s)
+        if not want:
+            return {}
+        want.sort()
+        recovered: dict = {}
+        # group consecutive-ish starts into <=chunk_slots windows
+        chunks: list = []
+        cur: list = []
+        for s in want:
+            if cur and (_dt.fromisoformat(s) - _dt.fromisoformat(cur[0])) >= _td(minutes=30 * chunk_slots):
+                chunks.append(cur); cur = []
+            cur.append(s)
+        if cur:
+            chunks.append(cur)
+        for ch in reversed(chunks):                     # newest chunk first
+            ws = (_dt.fromisoformat(ch[0]) - _td(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+            we = (_dt.fromisoformat(ch[-1]) + _td(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+            try:
+                by_start = await self.get_device_breakdown(
+                    mpan, ws, we, account_number=account_number,
+                    timezone_name=timezone_name, quiet=True)
+            except KrakenAPIError:
+                by_start = {}
+            for s in ch:
+                hit = by_start.get(s)
+                if hit is not None:
+                    recovered[s] = hit
+            if pace_s:
+                await asyncio.sleep(pace_s)
+        logger.info("recover_device_breakdown: mpan=%s recovered %d/%d slot(s)",
+                    _mask(mpan), len(recovered), len(want))
+        return recovered
+
+    @staticmethod
+    def _parse_breakdown_node(node: dict) -> Optional[dict]:
+        """One measurements node → four-bucket Home/EV split + per-bucket rate.
+        Home = Σ ECO7_* buckets, EV = Σ EV_DEVICE_* buckets; band and applied rate
+        come from the bucket that CARRIES the consumption (non-zero `value`) — read,
+        never inferred (design §4). This is what the summed-cost measurement read
+        (`_parse_measurement_node`) discards. Pence → £. None for a non-interval node."""
+        st = node.get("startAt")
+        if not st:
+            return None
+
+        def _amt(block):
+            try:
+                return float((block or {}).get("estimatedAmount"))
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _ppu(block):
+            ppu = (block or {}).get("pricePerUnit") or {}
+            try:
+                return float(ppu.get("amount"))
+            except (TypeError, ValueError):
+                return None
+
+        home_kwh = ev_kwh = home_cost = ev_cost = 0.0
+        home_rate = ev_rate = None
+        home_band = ev_band = None
+        home_rate_x = ev_rate_x = None
+        saw = False
+        for s2 in (((node.get("metaData") or {}).get("statistics")) or []):
+            if s2.get("type") == "STANDING_CHARGE_COST":
+                continue
+            saw = True
+            lab = (s2.get("label") or "").upper()
+            try:
+                val = float(s2.get("value"))
+            except (TypeError, ValueError):
+                val = 0.0
+            ci = s2.get("costInclTax") or {}
+            ce = s2.get("costExclTax") or {}
+            if "EV_DEVICE" in lab:
+                ev_kwh += val; ev_cost += _amt(ci)
+                if val > 1e-9:
+                    if _ppu(ci) is not None:
+                        ev_rate = _ppu(ci); ev_rate_x = _ppu(ce)
+                    ev_band = "off_peak" if "OFF_PEAK" in lab else "peak"
+            else:                                        # ECO7_* / home
+                home_kwh += val; home_cost += _amt(ci)
+                if val > 1e-9:
+                    if _ppu(ci) is not None:
+                        home_rate = _ppu(ci); home_rate_x = _ppu(ce)
+                    home_band = "off_peak" if "NIGHT" in lab else "peak"
+        if not saw:
+            return None
+        _p = lambda v: round(v / 100.0, 6) if v is not None else None
+        return {
+            "start": _iso_naive_utc(st),
+            "home_kwh": round(home_kwh, 6), "ev_kwh": round(ev_kwh, 6),
+            "home_rate": _p(home_rate), "ev_rate": _p(ev_rate),
+            "home_rate_exc": _p(home_rate_x), "ev_rate_exc": _p(ev_rate_x),
+            "home_cost": round(home_cost / 100.0, 6), "ev_cost": round(ev_cost / 100.0, 6),
+            "home_band": home_band, "ev_band": ev_band,
+        }
 
     @staticmethod
     def _parse_measurement_node(node: dict) -> Optional[dict]:

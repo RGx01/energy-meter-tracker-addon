@@ -53,6 +53,26 @@ class TestMeasuredApply(unittest.TestCase):
             "imp_home_band, rate_source, imp_rate_exc, imp_cost_exc, imp_cost_remainder FROM blocks "
             "WHERE block_start=?", (self.SLOT,)).fetchone()
 
+    def test_orphaned_ev_attributed_from_completed_dispatch(self):
+        # EV-split race: imp_kwh_ev NULL but a COMPLETED dispatch exists -> the measured pass
+        # attributes the EV from the dispatch (grid-clipped), instead of writing house-only.
+        self._blk(3.0, None, rate=0.05493)
+        self.st.record_dispatch_history(self.SLOT, "completed", provider="Myenergi",
+                                        source="unknown", energy_kwh=-2.0)
+        res = engine.apply_measured_to_block(self.SLOT, cost_incl=round(3.0*0.05493, 6),
+                                             label="OFF_PEAK")
+        self.assertTrue(res)
+        r = self._row()
+        self.assertIsNotNone(r["imp_rate_ev"])                       # EV attributed, not house-only
+        self.assertAlmostEqual(r["imp_cost_ev"], round(2.0*0.05493, 6), places=5)
+
+    def test_no_dispatch_stays_house_only(self):
+        # imp_kwh_ev NULL and NO dispatch -> house-only (never invents EV).
+        self._blk(3.0, None, rate=0.05493)
+        engine.apply_measured_to_block(self.SLOT, cost_incl=round(3.0*0.05493, 6),
+                                       label="OFF_PEAK")
+        self.assertIsNone(self._row()["imp_rate_ev"])
+
     def test_peak_bill_writes_measured_and_splits_exact(self):
         # 23rd bump: block currently off-peak; Octopus bills STANDARD £1.0294 / 3.186 kWh
         self._blk(3.186, 2.24, rate=0.05493)

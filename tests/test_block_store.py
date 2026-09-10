@@ -5484,6 +5484,55 @@ class TestMaterialiseCompletedOnlySlots(unittest.TestCase):
             "SELECT off_peak, source, state, energy_completed "
             "FROM dispatch_slots WHERE slot_start = ?", (slot_start,)).fetchone()
 
+    def _live_blocks(self, st, start, end):
+        st._conn.execute(
+            "INSERT OR IGNORE INTO config_periods (id, effective_from, billing_day, "
+            "block_minutes, timezone) VALUES (1,'2020-01-01T00:00:00',1,30,'UTC')")
+        from datetime import datetime, timedelta
+        t = datetime.fromisoformat(start); e = datetime.fromisoformat(end)
+        while t < e:
+            st._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+                "imp_kwh, imp_rate, imp_cost, interpolated) VALUES (?,?,?,1,0.1,0.05493,0.005,0)",
+                (t.isoformat(), (t+timedelta(minutes=30)).isoformat(), "electricity_main"))
+            t += timedelta(minutes=30)
+        st._conn.commit()
+
+    def test_confident_bump_out_of_window_emt_up_is_peak(self):
+        # completed-only, OUTSIDE the off-peak window, EMT recording continuously through the
+        # lookback -> CONFIDENT bump -> materialised PEAK (off_peak=0).
+        st = self._store()
+        self._live_blocks(st, "2026-08-12T09:00:00", "2026-08-12T13:00:00")
+        st.record_dispatch_history("2026-08-12T13:00:00", "completed",
+                                   provider="Myenergi", source="unknown", energy_kwh=-3.0)
+        st.materialise_completed_only_slots(0.4, is_off_peak=lambda s: False)
+        self.assertEqual(self._slot(st, "2026-08-12T13:00:00")["off_peak"], 0)
+
+    def test_out_of_window_emt_offline_stays_offpeak(self):
+        # same slot but EMT was NOT recording (no live blocks) -> ambiguous -> off-peak rescue.
+        st = self._store()
+        st.record_dispatch_history("2026-08-12T13:00:00", "completed",
+                                   provider="Myenergi", source="unknown", energy_kwh=-3.0)
+        st.materialise_completed_only_slots(0.4, is_off_peak=lambda s: False)
+        self.assertEqual(self._slot(st, "2026-08-12T13:00:00")["off_peak"], 1)
+
+    def test_in_window_is_offpeak_even_when_emt_up(self):
+        st = self._store()
+        self._live_blocks(st, "2026-08-12T22:00:00", "2026-08-13T02:00:00")
+        st.record_dispatch_history("2026-08-13T02:00:00", "completed",
+                                   provider="Myenergi", source="unknown", energy_kwh=-3.0)
+        st.materialise_completed_only_slots(0.4, is_off_peak=lambda s: True)
+        self.assertEqual(self._slot(st, "2026-08-13T02:00:00")["off_peak"], 1)
+
+    def test_boost_signal_forces_peak(self):
+        # a charger boost flag (e.g. Ohme) -> peak even if EMT coverage is unknown.
+        st = self._store()
+        st.record_dispatch_history("2026-08-12T13:00:00", "completed",
+                                   provider="Ohme", source="unknown", energy_kwh=-3.0)
+        st.materialise_completed_only_slots(0.4, is_off_peak=lambda s: False,
+                                            is_boost=lambda s: True)
+        self.assertEqual(self._slot(st, "2026-08-12T13:00:00")["off_peak"], 0)
+
     def test_materialises_completed_only_substantial(self):
         st = self._store()
         st.record_dispatch_history("2026-08-12T19:00:00", "completed",

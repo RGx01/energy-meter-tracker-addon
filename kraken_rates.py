@@ -113,6 +113,24 @@ class RateSchedule:
                 match = rate
         return match
 
+    def resolve_or_carry(self, ts: str) -> Optional[float]:
+        """Like resolve(), but if `ts` falls in a GAP (no period's [vfrom,vto)
+        covers it) the nearest period AT OR BEFORE ts carries forward (earliest
+        period if ts precedes them all). A TOU band rate is stable until a new
+        agreement, so a trailing/interior gap in one band's feed should extend
+        that band's own rate — NEVER borrow the other band's. Returns None only
+        for a genuinely empty schedule."""
+        p = self._periods
+        if not p:
+            return None
+        r = self.resolve(ts)
+        if r is not None:
+            return r
+        k = bisect.bisect_right(self._vfroms, ts) - 1
+        if k < 0:
+            k = 0
+        return p[k][2]
+
     def _day_rates(self, ts: str) -> list:
         """Rates of every period overlapping ts's calendar day. Bisects to the day
         for a monotonic schedule (O(log n + periods-in-day)); exact linear scan
@@ -469,18 +487,25 @@ def _synthesize_iog_tou_windowed(day_records, night_records,
                 continue
             if vf >= horizon:
                 break
-            src = day_sched if band == "day" else night_sched
-            inc = src.resolve(vf.isoformat())
-            if inc is None:             # one bucket empty → use the other
-                src = night_sched if band == "day" else day_sched
-                inc = src.resolve(vf.isoformat())
+            own = day_sched if band == "day" else night_sched
+            other = night_sched if band == "day" else day_sched
+            # Carry the band's OWN most-recent rate across a gap in its feed (common
+            # for recent dates: Octopus's day- or night- feed trails the other).
+            # Borrowing the OTHER band here silently priced a PEAK (day) window at the
+            # OFF-PEAK (night) rate — the recent-daytime-off-peak bug.
+            src = own
+            inc = own.resolve_or_carry(vf.isoformat()) if not own.is_empty() else None
+            if inc is None:             # own band ENTIRELY empty → degrade to the other
+                src = other
+                inc = other.resolve_or_carry(vf.isoformat()) if not other.is_empty() else None
             if inc is None:
                 continue
             rec = {"value_inc_vat": inc,
                    "valid_from": vf.isoformat(),
                    "valid_to": vt.isoformat(),
                    "payment_method": None}
-            exc = src.exc.resolve(vf.isoformat()) if src.exc is not None else None
+            exc = (src.exc.resolve_or_carry(vf.isoformat())
+                   if (src.exc is not None and not src.exc.is_empty()) else None)
             if exc is not None:
                 rec["value_exc_vat"] = exc
             out.append(rec)

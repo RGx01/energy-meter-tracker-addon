@@ -532,9 +532,10 @@ class TestGraphQLQueries(unittest.TestCase):
         self.assertEqual(len(c._session.post_calls), 2)          # followed the cursor
 
     def test_recover_rung1_off_peak_stops_immediately(self):
-        # An overnight core-off-peak slot returns OFF_PEAK from the SMALL (rung-1,
-        # −1h) window, so recovery accepts it and does NOT widen — one fetch, no
-        # wide window over the dense run (a wide window there is what gets stripped).
+        # An overnight core-off-peak slot returns OFF_PEAK from the FIRST (rung-1)
+        # forward window, so recovery accepts it and does NOT widen — one fetch. The
+        # window is a tight 30-min look-back bracketing the slot, with the forward
+        # edge at the first ladder rung (+2h); look-back never widens (4.5.7 §2).
         slot = "2026-01-15T02:00:00"
         c = self._client([_gql_data(_meas_page([
             _meas_node("2026-01-15T02:00:00+00:00", "6.326", "OFF_PEAK", "34.7")]))])
@@ -543,13 +544,14 @@ class TestGraphQLQueries(unittest.TestCase):
         self.assertTrue(rec[slot]["off_peak"])
         self.assertEqual(len(c._session.post_calls), 1)          # no widening
         _u, body, _h, _a = c._session.post_calls[0]
-        self.assertEqual(body["variables"]["start"], "2026-01-15T01:00:00Z")  # −1h
-        self.assertEqual(body["variables"]["end"], "2026-01-15T03:00:00Z")    # +1h
+        self.assertEqual(body["variables"]["start"], "2026-01-15T01:30:00Z")  # −30m look-back
+        self.assertEqual(body["variables"]["end"], "2026-01-15T04:00:00Z")    # +2h (rung-1 forward)
 
     def test_recover_ladder_widens_for_context(self):
-        # A morning dispatch-extended slot: rung-1 (−1h) lacks the run's start so it
-        # returns STANDARD; the ladder widens to rung-2 (−3h) which returns OFF_PEAK
-        # and wins. Proves context is recovered WITHOUT a huge window.
+        # A morning dispatch-extended slot: rung-1 (+2h forward) lacks the run's start
+        # so it returns STANDARD; the ladder widens the FORWARD edge to rung-2 (+3h)
+        # which returns OFF_PEAK and wins. Proves context is recovered by looking
+        # AHEAD (4.5.7 §2), WITHOUT a huge or backward window.
         slot = "2026-01-15T08:00:00"
         standard = _gql_data(_meas_page([
             _meas_node("2026-01-15T08:00:00+00:00", "3.6", "STANDARD_RATE", "101.0")]))
@@ -562,8 +564,10 @@ class TestGraphQLQueries(unittest.TestCase):
         self.assertEqual(len(c._session.post_calls), 2)           # widened once
         _u, b0, _h, _a = c._session.post_calls[0]
         _u, b1, _h, _a = c._session.post_calls[1]
-        self.assertEqual(b0["variables"]["start"], "2026-01-15T07:00:00Z")  # −1h
-        self.assertEqual(b1["variables"]["start"], "2026-01-15T05:00:00Z")  # −3h
+        self.assertEqual(b0["variables"]["start"], "2026-01-15T07:30:00Z")  # −30m look-back (fixed)
+        self.assertEqual(b1["variables"]["start"], "2026-01-15T07:30:00Z")  # same look-back
+        self.assertEqual(b0["variables"]["end"], "2026-01-15T10:00:00Z")    # +2h forward (rung-1)
+        self.assertEqual(b1["variables"]["end"], "2026-01-15T11:00:00Z")    # +3h forward (rung-2)
 
     def test_recover_omits_genuinely_empty(self):
         # Every rung comes back empty (stripped/no cost) → the slot is omitted so
@@ -576,7 +580,7 @@ class TestGraphQLQueries(unittest.TestCase):
         c = self._client([empty(), empty()])
         rec = run(c.recover_measurement_costs(
             "2600000000000", ["2026-01-15T02:00:00"], pace_s=0,
-            lookback_ladder=(1,), max_attempts=2))
+            lookahead_ladder=(2,), max_attempts=2))
         self.assertEqual(rec, {})
 
     def test_recover_opportunistic_sweep(self):

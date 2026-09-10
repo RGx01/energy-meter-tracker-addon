@@ -661,6 +661,25 @@ class TestReconcilePass(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)    # peak → off-peak
         self.assertEqual(r["rate_reconciled"], 1)
 
+    async def test_confident_bump_settled_reverts_to_peak(self):
+        from block_store import BlockStore
+        st = BlockStore(":memory:")
+        # completed-ONLY, LIVE, SETTLED, substantial, no plan, seen CONTEMPORANEOUSLY -> a
+        # confident out-of-app BUMP: the settled-guard must NOT hold it off-peak (30/08 13:00).
+        self._seed(st, "2020-01-01T13:30:00", 0.05493, [],
+                   off_peak_slot=True, completed_kwh=-3.0, settled=True)
+        st._conn.execute(
+            "INSERT INTO dispatch_history (slot_start, kind, provider, energy_kwh, "
+            "first_seen, last_seen) VALUES "
+            "('2020-01-01T13:30:00','completed','Myenergi',-3.0,"
+            "'2020-01-01T14:00:00','2020-01-01T14:00:00')")
+        st._conn.commit()
+        res = await self._run(st)
+        self.assertEqual(res["reverted"], 1)
+        r = st._conn.execute("SELECT imp_rate FROM blocks WHERE block_start=?",
+                             ("2020-01-01T13:30:00",)).fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.323092, places=5)
+
     async def test_completed_only_from_history_negligible_stays_peak(self):
         from block_store import BlockStore
         st = BlockStore(":memory:")

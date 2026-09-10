@@ -47,11 +47,26 @@ def _block(hh, segs, ev_kwh=0.0, batt_kwh=0.0):
     return {"start": f"2026-08-15T{hh // 2:02d}:{'30' if hh % 2 else '00'}:00", "meters": meters}
 
 
-def _render(day_blocks):
+class _CapStub:
+    """Minimal store for build_day_chart_html's over_cap read: maps a cap-day key to
+    its (boundary_slot, boundary_frac). build_day only calls cap_day_boundary()."""
+    def __init__(self, boundary_by_capday):
+        self._b = boundary_by_capday or {}
+    def cap_day_boundary(self, ts, tz_name):
+        import iog_cap
+        return self._b.get(iog_cap.cap_day_key(ts, tz_name))
+
+
+def _render(day_blocks, *, cap_from=None, cap_boundary=None):
+    # cap_from set → the day is on the capped IOG-SMB tariff (the held-peak / noon-reset
+    # model runs). cap_boundary (a {cap_day: (slot, frac)} map) supplies the authoritative
+    # over_cap signal via a stub store; omit it for a within-cap day (no break → no hold).
+    store = _CapStub(cap_boundary) if cap_boundary is not None else None
     html = ec.build_day_chart_html(
         "2026-08-15", day_blocks,
         {MAIN: "#1f77b4", "ev_charger": "#e377c2", "house_battery": "#ff7f0e"},
-        block_minutes=30, currency="£", bill_rounding=True)
+        block_minutes=30, currency="£", bill_rounding=True,
+        cap_from=cap_from, store=store)
     m = re.search(r'<script type="application/json" id="data_[^"]+">(.*?)</script>', html, re.S)
     return json.loads(m.group(1))["meters"]
 
@@ -73,7 +88,11 @@ class TestDayChartRateCurves(unittest.TestCase):
         return b
 
     def test_ev_hold_peak_to_noon_and_blend(self):
-        ev = _render(self._capped_day())["ev_charger"]["rate"]
+        # Capped day whose 6-hour cap is EXCEEDED at slot 2 (01:00 UTC). The morning
+        # slots (00:00–11:30) belong to the 2026-08-14 noon→noon cap-day; the boundary
+        # there drives over_cap so the EV line holds peak to the noon reset.
+        ev = _render(self._capped_day(), cap_from="2026-08-01",
+                     cap_boundary={"2026-08-14": ("2026-08-15T01:00:00", 0.5)})["ev_charger"]["rate"]
         self.assertAlmostEqual(ev[0], OFF, places=5)
         self.assertTrue(OFF < ev[2] < PEAK)              # blended boundary block
         self.assertAlmostEqual(ev[3], PEAK, places=5)    # over-cap peak == house peak
@@ -82,7 +101,8 @@ class TestDayChartRateCurves(unittest.TestCase):
         self.assertAlmostEqual(ev[24], OFF, places=5)    # noon reset → off-peak
 
     def test_house_lines_follow_main_rate(self):
-        m = _render(self._capped_day())
+        m = _render(self._capped_day(), cap_from="2026-08-01",
+                    cap_boundary={"2026-08-14": ("2026-08-15T01:00:00", 0.5)})
         hs = m[MAIN]["rate"]
         self.assertAlmostEqual(hs[0], OFF, places=5)     # in window
         self.assertAlmostEqual(hs[3], PEAK, places=5)    # over-cap day rate
@@ -94,9 +114,9 @@ class TestDayChartRateCurves(unittest.TestCase):
         b = [(0, _block(0, [_seg(2.0, OFF, "off_peak", "ev"), _seg(0.5, OFF, "off_peak", "house")])),
              (30, _block(30, [_seg(1.0, PEAK, "off_peak", "ev"), _seg(0.5, PEAK, "off_peak", "house")])),
              (31, _block(31, [_seg(0.5, PEAK, "day", "house")]))]     # idle EV after the bump
-        ev = _render(b)["ev_charger"]["rate"]
+        ev = _render(b, cap_from="2026-08-01")["ev_charger"]["rate"]   # capped, but no cap break
         self.assertAlmostEqual(ev[30], PEAK, places=5)   # bump → peak
-        self.assertAlmostEqual(ev[31], OFF, places=5)    # not latched (no real cap break)
+        self.assertAlmostEqual(ev[31], OFF, places=5)    # not latched (over_cap never fires)
 
     def test_freebie_out_of_window_dispatch_is_offpeak(self):
         # EV dispatch out of window within cap → whole block off-peak (freebie) → house off-peak.
@@ -109,7 +129,9 @@ class TestDayChartRateCurves(unittest.TestCase):
     def test_house_lines_agree_and_ev_offpeak_uncapped(self):
         b = [(0, _block(0, [_seg(2.0, OFF, "off_peak", "ev"), _seg(0.4, OFF, "off_peak", "house")], batt_kwh=0.4)),
              (20, _block(20, [_seg(0.6, PEAK, "day", "house")], batt_kwh=0.6))]
-        m = _render(b)
+        # Capped day with NO cap break: idle EV sits at the off-peak baseline (never peak),
+        # while the house line follows the TOU (peak in the day). over_cap never fires.
+        m = _render(b, cap_from="2026-08-01")
         di = m[MAIN]["rate"]; bt = m["house_battery"]["rate"]; ev = m["ev_charger"]["rate"]
         n = min(len(di), len(bt))
         self.assertEqual([round(x, 6) for x in di[:n]], [round(x, 6) for x in bt[:n]])  # agree
