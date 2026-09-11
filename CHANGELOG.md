@@ -1,5 +1,29 @@
 # Changelog
  
+## [4.5.9] — 2026-09-11
+
+*Fixes the EV vs House split reading too much as EV on days a home battery grid-charged at the
+same time as the car, on Intelligent Octopus Go. Costs and totals are unaffected — only the split.*
+
+### Fixed
+
+- **EV is no longer over-counted when the battery grid-charges during a smart-charge slot.**
+  Octopus's settled per-slot device breakdown splits the grid into just Home + EV — it has no
+  bucket for a home battery, so on an overnight slot where the battery drew from the grid at the
+  same time as the car, that battery energy landed in EV. EMT now bounds the EV quantity to the
+  car's own completed-dispatch session (Octopus's per-slot smart-charge energy, which matches a
+  physical charger meter to within a rounding error), so the battery's share stays with the House.
+  The settled bill still sets the EV rate and band; only the kWh split is capped. The Total Bill,
+  the grid total and every cost are byte-identical — Billing and Usage Stats simply attribute the
+  right amount to EV vs House. Works with or without a physical charger meter.
+
+### On upgrade
+
+- **Existing history is corrected automatically, once.** A one-off local pass re-splits any
+  settled off-peak slot whose EV was inflated by a concurrent battery charge, moving the excess
+  back to House at the same rate. No kWh or cost changes — only the EV/House split. No re-import
+  needed.
+
 ## [4.5.8] — 2026-09-11
 
 *Fixes the EV / battery cost reading too high on the Billing and Usage Stats tabs for accounts with
