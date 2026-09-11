@@ -6891,6 +6891,81 @@ def _maybe_backfill_historical_iog_split() -> None:
         _iog_split_backfill_running = False
 
 
+async def run_iog_split_carve(max_blocks: int = 2000) -> dict:
+    """Recurring PREDICTED EV/Home carve for UNSETTLED dispatched blocks whose completed
+    dispatch arrived AFTER finalise, so the finalise seam left them house-only (imp_kwh_ev
+    NULL, a single 'house' segment). Without this the car's charge sits in House on Billing +
+    Usage Stats until Octopus settles the day (~2 days) — even though EMT already has the
+    dispatch to predict the split. Carves the EV kWh from the completed dispatch (grid-clipped
+    = dispatch-capped, the SAME source as the 4.5.9 settlement cap) and re-splits the block
+    EV/House at its OWN single rate — ADDITIVE: imp_kwh / imp_cost / imp_rate are untouched
+    (Sigma segments == imp_cost), so the bill total stays byte-identical and settlement later
+    overwrites with the authoritative split. Only UNSETTLED blocks (rate_source not
+    measured/corrected) are touched; settled/corrected splits are settlement's realm. No
+    done-marker — it runs each tick and is cheap (only late-dispatch stragglers ever match)."""
+    if _store is None:
+        return {"ok": False, "reason": "no store"}
+    isched = _kraken_rate_schedules.get("import")
+    if isched is None or isched.is_empty():
+        return {"ok": True, "deferred": "schedule not ready"}
+    tz_name = _iog_site_tz()
+    conn = _store._conn
+    rows = conn.execute(
+        "SELECT b.block_start, b.imp_kwh, b.imp_rate, b.imp_rate_exc "
+        "FROM blocks b WHERE b.meter_id = 'electricity_main' AND b.imp_kwh_ev IS NULL "
+        "  AND b.imp_kwh > 0 "
+        "  AND (b.rate_source IS NULL OR b.rate_source NOT IN ('measured','corrected')) "
+        "  AND EXISTS (SELECT 1 FROM dispatch_history d WHERE d.kind = 'completed' "
+        "              AND d.slot_start = b.block_start AND d.energy_kwh IS NOT NULL) "
+        "ORDER BY b.block_start LIMIT ?", (int(max_blocks),)).fetchall()
+    carved = 0
+    for r in rows:
+        bs = r["block_start"]; kwh = float(r["imp_kwh"] or 0.0); rate = float(r["imp_rate"] or 0.0)
+        if kwh <= 1e-9:
+            continue
+        # Band-aware carve (dispatch-derived EV, grid-clipped) via the shared seam; we take the
+        # kWh + bands from it but re-price the split at the block's OWN single rate for strict
+        # cost-neutrality (scope-1 additive: no inc re-pricing).
+        tmp: dict = {"kwh": kwh, "rate": rate}
+        try:
+            _apply_iog_split(tmp, bs, "", kwh, rate, tz_name)
+        except Exception as e:
+            logger.warning("run_iog_split_carve: carve failed (%s): %s", bs, e)
+            continue
+        ev = tmp.get("kwh_ev")
+        if ev is None or float(ev) <= 1e-9:
+            continue                                   # no dispatch EV this slot -> stays house
+        ev = round(float(ev), 6)
+        rexc = r["imp_rate_exc"]
+        rexc = round(float(rexc), 6) if rexc is not None else round(rate / 1.05, 6)
+        ev_band = tmp.get("ev_band") or "off_peak"
+        home_band = tmp.get("home_band") or ev_band
+        house = round(kwh - ev, 6)
+        segs = []
+        if ev > 1e-9:
+            segs.append((ev, rate, rexc, ev_band, "ev"))
+        if house > 1e-9:
+            segs.append((house, rate, rexc, home_band, "house"))
+        try:
+            _store.set_block_segments(bs, "electricity_main", segs)
+            with conn:
+                conn.execute(
+                    "UPDATE blocks SET imp_kwh_ev = ?, imp_cost_ev = ?, imp_rate_ev = ?, "
+                    "imp_ev_band = COALESCE(imp_ev_band, ?), "
+                    "imp_home_band = COALESCE(imp_home_band, ?) "
+                    "WHERE meter_id = 'electricity_main' AND block_start = ? "
+                    "AND imp_kwh_ev IS NULL",
+                    (ev, round(ev * rate, 6), rate, ev_band, home_band, bs))
+            carved += 1
+        except Exception as e:
+            logger.warning("run_iog_split_carve: persist failed (%s): %s", bs, e)
+    if carved:
+        _schedule_chart_regen()
+        logger.info("run_iog_split_carve: carved predicted EV/Home split on %d unsettled "
+                    "dispatched block(s)", carved)
+    return {"ok": True, "carved": carved}
+
+
 _SEGMENT_BACKFILL_MARKER = "segment_backfill_state"   # store_meta key
 _SEGMENT_BACKFILL_SCOPE = 1
 _SEGMENT_BACKFILL_PASS_PACE = 1.0
@@ -10144,6 +10219,13 @@ async def _tick_dispatch_capture() -> None:
             await run_smb_ev_resplit()
         except Exception as e:
             logger.warning("_tick_dispatch_capture: smb ev-resplit failed: %s", e)
+        # 4.5.9: carve the PREDICTED EV/Home split onto unsettled dispatched blocks whose
+        # completed dispatch landed after finalise (else the car's charge sits in House until
+        # settlement). Additive, dispatch-capped; recurring (no done-marker).
+        try:
+            await run_iog_split_carve()
+        except Exception as e:
+            logger.warning("_tick_dispatch_capture: iog split carve failed: %s", e)
         try:
             await measure_settled_dispatched_blocks()
         except Exception as e:

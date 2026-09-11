@@ -17,6 +17,13 @@ same time as the car, on Intelligent Octopus Go. Costs and totals are unaffected
   the grid total and every cost are byte-identical — Billing and Usage Stats simply attribute the
   right amount to EV vs House. Works with or without a physical charger meter.
 
+- **Recent days no longer park EV charging in House until settlement.** When a smart-charge
+  dispatch arrives after a half-hour has already been priced, EMT now carves the predicted
+  EV/House split from the dispatch straight away (grid-clipped, same source as the settled
+  cap) instead of leaving the car's charge in House for ~2 days until Octopus settles. The
+  Billing "grid total" EV/House rows match the charger from the moment the dispatch lands;
+  settlement still overwrites with the final split. Additive — no kWh or cost changes.
+
 ### On upgrade
 
 - **Existing history is corrected automatically, once.** A one-off local pass re-splits any
