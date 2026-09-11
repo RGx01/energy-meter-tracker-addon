@@ -139,7 +139,7 @@
   <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;">
     <label style="font-size:13px;font-weight:600;">Source:</label>
     <select id="billing-source-select" style="padding:6px 10px;font-size:13px;">
-      <option value="dcc">DCC settlement (recommended)</option>
+      <option value="dcc">Cost settlement (recommended)</option>
       <option value="cad">CAD readings only</option>
     </select>
     <button class="btn btn-primary" id="btn-apply-source" onclick="applyBillingSource()">Apply</button>
@@ -151,7 +151,7 @@
 <div class="card" id="unsettled-card" style="display:none;">
   <div class="card-title">🔍 Review Unsettled Blocks</div>
   <p style="color:var(--muted);font-size:13px;margin-bottom:16px;line-height:1.7;">
-    These half-hour blocks have no DCC settlement yet, so they're billed using
+    These half-hour blocks have no cost settlement yet, so they're billed using
     your local CAD readings as a fallback. Recent blocks normally settle within
     a day or two; older ones may indicate a genuine gap.
   </p>
@@ -535,8 +535,8 @@ function loadBillingSource() {
         if (sel) sel.value = d.source;
         var st = document.getElementById('billing-source-status');
         if (st) st.textContent = 'Currently using ' + (d.source === 'dcc'
-          ? 'DCC settlement' : 'CAD readings') + '. '
-          + (d.unsettled || 0) + ' block(s) awaiting DCC settlement.';
+          ? 'cost settlement' : 'CAD readings') + '. '
+          + (d.unsettled || 0) + ' block(s) awaiting cost settlement.';
       }
       // Unsettled-blocks review (and Retry) are relevant whenever a supplier API
       // is present and billing runs on DCC — including a pure-API setup; no CAD
@@ -554,7 +554,7 @@ function applyBillingSource() {
   var sel = document.getElementById('billing-source-select');
   if (!sel) return;
   var source = sel.value;
-  var label = (source === 'dcc' ? 'DCC settlement' : 'CAD readings');
+  var label = (source === 'dcc' ? 'cost settlement' : 'CAD readings');
   if (!confirm('Switch billing to ' + label + '?\n\nThis re-calculates your entire '
     + 'history and can take a few minutes to complete in the background.')) return;
   var btn = document.getElementById('btn-apply-source');

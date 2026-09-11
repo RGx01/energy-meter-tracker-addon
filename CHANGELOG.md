@@ -1,6 +1,6 @@
 # Changelog
  
-## [4.5.7] — 2026-09-10
+## [4.5.7] — 2026-09-11
 
 *Fixes recent Intelligent Octopus Go days showing the wrong (off-peak) rate on the billing charts,
 and simplifies how EMT reconciles against Octopus's settled bill. The root cause was a gap in
@@ -9,16 +9,17 @@ assumed "rates firm up over days" behaviour is retired in favour of reading Octo
 device breakdown directly.*
 
 *Underlying it all: before a period settles, EMT predicts each block's rate by applying Octopus's
-Intelligent Octopus Go four-rate rules faithfully — off-peak in the guaranteed 23:30–05:30 window;
-the smart-charge dispatch off-peak "freebee" for a metered draw within the 6-hour car allowance;
-peak for bump/boost, for out-of-dispatch charging, and once the cap is exceeded — as those rules
-were published by Octopus on 7&nbsp;May&nbsp;2026
-([intelligent-octopus-go-smarter-charging-for-a-greener-grid](https://octopus.energy/blog/intelligent-octopus-go-smarter-charging-for-a-greener-grid/)).
-Once Octopus settles the period the settled bill is authoritative and EMT reconciles to it. The
+Intelligent Octopus Go four-rate rules faithfully, as published by Octopus on 7&nbsp;May&nbsp;2026
+([intelligent-octopus-go-smarter-charging-for-a-greener-grid](https://octopus.energy/blog/intelligent-octopus-go-smarter-charging-for-a-greener-grid/)):*
+
+- Home usage at the **off-peak** rate in the guaranteed 23:30–05:30 window.
+- Home usage at the **peak** rate in the 05:30–23:30 window.
+- The smart-charge dispatch off-peak **"freebee"** for a metered draw within the 6-hour car allowance.
+- **Peak** for bump/boost, for out-of-dispatch charging, and once the cap is exceeded (any EV usage outside of Smart Control, at any time of day).
+
+*Once Octopus settles the period the settled bill is authoritative and EMT reconciles to it. The
 published rules and the actual bill do not always agree — in either direction — so a pre-settlement
-rate is a best-effort prediction, not a guarantee; a gap can resolve as Octopus re-bills (a clawback
-or a refund) or as Octopus clarifies the four-rate rules so predictions can track billing more
-closely.*
+rate is a best-effort prediction, not a guarantee.*
 
 ### Fixed
 
