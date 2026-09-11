@@ -1891,7 +1891,7 @@ def _day_segment_split(main_import, meters):
     return out
 
 
-def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_minutes=30, currency='£', site_name=None, ev_slot_map=None, bill_rounding=False, fallback_vat=0.05, ev_fold_meter=None, ev_label=None):
+def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_minutes=30, currency='£', site_name=None, ev_slot_map=None, bill_rounding=False, fallback_vat=0.05, ev_fold_meter=None, ev_label=None, cap_from=None, import_schedule=None, store=None, timezone_name='UTC'):
     slots = 1440 // block_minutes
     meter_kwh    = defaultdict(lambda: [0.0] * slots)
     meter_rate   = defaultdict(lambda: [0.0] * slots)
@@ -2133,7 +2133,73 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
     # ONE tested place for "what rate applies each half-hour"; the chart only plots it. See
     # the presentation read-contract in docs/design/4.4.0_iog_pricing_and_reprice_design.md.
     import chart_emit
-    _series = chart_emit.day_rate_series(day_blocks, slots=slots, block_minutes=block_minutes)
+    # Cap gating: the 6-h-cap held-peak / noon-reset rules apply only to days within the
+    # capped IOG-SMB era (cap_from = the SMB agreement's start). Pre-cap days follow uncapped
+    # TOU -- EV shows its charged rate where charging, else tracks the house line.
+    _capped_day = bool(cap_from) and str(day) >= str(cap_from)
+    # Authoritative per-slot house TOU from the tariff schedule, so the house rate line never
+    # trusts an unreliable stored rate on a 0-kWh / seam-mis-priced block. resolve() is the
+    # base tariff (dispatch overlays don't affect it); schedule is pence -> £.
+    _house_tou = None
+    if import_schedule is not None:
+        _house_tou = [None] * slots
+        # Resolve the tariff TOU for EVERY slot (not just slots with a block), so the house
+        # rate line follows the day/night TOU across idle / no-usage slots instead of clinging
+        # to a stale stored rate. Derive each slot's naive-UTC timestamp from the hh<->UTC
+        # mapping the day's blocks give us (tz-agnostic; blocks are consecutive half-hours).
+        from datetime import datetime as _dt_ht, timedelta as _td_ht
+        _base_ht = None
+        for _hh, _b in day_blocks:
+            _bs = (_b or {}).get("start")
+            if _bs:
+                try:
+                    _base_ht = _dt_ht.fromisoformat(_bs) - _td_ht(minutes=_hh * block_minutes)
+                    break
+                except Exception:
+                    pass
+        if _base_ht is not None:
+            for _hh in range(slots):
+                try:
+                    _r = import_schedule.resolve(
+                        (_base_ht + _td_ht(minutes=_hh * block_minutes)).isoformat())
+                    if _r is not None:
+                        _house_tou[_hh] = _r / 100.0
+                except Exception:
+                    pass
+    # Authoritative held-peak signal for the EV line: over_cap[hh] True where the 6-hour
+    # cap is EXCEEDED at this slot (at/after its noon->noon cap-day boundary). The boundary
+    # comes from store.cap_day_boundary, which EXCLUDES bump/boost energy — so a bump or an
+    # out-of-dispatch peak charge never latches the line (4-rate rules); only a genuine
+    # over-cap smart-charge does. None on a pre-cap day / no store (chart_emit → no hold).
+    _over_cap = None
+    if _capped_day and store is not None:
+        try:
+            import iog_cap as _iogc
+            from datetime import datetime as _dt_oc, timedelta as _td_oc
+            _base_oc = None
+            for _hh, _b in day_blocks:
+                _bs = (_b or {}).get("start")
+                if _bs:
+                    try:
+                        _base_oc = _dt_oc.fromisoformat(_bs) - _td_oc(minutes=_hh * block_minutes)
+                        break
+                    except Exception:
+                        pass
+            if _base_oc is not None:
+                _over_cap = [False] * slots
+                _bcache = {}
+                for _hh in range(slots):
+                    _ts = (_base_oc + _td_oc(minutes=_hh * block_minutes)).isoformat()
+                    _k = _iogc.cap_day_key(_ts, timezone_name)
+                    if _k not in _bcache:
+                        _bcache[_k] = store.cap_day_boundary(_ts, timezone_name)
+                    # < 1.0: boundary slot (blend) and every slot after it in the cap-day.
+                    if _iogc._within_cap_frac(_ts, _bcache[_k]) < 1.0:
+                        _over_cap[_hh] = True
+        except Exception:
+            _over_cap = None
+    _series = chart_emit.day_rate_series(day_blocks, slots=slots, block_minutes=block_minutes, capped=_capped_day, house_tou=_house_tou, ev_slot_rate=meter_rate.get("ev_dispatch"), over_cap=_over_cap)
+    _ev_fb = _series.get("ev_fallback")
     for _mid in list(meter_rate.keys()):
         if _mid.endswith("_export"):
             continue
@@ -2141,8 +2207,26 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                   or _mid.lower().startswith("ev_") or _mid.lower().startswith("ev "))
         _curve = _series["ev"] if _is_ev else _series["house"]
         for hh in range(slots):
-            if _curve[hh] is not None:
-                meter_rate[_mid][hh] = _curve[hh]
+            if _curve[hh] is None:
+                continue
+            # BL-27 hardening: never let day_rate_series' off/held FALLBACK guess override a
+            # real dispatch-derived per-slot EV rate. A slot with EV energy but no stored EV
+            # segment (late-attributed / manually-corrected block) already carries the bar's
+            # rate in meter_rate here; keep the line on it so line and bar agree.
+            _keep = (_is_ev and _ev_fb is not None and _ev_fb[hh]
+                     and meter_rate[_mid][hh])
+            # 4.5.7: on a capped (IOG-SMB) day, do NOT preserve a physical EV device's own
+            # stored rate on an IDLE (0-kWh) slot — that value is the stale plain-TOU rate the
+            # sub-meter carries where the car isn't charging, and it's the ONLY EV surface not
+            # already on the synthetic/hybrid path (bars, Usage Stats, Insights, bill all are).
+            # Let the slot fall through to the synthetic curve (off-peak baseline within cap,
+            # held-peak on a genuine over_cap break, noon reset), matching every other surface.
+            # Charging slots (real EV kWh) still keep the bar's rate, so line and bar agree.
+            if _keep and _capped_day and meter_kwh.get(_mid, [0.0] * slots)[hh] <= 1e-9:
+                _keep = False
+            if _keep:
+                continue
+            meter_rate[_mid][hh] = _curve[hh]
 
     # ── x axis labels — outside the loop ──
     total_hh_kwh = [sum(meter_kwh[m][i] for m in meter_kwh if not m.endswith('_export')) for i in range(slots)]
@@ -2430,7 +2514,7 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
 # Main entry point
 # ─────────────────────────────────────────────────────────────
 
-def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minutes=None, currency='£', cfg=None, store=None):
+def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minutes=None, currency='£', cfg=None, store=None, cap_from=None, import_schedule=None):
 
     if not blocks:
         return "<html><body><p>No data available.</p></body></html>"
@@ -2843,7 +2927,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
         # Daily charts
         day_charts_html = ""
         for day in ps["days"]:
-            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_day_map, bill_rounding=_bill_rounding, fallback_vat=_vat_at(day), ev_fold_meter=_ev_phys_id, ev_label=("EV" if _ev_phys_id else None))
+            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_day_map, bill_rounding=_bill_rounding, fallback_vat=_vat_at(day), ev_fold_meter=_ev_phys_id, ev_label=("EV" if _ev_phys_id else None), cap_from=cap_from, import_schedule=import_schedule, store=store, timezone_name=timezone_name)
 
         open_attr    = "open" if charts_open else ""
         toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}"
@@ -2916,7 +3000,7 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
 
         day_charts_html = ""
         for day in gs["days"]:
-            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, chart_prefix=f"{pid_prefix}_", block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_day_map, bill_rounding=_bill_rounding, fallback_vat=_vat_at(day), ev_fold_meter=_ev_phys_id, ev_label=("EV" if _ev_phys_id else None))
+            day_charts_html += build_day_chart_html(day, days_map[day], meter_colors, chart_prefix=f"{pid_prefix}_", block_minutes=block_minutes, currency=currency, site_name=site_name, ev_slot_map=_ev_day_map, bill_rounding=_bill_rounding, fallback_vat=_vat_at(day), ev_fold_meter=_ev_phys_id, ev_label=("EV" if _ev_phys_id else None), cap_from=cap_from, import_schedule=import_schedule, store=store, timezone_name=timezone_name)
 
         toggle_label = f"Daily Charts &mdash; {ph} &nbsp;|&nbsp; {currency}{bill_total:.2f}"
         # Quarter/year sections can hold 90–365 day charts; default the panel

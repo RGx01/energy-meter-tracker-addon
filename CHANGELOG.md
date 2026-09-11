@@ -1,5 +1,78 @@
 # Changelog
  
+## [4.5.7] — 2026-09-11
+
+*Fixes recent Intelligent Octopus Go days showing the wrong (off-peak) rate on the billing charts,
+and simplifies how EMT reconciles against Octopus's settled bill. The root cause was a gap in
+Octopus's day/night rate feeds — not the charts — and the settlement machinery built around an
+assumed "rates firm up over days" behaviour is retired in favour of reading Octopus's own per-slot
+device breakdown directly.*
+
+*Underlying it all: before a period settles, EMT predicts each block's rate by applying Octopus's
+Intelligent Octopus Go four-rate rules faithfully, as published by Octopus on 7&nbsp;May&nbsp;2026
+([intelligent-octopus-go-smarter-charging-for-a-greener-grid](https://octopus.energy/blog/intelligent-octopus-go-smarter-charging-for-a-greener-grid/)):*
+
+- Home usage at the **off-peak** rate in the guaranteed 23:30–05:30 window.
+- Home usage at the **peak** rate in the 05:30–23:30 window.
+- The smart-charge dispatch off-peak **"freebee"** for a metered draw within the 6-hour car allowance.
+- **Peak** for bump/boost, for out-of-dispatch charging, and once the cap is exceeded (any EV usage outside of Smart Control, at any time of day).
+
+*Once Octopus settles the period the settled bill is authoritative and EMT reconciles to it. The
+published rules and the actual bill do not always agree — in either direction — so a pre-settlement
+rate is a best-effort prediction, not a guarantee.*
+
+### Fixed
+
+- **Recent daytime charges no longer show an off-peak rate.** Octopus's separate `day` and `night`
+  rate feeds can lag each other, and a missing recent `day` rate was being filled with the `night`
+  (off-peak) rate — so daytime slots on recent days priced off-peak. The time-of-use reconstruction
+  now carries each band's own last rate forward across a feed gap, so daytime is peak and night is
+  off-peak as it should be.
+- **The billing chart's house rate line follows the tariff on idle days.** A rounding mismatch
+  between the stored rate and the schedule could leave a whole day's house line flat off-peak (and,
+  on a day with no EV charging, blank the day). Both are fixed; the line shows the correct
+  time-of-use rate across idle and no-charge days.
+- **A late-arriving completed EV dispatch no longer strands the charge in Home.** Settlement now
+  takes the EV/house split from Octopus's own device breakdown, so a dispatch that lands after a
+  block was priced still attributes the EV correctly.
+- **The EV rate line only holds peak when the 6-hour cap is genuinely exceeded.** Previously any
+  peak-priced early slot — a bump charge, an out-of-dispatch draw, or a mis-priced ~0-kWh slot —
+  could latch the EV line to peak all the way to the noon reset. The held-peak now follows only a
+  real cap exceedance (a within-dispatch slot past the 6-hour boundary); a bump or out-of-dispatch
+  charge shows its own peak tick without latching.
+- **The one-off historical re-price keeps the smart-charge off-peak "freebee".** A daytime
+  smart-charge slot within the 6-hour cap stays off-peak (as billed) instead of being re-derived to
+  peak; a bump/boost or over-cap slot stays peak. Days the first repair pass mis-priced are corrected
+  automatically on the next start.
+- **The charts refresh automatically after the historical re-price.** The one-off repair now triggers
+  a chart regeneration when it changes any rate, so corrected days appear without waiting for a restart.
+
+### Changed
+
+- **Settlement reads Octopus's four-bucket device breakdown.** For IOG-SMB, EMT now reads the
+  settled cost, the Home/EV split, and the off-peak/peak band directly from Octopus's per-slot device
+  buckets (`getDeviceConsumptionBreakdown`) in one small query. The settled bill is authoritative for
+  cost and band, both bands apply as soon as the bill is available, and the settled rate is always the
+  exact tariff-agreement rate — never a cost÷kWh derivation.
+- **Retired the interim single-label settlement machinery.** The asymmetric age-gate (which deferred
+  recent "standard" reads), the per-block review-flag on a band change, the forward-extending
+  "recovery ladder" used to coax an off-peak label out of the API, and the "N rates finalising" pill
+  are all removed from settlement — they were built to cope with a settlement-lag / unreliable-label
+  problem the device breakdown makes moot. The recovery fetch is retained only for non-IOG-SMB import
+  backfill, which has no device buckets.
+- **Bump/boost charging no longer counts toward the 6-hour cap.** A bump/boost slot is billed at peak,
+  so its energy no longer advances the off-peak cap allowance — a peak-billed slot can't also consume
+  the off-peak window. This affects the pre-settlement rate prediction only (the settled bill remains
+  authoritative).
+
+### On upgrade
+
+- **Historical IOG-SMB days are re-priced automatically, once.** A one-off, local repair on first run
+  re-derives the rate for the days the feed-gap bug mis-priced, straight from the corrected schedule.
+  Your raw meter data and the Home/EV split are untouched — only the priced rate moves. No re-import
+  needed. This repair now also re-runs once to restore the smart-charge off-peak "freebee" on any
+  daytime dispatch slots an earlier pass had over-corrected to peak.
+
 ## [4.5.6] — 2026-08-29
 
 > ℹ️ **Note for Intelligent Octopus Go users.** IOG per-slot rate data from the API

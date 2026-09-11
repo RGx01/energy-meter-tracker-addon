@@ -236,7 +236,7 @@
   <div class="note-box">
     ⓘ <strong>Octopus Home Mini</strong> — if you have one, EMT can use its real-time demand feed as a
     live-power source for the Overview gauge and 48-hour history without a separate CAD sensor. Mini
-    figures are provisional; DCC settlement corrects the recorded history once available.
+    figures are provisional; cost settlement corrects the recorded history once available.
   </div>
   <p style="font-size:12px;color:var(--muted);">
     Full detail: see the <a href="https://github.com/RGx01/energy-meter-tracker-addon/wiki/Supplier-Settlement" target="_blank" style="color:var(--accent);">Supplier Settlement</a>
@@ -251,7 +251,7 @@
     On Intelligent Octopus Go (IOG), your EV often smart-charges in <strong>dispatch slots</strong> at
     the cheap off-peak rate, at times the standard tariff wouldn't predict. EMT captures those slots
     live and reprices the affected energy with a <strong>dispatch overlay</strong>, applied at both
-    block finalise and DCC settlement.
+    block finalise and cost settlement.
   </p>
   <ul>
     <li>Enable per device via the <strong>"use dispatch overlay"</strong> rate option in Meter Config, so your EV bills at the dispatch rate while the rest of the house stays on the standard tariff.</li>

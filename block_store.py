@@ -410,6 +410,13 @@ CREATE TABLE IF NOT EXISTS measured_cost (
     label       TEXT,                    -- OFF_PEAK | STANDARD_RATE | mixed
     kwh         REAL,
     fetched_at  TEXT,
+    -- C2 (4.5.7): the four-bucket SETTLED Home/EV split + per-bucket rate
+    -- (getDeviceConsumptionBreakdown). NULL for non-SMB / not-yet-fetched. One row
+    -- per settled slot holds cost + label + split — the whole settled truth (design §4).
+    home_kwh    REAL,
+    home_rate   REAL,
+    ev_kwh      REAL,
+    ev_rate     REAL,
     PRIMARY KEY (slot_start, mpan, direction)
 );
 """
@@ -1120,6 +1127,7 @@ class BlockStore:
         _ds_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(dispatch_slots)").fetchall()} if self._conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='dispatch_slots'").fetchone() else set()
         _dh_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(dispatch_history)").fetchall()} if self._conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='dispatch_history'").fetchone() else set()
         _ph_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(power_history)").fetchall()} if self._conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='power_history'").fetchone() else set()
+        _mc_cost_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(measured_cost)").fetchall()} if self._conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='measured_cost'").fetchone() else set()
 
         for _col, _tbl, _defn, _col_set in [
             ("protected",            "meters",         "INTEGER DEFAULT 0",  _m_cols),
@@ -1200,6 +1208,11 @@ class BlockStore:
             ("raw_end",          "dispatch_slots",   "TEXT",  _ds_cols),
             ("raw_start",        "dispatch_history", "TEXT",  _dh_cols),
             ("raw_end",          "dispatch_history", "TEXT",  _dh_cols),
+            # C2 (4.5.7): four-bucket settled Home/EV split folded into measured_cost.
+            ("home_kwh",         "measured_cost",  "REAL",  _mc_cost_cols),
+            ("home_rate",        "measured_cost",  "REAL",  _mc_cost_cols),
+            ("ev_kwh",           "measured_cost",  "REAL",  _mc_cost_cols),
+            ("ev_rate",          "measured_cost",  "REAL",  _mc_cost_cols),
         ]:
             if _col not in _col_set:
                 try:
@@ -1576,6 +1589,33 @@ class BlockStore:
              fetched_at or _utc_now_iso()))
         self._conn.commit()
 
+    def upsert_measured_breakdown(self, slot_start: str, *, mpan: str = "",
+                                 direction: str = "CONSUMPTION", home_kwh=None,
+                                 home_rate=None, ev_kwh=None, ev_rate=None) -> None:
+        """C2: fold the four-bucket settled Home/EV split onto the slot's measured_cost row.
+        INSERTs a row (cost NULL) if none exists yet; otherwise updates ONLY the split
+        columns, leaving the billed cost/label untouched. One row per slot = the whole
+        settled truth (design §4)."""
+        self._conn.execute(
+            "INSERT INTO measured_cost (slot_start, mpan, direction, home_kwh, home_rate, "
+            "ev_kwh, ev_rate, fetched_at) VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(slot_start, mpan, direction) DO UPDATE SET "
+            "home_kwh=excluded.home_kwh, home_rate=excluded.home_rate, "
+            "ev_kwh=excluded.ev_kwh, ev_rate=excluded.ev_rate",
+            (slot_start, mpan or "", direction, home_kwh, home_rate, ev_kwh, ev_rate,
+             _utc_now_iso()))
+        self._conn.commit()
+
+    def get_measured_breakdown(self, slot_start: str, direction: str = "CONSUMPTION"):
+        """C2: the cached four-bucket split for a slot (any mpan), or None if unset."""
+        r = self._conn.execute(
+            "SELECT home_kwh, home_rate, ev_kwh, ev_rate FROM measured_cost "
+            "WHERE slot_start=? AND direction=? ORDER BY fetched_at DESC LIMIT 1",
+            (slot_start, direction)).fetchone()
+        if r is None or (r[0] is None and r[2] is None):
+            return None
+        return {"home_kwh": r[0], "home_rate": r[1], "ev_kwh": r[2], "ev_rate": r[3]}
+
     def measured_slots_missing(self, starts, mpan: str = "",
                                direction: str = "CONSUMPTION") -> list:
         """Of `starts`, the slot_starts with NO measured_cost row yet (so the
@@ -1659,6 +1699,41 @@ class BlockStore:
             "ORDER BY slot_start", (start_iso, end_iso)
         ).fetchall()]
 
+    # ── IOG 6-hour cap boundary (shared by settlement pricing + the day chart) ──
+    _BUMP_SOURCES = ("bump-charge", "boost")
+
+    def cap_day_boundary(self, block_start: str, tz_name: str):
+        """The 6-hour-cap boundary for the noon->noon cap-day this slot belongs to, as
+        `(boundary_slot, boundary_frac)` -- or None when the cap is never reached.
+
+        The cap measures ACTUAL smart-charge time (design 4-rate rules): a BUMP/BOOST slot
+        bills at PEAK and therefore must NOT advance the cap -- a peak-billed slot can't
+        also consume the off-peak allowance. Completed dispatch slots that a bump/boost
+        covers are excluded from the tally before the boundary is located. Pure projection
+        of iog_cap over this store's completed dispatch feed -- the SINGLE source both the
+        settlement split (_iog_cap_day_boundary) and the day chart's held-peak read."""
+        import iog_cap
+        key = iog_cap.cap_day_key(block_start, tz_name)
+        try:
+            from datetime import date as _date, timedelta as _td
+            y, m, d = int(key[:4]), int(key[5:7]), int(key[8:10])
+            nxt = (_date(y, m, d) + _td(days=1)).isoformat()
+            lo, hi = key + "T00:00:00", nxt + "T23:59:59"
+            rows = self._conn.execute(
+                "SELECT slot_start, raw_start, raw_end, energy_kwh FROM dispatch_history "
+                "WHERE kind='completed' AND raw_start IS NOT NULL AND raw_end IS NOT NULL "
+                "AND raw_start >= ? AND raw_start < ?", (lo, hi)).fetchall()
+            _qs = ",".join("?" * len(self._BUMP_SOURCES))
+            boost = {r["slot_start"] for r in self._conn.execute(
+                "SELECT DISTINCT slot_start FROM dispatch_history "
+                f"WHERE source IN ({_qs}) AND slot_start >= ? AND slot_start < ?",
+                (*self._BUMP_SOURCES, lo, hi)).fetchall()}
+        except Exception:
+            return None
+        feed = [(r["raw_start"], r["raw_end"], r["energy_kwh"])
+                for r in rows if r["slot_start"] not in boost]
+        return iog_cap.cap_day_boundaries(feed, tz_name).get(key)
+
     def prune_dispatch_slots(self, days: int = 90) -> int:
         """Delete dispatch_slots older than `days` days. Generous retention (90d)
         — these are small and the overlay may reprice historical blocks during a
@@ -1672,49 +1747,101 @@ class BlockStore:
             )
         return cur.rowcount
 
-    def materialise_completed_only_slots(self, small_kwh: float = 0.4) -> int:
-        """Promote SUBSTANTIAL completed-ONLY dispatches from dispatch_history into
-        off-peak dispatch_slots (design §14). A completed-only slot — one EMT saw
-        purely as a `completed` dispatch (no `planned`/`started`, e.g. EMT was
-        offline for it, or the completed record arrived via a re-import) — lives in
-        dispatch_history but, under the live capture path, only becomes a billing
-        `dispatch_slot` if the completed dispatch is still in the provider's current
-        (rolling) dispatch window. Once it ages out, the evidence is stranded in the
-        history ledger and reconcile_dispatch_overlay's candidate query (which gates
-        on an off-peak dispatch_slot EXISTING) can never see it, so a genuine smart
-        charge stays mispriced at peak forever.
-
-        This is the settlement-time complement to that live capture: for any
-        `completed` history row with |energy| >= small_kwh, no `planned`/`started`
-        for the same slot, and no existing dispatch_slot, create an off-peak slot
-        (source='smart-charge-completed', state='completed'). _reconcile_decision
-        then prices it via the has_planned=False (offline / re-import) branch, i.e.
-        off-peak. Only SUBSTANTIAL completed-only slots are materialised — that is
-        exactly the set reconcile would price off-peak; a sub-threshold completed
-        dispatch would only ever resolve to peak, so creating a slot for it is
-        pointless (and it is left alone). Idempotent — a second run is a no-op
-        because the slot then exists. Returns the number of slots created.
+    def emt_recording_continuously(self, slot_start: str, hours: float = 4.0,
+                                   block_minutes: int = 30) -> bool:
+        """True when EMT recorded an UNBROKEN run of LIVE (non-interpolated) main-meter blocks
+        across [slot_start - hours, slot_start) — i.e. it was demonstrably up and polling in
+        the window a smart-charge PLAN for this slot would have been visible. EMT polls the
+        dispatch API on the same loop, so continuous live blocks mean any published plan would
+        have been captured. Used to turn a completed-only dispatch with NO plan into a
+        CONFIDENT bump: EMT was up and still saw no plan -> Octopus never scheduled it. A
+        missing OR interpolated (gap-filled) block in the window => EMT may have been offline
+        when the plan appeared => NOT confident (leave the completed-only rescue as off-peak).
         """
+        from datetime import datetime as _dt, timedelta as _td
+        try:
+            end = _dt.fromisoformat(str(slot_start).replace("Z", "").split("+")[0])
+        except Exception:
+            return False
+        step = max(1, int(block_minutes or 30))
+        start = end - _td(hours=float(hours))
+        rows = self._conn.execute(
+            "SELECT block_start, interpolated FROM blocks "
+            "WHERE meter_id = 'electricity_main' AND block_start >= ? AND block_start < ?",
+            (start.isoformat(), end.isoformat())).fetchall()
+        live = {r["block_start"] for r in rows if not r["interpolated"]}
+        t, n = start, 0
+        while t < end:
+            if t.isoformat() not in live:
+                return False          # missing or interpolated -> not continuously live
+            n += 1
+            t += _td(minutes=step)
+        return n > 0
+
+    def materialise_completed_only_slots(self, small_kwh: float = 0.4,
+                                         is_off_peak=None, is_boost=None,
+                                         emt_up_hours: float = 4.0) -> int:
+        """Promote SUBSTANTIAL completed-ONLY dispatches (no planned/started, no existing
+        slot) from dispatch_history into dispatch_slots so reconcile/settlement can see them
+        (design §14). Each is classified for its PROVISIONAL band:
+
+          * INSIDE the off-peak window -> OFF-peak (guaranteed; even a boost is off-peak there).
+          * OUTSIDE the window + CONFIDENT bump -> PEAK. Confident = the charger flags a boost
+            (is_boost), OR EMT was recording continuously through the window a plan would have
+            appeared (emt_recording_continuously) yet saw NO plan -> Octopus never scheduled it.
+            Settlement heals it DOWN immediately if we're wrong (cheaper = applied at any age).
+          * OUTSIDE the window + AMBIGUOUS (EMT may have been offline when a plan would appear)
+            -> OFF-peak, preserving the original completed-only rescue (a plan missed offline).
+
+        is_off_peak / is_boost: optional callables(slot_start)->bool|None. With is_off_peak
+        None (no schedule), legacy behaviour: every completed-only slot is off-peak. Peak slots
+        carry source='smart-charge-completed' like off-peak ones, so the settlement fetch (which
+        now includes them) can still verify and heal them. Idempotent. Returns rows created."""
+        now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        cands = self._conn.execute(
+            """SELECT h.slot_start, MAX(h.provider) AS provider,
+                      SUM(h.energy_kwh) AS energy_kwh,
+                      MAX(h.raw_start) AS raw_start, MAX(h.raw_end) AS raw_end
+               FROM dispatch_history h
+               WHERE h.kind = 'completed' AND h.energy_kwh IS NOT NULL
+                 AND ABS(h.energy_kwh) >= ?
+                 AND NOT EXISTS (SELECT 1 FROM dispatch_slots s
+                                 WHERE s.slot_start = h.slot_start)
+                 AND NOT EXISTS (SELECT 1 FROM dispatch_history h2
+                                 WHERE h2.slot_start = h.slot_start
+                                   AND h2.kind IN ('planned', 'started'))
+               GROUP BY h.slot_start""",
+            (small_kwh,)).fetchall()
+        n = 0
         with self._conn:
-            cur = self._conn.execute(
-                """INSERT INTO dispatch_slots
-                       (slot_start, off_peak, provider, source, captured_at,
-                        state, energy_planned, energy_completed, raw_start, raw_end)
-                   SELECT h.slot_start, 1, h.provider, 'smart-charge-completed', ?,
-                          'completed', NULL, h.energy_kwh, h.raw_start, h.raw_end
-                   FROM dispatch_history h
-                   WHERE h.kind = 'completed' AND h.energy_kwh IS NOT NULL
-                     AND ABS(h.energy_kwh) >= ?
-                     AND NOT EXISTS (SELECT 1 FROM dispatch_slots s
-                                     WHERE s.slot_start = h.slot_start)
-                     AND NOT EXISTS (SELECT 1 FROM dispatch_history h2
-                                     WHERE h2.slot_start = h.slot_start
-                                       AND h2.kind IN ('planned', 'started'))
-                   GROUP BY h.slot_start""",
-                ((datetime.now(timezone.utc).replace(tzinfo=None).isoformat()),
-                 small_kwh),
-            )
-        return cur.rowcount
+            for r in cands:
+                ss = r["slot_start"]
+                off_peak = 1
+                _inwin = None
+                if is_off_peak is not None:
+                    try:
+                        _inwin = is_off_peak(ss)
+                    except Exception:
+                        _inwin = None
+                if _inwin is False:                 # OUTSIDE the guaranteed off-peak window
+                    _boost = False
+                    if is_boost is not None:
+                        try:
+                            _boost = bool(is_boost(ss))
+                        except Exception:
+                            _boost = False
+                    if _boost or self.emt_recording_continuously(ss, emt_up_hours):
+                        off_peak = 0                # confident bump -> provisional PEAK
+                self._conn.execute(
+                    """INSERT INTO dispatch_slots
+                           (slot_start, off_peak, provider, source, captured_at,
+                            state, energy_planned, energy_completed, raw_start, raw_end)
+                       VALUES (?, ?, ?, 'smart-charge-completed', ?,
+                               'completed', NULL, ?, ?, ?)""",
+                    (ss, off_peak, r["provider"], now, r["energy_kwh"],
+                     r["raw_start"], r["raw_end"]))
+                n += 1
+        return n
 
     # ── Dispatch history (observe-only accumulation, design §11) ──────────────
 
@@ -2934,6 +3061,33 @@ class BlockStore:
             # segment so the reprice sweep rebuilds it from the corrected column — keeps the block
             # rewritable at any later date. Import-only (segments are import-only); no-op if none.
             if cur.rowcount > 0 and channel == "import":
+                self._conn.execute(
+                    "DELETE FROM block_segments WHERE block_start = ? AND meter_id = ? "
+                    "AND channel = 'import'", (start, meter_id))
+        return cur.rowcount > 0
+
+    def smb_repair_write_block(self, start: str, meter_id: str, *, rate, cost,
+                               rate_exc=None, cost_exc=None, ev_band=None,
+                               home_band=None) -> bool:
+        """One-off IOG-SMB rate repair (4.5.7; removed v5.0.0). Re-write a settled
+        block's INC + exc rate/cost and band labels to the values re-derived from the
+        FIXED schedule, and invalidate its import segments so they rebuild from the
+        corrected rate. PRESERVES imp_kwh and the EV/house SPLIT columns (imp_kwh_ev /
+        imp_cost_ev / imp_rate_ev) and the raw `reads` — only the priced rate layer
+        moves. Guarded: never touches a `corrected` (user) block or a provisional row.
+        Returns True if the row changed."""
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE blocks SET imp_rate = ?, imp_cost = ?, "
+                "imp_rate_exc = COALESCE(?, imp_rate_exc), "
+                "imp_cost_exc = COALESCE(?, imp_cost_exc), "
+                "imp_ev_band = COALESCE(?, imp_ev_band), "
+                "imp_home_band = COALESCE(?, imp_home_band) "
+                "WHERE block_start = ? AND meter_id = ? "
+                "AND is_provisional = 0 "
+                "AND (rate_source IS NULL OR rate_source != 'corrected')",
+                (rate, cost, rate_exc, cost_exc, ev_band, home_band, start, meter_id))
+            if cur.rowcount > 0:
                 self._conn.execute(
                     "DELETE FROM block_segments WHERE block_start = ? AND meter_id = ? "
                     "AND channel = 'import'", (start, meter_id))

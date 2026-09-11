@@ -267,6 +267,59 @@ def _config_timezone() -> str:
     return "UTC"
 
 
+def _active_period_timezone(retries: int = 3):
+    """The active config period's timezone, read STRAIGHT from config_periods (the
+    column is present whenever any blocks exist). This bypasses the transient
+    empty-meters path in load_config() (WAL-lock retry exhausting / a cold read
+    companion) that silently degraded the review list's UTC->local conversion to UTC,
+    shifting every flagged block by the BST offset and making Load-into-tool target the
+    wrong (empty) half-hour. Returns None ONLY when there is genuinely no active period
+    (fresh install, no blocks -> no review rows either), so callers can disable
+    Load-into-tool rather than offer a shifted block."""
+    import time as _time
+    for _attempt in range(max(1, retries)):
+        try:
+            store = _get_read_store()
+            row = store._conn.execute(
+                "SELECT timezone FROM config_periods "
+                "WHERE effective_to IS NULL ORDER BY effective_from DESC LIMIT 1"
+            ).fetchone()
+            if row and row["timezone"]:
+                return row["timezone"]
+            return None
+        except Exception:
+            if _attempt < retries - 1:
+                _time.sleep(0.1)
+                continue
+    return None
+
+
+# Fold near-identical stored rates (float / rounding artifacts -- e.g. 0.054929 vs the
+# canonical 0.054930, ~1e-6 apart) into the dominant value so the nearby-rate picker
+# never splits off a confusing 1-block option. STRICT < epsilon: Agile unit rates step
+# in 0.01p = 1e-4 increments, so two genuinely-distinct Agile rates exactly 1e-4 apart
+# are NEVER merged.
+_RATE_CLUSTER_EPS = 1e-4
+
+
+def _cluster_nearby_rates(rows, eps: float = _RATE_CLUSTER_EPS):
+    """rows: list of {"rate": float, "count": int}, assumed sorted by count DESC. Folds
+    any rate within < eps of an already-accepted (higher-count) representative into it,
+    summing counts. Returns the reduced list re-sorted by count DESC then rate; the most
+    common exact value in each cluster is kept as the representative."""
+    reps = []  # [rate, count]
+    for r in rows:
+        rate, cnt = r["rate"], r["count"]
+        for rep in reps:
+            if abs(rate - rep[0]) < eps:
+                rep[1] += cnt
+                break
+        else:
+            reps.append([rate, cnt])
+    reps.sort(key=lambda x: (-x[1], x[0]))
+    return [{"rate": rr, "count": cc} for rr, cc in reps]
+
+
 def _regen_charts_safely():
     """Regenerate the pre-built charts on the engine's event-loop thread — never
     the Flask request thread.
@@ -4368,29 +4421,6 @@ def _bf_range_starts(from_iso, to_iso, step_min, cap=20000):
     return out
 
 
-_IOG_IMPORT_MSG = ("API import/gap-fill is disabled for Intelligent Octopus Go "
-                   "periods. Octopus removed the per-slot off-peak label, so a "
-                   "re-import would re-price smart charges at peak and permanently "
-                   "corrupt the bill. Import from a CSV bill instead.")
-
-
-def _iog_import_locked(_eng, *, scope=None, frm=None, to=None, target_starts=None):
-    """4.5.6: is this API import/gap-fill target inside an IOG agreement window?
-    True => refuse (Octopus dropped the per-slot off-peak label; a re-import re-prices
-    smart charges at peak). CSV is never gated by this. Fail-open on error — the
-    engine chokepoint guard (run_gap_fill_job / run_api_import_job) is the backstop."""
-    try:
-        if not _eng._iog_agreement_windows():
-            return False
-        if scope == "whole_history":
-            return True
-        if scope == "gaps":
-            return any(_eng._block_start_in_iog(x) for x in (target_starts or []))
-        return _eng._range_overlaps_iog(frm, to)
-    except Exception:
-        return False
-
-
 @app.route("/api/backfill/plan", methods=["POST"])
 def api_backfill_plan():
     """Preview a unified backfill: gate + dispatch + window classification.
@@ -4426,14 +4456,10 @@ def api_backfill_plan():
                 (_from, _to))]
             target_starts = _bf_range_starts(_from, _to, _bf_step_minutes(store))
 
-        iog_locked = _iog_import_locked(
-            _eng, scope=scope, frm=body.get("from"), to=body.get("to"),
-            target_starts=target_starts)
         plan = _bf.plan_backfill(
             scope=scope, source=source, api_available=api_available,
             has_blocks=has_blocks, gaps=gaps,
-            target_starts=target_starts, occupied_starts=occupied_starts,
-            iog_locked=iog_locked)
+            target_starts=target_starts, occupied_starts=occupied_starts)
         plan.update({"api_available": api_available, "has_blocks": has_blocks,
                      "gaps_present": bool(gaps),
                      "gap_slots_total": sum(g.get("slots", 0) for g in gaps)})
@@ -4470,14 +4496,8 @@ def api_backfill_run():
         has_blocks    = bool(store.count_blocks())
         gaps          = store.find_block_gaps()
 
-        _ts_run = (_bf_flatten_gap_starts(gaps, _bf_step_minutes(store))
-                   if scope == "gaps" else None)
-        iog_locked = _iog_import_locked(
-            _eng, scope=scope, frm=body.get("from"), to=body.get("to"),
-            target_starts=_ts_run)
         gate = _bf.evaluate_gates(scope, source, api_available=api_available,
-                                  has_blocks=has_blocks, gaps_present=bool(gaps),
-                                  iog_locked=iog_locked)
+                                  has_blocks=has_blocks, gaps_present=bool(gaps))
         if not gate["allowed"]:
             return jsonify({"ok": False, "reason": gate["reason"],
                             "message": gate["message"]}), 400
@@ -4593,9 +4613,6 @@ def api_backfill_fill_gap():
         if not frm or not to:
             return jsonify({"ok": False, "reason": "bad_range",
                             "message": "from and to are required."}), 400
-        if _iog_import_locked(_eng, frm=frm, to=to):
-            return jsonify({"ok": False, "reason": "iog_locked",
-                            "message": _IOG_IMPORT_MSG}), 400
         if not body.get("confirmed"):
             return jsonify({"ok": False, "reason": "unconfirmed",
                             "message": "Confirmation required before writing."}), 400
@@ -4677,9 +4694,6 @@ def api_blocks_reimport():
         meter_id = body.get("meter_id") or "electricity_main"
         ch = body.get("channel")
         channels = (ch,) if ch in ("import", "export") else ("import", "export")
-        if _iog_import_locked(_eng, frm=utc_start, to=utc_end):
-            return jsonify({"ok": False, "reason": "iog_locked",
-                            "message": _IOG_IMPORT_MSG}), 400
         _asyncio.run_coroutine_threadsafe(
             _eng.run_gap_fill_job(utc_start, utc_end, channels=channels,
                                   meter_id=meter_id), _event_loop)
@@ -5282,11 +5296,6 @@ def api_historical_api_start():
             pace_s = min(max(float(body.get("pace_s", 1.5)), 0.0), 10.0)
         except (TypeError, ValueError):
             pace_s = 1.5
-        if _iog_import_locked(_eng,
-                              scope=("range" if body.get("from") else "whole_history"),
-                              frm=body.get("from"), to=None):
-            return jsonify({"ok": False, "reason": "iog_locked",
-                            "error": _IOG_IMPORT_MSG}), 400
         backup = None
         try:
             backup = os.path.basename(_create_backup_zip(label="pre-api-import"))
@@ -7432,7 +7441,14 @@ def api_regenerate_charts():
         html = energy_charts.generate_net_heatmap(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency)
         with open(os.path.join(CHART_DIR, "net_heatmap.html"), "w") as f:
             f.write(html)
-        html = energy_charts.generate_daily_import_export_charts(blocks, timezone_name=tz_name, block_minutes=bm, currency=currency, cfg=cfg, store=store)
+        # Cap-aware rate lines: mirror engine.generate_charts so a MANUAL regenerate matches
+        # the scheduled render (6-h-cap gating + authoritative TOU house line). Without these two
+        # args the rate lines fall back to the pre-BL-27 behaviour on this path only.
+        import engine as _eng_rc
+        _cap_from = _eng_rc._chart_cap_from()   # robust SMB cap gate (shared with generate_charts)
+        html = energy_charts.generate_daily_import_export_charts(
+            blocks, timezone_name=tz_name, block_minutes=bm, currency=currency, cfg=cfg, store=store,
+            cap_from=_cap_from, import_schedule=_eng_rc._kraken_rate_schedules.get("import"))
         with open(os.path.join(CHART_DIR, "daily_usage.html"), "w") as f:
             f.write(html)
         logger.info("server: charts regenerated on demand")
@@ -7673,27 +7689,6 @@ def api_db_vacuum():
 
 # ── Block deletion ────────────────────────────────────────────────────────────────────────────────
 
-_IOG_DELETE_MSG = ("Deleting blocks is disabled for Intelligent Octopus Go periods. "
-                   "Octopus removed the per-slot off-peak label, so the only way to "
-                   "restore a deleted IOG block — re-importing — now re-prices smart "
-                   "charges at peak and permanently corrupts the bill. Deletion is "
-                   "blocked here until this is resolved.")
-
-
-def _iog_delete_locked(_eng, from_date, to_date, tz_name):
-    """4.5.6: True if a delete range overlaps an IOG agreement window. Deletion is
-    disabled there because the only recovery (re-import) now corrupts. Fail-open on
-    error (a delete the guard cannot classify is allowed — matches prior behaviour)."""
-    try:
-        if not _eng._iog_agreement_windows():
-            return False
-        from block_store import local_date_range_to_utc_bounds
-        us, ue = local_date_range_to_utc_bounds(from_date, to_date, tz_name or "UTC")
-        return _eng._range_overlaps_iog(us, ue)
-    except Exception:
-        return False
-
-
 def _delete_window_to_utc_times(from_time, to_time, tz_name, from_date, to_date):
     """Resolve the delete's time-of-day window to the UTC HH:MM the store filters on.
 
@@ -7740,10 +7735,6 @@ def api_blocks_delete_preview():
         # Pass LOCAL times: the store treats from/to as the ends of ONE contiguous
         # span (from_date+from_time .. to_date+to_time), not a per-day window.
         result = store.count_blocks_for_date_range(from_date, to_date, meter_id, from_time, to_time, _tz_name, reconstructed_only)
-        import engine as _eng_iog
-        if isinstance(result, dict) and _iog_delete_locked(_eng_iog, from_date, to_date, _tz_name):
-            result["iog_locked"] = True
-            result["iog_message"] = _IOG_DELETE_MSG
         return jsonify(result)
     except Exception as e:
         logger.error("api_blocks_delete_preview: %s", e)
@@ -7880,8 +7871,6 @@ def api_blocks_delete():
                 _tz_name = (_md.get("meta") or {}).get("timezone", "UTC")
                 break
         reconstructed_only = bool(data.get("reconstructed_only"))
-        if _iog_delete_locked(_eng, from_date, to_date, _tz_name):
-            return jsonify({"error": _IOG_DELETE_MSG, "reason": "iog_locked"}), 400
         _delete_job.clear()
         _delete_job.update({"status": "running", "kind": "delete",
                             "step": "starting", "result": None, "error": None})
@@ -8523,7 +8512,8 @@ def api_corrections_nearby_rates():
                 GROUP BY {rate_col}
                 ORDER BY n DESC, {rate_col}""",
             (main_id, utc_start, utc_end)).fetchall()
-        rates = [{"rate": r["rate"], "count": r["n"]} for r in rows]
+        rates = _cluster_nearby_rates(
+            [{"rate": r["rate"], "count": r["n"]} for r in rows])
         return jsonify({"rates": rates, "channel": channel,
                         "window": [win_from, win_to]})
     except Exception as e:
@@ -8552,13 +8542,24 @@ def api_review_blocks():
             if not (md.get("meta") or {}).get("sub_meter"):
                 main_meta = md.get("meta") or {}
                 break
-        tz_name = main_meta.get("timezone", "UTC")
         block_minutes = int(main_meta.get("block_minutes", 30) or 30)
-        try:
-            _tz = ZoneInfo(tz_name)
-        except Exception:
-            _tz = ZoneInfo("UTC")
+        # Resolve the display tz from config_periods directly (present whenever blocks
+        # exist), NOT from meters meta: load_config() can transiently return empty
+        # meters and fall back to UTC, which shifted every review row by the BST offset
+        # and made Load-into-tool land on the wrong (empty) block. If the tz genuinely
+        # can't be resolved, leave the local fields None so the UI shows raw block_start
+        # and DISABLES Load-into-tool rather than offering a shifted target.
+        tz_name = _active_period_timezone() or main_meta.get("timezone")
+        _tz = None
+        if tz_name:
+            try:
+                _tz = ZoneInfo(tz_name)
+            except Exception:
+                _tz = None
         for a in alerts:
+            if _tz is None:
+                a["local_date"] = a["from_time"] = a["to_time"] = None
+                continue
             try:
                 start_utc = _dt.fromisoformat(a["block_start"]).replace(tzinfo=ZoneInfo("UTC"))
                 start_loc = start_utc.astimezone(_tz)
@@ -8739,6 +8740,35 @@ def api_corrections_preview():
         return jsonify({"error": str(e)}), 500
 
 
+def _corrections_multiband_count(store, where, params):
+    """Count main-meter blocks in the correction range whose IMPORT segments span more than one
+    rate band (a cap-transition / 4-rate block). A single-rate correction flattens that split
+    (UPDATE block_segments SET inc_rate = value), so the tool guards against it on IOG. Segments
+    only exist on 4.4.0+ segmented accounts; returns 0 otherwise."""
+    try:
+        if not store._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='block_segments'"
+                ).fetchone():
+            return 0
+        starts = [r[0] for r in store._conn.execute(
+            f"SELECT DISTINCT block_start FROM blocks WHERE {where}", params).fetchall()]
+        if not starts:
+            return 0
+        ph = ",".join("?" * len(starts))
+        # A GENUINE multi-rate (cap-transition) block spans a real band gap (off-peak vs peak,
+        # ~0.27) -- not a same-rate EV/house label pair (peak vs day), nor float/rounding noise
+        # (~1e-5). Gate on the rate SPREAD, well above noise and below the off/peak gap.
+        row = store._conn.execute(
+            "SELECT COUNT(*) FROM (SELECT block_start FROM block_segments "
+            "  WHERE channel = 'import' AND inc_rate IS NOT NULL AND block_start IN (" + ph + ") "
+            "  GROUP BY block_start HAVING (MAX(inc_rate) - MIN(inc_rate)) > 0.001)",
+            starts).fetchone()
+        return int(row[0]) if row and row[0] else 0
+    except Exception as e:
+        logger.warning("_corrections_multiband_count: %s", e)
+        return 0
+
+
 @app.route("/api/corrections/apply", methods=["POST"])
 def api_corrections_apply():
     """
@@ -8795,6 +8825,22 @@ def api_corrections_apply():
             corr_type, from_date, to_date, channel,
             from_time_utc, to_time_utc, meter_id, tz_name
         )
+
+        # IOG multi-band guard (4.5.7): a single-rate correction flattens a cap-transition
+        # block's 4-rate split (the segment UPDATE collapses EV/house peak/off-peak into one
+        # rate). Refuse when the range includes such a block unless the caller explicitly
+        # confirms. Single-band blocks (flat / Agile / E7) and standing corrections are unaffected.
+        if corr_type == "rate" and not bool(data.get("confirm_multiband")):
+            _mb = _corrections_multiband_count(store, where, params)
+            if _mb:
+                return jsonify({
+                    "error": "multiband_block",
+                    "multiband_blocks": _mb,
+                    "message": (f"{_mb} block(s) in this range have a multi-rate "
+                                "(cap-transition) split. A single rate would flatten the "
+                                "EV / house peak / off-peak breakdown \u2014 let settlement "
+                                "price these, or re-submit with confirmation to override."),
+                }), 409
 
         # API+ gate: a rate correction only touches DCC-settled blocks; unsettled
         # ones would be clobbered at settlement, so skip + report them. Pure CAD

@@ -1,2 +1,28 @@
+# ── VCS / build artefacts ────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
 *.patch
+ 
+# ── Local diagnostics — never ship ───────────────────────────────────
+# One-off probes (octopus_*_probe.py, probe_*.py, *_probe.py, etc.)
+*probe*.py
+# EXCEPT statistics_probe.py — despite the name it is a SHIPPED module: engine.py
+# imports it in the core attribution path (_stitch_hourly_energy → statistics_probe._to_utc),
+# so it must be tracked or a fresh checkout/deploy fails with ModuleNotFoundError.
+!statistics_probe.py
+# Shape tracker + its no-cron runner and CSV history
+emt_shape_tracker.py
+emt_tracker_loop.py
+emt_shape_history*.csv
+# Any CSV export / dump, and scratch dumps
+*.csv
 dir.txt
+*.patch
+# Test run outputs
+*.log
+test_results.json
+ 
+# NOTE: requirements.txt, screenshots/ and .build/ CI scripts are
+# intentionally tracked — do not ignore them.
