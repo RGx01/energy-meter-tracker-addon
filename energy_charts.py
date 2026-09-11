@@ -2213,8 +2213,18 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
             # real dispatch-derived per-slot EV rate. A slot with EV energy but no stored EV
             # segment (late-attributed / manually-corrected block) already carries the bar's
             # rate in meter_rate here; keep the line on it so line and bar agree.
-            if (_is_ev and _ev_fb is not None and _ev_fb[hh]
-                    and meter_rate[_mid][hh]):
+            _keep = (_is_ev and _ev_fb is not None and _ev_fb[hh]
+                     and meter_rate[_mid][hh])
+            # 4.5.7: on a capped (IOG-SMB) day, do NOT preserve a physical EV device's own
+            # stored rate on an IDLE (0-kWh) slot — that value is the stale plain-TOU rate the
+            # sub-meter carries where the car isn't charging, and it's the ONLY EV surface not
+            # already on the synthetic/hybrid path (bars, Usage Stats, Insights, bill all are).
+            # Let the slot fall through to the synthetic curve (off-peak baseline within cap,
+            # held-peak on a genuine over_cap break, noon reset), matching every other surface.
+            # Charging slots (real EV kWh) still keep the bar's rate, so line and bar agree.
+            if _keep and _capped_day and meter_kwh.get(_mid, [0.0] * slots)[hh] <= 1e-9:
+                _keep = False
+            if _keep:
                 continue
             meter_rate[_mid][hh] = _curve[hh]
 

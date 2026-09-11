@@ -34,7 +34,8 @@ class TestChartEmit(unittest.TestCase):
     def test_capped_off_blend_peak_hold_reset(self):
         db = [(2, _blk(OFF, [_ev(2.0, OFF, "off_peak")])),                 # within cap
               (4, _blk(BLEND, [_ev(1.0, OFF, "off_peak"), _ev(1.0, PEAK, "peak")])),  # boundary
-              (5, _blk(PEAK, [_ev(2.0, PEAK, "peak")]))]                   # over cap
+              (5, _blk(PEAK, [_ev(2.0, PEAK, "peak")])),                  # over cap
+              (47, _blk(PEAK))]                     # full day of data (blocks through 23:30)
         # over_cap is the authoritative held-peak signal: the cap is EXCEEDED from the
         # boundary slot (4) through to the noon reset (24). chart_emit latches on this
         # alone -- never on an inferred peak band.
@@ -113,7 +114,8 @@ class TestChartEmit(unittest.TestCase):
         # This is the 10/09 05:30 and 04/09 04:30 "peak held to noon" bug.
         db = [(2, _blk(OFF, [_ev(2.0, OFF, "off_peak")])),   # genuine overnight off-peak charge
               (9, _blk(PEAK, [_ev(0.001, PEAK, "peak")])),   # lone peak blip, no cap break
-              (11, _blk(PEAK))]                               # idle daytime after the blip
+              (11, _blk(PEAK)),                              # idle daytime after the blip
+              (47, _blk(PEAK))]                     # full day of data (blocks through 23:30)
         oc = [False] * 48                                    # cap never exceeded this day
         s = chart_emit.day_rate_series(db, slots=48, block_minutes=30, capped=True, over_cap=oc)
         self.assertAlmostEqual(s["ev"][9], PEAK, places=4)   # the blip shows its own peak tick
@@ -124,7 +126,7 @@ class TestChartEmit(unittest.TestCase):
         # Synthetic EV (no priced EV segments): the dispatch overlay (ev_slot_rate) feeds the
         # EV line so it never drops to None on idle slots, and the house line follows the TOU
         # across idle / stale near-zero off-peak slots (a battery IOG-SMB day).
-        db = [(4, _blk(OFF)), (12, _blk(OFF))]         # overnight + a stale off-peak DAYTIME block
+        db = [(4, _blk(OFF)), (12, _blk(OFF)), (47, _blk(PEAK))]   # full day (blocks through 23:30)
         tou = [OFF if h <= 10 else PEAK for h in range(48)]
         ev_slot = [0.0] * 48
         for h in (4, 5, 6):
@@ -136,6 +138,27 @@ class TestChartEmit(unittest.TestCase):
         self.assertTrue(all(v is not None for v in s["ev"]))    # never drops to None
         self.assertAlmostEqual(s["house"][12], PEAK, places=4)  # daytime → TOU, not the stale off
         self.assertAlmostEqual(s["house"][4],  OFF,  places=4)  # within-cap dispatch → freebee off
+
+
+    def test_rate_line_stops_at_last_block_not_projected(self):
+        # A "today" chart whose data stops at slot 20: the rate line must END there, not
+        # project the tariff to midnight — so a stale/lagging render is obvious. Idle PAST
+        # slots (<= last block) still get the TOU fill; only the future goes blank.
+        db = [(2, _blk(OFF, [_ev(2.0, OFF, "off_peak")])), (20, _blk(PEAK))]
+        tou = [OFF if h <= 8 else PEAK for h in range(48)]
+        s = chart_emit.day_rate_series(db, slots=48, block_minutes=30, capped=True, house_tou=tou)
+        self.assertIsNotNone(s["house"][20])                       # up to the last block
+        self.assertIsNotNone(s["house"][10])                       # idle past slot still TOU-filled
+        self.assertTrue(all(v is None for v in s["house"][21:]))   # future NOT projected
+        self.assertTrue(all(v is None for v in s["ev"][21:]))
+
+    def test_full_day_line_when_blocks_span_the_day(self):
+        # A complete past day (blocks through 23:30) is unchanged — the line spans the full day.
+        db = [(2, _blk(OFF, [_ev(2.0, OFF, "off_peak")])), (47, _blk(PEAK))]
+        tou = [OFF if h <= 8 else PEAK for h in range(48)]
+        s = chart_emit.day_rate_series(db, slots=48, block_minutes=30, capped=True, house_tou=tou)
+        self.assertIsNotNone(s["house"][47])                       # spans to end of day
+        self.assertIsNotNone(s["house"][30])
 
 
 if __name__ == "__main__":
