@@ -3968,7 +3968,12 @@ class BlockStore:
         daily_nets = []
         for d in sorted(by_d):
             raw_subs = list(sub_by_d[d].values())
-            direct   = round(max(0.0, by_d[d]["main_imp"] - sum(raw_subs)), 4)
+            # Direct/House = main total minus sub-meter total, clamped at zero at the DAY level.
+            # A genuinely negative main total (Agile plunge-price CREDIT) must survive rather than
+            # clamp to 0, so the credit reaches the bill — and so this matches the Usage-Stats
+            # aggregator's per-day reducer exactly on every tariff (SMB, flat, and Agile plunge).
+            _dm      = by_d[d]["main_imp"] - sum(raw_subs)
+            direct   = round(_dm if by_d[d]["main_imp"] < 0 else max(0.0, _dm), 4)
             sub_4s   = sum(round(v, 4) for v in raw_subs)
             imp_4    = round(direct + sub_4s, 4)
             sc_4     = round(by_d[d]["sc"], 4)
