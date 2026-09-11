@@ -55,6 +55,49 @@ class TestMeasuredSettledV2(unittest.TestCase):
             "SELECT imp_rate, rate_source, needs_review FROM blocks WHERE block_start=?",
             (slot,)).fetchone()
 
+    def test_settlement_recosts_physical_device_submeter(self):
+        # SMB device-cost fix: a settled block whose ev_charger sub-meter was costed by PASS 2
+        # at the pre-settlement PEAK must have the device RE-COSTED off-peak when the bill
+        # settles the slot off-peak (device == main == bill) — not left at the stale peak.
+        slot = "2026-09-08T04:00:00"
+        self._blk(slot, 3.0, PK)                              # main provisionally PEAK
+        self.st._conn.execute(                               # device sub-meter, PASS-2 costed PEAK
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+            "imp_kwh, imp_rate, imp_cost, rate_source, rate_corrected) "
+            "VALUES (?,?,?,1,?,?,?,'reconciled',0)",
+            (slot, slot, "ev_charger", 2.0, PK, round(2.0 * PK, 6)))
+        self.st._conn.commit()
+        self._meas(slot, round(3.0 * OFF, 6), "OFF_PEAK")     # bill: off-peak
+        engine.apply_measured_settled()
+        self.assertAlmostEqual(self._rate(slot)["imp_rate"], OFF, places=5)   # main off-peak
+        dev = self.st._conn.execute(
+            "SELECT imp_rate, imp_cost FROM blocks WHERE meter_id='ev_charger' AND block_start=?",
+            (slot,)).fetchone()
+        self.assertAlmostEqual(dev["imp_rate"], OFF, places=5)                # device re-costed
+        self.assertAlmostEqual(dev["imp_cost"], round(2.0 * OFF, 6), places=6)
+
+    def test_settlement_caps_ev_to_dispatch_not_bill_bucket(self):
+        # 4.5.9: Octopus's settled EV_DEVICE bucket over-attributes on a slot where the home
+        # battery grid-charged inside the dispatch window (no battery bucket). The car's
+        # completed-dispatch session is the measured ceiling — the settlement must cap EV to
+        # it, not write the inflated bill bucket into imp_kwh_ev. TOTAL cost is untouched.
+        slot = "2026-09-08T02:30:00"
+        self._blk(slot, 4.347, OFF)                              # main grid import, off-peak
+        self._meas(slot, round(4.347 * OFF, 6), "OFF_PEAK")
+        self.st.upsert_measured_breakdown(slot, mpan="m",
+                                          ev_kwh=3.182, ev_rate=OFF,   # confounded bill bucket
+                                          home_kwh=1.165, home_rate=OFF)
+        self.st._conn.execute(                                   # car's ACTUAL session = 1.37
+            "INSERT INTO dispatch_history (slot_start, kind, energy_kwh, first_seen, last_seen) "
+            "VALUES (?,?,?,?,?)", (slot, "completed", -1.37, slot, slot))
+        self.st._conn.commit()
+        engine.apply_measured_settled()
+        r = self.st._conn.execute(
+            "SELECT imp_kwh_ev, imp_cost FROM blocks WHERE block_start=? "
+            "AND meter_id='electricity_main'", (slot,)).fetchone()
+        self.assertAlmostEqual(r["imp_kwh_ev"], 1.37, places=5)         # capped to dispatch
+        self.assertAlmostEqual(r["imp_cost"], round(4.347 * OFF, 6), places=6)  # TOTAL unchanged
+
     def test_applies_both_bands_no_defer_no_flag(self):
         peak = "2026-09-09T13:00:00"           # recent, currently off-peak, bill says PEAK
         self._blk(peak, 3.0, OFF); self._meas(peak, round(3.0 * PK, 6), "STANDARD_RATE")

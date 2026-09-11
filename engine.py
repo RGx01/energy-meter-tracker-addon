@@ -6891,6 +6891,81 @@ def _maybe_backfill_historical_iog_split() -> None:
         _iog_split_backfill_running = False
 
 
+async def run_iog_split_carve(max_blocks: int = 2000) -> dict:
+    """Recurring PREDICTED EV/Home carve for UNSETTLED dispatched blocks whose completed
+    dispatch arrived AFTER finalise, so the finalise seam left them house-only (imp_kwh_ev
+    NULL, a single 'house' segment). Without this the car's charge sits in House on Billing +
+    Usage Stats until Octopus settles the day (~2 days) — even though EMT already has the
+    dispatch to predict the split. Carves the EV kWh from the completed dispatch (grid-clipped
+    = dispatch-capped, the SAME source as the 4.5.9 settlement cap) and re-splits the block
+    EV/House at its OWN single rate — ADDITIVE: imp_kwh / imp_cost / imp_rate are untouched
+    (Sigma segments == imp_cost), so the bill total stays byte-identical and settlement later
+    overwrites with the authoritative split. Only UNSETTLED blocks (rate_source not
+    measured/corrected) are touched; settled/corrected splits are settlement's realm. No
+    done-marker — it runs each tick and is cheap (only late-dispatch stragglers ever match)."""
+    if _store is None:
+        return {"ok": False, "reason": "no store"}
+    isched = _kraken_rate_schedules.get("import")
+    if isched is None or isched.is_empty():
+        return {"ok": True, "deferred": "schedule not ready"}
+    tz_name = _iog_site_tz()
+    conn = _store._conn
+    rows = conn.execute(
+        "SELECT b.block_start, b.imp_kwh, b.imp_rate, b.imp_rate_exc "
+        "FROM blocks b WHERE b.meter_id = 'electricity_main' AND b.imp_kwh_ev IS NULL "
+        "  AND b.imp_kwh > 0 "
+        "  AND (b.rate_source IS NULL OR b.rate_source NOT IN ('measured','corrected')) "
+        "  AND EXISTS (SELECT 1 FROM dispatch_history d WHERE d.kind = 'completed' "
+        "              AND d.slot_start = b.block_start AND d.energy_kwh IS NOT NULL) "
+        "ORDER BY b.block_start LIMIT ?", (int(max_blocks),)).fetchall()
+    carved = 0
+    for r in rows:
+        bs = r["block_start"]; kwh = float(r["imp_kwh"] or 0.0); rate = float(r["imp_rate"] or 0.0)
+        if kwh <= 1e-9:
+            continue
+        # Band-aware carve (dispatch-derived EV, grid-clipped) via the shared seam; we take the
+        # kWh + bands from it but re-price the split at the block's OWN single rate for strict
+        # cost-neutrality (scope-1 additive: no inc re-pricing).
+        tmp: dict = {"kwh": kwh, "rate": rate}
+        try:
+            _apply_iog_split(tmp, bs, "", kwh, rate, tz_name)
+        except Exception as e:
+            logger.warning("run_iog_split_carve: carve failed (%s): %s", bs, e)
+            continue
+        ev = tmp.get("kwh_ev")
+        if ev is None or float(ev) <= 1e-9:
+            continue                                   # no dispatch EV this slot -> stays house
+        ev = round(float(ev), 6)
+        rexc = r["imp_rate_exc"]
+        rexc = round(float(rexc), 6) if rexc is not None else round(rate / 1.05, 6)
+        ev_band = tmp.get("ev_band") or "off_peak"
+        home_band = tmp.get("home_band") or ev_band
+        house = round(kwh - ev, 6)
+        segs = []
+        if ev > 1e-9:
+            segs.append((ev, rate, rexc, ev_band, "ev"))
+        if house > 1e-9:
+            segs.append((house, rate, rexc, home_band, "house"))
+        try:
+            _store.set_block_segments(bs, "electricity_main", segs)
+            with conn:
+                conn.execute(
+                    "UPDATE blocks SET imp_kwh_ev = ?, imp_cost_ev = ?, imp_rate_ev = ?, "
+                    "imp_ev_band = COALESCE(imp_ev_band, ?), "
+                    "imp_home_band = COALESCE(imp_home_band, ?) "
+                    "WHERE meter_id = 'electricity_main' AND block_start = ? "
+                    "AND imp_kwh_ev IS NULL",
+                    (ev, round(ev * rate, 6), rate, ev_band, home_band, bs))
+            carved += 1
+        except Exception as e:
+            logger.warning("run_iog_split_carve: persist failed (%s): %s", bs, e)
+    if carved:
+        _schedule_chart_regen()
+        logger.info("run_iog_split_carve: carved predicted EV/Home split on %d unsettled "
+                    "dispatched block(s)", carved)
+    return {"ok": True, "carved": carved}
+
+
 _SEGMENT_BACKFILL_MARKER = "segment_backfill_state"   # store_meta key
 _SEGMENT_BACKFILL_SCOPE = 1
 _SEGMENT_BACKFILL_PASS_PACE = 1.0
@@ -10131,6 +10206,26 @@ async def _tick_dispatch_capture() -> None:
             await run_smb_rate_repair()
         except Exception as e:
             logger.warning("_tick_dispatch_capture: smb rate-repair failed: %s", e)
+        # One-off (4.5.7): heal sub-meter blocks the measured settlement left at a stale (peak)
+        # rate — device == main == bill. Gated + self-marking (smb_device_recost_done).
+        try:
+            await run_smb_device_recost()
+        except Exception as e:
+            logger.warning("_tick_dispatch_capture: smb device-recost failed: %s", e)
+        # One-off (4.5.9): re-split settled off-peak slots where Octopus's EV_DEVICE bucket
+        # absorbed a concurrent home-battery grid charge (EV over-read). Caps EV to the car's
+        # completed dispatch; cost/total-neutral. Gated + self-marking (smb_ev_resplit_done).
+        try:
+            await run_smb_ev_resplit()
+        except Exception as e:
+            logger.warning("_tick_dispatch_capture: smb ev-resplit failed: %s", e)
+        # 4.5.9: carve the PREDICTED EV/Home split onto unsettled dispatched blocks whose
+        # completed dispatch landed after finalise (else the car's charge sits in House until
+        # settlement). Additive, dispatch-capped; recurring (no done-marker).
+        try:
+            await run_iog_split_carve()
+        except Exception as e:
+            logger.warning("_tick_dispatch_capture: iog split carve failed: %s", e)
         try:
             await measure_settled_dispatched_blocks()
         except Exception as e:
@@ -10591,6 +10686,8 @@ def _chart_cap_from():
 # pass runs exactly ONCE more, re-derives those blocks off-peak, and fires a chart regen
 # (run_smb_rate_repair). Idempotent + self-marking; the whole one-off retires in v5.0.0.
 _SMB_RATE_REPAIR_DONE_KEY = "smb_rate_repair_done_v2"   # one-off (4.5.7); removed in v5.0.0
+_SMB_DEVICE_RECOST_DONE_KEY = "smb_device_recost_done"   # one-off (4.5.7); removed in v5.0.0
+_SMB_EV_RESPLIT_DONE_KEY = "smb_ev_resplit_done"   # one-off (4.5.9); removed in v5.0.0
 
 
 def _smb_migration_overlay(store, sched, start, base_rate, kwh):
@@ -10760,6 +10857,135 @@ async def run_smb_rate_repair(force: bool = False) -> dict:
         # mid-session (after the schedule build), so without this kick the user keeps
         # seeing the pre-repair rate lines until the next restart.
         if res.get("re_resolved", 0) or res.get("re_snapped", 0):
+            _schedule_chart_regen()
+    return res
+
+
+def _smb_device_recost_core(store) -> dict:
+    """One-off heal (4.5.7 device-cost fix): re-cost physical sub-meter blocks (ev_charger /
+    battery) to their parent MAIN rate wherever they DRIFTED. The measured-cost settlement
+    flipped the main to the settled band but did NOT re-cost the devices (which PASS 2 had
+    costed at the earlier, often peak, main rate) — so a configured-device account showed the
+    EV/battery at the stale peak on Billing + Usage Stats while the bill was off-peak. PASS 2
+    costs every sub-meter at the parent rate, so this restores device == main == bill. kWh is
+    untouched; only the priced rate/cost moves. Idempotent (only rows where the rate differs)."""
+    if store is None:
+        return {"ok": False, "reason": "no store"}
+    with store._conn:
+        cur = store._conn.execute(
+            "UPDATE blocks SET "
+            "  imp_rate = (SELECT m.imp_rate FROM blocks m "
+            "              WHERE m.meter_id='electricity_main' AND m.block_start=blocks.block_start), "
+            "  imp_cost = ROUND(COALESCE(imp_kwh,0) * (SELECT m.imp_rate FROM blocks m "
+            "              WHERE m.meter_id='electricity_main' AND m.block_start=blocks.block_start), 6), "
+            "  imp_rate_exc = (SELECT m.imp_rate_exc FROM blocks m "
+            "              WHERE m.meter_id='electricity_main' AND m.block_start=blocks.block_start), "
+            "  imp_cost_exc = ROUND(COALESCE(imp_kwh,0) * (SELECT m.imp_rate_exc FROM blocks m "
+            "              WHERE m.meter_id='electricity_main' AND m.block_start=blocks.block_start), 6), "
+            "  exc_source = 'tariff' "
+            "WHERE meter_id != 'electricity_main' AND imp_kwh IS NOT NULL "
+            "  AND EXISTS (SELECT 1 FROM blocks m WHERE m.meter_id='electricity_main' "
+            "              AND m.block_start = blocks.block_start AND m.imp_rate IS NOT NULL "
+            "              AND ABS(COALESCE(m.imp_rate,0) - COALESCE(blocks.imp_rate,0)) > 0.0001)")
+    return {"ok": True, "re_costed": cur.rowcount}
+
+
+async def run_smb_device_recost(force: bool = False) -> dict:
+    """One-off device-cost heal (4.5.7). Gated (`smb_device_recost_done`), self-marking,
+    idempotent; retires in v5.0.0. Heals sub-meter blocks the measured settlement left at a
+    stale (peak) rate after flipping the main off-peak. Local; no API."""
+    if _store is None:
+        return {"ok": False, "reason": "no store"}
+    if not force and _store.get_kraken_state(_SMB_DEVICE_RECOST_DONE_KEY):
+        return {"ok": True, "skipped": "already done"}
+    res = _smb_device_recost_core(_store)
+    if res.get("ok"):
+        import datetime as _dtm
+        _store.set_kraken_state(_SMB_DEVICE_RECOST_DONE_KEY,
+                                _dtm.datetime.now(_dtm.timezone.utc).isoformat())
+        logger.info("run_smb_device_recost: %s", res)
+        if res.get("re_costed", 0):
+            _schedule_chart_regen()
+    return res
+
+
+def _smb_ev_resplit_core(store) -> dict:
+    """One-off heal (4.5.9 EV-split fix): re-split settled OFF-PEAK slots whose stored EV kWh
+    exceeds the car's own completed-dispatch session. Octopus's settled four-bucket EV_DEVICE
+    total absorbs a concurrent HOME-BATTERY grid charge inside a dispatch window (no battery
+    bucket), so imp_kwh_ev over-reads — inflating EV and starving House on the split, while the
+    bill TOTAL is unaffected. The car's completed dispatch is the measured ceiling (matches a
+    physical EV meter to ~0.02%), so the excess EV kWh is moved back to HOUSE at the SAME
+    off-peak rate (EV off-peak == House off-peak on IOG-SMB) — block TOTAL kWh + cost stay
+    byte-identical; only the EV<->House split moves. Restricted to fully-off_peak, single-rate
+    main slots (the confound's locus and the only rate/cost-neutral case); any mixed/boundary
+    slot is skipped and counted for review. Idempotent (only slots still over the ceiling)."""
+    if store is None:
+        return {"ok": False, "reason": "no store"}
+    conn = store._conn
+    rows = conn.execute(
+        "SELECT b.block_start, b.imp_kwh, b.imp_kwh_ev, "
+        "  (SELECT SUM(ABS(d.energy_kwh)) FROM dispatch_history d "
+        "   WHERE d.kind='completed' AND d.slot_start=b.block_start "
+        "   AND d.energy_kwh IS NOT NULL) AS disp "
+        "FROM blocks b WHERE b.meter_id='electricity_main' AND b.rate_source='measured' "
+        "  AND b.imp_kwh_ev IS NOT NULL AND b.imp_kwh_ev > 0").fetchall()
+    resplit = 0; skipped_mixed = 0; zeroed = 0; moved = 0.0
+    for r in rows:
+        bs = r["block_start"]; kwh = float(r["imp_kwh"] or 0.0)
+        ev_old = float(r["imp_kwh_ev"] or 0.0)
+        disp = float(r["disp"]) if r["disp"] is not None else 0.0
+        disp = min(disp, kwh)                         # grid-clip the measured ceiling
+        if disp >= ev_old - 1e-9:
+            continue                                  # already within the dispatch session
+        ev_new = disp                                 # cap DOWN to the car's session (0 if none)
+        # Cost-neutral ONLY when EV & House share one off_peak rate on this slot.
+        segs = store.get_block_segments(bs, "electricity_main")
+        bands = {s["band"] for s in segs} if segs else set()
+        rates = {round(float(s["inc_rate"] or 0.0), 6) for s in segs} if segs else set()
+        if not segs or bands != {"off_peak"} or len(rates) != 1:
+            skipped_mixed += 1
+            continue
+        _rate = next(iter(rates))
+        _xrate = round(float(segs[0]["exc_rate"] or 0.0), 6)
+        house_new = round(kwh - ev_new, 6)
+        new_segs = []
+        if ev_new > 1e-9:
+            new_segs.append((round(ev_new, 6), _rate, _xrate, "off_peak", "ev"))
+        if house_new > 1e-9:
+            new_segs.append((house_new, _rate, _xrate, "off_peak", "house"))
+        store.set_block_segments(bs, "electricity_main", new_segs)
+        with conn:
+            conn.execute(
+                "UPDATE blocks SET imp_kwh_ev = ?, imp_cost_ev = ?, imp_rate_ev = ? "
+                "WHERE meter_id='electricity_main' AND block_start = ?",
+                (round(ev_new, 6) if ev_new > 1e-9 else None,
+                 round(ev_new * _rate, 6) if ev_new > 1e-9 else None,
+                 _rate if ev_new > 1e-9 else None, bs))
+        resplit += 1
+        moved += (ev_old - ev_new)
+        if ev_new <= 1e-9:
+            zeroed += 1
+    return {"ok": True, "resplit": resplit, "zeroed_no_dispatch": zeroed,
+            "skipped_mixed": skipped_mixed, "kwh_moved_to_house": round(moved, 3)}
+
+
+async def run_smb_ev_resplit(force: bool = False) -> dict:
+    """One-off EV-split heal (4.5.9). Gated (`smb_ev_resplit_done`), self-marking, idempotent;
+    retires in v5.0.0. Re-splits settled off-peak slots where Octopus's EV_DEVICE bucket
+    absorbed a concurrent home-battery grid charge, capping EV to the car's completed dispatch.
+    Local; no API. Cost/total-neutral; only the EV<->House split moves."""
+    if _store is None:
+        return {"ok": False, "reason": "no store"}
+    if not force and _store.get_kraken_state(_SMB_EV_RESPLIT_DONE_KEY):
+        return {"ok": True, "skipped": "already done"}
+    res = _smb_ev_resplit_core(_store)
+    if res.get("ok"):
+        import datetime as _dtm
+        _store.set_kraken_state(_SMB_EV_RESPLIT_DONE_KEY,
+                                _dtm.datetime.now(_dtm.timezone.utc).isoformat())
+        logger.info("run_smb_ev_resplit: %s", res)
+        if res.get("resplit", 0):
             _schedule_chart_regen()
     return res
 
@@ -10964,35 +11190,41 @@ def apply_measured_to_block(bs: str, *, cost_incl: float, cost_excl=None,
     kwh = row["imp_kwh"] or 0.0
     if kwh <= 1e-9:
         return False
-    evk = row["imp_kwh_ev"]
-    evk = float(evk) if (evk is not None and float(evk) > 1e-9) else 0.0
-    # EV-split race: a COMPLETED dispatch that arrived AFTER this block was priced leaves
-    # imp_kwh_ev NULL, so without this the measured pass would write the block house-only and
-    # stamp rate_source='measured' -- permanently orphaning the EV charge (the reconcile
-    # back-attribution is gated off for capped accounts, so it never heals). If the stored
-    # split is absent but a completed dispatch exists for this slot, attribute the EV from it
-    # (grid-clipped) so the measured write carries the split. The caller already excludes
-    # rate_corrected / imported blocks, so this never stomps a manual correction.
-    if evk <= 1e-9:
-        try:
-            _dc = store._conn.execute(
-                "SELECT SUM(ABS(energy_kwh)) FROM dispatch_history "
-                "WHERE kind = 'completed' AND slot_start = ? AND energy_kwh IS NOT NULL",
-                (bs,)).fetchone()
-            _dev = float(_dc[0]) if _dc and _dc[0] is not None else 0.0
-            if _dev > 1e-9:
-                evk = min(_dev, kwh)
-        except Exception:
-            pass
-    # C2 (4.5.7): the BILL's four-bucket split is authoritative for the EV/house
-    # segments (design §4) — prefer the cached breakdown's ev_kwh over the dispatch-
-    # derived value. The aggregate settled cost stays authoritative below.
+    # ── EV quantity: MEASURED grid draw is king (dispatch-bounded) ──────────────────
+    # Octopus's settled four-bucket EV_DEVICE total OVER-attributes on slots where another
+    # grid load (e.g. a home battery grid-charging overnight) drew concurrently INSIDE the
+    # dispatch window: the breakdown has no battery bucket, so that concurrent draw lands in
+    # EV. The car's own COMPLETED-dispatch session (Octopus's per-slot smart+boost energy) is
+    # the device-independent measured ceiling — it excludes the battery and matches a physical
+    # EV meter where one exists (dispatch == Zappi to ~0.02% on a device account). So the bill
+    # still sets the EV RATE/band, but never the quantity beyond the dispatched session; the
+    # grid-clip guards a dispatch over-read. No completed dispatch -> no measured EV session
+    # this slot -> the energy stays house (4-rate: not a smart charge). imp_kwh / imp_cost (the
+    # settled TOTAL) are untouched — only the EV<->house split moves.
+    try:
+        _dc = store._conn.execute(
+            "SELECT SUM(ABS(energy_kwh)) FROM dispatch_history "
+            "WHERE kind = 'completed' AND slot_start = ? AND energy_kwh IS NOT NULL",
+            (bs,)).fetchone()
+        _disp = float(_dc[0]) if _dc and _dc[0] is not None else 0.0
+    except Exception:
+        _disp = 0.0
+    _disp = min(_disp, kwh)                       # grid-clip the measured dispatch ceiling
+    # C2 (4.5.7, revised 4.5.9): the settled BILL bucket informs the EV RATE/band, but the
+    # dispatch session bounds the QUANTITY (measured is king). The aggregate settled cost
+    # stays authoritative below.
     try:
         _bd = store.get_measured_breakdown(bs)
     except Exception:
         _bd = None
-    if _bd and _bd.get("ev_kwh") is not None:
-        evk = min(float(_bd["ev_kwh"]), kwh)
+    _bill_ev = float(_bd["ev_kwh"]) if (_bd and _bd.get("ev_kwh") is not None) else None
+    _stored_ev = row["imp_kwh_ev"]
+    _stored_ev = float(_stored_ev) if (_stored_ev is not None and float(_stored_ev) > 1e-9) else 0.0
+    if _disp <= 1e-9:
+        evk = 0.0                                 # no measured EV session -> house
+    else:
+        _pref = _bill_ev if _bill_ev is not None else (_stored_ev if _stored_ev > 1e-9 else _disp)
+        evk = min(_pref, _disp)                   # cap EV to the car's own dispatched session
     sched = _kraken_rate_schedules.get("import")
     import pricing_segments as _ps
     try:
@@ -11097,6 +11329,26 @@ def apply_measured_to_block(bs: str, *, cost_incl: float, cost_excl=None,
         store.set_block_segments(bs, "electricity_main", segs)
     except Exception as e:
         logger.warning("apply_measured: segment write failed for %s: %s", bs, e)
+    # SMB device-cost fix: settlement flips the MAIN rate to the settled band, but a physical
+    # sub-meter (ev_charger / battery) was costed by PASS 2 at the EARLIER (pre-settlement,
+    # often peak) main rate and is NOT re-costed by this write. PASS 2 costs every sub-meter at
+    # the parent rate, so re-cost the sub-meter blocks for this slot to the settled rate in
+    # lock-step — device == main == bill. kWh (the grid-clipped device draw) is untouched; only
+    # the priced rate layer moves. No-op for a synthetic-EV account (no sub-meter blocks). This
+    # is the targeted equivalent of a PASS 2 re-run without round-tripping the whole block
+    # (which would drop rate_source='measured').
+    try:
+        with store._conn:
+            store._conn.execute(
+                "UPDATE blocks SET imp_rate = ?, imp_cost = ROUND(COALESCE(imp_kwh,0) * ?, 6), "
+                "imp_rate_exc = ?, imp_cost_exc = ROUND(COALESCE(imp_kwh,0) * ?, 6), "
+                "exc_source = 'tariff' "
+                # sub-meters only (ev_charger / battery); export meters have no imp_kwh
+                "WHERE block_start = ? AND meter_id != 'electricity_main' "
+                "AND imp_kwh IS NOT NULL",
+                (imp_rate, imp_rate, exc_rate, exc_rate, bs))
+    except Exception as e:
+        logger.warning("apply_measured: device re-cost failed for %s: %s", bs, e)
     return {"prior_band": _prior_band, "new_band": band, "new_rate": imp_rate}
 
 

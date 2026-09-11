@@ -76,6 +76,9 @@ class TestMeasuredApply(unittest.TestCase):
     def test_peak_bill_writes_measured_and_splits_exact(self):
         # 23rd bump: block currently off-peak; Octopus bills STANDARD £1.0294 / 3.186 kWh
         self._blk(3.186, 2.24, rate=0.05493)
+        # 4.5.9: EV quantity is bounded by the car's completed dispatch (a boost lands in the
+        # completed feed). Without a session the slot is house-only (test_no_dispatch_stays_house_only).
+        self.st.record_dispatch_history(self.SLOT, "completed", source="unknown", energy_kwh=-2.24)
         ok = engine.apply_measured_to_block(
             self.SLOT, cost_incl=1.029372, cost_excl=0.980355, label="STANDARD_RATE")
         self.assertTrue(ok)
@@ -109,6 +112,7 @@ class TestMeasuredApply(unittest.TestCase):
         # imp_cost stays the bill; the split reconciles to it via imp_cost_remainder.
         import iog_cap
         self._blk(3.0, 2.0, rate=0.05493)          # 2 kWh EV, 1 kWh house
+        self.st.record_dispatch_history(self.SLOT, "completed", source="unknown", energy_kwh=-2.0)
         engine._kraken_rate_schedules = {
             "import": _Sched(),
             "ev_device_off_peak": _Sched(), "ev_device_peak": _Sched()}

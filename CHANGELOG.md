@@ -1,5 +1,56 @@
 # Changelog
  
+## [4.5.9] — 2026-09-11
+
+*Fixes the EV vs House split reading too much as EV on days a home battery grid-charged at the
+same time as the car, on Intelligent Octopus Go. Costs and totals are unaffected — only the split.*
+
+### Fixed
+
+- **EV is no longer over-counted when the battery grid-charges during a smart-charge slot.**
+  Octopus's settled per-slot device breakdown splits the grid into just Home + EV — it has no
+  bucket for a home battery, so on an overnight slot where the battery drew from the grid at the
+  same time as the car, that battery energy landed in EV. EMT now bounds the EV quantity to the
+  car's own completed-dispatch session (Octopus's per-slot smart-charge energy, which matches a
+  physical charger meter to within a rounding error), so the battery's share stays with the House.
+  The settled bill still sets the EV rate and band; only the kWh split is capped. The Total Bill,
+  the grid total and every cost are byte-identical — Billing and Usage Stats simply attribute the
+  right amount to EV vs House. Works with or without a physical charger meter.
+
+- **Recent days no longer park EV charging in House until settlement.** When a smart-charge
+  dispatch arrives after a half-hour has already been priced, EMT now carves the predicted
+  EV/House split from the dispatch straight away (grid-clipped, same source as the settled
+  cap) instead of leaving the car's charge in House for ~2 days until Octopus settles. The
+  Billing "grid total" EV/House rows match the charger from the moment the dispatch lands;
+  settlement still overwrites with the final split. Additive — no kWh or cost changes.
+
+### On upgrade
+
+- **Existing history is corrected automatically, once.** A one-off local pass re-splits any
+  settled off-peak slot whose EV was inflated by a concurrent battery charge, moving the excess
+  back to House at the same rate. No kWh or cost changes — only the EV/House split. No re-import
+  needed.
+
+## [4.5.8] — 2026-09-11
+
+*Fixes the EV / battery cost reading too high on the Billing and Usage Stats tabs for accounts with
+a physical charger or battery meter on Intelligent Octopus Go.*
+
+### Fixed
+
+- **A physical EV charger (or battery) is now costed at the settled rate, not the pre-settlement peak.**
+  When Octopus settles a daytime smart-charge slot off-peak, EMT corrected the main import but left the
+  physical sub-meter at the earlier (peak) rate — so Billing and Usage Stats showed the device more
+  expensive than the bill, and the two tabs could disagree. The device now re-prices in lock-step with
+  the settled main, so every surface matches the bill. Accounts with no physical device (the synthetic
+  "EV (from dispatch)") were never affected.
+
+### On upgrade
+
+- **Existing history is corrected automatically, once.** A one-off local pass re-prices any device
+  half-hour left at the stale rate to match its settled main rate — energy (kWh) is untouched, only the
+  price moves. No re-import needed.
+
 ## [4.5.7] — 2026-09-11
 
 *Fixes recent Intelligent Octopus Go days showing the wrong (off-peak) rate on the billing charts,
