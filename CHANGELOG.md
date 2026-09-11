@@ -1,5 +1,28 @@
 # Changelog
  
+## [4.5.10] — 2026-09-11
+
+*Aligns the cost totals between the Billing and Usage Stats tabs to the penny on the SMB /
+time-of-use tariff, and on Agile. Display-only — no stored figure or bill total changes.*
+
+### Fixed
+
+- **Billing and Usage Stats now show the same cost, to the penny, on multi-rate days.** The two
+  tabs derived the "Direct / House" cost differently: Billing subtracts the sub-meters from the
+  main total once per day, but Usage Stats did it per rate band and floored each band at zero
+  independently. On a single-rate day these are identical, but on an SMB day with several bands a
+  battery- or EV-heavy off-peak band could floor to zero and drop a few pence the other bands
+  would have absorbed — so Usage Stats read a few pence above Billing. Usage Stats now uses the
+  same per-day reducer, so the tabs agree by construction. Flat and Economy-7 are byte-identical
+  (one band means per-rate equals per-day), and both tabs already match Octopus's own settled
+  per-slot cost exactly.
+
+- **Agile plunge-price credits are no longer clamped away in the period total.** A genuinely
+  negative main cost (a "plunge" credit) now survives the day-level house/direct calculation on
+  both tabs instead of being floored to zero, so the credit reaches the total on both surfaces.
+
+*(Display-only: recomputed on the next page load / chart refresh — no re-import, no data migration.)*
+
 ## [4.5.9] — 2026-09-11
 
 *Fixes the EV vs House split reading too much as EV on days a home battery grid-charged at the
