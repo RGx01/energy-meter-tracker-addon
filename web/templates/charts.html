@@ -2949,11 +2949,11 @@ document.addEventListener('DOMContentLoaded', function() {
         } else if (d.source !== 'dcc') {
           // API available but billing uses the local CAD figure as the source
           label = 'CAD source \u00b7 API ready';
-          tip = 'A supplier API is available, but billing uses the local CAD meter figure as the source rather than DCC settlement.';
+          tip = 'A supplier API is available, but billing uses the local CAD meter figure as the source rather than cost settlement.';
         } else if (d.unsettled > 0) {
           // DCC path with blocks still awaiting the supplier's settled figure
-          label = '\u23f3 ' + d.unsettled + ' block' + (d.unsettled === 1 ? '' : 's') + ' awaiting DCC settlement';
-          tip = 'These blocks are billed on EMT\u2019s provisional figure and haven\u2019t yet been reconciled to your supplier\u2019s settled DCC figure. See Data Management for detail.';
+          label = '\u23f3 ' + d.unsettled + ' block' + (d.unsettled === 1 ? '' : 's') + ' awaiting cost settlement';
+          tip = 'These blocks are billed on EMT\u2019s provisional figure and haven\u2019t yet been reconciled to your supplier\u2019s settled cost figure. See Data Management for detail.';
           amber = true;
         } else {
           // DCC path, everything settled — nothing to flag
