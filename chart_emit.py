@@ -54,6 +54,11 @@ def day_rate_series(day_blocks, *, slots: int, block_minutes: int,
     house_mr: dict = {}    # slot -> block-rate fallback (non-IOG / no house segment)
     ev_rate: dict = {}     # slot -> EV rate where the car DREW (segment or dispatch overlay)
     rates: set = set()     # the tariff rate values (clean off/peak extremes) for the EV baseline
+    # 4.5.7: the rate line must STOP at the last real block, never PROJECT the tariff to
+    # midnight — so a today-chart ends at the current block and a stale/lagging render is
+    # obvious (see the caller's last_nonzero truncation, which then trims the trace here).
+    day_blocks = list(day_blocks)
+    _last_hh = max((hh for hh, _ in day_blocks), default=-1)
     for hh, block in day_blocks:
         imp = (((block.get("meters") or {}).get(main_meter) or {})
                .get("channels", {}) or {}).get("import", {}) or {}
@@ -116,6 +121,8 @@ def day_rate_series(day_blocks, *, slots: int, block_minutes: int,
     held = None                        # cap-break hold (CAPPED days only); resets at noon
     ev_fallback = [False] * slots      # True where ev[hh] is a FILL guess, not a priced draw
     for hh in range(slots):
+        if hh > _last_hh:
+            break                          # no real block here or later → don't project
         if capped:
             if hh == noon:
                 held = None
