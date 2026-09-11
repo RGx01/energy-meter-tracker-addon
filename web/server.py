@@ -2405,16 +2405,18 @@ def _aggregate_block_rows(raw_rows, bucket_of, standing_scope="bucket",
 
     for _ld, _dd in _day_data.items():
         _m = _dd["main"]
-        _direct_cost = 0.0
-        for _rate, _mv in (_m.get("_main_by_rate") or {}).items():
-            _sv = (_m.get("_sub_by_rate") or {}).get(_rate, {"kwh": 0.0, "cost": 0.0})
-            # max(0) guards a sub-meter's power-integration cost OVER-subtracting a
-            # NON-negative main into a spurious negative remainder. A genuinely
-            # negative main cost (Agile plunge-price CREDIT) must survive, so only
-            # clamp when the main slot's cost is >= 0.
-            _d = _mv["cost"] - _sv["cost"]
-            _direct_cost += _d if _mv["cost"] < 0 else max(0.0, _d)
-        _m["imp_cost"] = _direct_cost
+        # Derive the bucket's Direct/House cost the SAME way compute_period_net does — subtract
+        # the sub-meter TOTAL from the main TOTAL once per bucket, clamping the remainder at zero
+        # at the DAY level, NOT per rate band. A per-rate clamp floored each band's remainder
+        # independently, so on a multi-band SMB day a battery-heavy off-peak band could clamp to 0
+        # and drop a negative the other bands would have absorbed — leaving Usage Stats a few pence
+        # above Billing. Per-day clamp matches compute_period_net exactly; single-rate days are
+        # unchanged (one band → per-rate == per-day), so flat/Economy-7 stay byte-identical. A
+        # genuinely negative main total (Agile plunge-price CREDIT) still survives.
+        _tot_main = sum(_mv["cost"] for _mv in (_m.get("_main_by_rate") or {}).values())
+        _tot_sub  = sum(_sv["cost"] for _sv in (_m.get("_sub_by_rate") or {}).values())
+        _d = _tot_main - _tot_sub
+        _m["imp_cost"] = _d if _tot_main < 0 else max(0.0, _d)
     return _day_data
 
 
