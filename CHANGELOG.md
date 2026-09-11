@@ -1,5 +1,25 @@
 # Changelog
  
+## [4.5.8] — 2026-09-11
+
+*Fixes the EV / battery cost reading too high on the Billing and Usage Stats tabs for accounts with
+a physical charger or battery meter on Intelligent Octopus Go.*
+
+### Fixed
+
+- **A physical EV charger (or battery) is now costed at the settled rate, not the pre-settlement peak.**
+  When Octopus settles a daytime smart-charge slot off-peak, EMT corrected the main import but left the
+  physical sub-meter at the earlier (peak) rate — so Billing and Usage Stats showed the device more
+  expensive than the bill, and the two tabs could disagree. The device now re-prices in lock-step with
+  the settled main, so every surface matches the bill. Accounts with no physical device (the synthetic
+  "EV (from dispatch)") were never affected.
+
+### On upgrade
+
+- **Existing history is corrected automatically, once.** A one-off local pass re-prices any device
+  half-hour left at the stale rate to match its settled main rate — energy (kWh) is untouched, only the
+  price moves. No re-import needed.
+
 ## [4.5.7] — 2026-09-11
 
 *Fixes recent Intelligent Octopus Go days showing the wrong (off-peak) rate on the billing charts,

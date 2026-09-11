@@ -10131,6 +10131,12 @@ async def _tick_dispatch_capture() -> None:
             await run_smb_rate_repair()
         except Exception as e:
             logger.warning("_tick_dispatch_capture: smb rate-repair failed: %s", e)
+        # One-off (4.5.7): heal sub-meter blocks the measured settlement left at a stale (peak)
+        # rate — device == main == bill. Gated + self-marking (smb_device_recost_done).
+        try:
+            await run_smb_device_recost()
+        except Exception as e:
+            logger.warning("_tick_dispatch_capture: smb device-recost failed: %s", e)
         try:
             await measure_settled_dispatched_blocks()
         except Exception as e:
@@ -10591,6 +10597,7 @@ def _chart_cap_from():
 # pass runs exactly ONCE more, re-derives those blocks off-peak, and fires a chart regen
 # (run_smb_rate_repair). Idempotent + self-marking; the whole one-off retires in v5.0.0.
 _SMB_RATE_REPAIR_DONE_KEY = "smb_rate_repair_done_v2"   # one-off (4.5.7); removed in v5.0.0
+_SMB_DEVICE_RECOST_DONE_KEY = "smb_device_recost_done"   # one-off (4.5.7); removed in v5.0.0
 
 
 def _smb_migration_overlay(store, sched, start, base_rate, kwh):
@@ -10760,6 +10767,54 @@ async def run_smb_rate_repair(force: bool = False) -> dict:
         # mid-session (after the schedule build), so without this kick the user keeps
         # seeing the pre-repair rate lines until the next restart.
         if res.get("re_resolved", 0) or res.get("re_snapped", 0):
+            _schedule_chart_regen()
+    return res
+
+
+def _smb_device_recost_core(store) -> dict:
+    """One-off heal (4.5.7 device-cost fix): re-cost physical sub-meter blocks (ev_charger /
+    battery) to their parent MAIN rate wherever they DRIFTED. The measured-cost settlement
+    flipped the main to the settled band but did NOT re-cost the devices (which PASS 2 had
+    costed at the earlier, often peak, main rate) — so a configured-device account showed the
+    EV/battery at the stale peak on Billing + Usage Stats while the bill was off-peak. PASS 2
+    costs every sub-meter at the parent rate, so this restores device == main == bill. kWh is
+    untouched; only the priced rate/cost moves. Idempotent (only rows where the rate differs)."""
+    if store is None:
+        return {"ok": False, "reason": "no store"}
+    with store._conn:
+        cur = store._conn.execute(
+            "UPDATE blocks SET "
+            "  imp_rate = (SELECT m.imp_rate FROM blocks m "
+            "              WHERE m.meter_id='electricity_main' AND m.block_start=blocks.block_start), "
+            "  imp_cost = ROUND(COALESCE(imp_kwh,0) * (SELECT m.imp_rate FROM blocks m "
+            "              WHERE m.meter_id='electricity_main' AND m.block_start=blocks.block_start), 6), "
+            "  imp_rate_exc = (SELECT m.imp_rate_exc FROM blocks m "
+            "              WHERE m.meter_id='electricity_main' AND m.block_start=blocks.block_start), "
+            "  imp_cost_exc = ROUND(COALESCE(imp_kwh,0) * (SELECT m.imp_rate_exc FROM blocks m "
+            "              WHERE m.meter_id='electricity_main' AND m.block_start=blocks.block_start), 6), "
+            "  exc_source = 'tariff' "
+            "WHERE meter_id != 'electricity_main' AND imp_kwh IS NOT NULL "
+            "  AND EXISTS (SELECT 1 FROM blocks m WHERE m.meter_id='electricity_main' "
+            "              AND m.block_start = blocks.block_start AND m.imp_rate IS NOT NULL "
+            "              AND ABS(COALESCE(m.imp_rate,0) - COALESCE(blocks.imp_rate,0)) > 0.0001)")
+    return {"ok": True, "re_costed": cur.rowcount}
+
+
+async def run_smb_device_recost(force: bool = False) -> dict:
+    """One-off device-cost heal (4.5.7). Gated (`smb_device_recost_done`), self-marking,
+    idempotent; retires in v5.0.0. Heals sub-meter blocks the measured settlement left at a
+    stale (peak) rate after flipping the main off-peak. Local; no API."""
+    if _store is None:
+        return {"ok": False, "reason": "no store"}
+    if not force and _store.get_kraken_state(_SMB_DEVICE_RECOST_DONE_KEY):
+        return {"ok": True, "skipped": "already done"}
+    res = _smb_device_recost_core(_store)
+    if res.get("ok"):
+        import datetime as _dtm
+        _store.set_kraken_state(_SMB_DEVICE_RECOST_DONE_KEY,
+                                _dtm.datetime.now(_dtm.timezone.utc).isoformat())
+        logger.info("run_smb_device_recost: %s", res)
+        if res.get("re_costed", 0):
             _schedule_chart_regen()
     return res
 
@@ -11097,6 +11152,26 @@ def apply_measured_to_block(bs: str, *, cost_incl: float, cost_excl=None,
         store.set_block_segments(bs, "electricity_main", segs)
     except Exception as e:
         logger.warning("apply_measured: segment write failed for %s: %s", bs, e)
+    # SMB device-cost fix: settlement flips the MAIN rate to the settled band, but a physical
+    # sub-meter (ev_charger / battery) was costed by PASS 2 at the EARLIER (pre-settlement,
+    # often peak) main rate and is NOT re-costed by this write. PASS 2 costs every sub-meter at
+    # the parent rate, so re-cost the sub-meter blocks for this slot to the settled rate in
+    # lock-step — device == main == bill. kWh (the grid-clipped device draw) is untouched; only
+    # the priced rate layer moves. No-op for a synthetic-EV account (no sub-meter blocks). This
+    # is the targeted equivalent of a PASS 2 re-run without round-tripping the whole block
+    # (which would drop rate_source='measured').
+    try:
+        with store._conn:
+            store._conn.execute(
+                "UPDATE blocks SET imp_rate = ?, imp_cost = ROUND(COALESCE(imp_kwh,0) * ?, 6), "
+                "imp_rate_exc = ?, imp_cost_exc = ROUND(COALESCE(imp_kwh,0) * ?, 6), "
+                "exc_source = 'tariff' "
+                # sub-meters only (ev_charger / battery); export meters have no imp_kwh
+                "WHERE block_start = ? AND meter_id != 'electricity_main' "
+                "AND imp_kwh IS NOT NULL",
+                (imp_rate, imp_rate, exc_rate, exc_rate, bs))
+    except Exception as e:
+        logger.warning("apply_measured: device re-cost failed for %s: %s", bs, e)
     return {"prior_band": _prior_band, "new_band": band, "new_rate": imp_rate}
 
 
