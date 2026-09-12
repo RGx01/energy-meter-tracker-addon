@@ -36,9 +36,9 @@ class TestC2SettledSplit(unittest.TestCase):
             # block: 5 kWh, EV split NULL (late dispatch), not yet settled
             self.store._conn.execute(
                 "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
-                "imp_kwh, imp_rate, imp_cost, imp_kwh_ev, is_provisional, interpolated) "
+                "imp_kwh, imp_kwh_api, imp_rate, imp_cost, imp_kwh_ev, is_provisional, interpolated) "
                 "VALUES ('2026-09-08T02:00:00','2026-09-08T02:30:00','electricity_main',1,"
-                "5.0,?,?,NULL,0,0)", (round(OFF/100,6), round(5.0*OFF/100,6)))
+                "5.0,5.0,?,?,NULL,0,0)", (round(OFF/100,6), round(5.0*OFF/100,6)))   # DCC-settled
         self._prev = (engine._store, engine._kraken_rate_schedules)
         engine._store = self.store
         engine._kraken_rate_schedules = {"import": _sched()}

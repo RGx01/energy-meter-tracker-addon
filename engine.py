@@ -11125,6 +11125,12 @@ def _review_band_reason(prior_band, new_band, prior_cost, new_cost) -> str:
 
 
 _MEASURED_HISTORY_DRAIN_PACE = 0.4        # seconds between drain batches (test-overridable)
+# ONE settleability predicate, shared by every settlement pass (drain candidates, drain
+# backlog, apply_measured_settled). A block may take Octopus's billed cost as authoritative
+# only if it is DCC-settled (imp_kwh_api present) OR an imported block — NEVER an unsettled
+# live block, which would be priced off a provisional CAD kWh (4.5.12). Keep the three call
+# sites on this single constant so they cannot drift apart.
+_SETTLEABLE_SQL = "(b.source LIKE 'imported%' OR b.imp_kwh_api IS NOT NULL)"
 _measured_history_drain_running = False   # re-entry guard for the scheduled drain task
 
 
@@ -11170,7 +11176,8 @@ async def run_measured_history_drain(max_batches: int = 5000) -> dict:
     for _ in range(max_batches):
         rows = store._conn.execute(
             "SELECT b.block_start FROM blocks b WHERE b.meter_id = 'electricity_main' "
-            "  AND b.imp_kwh > 0 "  # grid measured draw is king; do not gate on imp_kwh_api (unset on CAD/local-meter imports)
+            "  AND b.imp_kwh > 0 "
+            "  AND " + _SETTLEABLE_SQL + " "
             "  AND b.block_start >= ? AND b.block_start > ? AND b.block_start < ? "
             "  AND (b.rate_source IS NULL OR b.rate_source NOT IN ('measured','corrected')) "
             "  AND NOT EXISTS (SELECT 1 FROM measured_cost mc WHERE mc.slot_start = b.block_start) "
@@ -11230,7 +11237,8 @@ def _measured_history_backlog() -> int:
     try:
         return int(store._conn.execute(
             "SELECT COUNT(*) FROM blocks b WHERE b.meter_id = 'electricity_main' "
-            "  AND b.imp_kwh > 0 "  # grid measured draw is king; do not gate on imp_kwh_api (unset on CAD/local-meter imports)
+            "  AND b.imp_kwh > 0 "
+            "  AND " + _SETTLEABLE_SQL + " "
             "  AND b.block_start >= ? AND b.block_start < ? "
             "  AND (b.rate_source IS NULL OR b.rate_source NOT IN ('measured','corrected')) "
             "  AND NOT EXISTS (SELECT 1 FROM measured_cost mc WHERE mc.slot_start = b.block_start)",
@@ -11296,12 +11304,13 @@ def apply_measured_settled() -> dict:
         return {}
     try:
         rows = store._conn.execute(
-            """SELECT b.block_start, b.imp_cost, m.cost_incl, m.cost_excl, m.label
+            f"""SELECT b.block_start, b.imp_cost, m.cost_incl, m.cost_excl, m.label
                FROM blocks b
                JOIN measured_cost m ON m.slot_start = b.block_start
                     AND m.mpan = ? AND m.direction = 'CONSUMPTION'
                WHERE b.meter_id = 'electricity_main' AND b.rate_corrected = 0
                  AND (b.rate_source IS NULL OR b.rate_source NOT IN ('measured','corrected'))
+                 AND {_SETTLEABLE_SQL}
                  AND b.block_start >= ? AND m.cost_incl IS NOT NULL
                ORDER BY b.block_start""", (mpan, _measured_floor())).fetchall()
     except Exception as e:
@@ -11342,9 +11351,15 @@ def apply_measured_to_block(bs: str, *, cost_incl: float, cost_excl=None,
     if store is None or not bs or cost_incl is None:
         return False
     row = store._conn.execute(
-        "SELECT imp_kwh, imp_kwh_ev, imp_rate FROM blocks "
+        "SELECT imp_kwh, imp_kwh_ev, imp_rate, source, imp_kwh_api FROM blocks "
         "WHERE block_start = ? AND meter_id = 'electricity_main'", (bs,)).fetchone()
     if row is None:
+        return False
+    # Defence in depth (4.5.12): NEVER settle an unsettled LIVE block, whoever calls us.
+    # The callers' queries gate on _SETTLEABLE_SQL too, but this is the single stamper of
+    # rate_source='measured', so it must refuse on its own — a future/direct caller must
+    # not be able to price a block off a provisional CAD kWh before its meter DCC-settles.
+    if not str(row["source"] or "").startswith("imported") and row["imp_kwh_api"] is None:
         return False
     kwh = row["imp_kwh"] or 0.0
     if kwh <= 1e-9:
@@ -11393,7 +11408,24 @@ def apply_measured_to_block(bs: str, *, cost_incl: float, cost_excl=None,
 
     # Pick the BAND from the bill (cost/kWh nearest the block's OWN-date bounds), then SNAP
     # imp_rate to that band's CLEAN tariff value — not the derived cost/kWh.
-    _cost_rate = cost_incl / kwh
+    # 4.5.12: divide by the SETTLED kWh Octopus computed cost_incl on, not the block's
+    # imp_kwh (CAD until pass-2 reconciles it). Cost still beats the label (the 25/08 23:00
+    # case: label STANDARD, cost off-peak) — only the denominator changes. On a small slot
+    # the CAD/settled mismatch (0.004 vs 0.001) sagged cost/kWh into the wrong band.
+    _band_kwh = None
+    try:
+        _mk = store._conn.execute(
+            "SELECT kwh FROM measured_cost WHERE slot_start = ? AND direction = 'CONSUMPTION' "
+            "ORDER BY fetched_at DESC LIMIT 1", (bs,)).fetchone()
+        if _mk and _mk["kwh"] is not None and float(_mk["kwh"]) > 1e-9:
+            _band_kwh = float(_mk["kwh"])
+    except Exception:
+        _band_kwh = None
+    if _band_kwh is None and row["imp_kwh_api"] is not None and float(row["imp_kwh_api"]) > 1e-9:
+        _band_kwh = float(row["imp_kwh_api"])          # DCC-settled kWh
+    if _band_kwh is None:
+        _band_kwh = kwh                                  # imported block: its kWh IS the settled figure
+    _cost_rate = cost_incl / _band_kwh
     _lo = _hi = None
     if sched is not None:
         try:
