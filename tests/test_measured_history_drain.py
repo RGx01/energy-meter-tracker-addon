@@ -90,6 +90,27 @@ class TestMeasuredHistoryDrain(unittest.TestCase):
             mc = self.st.get_measured_breakdown(s)
             self.assertIsNotNone(mc)                                      # breakdown cached
 
+    def test_drain_settles_when_imp_kwh_api_is_null(self):
+        # prod-dev regression (v4.5.11): on a site with a live CAD/local import meter, the API
+        # import/gap-fill path writes consumption into imp_kwh and leaves imp_kwh_api NULL, and
+        # freshly-imported blocks land with rate_source NULL. The drain must still settle them
+        # from the bill (grid measured draw is king) — it must NOT gate on imp_kwh_api.
+        s = "2026-08-01T02:00:00"
+        self.st._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+            "imp_kwh, imp_kwh_api, imp_rate, imp_cost, rate_source, source) "
+            "VALUES (?,?,?,1,?,NULL,?,?,NULL,'imported_api')",
+            (s, s, "electricity_main", 3.0, 0.323092, round(3.0 * 0.323092, 6)))
+        self.st._conn.commit()
+        engine._kraken_client = _FakeClient({s: (1.0, 2.0)})
+
+        res = asyncio.run(engine.run_measured_history_drain())
+        self.assertEqual(res["settled"], 1)                              # settled despite NULL imp_kwh_api
+        r = self._row(s)
+        self.assertEqual(r["rate_source"], "measured")
+        self.assertAlmostEqual(r["imp_rate"], OFF, places=5)
+        self.assertIsNotNone(self.st.get_measured_breakdown(s))
+
     def test_recent_unbilled_slot_is_left_for_the_live_pass(self):
         from datetime import datetime, timezone
         recent = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%dT%H:00:00")
