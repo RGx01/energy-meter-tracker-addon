@@ -11170,7 +11170,7 @@ async def run_measured_history_drain(max_batches: int = 5000) -> dict:
     for _ in range(max_batches):
         rows = store._conn.execute(
             "SELECT b.block_start FROM blocks b WHERE b.meter_id = 'electricity_main' "
-            "  AND b.imp_kwh_api IS NOT NULL AND b.imp_kwh > 0 "
+            "  AND b.imp_kwh > 0 "  # grid measured draw is king; do not gate on imp_kwh_api (unset on CAD/local-meter imports)
             "  AND b.block_start >= ? AND b.block_start > ? AND b.block_start < ? "
             "  AND (b.rate_source IS NULL OR b.rate_source NOT IN ('measured','corrected')) "
             "  AND NOT EXISTS (SELECT 1 FROM measured_cost mc WHERE mc.slot_start = b.block_start) "
@@ -11230,7 +11230,7 @@ def _measured_history_backlog() -> int:
     try:
         return int(store._conn.execute(
             "SELECT COUNT(*) FROM blocks b WHERE b.meter_id = 'electricity_main' "
-            "  AND b.imp_kwh_api IS NOT NULL AND b.imp_kwh > 0 "
+            "  AND b.imp_kwh > 0 "  # grid measured draw is king; do not gate on imp_kwh_api (unset on CAD/local-meter imports)
             "  AND b.block_start >= ? AND b.block_start < ? "
             "  AND (b.rate_source IS NULL OR b.rate_source NOT IN ('measured','corrected')) "
             "  AND NOT EXISTS (SELECT 1 FROM measured_cost mc WHERE mc.slot_start = b.block_start)",
