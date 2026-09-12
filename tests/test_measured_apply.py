@@ -41,9 +41,9 @@ class TestMeasuredApply(unittest.TestCase):
     def _blk(self, kwh, evk, rate=0.05493):
         self.st._conn.execute(
             "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
-            "imp_kwh, imp_rate, imp_cost, imp_kwh_ev, rate_source) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (self.SLOT, self.SLOT, "electricity_main", 1, kwh, rate,
+            "imp_kwh, imp_kwh_api, imp_rate, imp_cost, imp_kwh_ev, rate_source) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (self.SLOT, self.SLOT, "electricity_main", 1, kwh, kwh, rate,   # DCC-settled
              round(kwh*rate, 6), evk, "reconciled"))
         self.st._conn.commit()
 
