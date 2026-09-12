@@ -1,5 +1,37 @@
 # Changelog
  
+## [4.5.12] — 2026-09-12
+
+*Intelligent Octopus Go (IOG-SMB) only. Fixes the billed-cost settlement wrongly claiming a
+block that has not yet DCC-settled. On the capped IOG-SMB tariff, the measured-cost drain and
+apply pass could stamp `rate_source='measured'` on a live block whose meter reading hadn't
+settled (`imp_kwh_api` still NULL) — pricing it from Octopus's billed cost divided by the
+still-provisional CAD kWh, which mis-banded tiny slots (e.g. a no-dispatch daytime half-hour
+priced off-peak instead of peak) and made a block show as both settled and "awaiting cost
+settlement". Costs/totals are within a sub-penny; the visible effect is a wrong band on the
+rate line for such slots. Agile, flat, Economy-7 and other tariffs are not affected: the
+billed-cost settlement path only runs on IOG/IOG-SMB, and Agile/export reconciliation is
+untouched by this change.*
+
+### Fixed
+
+- **IOG-SMB settlement now only applies to blocks that are actually settled.** The history
+  drain, its backlog signal, and `apply_measured_settled` now require a block to be
+  **DCC-settled** (`imp_kwh_api` present) *or* an **imported** block (`source LIKE 'imported%'`)
+  before taking Octopus's billed cost as authoritative — never an unsettled live block. This
+  keeps first-time import settlement working while preventing a live block from being priced
+  off a provisional CAD kWh before its meter reading lands. Forward-only: an affected slot
+  re-settles correctly once its meter DCC-settles (or on the next apply pass).
+
+- **Hardened so it can't come back the same way.** The settleability rule is now a single
+  shared predicate used by every IOG settlement pass (no drift between them); the one function
+  that stamps `rate_source='measured'` refuses an unsettled live block on its own, so a
+  future or direct caller can't bypass the gate; and the band pick now divides the billed cost
+  by the **settled** kWh Octopus computed it on, not the block's local CAD kWh — on a small slot
+  whose local kWh hadn't yet been reconciled to the settled figure, that mismatch could sag
+  cost ÷ kWh into the wrong band. Cost still decides the band over Octopus's label (unchanged
+  — the label can be wrong); only the denominator is corrected.
+
 ## [4.5.11] — 2026-09-12
 
 *Two Intelligent Octopus Go robustness fixes: a manual Cost-Correction now sticks (it could
