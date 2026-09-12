@@ -10230,6 +10230,13 @@ async def _tick_dispatch_capture() -> None:
             await measure_settled_dispatched_blocks()
         except Exception as e:
             logger.warning("_tick_dispatch_capture: measured-cost fetch failed: %s", e)
+        # First-time / bulk SMB history import: drain the imported capped history to Octopus's
+        # billed breakdown (the live fetch above is newest-first + bounded). Backlog-gated; no-op
+        # once caught up. Runs off the loop as a task.
+        try:
+            _maybe_drain_measured_history()
+        except Exception as e:
+            logger.warning("_tick_dispatch_capture: measured history drain schedule failed: %s", e)
         try:
             if _MEASURED_APPLY:
                 apply_measured_settled()
@@ -11115,6 +11122,158 @@ def _review_band_reason(prior_band, new_band, prior_cost, new_cost) -> str:
     return ("%s: Octopus billed \u00a3%.4f here vs EMT's \u00a3%.4f (same band, \u0394\u00a3%.4f) "
             "\u2014 applied to match the bill; verify it isn't a billing error."
             % (nb, new_cost, prior_cost, new_cost - prior_cost))
+
+
+_MEASURED_HISTORY_DRAIN_PACE = 0.4        # seconds between drain batches (test-overridable)
+_measured_history_drain_running = False   # re-entry guard for the scheduled drain task
+
+
+async def run_measured_history_drain(max_batches: int = 5000) -> dict:
+    """First-time SMB history fill: settle IMPORTED capped-tariff history to Octopus's own billed
+    four-bucket breakdown, OLDEST-first, skipping the not-yet-billed recent window.
+
+    The consumption import brings only kWh; on the capped IOG-SMB tariff the price depends on the
+    dispatch EV/House split + off-peak "freebee", which a first-time user has NO local dispatch for.
+    The live measure_settled pass fetches Octopus's breakdown but is newest-first + bounded (40 per
+    hourly tick), so a bulk history import would trickle in over days and read schedule-provisional
+    (House-only, day/night) meanwhile. This drains the backlog directly: it fetches the device
+    breakdown for the imported capped slots (recover_device_breakdown) and caches it, then
+    apply_measured_settled() writes the authoritative cost / split / band over the whole backlog.
+
+    Agreement-aware: only the capped SMB window (floored at the agreement valid_from) — flat and
+    uncapped-IOG history price correctly on the schedule and are left alone. Bounded + paced; a
+    cursor walks the window once per invocation (skipping absent / not-yet-billed slots). Read-only
+    fetch, additive apply — never touches a measured/corrected block."""
+    global _measured_history_drain_running
+    store = _store
+    if (store is None or _kraken_client is None or not _MEASURED_FETCH_ENABLED
+            or not _MEASURED_APPLY or not _import_is_smb_capped()):
+        return {"ok": True, "skipped": "not applicable"}
+    imp = (_kraken_discovery or {}).get("import") or {}
+    mpan = imp.get("mpan")
+    if not mpan:
+        return {"ok": True, "skipped": "no mpan"}
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    floor = _measured_floor()
+    # Only history Octopus has actually BILLED has a breakdown; the recent tail is left to the
+    # live measure_settled pass (which caches a slot the moment its breakdown lands).
+    cutoff = (_dt.now(_tz.utc).replace(tzinfo=None) - _td(hours=_RECONCILE_SETTLE_HOURS)).isoformat()
+
+    def _n(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    cursor = ""            # local high-water mark; advances past absent slots within this run
+    settled = 0
+    for _ in range(max_batches):
+        rows = store._conn.execute(
+            "SELECT b.block_start FROM blocks b WHERE b.meter_id = 'electricity_main' "
+            "  AND b.imp_kwh > 0 "  # grid measured draw is king; do not gate on imp_kwh_api (unset on CAD/local-meter imports)
+            "  AND b.block_start >= ? AND b.block_start > ? AND b.block_start < ? "
+            "  AND (b.rate_source IS NULL OR b.rate_source NOT IN ('measured','corrected')) "
+            "  AND NOT EXISTS (SELECT 1 FROM measured_cost mc WHERE mc.slot_start = b.block_start) "
+            "ORDER BY b.block_start ASC LIMIT ?",
+            (floor, cursor, cutoff, _MEASURED_MAX_PER_PASS)).fetchall()
+        missing = [r["block_start"] for r in rows]
+        if not missing:
+            break
+        try:
+            bd = await _kraken_client.recover_device_breakdown(mpan, missing)
+        except Exception as e:
+            logger.warning("measured history drain: breakdown fetch failed: %s", e)
+            break
+        stored = 0
+        for slot in missing:
+            node = bd.get(slot)
+            if not node:
+                continue                                   # not billed yet — cursor skips it
+            _hk, _ek = _n(node.get("home_kwh")), _n(node.get("ev_kwh"))
+            cost_incl = round(_n(node.get("home_cost")) + _n(node.get("ev_cost")), 6)
+            if cost_incl <= 0 and (_hk + _ek) <= 1e-9:
+                continue
+            _hre, _ere = node.get("home_rate_exc"), node.get("ev_rate_exc")
+            cost_excl = (round(_hk * _n(_hre) + _ek * _n(_ere), 6)
+                         if (_hre is not None or _ere is not None) else None)
+            _bands = {b for b in (node.get("home_band"), node.get("ev_band")) if b}
+            label = ("OFF_PEAK" if _bands == {"off_peak"}
+                     else ("STANDARD_RATE" if _bands == {"peak"} else "mixed"))
+            store.upsert_measured_cost(slot, mpan=mpan, cost_incl=cost_incl,
+                                       cost_excl=cost_excl, label=label,
+                                       kwh=round(_hk + _ek, 6))
+            store.upsert_measured_breakdown(slot, mpan=mpan, home_kwh=_hk,
+                                            home_rate=node.get("home_rate"), ev_kwh=_ek,
+                                            ev_rate=node.get("ev_rate"))
+            stored += 1
+        cursor = missing[-1]
+        if stored:
+            settled += stored
+            try:
+                apply_measured_settled()                   # write the cached backlog authoritatively
+            except Exception as e:
+                logger.warning("measured history drain: apply failed: %s", e)
+        await asyncio.sleep(_MEASURED_HISTORY_DRAIN_PACE)
+    if settled:
+        _schedule_chart_regen()
+        logger.info("measured history drain: settled %d imported capped slot(s) from the bill", settled)
+    return {"ok": True, "settled": settled}
+
+
+def _measured_history_backlog() -> int:
+    """Count of imported capped-window slots still needing the billed breakdown (drain work signal)."""
+    store = _store
+    if store is None or not _import_is_smb_capped():
+        return 0
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    cutoff = (_dt.now(_tz.utc).replace(tzinfo=None) - _td(hours=_RECONCILE_SETTLE_HOURS)).isoformat()
+    try:
+        return int(store._conn.execute(
+            "SELECT COUNT(*) FROM blocks b WHERE b.meter_id = 'electricity_main' "
+            "  AND b.imp_kwh > 0 "  # grid measured draw is king; do not gate on imp_kwh_api (unset on CAD/local-meter imports)
+            "  AND b.block_start >= ? AND b.block_start < ? "
+            "  AND (b.rate_source IS NULL OR b.rate_source NOT IN ('measured','corrected')) "
+            "  AND NOT EXISTS (SELECT 1 FROM measured_cost mc WHERE mc.slot_start = b.block_start)",
+            (_measured_floor(), cutoff)).fetchone()[0])
+    except Exception:
+        return 0
+
+
+def _maybe_drain_measured_history() -> None:
+    """Schedule the SMB history drain as a loop TASK when a first-time / bulk import has left a
+    backlog of capped slots without Octopus's billed breakdown. Guarded by an in-process flag; a
+    no-op with no backlog, no API, or a running import/delete. Re-arms whenever a new backlog appears."""
+    global _measured_history_drain_running
+    try:
+        if _store is None or _measured_history_drain_running or not _import_is_smb_capped():
+            return
+        if not kraken_available() or api_import_running() or delete_in_progress():
+            return
+        if _measured_history_backlog() <= 0:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            return
+
+        async def _task():
+            global _measured_history_drain_running
+            try:
+                await run_measured_history_drain()
+            except Exception as e:
+                logger.warning("_maybe_drain_measured_history: worker failed: %s", e)
+            finally:
+                _measured_history_drain_running = False
+
+        _measured_history_drain_running = True
+        logger.info("measured history drain: scheduling — %d imported capped slot(s) awaiting the bill",
+                    _measured_history_backlog())
+        loop.create_task(_task())
+    except Exception as e:
+        logger.warning("_maybe_drain_measured_history: schedule failed: %s", e)
+        _measured_history_drain_running = False
 
 
 def apply_measured_settled() -> dict:

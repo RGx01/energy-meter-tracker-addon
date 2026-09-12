@@ -1,5 +1,37 @@
 # Changelog
  
+## [4.5.11] — 2026-09-12
+
+*Two Intelligent Octopus Go robustness fixes: a manual Cost-Correction now sticks (it could
+silently lose its protection and be reverted, leaving a negative Home rate on the bill), and
+importing/gap-filling history now settles the capped SMB tariff to Octopus's own billed split
+instead of a schedule-provisional guess. The correction fix is forward-only — re-apply the
+correction (or re-import) to repair an already-affected block.*
+
+### Fixed
+
+- **A manual rate correction now survives a block rewrite.** When EMT re-touched a block — a
+  gap-fill, a carbon or remainder recompute, a device re-attribution, a settlement re-cost — it
+  rebuilt the row and silently reset the block's pricing authority (`rate_corrected`, `rate_source`,
+  `rate_reconciled`) to defaults, because those flags were never carried through the rewrite path.
+  On IOG that unprotected a user's peak correction, so the dispatch reconcile reverted the block to
+  the off-peak "freebee" and left the EV columns stranded at peak — showing a negative Home rate in
+  the bill. The rewrite now preserves all three flags (the same fix the `source`/`imported` tag got
+  earlier), so a Cost-Correction — and a settled or reconciled rate — holds. Latent since the flags
+  shipped; surfaced when 4.5.7 removed the IOG re-import gate. *(Forward fix: existing mis-reverted
+  blocks are unchanged — re-apply the correction or re-import the day to repair them.)*
+
+- **Importing / gap-filling history now prices the capped SMB tariff correctly.** The consumption
+  feed returns only kWh; on IOG-SMB the price depends on the dispatch EV/House split and off-peak
+  freebee, which a first-time user has no local dispatch records for — so filled history read
+  schedule-provisional (House-only, day/night, no freebee) and only trickled to the real figures via
+  the live settlement pass (newest-first, 40/hour). EMT now drains imported capped-tariff history
+  directly against Octopus's own billed four-bucket breakdown (`getDeviceConsumptionBreakdown`),
+  oldest-first, so a bulk history fill lands the real cost / EV-House split / band. Agreement-aware
+  (only the capped SMB window; flat and uncapped-IOG history already price correctly on the
+  schedule); the not-yet-billed recent tail is left to the live settlement pass. Read-only fetch,
+  additive apply — a settled or corrected block is never touched.
+
 ## [4.5.10] — 2026-09-11
 
 *Aligns the cost totals between the Billing and Usage Stats tabs to the penny on the SMB /

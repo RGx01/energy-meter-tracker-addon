@@ -685,6 +685,11 @@ def _block_rows(block: dict, config_period_id: int, tz_name: str) -> list[dict]:
             "needs_pass2_rerun": 1 if meter_block.get("needs_pass2_rerun") else 0,
             "needs_review":      1 if meter_block.get("needs_review") else 0,
             "source":            meter_block.get("source"),
+            # 4.5.11: block pricing authority — preserved across round-trips (see _row_to_block).
+            # A FRESH finalised block leaves these unset, so they default to 0 / NULL (uncorrected).
+            "rate_corrected":    1 if meter_block.get("rate_corrected") else 0,
+            "rate_source":       meter_block.get("price_rate_source"),
+            "rate_reconciled":   1 if meter_block.get("rate_reconciled") else 0,
             # provisional: 1 if sub-meter was written without a post-boundary read
             "imp_provisional":   1 if meter_block.get("provisional") else 0,
         })
@@ -818,6 +823,28 @@ def _row_to_block(rows: list[sqlite3.Row]) -> dict:
         try:
             if row["is_provisional"]:
                 meter_block["is_provisional"] = True
+        except (IndexError, KeyError):
+            pass
+        # 4.5.11: preserve the block's pricing AUTHORITY across a read -> modify ->
+        # append_block_replace round-trip. rate_corrected (a user Cost-Correction), rate_source
+        # (schedule/measured/corrected) and rate_reconciled were NEVER carried, so any round-trip
+        # (gap-fill, carbon/remainder recompute, device attribution, PASS 2 re-run) re-inserted
+        # them at the column DEFAULTS -- silently un-protecting a manual correction, which the
+        # dispatch reconcile then reverted (the negative-Home strand). Same class as the
+        # source / imp_kwh_api drop above.
+        try:
+            if row["rate_corrected"]:
+                meter_block["rate_corrected"] = int(row["rate_corrected"])
+        except (IndexError, KeyError):
+            pass
+        try:
+            if row["rate_source"] is not None:
+                meter_block["price_rate_source"] = row["rate_source"]
+        except (IndexError, KeyError):
+            pass
+        try:
+            if row["rate_reconciled"]:
+                meter_block["rate_reconciled"] = int(row["rate_reconciled"])
         except (IndexError, KeyError):
             pass
         # BL-23 (4.2): exc-VAT standing + provenance — surfaced so a read→modify→rewrite
@@ -6587,7 +6614,8 @@ class BlockStore:
                 standing_charge, standing_charge_exc, carbon_g, carbon_intensity_g, imp_provisional,
                 source, exc_source, is_provisional, needs_pass2_rerun, imp_kwh_api, needs_review,
                 exp_kwh_api,
-                imp_kwh_ev, imp_cost_ev, imp_rate_ev, imp_ev_band, imp_home_band
+                imp_kwh_ev, imp_cost_ev, imp_rate_ev, imp_ev_band, imp_home_band,
+                rate_corrected, rate_source, rate_reconciled
             ) VALUES (
                 :block_start, :block_end,
                 :meter_id, :config_period_id, :interpolated,
@@ -6599,7 +6627,8 @@ class BlockStore:
                 :standing_charge, :standing_charge_exc, :carbon_g, :carbon_intensity_g, :imp_provisional,
                 :source, :exc_source, :is_provisional, :needs_pass2_rerun, :imp_kwh_api, :needs_review,
                 :exp_kwh_api,
-                :imp_kwh_ev, :imp_cost_ev, :imp_rate_ev, :imp_ev_band, :imp_home_band
+                :imp_kwh_ev, :imp_cost_ev, :imp_rate_ev, :imp_ev_band, :imp_home_band,
+                :rate_corrected, :rate_source, :rate_reconciled
             )
         """
         with self._conn:
@@ -6622,7 +6651,8 @@ class BlockStore:
                 standing_charge, standing_charge_exc, carbon_g, carbon_intensity_g, imp_provisional,
                 source, exc_source, is_provisional, needs_pass2_rerun, imp_kwh_api, needs_review,
                 exp_kwh_api,
-                imp_kwh_ev, imp_cost_ev, imp_rate_ev, imp_ev_band, imp_home_band
+                imp_kwh_ev, imp_cost_ev, imp_rate_ev, imp_ev_band, imp_home_band,
+                rate_corrected, rate_source, rate_reconciled
             ) VALUES (
                 :block_start, :block_end,
                 :meter_id, :config_period_id, :interpolated,
@@ -6634,7 +6664,8 @@ class BlockStore:
                 :standing_charge, :standing_charge_exc, :carbon_g, :carbon_intensity_g, :imp_provisional,
                 :source, :exc_source, :is_provisional, :needs_pass2_rerun, :imp_kwh_api, :needs_review,
                 :exp_kwh_api,
-                :imp_kwh_ev, :imp_cost_ev, :imp_rate_ev, :imp_ev_band, :imp_home_band
+                :imp_kwh_ev, :imp_cost_ev, :imp_rate_ev, :imp_ev_band, :imp_home_band,
+                :rate_corrected, :rate_source, :rate_reconciled
             )
         """
         with self._conn:
