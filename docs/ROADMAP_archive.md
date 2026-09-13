@@ -1,6 +1,8 @@
 # Roadmap — Archive
 
-*Shipped and superseded items, moved out of the active [ROADMAP.md](ROADMAP.md).*
+*Ordered record of **shipped, closed and superseded** work. Nothing here is planned or in progress —
+the live backlog is [ROADMAP.md](ROADMAP.md). Backlog (BL) items are listed first, newest resolution
+first; the release history follows, newest first.*
 
 ## Shipped / closed backlog items
 
@@ -44,10 +46,6 @@ Settlement remains the final authority throughout.
 *Surfaced during 4.4.0 re-migration testing (M1/B6).* The Charts UI gates its auto-refresh on `_blocks_data_version` — `COUNT + MAX(block_start) + SUM(imp_kwh/imp_cost/exp_kwh/exp_cost/carbon_g)` plus the mtimes of `daily_usage.html`/`net_heatmap.html`. A **rate-only re-price** (the first-upgrade migration, or the M1/B6 canonical-rate work) changes segment/displayed **rates** but leaves `imp_cost`/`imp_kwh` byte-identical (the reconciliation invariant), so the DB fingerprint does **not** move; only a chart regen advancing the two mtimes bumps the token, which is incidental and doesn't cover the bill-summary breakdown reliably. Result: after a migration the Bill Summary keeps its cached render until a manual browser refresh (a finalise, which moves cost, refreshes normally). **Fix:** make the token capture a rate/segment change too — cheapest is a `block_segments` rate fingerprint (e.g. `SUM(ROUND(inc_rate,6)*seq)` or a rowid/updated-at max), or have the reprice sweep bump a persistent `reprice_generation` counter the token reads; then any cost-neutral re-price busts the cache and the Charts + Usage-Stats surfaces refresh on the next poll/tab-focus without a hard refresh. Also audit whether the **billing-history** page (no `data-version` poll at all today) should adopt the same gate. Display/UX only — no figure changes.
 
 
-#### BL-34 — Settled peak-priced segments keep a stale `band='off_peak'` label  ·  *UI · cosmetic · low risk · scheduled 4.5.0*
-*Surfaced during the 23 Aug 2026 prod dispatch review.* On API-settled out-of-window blocks the EV/house segment is priced at the **peak** `inc_rate` (Octopus's settled cost — authoritative) but still carries `band='off_peak'`, so the label doesn't match the rate. Cost is unaffected (the segment rate wins), but the band breakdown / any band-keyed display can mislabel the energy. **Fix:** derive the segment `band` from the applied rate (or clear the stale label when a settled API cost overrides the estimate) so label and rate agree. Display-only; no figure changes.
-
-
 #### BL-35 — Retain the dispatch lifecycle permanently (remove the 90-day prune)  ·  *data integrity · SHIPPED (4.5.0)*
 *The planned/started/completed dispatch history is the canonical ingredient for any future re-price (smart-vs-bump, cap reconstruction) — and unlike Octopus's rolling ~90-day window, EMT must keep it for the life of the DB.* 4.4.0 shipped with `prune_dispatch_slots` / `prune_dispatch_history` deleting both tables at 90 days (Octopus's own amnesia, replicated). Removed the scheduled prune calls from the `engine.py` capture ticks so the lifecycle is retained forever; the `prune_*` defs remain unused (test-covered). Storage is negligible (~thousands of rows/yr on a 70 MB+ DB). Underpins BL-9's cap, BL-28's deep-history reconstruction, and the 4.5.0 online-bump gate. Design: `4.4.0_iog_pricing_and_reprice_design.md` §3d.
 
@@ -73,7 +71,51 @@ Settlement remains the final authority throughout.
 #### BL-42 — API/Mini sub-meter device split skipped on the boundary-finalise path (`load_current_block` drops config meta)  ·  *display · SHIPPED (4.5.2)*
 *Indra + Fox-battery user (Octopus Home Mini, `data_source_mode=api`).* `load_current_block` rebuilt the in-progress block's meters with empty meta, so `_apply_pass2` saw `sub_meter=False`/`parent_meter=None` and the device split no-op'd → `imp_kwh_remainder` NULL → Usage-Stats double-count on provisional days. Masked on CAD (`capture_samples` re-stamps meta) and settled blocks (`get_block_dict`); byte-identical 3.2.0→4.4.0 (not a release regression; latent since ≥3.2.0, surfaced on Mini reconnect). Fix: repopulate meta from `config_from_db`. Forward fix; history self-heals at settlement. Test: `tests/test_current_block_meta.py`.
 
+
+#### BL-43 — First-time connect stalls the HA WebSocket building a large (Agile) rate schedule  ·  *setup robustness · SHIPPED (4.5.3)*
+Agile ~34k half-hourly periods: `build_rate_schedule` built the schedule + O(n) diagnostic walk inline on the engine loop during a rate refresh / first-time connect → starved the HA WebSocket heartbeat → supervisor "No PONG received after 15s" → the connect request timed out → the wizard showed the generic "Could not connect: check key/account" (the backend connect had actually succeeded). Fix: offload the CPU-bound build + diag to a worker thread (`run_in_executor`); cap the per-period distinct/date-span diag for large (>2000-period) schedules. Reported by a new Agile user; couldn't reproduce on a fixed-tariff account (328 vs 34,078 periods). Tests: `tests/test_rate_schedule_offload.py`.
+
+#### BL-44 — API-only account with no live source spins forever on block formation  ·  *robustness · SHIPPED (4.5.3)*
+No live source (no Mini reads AND no local sensor) → a block never gets a post-boundary read, finalises "nothing to finalise", and the empty block never advanced the opener → `ensure_correct_block` re-rolled the SAME boundary every ~10s indefinitely. Fix: when a finalise leaves the opener unchanged, roll it forward to the current window so blocks advance one per boundary and DCC settlement backfills. Keyed on "opener unchanged" so gap catch-up is never skipped. Tests: `tests/test_ensure_block_advance.py`.
+
+#### BL-45 — Generation-mix donut shows a forecast slot (MAX(captured_at) over forecast-bearing mix_history)  ·  *display · SHIPPED (4.5.3)*  ·  [#408]
+`mix_history` holds fw48h forecast rows; the donut's current-mix query took `MAX(captured_at)` → a slot up to ~48h ahead (gas-heavy forecast night ~56% vs ~30% now), while the 48h chart showed the real current slot. Fix: donut selects the newest slot `<= now`; `get_mix_history` gains the same upper bound (belt-and-braces; the frontend already clipped). CO2 value + Insights unaffected (`get_nearest_carbon_intensity` / block-stamped). Regional-vs-national ruled out (same source); confirmed on the prod DB (the 56.4% donut = the `2026-08-28T00:00` forecast row).
+
+#### BL-46 — Device delete leaves the parent's house/EV split stale  ·  *correctness · SHIPPED (4.5.4)*
+`/api/meter/<id>/delete-data` deleted the device but never recomputed the parent, leaving `imp_kwh_remainder` stale (dev: kwh/2), diverging from the correct segments. Fix: recompute the parent over the deleted window on delete, and make the recompute EV-aware (`grid − imp_kwh_ev − surviving subs`, not `grid − subs`). Delete button re-enabled (was disabled in 4.5.3). Already-corrupted history heals via delete+reimport. Test: `tests/test_recompute_ev_aware.py`.
+
+#### BL-9 — IOG 6-hour charge cap (4-rate model)  ·  *pricing · SHIPPED (4.4.0, experimental) — VALIDATED (4.5.x)*
+Shipped experimental in 4.4.0 and carried a standing validation debt: *"pending validation against a
+real settled capped statement."* **Closed** — the 4.5.7–4.5.12 IOG-SMB settlement work reconciles every
+capped slot against Octopus's own billed four-bucket breakdown, so the cap model has now been proven
+against real settled bills rather than reconstructed rates. The "experimental" qualifier no longer applies.
+
+#### BL-28 — Charger-derived IOG split / deep-history reconstruction  ·  *attribution*
+> **Closed — superseded.** The dispatch-derived **synthetic EV** (grid-clipped, hybrid across the
+> physical/synthetic seam) plus the **settled billed-breakdown** reconciliation together cover the
+> ground this item was scoped for: the house/car split is now correct with or without a charger
+> sensor, and settled history is priced from Octopus's own per-slot split. Design retained for
+> reference: `docs/design/charger_derived_iog_split_design.md`.
+
+#### BL-34 — Settled peak-priced segments keep a stale `band='off_peak'` label  ·  *UI · cosmetic*
+> **Closed — resolved by the 4.5.7 settled-band rework.** The defect was a segment priced at the peak
+> rate while still labelled `off_peak`. `apply_measured_to_block` now derives the **band and the rate
+> from the same decision** (the bill's cost/kWh against the block's own-date agreement bounds) and
+> writes both onto the segment together, so they cannot disagree. Verified on live data (prod and
+> prod-dev, 12 Sep 2026): across all settled segments, every `off_peak` segment carries the off-peak
+> rate and every `day` segment the peak rate — **0 mismatches**.
+
+#### BL-37 — Dispatch-poll heartbeat (meter-up / poller-down refinement)  ·  *robustness*
+> **Closed — not planned.** The residual case (EMT's meter ingest up but the dispatch poller down) is
+> covered in practice: Kraken's dispatch feed is dependable, and DCC settlement is the final authority
+> on any slot EMT mis-estimated in the interim. Parked deliberately at 4.5.0 and now formally closed
+> rather than carried as perpetual backlog.
+
 ## v4
+
+### 4.5.5 ✅ — IOG SMB / time-of-use pricing complete + measured-cost reconciliation
+
+*Completes the SMB / 6-hour-cap tariff and adds a settled-bill reconciliation path.* The new tariff drops `standard-unit-rates`, returning day/night as two flat windowless rates that collapsed `resolve()` — EMT now **reconstructs the windowed periods** (BL-52), prices every block on the tariff that applied on **its own date** via an **agreement-stitched** schedule (BL-54), and resolves large half-hourly schedules in **O(log n)** (BL-56, Agile-scale). The settlement reconcile was made to actually run after a restart (schedule-ready gate, **BL-59**) and to re-price the **EV/house split on a capped block** in lock-step with a band change (**BL-58 / BL-58b**). For a settled dispatched block the heuristic can't price with confidence, EMT **defers to Octopus's billed cost** (**BL-53**, closes BL-20): the bill decides the band, `imp_rate` snaps to the clean tariff rate, `imp_cost` is the exact bill, and a material disagreement is applied **and review-flagged** as a possible billing discrepancy. The Cost-Corrections tool became a complete top authority (ex-VAT re-derived from the corrected inc via the VAT calendar, **BL-57 / BL-57b**), and the review list + web reads were hardened (per-thread read connection, no more `SQLITE_MISUSE`; retrying loader — **BL-18b / BL-18c**). Additive and off for non-IOG tariffs; inc-VAT totals unchanged. Full design: `docs/design/EMT-4.5.5_iog_smb_tou_pricing_design.md`.
 
 ### 4.4.0 ✅ — Priced-segment pricing model, hybrid EV & the IOG 6-hour cap (experimental)
 Pricing moves to a single **priced-segment** model (**BL-27**): every half-hour stores its real rate bands — off-peak / peak, car / house — as one ordered `{kwh, inc_rate, exc_rate, band, attribution}` record that **is** the pricing and the single source of truth for **every** surface (Billing, Usage Stats, Usage Insights, the day & heatmap charts, the carbon view, and Cost Corrections), retiring the layered EV-split / ex-VAT columns whose drift caused a recurring bug class. History migrates **once** in the background on first run — a progress banner while it works, self-repair of any block a prior version mispriced (notably the **capped-IOG-priced-in-pence** break, now correct in £), and a single `reprice_history_report.json` written to the share folder — via a unified reprice sweep that is now the **sole** historical derivation (the three legacy backfills retired). The **EV device** becomes a **hybrid across the seam**: the recorded physical charger (CT/CAD) stands *before* dispatch coverage, Octopus's **synthetic completed-dispatch** EV supersedes it *after* — stitched into one continuous 'EV' identity, authoritative for cost **and** carbon, so the house/car split is correct with or without a charger sensor and reads the same on every surface. The **IOG 6-hour charge cap** lands as an **experimental** 4-rate model (**BL-9**, still pending validation against a real settled capped statement): a migrated capped meter is priced on the full noon→noon cap-day with the out-of-window off-peak 'freebie', and a cap-boundary half-hour bills to its **two real rate bands** rather than a blended average; cap length is live-configurable (`IOG_CAP_HOURS`). Real-data hardening fixes: the bill EV/Home split shows one **canonical per-band rate** (rate-change-safe) taken from the tariff rather than re-divided rounded costs; **Direct import floored at 0** (kWh *and* £) on battery-assist slots where the synthetic EV over-claims grid; the migration carries the **canonical tariff rate** for clean blocks (no 1/kWh scatter); Usage-Stats rate-tiers rebuilt from segments; the Charts/Bill freshness token catches a cost-neutral re-price (**BL-32**); and the supplier **reconnect** now persists the API mode and re-renders the panel in place, so a Disconnect or DB-swap no longer looks like lost credentials (**#381**). Additive and billing-neutral for uncapped / non-IOG accounts — inc-VAT totals and the Total Bill are byte-identical. **Deprecation:** from **v5.0.0** the one-time legacy migrations are removed — if you're below 4.4.0, upgrade *through* 4.4.x first (**BL-33**).
@@ -245,3 +287,4 @@ Core half-hour metering engine, sub-meter support, gap filling, billing charts, 
 [#261]: https://github.com/RGx01/energy-meter-tracker-addon/issues/261
 [#1708]: https://github.com/BottlecapDave/HomeAssistant-OctopusEnergy/issues/1708
 [#219]: https://github.com/RGx01/energy-meter-tracker-addon/issues/219
+[#408]: https://github.com/RGx01/energy-meter-tracker-addon/issues/408
