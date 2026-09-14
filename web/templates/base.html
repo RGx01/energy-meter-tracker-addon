@@ -290,6 +290,16 @@
     }
 
     /* ── Buttons ── */
+    /* A disabled button must LOOK disabled. Without this a `disabled` .btn renders
+       identically to a live one — so a control the code has correctly locked still reads
+       as the thing to press, and clicking it does nothing (or is refused server-side).
+       Applies app-wide rather than per-screen so no future button can regress. */
+    .btn:disabled,
+    .btn[disabled] {
+      opacity: 0.45;
+      cursor: not-allowed;
+      filter: grayscale(35%);
+    }
     .btn {
       display: inline-flex;
       align-items: center;

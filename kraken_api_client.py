@@ -393,6 +393,42 @@ def _looks_like_edge_block(body: str) -> bool:
     return (body or "").lstrip()[:1] == "<"
 
 
+# ── Tariff band from a statistic label ────────────────────────────────────────────────
+# Octopus's bucket labels are REGION-SUFFIXED on the newer tariffs: a Southern account
+# sees CONSUMPTION_CHARGE_ECO7_DAY_H, an East-Midlands one CONSUMPTION_CHARGE_ECO7_DAY_B.
+# The suffix is the GSP group letter (A-P, no I or O) and there are fourteen of them, so
+# it must never be enumerated or matched exactly — test the BUCKET NAME as a substring and
+# the suffix is simply never read. The legacy Intelligent-Octopus vocabulary carries no
+# suffix at all (bare OFF_PEAK / STANDARD_RATE), and the same substring test covers it.
+#
+# Vocabulary seen in the wild (two real accounts, regions B and H):
+#   legacy IOG : OFF_PEAK, STANDARD_RATE
+#   flat/fixed : CONSUMPTION
+#   IOG-SMB    : CONSUMPTION_CHARGE_ECO7_DAY_x, CONSUMPTION_CHARGE_ECO7_NIGHT_x,
+#                CONSUMPTION_CHARGE_EV_DEVICE_OFF_PEAK_x, CONSUMPTION_CHARGE_EV_DEVICE_PEAK_x
+# Note the two spellings of the SAME band: home off-peak is NIGHT, EV off-peak is OFF_PEAK.
+_OFF_PEAK_WORDS = ("OFF_PEAK", "OFFPEAK", "NIGHT")
+_PEAK_WORDS = ("PEAK", "DAY", "STANDARD_RATE", "STANDARD")
+
+
+def label_band(label) -> Optional[bool]:
+    """True = off-peak, False = peak, None = the label carries no band signal.
+
+    ORDER MATTERS: "PEAK" is a substring of "OFF_PEAK", so off-peak is tested first.
+    A flat tariff's bare CONSUMPTION label returns None deliberately — it has no band,
+    and None lets _tariff_rate_for resolve by time of day rather than forcing the
+    day's high rate. STANDARD_RATE must stay False: export slots arrive labelled that
+    way and _billed_rate's published-rate branch depends on False, not None."""
+    lab = (label or "").upper()
+    if not lab:
+        return None
+    if any(w in lab for w in _OFF_PEAK_WORDS):
+        return True
+    if any(w in lab for w in _PEAK_WORDS):
+        return False
+    return None
+
+
 class KrakenAPIClient:
     """Async REST client for the Octopus/Kraken public API.
 
@@ -1356,13 +1392,13 @@ class KrakenAPIClient:
                 if val > 1e-9:
                     if _ppu(ci) is not None:
                         ev_rate = _ppu(ci); ev_rate_x = _ppu(ce)
-                    ev_band = "off_peak" if "OFF_PEAK" in lab else "peak"
+                    ev_band = "off_peak" if label_band(lab) else "peak"
             else:                                        # ECO7_* / home
                 home_kwh += val; home_cost += _amt(ci)
                 if val > 1e-9:
                     if _ppu(ci) is not None:
                         home_rate = _ppu(ci); home_rate_x = _ppu(ce)
-                    home_band = "off_peak" if "NIGHT" in lab else "peak"
+                    home_band = "off_peak" if label_band(lab) else "peak"
         if not saw:
             return None
         _p = lambda v: round(v / 100.0, 6) if v is not None else None
@@ -1378,9 +1414,9 @@ class KrakenAPIClient:
     @staticmethod
     def _parse_measurement_node(node: dict) -> Optional[dict]:
         """One measurements edge node → normalised dict, or None for a non-interval
-        node. Energy cost sums the TOU_BUCKET_COST statistic(s); off_peak derives
-        from their label(s) (all OFF_PEAK → True; none OFF_PEAK → False; mixed →
-        None). Standing sums STANDING_CHARGE_COST. Pence → £."""
+        node. Energy cost sums the TOU_BUCKET_COST statistic(s); off_peak comes from
+        the bucket(s) that CARRY the charge, classified by `label_band` (region-suffix
+        agnostic). Standing sums STANDING_CHARGE_COST. Pence → £."""
         st = node.get("startAt")
         if not st:
             return None
@@ -1394,23 +1430,42 @@ class KrakenAPIClient:
         energy_incl = energy_excl = standing_incl = standing_excl = 0.0
         saw_energy = saw_standing = False
         labels: set = set()
+        bands: set = set()
         for s in (((node.get("metaData") or {}).get("statistics")) or []):
             if s.get("type") == "STANDING_CHARGE_COST":
                 standing_incl += _amt(s.get("costInclTax"))
                 standing_excl += _amt(s.get("costExclTax"))
                 saw_standing = True
             else:                                   # TOU_BUCKET_COST / any energy line
-                energy_incl += _amt(s.get("costInclTax"))
+                _inc = _amt(s.get("costInclTax"))
+                energy_incl += _inc
                 energy_excl += _amt(s.get("costExclTax"))
                 saw_energy = True
                 if s.get("label"):
                     labels.add(s.get("label"))
-        off_peak = None
-        if labels:
-            if labels <= {"OFF_PEAK"}:
-                off_peak = True
-            elif "OFF_PEAK" not in labels:
-                off_peak = False
+                # The band comes from the bucket that CARRIES the charge, not from the
+                # set of buckets present. On the 4-bucket IOG-SMB tariff Octopus returns
+                # ALL FOUR labels on EVERY slot, zero-valued where unused, so a label-SET
+                # test can never separate off-peak from peak (it silently resolved every
+                # SMB slot to peak). Prefer per-bucket `value` (kWh - the settlement read
+                # asks for it); fall back to a non-zero cost for the summed-cost read,
+                # which does not.
+                carries = None
+                _v = s.get("value")
+                if _v is not None:
+                    try:
+                        carries = abs(float(_v)) > 1e-9
+                    except (TypeError, ValueError):
+                        carries = None
+                if carries is None:
+                    carries = abs(_inc) > 1e-9
+                if carries:
+                    b = label_band(s.get("label"))
+                    if b is not None:
+                        bands.add(b)
+        # Exactly one carrying band -> that band. Both (home + EV in the same half-hour)
+        # or none identifiable -> None, which _tariff_rate_for resolves by time of day.
+        off_peak = bands.pop() if len(bands) == 1 else None
         try:
             kwh = float(node.get("value") or 0)
         except (TypeError, ValueError):

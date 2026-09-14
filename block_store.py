@@ -39,6 +39,15 @@ SCHEMA_VERSION = 1
 # Reconstructed blocks carry one of these in blocks.source. The reconstructed-
 # history delete filter matches the shared 'imported' prefix, so a bad import can
 # be wiped without touching native (live/kraken) data.
+def _in_span(spans, start: str) -> bool:
+    """True when `start` falls inside any {from,to} span (half-open; to=None = open)."""
+    for sp in spans or []:
+        frm, to = sp.get("from"), sp.get("to")
+        if frm and start >= frm and (to is None or start < to):
+            return True
+    return False
+
+
 IMPORTED_SOURCE_API     = "imported_api"       # from the Octopus consumption API
 IMPORTED_SOURCE_CSV     = "imported_csv"        # from a supplied CSV (rate-from-cost)
 IMPORTED_SOURCE_BLENDED = "imported_blended"    # go-live period straddling live capture
@@ -2853,6 +2862,35 @@ class BlockStore:
             return row["id"], int(row["block_minutes"] or 30)
         return cp["id"], int(cp.get("block_minutes") or 30)
 
+    def imported_block_replaceable(self, block_start: str, meter_id: str,
+                                   channel: str) -> tuple:
+        """May a bill/CSV import REPLACE this block? Returns (ok, reason).
+
+        First-man-wins is the default for good reason — a CSV can silently clobber live
+        readings a user can never get back. This is the one narrow exception: a period
+        the supplier never costed, where what we hold is usage x published rate and the
+        bill carries the real charges. Even then, three things are never overwritten:
+
+          * a live / CAD / settled reading (source is not an import) — the meter is a
+            better source of kWh than a bill, always;
+          * a block the user manually corrected — their judgement outranks any import;
+          * a slot with no existing data — that is an ordinary insert, not a replace.
+        """
+        kcol = "imp_kwh" if channel == "import" else "exp_kwh"
+        row = self._conn.execute(
+            f"SELECT {kcol} AS v, source, rate_corrected, rate_source "
+            "FROM blocks WHERE block_start = ? AND meter_id = ?",
+            (block_start, meter_id)).fetchone()
+        if row is None or row["v"] is None:
+            return (False, "empty")                 # nothing there — plain insert
+        src = str(row["source"] or "")
+        if not src.startswith("imported"):
+            return (False, "live")                  # never clobber a real reading
+        if row["rate_corrected"] or str(row["rate_source"] or "") == "corrected":
+            return (False, "corrected")             # the user's own fix wins
+        return (True, "replaceable")
+
+
     def upsert_imported_block(
         self, block_start: str, meter_id: str, channel: str, *,
         kwh: float, rate: float | None, cost: float | None,
@@ -2893,6 +2931,17 @@ class BlockStore:
                     (block_start, meter_id)).fetchone()
                 if ex is not None and ex["v"] is not None:
                     return ex["id"], False        # first-man wins: leave it as-is
+            else:
+                # `overwrite` means "replace an IMPORTED, uncorrected block" — never a
+                # live/settled reading or a user correction, whatever the caller asks
+                # for. Callers already check (imported_block_replaceable); this makes
+                # the invariant a property of the writer so it cannot be bypassed.
+                ok, why = self.imported_block_replaceable(block_start, meter_id, channel)
+                if not ok and why in ("live", "corrected"):
+                    ex = self._conn.execute(
+                        "SELECT id FROM blocks WHERE block_start = ? AND meter_id = ?",
+                        (block_start, meter_id)).fetchone()
+                    return (ex["id"] if ex else None), False
             is_import = channel == "import"
             # BL-23 (4.2 Slice D): persist ex-VAT for the import channel (NULL otherwise).
             exc_cols = (", imp_cost_exc, imp_rate_exc, standing_charge_exc, exc_source"
@@ -3734,6 +3783,7 @@ class BlockStore:
     def apply_csv_import(
         self, channel_csvs: dict, meter_id: str = "electricity_main", *,
         periods_by_channel: dict | None = None, overrides: dict | None = None,
+        replace_ranges: list | None = None,
     ) -> dict:
         """Parse Octopus per-channel CSV(s), derive rates (rate-from-cost), and
         write reconstructed `imported_csv` blocks + one `rate` derivation per
@@ -3746,6 +3796,13 @@ class BlockStore:
         replaces the derived aggregate for its blocks and is stored as the
         derivation's confirmed_value.
 
+        `replace_ranges` (optional) = [{from,to}] spans where an existing IMPORTED block
+        may be REPLACED rather than skipped — the agreements a previous API import proved
+        the supplier does not cost, where what we hold is usage x published rate and the
+        bill carries the real charges. Outside those spans first-man-wins is unchanged,
+        and inside them live/settled readings and user corrections are still protected
+        (see imported_block_replaceable).
+
         Import is written before export so both settle onto the shared row.
         Returns a per-channel summary with blocks written, period rate derivations,
         and the re-price-vs-CSV-cost reconciliation."""
@@ -3754,6 +3811,7 @@ class BlockStore:
         overrides = overrides or {}
         out: dict = {"ok": True, "meter_id": meter_id, "channels": {},
                      "blocks_written": 0, "blocks_skipped": 0,
+                     "blocks_replaced": 0, "blocks_protected": 0,
                      "span": {"from": None, "to": None}}
         # Import first (house figure) so export merges onto existing rows.
         for channel in ("import", "export"):
@@ -3808,6 +3866,8 @@ class BlockStore:
 
             written = 0
             skipped = 0                 # first-man-wins: slot already held data
+            replaced = 0                # inside an uncostable span: usable bill data won
+            protected = 0               # inside one, but live/settled or user-corrected
             eff_flags: dict = {}        # for reconciliation with confirmed rates
             for b in blocks:
                 flag = deriv["flags"].get(b["block_start"]) or {}
@@ -3828,20 +3888,36 @@ class BlockStore:
                 else:
                     rate = flag.get("rate")
                 eff_flags[b["block_start"]] = {"tier": tier, "rate": rate}
+                # Replace, rather than skip, only inside a span the supplier never
+                # costed — and only over data an import wrote.
+                _may_replace = False
+                _blocked = False
+                if _in_span(replace_ranges, b["block_start"]):
+                    _ok, _why = self.imported_block_replaceable(
+                        b["block_start"], meter_id, channel)
+                    _may_replace = _ok
+                    _blocked = _why in ("live", "corrected")
                 bid, wrote = self.upsert_imported_block(
                     b["block_start"], meter_id, channel,
                     kwh=b["kwh"], rate=rate, cost=b.get("cost"),
                     standing=day_standing.get(b["block_start"][:10]),
-                    derivation_id=did,
+                    derivation_id=did, overwrite=_may_replace,
                     cost_exc=b.get("cost_exc"), rate_exc=b.get("rate_exc"),
                     standing_exc=b.get("standing_exc"), exc_source=b.get("exc_source"))
                 if wrote:
-                    written += 1
+                    if _may_replace:
+                        replaced += 1
+                    else:
+                        written += 1
                 elif bid is not None:
-                    skipped += 1        # a block already existed here — left as-is
+                    if _blocked:
+                        protected += 1  # live/settled or user-corrected — never touched
+                    else:
+                        skipped += 1    # a block already existed here — left as-is
 
             out["channels"][channel] = {
                 "ok": True, "blocks_written": written, "blocks_skipped": skipped,
+                "blocks_replaced": replaced, "blocks_protected": protected,
                 "period_derivations": [d for _f, _t, d, _o in period_meta],
                 "off_peak_kwh": deriv["off_peak_kwh"], "peak_kwh": deriv["peak_kwh"],
                 "reconcile": _ci.reconcile(blocks, eff_flags),
@@ -3849,6 +3925,8 @@ class BlockStore:
             }
             out["blocks_written"] += written
             out["blocks_skipped"] += skipped
+            out["blocks_replaced"] += replaced
+            out["blocks_protected"] += protected
         if out["blocks_written"]:
             # Freshly-imported history carries NULL carbon_intensity. The historical
             # carbon backfill sets a "done" marker once it has swept the then-known

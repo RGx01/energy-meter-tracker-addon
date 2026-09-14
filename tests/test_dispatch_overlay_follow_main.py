@@ -20,6 +20,8 @@ TestDispatchOverlayAtFinalise in test_engine.py.
 import sys
 import os
 import json
+import shutil
+import tempfile
 import types
 import unittest
 from datetime import datetime
@@ -86,8 +88,11 @@ class TestFollowMainDeviceOverlay(unittest.TestCase):
                                         "rate_source": "main"}}},
         }}
         self._orig_cfg_path = engine.CONFIG_PATH
-        engine.CONFIG_PATH = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "_test_meters_config.json")
+        # Scratch config in a temp dir, NOT inside tests/. Written into the repo it
+        # survives a run that dies before tearDown, gets committed by the next
+        # `git add -A`, and then looks like a fixture the suite mysteriously deletes.
+        self._cfg_dir = tempfile.mkdtemp(prefix="emt-test-cfg-")
+        engine.CONFIG_PATH = os.path.join(self._cfg_dir, "meters_config.json")
         with open(engine.CONFIG_PATH, "w") as f:
             json.dump(self.cfg, f)
         self._lj = patch.object(engine, "load_json",
@@ -111,10 +116,7 @@ class TestFollowMainDeviceOverlay(unittest.TestCase):
         engine._store = self._orig_store
         engine._kraken_rate_schedules = self._orig_sched
         engine._DISPATCH_OVERLAY_APPLY = self._orig_apply
-        try:
-            os.remove(engine.CONFIG_PATH)
-        except OSError:
-            pass
+        shutil.rmtree(self._cfg_dir, ignore_errors=True)
         engine.CONFIG_PATH = self._orig_cfg_path
 
     def _finalise(self, start, end, main, batt, ev):

@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 .DS_Store
 *.patch
+*.pytest_cache
  
 # ── Local diagnostics — never ship ───────────────────────────────────
 # One-off probes (octopus_*_probe.py, probe_*.py, *_probe.py, etc.)
@@ -26,3 +27,24 @@ test_results.json
  
 # NOTE: requirements.txt, screenshots/ and .build/ CI scripts are
 # intentionally tracked — do not ignore them.
+
+# ── Test scaffolding — created by run_tests.sh, removed again on exit ────────
+# Symlinks into the source tree so tests can load sibling modules by path. They
+# are build artefacts; a stale copy committed here shows up in every later diff.
+tests/block_store.py
+tests/energy_charts.py
+tests/energy_engine_io.py
+tests/engine.py
+tests/ha_client.py
+tests/instance.py
+tests/kraken_api_client.py
+tests/kraken_ingester.py
+tests/kraken_mini.py
+tests/kraken_rates.py
+tests/main.py
+tests/server.py
+tests/web
+tests/templates
+# Scratch config a test used to write here (it now uses a temp dir) — ignored so
+# an old working copy can't reintroduce it.
+tests/_test_meters_config.json

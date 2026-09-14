@@ -7521,7 +7521,7 @@ def _maybe_repair_stale_exc() -> None:
 
 
 def _billed_rate(rate_segs, start, off_peak, meas_cost, kwh,
-                 tol: float = 0.001):
+                 tol: float = 0.001, labelled=None):
     """£/kWh for an imported slot, choosing the right source of truth by tariff type.
 
     The rate-source axis is whether the slot carries a time-of-use (OFF_PEAK/
@@ -7551,9 +7551,17 @@ def _billed_rate(rate_segs, start, off_peak, meas_cost, kwh,
     rate all day (flat export, fixed import). Agile carries no label at all
     (off_peak None) and is resolved per-slot."""
     sched = _tariff_rate_for(rate_segs, start, off_peak)
-    # Continuous / unlabelled tariff (Agile): _tariff_rate_for used resolve() for the
+    # Continuous / UNLABELLED tariff (Agile): _tariff_rate_for used resolve() for the
     # exact per-slot published rate — always prefer it over billed jitter.
-    if off_peak is None and sched is not None:
+    #
+    # `off_peak is None` alone is NOT that test. On the 4-bucket IOG-SMB tariff a slot
+    # carrying BOTH home and EV consumption is legitimately band-ambiguous and reports
+    # off_peak None while still being a banded, dispatch-aware slot — and for an
+    # out-of-window dispatch (EV at off-peak while the house pays peak) the blended
+    # truth is cost÷kWh, not the time-of-day schedule rate. So a slot that carried any
+    # TOU label is never treated as continuous. `labelled=None` keeps the historical
+    # behaviour for callers that don't know (the label set is unavailable).
+    if off_peak is None and sched is not None and not labelled:
         return sched
     # Labelled slot (IOG import, or flat export tagged STANDARD_RATE). Decide by
     # whether the tariff is BANDED on this day. A SINGLE rate for the day (flat
@@ -7634,6 +7642,113 @@ def _reprice_suspect(channel, row, rate_segs, min_kwh: float,
     if off_peak_floor is not None and off_peak_floor > 0:
         return rate > off_peak_floor * _PEAK_BAND_FACTOR
     return False
+
+
+# Coverage at or above this fraction of a tariff agreement's CONSUMING half-hours having
+# no billed cost means Octopus is not publishing per-slot costs for that product at all —
+# not that a fetch was starved. Retrying returns the same empty answer however many times
+# it is pressed, so the panel must stop offering it and point at the PDF bills instead.
+# Evidence: one real account ran three consecutive INTELLI agreements at 100% uncosted for
+# 23 months while the flat tariff before and the IOG-SMB tariff after were both fully
+# costed; three independent day-sweeps and an 11-variant request matrix all came back
+# empty. 95% rather than 100% so a handful of recovered stragglers can't flip the verdict.
+_COST_COVERAGE_PDF_THRESHOLD = 0.95
+# ...but never on a handful of slots. 0-costed-out-of-3 is also "100% uncosted", and that
+# must not be allowed to stop work or tell a user their history is wrong. ~200 consuming
+# half-hours is about four days — enough that a run of genuinely uncosted slots means the
+# product, not a bad afternoon. One floor for BOTH the display and the skip, so the panel
+# can never say "don't retry" while the engine retries anyway.
+_COST_COVERAGE_MIN_SLOTS = 200
+_COST_COVERAGE_KEY = "import_cost_coverage"
+
+
+def _coverage_verdict(slots: int, costed: int) -> str:
+    """'pdf' (no request shape recovers these), 'partial' (a re-fetch can help), 'ok'."""
+    if slots <= 0:
+        return "ok"
+    uncosted = slots - costed
+    if not uncosted:
+        return "ok"
+    if slots >= _COST_COVERAGE_MIN_SLOTS and (uncosted / slots) >= _COST_COVERAGE_PDF_THRESHOLD:
+        return "pdf"
+    return "partial"
+
+
+def _uncostable_ranges(channel: str = "import") -> list:
+    """Date spans whose tariff agreement Octopus does not cost at all, from the coverage
+    recorded by previous chunks of this import.
+
+    Used to stop work that cannot succeed: the calm re-fetch inside the import, and the
+    deferred verify sweep. Both would otherwise spend hours of a SHARED Octopus allowance
+    re-asking for a cost that was never published — while the panel tells the user exactly
+    that. Empty until a chunk has actually established the verdict, so the first chunk in
+    any era always does the full work and nothing is skipped on an assumption.
+    """
+    out = []
+    try:
+        cov = (_store.get_meta(_COST_COVERAGE_KEY, None) or {}).get(channel) or {}
+    except Exception:
+        return out
+    for rec in cov.values():
+        slots = int(rec.get("slots") or 0)
+        costed = int(rec.get("costed") or 0)
+        if _coverage_verdict(slots, costed) == "pdf":
+            out.append({"from": rec.get("from"), "to": rec.get("to"),
+                        "tariff_code": rec.get("tariff_code")})
+    return out
+
+
+def _in_uncostable_range(ranges, start: str) -> bool:
+    """True when `start` falls inside a known-uncostable agreement (half-open)."""
+    for r in ranges or []:
+        frm, to = r.get("from"), r.get("to")
+        if frm and start >= frm and (to is None or start < to):
+            return True
+    return False
+
+
+def _era_is_banded(rate_segs, start) -> bool:
+    """True when the tariff had DISTINCT off-peak and peak rates at `start`.
+
+    This is the difference between "unverified" and "wrong". On a single-rate tariff a
+    schedule-priced half-hour is exactly right — there is only one price. On a banded,
+    dispatch-aware tariff (Intelligent Octopus and friends) it is not: a smart-charge
+    session outside the fixed off-peak window is billed at the OFF-PEAK rate, and nothing
+    in the consumption feed says when one happened, so the schedule prices it at PEAK and
+    the half-hour reads far too high (see _import_pricing_flag). Data-driven rather than
+    matching tariff-code names, so a product we have never seen classifies itself.
+    """
+    for vf, vt, sched in (rate_segs or []):
+        if sched is not None and start >= vf and (vt is None or start < vt):
+            try:
+                lo, hi = sched.day_rate_bounds(start)
+            except Exception:
+                return False
+            return lo is not None and hi is not None and abs(hi - lo) > 1e-9
+    return False
+
+
+def _agreement_era(channel: str, start: str):
+    """(tariff_code, from, to) of the agreement live at `start`, or None.
+
+    Coverage is judged PER AGREEMENT because that is the unit Octopus configures product
+    rates against — a raw whole-import count mixes a blank tariff era in with healthy ones
+    and hides both.
+    """
+    import api_import as _ai
+    info = (_kraken_discovery or {}).get(channel) or {}
+    for a in (info.get("agreements") or []):
+        code = a.get("tariff_code")
+        if not code:
+            continue
+        try:
+            vf = _ai._iso(_ai._naive_utc(a.get("valid_from"))) if a.get("valid_from") else None
+            vt = _ai._iso(_ai._naive_utc(a.get("valid_to"))) if a.get("valid_to") else None
+        except Exception:
+            continue
+        if vf and start >= vf and (vt is None or start < vt):
+            return (code, vf, vt)
+    return None
 
 
 def _import_pricing_flag(channel: str, kwh, meas_cost, buckets,
@@ -7980,6 +8095,7 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
 
         priced = off_peak = 0
         fb_material = fb_no_bucket = 0     # IOG-dispatch pricing diagnostic
+        era_cov: dict = {}                 # per-agreement billed-cost coverage
         fb_samples = []
         fb_starts = []                     # ALL no-cost material slots → reprice queue
         rows_to_write = []
@@ -7991,7 +8107,8 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
             # Rate: Octopus's billed cost is truth — use cost÷kWh, keeping the clean
             # scheduled rate only when it agrees (so a mis-dated price-cap change in
             # the local schedule can't stamp a rate that contradicts the bill).
-            rate = _billed_rate(rate_segs, st, ofp, meas_cost, kwh)
+            rate = _billed_rate(rate_segs, st, ofp, meas_cost, kwh,
+                                labelled=bool(r.get("buckets")))
             # Cost: exact billed figure if Measurements gave one; otherwise
             # reconstruct kWh × tariff-rate (fills the cost-missing half-hours).
             if meas_cost is not None:
@@ -8021,6 +8138,21 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
                 off_peak += 1
             # Diagnostic: a material-kWh slot Measurements gave no cost for is
             # schedule-priced and can't reflect an out-of-window IOG dispatch.
+            # Per-agreement coverage. Zero-consumption half-hours are excluded from
+            # both sides: Octopus returns a 0.00 cost for them, which would read as
+            # "priced" and quietly inflate coverage on a sparse meter.
+            if kwh > 0:
+                _era = _agreement_era(channel, st)
+                if _era:
+                    _k = f"{_era[0]}|{_era[1]}"
+                    _c = era_cov.setdefault(_k, {"tariff_code": _era[0], "from": _era[1],
+                                                 "to": _era[2], "slots": 0, "costed": 0,
+                                                 "banded": False})
+                    _c["slots"] += 1
+                    if not _c["banded"] and _era_is_banded(rate_segs, st):
+                        _c["banded"] = True
+                    if meas_cost is not None:
+                        _c["costed"] += 1
             _fb, _nb = _import_pricing_flag(channel, kwh, meas_cost, r.get("buckets"))
             if _fb:
                 fb_material += 1
@@ -8042,6 +8174,22 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
         # Total flagged this chunk BEFORE in-pass recovery reduces it — the "raised"
         # figure the post-import health summary reports.
         flags_raised_ch = fb_material
+
+        # Drop slots that sit inside an agreement an EARLIER chunk already proved Octopus
+        # does not cost. Re-fetching them cannot succeed, and queueing them would offer a
+        # Retry the panel has already said is pointless. The diagnostic counts above are
+        # deliberately left intact — "N came back without a price" stays truthful; it is
+        # only the WORK that stops.
+        _uncostable = _uncostable_ranges(channel) if channel == "import" else []
+        fb_skipped_uncostable = 0
+        if _uncostable and fb_starts:
+            _keep = [x for x in fb_starts if not _in_uncostable_range(_uncostable, x)]
+            fb_skipped_uncostable = len(fb_starts) - len(_keep)
+            if fb_skipped_uncostable:
+                logger.info("import pricing [%s]: %d slot(s) fall in a tariff period "
+                            "Octopus does not cost — not retried, not queued",
+                            channel, fb_skipped_uncostable)
+            fb_starts = _keep
         healed_in_pass = 0
         # ── In-pass cost recovery ────────────────────────────────────────────
         # The material no-cost slots above are the empty-`statistics` signature
@@ -8070,13 +8218,22 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
                     kwh = row.get("kwh") or 0.0
                     # Billed cost is truth — cost÷kWh, keeping the clean scheduled
                     # rate only when it agrees (price-cap-safe).
-                    rate = _billed_rate(rate_segs, st, ofp, mc, kwh)
+                    rate = _billed_rate(rate_segs, st, ofp, mc, kwh,
+                                        labelled=bool(node.get("buckets")))
                     if row.get("cost") is None:
                         priced += 1
                     if ofp and not row.get("_was_off_peak"):
                         off_peak += 1
                     row["cost"] = mc
                     row["rate"] = rate
+                    # Credit the recovery to its agreement — a slot healed by the calm
+                    # re-fetch IS costed, and leaving it out would understate coverage
+                    # and could tip a healthy era over the PDF threshold.
+                    _era = _agreement_era(channel, st) if (kwh or 0) > 0 else None
+                    if _era:
+                        _c = era_cov.get(f"{_era[0]}|{_era[1]}")
+                        if _c and _c["costed"] < _c["slots"]:
+                            _c["costed"] += 1
                     # BL-23 (4.2): the recovered node carries the exact ex-VAT cost too.
                     _ce = node.get("cost_excl")
                     if _ce is not None:
@@ -8123,6 +8280,29 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
                 _store.add_reprice_queue(channel, fb_starts)
             except Exception as _qe:
                 logger.warning("import reprice queue: persist failed: %s", _qe)
+
+        # Persist per-agreement coverage every chunk — unconditionally, unlike the
+        # flag diagnostic above. A fully-costed era is just as much a finding as a blank
+        # one: it is what lets the panel say "this tariff period is fine, that one never
+        # had costs" instead of lumping the whole import into a single number.
+        if era_cov and not dry_run:
+            try:
+                _cov = _store.get_meta(_COST_COVERAGE_KEY, None) or {}
+                _ch = _cov.get(channel) or {}
+                for _k, _v in era_cov.items():
+                    _prev = _ch.get(_k) or {"tariff_code": _v["tariff_code"],
+                                            "from": _v["from"], "to": _v["to"],
+                                            "slots": 0, "costed": 0, "banded": False}
+                    _prev["slots"] += _v["slots"]
+                    _prev["costed"] += _v["costed"]
+                    _prev["banded"] = bool(_prev.get("banded")) or bool(_v.get("banded"))
+                    _prev["to"] = _v["to"]        # an open agreement may have gained an end
+                    _ch[_k] = _prev
+                _cov[channel] = _ch
+                _cov["updated_at"] = _dt_now_iso_safe()
+                _store.set_meta(_COST_COVERAGE_KEY, _cov)
+            except Exception as _ce2:
+                logger.warning("import cost coverage: persist failed: %s", _ce2)
 
         written = 0
         if not dry_run and rows_to_write:
@@ -8386,7 +8566,8 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                 confirmed.append(st)
                 ofp = r.get("off_peak")
                 kwh = r.get("kwh") or 0
-                rate = _billed_rate(rate_segs, st, ofp, mc, kwh)
+                rate = _billed_rate(rate_segs, st, ofp, mc, kwh,
+                                    labelled=bool(r.get("buckets")))
                 if _store.reprice_imported_block(st, meter_id, channel, rate, mc,
                                                  cost_exc=r.get("cost_excl"),
                                                  exc_source="measurement"):
@@ -8420,7 +8601,8 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                     if mc is None:
                         continue
                     new_rate = _billed_rate(rate_segs, st, r.get("off_peak"),
-                                            mc, r.get("kwh") or 0)
+                                            mc, r.get("kwh") or 0,
+                                            labelled=bool(r.get("buckets")))
                     if new_rate is None:
                         continue
                     cur_rate = cur.get("imp_rate") if _imp else cur.get("exp_rate")
@@ -8461,7 +8643,8 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                     continue
                 confirmed_ss.append(st)
                 ofp = node.get("off_peak")
-                rate = _billed_rate(rate_segs, st, ofp, mc, node.get("kwh") or 0)
+                rate = _billed_rate(rate_segs, st, ofp, mc, node.get("kwh") or 0,
+                                    labelled=bool(node.get("buckets")))
                 if _store.reprice_imported_block(st, meter_id, channel, rate, mc,
                                                  cost_exc=node.get("cost_excl"),
                                                  exc_source="measurement"):
@@ -8804,6 +8987,17 @@ async def run_deferred_verify_pricing(*, chunk_days: int = 30, headroom_frac: fl
                         "from": None, "to": None, "corrections": [],
                         "started_at": _dt_now_iso_safe()})
     repriced = checked = skipped = 0
+    # Agreements an import already proved Octopus does not cost. Chunks falling wholly
+    # inside one are skipped without a single API call — the sweep can only ever confirm
+    # what is already known, and it burns a shared allowance for hours doing it while the
+    # panel tells the user to use their bills instead.
+    uncostable = _uncostable_ranges("import")
+    skipped_uncostable_chunks = 0
+    if uncostable:
+        logger.info("verify pricing: %d tariff period(s) will be skipped — Octopus "
+                    "publishes no costs for them: %s", len(uncostable),
+                    ", ".join(f"{r.get('tariff_code')} {str(r.get('from'))[:10]}"
+                              f"..{str(r.get('to') or 'now')[:10]}" for r in uncostable))
     logger.info("verify pricing: starting over %s..%s in ~%d chunk(s)",
                 lo.date(), hi.date(), total_chunks)
     try:
@@ -8823,6 +9017,24 @@ async def run_deferred_verify_pricing(*, chunk_days: int = 30, headroom_frac: fl
                 logger.info("verify pricing: paused (allowance low); cursor left at %s",
                             cursor.isoformat())
                 return {"ran": True, "paused": True, "repriced": repriced}
+            # Skip only a chunk that lies ENTIRELY inside an uncostable agreement. One
+            # straddling the boundary still has costable days in it and must be checked.
+            if uncostable and _in_uncostable_range(uncostable, c_from.isoformat()) \
+                    and _in_uncostable_range(uncostable, (c_to - _td(seconds=1)).isoformat()):
+                skipped_uncostable_chunks += 1
+                cursor = c_from
+                try:
+                    _store.set_kraken_state(_VERIFY_CURSOR_KEY, cursor.isoformat())
+                except Exception:
+                    pass
+                _verify_job.update({
+                    "chunks_done": _verify_job.get("chunks_done", 0) + 1,
+                    "skipped_uncostable_chunks": skipped_uncostable_chunks,
+                    "phase": "skipping a tariff period Octopus does not cost",
+                    "from": c_from.date().isoformat(), "to": c_to.date().isoformat()})
+                await _asyncio.sleep(0)        # keep the loop cooperative
+                continue
+
             _verify_job["status"] = "running"
             _verify_job["phase"] = "verifying"
             _verify_job["from"] = c_from.date().isoformat()
@@ -8871,6 +9083,7 @@ async def run_deferred_verify_pricing(*, chunk_days: int = 30, headroom_frac: fl
             pass
         _elapsed = int(__import__("time").monotonic() - _t0)
         _verify_job.update({"status": "done", "phase": "done",
+                            "skipped_uncostable_chunks": skipped_uncostable_chunks,
                             "repriced": repriced, "checked": checked, "skipped": skipped,
                             "elapsed_s": _elapsed, "corrections": list(corrections),
                             "finished_at": _dt_now_iso_safe()})
@@ -8993,6 +9206,68 @@ def _persist_import_health(j: dict) -> None:
     _store.set_kraken_state(_IMPORT_HEALTH_KEY, _json.dumps(summary))
 
 
+def debug_mode() -> bool:
+    """True when the add-on is running with `log_level: debug`.
+
+    run.sh already resolves the add-on option into LOG_LEVEL for both Supervised and
+    standalone startup, so this reuses a switch the user can see and set in the add-on
+    configuration rather than inventing a hidden one. Gates operator-only affordances
+    that a normal user must never meet.
+    """
+    return (os.environ.get("LOG_LEVEL") or "").strip().lower() == "debug"
+
+
+# ── Pricing-health DEMO payloads ──────────────────────────────────────────────────────
+# An operator whose own account is healthy can never see the unhappy states of the import
+# panel — which is exactly where the wording matters most and where a regression would go
+# unnoticed. These return the REAL payload shape (so the fixtures cannot drift from the
+# contract the panel reads) with synthetic numbers. Read-only: nothing is stored, no import
+# is affected, and the panel prints a banner so demo output can never be mistaken for a
+# real run. Reached only via an explicit ?health_demo=... in the page URL.
+_HEALTH_DEMO_RANGE = {"from": "2024-08-19T19:00:00", "to": "2026-08-17T23:30:00"}
+
+
+def _demo_era(code, frm, to, slots, costed, banded=False):
+    uncosted = slots - costed
+    frac = (uncosted / slots) if slots else 0.0
+    return {"tariff_code": code, "from": frm, "to": to, "slots": slots,
+            "costed": costed, "uncosted": uncosted, "banded": banded,
+            "uncosted_pct": round(100.0 * frac, 1),
+            "verdict": _coverage_verdict(slots, costed)}
+
+
+def api_import_health_demo(scenario: str) -> dict:
+    """Canned pricing-health payloads for eyeballing the panel. See above."""
+    flat = _demo_era("E-1R-OE-FIX-12M-24-05-11-H",
+                     "2024-05-14T23:00:00", "2024-09-11T23:00:00", 1150, 1150)
+    blank = _demo_era("E-1R-INTELLI-VAR-22-10-14-H",
+                      "2024-09-11T23:00:00", "2026-08-23T23:00:00", 33573, 0, banded=True)
+    starved = _demo_era("E-1R-INTELLI-FIX-12M-25-04-10-H",
+                        "2025-04-10T23:00:00", "2026-04-10T23:00:00", 17000, 16750, banded=True)
+    smb = _demo_era("E-1R-IOG-SMB-FIX-6M-26-03-05-H",
+                    "2026-08-23T23:00:00", None, 1200, 1200)
+
+    sets = {
+        # One tariff period Octopus never priced — nothing to retry, bills are the route.
+        "pdf": ([flat, blank, smb], 2091, 0, 2091),
+        # A blank period AND a starved one: the panel must offer Retry for the 250
+        # recoverable slots while still pointing at the bills for the blank period.
+        "mixed": ([flat, blank, starved, smb], 2341, 25, 2341),
+        # Classic starved fetch — Retry is the right answer and must still be offered.
+        "partial": ([flat, starved, smb], 250, 25, 250),
+        # Everything priced.
+        "clean": ([flat, smb], 0, 0, 0),
+    }
+    eras, raised, recovered, remaining = sets.get(scenario) or sets["pdf"]
+    return {"ok": True, "have": True, "debug": True,
+            "demo": scenario if scenario in sets else "pdf",
+            "raised": raised, "auto_recovered": recovered, "remaining": remaining,
+            "blocks": sum(e["slots"] for e in eras),
+            "uncosted_total": sum(e["uncosted"] for e in eras),
+            "eras": eras, "queue": {"import": [], "export": []},
+            **_HEALTH_DEMO_RANGE}
+
+
 def api_import_health() -> dict:
     """Post-import health summary for the import page's persistent panel. Reads the
     persisted run summary and overlays the LIVE remaining-queue count, so 'still
@@ -9011,6 +9286,40 @@ def api_import_health() -> dict:
         pass
     try:
         out["remaining"] = int(_store.reprice_queue_count())
+    except Exception:
+        pass
+    # Per-agreement billed-cost coverage, with a verdict per era. This is what lets the
+    # panel distinguish "a fetch was starved, retry will help" from "Octopus does not
+    # publish per-slot costs for this product, retry returns the same empty answer".
+    # Lets the panel offer its demo picker. The picker is the only way in: EMT is served
+    # through Home Assistant ingress, i.e. inside an iframe, so a query parameter typed
+    # into the browser's address bar belongs to the OUTER HA page and never reaches this
+    # document's location.search.
+    out["debug"] = debug_mode()
+    out["eras"] = []
+    out["uncosted_total"] = 0
+    try:
+        cov = (_store.get_meta(_COST_COVERAGE_KEY, None) or {}).get("import") or {}
+        for rec in cov.values():
+            slots = int(rec.get("slots") or 0)
+            costed = int(rec.get("costed") or 0)
+            if slots <= 0:
+                continue
+            uncosted = slots - costed
+            frac = uncosted / slots
+            out["uncosted_total"] += uncosted
+            out["eras"].append({
+                "tariff_code": rec.get("tariff_code"),
+                "from": rec.get("from"), "to": rec.get("to"),
+                "slots": slots, "costed": costed, "uncosted": uncosted,
+                # Banded => schedule pricing cannot be trusted for the uncosted slots.
+                "banded": bool(rec.get("banded")),
+                "uncosted_pct": round(100.0 * frac, 1),
+                # "pdf": no request shape recovers these — send the user to their bills.
+                # "partial": some slots priced, so a calm re-fetch can genuinely help.
+                "verdict": _coverage_verdict(slots, costed),
+            })
+        out["eras"].sort(key=lambda e: str(e.get("from") or ""))
     except Exception:
         pass
     # The actual queued slots (per channel), so the panel can list "which slots

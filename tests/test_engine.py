@@ -3366,7 +3366,7 @@ class TestRepairImportPricing(unittest.TestCase):
         # Force the computed rate to equal the stored rate so the reprice is a
         # genuine no-op (value unchanged → reprice_imported_block returns False).
         _saved_br = engine._billed_rate
-        engine._billed_rate = lambda segs, st, ofp, mc, kwh: 0.28124
+        engine._billed_rate = lambda segs, st, ofp, mc, kwh, **kw: 0.28124
         self.addCleanup(lambda: setattr(engine, "_billed_rate", _saved_br))
 
         client = MagicMock()
