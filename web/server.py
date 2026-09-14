@@ -5352,6 +5352,15 @@ def api_historical_api_health():
     live from the reprice queue. Read-only."""
     try:
         import engine as _eng
+        # Read-only demo payloads so the panel's unhappy states can be inspected on a
+        # healthy account (see engine.api_import_health_demo). Never reached unless the
+        # caller asks for it by name.
+        # Operator-only. Silently ignored unless the add-on is running with
+        # `log_level: debug`, so a normal user who lands on a shared URL carrying the
+        # parameter just sees their own real figures rather than an error or a banner.
+        demo = (request.args.get("demo") or "").strip()
+        if demo and _eng.debug_mode():
+            return jsonify(_eng.api_import_health_demo(demo))
         return jsonify(_eng.api_import_health())
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -5691,8 +5700,25 @@ def api_historical_csv_apply():
         except Exception as be:
             logger.warning("csv apply: backup failed (continuing): %s", be)
         store = _get_store()
+        # Spans a previous API import proved the supplier does not cost. Inside those,
+        # and ONLY there, a bill may replace what the API import left behind (usage x
+        # published rate) instead of being skipped by first-man-wins. Live/settled
+        # readings and user corrections are still protected inside them.
+        try:
+            import engine as _eng
+            replace_ranges = _eng._uncostable_ranges("import")
+        except Exception as _rr:
+            logger.warning("csv apply: uncostable ranges unavailable (%s) — "
+                           "first-man-wins everywhere", _rr)
+            replace_ranges = []
         result = store.apply_csv_import(
-            texts, meter_id=meter_id, overrides=overrides)
+            texts, meter_id=meter_id, overrides=overrides,
+            replace_ranges=replace_ranges)
+        if result.get("blocks_replaced"):
+            logger.info("csv apply: replaced %d block(s) inside %d uncostable tariff "
+                        "period(s); %d protected (live or user-corrected)",
+                        result.get("blocks_replaced"), len(replace_ranges),
+                        result.get("blocks_protected") or 0)
         result["backup"] = backup
         # Offer a region/site confirmation for the imported span. CSV carries no
         # provenance, so the user names the site AND sets the region; skipping

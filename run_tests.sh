@@ -17,8 +17,24 @@ set -u
 cd "$(dirname "$0")"
 
 # ── Scaffolding: tests load sibling modules by absolute path ─────────────────
+# Created here and removed again on exit. Leaving them behind means every later
+# `git status`, `git add -A`, diff or zip of the tree carries a dozen stray symlinks
+# and two directories that are pure build scaffolding — which is how they end up
+# inside patches. Only SYMLINKS are removed, so a real file of the same name (if
+# anyone ever adds one) is never touched.
 _MODULES=(block_store energy_charts engine ha_client instance kraken_api_client
           kraken_ingester kraken_mini kraken_rates energy_engine_io main)
+_cleanup_scaffolding() {
+  for m in "${_MODULES[@]}"; do
+    [ -L "tests/$m.py" ] && rm -f "tests/$m.py"
+  done
+  [ -L tests/web ]       && rm -f tests/web
+  [ -L tests/server.py ] && rm -f tests/server.py
+  [ -L tests/templates ] && rm -f tests/templates
+  return 0
+}
+trap _cleanup_scaffolding EXIT INT TERM
+
 for m in "${_MODULES[@]}"; do
   [ -e "tests/$m.py" ] || ln -sf "../$m.py" "tests/$m.py"
 done
