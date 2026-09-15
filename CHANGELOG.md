@@ -1,6 +1,37 @@
 # Changelog
  
-## [4.5.13] — 2026-09-14
+## [4.5.13] — 2026-09-15
+
+### Settlement re-run: an export settlement no longer re-prices import
+
+`needs_pass2_rerun` is a **block-level** flag with no channel on it. `upsert_kraken_block`
+consults `imp_kwh_api` / `exp_kwh_api` to decide whether *that channel's* settled figure
+changed, then raises one shared flag; the drain reloads the whole block and re-runs every
+channel. So a Kraken poll that settles only **export** queued the block and the **import**
+channel was re-run too — against a `chosen` kWh that is simply the unchanged CAD figure,
+because `imp_kwh_api` was still NULL. There was nothing to re-cost, yet the re-run took the
+full path: re-resolve the dispatch overlay, re-run the IOG split, rewrite the priced layer.
+
+Observed in prod. A 12:00 BST slot on 13 Sep drew 0.012 kWh and was finalised at peak, with
+no completed dispatch yet; the dispatch arrived an hour later. Some thirty hours on, a restart
+forced the six-hourly Kraken poll, which settled export for all 48 slots of that day while
+import stayed unsettled. The drain then re-ran the block: the dispatch overlay **refused** the
+slot (0.012 kWh is below the 0.10 kWh over-report floor, and it logged exactly that) — but
+`_apply_iog_split` carries no such floor, so on the capped tariff it repriced the slot from
+£0.323092 to £0.054917 anyway. Reconcile would have reverted it as an out-of-app bump, except
+that the blended £0.054917 sits 1.3e-5 from the canonical off-peak £0.05493 and its band test
+uses a 1e-6 tolerance, so it read the block as already at peak and left it alone.
+
+A settlement re-run exists to re-cost a channel against **its own** newly settled kWh. Where
+there is no settled import figure it now keeps the finalised rate and re-costs only, exactly as
+it already did for a user correction, a dispatch reconciliation or an Octopus-billed rate. A
+missing or zero stored rate still falls through to the resolver, so gap-block rate repair is
+untouched, and a genuine import settlement re-resolves as before.
+
+Cost impact on the observed slot was a third of a penny. The reason it matters is that a
+settled-looking historical block had its whole priced layer rewritten a day later, by a
+settlement that carried no information about it.
+
 
 ### Intelligent Octopus Go (IOG-SMB): read the band from the bucket that carries the charge
 
@@ -97,6 +128,18 @@ saying work was in progress, next to a button that looked ready to press:
   re-armed Start straight through a live lock. The server already refused these with a 409;
   the UI was offering an action that could only end in a refusal. It now explains itself
   ("waiting for the previous run's pricing check to finish") instead of failing on click.
+- **An import that writes nothing no longer triggers a pricing check.** The deferred
+  off-peak/peak verification scopes itself to the *whole* imported history rather than to
+  the run that launched it, and it was launched unconditionally when a job finished. So
+  running the importer over a span already covered — the plan says "empty window", zero
+  blocks written — still spent minutes and a shared API allowance re-checking everything
+  that had already been verified, and then reported "split verified" for an import that
+  imported nothing. It now runs only when a run actually wrote blocks (either channel).
+- **"Show details" stays open.** The pricing-health panel is re-rendered wholesale on
+  every poll — every few seconds while a check is live — which destroyed the `<details>`
+  element and snapped the section shut under anyone who expanded it. The open/closed
+  choice now survives the re-render, so it only appeared to "fix itself" before because
+  polling had stopped.
 - **The panel and the banner now read from one state.** The panel tracked only the import
   job while the banner above also tracks the post-import pricing check — which is how a
   terminal "✓ Import complete" came to sit underneath "A backfill is running". While that
