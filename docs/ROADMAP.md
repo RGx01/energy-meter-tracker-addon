@@ -13,8 +13,9 @@ Nothing in this file has shipped.*
 | 2 | BL-50 — Unify user-job mutual exclusion | architecture · correctness | v5.0.0 | ⚠️ needs issue |
 | 3 | BL-33 — Remove the one-time legacy migrations | deprecation | v5.0.0 | ⚠️ needs issue |
 | 4 | BL-61 — 4.5.7 settlement/chart cleanup follow-ups | tech-debt | v5.0.0 | ⚠️ needs issue |
-| 5 | BL-51 — Reprice banner: upgrade vs import-triggered | UI | low | ⚠️ needs issue |
-| 6 | BL-60 — Usage Stats block inspector (pre/post-settlement) | diagnostics | proposed | ⚠️ needs issue |
+| 5 | BL-63 — Two pricing models: collapse onto one (Principle 0) | architecture · first-principles | v5.0.0 | ⚠️ needs issue |
+| 6 | BL-51 — Reprice banner: upgrade vs import-triggered | UI | low | ⚠️ needs issue |
+| 7 | BL-60 — Usage Stats block inspector (pre/post-settlement) | diagnostics | proposed | ⚠️ needs issue |
 
 ---
 
@@ -51,6 +52,28 @@ cost/buckets, not the label, so it can collapse to a plain small-window cost fet
 `'settled'`** to match the design hierarchy — deferred from 4.5.7 because it forces a data migration of
 every existing `'measured'` block row, best batched under one migration-gated release.
 
+#### BL-63 — Two pricing models: decide which one is the model, and collapse onto it  ·  *architecture · first-principles · target v5.0.0*  ·  ⚠️ **needs issue**
+
+*Surfaced during the BL-62 investigation (Sept 2026), where `reprice.py` reads as the canonical pricer, carries the exact arithmetic fingerprint of the rate being chased, and has no production caller at all — which cost most of a day's misdiagnosis.*
+
+**Where it came from.** The 4.4.0 design opens (§0) with the bug class it exists to kill: *"an authoritative input changed (a dispatch completed, a block settled, a reconcile ran, the VAT calendar changed) and we updated **some** derived fields but not others, so the ex-VAT figures, or the EV split, or the segments, or the bands went stale."* Root cause 2 was named as *"derived fields maintained piecemeal — no single operation owned 'recompute everything this block derives'."* The remedy was **Principle 0** — one pure function turning a block's authoritative inputs into every derived value, with all other paths conforming — implemented as `reprice.reprice_block`, with `pricing_segments` as its representation layer and `carbon.py` as the adjacent pass.
+
+**What actually happened.** §P3.3 chose option (A), *"to remain faithful to the one model"*, staged as route → prove conformance → collapse, with (B) rejected as *"Safer; two pricing models persist."* P3.3a/b/c then built `_reprice_history_block` **inside engine.py** and flipped the sweep onto that. The routing shipped; the collapse never did. The outcome is the rejected (B).
+
+**Current state (measured on prod-dev, 15 Sept 2026).**
+- **Live model:** engine's `_reprice_history_block` + the finalise/settlement seam. This is what runs.
+- **Shelved model:** `reprice.reprice_block` (169 lines), `carbon.ev_carbon` / `house_carbon` / `carbon_from_reprice`, and 9 of 11 public functions in `pricing_segments` (the whole "legacy imp_* columns become views over the segments" projection layer). Zero production callers; ~37 test references, so the suite is green and the code reads as load-bearing.
+- **The requirement is already met by the live path.** Block-vs-segment rate agreement across every measured block since 1 Sept: **0 mismatches**. The atomic-recompute invariant was reached incrementally (BL-27 segments-as-truth, P3.3a's unified sweep, the settlement seam writing all derived fields together) rather than via Principle 0.
+
+**The residue that is NOT solved.** Derived rates are back-computed from a 6-dp rounded cost rather than carrying the canonical band rate, so they scatter: 12 measured blocks hold `imp_rate != imp_rate_ev`, worst case 1.3e-5 (0.05493 vs 0.054917). Cost impact nil — but it is exactly what let a blended rate slip past reconcile's `abs(cur_rate - off_peak) < 1e-6` band test in BL-62, silently disarming the bump revert. Any exact-equality comparison against a canonical rate is defeatable this way.
+
+**Decision required at v5.0.0** (do not act before — switching live pricing to an unexercised path is the larger risk, and the 4.4.0 doc itself rates (A) *"higher risk, perf-sensitive (a re-price per block over years)"*):
+1. **Finish the collapse** — route everything through `reprice_block`, delete engine's copy. Faithful to Principle 0; highest risk; buys an invariant already held.
+2. **Adopt the live model** — retire `reprice.py`, `carbon_from_reprice`, `ev_carbon`/`house_carbon` and the unused projection layer with their tests; record in the 4.4.0 design that Principle 0 was satisfied incrementally. Lowest risk; removes the trap that a shelved-but-tested module reads as canonical.
+3. **Keep both** — rejected: it is the status quo, and it has already cost a misdiagnosis.
+
+**Recommendation: (2), plus the rounding fix** — carry the canonical band rate instead of re-deriving it from rounded cost, or compare bands with a tolerance that reflects storage precision (1e-4, matching the existing near-identical-rate clustering). Pairs naturally with BL-33 (one-time-migration removal) and BL-61 (4.5.7 tech-debt), both already v5.0.0.
+
 #### BL-51 — Reprice banner should distinguish an upgrade from an import-triggered reprice  ·  *UI · low*  ·  ⚠️ **needs issue**
 *Surfaced during 4.5.4 gap-fill testing.* The global "Finishing your upgrade" advisory (base.html) is driven by `api_reprice_history_status` → `in_progress = (not done) and count_blocks_needing_reprice() > 0`. That backlog counter (missing segments / missing exc) is driven by **both** a genuine version upgrade **and** a gap-fill / import / delete-reimport — the unified reprice-history sweep covers all of them by design (P3.3d). So after a gap fill the banner correctly fires (the sweep really is running) but mislabels it "Finishing your upgrade", even though no upgrade occurred. The behaviour is correct; only the messaging is wrong, and it double-surfaces with the Historical Import page's own Pricing-health progress. **Fix:** record *why* the sweep is running. The `reprice_history_state` marker stores `done/swept/stalled` but no trigger — add a `reason` field set at the two kickoff sites (`"upgrade"` from the startup version-change gate; `"import"` from the post-import sweep). `api_reprice_history_status` returns it; the banner branches on it — keep the "avoid restarting" upgrade advisory for `reason == "upgrade"`, and for `reason == "import"` either use neutral wording ("Re-pricing your recent import…") or suppress the global banner entirely (the import page already owns that progress). Cosmetic/UX only — no pricing or data impact. Files: `engine.py` (marker reason), `web/server.py` (`api_reprice_history_status`), `web/templates/base.html` (banner text/visibility).
 
@@ -77,6 +100,7 @@ then the reference added to its heading and to the priority table:
 - [ ] **BL-50** — Unify user-job mutual exclusion (deny + idempotent-retry)
 - [ ] **BL-33** — Remove the one-time legacy migrations (v5.0.0 deprecation)
 - [ ] **BL-61** — 4.5.7 settlement/chart cleanup follow-ups
+- [ ] **BL-63** — Two pricing models: decide which one is the model, and collapse onto it
 - [ ] **BL-51** — Reprice banner should distinguish an upgrade from an import-triggered reprice
 - [ ] **BL-60** — Usage Stats block inspector: pre/post-settlement detail for a single block
 
