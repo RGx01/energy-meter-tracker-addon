@@ -6,6 +6,64 @@ first; the release history follows, newest first.*
 
 ## Shipped / closed backlog items
 
+### BL-62 — 4.5.13 — settlement re-run is scoped to the channel that settled
+
+*Closed by the 13 Sep 2026 prod case: a historical slot repriced peak → off-peak roughly thirty
+hours after it was written, on a restart, on a block whose import had never settled.*
+
+**The flaw.** `needs_pass2_rerun` is a **block-level** flag. `upsert_kraken_block` picks
+`imp_kwh_api` or `exp_kwh_api` to decide whether *that channel's* figure changed, then raises one
+shared flag with no channel recorded; `_drain_pass2_queue` reloads the block and re-runs every
+channel. An export-only settlement therefore re-ran the import channel against `chosen = cad_kwh`
+— the kWh already stored. Nothing to re-cost, but the re-run still re-resolved the dispatch
+overlay and re-ran the IOG split.
+
+**Why it surfaced when it did.** The Kraken poll is six-hourly and a restart forces one
+immediately, so the restart is what fetched the export settlement — not a code path that only
+runs at boot. Export settled for all 48 slots of 13 Sep; import had not settled for any of them.
+
+**Three quirks it exposed, and why none of them is work to schedule.** The investigation surfaced
+three things that look like defects in isolation:
+
+1. `_apply_iog_split` ignores `_DISPATCH_OVERLAY_MIN_KWH`. The over-report floor guards
+   `_dispatch_overlay_rate` only, so the capped seam reprices a sub-floor dispatch slot even after
+   the overlay has refused it and logged the refusal.
+2. The capped seam writes a **blended** rate (£0.054917) rather than the canonical band rate
+   (£0.05493). Reconcile's `abs(cur_rate - off_peak) < 1e-6` band test cannot see that as
+   off-peak, so its out-of-app-bump revert silently never fires.
+3. `_iog_slot_is_boost` matches `dispatch_history.source` against `{"bump-charge", "boost"}`, but
+   Myenergi's completed rows carry `source='unknown'` — so a bump is invisible to the cap layer
+   and "exclude boost energy from the 6 h cap tally" cannot fire for that provider.
+
+All three only bite a **schedule-derived estimate that is never superseded by a bill**, and on the
+evidence no such block exists:
+
+* **The seam cannot reach an uncosted era.** `_apply_iog_split` returns at `ev_kwh <= 1e-9`, so it
+  needs a completed dispatch row for that exact slot. `dispatch_history` is pruned at 90 days and
+  only starts when EMT began capturing it — on prod-dev, **54,143 of ~57,450 main blocks (94 %)
+  predate every dispatch record**, including every imported and legacy-tariff era. The accounts
+  where Octopus never publishes a cost (Brian's 2024–26 Intelligent stretch) are exactly those
+  eras, so "cost never settles" and "the capped seam repriced it" cannot coexist on one block.
+* **Where the seam can reach, the bill always lands.** Of settled blocks 1–12 Sep that drew
+  anything, **257 of 257 (100 %)** carry `rate_source='measured'`; the remainder on `schedule` are
+  zero-kWh slots with no cost to bill. `apply_measured_to_block` then overwrites rate and cost and
+  stamps `measured`, which is in the preserve list permanently.
+* **After this fix the window is a few minutes.** The re-price now requires `imp_kwh_api`, and
+  import kWh and import cost share a settlement frontier (both `2026-09-12T23:30` in the
+  snapshot). The drain runs a little ahead of the measured-cost pass within one tick (21:11:31 vs
+  21:16:29 in the prod log), so an estimate can be written and corrected by the bill minutes
+  later. Not worth code.
+
+Recorded here so the reasoning survives, not as deferred work. Re-open only if a capped account
+is ever observed holding dispatched slots that stay on `rate_source='schedule'` after settlement.
+
+**Fix (shipped).** No settled figure for a channel ⇒ no re-resolve for that channel. The import
+re-run keeps its finalised rate and re-costs only, joining the existing preserve list (user
+correction, dispatch reconciliation, Octopus-billed). A missing or zero stored rate still falls
+through to `_resolve_block_rate`, so gap-block rate repair is unaffected, and a genuine import
+settlement re-resolves exactly as before. Guarded by `tests/test_export_settlement_scope.py`,
+which reproduces the prod slot to six decimal places.
+
 ### 4.5.0 — IOG bump handling: don't promote completed-only dispatches to off-peak
 
 *Closes the long-open bump-validation item (`dispatch_validation_design.md` §12/§13; `4.4.0_iog_pricing_and_reprice_design.md` §3c) with the **first real bump ever observed** — a manual Zappi **Fast** bump during a Free Electricity hour, 23 Aug 2026 prod. This is a **framing/correction of the completed-dispatch classification model**, not new provider support.*

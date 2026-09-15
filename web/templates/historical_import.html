@@ -1497,7 +1497,7 @@ function loadPricingHealth(){
     // is active (or slots still need a retry) keep it fully expanded.
     var collapse = (!vActive && rem === 0);
     var inner = collapse
-      ? (head + '<details style="margin-top:2px;">'
+      ? (head + '<details id="health-details"' + (_healthDetailsOpen ? ' open' : '') + ' style="margin-top:2px;">'
          + '<summary style="cursor:pointer;font-size:12px;color:var(--muted);">Show details</summary>'
          + '<div style="margin-top:8px;">' + intro + body + '</div></details>')
       : (head + intro + body);
@@ -1505,6 +1505,12 @@ function loadPricingHealth(){
     // very case where the panel is collapsed and there is nothing to look at).
     el.innerHTML = '<div style="border:1px solid var(--border);border-radius:8px;padding:12px 14px;">'
       + inner + _healthDemoPicker(d) + '</div>';
+    // The panel is re-rendered wholesale every poll (2-4s while a check is live), which
+    // destroys the <details> element and with it the user's expanded/collapsed choice —
+    // so it snapped shut under them until polling stopped. Remember the choice and
+    // re-apply it, so expanding mid-run sticks.
+    var _dt = document.getElementById('health-details');
+    if(_dt) _dt.addEventListener('toggle', function(){ _healthDetailsOpen = this.open; });
 
     if(vActive) _lastActiveAt = Date.now();
     if(_verifyTimer){ clearTimeout(_verifyTimer); _verifyTimer = null; }
@@ -1522,6 +1528,8 @@ function loadVerifyStatus(){ loadPricingHealth(); }
 // the CSV reprice path (reprice-from-csv updates the block cost in place + clears
 // the slot from the queue). Set from /health on each render.
 var _HEALTH_QUEUE = { import: [], export: [] };
+// Survives the panel's re-render (see loadPricingHealth). Starts closed, as before.
+var _healthDetailsOpen = false;
 function _healthEscapeHatch(){
   var q = _HEALTH_QUEUE || {};
   var chans = ['import','export'].filter(function(c){ return (q[c]||[]).length; });

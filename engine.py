@@ -3338,6 +3338,7 @@ def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricit
             # only re-cost it against the settled kWh. (Ordering normally puts
             # reconcile after settlement, so this is belt-and-braces.)
             _override_rate = None
+            _override_why = "user correction / reconciled / measured"
             try:
                 if _store is not None:
                     _mrow = _store._conn.execute(
@@ -3351,14 +3352,34 @@ def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricit
                         _override_rate = _mrow[2]
             except Exception:
                 _override_rate = None
+            # BL-62: an EXPORT-only settlement must not re-price IMPORT. `needs_pass2_rerun`
+            # is a BLOCK-level flag with no channel (upsert_kraken_block picks imp/exp_kwh_api
+            # to decide whether the figure CHANGED, then raises one shared flag), so a poll
+            # that settles only export queues the block and the drain re-runs every channel.
+            # For import that is a no-op by construction: `chosen` falls back to `cad_kwh`,
+            # which IS the already-stored kWh — there is nothing to re-cost. Yet the else-branch
+            # below re-resolves the dispatch overlay and re-runs the IOG split, which CAN move a
+            # historical rate. The 2026-09-13 12:00 BST case: export settled on a restart-forced
+            # Kraken poll ~30 h after the slot; the overlay itself refused (0.012 kWh < the 0.10
+            # over-report floor, logged) but `_apply_iog_split` carries no floor, so the capped
+            # seam repriced the slot peak -> off-peak (0.323092 -> 0.054917) on a block whose
+            # import had never settled. No settled import figure => keep the finalised rate.
+            # Only a genuine import settlement (or an explicit CAD switch) may re-resolve it.
+            # A missing/zero stored rate still falls through, so `_resolve_block_rate`'s
+            # zero/missing-rate REPAIR — the reason that branch exists — is untouched.
+            if _override_rate is None and use_dcc and dcc_kwh is None:
+                _stored_rate = imp_ch.get("rate")
+                if _stored_rate:
+                    _override_rate = float(_stored_rate)
+                    _override_why = "import not settled (export-only settlement)"
             if _override_rate is not None:
-                # user correction / dispatch reconciliation — keep the stored rate, only
-                # re-cost to the settled kWh; no overlay/split/persist so the override is
-                # never stomped. ex-VAT is still derived (from that same rate).
+                # user correction / dispatch reconciliation / unsettled import — keep the
+                # stored rate, only re-cost to the chosen kWh; no overlay/split/persist so the
+                # rate is never stomped. ex-VAT is still derived (from that same rate).
                 rate = _override_rate
-                logger.info("_rerun_pass2: %s rate override preserved (%.5f) — "
-                            "re-costed to settled kWh (not re-resolved)",
-                            block.get("start", ""), rate)
+                logger.info("_rerun_pass2: %s rate preserved (%.5f) — %s; re-costed to "
+                            "chosen kWh (not re-resolved)",
+                            block.get("start", ""), rate, _override_why)
                 imp_ch["rate"] = rate
                 imp_ch["kwh"] = chosen
                 imp_ch["kwh_total"] = chosen
@@ -8938,6 +8959,14 @@ async def _verify_allowance_low(headroom_frac: float) -> bool:
     return bool(rem is not None and lim and rem < headroom_frac * lim)
 
 
+def _run_wrote_blocks(job: dict) -> int:
+    """How many blocks a finished import/gap-fill job actually wrote."""
+    try:
+        return sum(int(v or 0) for v in (job.get("written") or {}).values())
+    except Exception:
+        return 0
+
+
 async def run_deferred_verify_pricing(*, chunk_days: int = 30, headroom_frac: float = 0.5,
                                       wait_s: float = 60.0, max_wait_cycles: int = 120,
                                       restart: bool = True) -> dict:
@@ -9532,10 +9561,16 @@ async def run_gap_fill_job(from_ts, to_ts, *, channels=("import", "export"),
             _persist_import_health(j)
         except Exception as _e:
             logger.warning("run_gap_fill_job: health persist failed: %s", _e)
-        try:
-            asyncio.create_task(run_deferred_verify_pricing())
-        except Exception as _e:
-            logger.warning("run_gap_fill_job: verify launch failed: %s", _e)
+        _wrote = _run_wrote_blocks(j)
+        if _wrote:
+            try:
+                asyncio.create_task(run_deferred_verify_pricing())
+            except Exception as _e:
+                logger.warning("run_gap_fill_job: verify launch failed: %s", _e)
+        else:
+            logger.info("run_gap_fill_job: nothing written — skipping the pricing "
+                        "verification pass")
+            j["verify_skipped"] = "no_blocks_written"
         j["status"] = "done"; j["phase"] = "done"
         _persist_run_status(j)     # durable summary for reload (poll-on-load)
     except Exception as e:
@@ -9641,10 +9676,23 @@ async def run_api_import_job(requested_from=None, *, chunk_days: int = 60,
                 # bulk import couldn't (the small off-peak/peak-split error). Runs
                 # DETACHED on the loop so the import job reports 'done' immediately —
                 # the verify has its own live status the UI polls.
-                try:
-                    asyncio.create_task(run_deferred_verify_pricing())
-                except Exception as _e:
-                    logger.warning("run_api_import_job: verify launch failed: %s", _e)
+                # ...but only if this run actually wrote blocks. The verify scopes
+                # itself to the WHOLE imported history, not to what this run touched, so
+                # firing it after a no-op import (an empty window — the span already
+                # covered, or older than the API retains) re-checks everything that was
+                # already verified: minutes of work and a shared API allowance spent to
+                # confirm nothing, then a "split verified" verdict for an import that
+                # imported nothing.
+                _wrote = _run_wrote_blocks(j)
+                if _wrote:
+                    try:
+                        asyncio.create_task(run_deferred_verify_pricing())
+                    except Exception as _e:
+                        logger.warning("run_api_import_job: verify launch failed: %s", _e)
+                else:
+                    logger.info("run_api_import_job: nothing written — skipping the "
+                                "pricing verification pass")
+                    j["verify_skipped"] = "no_blocks_written"
                 j["status"] = "done"
                 j["phase"] = "done"
                 return

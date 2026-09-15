@@ -372,3 +372,26 @@ class TestUncostableRanges(unittest.TestCase):
         c_from, c_to = "2026-08-10T00:00:00", "2026-09-09T00:00:00"
         self.assertTrue(f(self.RANGES, c_from))
         self.assertFalse(f(self.RANGES, c_to))
+
+
+class TestVerifyOnlyAfterAWrite(unittest.TestCase):
+    """The deferred pricing check re-verifies the WHOLE imported history, not just what a
+    run touched. Firing it after an import that wrote nothing — an empty window, a span
+    already covered — spends minutes and a shared API allowance confirming what was
+    already confirmed, then reports "split verified" for an import that imported nothing.
+    """
+
+    def test_counts_what_a_run_wrote(self):
+        self.assertEqual(engine._run_wrote_blocks({"written": {"import": 1440, "export": 96}}), 1536)
+
+    def test_an_empty_window_wrote_nothing(self):
+        self.assertEqual(engine._run_wrote_blocks({"written": {"import": 0, "export": 0}}), 0)
+
+    def test_missing_or_malformed_written_is_zero_not_an_error(self):
+        for job in ({}, {"written": None}, {"written": {}},
+                    {"written": {"import": None}}, {"written": {"import": "x"}}):
+            self.assertEqual(engine._run_wrote_blocks(job), 0, job)
+
+    def test_one_channel_written_still_counts(self):
+        # A gap fill can land import-only; that must still be verified.
+        self.assertEqual(engine._run_wrote_blocks({"written": {"import": 12, "export": 0}}), 12)
