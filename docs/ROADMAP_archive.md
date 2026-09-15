@@ -39,11 +39,18 @@ All three only bite a **schedule-derived estimate that is never superseded by a 
 evidence no such block exists:
 
 * **The seam cannot reach an uncosted era.** `_apply_iog_split` returns at `ev_kwh <= 1e-9`, so it
-  needs a completed dispatch row for that exact slot. `dispatch_history` is pruned at 90 days and
-  only starts when EMT began capturing it — on prod-dev, **54,143 of ~57,450 main blocks (94 %)
-  predate every dispatch record**, including every imported and legacy-tariff era. The accounts
-  where Octopus never publishes a cost (Brian's 2024–26 Intelligent stretch) are exactly those
-  eras, so "cost never settles" and "the capped seam repriced it" cannot coexist on one block.
+  needs a completed dispatch row for that exact slot. Dispatch records are now kept
+  **indefinitely** — the 90-day prune was retired in 4.5.0 (**BL-35**, below) so completed
+  dispatches survive for later reconstruction, and `prune_dispatch_history` remains only as a dead
+  method. But retention is not
+  the constraint: coverage can only ever accumulate **forward** from the moment EMT began polling,
+  because Octopus serves a short rolling dispatch window and no `planned`/`started` history at all,
+  so a past era can never acquire records it did not have at the time. On prod-dev that leaves
+  **54,143 of ~57,450 main blocks (94 %) predating every dispatch record**, including every
+  imported and legacy-tariff era — a figure that only improves going forward, never regresses. The
+  accounts where Octopus never publishes a cost (Brian's 2024–26 Intelligent stretch) are exactly
+  those eras, so "cost never settles" and "the capped seam repriced it" cannot coexist on one
+  block.
 * **Where the seam can reach, the bill always lands.** Of settled blocks 1–12 Sep that drew
   anything, **257 of 257 (100 %)** carry `rate_source='measured'`; the remainder on `schedule` are
   zero-kWh slots with no cost to bill. `apply_measured_to_block` then overwrites rate and cost and
