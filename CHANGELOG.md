@@ -2,188 +2,45 @@
  
 ## [4.5.13] — 2026-09-15
 
-### Settlement re-run: an export settlement no longer re-prices import
+### Fixed
 
-`needs_pass2_rerun` is a **block-level** flag with no channel on it. `upsert_kraken_block`
-consults `imp_kwh_api` / `exp_kwh_api` to decide whether *that channel's* settled figure
-changed, then raises one shared flag; the drain reloads the whole block and re-runs every
-channel. So a Kraken poll that settles only **export** queued the block and the **import**
-channel was re-run too — against a `chosen` kWh that is simply the unchanged CAD figure,
-because `imp_kwh_api` was still NULL. There was nothing to re-cost, yet the re-run took the
-full path: re-resolve the dispatch overlay, re-run the IOG split, rewrite the priced layer.
+- **A settlement for one channel no longer re-prices the other.** `needs_pass2_rerun` carries
+  no channel, so an export-only settlement re-priced the import channel against unchanged kWh —
+  rewriting a settled-looking historical block a day later. A channel with no newly settled
+  figure now keeps its finalised rate and is re-costed only. [#453]
+- **IOG-SMB half-hours no longer all resolve to peak.** Octopus returns all four buckets on
+  every slot; the parser matched the legacy one-bare-label vocabulary exactly, so no
+  region-suffixed bucket ever matched. The band now comes from the bucket carrying the charge,
+  matched by name, with no region list anywhere in the tree. Costs were never affected. [#454]
+- **Historical import distinguishes "never priced" from "retry might help".** Cost coverage is
+  tracked per tariff agreement; an era ≥95% uncosted is reported as a period Octopus never
+  priced — naming dates and tariff code, and pointing at the PDF-bill route — instead of
+  offering a Retry that cannot succeed. On a banded tariff the notice says plainly that the
+  costs read too high and EMT cannot correct them. [#455]
+- **The "no price returned" count is no longer filtered at 1.0 kWh**, which under-reported
+  ~33,500 half-hours as 2,091. [#456]
+- **Historical Import panel reports what is actually happening.** Disabled buttons now look
+  disabled (app-wide); "Start import" is locked while any run or its pricing check is live; an
+  import that writes nothing no longer triggers a pricing check; "Show details" survives the
+  poll re-render; the panel and banner share one state; and a replayed summary is labelled and
+  dated. [#457]
+- **Bills can correct an uncostable period without deleting anything first.** Inside an
+  agreement proven uncostable, a bill's half-hour replaces the imported kWh, rate and cost
+  together; first-man-wins is unchanged everywhere else, and live/settled and hand-corrected
+  blocks are never overwritten. The engine also stops retrying and re-verifying inside such a
+  period. [#458]
+- **`log_level` now works.** `run.sh` set `LOG_LEVEL` but nothing in Python read it. An
+  instance already configured with `log_level: debug` starts emitting debug logs after this
+  upgrade. [#459]
 
-Observed in prod. A 12:00 BST slot on 13 Sep drew 0.012 kWh and was finalised at peak, with
-no completed dispatch yet; the dispatch arrived an hour later. Some thirty hours on, a restart
-forced the six-hourly Kraken poll, which settled export for all 48 slots of that day while
-import stayed unsettled. The drain then re-ran the block: the dispatch overlay **refused** the
-slot (0.012 kWh is below the 0.10 kWh over-report floor, and it logged exactly that) — but
-`_apply_iog_split` carries no such floor, so on the capped tariff it repriced the slot from
-£0.323092 to £0.054917 anyway. Reconcile would have reverted it as an out-of-app bump, except
-that the blended £0.054917 sits 1.3e-5 from the canonical off-peak £0.05493 and its band test
-uses a 1e-6 tolerance, so it read the block as already at peak and left it alone.
+### Added
 
-A settlement re-run exists to re-cost a channel against **its own** newly settled kWh. Where
-there is no settled import figure it now keeps the finalised rate and re-costs only, exactly as
-it already did for a user correction, a dispatch reconciliation or an Octopus-billed rate. A
-missing or zero stored rate still falls through to the resolver, so gap-block rate repair is
-untouched, and a genuine import settlement re-resolves as before.
-
-Cost impact on the observed slot was a third of a penny. The reason it matters is that a
-settled-looking historical block had its whole priced layer rewritten a day later, by a
-settlement that carried no information about it.
-
-
-### Intelligent Octopus Go (IOG-SMB): read the band from the bucket that carries the charge
-
-Octopus returns **all four** IOG-SMB buckets on **every** half-hour
-(`CONSUMPTION_CHARGE_ECO7_DAY_x`, `ECO7_NIGHT_x`, `EV_DEVICE_OFF_PEAK_x`,
-`EV_DEVICE_PEAK_x`), zero-valued where unused. The import parser decided off-peak from the
-label *set* — a test written for the legacy Intelligent Octopus vocabulary, where a slot
-carried exactly one bare `OFF_PEAK` / `STANDARD_RATE` label — so on IOG-SMB it resolved
-**every** slot to peak.
-
-Costs were never wrong: `_billed_rate` takes Octopus's billed cost as truth on a banded
-tariff, so a mis-banded slot still fell through to cost÷kWh and landed on the right number.
-What it cost was the *snap* — an off-peak slot's rate fragmented into per-slot jitter
-instead of the clean published value — and a post-import "off-peak slots" count that always
-read zero.
-
-The labels are **region-suffixed** with the GSP group letter (`…_H` in the South, `…_B` in
-the East Midlands — fourteen groups, A–P without I or O). The new `label_band()` matches the
-bucket NAME as a substring, so the suffix is never read and no region list exists anywhere
-in the tree. Off-peak is tested before peak because `PEAK` is a substring of `OFF_PEAK`, and
-home off-peak (`NIGHT`) and EV off-peak (`OFF_PEAK`) are the same band spelled two ways.
-
-Two consequential details:
-
-- A slot carrying BOTH home and EV consumption is genuinely band-ambiguous and now reports
-  `off_peak=None` instead of a false "peak". `_billed_rate` gained a `labelled` flag so such
-  a slot is still treated as banded (billed cost is truth) rather than being mistaken for a
-  continuous/Agile slot where the schedule would win — which matters for an EV dispatch
-  outside the fixed off-peak window.
-- A flat tariff's bare `CONSUMPTION` label now classifies as "no band" rather than peak,
-  letting the rate resolve by time of day. `STANDARD_RATE` still classifies as peak, which
-  the export/published-rate path depends on.
-
-The settled four-bucket reader (`_parse_breakdown_node`) was already correct — it matched
-substrings and read the carrying bucket's `value`. It now shares the same classifier so the
-two paths cannot drift apart again.
-
-### Historical import: say when Octopus never published half-hourly costs, and point at the bills
-
-The import counts half-hours that came back without a billed cost. It reported that count
-as one number for the whole import and offered a Retry — which is right when a fetch was
-starved, and useless when Octopus simply does not publish per-slot costs for that product.
-On a real account the difference was stark: three consecutive Intelligent Octopus
-agreements ran **100% uncosted for 23 months**, while the flat tariff before them and the
-IOG-SMB tariff after were both fully priced. Three independent whole-day sweeps and an
-11-variant request matrix (every granularity from five-minute to monthly, per register,
-date-windowed) all came back empty. Pressing Retry returned the same empty answer.
-
-Coverage is now tracked **per tariff agreement** — the unit Octopus configures product
-rates against — and the pricing-health panel reads it:
-
-- an era at or above **95%** uncosted is reported as a period Octopus never priced, naming
-  the dates and tariff code, with a button through to the existing PDF-bill CSV builder;
-- Retry is still offered, but only for the slots outside such an era — the ones a calm
-  re-fetch can genuinely recover;
-- the panel no longer claims "All prices recovered" when the only reason nothing is
-  outstanding is that an entire period is unrecoverable.
-
-Also fixes an **undercount** in the same panel. The "came back without a price" figure only
-ever counted half-hours above 1.0 kWh — a diagnostic threshold that had leaked into
-user-facing copy, showing "2,091" where the true figure was around 33,500. The health
-endpoint now carries `uncosted_total` (unfiltered) alongside the material count.
-
-The notice distinguishes two very different situations, because the severity is not the
-same. On a **single-rate** tariff a schedule-priced half-hour is exactly right and only the
-cross-check is missing. On a **banded, dispatch-aware** tariff it is not: Intelligent
-Octopus bills a smart-charge session *outside* the fixed off-peak window at the off-peak
-rate, and nothing in the consumption feed says when one happened — so those half-hours get
-the peak rate and read **too high**. Bandedness is determined from the rate schedule EMT
-already builds (distinct off-peak/peak rates that day), not by matching tariff-code names,
-so an unfamiliar product classifies itself.
-
-For a banded period the notice says plainly that **the period was not costed correctly**:
-EMT could only multiply usage by the published rate, that is not what Octopus charged, and
-**EMT has no way to detect or correct the difference** — the costs are absent from the API
-at every granularity, so retrying cannot help. The only remedy is re-importing from the PDF
-bills, and the notice names the exact date span of bills to gather. Usage is unaffected and
-does not change; only the costs are replaced.
-
-### Also
-
-### Historical Import: stop the panel misreporting what is happening
-
-Three fixes to a panel that could show a finished run's summary underneath a banner
-saying work was in progress, next to a button that looked ready to press:
-
-- **A disabled button now looks disabled.** There was no `:disabled` styling for `.btn`
-  anywhere, so a control the code had correctly locked rendered identically to a live one
-  — most visibly "Preview plan", which stayed solid while every button around it greyed
-  out. Fixed app-wide rather than per-screen.
-- **"Start import" is locked while anything is running**, including the *previous* run's
-  pricing-verification pass. The run lock covered the source/task picker but not the start
-  control, and the confirm checkbox flipped Start's `disabled` directly — so ticking it
-  re-armed Start straight through a live lock. The server already refused these with a 409;
-  the UI was offering an action that could only end in a refusal. It now explains itself
-  ("waiting for the previous run's pricing check to finish") instead of failing on click.
-- **An import that writes nothing no longer triggers a pricing check.** The deferred
-  off-peak/peak verification scopes itself to the *whole* imported history rather than to
-  the run that launched it, and it was launched unconditionally when a job finished. So
-  running the importer over a span already covered — the plan says "empty window", zero
-  blocks written — still spent minutes and a shared API allowance re-checking everything
-  that had already been verified, and then reported "split verified" for an import that
-  imported nothing. It now runs only when a run actually wrote blocks (either channel).
-- **"Show details" stays open.** The pricing-health panel is re-rendered wholesale on
-  every poll — every few seconds while a check is live — which destroyed the `<details>`
-  element and snapped the section shut under anyone who expanded it. The open/closed
-  choice now survives the re-render, so it only appeared to "fix itself" before because
-  polling had stopped.
-- **The panel and the banner now read from one state.** The panel tracked only the import
-  job while the banner above also tracks the post-import pricing check — which is how a
-  terminal "✓ Import complete" came to sit underneath "A backfill is running". While that
-  check runs the panel now says so: this session's run reads "Import complete — checking
-  prices…" with a note that all blocks are written and prices may read high until the check
-  reaches them; a replayed older summary says plainly that the check is current and the
-  figures above are from the earlier run.
-- **A replayed summary is labelled and dated.** With no job live, the status endpoint
-  returns the last completed run so the panel isn't blank on load — but it was rendered
-  bare, so a run from weeks ago read as current, complete with "Charts are rebuilt
-  automatically". It now reads "Previous import complete · Last import, finished
-  19 Aug 2026, 21:02" and puts the chart line in the past tense. A genuinely fresh run is
-  unchanged.
-
-- **Bills can now correct an uncostable period without deleting anything first.** A
-  CSV/bill import is otherwise first-man-wins — it must never clobber data a user cannot
-  get back — so re-importing over an existing span silently skipped every block and
-  changed nothing. That rule is now relaxed in exactly one place: inside an agreement a
-  previous API import proved the supplier does not cost, a bill's half-hour **replaces**
-  what the import left behind (usage x published rate) with the billed kWh, rate and cost
-  together. Everywhere else first-man-wins is unchanged, and even inside such a period two
-  things are still never overwritten — a live/settled meter reading, and any block the
-  user corrected by hand. This matters most on an account with several Intelligent Octopus
-  agreements where only some lack costs: coverage is tracked per agreement, so only the
-  uncostable ones are touched and the user does no date arithmetic. The apply result now
-  reports `blocks_replaced` and `blocks_protected` alongside written/skipped.
-- The engine now **acts** on that verdict instead of only reporting it. Once a chunk has
-  established that an agreement is uncostable (and only above a ~200-slot floor, so a thin
-  era cannot suppress work on noise), its half-hours are no longer queued for retry or
-  re-fetched by the import's calm recovery pass, and the deferred verify sweep skips any
-  chunk lying wholly inside it — a straddling chunk is still checked in full. Previously
-  the panel said "retrying cannot help" while the sweep spent hours of a shared Octopus
-  allowance confirming exactly that, reporting 0% progress throughout. The import itself is
-  untouched: every half-hour is still fetched and written.
-- `log_level` now actually works. `run.sh` has always resolved the add-on option into
-  `LOG_LEVEL`, but nothing in Python read it, so logging was hardcoded to INFO and setting
-  the option had no effect. An instance already configured with `log_level: debug` will
-  start emitting debug logs after this upgrade.
 - Maintainer diagnostics, gated behind `log_level: debug` and invisible otherwise: the
-  pricing-health panel on Historical Import gains a scenario picker that renders it from
-  canned coverage (`pdf`, `mixed`, `partial`, `clean`), so its unhappy states can be
-  checked without an affected account. Read-only and banner-labelled. Chosen in the page
-  rather than by URL because Home Assistant serves the add-on in an ingress iframe, where
-  a query string on the address bar never reaches the document.
+  pricing-health panel on Historical Import gains a scenario picker rendering it from canned
+  coverage (`pdf`, `mixed`, `partial`, `clean`), so its unhappy states can be checked without
+  an affected account. Read-only and banner-labelled. Chosen in-page rather than by URL,
+  because Home Assistant serves the add-on in an ingress iframe where a query string on the
+  address bar never reaches the document.
 
 ## [4.5.12] — 2026-09-12
 
@@ -542,3 +399,11 @@ IOG periods.*
 ---
 
 Released versions (**4.3.x and earlier**) are in [CHANGELOG-ARCHIVE.md](CHANGELOG-ARCHIVE.md).
+
+[#453]: https://github.com/RGx01/energy-meter-tracker-addon/issues/453
+[#454]: https://github.com/RGx01/energy-meter-tracker-addon/issues/454
+[#455]: https://github.com/RGx01/energy-meter-tracker-addon/issues/455
+[#456]: https://github.com/RGx01/energy-meter-tracker-addon/issues/456
+[#457]: https://github.com/RGx01/energy-meter-tracker-addon/issues/457
+[#458]: https://github.com/RGx01/energy-meter-tracker-addon/issues/458
+[#459]: https://github.com/RGx01/energy-meter-tracker-addon/issues/459
