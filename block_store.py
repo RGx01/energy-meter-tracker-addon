@@ -1652,6 +1652,30 @@ class BlockStore:
             return None
         return {"home_kwh": r[0], "home_rate": r[1], "ev_kwh": r[2], "ev_rate": r[3]}
 
+    def slots_with_bill_split(self, start_iso: str, end_iso: str,
+                              direction: str = "CONSUMPTION") -> set:
+        """Slot starts in [start_iso, end_iso] for which Octopus's OWN device breakdown is
+        held — i.e. the bill has actually STATED that half-hour's Home/EV split.
+
+        A settled slot with no stored split means two very different things, and only this
+        tells them apart. If the bill supplied a breakdown and its EV share is zero, the
+        bill is saying there was no EV, and a stray dispatch row must not invent one. If no
+        breakdown was ever retrieved — a legacy tariff has none, and an SMB slot settled
+        before the four-bucket fetch reached it keeps `ev_kwh` NULL forever — then the bill
+        has said NOTHING about the split, and a completed dispatch is still the best
+        evidence available. `rate_source` cannot make that distinction: it records that the
+        COST is settled, which is true in both cases.
+
+        The range is inclusive at both ends; being over-inclusive by a slot is harmless,
+        since callers only ever test membership for slots they are already rendering."""
+        try:
+            return {r[0] for r in self._conn.execute(
+                "SELECT slot_start FROM measured_cost WHERE direction=? "
+                "AND ev_kwh IS NOT NULL AND slot_start >= ? AND slot_start <= ?",
+                (direction, start_iso, end_iso))}
+        except Exception:
+            return set()
+
     def measured_slots_missing(self, starts, mpan: str = "",
                                direction: str = "CONSUMPTION") -> list:
         """Of `starts`, the slot_starts with NO measured_cost row yet (so the

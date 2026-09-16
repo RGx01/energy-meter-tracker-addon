@@ -39,10 +39,7 @@ def _server_ns():
     ns = {}
     for n in ast.parse(src).body:
         if isinstance(n, ast.FunctionDef) and n.name in (
-                "_dispatch_ev_split_by_bucket", "_block_settled"):
-            exec(compile(ast.Module([n], []), "<s>", "exec"), ns)
-        elif isinstance(n, ast.Assign) and getattr(
-                n.targets[0], "id", "") == "_SETTLED_RATE_SOURCES":
+                "_dispatch_ev_split_by_bucket"):
             exec(compile(ast.Module([n], []), "<s>", "exec"), ns)
     return ns
 
@@ -64,6 +61,16 @@ def _block(slot, kwh, cost, kwh_ev=None, cost_ev=None, segments=None,
     return {"start": slot, "meters": {"electricity_main": mb}}
 
 
+def _bill_spoke(store, slot, *, ev_kwh=0.0, home_kwh=0.0):
+    """Octopus supplied a device breakdown for this half-hour — the bill has STATED the
+    split. ev_kwh=0 is a real statement ("no EV here"), NOT silence."""
+    store._conn.execute(
+        "INSERT INTO measured_cost (slot_start, mpan, direction, ev_kwh, home_kwh, "
+        "fetched_at) VALUES (?,'','CONSUMPTION',?,?,?)", (slot, ev_kwh, home_kwh, slot))
+    store._conn.commit()
+    return store
+
+
 def _dispatched(store, slot, kwh=2.0):
     store._conn.execute(
         "INSERT INTO dispatch_history (slot_start, kind, provider, source, energy_kwh, "
@@ -78,39 +85,38 @@ class TestSlotMapAuthority(unittest.TestCase):
 
     # ── SETTLED: the bill decides ───────────────────────────────────────────────
     def test_settled_split_survives_an_empty_dispatch_table(self):
-        blocks = [_block(SLOT_A, 4.0, 0.80, kwh_ev=3.0, cost_ev=0.55,
-                         rate_source="measured")]
-        out = _dispatch_ev_slot_map(BlockStore(":memory:"), blocks, CFG)
+        st = _bill_spoke(BlockStore(":memory:"), SLOT_A, ev_kwh=3.0)
+        blocks = [_block(SLOT_A, 4.0, 0.80, kwh_ev=3.0, cost_ev=0.55)]
+        out = _dispatch_ev_slot_map(st, blocks, CFG)
         self.assertIn(SLOT_A, out, "bill-derived split dropped with no dispatch row")
         self.assertAlmostEqual(out[SLOT_A]["kwh"], 3.0, places=9)
         self.assertAlmostEqual(out[SLOT_A]["cost"], 0.55, places=9)
 
     def test_imported_history_counts_as_settled(self):
+        st = _bill_spoke(BlockStore(":memory:"), SLOT_A, ev_kwh=3.0)
         blocks = [_block(SLOT_A, 4.0, 0.80, kwh_ev=3.0, cost_ev=0.55,
                          source="imported_api")]
-        out = _dispatch_ev_slot_map(BlockStore(":memory:"), blocks, CFG)
+        out = _dispatch_ev_slot_map(st, blocks, CFG)
         self.assertAlmostEqual(out[SLOT_A]["kwh"], 3.0, places=9)
 
     def test_ev_segment_alone_qualifies_a_settled_slot(self):
         segs = [{"kwh": 2.5, "inc_rate": 0.07, "attribution": "ev"},
                 {"kwh": 1.5, "inc_rate": 0.28, "attribution": "house"}]
-        out = _dispatch_ev_slot_map(
-            BlockStore(":memory:"),
-            [_block(SLOT_A, 4.0, 0.60, segments=segs, rate_source="measured")], CFG)
+        st = _bill_spoke(BlockStore(":memory:"), SLOT_A, ev_kwh=2.5)
+        out = _dispatch_ev_slot_map(st, [_block(SLOT_A, 4.0, 0.60, segments=segs)], CFG)
         self.assertAlmostEqual(out[SLOT_A]["kwh"], 2.5, places=9)
         self.assertAlmostEqual(out[SLOT_A]["cost"], 2.5 * 0.07, places=9)
 
     def test_settled_with_no_split_is_not_carved_from_a_dispatch_row(self):
         """The guard: the bill billed no EV here, so a stray dispatch row invents none."""
-        st = _dispatched(BlockStore(":memory:"), SLOT_A)
-        out = _dispatch_ev_slot_map(
-            st, [_block(SLOT_A, 4.0, 0.80, rate_source="measured")], CFG)
+        st = _bill_spoke(_dispatched(BlockStore(":memory:"), SLOT_A), SLOT_A, ev_kwh=0.0)
+        out = _dispatch_ev_slot_map(st, [_block(SLOT_A, 4.0, 0.80)], CFG)
         self.assertEqual(out, {})
 
     def test_settled_split_is_clipped_to_the_slot_grid_import(self):
-        blocks = [_block(SLOT_A, 2.0, 0.40, kwh_ev=3.0, cost_ev=0.60,
-                         rate_source="measured")]
-        out = _dispatch_ev_slot_map(BlockStore(":memory:"), blocks, CFG)
+        st = _bill_spoke(BlockStore(":memory:"), SLOT_A, ev_kwh=3.0)
+        blocks = [_block(SLOT_A, 2.0, 0.40, kwh_ev=3.0, cost_ev=0.60)]
+        out = _dispatch_ev_slot_map(st, blocks, CFG)
         self.assertAlmostEqual(out[SLOT_A]["kwh"], 2.0, places=9)
         self.assertAlmostEqual(out[SLOT_A]["cost"], 0.40, places=9)
 
@@ -136,6 +142,14 @@ class TestSlotMapAuthority(unittest.TestCase):
         self.assertAlmostEqual(out[SLOT_B]["kwh"], 2.0, places=9)
         self.assertAlmostEqual(out[SLOT_B]["cost"], 0.11, places=9)   # not the 0.40 carve
 
+    def test_cost_settled_but_bill_silent_falls_back_to_dispatch(self):
+        """BL-66: rate_source said 'measured' but no breakdown was ever held, so the bill
+        never stated a split. The dispatch proves the car charged and must still show."""
+        st = _dispatched(BlockStore(":memory:"), SLOT_A, kwh=1.57)   # no _bill_spoke
+        out = _dispatch_ev_slot_map(
+            st, [_block(SLOT_A, 3.194, 0.175, rate_source="measured")], CFG)
+        self.assertAlmostEqual(out[SLOT_A]["kwh"], 1.57, places=9)
+
     def test_no_authority_anywhere_is_empty(self):
         out = _dispatch_ev_slot_map(
             BlockStore(":memory:"), [_block(SLOT_A, 4.0, 0.80)], CFG)
@@ -148,7 +162,6 @@ class TestBucketSplitAuthority(unittest.TestCase):
     def setUp(self):
         ns = _server_ns()
         self.fn = ns["_dispatch_ev_split_by_bucket"]
-        self.settled = ns["_block_settled"]
         self.day = lambda s: s[:10]
 
     # ── SETTLED ─────────────────────────────────────────────────────────────────
@@ -156,37 +169,37 @@ class TestBucketSplitAuthority(unittest.TestCase):
         main = {SLOT_A: (4.0, 0.80), SLOT_B: (2.0, 0.40)}
         stored = {SLOT_A: (3.0, 0.55), SLOT_B: (1.0, 0.18)}
         out = self.fn(main, {}, self.day, stored_by_slot=stored,
-                      settled_slots={SLOT_A, SLOT_B})
+                      bill_split_slots={SLOT_A, SLOT_B})
         self.assertAlmostEqual(out["2026-09-01"]["kwh"], 4.0, places=9)
         self.assertAlmostEqual(out["2026-09-01"]["cost"], 0.73, places=9)
 
     def test_settled_without_a_split_is_never_carved(self):
         out = self.fn({SLOT_A: (4.0, 0.80)}, {SLOT_A: 2.0}, self.day,
-                      settled_slots={SLOT_A})
+                      bill_split_slots={SLOT_A})
         self.assertEqual(out, {}, "a dispatch row invented EV the bill did not bill")
 
     def test_settled_split_clipped_to_grid(self):
         out = self.fn({SLOT_A: (2.0, 0.40)}, {}, self.day,
-                      stored_by_slot={SLOT_A: (3.0, 0.60)}, settled_slots={SLOT_A})
+                      stored_by_slot={SLOT_A: (3.0, 0.60)}, bill_split_slots={SLOT_A})
         self.assertAlmostEqual(out["2026-09-01"]["kwh"], 2.0, places=9)
         self.assertAlmostEqual(out["2026-09-01"]["cost"], 0.40, places=9)
 
     # ── UNSETTLED ───────────────────────────────────────────────────────────────
     def test_unsettled_without_dispatch_has_no_ev(self):
         out = self.fn({SLOT_A: (4.0, 0.80)}, {}, self.day,
-                      stored_by_slot={SLOT_A: (3.0, 0.55)}, settled_slots=set())
+                      stored_by_slot={SLOT_A: (3.0, 0.55)}, bill_split_slots=set())
         self.assertEqual(out, {})
 
     def test_unsettled_prefers_stored_over_the_carve(self):
         out = self.fn({SLOT_A: (4.0, 0.80)}, {SLOT_A: 2.0}, self.day,
-                      stored_by_slot={SLOT_A: (2.0, 0.11)}, settled_slots=set())
+                      stored_by_slot={SLOT_A: (2.0, 0.11)}, bill_split_slots=set())
         self.assertAlmostEqual(out["2026-09-01"]["kwh"], 2.0, places=9)
         self.assertAlmostEqual(out["2026-09-01"]["cost"], 0.11, places=9)
 
     def test_unsettled_dispatch_only_is_byte_identical(self):
         """The standing guard: the pre-existing pro-rata result, unchanged."""
         main = {SLOT_A: (4.0, 0.80), SLOT_B: (2.0, 0.40)}
-        out = self.fn(main, {SLOT_A: 1.0, SLOT_B: 0.5}, self.day, settled_slots=set())
+        out = self.fn(main, {SLOT_A: 1.0, SLOT_B: 0.5}, self.day, bill_split_slots=set())
         self.assertAlmostEqual(out["2026-09-01"]["kwh"], 1.5, places=9)
         self.assertAlmostEqual(out["2026-09-01"]["cost"], 0.20 + 0.10, places=9)
 
@@ -194,42 +207,46 @@ class TestBucketSplitAuthority(unittest.TestCase):
     def test_mixed_era_settled_and_unsettled_in_one_bucket(self):
         main = {SLOT_A: (4.0, 0.80), SLOT_B: (2.0, 0.40)}
         out = self.fn(main, {SLOT_B: 1.5}, self.day,
-                      stored_by_slot={SLOT_A: (3.0, 0.55)}, settled_slots={SLOT_A})
+                      stored_by_slot={SLOT_A: (3.0, 0.55)}, bill_split_slots={SLOT_A})
         self.assertAlmostEqual(out["2026-09-01"]["kwh"], 4.5, places=9)
         self.assertAlmostEqual(out["2026-09-01"]["cost"], 0.55 + 0.30, places=9)
 
     def test_unknown_settlement_takes_a_stored_split_at_face_value(self):
-        """settled_slots=None — the caller cannot say; pre-existing behaviour."""
+        """bill_split_slots=None — the caller cannot say; pre-existing behaviour."""
         out = self.fn({SLOT_A: (4.0, 0.80)}, {}, self.day,
                       stored_by_slot={SLOT_A: (3.0, 0.55)})
         self.assertAlmostEqual(out["2026-09-01"]["kwh"], 3.0, places=9)
 
     def test_zero_grid_slot_contributes_nothing(self):
         out = self.fn({SLOT_A: (0.0, 0.0)}, {}, self.day,
-                      stored_by_slot={SLOT_A: (3.0, 0.60)}, settled_slots={SLOT_A})
+                      stored_by_slot={SLOT_A: (3.0, 0.60)}, bill_split_slots={SLOT_A})
         self.assertEqual(out, {})
 
     def test_bucket_sums_are_order_stable(self):
         slots = ["2026-09-01T%02d:00:00" % h for h in range(12)]
         main = {s: (4.0, 0.8123456789) for s in slots}
         stored = {s: (3.0, 0.5512345678) for s in slots}
-        a = self.fn(main, {}, self.day, stored_by_slot=stored, settled_slots=set(slots))
+        a = self.fn(main, {}, self.day, stored_by_slot=stored, bill_split_slots=set(slots))
         b = self.fn(main, {}, self.day,
                     stored_by_slot={k: stored[k] for k in reversed(slots)},
-                    settled_slots=set(slots))
+                    bill_split_slots=set(slots))
         self.assertEqual(a["2026-09-01"]["cost"], b["2026-09-01"]["cost"])
 
-    # ── the predicate ───────────────────────────────────────────────────────────
-    def test_settled_predicate(self):
-        for rs, src, want in [("measured", None, True), ("corrected", None, True),
-                              ("schedule", None, False), (None, "imported_api", True),
-                              ("schedule", "imported_bill", True),
-                              (None, "ha_sensor", False), (None, None, False)]:
-            self.assertEqual(self.settled({"rate_source": rs, "source": src}), want,
-                             "rate_source=%r source=%r" % (rs, src))
+    # ── BL-66: a settled COST is not a stated SPLIT ─────────────────────────────
+    def test_cost_settled_but_bill_silent_falls_back_to_dispatch(self):
+        """The regression this fixes. Octopus settled the cost (rate_source='measured')
+        but its four-bucket breakdown was never retrieved, so the bill has said nothing
+        about the split. A completed dispatch proves the car charged; keying the guard on
+        settlement read the missing split as a denial and hid it."""
+        out = self.fn({SLOT_A: (3.194, 0.175)}, {SLOT_A: 1.570}, self.day,
+                      bill_split_slots=set())          # bill silent for this slot
+        self.assertAlmostEqual(out["2026-09-01"]["kwh"], 1.570, places=9)
 
-    def test_settled_predicate_tolerates_a_row_without_the_columns(self):
-        self.assertFalse(self.settled({}))
+    def test_bill_spoke_and_said_no_ev_still_wins(self):
+        """...but where the breakdown IS held and carries no EV, the bill is believed."""
+        out = self.fn({SLOT_A: (3.194, 0.175)}, {SLOT_A: 1.570}, self.day,
+                      bill_split_slots={SLOT_A})       # breakdown held, no EV in it
+        self.assertEqual(out, {})
 
 
 if __name__ == "__main__":
