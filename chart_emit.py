@@ -140,6 +140,17 @@ def day_rate_series(day_blocks, *, slots: int, block_minutes: int,
         _stored_h = house_seg.get(hh, house_mr.get(hh))
         if capped and hh in ev_rate:
             house[hh] = round(ev_rate[hh], 6)
+        elif hh in ev_rate and _stored_h is not None:
+            # PRE-CAP (legacy Intelligent), slot with a dispatch: what the half-hour was
+            # actually CHARGED wins over the TOU schedule. Legacy has no four-bucket split
+            # — a smart-charge dispatch commonly discounts the whole half-hour, house
+            # included — but not always (a part-slot dispatch stays at peak), so the line
+            # must follow the priced figure rather than assume either. Falling through to
+            # house_tou plotted the schedule's peak on slots the bill charged at off-peak,
+            # stranding the house line above an EV line that had correctly dropped.
+            # `_stored_h` is the house-attributed segment rate where the house DREW, else
+            # the block's own rate; absent both, the TOU branch below still applies.
+            house[hh] = round(_stored_h, 6)
         elif (_stored_h is not None and _tlo is not None and _thi is not None
               and _tlo + 1e-9 < _stored_h < _thi - 1e-9):
             house[hh] = round(_stored_h, 6)

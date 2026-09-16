@@ -64,6 +64,29 @@
   together; first-man-wins is unchanged everywhere else, and live/settled and hand-corrected
   blocks are never overwritten. The engine also stops retrying and re-verifying inside such a
   period. [#458]
+- **A settled cost is not a stated split.** The EV/House read path took `rate_source`
+  ('measured'/'corrected', or imported history) to mean the bill had described that
+  half-hour, and therefore read a missing split as the bill declaring no EV. But
+  `rate_source` records that the COST is settled, which is equally true of a half-hour whose
+  four-bucket device breakdown was never fetched — a legacy tariff has none, and an SMB slot
+  settled before the bucket fetch reached it keeps its breakdown NULL permanently. On those,
+  the bill has said nothing about the split, and a completed dispatch proving the car charged
+  was being discarded. The guard is now keyed on whether a device breakdown is actually held
+  for the half-hour: present and carrying no EV, the bill is believed and a stray dispatch
+  row still cannot invent any; absent, the bill is silent and dispatch decides, as before.
+  Restores 4.91 kWh of EV attribution across four half-hours on a live account.
+- **Legacy Intelligent rate lines follow the dispatch again.** Before IOG-SMB there is no
+  four-bucket split: a smart-charge dispatch commonly discounts the WHOLE half-hour, house
+  included. The house line was built from the tariff schedule instead of the charged figure
+  on those slots, so it plotted peak over a half-hour the bill charged at off-peak and sat
+  stranded above an EV line that had correctly dropped — the two lines separating exactly
+  where they should have moved together. The rule granting the whole-slot ride was gated on
+  the capped (SMB) era, which is the one era that does NOT have it. A pre-cap slot with a
+  dispatch now follows what it was actually charged — the house-attributed segment rate
+  where the house drew, else the block's own rate — so a part-slot dispatch billed at peak
+  still plots peak rather than being dragged down. Across a live legacy account this
+  corrected 374 of 375 dispatch half-hours (the remaining one imports 0.000 kWh); the capped
+  era is untouched. Display only — no stored rate or cost changes.
 - **`log_level` now works.** `run.sh` set `LOG_LEVEL` but nothing in Python read it. An
   instance already configured with `log_level: debug` starts emitting debug logs after this
   upgrade. [#459]
