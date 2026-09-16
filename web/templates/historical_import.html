@@ -1168,6 +1168,13 @@ function pollStatus(expectStart){
       if(row) row.style.display = 'block';
       var st = document.getElementById('api-apply-status'); if(st) st.textContent = 'Starting…';
       var out = document.getElementById('api-apply-out'); if(out) out.innerHTML = '';
+      // Drop the PLAN preview once the run is live. planApi() renders it once and never
+      // refreshes it, so on a fresh install it froze "No existing history yet — imports
+      // everything up to now" (the empty-store ceiling, true when Preview plan was
+      // pressed) directly above a live "34,953 blocks" from this very poll. A forecast
+      // and an outcome contradicting each other in the same panel; the live status below
+      // says everything the plan did.
+      var _plan = document.getElementById('api-plan-out'); if(_plan) _plan.innerHTML = '';
     } else if(status !== 'idle'){
       _expectingJob = false;   // terminal (done/cancelled/error) — stop expecting
       // Terminal / persisted run (done / cancelled / error). Show the SUMMARY only,
@@ -1265,6 +1272,13 @@ var _verifyTimer = null;
 // server-side just after the import→verify handoff is picked up live, instead of
 // the panel sitting on the PREVIOUS run's 'Up to date' verdict until a manual reload.
 var _verifyWatchUntil = 0;
+// loadPricingHealth is driven from eight places (a 4s verify re-poll, the 1.5s post-import
+// handoff, pollStatus, DOMContentLoaded and several handlers), so several fetch trains can
+// be in flight at once. Without a token the LAST response to resolve wins regardless of
+// which was ISSUED last, and a reply that predates the verify job — status empty, so
+// vActive false — clobbers the live state, dropping the banner and unlocking the picker
+// until the next reply puts it back. That is the few-second flip-flop.
+var _healthReq = 0;
 function _fmtDur(s){
   s = Math.max(0, parseInt(s,10)||0);
   if(s < 60) return s + 's';
@@ -1299,18 +1313,28 @@ function loadPricingHealth(){
     return;
   }
   var vs = document.getElementById('verify-status'); if(vs) vs.innerHTML = '';  // merged in here now
+  var _myReq = ++_healthReq;
   Promise.all([
     fetch(apiUrl('/api/historical/api-import/health' + _healthDemoQS())).then(function(r){return r.json();}).catch(function(){return null;}),
     fetch(apiUrl('/api/historical/api-import/verify-status')).then(function(r){return r.json();}).catch(function(){return null;})
   ]).then(function(res){
+    if(_myReq !== _healthReq) return;   // a newer request has been issued — this reply is stale
     var d = res[0] || {}, v = res[1] || {};
     _HEALTH_QUEUE = d.queue || { import: [], export: [] };   // slots for the CSV escape hatch
     var vst = v && v.status;
     var vActive = (vst==='running' || vst==='waiting' || vst==='paused');
-    _verifyActive = vActive;              // feed the start lock (run isn't "finished" until verify is)
-    _verifyChecked = true;
-    _settling = false;                    // verify state is now known → release the handoff hold
-    applyRunLock();
+    // CONCLUSIVE = the server actually has a verify record to report. An empty/unknown
+    // status is not "no verify is running", it is "ask again" — during the handoff the
+    // job exists server-side before it reports, and treating silence as an answer is
+    // what released the hold early and made the banner blink.
+    var vConclusive = vActive || vst==='done' || vst==='failed' || vst==='cancelled';
+    var vWatching   = Date.now() < _verifyWatchUntil;
+    if(vConclusive || !vWatching){
+      _verifyActive = vActive;            // feed the start lock (run isn't "finished" until verify is)
+      _verifyChecked = true;
+      _settling = false;                  // verify state is now known → release the handoff hold
+      applyRunLock();
+    }
     var haveHealth = !!(d && d.have);
     if(!haveHealth && !vActive && vst!=='done'){
       // Nothing to report. In debug still render the picker, otherwise the only way to

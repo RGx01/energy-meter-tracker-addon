@@ -5867,27 +5867,60 @@ def api_historical_csv_template():
         return jsonify({"error": str(e)}), 500
 
 
+_REPRICE_CAUSE_WINDOW_H = 12.0   # an import finishing this recently owns the sweep
+
+
+def _reprice_sweep_cause(store) -> str:
+    """Why is history being re-priced — 'import' or 'upgrade'?
+
+    The sweep has two triggers and the banner used to name only one, so a FRESH INSTALL
+    that imported its history was told EMT was "finishing your upgrade" — on a box that
+    had never run a previous version, and had just been asked to do exactly this work.
+    The verify pass runs the sweep forced after every import and gap-fill (P3.3d), so a
+    live or recently-finished run is the cause; only in its absence is this an upgrade.
+    Read-only and fail-safe: anything unexpected reads as 'upgrade', the old wording."""
+    try:
+        import engine as _eng
+        if _eng.api_import_running():
+            return "import"
+        import json as _json
+        from datetime import datetime as _dt, timedelta as _td
+        raw = store.get_kraken_state(_eng._IMPORT_RUN_KEY)
+        snap = _json.loads(raw) if raw else {}
+        fin = snap.get("finished_at")
+        if fin:
+            age = _dt.utcnow() - _dt.fromisoformat(str(fin)[:19])
+            if age < _td(hours=_REPRICE_CAUSE_WINDOW_H):
+                return "import"
+    except Exception:
+        pass
+    return "upgrade"
+
+
 @app.route("/api/reprice-history-status")
 def api_reprice_history_status():
-    """Read-only: is the historical re-price sweep still working through a backlog (the first
-    run after an upgrade)? Drives the 'finishing your upgrade' banner. `in_progress` = not done
-    AND blocks still need re-pricing. Fails safe to not-in-progress so a hiccup never nags."""
+    """Read-only: is the historical re-price sweep still working through a backlog? Drives the
+    re-pricing banner. `in_progress` = not done AND blocks still need re-pricing. `cause` says
+    whether an import or an upgrade armed it, so the banner can stop calling a fresh install's
+    own import an upgrade. Fails safe to not-in-progress so a hiccup never nags."""
     try:
         import engine as _eng
         store = _get_store()
         m = store.get_meta(_eng._REPRICE_HISTORY_MARKER, {}) or {}
         remaining = int(store.count_blocks_needing_reprice())
         done = bool(m.get("done"))
+        _ip = (not done) and remaining > 0
         return jsonify({
             "done": done,
             "remaining": remaining,
             "swept": int(m.get("swept") or 0),
             "stalled": int(m.get("stalled") or 0),
-            "in_progress": (not done) and remaining > 0,
+            "in_progress": _ip,
+            "cause": _reprice_sweep_cause(store) if _ip else None,
         })
     except Exception as e:
         logger.debug("api_reprice_history_status: %s", e)
-        return jsonify({"in_progress": False, "remaining": 0, "done": True})
+        return jsonify({"in_progress": False, "remaining": 0, "done": True, "cause": None})
 
 
 @app.route("/api/reprice-history-conformance")
