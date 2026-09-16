@@ -9179,6 +9179,24 @@ async def run_deferred_verify_pricing(*, chunk_days: int = 30, headroom_frac: fl
 
         # P3.3c: the forced sweep above now covers exc (superset coverage), so the legacy exc
         # backfill is no longer run here — it stays defined but dormant.
+
+        # A bulk import finishing is the strongest signal there is that settlement work is
+        # waiting, and nothing rang the bell: _maybe_drain_measured_history() is only reached
+        # from the HOURLY branch of _tick_dispatch_capture, so a fresh install wrote ~35k
+        # blocks and then sat silent until that branch next came round — up to an hour with
+        # the EV/House split visibly absent, because on a first import the bill is the only
+        # source (Octopus serves a short rolling dispatch window, so there is no completed
+        # dispatch to derive one from either). Worse, on a fresh install the hourly branch had
+        # ALREADY run once during startup, against an empty store, taking the slot with
+        # nothing to do. Kick it here, where the whole run is genuinely finished: the import
+        # job is terminal by now (so api_import_running() no longer blocks it), the helper is
+        # backlog-gated and re-entrancy-guarded, and it schedules its own task — so this is a
+        # no-op on every subsequent import that has nothing to settle.
+        try:
+            _maybe_drain_measured_history()
+        except Exception as _dr_e:
+            logger.warning("verify pricing: measured history drain schedule failed: %s", _dr_e)
+
         return {"ran": True, "repriced": repriced, "checked": checked,
                 "skipped": skipped, "elapsed_s": _elapsed}
     except Exception as e:
@@ -10619,6 +10637,12 @@ async def _tick_dispatch_capture() -> None:
             await run_smb_ev_resplit()
         except Exception as e:
             logger.warning("_tick_dispatch_capture: smb ev-resplit failed: %s", e)
+        # 4.5.13: give banded-IOG blocks the tariff rate they were charged at, and the
+        # matching band label, instead of the cost-derived rate rounding left behind.
+        try:
+            await run_band_rate_snap()
+        except Exception as e:
+            logger.warning("_tick_dispatch_capture: band rate snap failed: %s", e)
         # 4.5.9: carve the PREDICTED EV/Home split onto unsettled dispatched blocks whose
         # completed dispatch landed after finalise (else the car's charge sits in House until
         # settlement). Additive, dispatch-capped; recurring (no done-marker).
@@ -11102,6 +11126,30 @@ def _chart_cap_from():
 _SMB_RATE_REPAIR_DONE_KEY = "smb_rate_repair_done_v2"   # one-off (4.5.7); removed in v5.0.0
 _SMB_DEVICE_RECOST_DONE_KEY = "smb_device_recost_done"   # one-off (4.5.7); removed in v5.0.0
 _SMB_EV_RESPLIT_DONE_KEY = "smb_ev_resplit_done"   # one-off (4.5.9); removed in v5.0.0
+_BAND_SNAP_DONE_KEY = "band_rate_snap_done_v2"   # one-off (4.5.13); removed in v5.0.0
+# _v2: the v1 pass wrote bands from the RATE alone. It had no attribution filter, so it
+# relabelled EV segments the four-bucket machinery owns; it overwrote bands that were
+# already explicit rather than only filling in the "unknown" fallback; and it emitted
+# 'peak' for house on the cap-classifier's vocabulary, collapsing ECO7_DAY into it.
+#
+# NOTE house genuinely uses BOTH vocabularies, depending on which path priced the slot:
+# iog_cap.classify_slot writes off_peak/day, while recover_device_breakdown (the settled
+# four-bucket read) writes `"off_peak" if label_band(lab) else "peak"`. So a house segment
+# banded 'peak' may be perfectly correct — common on an account with no home battery, where
+# house draw lands in a peak bucket routinely. That is why v1's damage CANNOT be repaired
+# here: a relabelled segment is indistinguishable from a legitimately settled one, and a
+# blanket "house peak must be wrong" rule would destroy correct labels on exactly the
+# accounts least like the one this was found on. Bumping the key re-runs the corrected
+# pass once; a tree that took v1 needs a pre-heal backup to undo it.
+# How close a stored rate must sit to a published band to be read as that band, expressed
+# as a FRACTION of the band — never an absolute figure. The error is rounding in the
+# billed cost the rate was divided out of, so it scales with the rate: on one live account
+# 7.0004p landed 1e-6 low while 7.4999p landed 2.9e-5 low. Any constant tuned on one of
+# those silently misses the other, and another user's IOG rates are different again. A
+# banded IOG tariff separates its bands by hundreds of percent (5.493p vs 32.3092p), so
+# 0.2% cannot reach across — while a genuine transition BLEND sits far from either band
+# and is left alone, which is what keeps this from flattening real boundary slots.
+_BAND_SNAP_REL_TOL = 0.002
 
 
 def _smb_migration_overlay(store, sched, start, base_rate, kwh):
@@ -11382,6 +11430,147 @@ def _smb_ev_resplit_core(store) -> dict:
             zeroed += 1
     return {"ok": True, "resplit": resplit, "zeroed_no_dispatch": zeroed,
             "skipped_mixed": skipped_mixed, "kwh_moved_to_house": round(moved, 3)}
+
+
+def _band_rate_snap_core(store, limit=None) -> dict:
+    """Give every banded-IOG block the tariff rate it was actually charged at, and the band
+    label to match — reading both from the published schedule, never from a constant.
+
+    An imported half-hour's rate is divided back out of Octopus's billed cost, so it carries
+    that cost's rounding: on one live account the 7.0004p off-peak band is stored as
+    0.070003 for ~9,500 blocks, and an earlier 7.4999p era as 0.07497. Cost stays right
+    (it is the billed figure) but the RATE is a whisker off the band, and every reader that
+    compares a rate to the schedule then disagrees with it -- most visibly the rate line,
+    which refuses a stored rate unless it sits strictly between the day's bounds and so
+    plotted peak over half-hours the bill charged at off-peak.
+
+    The band is resolved per DAY from the agreement-stitched schedule (`day_rate_bounds`),
+    so it follows whatever that account's tariff actually charged, in every era it has been
+    through. Nothing here knows a rate.
+
+    Scope, deliberately narrow:
+      * the agreement live on the block's OWN date must be an IOG/Intelligent tariff --
+        `_agreement_era`, not the current tariff, so a user who has since switched is still
+        healed correctly and a non-IOG era is never touched;
+      * the day must be genuinely BANDED (min < max) -- a flat tariff has no band to snap to;
+      * the stored rate must already be within _BAND_SNAP_REL_TOL of a band.
+    `imp_cost` is never written: the bill is authoritative and stays exactly as billed.
+    Segment inc/exc move with the block, so segment-derived displays shift by rounding --
+    reported as `cost_drift` so the change is auditable rather than silent."""
+    import api_import as _ai  # noqa: F401  (imported for _agreement_era's own use)
+    import vat_calendar as _vc
+    _learned_vat = None
+    try:
+        _learned_vat = store.get_vat_calendar()
+    except Exception:
+        pass
+    sched = _kraken_rate_schedules.get("import")
+    if sched is None or sched.is_empty():
+        return {"ok": False, "reason": "no import schedule"}
+    rows = store._conn.execute(
+        "SELECT block_start, imp_rate, imp_rate_exc FROM blocks "
+        "WHERE meter_id='electricity_main' AND imp_rate IS NOT NULL AND imp_kwh > 0 "
+        "ORDER BY block_start" + (" LIMIT %d" % int(limit) if limit else "")).fetchall()
+    n_rate = n_band = n_skip_tariff = n_skip_flat = n_skip_far = 0
+    drift = 0.0
+    _band_cache: dict = {}
+    for r in rows:
+        bs = r["block_start"]
+        era = _agreement_era("import", bs)
+        code = (era[0] if era else "") or ""
+        if not ("IOG" in code.upper() or "INTELLI" in code.upper()):
+            n_skip_tariff += 1
+            continue
+        day = bs[:10]
+        if day not in _band_cache:
+            lo, hi = sched.day_rate_bounds(bs)
+            _band_cache[day] = (None if lo is None else lo / 100.0,
+                                None if hi is None else hi / 100.0)
+        lo, hi = _band_cache[day]
+        if lo is None or hi is None or (hi - lo) <= 1e-9:
+            n_skip_flat += 1
+            continue
+        cur = float(r["imp_rate"])
+        target = lo if abs(cur - lo) <= abs(cur - hi) else hi
+        if target <= 0 or abs(cur - target) / target > _BAND_SNAP_REL_TOL:
+            n_skip_far += 1                      # a genuine blend, or not this band at all
+            continue
+        # House and EV use DIFFERENT vocabularies at the same rate — that is the whole
+        # point of the four buckets (ECO7_DAY vs EV_DEVICE_PEAK). This pass only ever
+        # writes HOUSE segments, so it speaks the house vocabulary: off_peak / day.
+        band = "off_peak" if target == lo else "day"
+        moved = abs(cur - target) > 1e-12
+        if moved:
+            # DERIVE exc from the snapped inc and the statutory VAT for that date, rather
+            # than scaling the stored exc by the same ratio. Scaling preserves the stored
+            # inc/exc ratio -- which in the very era this heal exists for is ITSELF a
+            # rounding artefact (0.070003/0.06667 = 1.049993, not 1.05), so the scaled exc
+            # would inherit the error being removed. The VAT calendar is the authority and
+            # knows the rate in force on the block's own date, so a 5%/20% era is right too.
+            _exc = r["imp_rate_exc"]
+            if _exc is None:
+                new_exc = None
+            else:
+                _v = _vc.resolve_vat(bs, _learned_vat)
+                new_exc = (round(target / (1.0 + _v), 8) if _v is not None
+                           else round(float(_exc) * (target / cur), 8) if cur else _exc)
+            store._conn.execute(
+                "UPDATE blocks SET imp_rate=?, imp_rate_exc=? "
+                "WHERE block_start=? AND meter_id='electricity_main'",
+                (round(target, 8), new_exc, bs))
+            for sg in store._conn.execute(
+                    "SELECT seq, kwh, inc_rate, exc_rate FROM block_segments "
+                    "WHERE block_start=? AND channel='import' AND attribution='house'",
+                    (bs,)).fetchall():
+                _ir = float(sg["inc_rate"] or 0.0)
+                if _ir <= 0 or abs(_ir - target) / target > _BAND_SNAP_REL_TOL:
+                    continue                      # a segment on the OTHER band: leave it
+                _er = sg["exc_rate"]
+                if _er is None:
+                    _new_er = None
+                else:
+                    _v = _vc.resolve_vat(bs, _learned_vat)
+                    _new_er = (round(target / (1.0 + _v), 8) if _v is not None
+                               else round(float(_er) * (target / _ir), 8))
+                store._conn.execute(
+                    "UPDATE block_segments SET inc_rate=?, exc_rate=?, band=? "
+                    "WHERE block_start=? AND channel='import' AND seq=?",
+                    (round(target, 8), _new_er, band, bs, sg["seq"]))
+                drift += float(sg["kwh"] or 0.0) * (target - _ir)
+            n_rate += 1
+        # Fill in the UNKNOWN fallback only. 'standard' is what pricing_segments writes
+        # when it was given no band; off_peak / day / peak are statements the pricing path
+        # actually made, and overwriting one loses information this pass cannot reconstruct
+        # (an EV slot billed off-peak at the peak RATE is exactly that case).
+        _n = store._conn.execute(
+            "UPDATE block_segments SET band=? WHERE block_start=? AND channel='import' "
+            "AND attribution='house' AND band='standard' AND ABS(inc_rate - ?) <= ?",
+            (band, bs, target, target * _BAND_SNAP_REL_TOL)).rowcount
+        if _n and not moved:
+            n_band += 1
+    store._conn.commit()
+    return {"ok": True, "rate_snapped": n_rate, "band_only": n_band,
+            "cost_drift": round(drift, 6), "skipped_non_iog": n_skip_tariff,
+            "skipped_flat": n_skip_flat, "skipped_off_band": n_skip_far,
+            "scanned": len(rows)}
+
+
+async def run_band_rate_snap(force: bool = False) -> dict:
+    """One-off band-rate snap (4.5.13). Gated (`band_rate_snap_done`), self-marking,
+    idempotent; retires in v5.0.0. Local; no API. The billed cost is never touched."""
+    if _store is None:
+        return {"ok": False, "reason": "no store"}
+    if not force and _store.get_kraken_state(_BAND_SNAP_DONE_KEY):
+        return {"ok": True, "skipped": "already done"}
+    res = _band_rate_snap_core(_store)
+    if res.get("ok"):
+        import datetime as _dtm
+        _store.set_kraken_state(_BAND_SNAP_DONE_KEY,
+                                _dtm.datetime.now(_dtm.timezone.utc).isoformat())
+        logger.info("run_band_rate_snap: %s", res)
+        if res.get("rate_snapped", 0) or res.get("band_only", 0):
+            _schedule_chart_regen()
+    return res
 
 
 async def run_smb_ev_resplit(force: bool = False) -> dict:
