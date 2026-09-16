@@ -159,8 +159,12 @@ class KrakenIngester:
                     oldest_dt = oldest_dt.replace(tzinfo=timezone.utc)
                 floor_dt = now - timedelta(days=self.backfill_days)
                 start_dt = min(start_dt, max(oldest_dt, floor_dt))
-        except Exception:
-            pass          # never let the unsettled probe break the poll window
+        except Exception as e:
+            # Never let the unsettled probe break the poll window — but say so. Silently
+            # skipping it leaves the window at the cursor, so lagging settlement is never
+            # chased and nothing indicates why.
+            logger.warning("poll: unsettled anchor unavailable (%s) — window not pulled "
+                           "back; lagging settlement will not be chased this poll", e)
         # ALSO pull back to the oldest OUTAGE HOLE — a slot with blocks either side but
         # none of its own. The oldest-unsettled anchor only sees blocks that EXIST, so
         # a hole between two disjoint fetch windows (register measurements ending at T,

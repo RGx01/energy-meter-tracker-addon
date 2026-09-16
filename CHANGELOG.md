@@ -19,6 +19,41 @@
   costs read too high and EMT cannot correct them. [#455]
 - **The "no price returned" count is no longer filtered at 1.0 kWh**, which under-reported
   ~33,500 half-hours as 2,091. [#456]
+- **A fresh install can import its whole history.** The backward API import tiles up to
+  `go_live` — the oldest block already held — so it never re-fetches a range that is present.
+  An API-only install with no sensors has no blocks at all, so that ceiling was missing and
+  Whole history refused outright, showing the raw reason code `no_go_live` in red; Date range
+  and Gap fill, which tolerate a missing ceiling, worked throughout. An empty store has
+  nothing to tile up to and no range to protect, so the ceiling is now the current half-hour.
+  The panel also stopped rendering machine reason codes: one renderer prefers the endpoint's
+  own wording, then a mapped explanation, and only falls back to the raw value.
+- **Imported IOG-SMB history now carries the Home/EV split from the bill.** The settled split
+  caps EV at the car's own completed-dispatch session, because Octopus's `EV_DEVICE` bucket
+  over-attributes when a home battery draws concurrently inside the dispatch window. But a
+  dispatch ceiling of zero is ambiguous — either the car did not charge, or there is no
+  dispatch data for that time at all, which is always the case for imported history since
+  Octopus serves a short rolling window and no history. Both read as "no EV", so a freshly
+  imported SMB era settled from the bill with the right totals and a house-only split,
+  discarding the EV bucket the bill had already supplied. Where the ceiling is genuinely
+  unknown the bill is now the evidence, grid-clipped; where a dispatch record exists the cap
+  is unchanged. Blocks already settled house-only are healed in place from the cached bill
+  data, without re-fetching. On a two-year import this restored 278.69 kWh of EV across 111
+  half-hours, matching the bill exactly, with total kWh and cost unchanged.
+- **…and the charts now draw that split.** Storing it was only half the job. Both
+  synthetic-EV walks keyed off the dispatch map, visiting a half-hour only if it carried a
+  completed dispatch row and consulting the stored split merely to refine one. That was
+  sound while EMT only ever saw live data, where the two coincide by construction — on a
+  live account 483 of 483 stored splits have a dispatch row. Imported history has none:
+  Octopus serves a short rolling dispatch window and keeps no history, so 0 of 111 settled
+  half-hours had one, and Usage Stats and the billing charts drew 100% house while the
+  billing summary, which sources the EV-attributed segments, showed the EV correctly.
+  Settlement now picks the authority. A settled half-hour is the bill's to describe: its
+  stored split is the answer and needs no dispatch record, and the absence of one means the
+  bill billed no EV, so a stray dispatch row no longer invents any. An unsettled half-hour
+  is still a prediction, so dispatch remains the gate exactly as before, and the stored
+  column — which is that same dispatch split priced across the cap bands — stays preferred
+  over a pro-rata carve. Charts and billing now agree to a rounding unit across a two-year
+  import; a live account's figures are unchanged.
 - **Historical Import panel reports what is actually happening.** Disabled buttons now look
   disabled (app-wide); "Start import" is locked while any run or its pricing check is live; an
   import that writes nothing no longer triggers a pricing check; "Show details" survives the

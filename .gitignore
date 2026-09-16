@@ -7,12 +7,21 @@ __pycache__/
 *.pytest_cache
  
 # ── Local diagnostics — never ship ───────────────────────────────────
-# One-off probes (octopus_*_probe.py, probe_*.py, *_probe.py, etc.)
-*probe*.py
-# EXCEPT statistics_probe.py — despite the name it is a SHIPPED module: engine.py
-# imports it in the core attribution path (_stitch_hourly_energy → statistics_probe._to_utc),
-# so it must be tracked or a fresh checkout/deploy fails with ModuleNotFoundError.
+# One-off probes (octopus_*_probe.py, probe_*.py, *_probe.py, etc.), ANCHORED to the
+# repo root by the leading slash — the root is where probes are written, and all 17 of
+# them live there. Unanchored, this also swallowed tests/test_*_probe.py: four real
+# suite files carrying 67 tests, which a fresh clone never saw and which could not
+# travel in a patch, so they silently drifted from the code they cover.
+/*probe*.py
+# EXCEPT the two modules that are SHIPPED CODE despite the name. Both are imported by
+# engine.py, so an unexcepted one is absent from a fresh clone and the import raises
+# ModuleNotFoundError at runtime — invisible locally, because a working tree has the
+# file whether or not git tracks it.
+#   statistics_probe  — core attribution path (_stitch_hourly_energy → _to_utc)
+#   consumption_probe — backs /api/historical/probe and /api/historical/probe-devices
+#                       (the Historical Probe panel); untracked until 4.5.13
 !statistics_probe.py
+!consumption_probe.py
 # Shape tracker + its no-cron runner and CSV history
 emt_shape_tracker.py
 emt_tracker_loop.py

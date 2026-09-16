@@ -1399,6 +1399,36 @@ def _ev_meter_id(cfg):
     return None
 
 
+_SETTLED_RATE_SOURCES = ("measured", "corrected")
+
+
+def _has_stored_split(b):
+    """True when this block carries a bill-authoritative EV split of its own — an
+    EV-attributed segment or a stored kwh_ev column — independent of any dispatch row."""
+    imp = (((b.get("meters") or {}).get("electricity_main") or {})
+           .get("channels", {}) or {}).get("import", {}) or {}
+    _segs = imp.get("segments") or []
+    if any((x.get("attribution") == "ev") and float(x.get("kwh") or 0.0) > 1e-9
+           for x in _segs):
+        return True
+    _sk = imp.get("kwh_ev")
+    try:
+        return _sk is not None and float(_sk) > 1e-9
+    except (TypeError, ValueError):
+        return False
+
+
+def _block_settled(b):
+    """Has Octopus priced this half-hour, making the BILL the authority for its EV/house
+    split rather than a dispatch prediction? True when the cost came from the supplier's
+    own figures (rate_source measured/corrected — a hand Cost-Correction counts) or when
+    the block was imported as already-settled history."""
+    mb = (b.get("meters") or {}).get("electricity_main") or {}
+    if str(mb.get("price_rate_source") or "") in _SETTLED_RATE_SOURCES:
+        return True
+    return str(mb.get("source") or "").startswith("imported")
+
+
 def _dispatch_ev_slot_map(store, blocks, cfg, gated=True):
     """{slot_start(UTC ISO): {"kwh","cost","rate"}} — per-slot EV reconstructed from
     COMPLETED dispatches (Octopus's own per-slot EV energy), grid-clipped to that slot's
@@ -1434,12 +1464,21 @@ def _dispatch_ev_slot_map(store, blocks, cfg, gated=True):
         v = abs(float(e))
         if v > 1e-9:
             ev_raw[r["slot_start"]] = ev_raw.get(r["slot_start"], 0.0) + v
-    if not ev_raw:
-        return {}
     out = {}
     for b in blocks:
         slot = (b or {}).get("start")
-        if not slot or slot not in ev_raw or slot in covered:
+        if not slot or slot in covered:
+            continue
+        # SETTLEMENT picks the authority. A SETTLED half-hour is the bill's to describe:
+        # its stored/segmented split is the answer and needs no dispatch row (imported
+        # history never has one — Octopus serves a short rolling window and keeps no
+        # history), while the ABSENCE of a split means the bill billed no EV, so a stray
+        # dispatch row must not manufacture one. An UNSETTLED half-hour is still a
+        # prediction, and there dispatch remains the gate exactly as before.
+        if _block_settled(b):
+            if not _has_stored_split(b):
+                continue
+        elif slot not in ev_raw:
             continue
         imp = (((b.get("meters") or {}).get("electricity_main") or {})
                .get("channels", {}) or {}).get("import", {}) or {}
@@ -1479,6 +1518,8 @@ def _dispatch_ev_slot_map(store, blocks, cfg, gated=True):
             _sr = imp.get("rate_ev")
             rate = round(float(_sr), 4) if _sr else (round(ec / ek, 4) if ek else rate)
         else:
+            if slot not in ev_raw:                 # settled slots never reach here
+                continue
             ek = min(ev_raw[slot], mk)
             if ek <= 1e-9:
                 continue

@@ -2626,7 +2626,7 @@ def api_blocks_summary():
             SELECT b.block_start, b.meter_id, m.is_sub_meter, m.parent_meter_id,
                    b.imp_kwh, b.imp_kwh_grid, b.imp_kwh_remainder,
                    b.imp_rate, b.imp_cost, b.imp_cost_remainder, b.exp_kwh, b.exp_cost,
-                   b.imp_kwh_ev, b.imp_cost_ev,
+                   b.imp_kwh_ev, b.imp_cost_ev, b.rate_source, b.source,
                    b.standing_charge, b.carbon_g,
                    b.interpolated, cp.billing_day
             FROM blocks b
@@ -2729,6 +2729,7 @@ def api_blocks_summary():
                       "energy_kwh": r["energy_kwh"]} for r in _drows])
                 _main_slot = {}
                 _stored_slot = {}
+                _settled_slot = set()
                 for _rr in _raw_rows:
                     if _rr["is_sub_meter"]:
                         continue
@@ -2737,8 +2738,11 @@ def api_blocks_summary():
                     if _rr["imp_kwh_ev"] is not None:      # BL-9: stored, bill-authoritative
                         _stored_slot[_rr["block_start"]] = (
                             float(_rr["imp_kwh_ev"]), float(_rr["imp_cost_ev"] or 0))
+                    if _block_settled(_rr):
+                        _settled_slot.add(_rr["block_start"])
                 _ev_day = _dispatch_ev_split_by_bucket(
-                    _main_slot, _ev_slot, _bucket_local_day, stored_by_slot=_stored_slot)
+                    _main_slot, _ev_slot, _bucket_local_day, stored_by_slot=_stored_slot,
+                    settled_slots=_settled_slot)
             except Exception:
                 _ev_day = {}
             _apply_ev_split_to_summary_rows(rows, meters_list, _ev_day)
@@ -2823,6 +2827,7 @@ def api_blocks_day():
             SELECT b.block_start, b.meter_id, m.is_sub_meter,
                    b.imp_kwh, b.imp_kwh_grid, b.imp_kwh_remainder,
                    b.imp_rate, b.imp_cost, b.imp_kwh_ev, b.imp_cost_ev,
+                   b.rate_source, b.source,
                    b.exp_kwh, b.exp_cost,
                    b.standing_charge, b.carbon_g
             FROM blocks b
@@ -2889,6 +2894,7 @@ def api_blocks_day():
                       "energy_kwh": r["energy_kwh"]} for r in _drows])
                 _main_slot = {}
                 _stored_slot = {}
+                _settled_slot = set()
                 for _rr in _raw:
                     if _rr["is_sub_meter"]:
                         continue
@@ -2897,8 +2903,11 @@ def api_blocks_day():
                     if _rr["imp_kwh_ev"] is not None:
                         _stored_slot[_rr["block_start"]] = (
                             float(_rr["imp_kwh_ev"]), float(_rr["imp_cost_ev"] or 0))
+                    if _block_settled(_rr):
+                        _settled_slot.add(_rr["block_start"])
                 _ev_by_slot = _dispatch_ev_split_by_bucket(
-                    _main_slot, _ev_slot, _slot_of, stored_by_slot=_stored_slot)
+                    _main_slot, _ev_slot, _slot_of, stored_by_slot=_stored_slot,
+                    settled_slots=_settled_slot)
             except Exception:
                 _ev_by_slot = {}
             _apply_ev_split_to_summary_rows(
@@ -6457,8 +6466,27 @@ def _dispatch_derived_ev_kwh(dispatch_rows) -> dict:
     return out
 
 
+_SETTLED_RATE_SOURCES = ("measured", "corrected")
+
+
+def _block_settled(row) -> bool:
+    """Has Octopus priced this half-hour, so that the BILL — not a dispatch prediction —
+    is the authority for its EV/house split? True when the block's cost came from the
+    supplier's own figures (`rate_source` measured/corrected, which covers a hand
+    Cost-Correction too) or when the block was imported as already-settled history.
+    Tolerates a row that does not carry the columns (older callers / stub rows)."""
+    def _get(k):
+        try:
+            return row[k]
+        except (IndexError, KeyError, TypeError):
+            return None
+    if str(_get("rate_source") or "") in _SETTLED_RATE_SOURCES:
+        return True
+    return str(_get("source") or "").startswith("imported")
+
+
 def _dispatch_ev_split_by_bucket(main_by_slot, ev_by_slot, bucket_fn,
-                                 stored_by_slot=None) -> dict:
+                                 stored_by_slot=None, settled_slots=None) -> dict:
     """Grid-clip the per-slot dispatch EV to that slot's main import and apportion its
     cost, then bucket to {bucket: {"kwh","cost"}}. Pure — `main_by_slot` is
     {slot: (imp_kwh, imp_cost)}, `ev_by_slot` is {slot: kwh}.
@@ -6472,15 +6500,40 @@ def _dispatch_ev_split_by_bucket(main_by_slot, ev_by_slot, bucket_fn,
     grid import, so a caller can split a chart segment without moving any total."""
     stored_by_slot = stored_by_slot or {}
     out: dict = {}
-    for _slot, _e in ev_by_slot.items():
+    # SETTLEMENT picks the authority for a slot; the dispatch map is not the index.
+    #
+    #   SETTLED (rate_source measured/corrected, or imported) -> the BILL decides. Octopus
+    #     has priced the half-hour into its four buckets, so the stored split IS the answer,
+    #     and its ABSENCE is also an answer: the bill billed no EV here, and a dispatch row
+    #     must not manufacture one. Settled slots need no dispatch record at all, which is
+    #     what makes imported history work — Octopus serves a short rolling dispatch window
+    #     and keeps no history, so no historic slot has one.
+    #   UNSETTLED (still predicted) -> DISPATCH decides: no completed dispatch, no EV. The
+    #     stored column, where the live split already wrote one, is that same dispatch answer
+    #     priced cap-aware across the bands, so it is preferred over re-deriving a pro-rata
+    #     carve at the block's blended rate (BL-9 — unchanged behaviour).
+    #
+    # settled_slots=None means the caller cannot say; a stored split is then taken at face
+    # value, which is the pre-existing behaviour. Sorted walk keeps bucket sums order-stable.
+    for _slot in sorted(set(ev_by_slot) | set(stored_by_slot)):
+        _e = ev_by_slot.get(_slot, 0.0)
         _mk, _mc = main_by_slot.get(_slot, (0.0, 0.0))
         _sv = stored_by_slot.get(_slot)
-        if _sv is not None and _sv[0] > 1e-9:
+        _settled = (_sv is not None) if settled_slots is None else (_slot in settled_slots)
+        if _settled:
+            if _sv is None or _sv[0] <= 1e-9:
+                continue                                  # the bill billed no EV this slot
             _ek = min(_sv[0], _mk) if _mk > 0 else 0.0
             _ec = _sv[1] * (_ek / _sv[0]) if _sv[0] > 0 else 0.0
         else:
-            _ek = min(_e, _mk) if _mk > 0 else 0.0        # can't exceed the grid that slot
-            _ec = _mc * (_ek / _mk) if _mk > 0 else 0.0   # cost follows the same fraction
+            if _slot not in ev_by_slot:
+                continue                                  # no dispatch -> no predicted EV
+            if _sv is not None and _sv[0] > 1e-9:
+                _ek = min(_sv[0], _mk) if _mk > 0 else 0.0
+                _ec = _sv[1] * (_ek / _sv[0]) if _sv[0] > 0 else 0.0
+            else:
+                _ek = min(_e, _mk) if _mk > 0 else 0.0    # can't exceed the grid that slot
+                _ec = _mc * (_ek / _mk) if _mk > 0 else 0.0
         if _ek <= 1e-9:
             continue
         _b = bucket_fn(_slot)
