@@ -5799,18 +5799,37 @@ _kraken_mini_last_register = None   # {"ts": boundary_iso, "value": register}
 
 
 def _kraken_backfill_days() -> int:
-    """Compute the first-run backfill window: from the oldest block to now,
-    capped. Beyond the oldest block, DCC rows have no block to attach to.
+    """Compute the first-run backfill window: from the oldest block STILL AWAITING
+    settlement to now, capped. Beyond the oldest block, DCC rows have no block to
+    attach to.
 
     Fresh DB (no blocks): return 0 — do NOT backfill. There are no blocks to
     reconcile, so pulling ~400 days (~19k half-hourly rows) is wasted work and
     needless API load. The first poll then starts the cursor at 'now' and only
-    tracks forward. A deliberate historical-import action can be added later."""
+    tracks forward. A deliberate historical-import action can be added later.
+
+    Measured from the oldest UNSETTLED block, not the oldest block outright. An
+    IMPORTED block already carries the supplier's own half-hourly figure — the
+    historical import fetched it from this same API — so re-fetching it settles
+    nothing. Anchoring on the oldest block meant a fresh install that imports two
+    years immediately swept the full 400-day cap: 19,129 rows per poll, every poll,
+    of figures already present (measured: 19,129 of 19,129 identical, total delta
+    0.000000 kWh). `_UNSETTLED_WHERE` already excludes `imported%`, so the same
+    predicate the poll uses to chase lagging settlement now sizes the window — and
+    the two stay consistent, since the poll floors that anchor at this horizon."""
     oldest = None
     try:
-        oldest = _store.get_oldest_block_start()
-    except Exception:
-        pass
+        oldest = _store.get_oldest_unsettled_block_start()
+    except Exception as e:
+        # Do NOT fail silently. Returning 0 is the safe direction (never hammer the API
+        # on an unknown state), but it is indistinguishable from "nothing to settle" —
+        # and it LATCHES: the ingester keeps backfill_days for its lifetime, and the
+        # poll floors its own unsettled anchor at `now - backfill_days`, so a horizon of
+        # 0 clamps that anchor to now. Settlement then quietly stops reaching back and
+        # blocks sit on estimates with no signal. Loud, so the cause is visible.
+        logger.warning("_kraken_backfill_days: could not read the oldest unsettled "
+                       "block (%s) — backfilling 0 days this run; settlement will not "
+                       "reach back until this clears", e)
     if not oldest:
         return 0
     try:
@@ -10618,6 +10637,13 @@ async def _tick_dispatch_capture() -> None:
             _maybe_drain_measured_history()
         except Exception as e:
             logger.warning("_tick_dispatch_capture: measured history drain schedule failed: %s", e)
+        # Blocks already settled house-only because the dispatch ceiling was ambiguous are
+        # stamped 'measured', so the drain's backlog can never revisit them. Heal from the
+        # cached bill buckets (no API calls); empty in the steady state.
+        try:
+            run_settled_ev_split_heal()
+        except Exception as e:
+            logger.warning("_tick_dispatch_capture: settled EV split heal failed: %s", e)
         try:
             if _MEASURED_APPLY:
                 apply_measured_settled()
@@ -11628,6 +11654,55 @@ def _measured_history_backlog() -> int:
         return 0
 
 
+def run_settled_ev_split_heal(limit: int = 2000) -> dict:
+    """Re-apply the bill's EV/Home split to blocks settled WITHOUT one.
+
+    Until the ambiguous-ceiling fix, `apply_measured_to_block` treated a dispatch ceiling of
+    zero as "no EV" even where no dispatch data existed for the slot at all. On imported
+    history that is always the case — Octopus serves a short rolling dispatch window — so a
+    freshly imported IOG-SMB era settled from the bill with `rate_source='measured'`, the
+    correct total cost, and a house-only split, discarding the EV_DEVICE bucket the bill had
+    already supplied.
+
+    Those blocks are stamped `measured`, so the drain's backlog (which excludes them) will
+    never revisit them. This heals them from the `measured_cost` rows already cached locally —
+    no API calls — by re-invoking the one settle path, which is idempotent. Recurring rather
+    than marker-gated: the candidate query is empty in the steady state, so it self-heals any
+    later occurrence instead of needing a second migration. Never touches a corrected block.
+    """
+    store = _store
+    if store is None or not _import_is_smb_capped():
+        return {"ok": True, "skipped": "not applicable"}
+    try:
+        rows = store._conn.execute(
+            "SELECT b.block_start, mc.cost_incl, mc.cost_excl, mc.label "
+            "FROM blocks b JOIN measured_cost mc ON mc.slot_start = b.block_start "
+            "WHERE b.meter_id = 'electricity_main' AND b.rate_source = 'measured' "
+            "  AND b.imp_kwh_ev IS NULL AND COALESCE(b.imp_kwh, 0) > 0 "
+            "  AND COALESCE(b.rate_corrected, 0) = 0 "
+            "  AND mc.ev_kwh IS NOT NULL AND mc.ev_kwh > 0 "
+            "  AND mc.cost_incl IS NOT NULL "
+            "ORDER BY b.block_start LIMIT ?", (int(limit),)).fetchall()
+    except Exception as e:
+        logger.warning("settled EV split heal: query failed: %s", e)
+        return {"ok": False, "reason": "query_failed"}
+    if not rows:
+        return {"ok": True, "healed": 0}
+    healed = 0
+    for r in rows:
+        try:
+            if apply_measured_to_block(r["block_start"], cost_incl=float(r["cost_incl"]),
+                                       cost_excl=r["cost_excl"], label=r["label"]):
+                healed += 1
+        except Exception as e:
+            logger.warning("settled EV split heal: %s failed: %s", r["block_start"], e)
+    if healed:
+        _schedule_chart_regen()
+        logger.info("settled EV split heal: restored the bill's EV/Home split on %d "
+                    "settled block(s) that had been stored house-only", healed)
+    return {"ok": True, "healed": healed}
+
+
 def _maybe_drain_measured_history() -> None:
     """Schedule the SMB history drain as a loop TASK when a first-time / bulk import has left a
     backlog of capped slots without Octopus's billed breakdown. Guarded by an in-process flag; a
@@ -11775,7 +11850,30 @@ def apply_measured_to_block(bs: str, *, cost_incl: float, cost_excl=None,
     _bill_ev = float(_bd["ev_kwh"]) if (_bd and _bd.get("ev_kwh") is not None) else None
     _stored_ev = row["imp_kwh_ev"]
     _stored_ev = float(_stored_ev) if (_stored_ev is not None and float(_stored_ev) > 1e-9) else 0.0
+    # A dispatch ceiling of ZERO is ambiguous. Either the car genuinely did not charge (a LIVE
+    # slot we were watching) or we hold no dispatch data for that time AT ALL — imported
+    # history, or a slot older than the oldest record we have, because Octopus serves a short
+    # rolling dispatch window and no history. Treating both as "no EV" silently discarded the
+    # bill's own EV_DEVICE bucket on every imported IOG-SMB slot: a fresh install settled 438
+    # slots from the bill, 111 of them carrying EV, and stored a house-only split because
+    # dispatch_history held six rows from that morning. Where the ceiling is genuinely UNKNOWN
+    # the settled bucket is the only evidence there is, so trust it (grid-clipped). Where a
+    # dispatch record exists for the slot, the 4.5.9 measured-is-king cap is unchanged.
+    _ceiling_unknown = False
     if _disp <= 1e-9:
+        try:
+            _seen = store._conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM dispatch_history WHERE slot_start = ?), "
+                "       (SELECT MIN(slot_start) FROM dispatch_history)", (bs,)).fetchone()
+            _row_here, _oldest = bool(_seen[0]), _seen[1]
+        except Exception:
+            _row_here, _oldest = True, None       # unsure -> keep the strict 4.5.9 behaviour
+        _imported = str(row["source"] or "").startswith("imported")
+        _pre_observation = bool(_oldest) and str(bs) < str(_oldest)
+        _ceiling_unknown = (not _row_here) and (_imported or _pre_observation)
+    if _ceiling_unknown:
+        evk = min(_bill_ev, kwh) if _bill_ev is not None else 0.0
+    elif _disp <= 1e-9:
         evk = 0.0                                 # no measured EV session -> house
     else:
         _pref = _bill_ev if _bill_ev is not None else (_stored_ev if _stored_ev > 1e-9 else _disp)

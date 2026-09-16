@@ -4231,6 +4231,24 @@ class BlockStore:
             prev_api = None
         _figure_changed = (prev_api is None) or (
             abs((settled_kwh or 0.0) - (prev_api or 0.0)) > 1e-6)
+        # An IMPORTED block already holds the supplier's OWN half-hourly figure: the
+        # historical import fetched it from this same API. Its `*_kwh_api` column is
+        # NULL only because it never went through DCC settlement locally — not because
+        # the number is an estimate. Treating that NULL as "changed" meant a first
+        # settlement re-stating an identical figure queued the block for a full PASS 2
+        # re-run. On a fresh install that imports two years, the backfill poll re-fetched
+        # 19,129 slots and flagged every one: measured on the reporting DB, 19,129 of
+        # 19,129 matched `imp_kwh` exactly (total delta 0.000000 kWh), so 13,779 blocks
+        # were re-materialised against a kWh that had not moved.
+        # The figure is still STORED — provenance stays honest and the corrections tool's
+        # settled-only gate opens as it should. Only the re-run flag is withheld, and only
+        # when the supplier has just confirmed what the import already wrote.
+        if (_figure_changed and prev_api is None and settled_kwh is not None
+                and cad_kwh is not None
+                and str((existing["source"] if "source" in existing.keys() else "") or "")
+                    .startswith("imported")
+                and abs(float(settled_kwh) - float(cad_kwh)) <= 1e-6):
+            _figure_changed = False
         rerun = 1 if (billing_source == "api" and _figure_changed) else 0
         new_review = 1 if (review or (existing["needs_review"] or 0)) else 0
         new_rerun = 1 if (rerun or (existing["needs_pass2_rerun"] or 0)) else 0
@@ -4310,9 +4328,24 @@ class BlockStore:
 
         api_col = "imp_kwh_api" if channel == "import" else "exp_kwh_api"
         self._conn.execute(
+            # `source` is PROVENANCE — how the block came into existence — not a record
+            # of who last touched it. Settlement writes the supplier's confirmed figure
+            # into *_kwh_api; it must not restate where the block came from. COALESCE(?,
+            # source) overwrote an importer's tag on first settlement, so 19,129
+            # reconstructed blocks re-labelled themselves 'kraken_api' and silently left
+            # three import-scoped behaviours: the Delete Blocks rollback filter
+            # (source LIKE 'imported%'), the CSV/bill reprice path, and BL-62's scoped
+            # bill replacement for an uncostable era — the PDF remedy expired simply by
+            # the kWh settling. It also moved retag_untagged_imports' go-live anchor
+            # (earliest read-or-kraken_api block) from today to 2025-08-12.
+            # Narrow rule: an IMPORT tag is preserved because it records a reconstruction
+            # those features scope on. Everything else is unchanged — an ha_sensor block
+            # that DCC-settles still becomes 'kraken_api' (its figure genuinely is the
+            # API's now, and no import-scoped behaviour keys on it).
             f"""UPDATE blocks
                 SET {api_col} = ?,
-                    source = COALESCE(?, source),
+                    source = CASE WHEN source LIKE 'imported%' THEN source
+                                  ELSE COALESCE(?, source) END,
                     needs_review = ?,
                     needs_pass2_rerun = ?,
                     finalised_from_cad = 0

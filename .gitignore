@@ -7,8 +7,13 @@ __pycache__/
 *.pytest_cache
  
 # ── Local diagnostics — never ship ───────────────────────────────────
-# One-off probes (octopus_*_probe.py, probe_*.py, *_probe.py, etc.)
-*probe*.py
+# One-off probes (octopus_*_probe.py, probe_*.py, *_probe.py, etc.), ANCHORED to the
+# repo root by the leading slash — the root is where probes are written, and every one
+# of the 17 currently on disk lives there. Unanchored, this pattern also swallowed
+# tests/test_*_probe.py: four real suite files carrying 67 tests, which a fresh clone
+# therefore never saw and which could not travel in a patch, so they silently drifted
+# out of step with the code they cover.
+/*probe*.py
 # EXCEPT statistics_probe.py — despite the name it is a SHIPPED module: engine.py
 # imports it in the core attribution path (_stitch_hourly_energy → statistics_probe._to_utc),
 # so it must be tracked or a fresh checkout/deploy fails with ModuleNotFoundError.
