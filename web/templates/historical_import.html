@@ -520,7 +520,7 @@ async function bfPreview() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body) });
     var j = await r.json();
-    if (!j.ok) { out.innerHTML = '<div style="color:var(--warning);">' + _esc(j.message || j.reason || 'Not available') + '</div>'; return; }
+    if (!j.ok) { out.innerHTML = '<div style="color:var(--warning);">' + _esc(_bfReason(j)) + '</div>'; return; }
     bfRenderPlan(j);
   } catch (e) { out.innerHTML = '<span style="color:var(--danger);">' + _esc(e) + '</span>'; }
 }
@@ -777,6 +777,34 @@ function _fmtWhen(iso){
                                         hour:'2-digit', minute:'2-digit'});
   }catch(e){ return String(iso).substr(0,16).replace('T',' '); }
 }
+// A failed call must never show its machine reason code to a user (the `no_go_live`
+// leak). Prefer whatever human text the endpoint sent — `message`, then `note` —
+// then map the known codes, and only fall back to the raw value for something
+// genuinely unforeseen.
+var _BF_REASONS = {
+  no_api:      'Not connected to Octopus — add your API key in Settings first.',
+  no_store:    'The data store is not ready yet — try again in a moment.',
+  no_ha:       'Not connected to Home Assistant.',
+  no_loop:     'The engine is still starting — try again in a moment.',
+  no_ingester: 'The importer is not available.',
+  no_from:     'Choose a start date first.',
+  no_go_live:  'No existing history to tile up to yet.',
+  bad_range:   'That date range is not valid.',
+  bad_oldest:  'Could not read the earliest stored reading.',
+  busy:        'Another job is running — wait for it to finish.',
+  verify_active: 'The previous run’s pricing check is still finishing.',
+  migrating:   'A migration is running — try again once it completes.',
+  unconfirmed: 'Tick the confirmation box first.',
+  already_done: 'Already imported — nothing left to do.',
+  account_failed: 'Could not read your Octopus account.'
+};
+function _bfReason(d){
+  d = d || {};
+  if (d.message) return d.message;
+  if (d.note) return d.note;
+  if (d.reason && _BF_REASONS[d.reason]) return _BF_REASONS[d.reason];
+  return d.error || d.reason || 'Not available';
+}
 function _esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
 function _p(v){ return (v==null)?'—':(v*100).toFixed(2)+'p'; }     // £/kWh → p/kWh
@@ -800,8 +828,12 @@ function planApi(){
   fetch(apiUrl('/api/historical/api-import/plan'), {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ from: IMPORT_FROM })})
     .then(function(r){return r.json();}).then(function(d){
       st.textContent = '';
-      if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(d.error||d.reason||'failed')+'</span>'; return; }
-      var html = '<div style="color:var(--muted);">Tiles up to go-live '+_esc((d.go_live||'').substr(0,10))+':</div>';
+      if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(_bfReason(d))+'</span>'; return; }
+      var html = '<div style="color:var(--muted);">'
+        + (d.ceiling_source === 'now'
+             ? 'No existing history yet — imports everything up to now:'
+             : 'Tiles up to go-live '+_esc((d.go_live||'').substr(0,10))+':')
+        + '</div>';
       ["import","export"].forEach(function(chn){
         var c = (d.channels||{})[chn]; if(!c) return;
         if(!c.ok){ html += '<div style="text-transform:capitalize;">'+chn+': '+_esc(c.note||'not available')+'</div>'; return; }
@@ -870,7 +902,7 @@ function diagnoseRange(){
   fetch(apiUrl('/api/historical/import-range-diagnostic'), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
     .then(function(r){return r.json();}).then(function(d){
       st.textContent = '';
-      if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(d.error||d.reason||'failed')+'</span>'; return; }
+      if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(_bfReason(d))+'</span>'; return; }
       var html = '';
       ["import","export"].forEach(function(chn){
         var c = (d.channels||{})[chn]; if(!c) return;
@@ -903,7 +935,7 @@ function meterHistory(){
   fetch(apiUrl('/api/historical/consumption-diagnostic'), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
     .then(function(r){return r.json();}).then(function(d){
       st.textContent = '';
-      if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(d.error||d.reason||'failed')+'</span>'; return; }
+      if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(_bfReason(d))+'</span>'; return; }
       var html = '';
       (d.meter_points||[]).forEach(function(mp){
         var chan = mp.is_export ? 'Export' : 'Import';

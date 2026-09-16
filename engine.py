@@ -6134,25 +6134,23 @@ async def plan_api_import(requested_from=None, *, chunk_days: int = 60) -> dict:
     import api_import as _ai
     if not kraken_available():
         return {"ok": False, "reason": "no_api", "channels": {}}
-    try:
-        # Ceiling = oldest EXISTING block of ANY source (contiguity rule). A new
-        # backward import must stop at the oldest block we already have — including
-        # blocks a previous import wrote — so it only fills the remaining gap below
-        # them rather than re-fetching a range that's already present. Interior
-        # holes are handled separately by the gap-fill flow, so an earlier import
-        # can't leave a gap this ceiling would wall off.
-        go_live = _store.get_oldest_block_start()
-    except Exception:
-        go_live = None
+    # Ceiling = oldest EXISTING block of ANY source (contiguity rule). A new backward
+    # import must stop at the oldest block we already have — including blocks a
+    # previous import wrote — so it only fills the remaining gap below them rather
+    # than re-fetching a range that's already present. Interior holes are handled
+    # separately by the gap-fill flow, so an earlier import can't leave a gap this
+    # ceiling would wall off. An EMPTY store has neither concern: the ceiling is now.
+    go_live, ceiling_source = _import_ceiling()
     if not go_live:
-        return {"ok": False, "reason": "no_go_live", "channels": {},
-                "note": "no existing blocks to tile up to yet"}
+        return {"ok": False, "reason": "no_store", "channels": {},
+                "message": "The data store is not ready yet — try again in a moment."}
     disc = _kraken_discovery or {}
     # The Measurements API is a rolling ~2-year window; older data has aged out and
     # is only reachable via CSV. Cap the advertised floor there so the preview never
     # promises phantom pre-retention chunks (e.g. from an agreement that predates it).
     retention_floor = _retention_floor_iso()
     out: dict = {"ok": True, "go_live": go_live, "channels": {},
+                 "ceiling_source": ceiling_source,
                  "retention_floor": retention_floor,
                  "retention_days": _API_RETENTION_DAYS, "retention_capped": False}
     for name in ("import", "export"):
@@ -6202,6 +6200,34 @@ def _retention_floor_iso():
     from datetime import datetime, timedelta
     return (datetime.utcnow() - timedelta(days=_API_RETENTION_DAYS)
             ).replace(microsecond=0).isoformat()
+
+
+def _import_ceiling():
+    """Ceiling for a backward API import, as (iso, source).
+
+    Normally EMT's oldest EXISTING block: a backward import tiles UP TO live capture
+    and stops, so it never re-fetches a range already present (the contiguity rule).
+
+    On an EMPTY store there is nothing to tile up to and nothing to protect — no live
+    capture to stop short of, no existing range to avoid — which is the normal first
+    run of an API-only install with no sensors. Refusing there ("no_go_live") made
+    Whole history impossible on a fresh install while Date range and Gap fill, which
+    tolerate a missing ceiling, both worked. So an empty store imports up to the
+    CURRENT half-hour boundary instead; the partial in-progress slot is left alone
+    because capture owns it.
+
+    Returns (iso, "blocks") or (iso, "now"); (None, "none") only if the store is gone.
+    """
+    try:
+        go_live = _store.get_oldest_block_start()
+    except Exception:
+        go_live = None
+    if go_live:
+        return go_live, "blocks"
+    try:
+        return _snap_to_slot(_dt_now_iso_safe()), "now"
+    except Exception:
+        return None, "none"
 
 
 def _earliest_agreement_from(info: dict):
@@ -7906,15 +7932,13 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
     bounded = until_ts is not None
     if bounded and not requested_from:
         return {"ok": False, "reason": "no_from", "channels": {}}
-    try:
-        # Ceiling = oldest EXISTING block of ANY source (contiguity rule) so a new
-        # backward import stops at the oldest block we already have and only fills
-        # the remaining gap below it — see plan_api_import.
-        go_live = _store.get_oldest_block_start()
-    except Exception:
-        go_live = None
+    # Ceiling = oldest EXISTING block of ANY source (contiguity rule) so a new
+    # backward import stops at the oldest block we already have and only fills the
+    # remaining gap below it — see plan_api_import. An EMPTY store (fresh API-only
+    # install) has nothing to tile up to, so the ceiling is the current half-hour.
+    go_live, _ceiling_source = _import_ceiling()
     if not go_live and not bounded:
-        return {"ok": False, "reason": "no_go_live", "channels": {}}
+        return {"ok": False, "reason": "no_store", "channels": {}}
     disc = _kraken_discovery or {}
     out: dict = {"ok": True, "go_live": go_live, "dry_run": dry_run, "channels": {}}
     all_done = True
