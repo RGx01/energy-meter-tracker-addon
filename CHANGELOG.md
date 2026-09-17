@@ -1,6 +1,6 @@
 # Changelog
  
-## [4.5.13] — 2026-09-15
+## [4.5.13] — 2026-09-17
 
 *Puts the tariff's own rates and bands back onto imported Intelligent Octopus history.
 A half-hour brought in from the supplier had its rate divided back out of the billed
