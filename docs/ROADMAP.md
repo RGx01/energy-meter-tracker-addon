@@ -15,8 +15,7 @@ Nothing in this file has shipped.*
 | 4 | BL-61 — 4.5.7 settlement/chart cleanup follow-ups | tech-debt | v5.0.0 | ⚠️ needs issue |
 | 5 | BL-63 — Two pricing models: collapse onto one (Principle 0) | architecture · first-principles | v5.0.0 | ⚠️ needs issue |
 | 6 | BL-64 — Bill-parser fixtures + a pypdf bump gate | testing · tooling | next | ⚠️ needs issue |
-| 7 | BL-51 — Reprice banner: upgrade vs import-triggered | UI | low | ⚠️ needs issue |
-| 8 | BL-60 — Usage Stats block inspector (pre/post-settlement) | diagnostics | proposed | ⚠️ needs issue |
+| 7 | BL-60 — Usage Stats block inspector (pre/post-settlement) | diagnostics | proposed | ⚠️ needs issue |
 
 ---
 
@@ -97,9 +96,6 @@ every existing `'measured'` block row, best batched under one migration-gated re
 
 *Related: `pypdf==6.18.0` was verified against five real bills on 16 Sept 2026; `requirements.txt` still pins 6.16.1.*
 
-#### BL-51 — Reprice banner should distinguish an upgrade from an import-triggered reprice  ·  *UI · low*  ·  ⚠️ **needs issue**
-*Surfaced during 4.5.4 gap-fill testing.* The global "Finishing your upgrade" advisory (base.html) is driven by `api_reprice_history_status` → `in_progress = (not done) and count_blocks_needing_reprice() > 0`. That backlog counter (missing segments / missing exc) is driven by **both** a genuine version upgrade **and** a gap-fill / import / delete-reimport — the unified reprice-history sweep covers all of them by design (P3.3d). So after a gap fill the banner correctly fires (the sweep really is running) but mislabels it "Finishing your upgrade", even though no upgrade occurred. The behaviour is correct; only the messaging is wrong, and it double-surfaces with the Historical Import page's own Pricing-health progress. **Fix:** record *why* the sweep is running. The `reprice_history_state` marker stores `done/swept/stalled` but no trigger — add a `reason` field set at the two kickoff sites (`"upgrade"` from the startup version-change gate; `"import"` from the post-import sweep). `api_reprice_history_status` returns it; the banner branches on it — keep the "avoid restarting" upgrade advisory for `reason == "upgrade"`, and for `reason == "import"` either use neutral wording ("Re-pricing your recent import…") or suppress the global banner entirely (the import page already owns that progress). Cosmetic/UX only — no pricing or data impact. Files: `engine.py` (marker reason), `web/server.py` (`api_reprice_history_status`), `web/templates/base.html` (banner text/visibility).
-
 #### BL-60 — Usage Stats block inspector: pre/post-settlement detail for a single block  ·  *diagnostics · proposed*  ·  ⚠️ **needs issue**
 *Turns the manual forensic we keep repeating into a self-serve drill-down.* Diagnosing a single
 half-hour today means hand-running SQL across `blocks`, `block_segments`, `measured_cost` and
@@ -125,7 +121,6 @@ then the reference added to its heading and to the priority table:
 - [ ] **BL-61** — 4.5.7 settlement/chart cleanup follow-ups
 - [ ] **BL-63** — Two pricing models: decide which one is the model, and collapse onto it
 - [ ] **BL-64** — Bill-parser fixtures from real bills, and a pypdf bump gate
-- [ ] **BL-51** — Reprice banner should distinguish an upgrade from an import-triggered reprice
 - [ ] **BL-60** — Usage Stats block inspector: pre/post-settlement detail for a single block
 
 *Convention: reference issues as `[#nnn]` on the item heading, with the link definition at the foot

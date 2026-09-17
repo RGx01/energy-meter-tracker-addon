@@ -1,4 +1,4 @@
-"""BL-68: a bill that says "nothing was drawn" is an ANSWER, not a gap.
+"""BL-70: a bill that says "nothing was drawn" is an ANSWER, not a gap.
 
 `recover_device_breakdown` returns a parsed node for a dispatched-but-idle half-hour —
 every bucket present, every value zero — and counts it `recovered`. `measure_settled`
@@ -134,7 +134,7 @@ class TestBillSaysZero(_Base):
                          self.st.slots_with_bill_split("2026-09-01", "2026-09-30"))
 
     def test_second_pass_does_not_touch_the_network(self):
-        """THE regression. Before BL-68 this re-fetched every hour, forever."""
+        """THE regression. Before BL-70 this re-fetched every hour, forever."""
         self._block(0.0)
         c = _CountingClient(ZERO_NODE)
         engine._kraken_client = c
