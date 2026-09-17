@@ -11641,7 +11641,7 @@ async def measure_settled_dispatched_blocks() -> dict:
             return 0.0
 
     _use_buckets = _import_is_smb_capped()
-    n_store = n_absent = n_mixed = 0
+    n_store = n_absent = n_mixed = n_zero = 0
     if _use_buckets:
         # IOG-SMB: authoritative four-bucket read (cost + split + band), ONE small-window
         # fetch (recover_device_breakdown chunks internally to dodge the complexity strip).
@@ -11658,7 +11658,29 @@ async def measure_settled_dispatched_blocks() -> dict:
             _hk, _ek = _n(node.get("home_kwh")), _n(node.get("ev_kwh"))
             cost_incl = round(_n(node.get("home_cost")) + _n(node.get("ev_cost")), 6)
             if cost_incl <= 0 and (_hk + _ek) <= 1e-9:
-                n_absent += 1
+                # BL-68: Octopus ANSWERED, and the answer is "nothing was drawn". That is a
+                # settled fact, not a missing one — the node parsed (recover_device_breakdown
+                # counts it recovered), every bucket is simply zero. Filing it under `absent`
+                # wrote nothing, so `measured_slots_missing` handed the slot straight back on
+                # the next pass: eleven dispatched-but-idle half-hours were re-fetched every
+                # hour, forever, re-proving the same true fact six GraphQL calls at a time.
+                #
+                # Cache the zero and the loop ends — `missing` goes empty and the pass returns
+                # before any fetch. But only believe it when OUR OWN settled kWh agrees: a bill
+                # that simply hasn't run yet also reports zero, and caching that would be a
+                # permanent lie. Where the block HAS energy, keep the old retry behaviour.
+                #
+                # The breakdown columns stay NULL on purpose. A zero-kWh slot has no split to
+                # state, and leaving them NULL keeps the row out of slots_with_bill_split() and
+                # run_settled_ev_split_heal() entirely. The block itself needs no stamp: it
+                # already reads imp_kwh=0 / imp_cost=0, which is what the bill just confirmed,
+                # and apply_measured_to_block rightly refuses an empty half-hour.
+                if (by_start[slot]["imp_kwh"] or 0.0) <= 1e-9:
+                    store.upsert_measured_cost(slot, mpan=mpan, cost_incl=0.0, cost_excl=0.0,
+                                               label="ZERO", kwh=0.0)
+                    n_zero += 1
+                else:
+                    n_absent += 1
                 continue
             _hre, _ere = node.get("home_rate_exc"), node.get("ev_rate_exc")
             cost_excl = (round(_hk * _n(_hre) + _ek * _n(_ere), 6)
@@ -11696,11 +11718,14 @@ async def measure_settled_dispatched_blocks() -> dict:
                 slot, mpan=mpan, cost_incl=node.get("cost_incl"),
                 cost_excl=node.get("cost_excl"), label=label, kwh=node.get("kwh"))
             n_store += 1
-    logger.info("measure_settled: candidates=%d fetched=%d stored=%d mixed=%d absent=%d "
-                "(source=%s, apply=%s)", len(rows), len(missing), n_store, n_mixed,
-                n_absent, "buckets" if _use_buckets else "single-cost", _MEASURED_APPLY)
+    # BL-68: `zero` and `absent` were one counter, which made the log self-contradictory —
+    # "recovered 11/11" on one line and "absent=11" on the next. They mean opposite things:
+    # zero = the bill stated nothing was drawn; absent = the bill said nothing at all.
+    logger.info("measure_settled: candidates=%d fetched=%d stored=%d mixed=%d zero=%d "
+                "absent=%d (source=%s, apply=%s)", len(rows), len(missing), n_store, n_mixed,
+                n_zero, n_absent, "buckets" if _use_buckets else "single-cost", _MEASURED_APPLY)
     return {"candidates": len(rows), "fetched": len(missing), "stored": n_store,
-            "mixed": n_mixed, "absent": n_absent}
+            "mixed": n_mixed, "zero": n_zero, "absent": n_absent}
 
 
 def _review_band_reason(prior_band, new_band, prior_cost, new_cost) -> str:
@@ -11939,7 +11964,11 @@ def apply_measured_settled() -> dict:
     both bands, with NO age-gate and NO review-flag — a divergence from EMT's prediction is
     Octopus's own bill, not an anomaly to surface. The RATE is snapped to the tariff agreement
     in apply_measured_to_block (never cost/kWh). Idempotent: once a block is rate_source=
-    'measured' it drops out of the query. Only runs when _MEASURED_APPLY. Local writes only."""
+    'measured' it drops out of the query. Only runs when _MEASURED_APPLY. Local writes only.
+
+    (BL-68: `m.cost_incl > 0` skips the cached zero rows — a half-hour the bill says drew
+    nothing has no cost to apply and no rate to snap, and apply_measured_to_block refuses it
+    on `kwh <= 1e-9` anyway. Excluding them here just saves walking them every pass.)"""
     store = _store
     if store is None or not _MEASURED_APPLY:
         return {}
@@ -11957,6 +11986,7 @@ def apply_measured_settled() -> dict:
                  AND (b.rate_source IS NULL OR b.rate_source NOT IN ('measured','corrected'))
                  AND {_SETTLEABLE_SQL}
                  AND b.block_start >= ? AND m.cost_incl IS NOT NULL
+                 AND m.cost_incl > 0
                ORDER BY b.block_start""", (mpan, _measured_floor())).fetchall()
     except Exception as e:
         logger.warning("apply_measured: query failed: %s", e)
