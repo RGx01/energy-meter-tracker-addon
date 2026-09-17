@@ -1,5 +1,183 @@
 # Changelog
  
+## [4.5.13] — 2026-09-17
+
+*Puts the tariff's own rates and bands back onto imported Intelligent Octopus history.
+A half-hour brought in from the supplier had its rate divided back out of the billed
+cost, so it landed a whisker off the published band and carried no band label at all —
+which is why a smart-charge the bill discounted to off-peak could still be drawn at peak.
+Rates now snap to the band the account's own agreement charged, in every tariff era it
+has been through, and the band is labelled to match. Billed costs are never rewritten.
+Alongside it: the Home/EV split on imported history, and the import panel telling the
+truth about what it is doing.*
+
+### Fixed
+
+- **Imported history now carries the tariff rate it was charged at, and the right band.**
+  An imported half-hour's rate is divided back out of the supplier's billed cost, so it
+  inherits that cost's rounding: on one live account the 7.0004p off-peak band was stored as
+  0.070003 across ~9,500 half-hours, an earlier 7.4999p era as 0.07497, and a 9.0p era as
+  0.089985. The cost was right throughout — it is the billed figure — but the rate sat a
+  whisker off the published band, so every reader that compares a rate to the tariff
+  disagreed with it. Most visibly the rate line, which refuses a stored rate unless it falls
+  strictly between the day's two bands, and so plotted peak across half-hours the bill had
+  charged at off-peak — a legacy Intelligent smart-charge, which discounts the whole slot.
+  A one-off local pass now reads each day's bands from the account's own agreement-stitched
+  schedule and gives the block that exact rate plus the matching off-peak/peak label. It
+  knows no rates of its own: bands come from the schedule, the ex-VAT rate is re-derived
+  from the VAT calendar rather than carried over, the tolerance is a fraction of the band
+  rather than a fixed figure (the error scales with the rate), and it runs only where the
+  agreement live on that block's own date was an IOG/Intelligent tariff with two genuine
+  bands. The billed cost is never rewritten. Across three years this corrected the rate line
+  on 4,614 half-hours; segment-derived figures move by rounding only, reported in the log as
+  `cost_drift` (£0.009 over the same three years). It writes only house segments, and only
+  where the band was `standard` — the "unknown" fallback. A band the pricing path already
+  stated is never overwritten, whatever the rate says: house legitimately carries off-peak,
+  day and peak depending on which path priced the slot, so a rate is no licence to overrule
+  the supplier's own label.
+- **Legacy Intelligent rate lines follow the dispatch again.** Before IOG-SMB there is no
+  four-bucket split: a smart-charge dispatch commonly discounts the WHOLE half-hour, house
+  included. The house line was built from the tariff schedule instead of the charged figure
+  on those slots, so it plotted peak over a half-hour the bill charged at off-peak and sat
+  stranded above an EV line that had correctly dropped — the two lines separating exactly
+  where they should have moved together. The rule granting the whole-slot ride was gated on
+  the capped (SMB) era, which is the one era that does NOT have it. A pre-cap slot with a
+  dispatch now follows what it was actually charged — the house-attributed segment rate
+  where the house drew, else the block's own rate — so a part-slot dispatch billed at peak
+  still plots peak rather than being dragged down. Across a live legacy account this
+  corrected 374 of 375 dispatch half-hours (the remaining one imports 0.000 kWh); the capped
+  era is untouched. Display only — no stored rate or cost changes.
+- **IOG-SMB half-hours no longer all resolve to peak.** Octopus returns all four buckets on
+  every slot; the parser matched the legacy one-bare-label vocabulary exactly, so no
+  region-suffixed bucket ever matched. The band now comes from the bucket carrying the charge,
+  matched by name, with no region list anywhere in the tree. Costs were never affected. [#454]
+- **Imported IOG-SMB history now carries the Home/EV split from the bill.** The settled split
+  caps EV at the car's own completed-dispatch session, because Octopus's `EV_DEVICE` bucket
+  over-attributes when a home battery draws concurrently inside the dispatch window. But a
+  dispatch ceiling of zero is ambiguous — either the car did not charge, or there is no
+  dispatch data for that time at all, which is always the case for imported history since
+  Octopus serves a short rolling window and no history. Both read as "no EV", so a freshly
+  imported SMB era settled from the bill with the right totals and a house-only split,
+  discarding the EV bucket the bill had already supplied. Where the ceiling is genuinely
+  unknown the bill is now the evidence, grid-clipped; where a dispatch record exists the cap
+  is unchanged. Blocks already settled house-only are healed in place from the cached bill
+  data, without re-fetching. On a two-year import this restored 278.69 kWh of EV across 111
+  half-hours, matching the bill exactly, with total kWh and cost unchanged.
+- **…and the charts now draw that split.** Storing it was only half the job. Both
+  synthetic-EV walks keyed off the dispatch map, visiting a half-hour only if it carried a
+  completed dispatch row and consulting the stored split merely to refine one. That was
+  sound while EMT only ever saw live data, where the two coincide by construction — on a
+  live account 483 of 483 stored splits have a dispatch row. Imported history has none:
+  Octopus serves a short rolling dispatch window and keeps no history, so 0 of 111 settled
+  half-hours had one, and Usage Stats and the billing charts drew 100% house while the
+  billing summary, which sources the EV-attributed segments, showed the EV correctly.
+  Settlement now picks the authority. A settled half-hour is the bill's to describe: its
+  stored split is the answer and needs no dispatch record, and the absence of one means the
+  bill billed no EV, so a stray dispatch row no longer invents any. An unsettled half-hour
+  is still a prediction, so dispatch remains the gate exactly as before, and the stored
+  column — which is that same dispatch split priced across the cap bands — stays preferred
+  over a pro-rata carve. Charts and billing now agree to a rounding unit across a two-year
+  import; a live account's figures are unchanged.
+- **A settled cost is not a stated split.** The EV/House read path took `rate_source`
+  ('measured'/'corrected', or imported history) to mean the bill had described that
+  half-hour, and therefore read a missing split as the bill declaring no EV. But
+  `rate_source` records that the COST is settled, which is equally true of a half-hour whose
+  four-bucket device breakdown was never fetched — a legacy tariff has none, and an SMB slot
+  settled before the bucket fetch reached it keeps its breakdown NULL permanently. On those,
+  the bill has said nothing about the split, and a completed dispatch proving the car charged
+  was being discarded. The guard is now keyed on whether a device breakdown is actually held
+  for the half-hour: present and carrying no EV, the bill is believed and a stray dispatch
+  row still cannot invent any; absent, the bill is silent and dispatch decides, as before.
+  Restores 4.91 kWh of EV attribution across four half-hours on a live account.
+- **A bill that says "nothing was drawn" is an answer, not a gap.** A dispatched half-hour
+  in which nothing was actually drawn comes back from the supplier as a fully parsed
+  reading with every bucket at zero: the fetch succeeded and the figure is £0. It was
+  being filed alongside the half-hours the supplier returned nothing at all for, so nothing
+  was written, so the next pass asked again. On one live account eleven idle half-hours were
+  re-fetched every hour indefinitely, six API calls at a time, re-establishing a figure
+  already known — and occupying eleven of the forty slots each pass is allowed, crowding
+  out half-hours still waiting for a real answer. The zero is now kept as the settled figure
+  it is, and the pass returns without fetching anything. It is believed only where the
+  half-hour's own settled reading is also zero: a bill that has simply not run yet reports
+  zero as well, and that case stays retryable rather than being cached as fact. The block
+  itself is left alone, since it already records no energy and no cost, which is precisely
+  what the bill confirmed. The two outcomes are now counted apart in the log (`zero=`
+  against `absent=`), which until now could report "recovered 11/11" and "absent=11" one
+  line from each other.
+- **A settlement for one channel no longer re-prices the other.** `needs_pass2_rerun` carries
+  no channel, so an export-only settlement re-priced the import channel against unchanged kWh —
+  rewriting a settled-looking historical block a day later. A channel with no newly settled
+  figure now keeps its finalised rate and is re-costed only. [#453]
+- **A fresh install can import its whole history.** The backward API import tiles up to
+  `go_live` — the oldest block already held — so it never re-fetches a range that is present.
+  An API-only install with no sensors has no blocks at all, so that ceiling was missing and
+  Whole history refused outright, showing the raw reason code `no_go_live` in red; Date range
+  and Gap fill, which tolerate a missing ceiling, worked throughout. An empty store has
+  nothing to tile up to and no range to protect, so the ceiling is now the current half-hour.
+  The panel also stopped rendering machine reason codes: one renderer prefers the endpoint's
+  own wording, then a mapped explanation, and only falls back to the raw value.
+- **A finished import now starts the bill fetch instead of waiting for the clock.** On a
+  first import the supplier's four-bucket breakdown is the ONLY source of the Home/EV split
+  — Octopus serves a short rolling dispatch window and keeps no history, so there is no
+  completed dispatch to derive one from either — and the pass that fetches it was reachable
+  only from an hourly tick. On a fresh install that tick had already taken its slot during
+  startup, against an empty store, so an import could write 35,000 blocks and then sit
+  silent for the best part of an hour with the split visibly absent, looking for all the
+  world like a broken feature. The import's own completion now kicks it: on one live run
+  that moved the bill fetch from 21:17 to 21:02, and 438 half-hours settled in 81 seconds.
+  The hourly tick still runs as a retry, and the kick is a no-op when there is nothing
+  outstanding.
+- **Historical import distinguishes "never priced" from "retry might help".** Cost coverage is
+  tracked per tariff agreement; an era ≥95% uncosted is reported as a period Octopus never
+  priced — naming dates and tariff code, and pointing at the PDF-bill route — instead of
+  offering a Retry that cannot succeed. On a banded tariff the notice says plainly that the
+  costs read too high and EMT cannot correct them. [#455]
+- **The "no price returned" count is no longer filtered at 1.0 kWh**, which under-reported
+  ~33,500 half-hours as 2,091. [#456]
+- **Bills can correct an uncostable period without deleting anything first.** Inside an
+  agreement proven uncostable, a bill's half-hour replaces the imported kWh, rate and cost
+  together; first-man-wins is unchanged everywhere else, and live/settled and hand-corrected
+  blocks are never overwritten. The engine also stops retrying and re-verifying inside such a
+  period. [#458]
+- **The Historical Import panel no longer flips between running and finished.** Its
+  pricing-health poll is driven from eight places at once — a 4-second verify re-poll, the
+  1.5-second post-import handoff, the status poll, page load and several handlers — with no
+  request token, so whichever reply resolved LAST won regardless of which was ISSUED last.
+  A reply sent before the post-import verify had registered carried an empty status, which
+  the panel read as "no verify is running" and used to release the handoff hold: the banner
+  vanished, the picker unlocked and a terminal summary appeared, until the next reply put
+  it all back a second or two later. Stale replies are now discarded, and the hold is
+  released only on a conclusive verify status — silence means "ask again", not "finished".
+  The plan preview is also cleared once a run goes live: it is rendered once and never
+  refreshed, so on a fresh install it froze "No existing history yet" above a live count of
+  34,953 imported blocks.
+- **Historical Import panel reports what is actually happening.** Disabled buttons now look
+  disabled (app-wide); "Start import" is locked while any run or its pricing check is live; an
+  import that writes nothing no longer triggers a pricing check; "Show details" survives the
+  poll re-render; the panel and banner share one state; and a replayed summary is labelled and
+  dated. [#457]
+- **A fresh install is no longer told it is "finishing your upgrade".** The historical
+  re-price sweep has two triggers — the first run after an upgrade, and the forced pass that
+  follows every import and gap-fill — but its banner named only the first. So a brand-new
+  install that imported its history was told EMT was finishing an upgrade, on a box that had
+  never run an earlier version, and was warned to avoid restarting or rebuilding while doing
+  the very thing it had just been asked to do. The status endpoint now reports which trigger
+  armed the sweep and the banner leads with it: "Finishing your import — EMT is pricing the
+  history it just fetched". Upgrade wording is unchanged, and anything unexpected falls back
+  to it.
+- **`log_level` now works.** `run.sh` set `LOG_LEVEL` but nothing in Python read it. An
+  instance already configured with `log_level: debug` starts emitting debug logs after this
+  upgrade. [#459]
+
+### Added
+
+- Maintainer diagnostics, gated behind `log_level: debug` and invisible otherwise: the
+  pricing-health panel on Historical Import gains a scenario picker rendering it from canned
+  coverage (`pdf`, `mixed`, `partial`, `clean`), so its unhappy states can be checked without
+  an affected account. Read-only and banner-labelled. Chosen in-page rather than by URL,
+  because Home Assistant serves the add-on in an ingress iframe where a query string on the
+  address bar never reaches the document.
+
 ## [4.5.12] — 2026-09-12
 
 *Intelligent Octopus Go (IOG-SMB) only. Fixes the billed-cost settlement wrongly claiming a
@@ -357,3 +535,11 @@ IOG periods.*
 ---
 
 Released versions (**4.3.x and earlier**) are in [CHANGELOG-ARCHIVE.md](CHANGELOG-ARCHIVE.md).
+
+[#453]: https://github.com/RGx01/energy-meter-tracker-addon/issues/453
+[#454]: https://github.com/RGx01/energy-meter-tracker-addon/issues/454
+[#455]: https://github.com/RGx01/energy-meter-tracker-addon/issues/455
+[#456]: https://github.com/RGx01/energy-meter-tracker-addon/issues/456
+[#457]: https://github.com/RGx01/energy-meter-tracker-addon/issues/457
+[#458]: https://github.com/RGx01/energy-meter-tracker-addon/issues/458
+[#459]: https://github.com/RGx01/energy-meter-tracker-addon/issues/459

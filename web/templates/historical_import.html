@@ -110,12 +110,15 @@
         <div id="site-plan-rows"></div>
       </div>
       <label id="api-confirm-label" style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:8px;cursor:pointer;">
-        <input type="checkbox" id="api-confirm" onchange="document.getElementById('btn-api-start').disabled=!this.checked;">
+        <input type="checkbox" id="api-confirm" onchange="_syncStartEnabled();">
         Import these blocks (a backup is taken first). Runs in the background — you can
         leave this page; pause, resume or cancel any time.
       </label>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
         <button class="btn" id="btn-api-start" onclick="startApi()" disabled>Start import</button>
+        <span id="api-start-locked-note" style="display:none;font-size:12px;color:var(--muted);">
+          Waiting for the previous run's pricing check to finish.
+        </span>
         <button class="btn btn-secondary" id="btn-api-pause" onclick="controlApi('pause')" style="display:none;">Pause</button>
         <button class="btn btn-secondary" id="btn-api-resume" onclick="controlApi('resume')" style="display:none;">Resume</button>
         <button class="btn btn-secondary" id="btn-api-cancel" onclick="controlApi('cancel')" style="display:none;">Cancel</button>
@@ -517,7 +520,7 @@ async function bfPreview() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body) });
     var j = await r.json();
-    if (!j.ok) { out.innerHTML = '<div style="color:var(--warning);">' + _esc(j.message || j.reason || 'Not available') + '</div>'; return; }
+    if (!j.ok) { out.innerHTML = '<div style="color:var(--warning);">' + _esc(_bfReason(j)) + '</div>'; return; }
     bfRenderPlan(j);
   } catch (e) { out.innerHTML = '<span style="color:var(--danger);">' + _esc(e) + '</span>'; }
 }
@@ -706,10 +709,102 @@ function goStep(s){
     if(el) el.style.display = (k===s) ? "block" : "none";
   });
 }
+// Jump from the pricing-health notice straight to the bill builder. goStep() already
+// owns which step panel is visible; this also mirrors the task chooser's own selection
+// so the page doesn't end up showing the bills panel while the chooser still reads
+// "API import", and scrolls it into view because the notice sits well above it.
+// Pricing-health demo scenarios. These render the panel from canned coverage so the
+// states an operator's own (healthy) account never produces can still be looked at.
+//
+// Selected IN PAGE, not from the URL: EMT is served through Home Assistant ingress, which
+// means this document lives in an iframe. A ?health_demo= typed into the browser address
+// bar belongs to the outer HA page, so this document's location.search never sees it — the
+// first cut of this shipped exactly that way and silently did nothing. The query string is
+// still honoured as a fallback for direct-port access, where it does work.
+var _healthDemo = '';
+try{
+  _healthDemo = new URLSearchParams(location.search).get('health_demo') || '';
+}catch(e){ _healthDemo = ''; }
+
+function _healthDemoQS(){
+  return _healthDemo ? ('?demo=' + encodeURIComponent(_healthDemo)) : '';
+}
+function _healthSetDemo(v){
+  _healthDemo = v || '';
+  if(typeof loadPricingHealth === 'function') loadPricingHealth();
+}
+// The picker itself — rendered only when the server reports debug mode, so a normal user
+// never meets it even if they somehow reach this code path.
+function _healthDemoPicker(d){
+  if(!d || !d.debug) return '';
+  var opts = ['', 'pdf', 'mixed', 'partial', 'clean'].map(function(v){
+    var label = v || 'off (your real data)';
+    var sel = (v === _healthDemo) ? ' selected' : '';
+    return '<option value="' + v + '"' + sel + '>' + label + '</option>';
+  }).join('');
+  return '<div style="display:flex;align-items:center;gap:8px;margin-top:10px;'
+    + 'padding-top:8px;border-top:1px dashed var(--border,#ddd);font-size:12px;'
+    + 'color:var(--muted);">'
+    + '<span>Debug \u00b7 preview a pricing-health scenario:</span>'
+    + '<select onchange="_healthSetDemo(this.value)" style="font-size:12px;padding:1px 4px;">'
+    + opts + '</select>'
+    + '<span style="opacity:0.7;">visible because log_level is debug</span>'
+    + '</div>';
+}
+function _healthGoToBills(){
+  try{
+    var srcBtn = document.querySelector('.bf-source-btn[data-source="csv"]');
+    if(srcBtn) srcBtn.click();
+    var taskBtn = document.querySelector('.bf-scope-btn[data-scope="bills"]');
+    if(taskBtn) taskBtn.click();
+  }catch(e){ /* chooser markup changed — goStep below still gets them there */ }
+  if(typeof goStep === 'function') goStep('bills');
+  var el = document.getElementById('step-bills');
+  if(el && el.scrollIntoView) el.scrollIntoView({behavior:'smooth', block:'start'});
+}
 // The API panel (#step-intro) is API-only. Show it while an API import is live or has
 // a persisted last-run to display (poll-on-load), or when the user picks the API
 // source; hide it otherwise (fresh load with no API run, or CSV selected).
 function _setApiPanel(show){ var el=document.getElementById("step-intro"); if(el) el.style.display = show ? "block" : "none"; }
+// "2026-08-19T21:02:04.923740" -> "19 Aug 2026, 21:02". Returns '' on anything odd,
+// so a missing/garbled timestamp degrades to no date rather than to "Invalid Date".
+function _fmtWhen(iso){
+  if(!iso) return '';
+  var d = new Date(String(iso));
+  if(isNaN(d.getTime())) return '';
+  try{
+    return d.toLocaleString(undefined, {day:'numeric', month:'short', year:'numeric',
+                                        hour:'2-digit', minute:'2-digit'});
+  }catch(e){ return String(iso).substr(0,16).replace('T',' '); }
+}
+// A failed call must never show its machine reason code to a user (the `no_go_live`
+// leak). Prefer whatever human text the endpoint sent — `message`, then `note` —
+// then map the known codes, and only fall back to the raw value for something
+// genuinely unforeseen.
+var _BF_REASONS = {
+  no_api:      'Not connected to Octopus — add your API key in Settings first.',
+  no_store:    'The data store is not ready yet — try again in a moment.',
+  no_ha:       'Not connected to Home Assistant.',
+  no_loop:     'The engine is still starting — try again in a moment.',
+  no_ingester: 'The importer is not available.',
+  no_from:     'Choose a start date first.',
+  no_go_live:  'No existing history to tile up to yet.',
+  bad_range:   'That date range is not valid.',
+  bad_oldest:  'Could not read the earliest stored reading.',
+  busy:        'Another job is running — wait for it to finish.',
+  verify_active: 'The previous run’s pricing check is still finishing.',
+  migrating:   'A migration is running — try again once it completes.',
+  unconfirmed: 'Tick the confirmation box first.',
+  already_done: 'Already imported — nothing left to do.',
+  account_failed: 'Could not read your Octopus account.'
+};
+function _bfReason(d){
+  d = d || {};
+  if (d.message) return d.message;
+  if (d.note) return d.note;
+  if (d.reason && _BF_REASONS[d.reason]) return _BF_REASONS[d.reason];
+  return d.error || d.reason || 'Not available';
+}
 function _esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
 function _p(v){ return (v==null)?'—':(v*100).toFixed(2)+'p'; }     // £/kWh → p/kWh
@@ -733,8 +828,12 @@ function planApi(){
   fetch(apiUrl('/api/historical/api-import/plan'), {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ from: IMPORT_FROM })})
     .then(function(r){return r.json();}).then(function(d){
       st.textContent = '';
-      if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(d.error||d.reason||'failed')+'</span>'; return; }
-      var html = '<div style="color:var(--muted);">Tiles up to go-live '+_esc((d.go_live||'').substr(0,10))+':</div>';
+      if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(_bfReason(d))+'</span>'; return; }
+      var html = '<div style="color:var(--muted);">'
+        + (d.ceiling_source === 'now'
+             ? 'No existing history yet — imports everything up to now:'
+             : 'Tiles up to go-live '+_esc((d.go_live||'').substr(0,10))+':')
+        + '</div>';
       ["import","export"].forEach(function(chn){
         var c = (d.channels||{})[chn]; if(!c) return;
         if(!c.ok){ html += '<div style="text-transform:capitalize;">'+chn+': '+_esc(c.note||'not available')+'</div>'; return; }
@@ -803,7 +902,7 @@ function diagnoseRange(){
   fetch(apiUrl('/api/historical/import-range-diagnostic'), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
     .then(function(r){return r.json();}).then(function(d){
       st.textContent = '';
-      if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(d.error||d.reason||'failed')+'</span>'; return; }
+      if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(_bfReason(d))+'</span>'; return; }
       var html = '';
       ["import","export"].forEach(function(chn){
         var c = (d.channels||{})[chn]; if(!c) return;
@@ -836,7 +935,7 @@ function meterHistory(){
   fetch(apiUrl('/api/historical/consumption-diagnostic'), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
     .then(function(r){return r.json();}).then(function(d){
       st.textContent = '';
-      if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(d.error||d.reason||'failed')+'</span>'; return; }
+      if(!d.ok){ out.innerHTML = '<span style="color:var(--danger);">'+_esc(_bfReason(d))+'</span>'; return; }
       var html = '';
       (d.meter_points||[]).forEach(function(mp){
         var chan = mp.is_export ? 'Export' : 'Import';
@@ -878,6 +977,15 @@ var _importChecked = false, _verifyChecked = false;   // until BOTH statuses are
 // the source picker is disabled so no second run can be started. Driven purely by
 // the live job state polled from the server (pollStatus + loadPricingHealth), so a
 // page refresh re-reads it and can't get round the lock.
+// Start is enabled only when the box is ticked AND nothing is running. The checkbox
+// used to flip `disabled` directly, which re-armed Start straight through a live lock.
+function _syncStartEnabled(){
+  var cb = document.getElementById('api-confirm');
+  var b  = document.getElementById('btn-api-start');
+  if(!b) return;
+  var running = _importActive || _verifyActive || _settling;
+  b.disabled = running || !(cb && cb.checked);
+}
 function applyRunLock(){
   var running = _importActive || _verifyActive || _settling;
   // Disable the picker while a run is live OR until we've confirmed BOTH statuses
@@ -894,6 +1002,16 @@ function applyRunLock(){
     else { b.disabled = false; b.style.opacity = ''; b.style.cursor = ''; }
   });
   var pv = document.getElementById('bf-preview-btn'); if(pv && locked) pv.disabled = true;
+  // The START control, not just the picker. The server already refuses a start while an
+  // import or the post-import verify is live (409), so leaving it armed offered an action
+  // that could only end in a refusal — the worst kind of affordance. Lock the confirm box
+  // as well, or the user can simply re-arm Start by ticking it.
+  var cb = document.getElementById('api-confirm');
+  if(cb){ cb.disabled = !!locked; if(locked) cb.checked = false; }
+  var startBtn = document.getElementById('btn-api-start');
+  if(startBtn && locked) startBtn.disabled = true;
+  var lockNote = document.getElementById('api-start-locked-note');
+  if(lockNote) lockNote.style.display = locked && _verifyActive && !_importActive ? '' : 'none';
   // When unlocking, restore the API-vs-CSV availability gating (API greyed if no key).
   if(!locked && typeof bfApplyGates === 'function') bfApplyGates();
 }
@@ -919,7 +1037,9 @@ function _apiButtons(status){
   show('btn-api-cancel', active || status==='paused');
   document.getElementById('btn-api-start').disabled =
     !(document.getElementById('api-confirm') && document.getElementById('api-confirm').checked)
-    || active || status==='paused';
+    || active || status==='paused'
+    // ...and never while the run lock is on (a verify from the PREVIOUS run counts).
+    || _importActive || _verifyActive || _settling;
 }
 
 function _renderApiStatus(d){
@@ -937,6 +1057,15 @@ function _renderApiStatus(d){
     var _cb = document.getElementById('api-confirm'); if (_cb) _cb.checked = false;
   }
   st.textContent = STATUS_LABEL[status] || status;
+  if(d.persisted && status === 'done') st.textContent = 'Previous import complete';
+  // The panel used to know only about the IMPORT job, while the banner above also
+  // tracks the post-import verify. That is how a terminal "✓ Import complete" ended up
+  // sitting underneath "A backfill is running". The two now read from the same state.
+  var _tailRunning = (_verifyActive || _settling) && !_importActive;
+  var _terminal = (status === 'done' || status === 'cancelled' || status === 'error');
+  if(_tailRunning && _terminal && !d.persisted){
+    st.textContent = '\u23f3 Import complete \u2014 checking prices\u2026';
+  }
   // During the post-import tail, show the live phase so it doesn't look stalled.
   if(status==='finalising' && PHASE_LABEL[d.phase]) st.textContent = PHASE_LABEL[d.phase];
   if(d.error) st.textContent = 'Error: ' + _esc(d.error);
@@ -948,7 +1077,31 @@ function _renderApiStatus(d){
       + (w[chn]||0)+' blocks'
       + (o[chn] ? ' · back to '+_esc((o[chn]||'').substr(0,10)) : '')+'</div>';
   });
-  if(status==='done') html += '<div style="color:var(--muted);margin-top:4px;">Charts are rebuilt automatically — see the pricing health below. Undo any time via Delete Blocks → reconstructed history.</div>';
+  // A PERSISTED snapshot is the LAST completed run, replayed on any page load when no
+  // job is live. Rendered bare it reads as something that just happened — which is how
+  // "0 blocks · Charts are rebuilt automatically" ends up on screen underneath a banner
+  // saying a backfill is running. Date it, and drop the present-tense chart line.
+  if(d.persisted){
+    var when = _fmtWhen(d.finished_at);
+    html = '<div style="color:var(--muted);font-size:12px;margin-bottom:4px;">'
+      + 'Last import' + (when ? ' \u00b7 finished ' + _esc(when) : '') + '</div>' + html;
+    // A replayed summary while the tail is live: say which is which, so an old result
+    // and current activity are never mistaken for one another.
+    if(_tailRunning) html += '<div style="color:#b45309;margin-top:4px;">'
+      + '\u23f3 A pricing check is running now \u2014 its progress is below. The figures '
+      + 'above are from that earlier run.</div>';
+    if(status==='done') html += '<div style="color:var(--muted);margin-top:4px;">'
+      + 'Charts were rebuilt after that run. Undo any time via Delete Blocks \u2192 '
+      + 'reconstructed history.</div>';
+  } else if(_tailRunning && _terminal){
+    // This session's import has written everything; the verify is its tail. Describe
+    // the tail rather than declaring the whole job finished.
+    html += '<div style="color:#b45309;margin-top:4px;">'
+      + '\u23f3 All blocks written. The pricing check is still running \u2014 progress '
+      + 'is below, and prices may read high until it reaches them.</div>';
+  } else if(status==='done'){
+    html += '<div style="color:var(--muted);margin-top:4px;">Charts are rebuilt automatically — see the pricing health below. Undo any time via Delete Blocks → reconstructed history.</div>';
+  }
   out.innerHTML = html;
   _apiButtons(status);
 }
@@ -1015,6 +1168,13 @@ function pollStatus(expectStart){
       if(row) row.style.display = 'block';
       var st = document.getElementById('api-apply-status'); if(st) st.textContent = 'Starting…';
       var out = document.getElementById('api-apply-out'); if(out) out.innerHTML = '';
+      // Drop the PLAN preview once the run is live. planApi() renders it once and never
+      // refreshes it, so on a fresh install it froze "No existing history yet — imports
+      // everything up to now" (the empty-store ceiling, true when Preview plan was
+      // pressed) directly above a live "34,953 blocks" from this very poll. A forecast
+      // and an outcome contradicting each other in the same panel; the live status below
+      // says everything the plan did.
+      var _plan = document.getElementById('api-plan-out'); if(_plan) _plan.innerHTML = '';
     } else if(status !== 'idle'){
       _expectingJob = false;   // terminal (done/cancelled/error) — stop expecting
       // Terminal / persisted run (done / cancelled / error). Show the SUMMARY only,
@@ -1112,6 +1272,13 @@ var _verifyTimer = null;
 // server-side just after the import→verify handoff is picked up live, instead of
 // the panel sitting on the PREVIOUS run's 'Up to date' verdict until a manual reload.
 var _verifyWatchUntil = 0;
+// loadPricingHealth is driven from eight places (a 4s verify re-poll, the 1.5s post-import
+// handoff, pollStatus, DOMContentLoaded and several handlers), so several fetch trains can
+// be in flight at once. Without a token the LAST response to resolve wins regardless of
+// which was ISSUED last, and a reply that predates the verify job — status empty, so
+// vActive false — clobbers the live state, dropping the banner and unlocking the picker
+// until the next reply puts it back. That is the few-second flip-flop.
+var _healthReq = 0;
 function _fmtDur(s){
   s = Math.max(0, parseInt(s,10)||0);
   if(s < 60) return s + 's';
@@ -1146,20 +1313,40 @@ function loadPricingHealth(){
     return;
   }
   var vs = document.getElementById('verify-status'); if(vs) vs.innerHTML = '';  // merged in here now
+  var _myReq = ++_healthReq;
   Promise.all([
-    fetch(apiUrl('/api/historical/api-import/health')).then(function(r){return r.json();}).catch(function(){return null;}),
+    fetch(apiUrl('/api/historical/api-import/health' + _healthDemoQS())).then(function(r){return r.json();}).catch(function(){return null;}),
     fetch(apiUrl('/api/historical/api-import/verify-status')).then(function(r){return r.json();}).catch(function(){return null;})
   ]).then(function(res){
+    if(_myReq !== _healthReq) return;   // a newer request has been issued — this reply is stale
     var d = res[0] || {}, v = res[1] || {};
     _HEALTH_QUEUE = d.queue || { import: [], export: [] };   // slots for the CSV escape hatch
     var vst = v && v.status;
     var vActive = (vst==='running' || vst==='waiting' || vst==='paused');
-    _verifyActive = vActive;              // feed the start lock (run isn't "finished" until verify is)
-    _verifyChecked = true;
-    _settling = false;                    // verify state is now known → release the handoff hold
-    applyRunLock();
+    // CONCLUSIVE = the server actually has a verify record to report. An empty/unknown
+    // status is not "no verify is running", it is "ask again" — during the handoff the
+    // job exists server-side before it reports, and treating silence as an answer is
+    // what released the hold early and made the banner blink.
+    var vConclusive = vActive || vst==='done' || vst==='failed' || vst==='cancelled';
+    var vWatching   = Date.now() < _verifyWatchUntil;
+    if(vConclusive || !vWatching){
+      _verifyActive = vActive;            // feed the start lock (run isn't "finished" until verify is)
+      _verifyChecked = true;
+      _settling = false;                  // verify state is now known → release the handoff hold
+      applyRunLock();
+    }
     var haveHealth = !!(d && d.have);
-    if(!haveHealth && !vActive && vst!=='done'){ el.innerHTML = ''; if(_verifyTimer){clearTimeout(_verifyTimer);_verifyTimer=null;} return; }
+    if(!haveHealth && !vActive && vst!=='done'){
+      // Nothing to report. In debug still render the picker, otherwise the only way to
+      // reach the demo is to already have the very state the demo exists to simulate.
+      el.innerHTML = d.debug
+        ? '<div class="card"><strong style="font-size:14px;">Pricing health</strong>'
+          + '<div style="font-size:12px;color:var(--muted);margin-top:4px;">'
+          + 'No import health recorded yet.</div>' + _healthDemoPicker(d) + '</div>'
+        : '';
+      if(_verifyTimer){clearTimeout(_verifyTimer);_verifyTimer=null;}
+      return;
+    }
 
     var raised = d.raised||0, rec = d.auto_recovered||0, rem = d.remaining||0;
     var range = (d.from && d.to)
@@ -1178,8 +1365,17 @@ function loadPricingHealth(){
         + 'background:rgba(21,128,61,0.10);border-radius:999px;padding:2px 10px;">\u2713 Up to date</span>';
     }
 
+    var demoTag = d.demo
+      ? '<span style="font-size:11px;font-weight:700;color:#7c2d12;background:#fed7aa;'
+        + 'border-radius:4px;padding:1px 6px;letter-spacing:0.04em;">DEMO: '
+        + _esc(d.demo).toUpperCase() + '</span>'
+      : '';
     var head = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">'
-      + '<strong style="font-size:14px;">Pricing health</strong>' + badge + '</div>'
+      + '<strong style="font-size:14px;">Pricing health</strong>' + demoTag + badge + '</div>'
+      + (d.demo ? '<div style="font-size:12px;color:#7c2d12;margin-bottom:6px;">'
+          + 'Synthetic data \u2014 nothing here reflects your account. Drop '
+          + '<code>?health_demo=\u2026</code> from the URL to return to the real figures.'
+          + '</div>' : '')
       + (range ? '<div style="font-size:12px;color:var(--muted);margin-bottom:8px;">'+range+'</div>' : '');
 
     var intro = '<div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:8px;">'
@@ -1196,7 +1392,91 @@ function loadPricingHealth(){
           raised + ' half-hour' + (raised===1?'':'s') + ' came back without a price', 'raised at import');
         if(rec > 0) body += _healthRow('check','#15803d',
           rec + ' auto-recovered on the calm retry', 'recovered', 'rgba(21,128,61,0.08)');
-        if(rem > 0){
+        // ---- Tariff periods Octopus never priced ----------------------------------
+        // An era at or above the threshold isn't a starved fetch, it's a product whose
+        // per-slot costs Octopus doesn't publish. Retrying returns the same empty answer
+        // every time, so don't offer it here — send them to their bills instead, which
+        // is the only source that actually has the money for those months.
+        var pdfEras = (d.eras||[]).filter(function(e){ return e.verdict === 'pdf'; });
+        if(pdfEras.length){
+          // Spell out the exact span to collect bills for — "re-import this period" is
+          // not actionable unless you know which months to dig out.
+          var _lo = pdfEras.map(function(e){ return (e.from||'').substr(0,10); })
+                           .filter(Boolean).sort()[0] || '';
+          var _hiRaw = pdfEras.map(function(e){ return e.to ? (e.to||'').substr(0,10) : ''; });
+          var billSpan = _hiRaw.indexOf('') >= 0
+            ? (_esc(_lo) + ' to now')
+            : (_esc(_lo) + ' to ' + _esc(_hiRaw.sort().slice(-1)[0]));
+          var rows = pdfEras.map(function(e){
+            var from = _esc((e.from||'').substr(0,10));
+            var to   = e.to ? _esc((e.to||'').substr(0,10)) : 'now';
+            return '<div style="margin:4px 0 0 12px;font-size:12px;color:#b45309;">'
+              + from + ' \u2192 ' + to
+              + ' <span style="color:var(--muted);">\u00b7 ' + _esc(e.tariff_code||'') + ' \u00b7 '
+              + e.uncosted.toLocaleString() + ' of ' + e.slots.toLocaleString()
+              + ' half-hours (' + e.uncosted_pct + '%)</span></div>';
+          }).join('');
+          body += '<div style="padding:8px 12px;background:rgba(180,83,9,0.08);'
+            + 'border-radius:6px;margin-top:6px;">'
+            + '<div style="display:flex;align-items:center;gap:10px;">'
+            + '<span style="color:#b45309;">\u25cf</span>'
+            + '<span style="font-size:13px;color:#b45309;font-weight:600;">'
+            + (pdfEras.some(function(e){ return e.banded; })
+                ? (pdfEras.length===1 ? 'This period was not costed correctly'
+                                      : 'These periods were not costed correctly')
+                  + ' \u2014 and EMT cannot fix it on its own'
+                : 'Octopus didn\u2019t publish half-hourly costs for '
+                  + (pdfEras.length===1 ? 'this tariff period' : 'these tariff periods'))
+            + '</span></div>'
+            + rows
+            // A banded, dispatch-aware tariff (Intelligent Octopus and friends) cannot be
+            // priced from published rates alone: a smart-charge session OUTSIDE the fixed
+            // off-peak window is billed at the off-peak rate, and nothing in the
+            // consumption feed says when one happened. Those half-hours get the peak rate
+            // and read too high. On a single-rate tariff there is no such ambiguity, so
+            // say so rather than alarming someone whose figures are genuinely correct.
+            + '<div style="font-size:12px;color:var(--muted);margin:8px 0 0 12px;line-height:1.6;">'
+            + (pdfEras.some(function(e){ return e.banded; })
+                ? 'Octopus supplied your usage for '
+                  + (pdfEras.length===1 ? 'this period' : 'these periods')
+                  + ' but <strong>not what it charged you</strong>, so EMT could only '
+                  + 'multiply each half-hour by the published tariff rate. '
+                  + '<strong>On Intelligent Octopus that is not the real cost.</strong> '
+                  + 'When your car charges outside the usual off-peak window Octopus still '
+                  + 'bills it at the off-peak rate \u2014 nothing in the data tells EMT that '
+                  + 'happened, so those half-hours were charged at the peak rate instead and '
+                  + 'can read <strong>several times too high</strong>.'
+                  + '<br><br><strong>EMT has no way to detect or correct this.</strong> The '
+                  + 'costs are not available from the API at any level of detail \u2014 '
+                  + 'half-hourly, daily or monthly \u2014 so retrying cannot help. The only '
+                  + 'way to price '
+                  + (pdfEras.length===1 ? 'this period' : 'these periods')
+                  + ' correctly is to re-import from your <strong>PDF bills</strong>, which '
+                  + 'list the real half-hourly charges. Gather the bills covering '
+                  + billSpan + ' and run them through the bill importer below \u2014 '
+                  + '<strong>nothing needs deleting first</strong>. Half-hours in '
+                  + (pdfEras.length===1 ? 'this period' : 'these periods')
+                  + ' are replaced with the billed figures; everything outside '
+                  + (pdfEras.length===1 ? 'it' : 'them')
+                  + ' is left exactly as it is, and live meter readings and any '
+                  + 'corrections you made are never overwritten.'
+                : 'Your usage and prices for these months are complete \u2014 this tariff '
+                  + 'has a single rate, so EMT can price every half-hour exactly. What\u2019s '
+                  + 'missing is only Octopus\u2019s own billed figure to check them against, '
+                  + 'and retrying won\u2019t produce it. Importing the <strong>PDF bills</strong> '
+                  + 'would add it, if you want the cross-check.')
+            + '</div>'
+            + '<div style="margin:8px 0 0 12px;">'
+            + '<button class="btn btn-secondary" style="font-size:12px;padding:2px 10px;" '
+            + 'onclick="_healthGoToBills()">Build a CSV from your bills \u2192</button>'
+            + '</div></div>';
+        }
+
+        // Retry is offered only for what a re-fetch could actually recover: slots outside
+        // an era we already know Octopus never prices.
+        var pdfCovered = pdfEras.reduce(function(n, e){ return n + e.uncosted; }, 0);
+        var retryable = Math.max(0, rem - pdfCovered);
+        if(retryable > 0){
           // Guard: while the verify pass is live it's already fetching from Octopus
           // on the shared rate-limit allowance. A manual Retry would launch a SECOND
           // concurrent API pass competing for the same budget, so defer it until
@@ -1205,11 +1485,11 @@ function loadPricingHealth(){
             ? '<button class="btn btn-secondary" disabled title="A pricing check is running \u2014 retry becomes available once it finishes." '
               + 'style="margin-left:auto;font-size:12px;padding:2px 10px;opacity:0.5;cursor:not-allowed;">Retry after verify</button>'
             : '<button class="btn btn-secondary" style="margin-left:auto;font-size:12px;padding:2px 10px;" '
-              + 'onclick="repriceQueue(this)">Retry '+rem+'</button>';
+              + 'onclick="repriceQueue(this)">Retry '+retryable+'</button>';
           body += '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;'
             + 'background:rgba(180,83,9,0.08);border-radius:6px;margin-top:6px;">'
             + '<span style="color:#b45309;">\u25cf</span>'
-            + '<span style="font-size:13px;color:#b45309;">'+rem+' still need a retry</span>'
+            + '<span style="font-size:13px;color:#b45309;">'+retryable+' still need a retry</span>'
             + retryBtn + '</div>';
           if(vActive){
             body += '<div style="font-size:12px;color:var(--muted);margin:4px 0 0 12px;">'
@@ -1217,7 +1497,7 @@ function loadPricingHealth(){
               + 'retry re-enables once it finishes, if any still need it.</div>';
           }
           body += _healthEscapeHatch();      // last resort: fill these slots from CSV
-        } else {
+        } else if(!pdfEras.length){
           body += _healthRow('check','#15803d','All prices recovered \u2014 nothing outstanding', '', 'rgba(21,128,61,0.08)');
         }
       } else {
@@ -1273,12 +1553,20 @@ function loadPricingHealth(){
     // is active (or slots still need a retry) keep it fully expanded.
     var collapse = (!vActive && rem === 0);
     var inner = collapse
-      ? (head + '<details style="margin-top:2px;">'
+      ? (head + '<details id="health-details"' + (_healthDetailsOpen ? ' open' : '') + ' style="margin-top:2px;">'
          + '<summary style="cursor:pointer;font-size:12px;color:var(--muted);">Show details</summary>'
          + '<div style="margin-top:8px;">' + intro + body + '</div></details>')
       : (head + intro + body);
+    // Picker last, OUTSIDE the collapse so it stays reachable on a settled import (the
+    // very case where the panel is collapsed and there is nothing to look at).
     el.innerHTML = '<div style="border:1px solid var(--border);border-radius:8px;padding:12px 14px;">'
-      + inner + '</div>';
+      + inner + _healthDemoPicker(d) + '</div>';
+    // The panel is re-rendered wholesale every poll (2-4s while a check is live), which
+    // destroys the <details> element and with it the user's expanded/collapsed choice —
+    // so it snapped shut under them until polling stopped. Remember the choice and
+    // re-apply it, so expanding mid-run sticks.
+    var _dt = document.getElementById('health-details');
+    if(_dt) _dt.addEventListener('toggle', function(){ _healthDetailsOpen = this.open; });
 
     if(vActive) _lastActiveAt = Date.now();
     if(_verifyTimer){ clearTimeout(_verifyTimer); _verifyTimer = null; }
@@ -1296,6 +1584,8 @@ function loadVerifyStatus(){ loadPricingHealth(); }
 // the CSV reprice path (reprice-from-csv updates the block cost in place + clears
 // the slot from the queue). Set from /health on each render.
 var _HEALTH_QUEUE = { import: [], export: [] };
+// Survives the panel's re-render (see loadPricingHealth). Starts closed, as before.
+var _healthDetailsOpen = false;
 function _healthEscapeHatch(){
   var q = _HEALTH_QUEUE || {};
   var chans = ['import','export'].filter(function(c){ return (q[c]||[]).length; });

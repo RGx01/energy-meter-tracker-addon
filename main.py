@@ -12,6 +12,7 @@ Starts:
 
 import asyncio
 import logging
+import os
 import sys
 
 from ha_client import HAClient
@@ -19,8 +20,13 @@ from engine import engine_startup, engine_loop_task, kraken_poll_task, setup, DA
 import web.server as server
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
+# run.sh resolves the add-on's `log_level` option into LOG_LEVEL for both Supervised and
+# standalone startup, but nothing ever read it — the documented option did nothing. Honour
+# it here so "debug mode" means what it says (it also gates operator-only UI affordances;
+# see engine.debug_mode).
+_LEVEL = getattr(logging, (os.environ.get("LOG_LEVEL") or "info").strip().upper(), None)
 logging.basicConfig(
-    level=logging.INFO,
+    level=_LEVEL if isinstance(_LEVEL, int) else logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
     stream=sys.stdout,

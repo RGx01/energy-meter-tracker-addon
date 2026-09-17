@@ -2590,7 +2590,9 @@ class TestMaybeSetupMini(unittest.TestCase):
 
 class TestKrakenBackfillDays(unittest.TestCase):
     """Fresh DB (no blocks) must NOT backfill — return 0 — to avoid pulling
-    ~400 days (~19k rows) to reconcile blocks that don't exist."""
+    ~400 days (~19k rows) to reconcile blocks that don't exist. The same applies
+    when every block is already settled or imported: see
+    tests/test_backfill_window.py for that coverage."""
 
     def setUp(self):
         self._orig_store = engine._store
@@ -2599,9 +2601,14 @@ class TestKrakenBackfillDays(unittest.TestCase):
         engine._store = self._orig_store
 
     class _Store:
+        """`oldest` is the oldest block AWAITING SETTLEMENT — what now sizes the
+        window. An imported block already carries the supplier's figure and is
+        excluded by _UNSETTLED_WHERE, so it never reaches here."""
         def __init__(self, oldest):
             self._oldest = oldest
-        def get_oldest_block_start(self):
+        def get_oldest_unsettled_block_start(self, *a, **kw):
+            return self._oldest
+        def get_oldest_block_start(self, *a, **kw):
             return self._oldest
 
     def test_fresh_db_no_backfill(self):
@@ -3366,7 +3373,7 @@ class TestRepairImportPricing(unittest.TestCase):
         # Force the computed rate to equal the stored rate so the reprice is a
         # genuine no-op (value unchanged → reprice_imported_block returns False).
         _saved_br = engine._billed_rate
-        engine._billed_rate = lambda segs, st, ofp, mc, kwh: 0.28124
+        engine._billed_rate = lambda segs, st, ofp, mc, kwh, **kw: 0.28124
         self.addCleanup(lambda: setattr(engine, "_billed_rate", _saved_br))
 
         client = MagicMock()

@@ -2626,7 +2626,7 @@ def api_blocks_summary():
             SELECT b.block_start, b.meter_id, m.is_sub_meter, m.parent_meter_id,
                    b.imp_kwh, b.imp_kwh_grid, b.imp_kwh_remainder,
                    b.imp_rate, b.imp_cost, b.imp_cost_remainder, b.exp_kwh, b.exp_cost,
-                   b.imp_kwh_ev, b.imp_cost_ev,
+                   b.imp_kwh_ev, b.imp_cost_ev, b.rate_source, b.source,
                    b.standing_charge, b.carbon_g,
                    b.interpolated, cp.billing_day
             FROM blocks b
@@ -2737,8 +2737,11 @@ def api_blocks_summary():
                     if _rr["imp_kwh_ev"] is not None:      # BL-9: stored, bill-authoritative
                         _stored_slot[_rr["block_start"]] = (
                             float(_rr["imp_kwh_ev"]), float(_rr["imp_cost_ev"] or 0))
+                # Slots the BILL has actually described — not merely cost-settled ones.
+                _bill_slot = store.slots_with_bill_split(_all_utc_s2, _all_utc_e2)
                 _ev_day = _dispatch_ev_split_by_bucket(
-                    _main_slot, _ev_slot, _bucket_local_day, stored_by_slot=_stored_slot)
+                    _main_slot, _ev_slot, _bucket_local_day, stored_by_slot=_stored_slot,
+                    bill_split_slots=_bill_slot)
             except Exception:
                 _ev_day = {}
             _apply_ev_split_to_summary_rows(rows, meters_list, _ev_day)
@@ -2823,6 +2826,7 @@ def api_blocks_day():
             SELECT b.block_start, b.meter_id, m.is_sub_meter,
                    b.imp_kwh, b.imp_kwh_grid, b.imp_kwh_remainder,
                    b.imp_rate, b.imp_cost, b.imp_kwh_ev, b.imp_cost_ev,
+                   b.rate_source, b.source,
                    b.exp_kwh, b.exp_cost,
                    b.standing_charge, b.carbon_g
             FROM blocks b
@@ -2897,8 +2901,10 @@ def api_blocks_day():
                     if _rr["imp_kwh_ev"] is not None:
                         _stored_slot[_rr["block_start"]] = (
                             float(_rr["imp_kwh_ev"]), float(_rr["imp_cost_ev"] or 0))
+                _bill_slot = store.slots_with_bill_split(_u_s, _u_e)
                 _ev_by_slot = _dispatch_ev_split_by_bucket(
-                    _main_slot, _ev_slot, _slot_of, stored_by_slot=_stored_slot)
+                    _main_slot, _ev_slot, _slot_of, stored_by_slot=_stored_slot,
+                    bill_split_slots=_bill_slot)
             except Exception:
                 _ev_by_slot = {}
             _apply_ev_split_to_summary_rows(
@@ -5352,6 +5358,15 @@ def api_historical_api_health():
     live from the reprice queue. Read-only."""
     try:
         import engine as _eng
+        # Read-only demo payloads so the panel's unhappy states can be inspected on a
+        # healthy account (see engine.api_import_health_demo). Never reached unless the
+        # caller asks for it by name.
+        # Operator-only. Silently ignored unless the add-on is running with
+        # `log_level: debug`, so a normal user who lands on a shared URL carrying the
+        # parameter just sees their own real figures rather than an error or a banner.
+        demo = (request.args.get("demo") or "").strip()
+        if demo and _eng.debug_mode():
+            return jsonify(_eng.api_import_health_demo(demo))
         return jsonify(_eng.api_import_health())
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -5691,8 +5706,25 @@ def api_historical_csv_apply():
         except Exception as be:
             logger.warning("csv apply: backup failed (continuing): %s", be)
         store = _get_store()
+        # Spans a previous API import proved the supplier does not cost. Inside those,
+        # and ONLY there, a bill may replace what the API import left behind (usage x
+        # published rate) instead of being skipped by first-man-wins. Live/settled
+        # readings and user corrections are still protected inside them.
+        try:
+            import engine as _eng
+            replace_ranges = _eng._uncostable_ranges("import")
+        except Exception as _rr:
+            logger.warning("csv apply: uncostable ranges unavailable (%s) — "
+                           "first-man-wins everywhere", _rr)
+            replace_ranges = []
         result = store.apply_csv_import(
-            texts, meter_id=meter_id, overrides=overrides)
+            texts, meter_id=meter_id, overrides=overrides,
+            replace_ranges=replace_ranges)
+        if result.get("blocks_replaced"):
+            logger.info("csv apply: replaced %d block(s) inside %d uncostable tariff "
+                        "period(s); %d protected (live or user-corrected)",
+                        result.get("blocks_replaced"), len(replace_ranges),
+                        result.get("blocks_protected") or 0)
         result["backup"] = backup
         # Offer a region/site confirmation for the imported span. CSV carries no
         # provenance, so the user names the site AND sets the region; skipping
@@ -5835,27 +5867,60 @@ def api_historical_csv_template():
         return jsonify({"error": str(e)}), 500
 
 
+_REPRICE_CAUSE_WINDOW_H = 12.0   # an import finishing this recently owns the sweep
+
+
+def _reprice_sweep_cause(store) -> str:
+    """Why is history being re-priced — 'import' or 'upgrade'?
+
+    The sweep has two triggers and the banner used to name only one, so a FRESH INSTALL
+    that imported its history was told EMT was "finishing your upgrade" — on a box that
+    had never run a previous version, and had just been asked to do exactly this work.
+    The verify pass runs the sweep forced after every import and gap-fill (P3.3d), so a
+    live or recently-finished run is the cause; only in its absence is this an upgrade.
+    Read-only and fail-safe: anything unexpected reads as 'upgrade', the old wording."""
+    try:
+        import engine as _eng
+        if _eng.api_import_running():
+            return "import"
+        import json as _json
+        from datetime import datetime as _dt, timedelta as _td
+        raw = store.get_kraken_state(_eng._IMPORT_RUN_KEY)
+        snap = _json.loads(raw) if raw else {}
+        fin = snap.get("finished_at")
+        if fin:
+            age = _dt.utcnow() - _dt.fromisoformat(str(fin)[:19])
+            if age < _td(hours=_REPRICE_CAUSE_WINDOW_H):
+                return "import"
+    except Exception:
+        pass
+    return "upgrade"
+
+
 @app.route("/api/reprice-history-status")
 def api_reprice_history_status():
-    """Read-only: is the historical re-price sweep still working through a backlog (the first
-    run after an upgrade)? Drives the 'finishing your upgrade' banner. `in_progress` = not done
-    AND blocks still need re-pricing. Fails safe to not-in-progress so a hiccup never nags."""
+    """Read-only: is the historical re-price sweep still working through a backlog? Drives the
+    re-pricing banner. `in_progress` = not done AND blocks still need re-pricing. `cause` says
+    whether an import or an upgrade armed it, so the banner can stop calling a fresh install's
+    own import an upgrade. Fails safe to not-in-progress so a hiccup never nags."""
     try:
         import engine as _eng
         store = _get_store()
         m = store.get_meta(_eng._REPRICE_HISTORY_MARKER, {}) or {}
         remaining = int(store.count_blocks_needing_reprice())
         done = bool(m.get("done"))
+        _ip = (not done) and remaining > 0
         return jsonify({
             "done": done,
             "remaining": remaining,
             "swept": int(m.get("swept") or 0),
             "stalled": int(m.get("stalled") or 0),
-            "in_progress": (not done) and remaining > 0,
+            "in_progress": _ip,
+            "cause": _reprice_sweep_cause(store) if _ip else None,
         })
     except Exception as e:
         logger.debug("api_reprice_history_status: %s", e)
-        return jsonify({"in_progress": False, "remaining": 0, "done": True})
+        return jsonify({"in_progress": False, "remaining": 0, "done": True, "cause": None})
 
 
 @app.route("/api/reprice-history-conformance")
@@ -6432,7 +6497,7 @@ def _dispatch_derived_ev_kwh(dispatch_rows) -> dict:
 
 
 def _dispatch_ev_split_by_bucket(main_by_slot, ev_by_slot, bucket_fn,
-                                 stored_by_slot=None) -> dict:
+                                 stored_by_slot=None, bill_split_slots=None) -> dict:
     """Grid-clip the per-slot dispatch EV to that slot's main import and apportion its
     cost, then bucket to {bucket: {"kwh","cost"}}. Pure — `main_by_slot` is
     {slot: (imp_kwh, imp_cost)}, `ev_by_slot` is {slot: kwh}.
@@ -6446,15 +6511,46 @@ def _dispatch_ev_split_by_bucket(main_by_slot, ev_by_slot, bucket_fn,
     grid import, so a caller can split a chart segment without moving any total."""
     stored_by_slot = stored_by_slot or {}
     out: dict = {}
-    for _slot, _e in ev_by_slot.items():
+    # WHETHER THE BILL HAS SPOKEN picks the authority for a slot; the dispatch map is not
+    # the index, and neither is settlement.
+    #
+    #   BILL HAS STATED THE SPLIT (a device breakdown is held for this half-hour) -> the
+    #     BILL decides. Octopus has priced it into four buckets, so the stored split IS the
+    #     answer and its ABSENCE is also an answer: the bill billed no EV here, and a
+    #     dispatch row must not manufacture one. Such slots need no dispatch record at all,
+    #     which is what makes imported history work — Octopus serves a short rolling
+    #     dispatch window and keeps no history, so no historic slot has one.
+    #   BILL SILENT -> DISPATCH decides: no completed dispatch, no EV. The stored column,
+    #     where the live split already wrote one, is that same dispatch answer priced
+    #     cap-aware across the bands, so it is preferred over re-deriving a pro-rata carve
+    #     at the block's blended rate (BL-9 — unchanged behaviour).
+    #
+    # Keyed on the breakdown, NOT on `rate_source`: that records a settled COST, which is
+    # equally true of a slot whose four buckets were never fetched. Reading the missing
+    # split as a denial hid EV on half-hours with a completed dispatch proving otherwise.
+    #
+    # bill_split_slots=None means the caller cannot say; a stored split is then taken at
+    # face value, which is the pre-existing behaviour. Sorted walk keeps sums order-stable.
+    for _slot in sorted(set(ev_by_slot) | set(stored_by_slot)):
+        _e = ev_by_slot.get(_slot, 0.0)
         _mk, _mc = main_by_slot.get(_slot, (0.0, 0.0))
         _sv = stored_by_slot.get(_slot)
-        if _sv is not None and _sv[0] > 1e-9:
+        _bill_spoke = ((_sv is not None) if bill_split_slots is None
+                       else (_slot in bill_split_slots))
+        if _bill_spoke:
+            if _sv is None or _sv[0] <= 1e-9:
+                continue                                  # the bill billed no EV this slot
             _ek = min(_sv[0], _mk) if _mk > 0 else 0.0
             _ec = _sv[1] * (_ek / _sv[0]) if _sv[0] > 0 else 0.0
         else:
-            _ek = min(_e, _mk) if _mk > 0 else 0.0        # can't exceed the grid that slot
-            _ec = _mc * (_ek / _mk) if _mk > 0 else 0.0   # cost follows the same fraction
+            if _slot not in ev_by_slot:
+                continue                                  # no dispatch -> no predicted EV
+            if _sv is not None and _sv[0] > 1e-9:
+                _ek = min(_sv[0], _mk) if _mk > 0 else 0.0
+                _ec = _sv[1] * (_ek / _sv[0]) if _sv[0] > 0 else 0.0
+            else:
+                _ek = min(_e, _mk) if _mk > 0 else 0.0    # can't exceed the grid that slot
+                _ec = _mc * (_ek / _mk) if _mk > 0 else 0.0
         if _ek <= 1e-9:
             continue
         _b = bucket_fn(_slot)

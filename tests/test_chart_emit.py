@@ -78,6 +78,48 @@ class TestChartEmit(unittest.TestCase):
         self.assertAlmostEqual(s["ev"][30], PEAK, places=4)     # idle tracks house TOU (not latched off)
         self.assertAlmostEqual(s["ev"][46], OFF,  places=4)     # idle tracks house TOU (not latched peak)
 
+    def test_precap_dispatch_house_follows_the_charged_rate(self):
+        # BL-66. Legacy Intelligent has no four-bucket split: a smart-charge dispatch
+        # commonly discounts the WHOLE half-hour, house included. The house line must
+        # follow what the slot was CHARGED, not the TOU schedule -- otherwise it plots
+        # peak over a slot billed at off-peak and strands itself above an EV line that
+        # correctly dropped. Real shape, from 2026-07-15T10:00 on a live legacy account.
+        db = [(20, _blk(OFF, [_ev(2.596, OFF, "off_peak"),
+                              {"kwh": 0.4, "inc_rate": OFF, "attribution": "house"}])),
+              (30, _blk(PEAK))]                      # idle daytime -> TOU peak, untouched
+        tou = [PEAK] * 48
+        s = chart_emit.day_rate_series(db, slots=48, block_minutes=30, capped=False,
+                                       house_tou=tou)
+        self.assertAlmostEqual(s["house"][20], OFF, places=4)   # was PEAK from house_tou
+        self.assertAlmostEqual(s["ev"][20],    OFF, places=4)
+        self.assertAlmostEqual(s["house"][30], PEAK, places=4)  # no dispatch -> still TOU
+
+    def test_precap_dispatch_all_ev_uses_the_block_rate(self):
+        # Whole half-hour went to the car, so there is no house-attributed segment to
+        # read. The block's own priced rate still carries the discount, so the line
+        # follows it rather than falling through to the schedule.
+        db = [(26, _blk(OFF, [_ev(1.436, OFF, "off_peak")]))]
+        s = chart_emit.day_rate_series(db, slots=48, block_minutes=30, capped=False,
+                                       house_tou=[PEAK] * 48)
+        self.assertAlmostEqual(s["house"][26], OFF, places=4)
+
+    def test_precap_partslot_dispatch_stays_at_peak(self):
+        # Not every legacy dispatch slot is discounted -- a part-slot charge is billed at
+        # peak. The line follows the charged figure, so it must NOT be dragged down.
+        db = [(22, _blk(PEAK, [_ev(0.204, PEAK, "peak")]))]
+        s = chart_emit.day_rate_series(db, slots=48, block_minutes=30, capped=False,
+                                       house_tou=[PEAK] * 48)
+        self.assertAlmostEqual(s["house"][22], PEAK, places=4)
+
+    def test_capped_dispatch_unchanged_by_the_precap_rule(self):
+        # Byte-identity guard: on a CAPPED day the cap branch still wins, so the SMB
+        # house line is untouched by the pre-cap rule above.
+        db = [(20, _blk(OFF, [_ev(2.0, OFF, "off_peak"),
+                              {"kwh": 0.4, "inc_rate": PEAK, "attribution": "house"}]))]
+        s = chart_emit.day_rate_series(db, slots=48, block_minutes=30, capped=True,
+                                       house_tou=[PEAK] * 48)
+        self.assertAlmostEqual(s["house"][20], OFF, places=4)   # rides the dispatch band
+
     def test_capped_idle_within_cap_diverges_from_house(self):
         # Capped day, idle daytime BEFORE any cap break: EV = off-peak (a smart charge here
         # would be within cap) while the house line sits at peak TOU -- the deliberate divergence.

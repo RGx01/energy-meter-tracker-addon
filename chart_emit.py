@@ -51,6 +51,7 @@ def day_rate_series(day_blocks, *, slots: int, block_minutes: int,
       from the authoritative cap machinery; None (or omitted) → no hold.
     """
     house_seg: dict = {}   # slot -> HOUSE rate where the house genuinely DREW (priced segment)
+    house_band: dict = {}  # slot -> the BAND the bill put it in ('off_peak'/'peak'), when known
     house_mr: dict = {}    # slot -> block-rate fallback (non-IOG / no house segment)
     ev_rate: dict = {}     # slot -> EV rate where the car DREW (segment or dispatch overlay)
     rates: set = set()     # the tariff rate values (clean off/peak extremes) for the EV baseline
@@ -74,6 +75,12 @@ def day_rate_series(day_blocks, *, slots: int, block_minutes: int,
         hk = sum(_f(x.get("kwh")) for x in hsegs)
         if hk > 1e-9:
             house_seg[hh] = sum(_f(x.get("kwh")) * _f(x.get("inc_rate")) for x in hsegs) / hk
+            # The BAND the bill put this half-hour in, where the segments carry one they
+            # were actually given. 'standard' is pricing_segments' fallback for "unknown",
+            # so only an explicit off_peak/peak counts as the bill having spoken.
+            _hb = {x.get("band") for x in hsegs if x.get("band") in ("off_peak", "peak")}
+            if len(_hb) == 1:
+                house_band[hh] = _hb.pop()
         elif mr:
             house_mr[hh] = mr
             rates.add(round(mr, 6))
@@ -140,6 +147,25 @@ def day_rate_series(day_blocks, *, slots: int, block_minutes: int,
         _stored_h = house_seg.get(hh, house_mr.get(hh))
         if capped and hh in ev_rate:
             house[hh] = round(ev_rate[hh], 6)
+        elif hh in ev_rate and _stored_h is not None:
+            # PRE-CAP (legacy Intelligent), slot with a dispatch: what the half-hour was
+            # actually CHARGED wins over the TOU schedule. Legacy has no four-bucket split
+            # — a smart-charge dispatch commonly discounts the whole half-hour, house
+            # included — but not always (a part-slot dispatch stays at peak), so the line
+            # must follow the priced figure rather than assume either. Falling through to
+            # house_tou plotted the schedule's peak on slots the bill charged at off-peak,
+            # stranding the house line above an EV line that had correctly dropped.
+            # `_stored_h` is the house-attributed segment rate where the house DREW, else
+            # the block's own rate; absent both, the TOU branch below still applies.
+            house[hh] = round(_stored_h, 6)
+        elif house_band.get(hh) in ("off_peak", "peak") and _stored_h is not None:
+            # The bill EXPLICITLY banded this half-hour, so its own priced rate wins over
+            # the schedule's prediction. This is what a legacy Intelligent dispatch looks
+            # like once the rate has been snapped to its band: an off-peak-banded slot in
+            # the middle of the peak window, sitting exactly ON the off-peak bound — which
+            # the strictly-between blend test below rejects, sending the line to the
+            # schedule's peak over a half-hour the bill charged at off-peak.
+            house[hh] = round(_stored_h, 6)
         elif (_stored_h is not None and _tlo is not None and _thi is not None
               and _tlo + 1e-9 < _stored_h < _thi - 1e-9):
             house[hh] = round(_stored_h, 6)

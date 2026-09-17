@@ -3338,6 +3338,7 @@ def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricit
             # only re-cost it against the settled kWh. (Ordering normally puts
             # reconcile after settlement, so this is belt-and-braces.)
             _override_rate = None
+            _override_why = "user correction / reconciled / measured"
             try:
                 if _store is not None:
                     _mrow = _store._conn.execute(
@@ -3351,14 +3352,34 @@ def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricit
                         _override_rate = _mrow[2]
             except Exception:
                 _override_rate = None
+            # BL-62: an EXPORT-only settlement must not re-price IMPORT. `needs_pass2_rerun`
+            # is a BLOCK-level flag with no channel (upsert_kraken_block picks imp/exp_kwh_api
+            # to decide whether the figure CHANGED, then raises one shared flag), so a poll
+            # that settles only export queues the block and the drain re-runs every channel.
+            # For import that is a no-op by construction: `chosen` falls back to `cad_kwh`,
+            # which IS the already-stored kWh — there is nothing to re-cost. Yet the else-branch
+            # below re-resolves the dispatch overlay and re-runs the IOG split, which CAN move a
+            # historical rate. The 2026-09-13 12:00 BST case: export settled on a restart-forced
+            # Kraken poll ~30 h after the slot; the overlay itself refused (0.012 kWh < the 0.10
+            # over-report floor, logged) but `_apply_iog_split` carries no floor, so the capped
+            # seam repriced the slot peak -> off-peak (0.323092 -> 0.054917) on a block whose
+            # import had never settled. No settled import figure => keep the finalised rate.
+            # Only a genuine import settlement (or an explicit CAD switch) may re-resolve it.
+            # A missing/zero stored rate still falls through, so `_resolve_block_rate`'s
+            # zero/missing-rate REPAIR — the reason that branch exists — is untouched.
+            if _override_rate is None and use_dcc and dcc_kwh is None:
+                _stored_rate = imp_ch.get("rate")
+                if _stored_rate:
+                    _override_rate = float(_stored_rate)
+                    _override_why = "import not settled (export-only settlement)"
             if _override_rate is not None:
-                # user correction / dispatch reconciliation — keep the stored rate, only
-                # re-cost to the settled kWh; no overlay/split/persist so the override is
-                # never stomped. ex-VAT is still derived (from that same rate).
+                # user correction / dispatch reconciliation / unsettled import — keep the
+                # stored rate, only re-cost to the chosen kWh; no overlay/split/persist so the
+                # rate is never stomped. ex-VAT is still derived (from that same rate).
                 rate = _override_rate
-                logger.info("_rerun_pass2: %s rate override preserved (%.5f) — "
-                            "re-costed to settled kWh (not re-resolved)",
-                            block.get("start", ""), rate)
+                logger.info("_rerun_pass2: %s rate preserved (%.5f) — %s; re-costed to "
+                            "chosen kWh (not re-resolved)",
+                            block.get("start", ""), rate, _override_why)
                 imp_ch["rate"] = rate
                 imp_ch["kwh"] = chosen
                 imp_ch["kwh_total"] = chosen
@@ -5778,18 +5799,37 @@ _kraken_mini_last_register = None   # {"ts": boundary_iso, "value": register}
 
 
 def _kraken_backfill_days() -> int:
-    """Compute the first-run backfill window: from the oldest block to now,
-    capped. Beyond the oldest block, DCC rows have no block to attach to.
+    """Compute the first-run backfill window: from the oldest block STILL AWAITING
+    settlement to now, capped. Beyond the oldest block, DCC rows have no block to
+    attach to.
 
     Fresh DB (no blocks): return 0 — do NOT backfill. There are no blocks to
     reconcile, so pulling ~400 days (~19k half-hourly rows) is wasted work and
     needless API load. The first poll then starts the cursor at 'now' and only
-    tracks forward. A deliberate historical-import action can be added later."""
+    tracks forward. A deliberate historical-import action can be added later.
+
+    Measured from the oldest UNSETTLED block, not the oldest block outright. An
+    IMPORTED block already carries the supplier's own half-hourly figure — the
+    historical import fetched it from this same API — so re-fetching it settles
+    nothing. Anchoring on the oldest block meant a fresh install that imports two
+    years immediately swept the full 400-day cap: 19,129 rows per poll, every poll,
+    of figures already present (measured: 19,129 of 19,129 identical, total delta
+    0.000000 kWh). `_UNSETTLED_WHERE` already excludes `imported%`, so the same
+    predicate the poll uses to chase lagging settlement now sizes the window — and
+    the two stay consistent, since the poll floors that anchor at this horizon."""
     oldest = None
     try:
-        oldest = _store.get_oldest_block_start()
-    except Exception:
-        pass
+        oldest = _store.get_oldest_unsettled_block_start()
+    except Exception as e:
+        # Do NOT fail silently. Returning 0 is the safe direction (never hammer the API
+        # on an unknown state), but it is indistinguishable from "nothing to settle" —
+        # and it LATCHES: the ingester keeps backfill_days for its lifetime, and the
+        # poll floors its own unsettled anchor at `now - backfill_days`, so a horizon of
+        # 0 clamps that anchor to now. Settlement then quietly stops reaching back and
+        # blocks sit on estimates with no signal. Loud, so the cause is visible.
+        logger.warning("_kraken_backfill_days: could not read the oldest unsettled "
+                       "block (%s) — backfilling 0 days this run; settlement will not "
+                       "reach back until this clears", e)
     if not oldest:
         return 0
     try:
@@ -6113,25 +6153,23 @@ async def plan_api_import(requested_from=None, *, chunk_days: int = 60) -> dict:
     import api_import as _ai
     if not kraken_available():
         return {"ok": False, "reason": "no_api", "channels": {}}
-    try:
-        # Ceiling = oldest EXISTING block of ANY source (contiguity rule). A new
-        # backward import must stop at the oldest block we already have — including
-        # blocks a previous import wrote — so it only fills the remaining gap below
-        # them rather than re-fetching a range that's already present. Interior
-        # holes are handled separately by the gap-fill flow, so an earlier import
-        # can't leave a gap this ceiling would wall off.
-        go_live = _store.get_oldest_block_start()
-    except Exception:
-        go_live = None
+    # Ceiling = oldest EXISTING block of ANY source (contiguity rule). A new backward
+    # import must stop at the oldest block we already have — including blocks a
+    # previous import wrote — so it only fills the remaining gap below them rather
+    # than re-fetching a range that's already present. Interior holes are handled
+    # separately by the gap-fill flow, so an earlier import can't leave a gap this
+    # ceiling would wall off. An EMPTY store has neither concern: the ceiling is now.
+    go_live, ceiling_source = _import_ceiling()
     if not go_live:
-        return {"ok": False, "reason": "no_go_live", "channels": {},
-                "note": "no existing blocks to tile up to yet"}
+        return {"ok": False, "reason": "no_store", "channels": {},
+                "message": "The data store is not ready yet — try again in a moment."}
     disc = _kraken_discovery or {}
     # The Measurements API is a rolling ~2-year window; older data has aged out and
     # is only reachable via CSV. Cap the advertised floor there so the preview never
     # promises phantom pre-retention chunks (e.g. from an agreement that predates it).
     retention_floor = _retention_floor_iso()
     out: dict = {"ok": True, "go_live": go_live, "channels": {},
+                 "ceiling_source": ceiling_source,
                  "retention_floor": retention_floor,
                  "retention_days": _API_RETENTION_DAYS, "retention_capped": False}
     for name in ("import", "export"):
@@ -6181,6 +6219,34 @@ def _retention_floor_iso():
     from datetime import datetime, timedelta
     return (datetime.utcnow() - timedelta(days=_API_RETENTION_DAYS)
             ).replace(microsecond=0).isoformat()
+
+
+def _import_ceiling():
+    """Ceiling for a backward API import, as (iso, source).
+
+    Normally EMT's oldest EXISTING block: a backward import tiles UP TO live capture
+    and stops, so it never re-fetches a range already present (the contiguity rule).
+
+    On an EMPTY store there is nothing to tile up to and nothing to protect — no live
+    capture to stop short of, no existing range to avoid — which is the normal first
+    run of an API-only install with no sensors. Refusing there ("no_go_live") made
+    Whole history impossible on a fresh install while Date range and Gap fill, which
+    tolerate a missing ceiling, both worked. So an empty store imports up to the
+    CURRENT half-hour boundary instead; the partial in-progress slot is left alone
+    because capture owns it.
+
+    Returns (iso, "blocks") or (iso, "now"); (None, "none") only if the store is gone.
+    """
+    try:
+        go_live = _store.get_oldest_block_start()
+    except Exception:
+        go_live = None
+    if go_live:
+        return go_live, "blocks"
+    try:
+        return _snap_to_slot(_dt_now_iso_safe()), "now"
+    except Exception:
+        return None, "none"
 
 
 def _earliest_agreement_from(info: dict):
@@ -7521,7 +7587,7 @@ def _maybe_repair_stale_exc() -> None:
 
 
 def _billed_rate(rate_segs, start, off_peak, meas_cost, kwh,
-                 tol: float = 0.001):
+                 tol: float = 0.001, labelled=None):
     """£/kWh for an imported slot, choosing the right source of truth by tariff type.
 
     The rate-source axis is whether the slot carries a time-of-use (OFF_PEAK/
@@ -7551,9 +7617,17 @@ def _billed_rate(rate_segs, start, off_peak, meas_cost, kwh,
     rate all day (flat export, fixed import). Agile carries no label at all
     (off_peak None) and is resolved per-slot."""
     sched = _tariff_rate_for(rate_segs, start, off_peak)
-    # Continuous / unlabelled tariff (Agile): _tariff_rate_for used resolve() for the
+    # Continuous / UNLABELLED tariff (Agile): _tariff_rate_for used resolve() for the
     # exact per-slot published rate — always prefer it over billed jitter.
-    if off_peak is None and sched is not None:
+    #
+    # `off_peak is None` alone is NOT that test. On the 4-bucket IOG-SMB tariff a slot
+    # carrying BOTH home and EV consumption is legitimately band-ambiguous and reports
+    # off_peak None while still being a banded, dispatch-aware slot — and for an
+    # out-of-window dispatch (EV at off-peak while the house pays peak) the blended
+    # truth is cost÷kWh, not the time-of-day schedule rate. So a slot that carried any
+    # TOU label is never treated as continuous. `labelled=None` keeps the historical
+    # behaviour for callers that don't know (the label set is unavailable).
+    if off_peak is None and sched is not None and not labelled:
         return sched
     # Labelled slot (IOG import, or flat export tagged STANDARD_RATE). Decide by
     # whether the tariff is BANDED on this day. A SINGLE rate for the day (flat
@@ -7634,6 +7708,113 @@ def _reprice_suspect(channel, row, rate_segs, min_kwh: float,
     if off_peak_floor is not None and off_peak_floor > 0:
         return rate > off_peak_floor * _PEAK_BAND_FACTOR
     return False
+
+
+# Coverage at or above this fraction of a tariff agreement's CONSUMING half-hours having
+# no billed cost means Octopus is not publishing per-slot costs for that product at all —
+# not that a fetch was starved. Retrying returns the same empty answer however many times
+# it is pressed, so the panel must stop offering it and point at the PDF bills instead.
+# Evidence: one real account ran three consecutive INTELLI agreements at 100% uncosted for
+# 23 months while the flat tariff before and the IOG-SMB tariff after were both fully
+# costed; three independent day-sweeps and an 11-variant request matrix all came back
+# empty. 95% rather than 100% so a handful of recovered stragglers can't flip the verdict.
+_COST_COVERAGE_PDF_THRESHOLD = 0.95
+# ...but never on a handful of slots. 0-costed-out-of-3 is also "100% uncosted", and that
+# must not be allowed to stop work or tell a user their history is wrong. ~200 consuming
+# half-hours is about four days — enough that a run of genuinely uncosted slots means the
+# product, not a bad afternoon. One floor for BOTH the display and the skip, so the panel
+# can never say "don't retry" while the engine retries anyway.
+_COST_COVERAGE_MIN_SLOTS = 200
+_COST_COVERAGE_KEY = "import_cost_coverage"
+
+
+def _coverage_verdict(slots: int, costed: int) -> str:
+    """'pdf' (no request shape recovers these), 'partial' (a re-fetch can help), 'ok'."""
+    if slots <= 0:
+        return "ok"
+    uncosted = slots - costed
+    if not uncosted:
+        return "ok"
+    if slots >= _COST_COVERAGE_MIN_SLOTS and (uncosted / slots) >= _COST_COVERAGE_PDF_THRESHOLD:
+        return "pdf"
+    return "partial"
+
+
+def _uncostable_ranges(channel: str = "import") -> list:
+    """Date spans whose tariff agreement Octopus does not cost at all, from the coverage
+    recorded by previous chunks of this import.
+
+    Used to stop work that cannot succeed: the calm re-fetch inside the import, and the
+    deferred verify sweep. Both would otherwise spend hours of a SHARED Octopus allowance
+    re-asking for a cost that was never published — while the panel tells the user exactly
+    that. Empty until a chunk has actually established the verdict, so the first chunk in
+    any era always does the full work and nothing is skipped on an assumption.
+    """
+    out = []
+    try:
+        cov = (_store.get_meta(_COST_COVERAGE_KEY, None) or {}).get(channel) or {}
+    except Exception:
+        return out
+    for rec in cov.values():
+        slots = int(rec.get("slots") or 0)
+        costed = int(rec.get("costed") or 0)
+        if _coverage_verdict(slots, costed) == "pdf":
+            out.append({"from": rec.get("from"), "to": rec.get("to"),
+                        "tariff_code": rec.get("tariff_code")})
+    return out
+
+
+def _in_uncostable_range(ranges, start: str) -> bool:
+    """True when `start` falls inside a known-uncostable agreement (half-open)."""
+    for r in ranges or []:
+        frm, to = r.get("from"), r.get("to")
+        if frm and start >= frm and (to is None or start < to):
+            return True
+    return False
+
+
+def _era_is_banded(rate_segs, start) -> bool:
+    """True when the tariff had DISTINCT off-peak and peak rates at `start`.
+
+    This is the difference between "unverified" and "wrong". On a single-rate tariff a
+    schedule-priced half-hour is exactly right — there is only one price. On a banded,
+    dispatch-aware tariff (Intelligent Octopus and friends) it is not: a smart-charge
+    session outside the fixed off-peak window is billed at the OFF-PEAK rate, and nothing
+    in the consumption feed says when one happened, so the schedule prices it at PEAK and
+    the half-hour reads far too high (see _import_pricing_flag). Data-driven rather than
+    matching tariff-code names, so a product we have never seen classifies itself.
+    """
+    for vf, vt, sched in (rate_segs or []):
+        if sched is not None and start >= vf and (vt is None or start < vt):
+            try:
+                lo, hi = sched.day_rate_bounds(start)
+            except Exception:
+                return False
+            return lo is not None and hi is not None and abs(hi - lo) > 1e-9
+    return False
+
+
+def _agreement_era(channel: str, start: str):
+    """(tariff_code, from, to) of the agreement live at `start`, or None.
+
+    Coverage is judged PER AGREEMENT because that is the unit Octopus configures product
+    rates against — a raw whole-import count mixes a blank tariff era in with healthy ones
+    and hides both.
+    """
+    import api_import as _ai
+    info = (_kraken_discovery or {}).get(channel) or {}
+    for a in (info.get("agreements") or []):
+        code = a.get("tariff_code")
+        if not code:
+            continue
+        try:
+            vf = _ai._iso(_ai._naive_utc(a.get("valid_from"))) if a.get("valid_from") else None
+            vt = _ai._iso(_ai._naive_utc(a.get("valid_to"))) if a.get("valid_to") else None
+        except Exception:
+            continue
+        if vf and start >= vf and (vt is None or start < vt):
+            return (code, vf, vt)
+    return None
 
 
 def _import_pricing_flag(channel: str, kwh, meas_cost, buckets,
@@ -7770,15 +7951,13 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
     bounded = until_ts is not None
     if bounded and not requested_from:
         return {"ok": False, "reason": "no_from", "channels": {}}
-    try:
-        # Ceiling = oldest EXISTING block of ANY source (contiguity rule) so a new
-        # backward import stops at the oldest block we already have and only fills
-        # the remaining gap below it — see plan_api_import.
-        go_live = _store.get_oldest_block_start()
-    except Exception:
-        go_live = None
+    # Ceiling = oldest EXISTING block of ANY source (contiguity rule) so a new
+    # backward import stops at the oldest block we already have and only fills the
+    # remaining gap below it — see plan_api_import. An EMPTY store (fresh API-only
+    # install) has nothing to tile up to, so the ceiling is the current half-hour.
+    go_live, _ceiling_source = _import_ceiling()
     if not go_live and not bounded:
-        return {"ok": False, "reason": "no_go_live", "channels": {}}
+        return {"ok": False, "reason": "no_store", "channels": {}}
     disc = _kraken_discovery or {}
     out: dict = {"ok": True, "go_live": go_live, "dry_run": dry_run, "channels": {}}
     all_done = True
@@ -7980,6 +8159,7 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
 
         priced = off_peak = 0
         fb_material = fb_no_bucket = 0     # IOG-dispatch pricing diagnostic
+        era_cov: dict = {}                 # per-agreement billed-cost coverage
         fb_samples = []
         fb_starts = []                     # ALL no-cost material slots → reprice queue
         rows_to_write = []
@@ -7991,7 +8171,8 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
             # Rate: Octopus's billed cost is truth — use cost÷kWh, keeping the clean
             # scheduled rate only when it agrees (so a mis-dated price-cap change in
             # the local schedule can't stamp a rate that contradicts the bill).
-            rate = _billed_rate(rate_segs, st, ofp, meas_cost, kwh)
+            rate = _billed_rate(rate_segs, st, ofp, meas_cost, kwh,
+                                labelled=bool(r.get("buckets")))
             # Cost: exact billed figure if Measurements gave one; otherwise
             # reconstruct kWh × tariff-rate (fills the cost-missing half-hours).
             if meas_cost is not None:
@@ -8021,6 +8202,21 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
                 off_peak += 1
             # Diagnostic: a material-kWh slot Measurements gave no cost for is
             # schedule-priced and can't reflect an out-of-window IOG dispatch.
+            # Per-agreement coverage. Zero-consumption half-hours are excluded from
+            # both sides: Octopus returns a 0.00 cost for them, which would read as
+            # "priced" and quietly inflate coverage on a sparse meter.
+            if kwh > 0:
+                _era = _agreement_era(channel, st)
+                if _era:
+                    _k = f"{_era[0]}|{_era[1]}"
+                    _c = era_cov.setdefault(_k, {"tariff_code": _era[0], "from": _era[1],
+                                                 "to": _era[2], "slots": 0, "costed": 0,
+                                                 "banded": False})
+                    _c["slots"] += 1
+                    if not _c["banded"] and _era_is_banded(rate_segs, st):
+                        _c["banded"] = True
+                    if meas_cost is not None:
+                        _c["costed"] += 1
             _fb, _nb = _import_pricing_flag(channel, kwh, meas_cost, r.get("buckets"))
             if _fb:
                 fb_material += 1
@@ -8042,6 +8238,22 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
         # Total flagged this chunk BEFORE in-pass recovery reduces it — the "raised"
         # figure the post-import health summary reports.
         flags_raised_ch = fb_material
+
+        # Drop slots that sit inside an agreement an EARLIER chunk already proved Octopus
+        # does not cost. Re-fetching them cannot succeed, and queueing them would offer a
+        # Retry the panel has already said is pointless. The diagnostic counts above are
+        # deliberately left intact — "N came back without a price" stays truthful; it is
+        # only the WORK that stops.
+        _uncostable = _uncostable_ranges(channel) if channel == "import" else []
+        fb_skipped_uncostable = 0
+        if _uncostable and fb_starts:
+            _keep = [x for x in fb_starts if not _in_uncostable_range(_uncostable, x)]
+            fb_skipped_uncostable = len(fb_starts) - len(_keep)
+            if fb_skipped_uncostable:
+                logger.info("import pricing [%s]: %d slot(s) fall in a tariff period "
+                            "Octopus does not cost — not retried, not queued",
+                            channel, fb_skipped_uncostable)
+            fb_starts = _keep
         healed_in_pass = 0
         # ── In-pass cost recovery ────────────────────────────────────────────
         # The material no-cost slots above are the empty-`statistics` signature
@@ -8070,13 +8282,22 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
                     kwh = row.get("kwh") or 0.0
                     # Billed cost is truth — cost÷kWh, keeping the clean scheduled
                     # rate only when it agrees (price-cap-safe).
-                    rate = _billed_rate(rate_segs, st, ofp, mc, kwh)
+                    rate = _billed_rate(rate_segs, st, ofp, mc, kwh,
+                                        labelled=bool(node.get("buckets")))
                     if row.get("cost") is None:
                         priced += 1
                     if ofp and not row.get("_was_off_peak"):
                         off_peak += 1
                     row["cost"] = mc
                     row["rate"] = rate
+                    # Credit the recovery to its agreement — a slot healed by the calm
+                    # re-fetch IS costed, and leaving it out would understate coverage
+                    # and could tip a healthy era over the PDF threshold.
+                    _era = _agreement_era(channel, st) if (kwh or 0) > 0 else None
+                    if _era:
+                        _c = era_cov.get(f"{_era[0]}|{_era[1]}")
+                        if _c and _c["costed"] < _c["slots"]:
+                            _c["costed"] += 1
                     # BL-23 (4.2): the recovered node carries the exact ex-VAT cost too.
                     _ce = node.get("cost_excl")
                     if _ce is not None:
@@ -8123,6 +8344,29 @@ async def import_api_history(requested_from=None, *, chunk_days: int = 60,
                 _store.add_reprice_queue(channel, fb_starts)
             except Exception as _qe:
                 logger.warning("import reprice queue: persist failed: %s", _qe)
+
+        # Persist per-agreement coverage every chunk — unconditionally, unlike the
+        # flag diagnostic above. A fully-costed era is just as much a finding as a blank
+        # one: it is what lets the panel say "this tariff period is fine, that one never
+        # had costs" instead of lumping the whole import into a single number.
+        if era_cov and not dry_run:
+            try:
+                _cov = _store.get_meta(_COST_COVERAGE_KEY, None) or {}
+                _ch = _cov.get(channel) or {}
+                for _k, _v in era_cov.items():
+                    _prev = _ch.get(_k) or {"tariff_code": _v["tariff_code"],
+                                            "from": _v["from"], "to": _v["to"],
+                                            "slots": 0, "costed": 0, "banded": False}
+                    _prev["slots"] += _v["slots"]
+                    _prev["costed"] += _v["costed"]
+                    _prev["banded"] = bool(_prev.get("banded")) or bool(_v.get("banded"))
+                    _prev["to"] = _v["to"]        # an open agreement may have gained an end
+                    _ch[_k] = _prev
+                _cov[channel] = _ch
+                _cov["updated_at"] = _dt_now_iso_safe()
+                _store.set_meta(_COST_COVERAGE_KEY, _cov)
+            except Exception as _ce2:
+                logger.warning("import cost coverage: persist failed: %s", _ce2)
 
         written = 0
         if not dry_run and rows_to_write:
@@ -8386,7 +8630,8 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                 confirmed.append(st)
                 ofp = r.get("off_peak")
                 kwh = r.get("kwh") or 0
-                rate = _billed_rate(rate_segs, st, ofp, mc, kwh)
+                rate = _billed_rate(rate_segs, st, ofp, mc, kwh,
+                                    labelled=bool(r.get("buckets")))
                 if _store.reprice_imported_block(st, meter_id, channel, rate, mc,
                                                  cost_exc=r.get("cost_excl"),
                                                  exc_source="measurement"):
@@ -8420,7 +8665,8 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                     if mc is None:
                         continue
                     new_rate = _billed_rate(rate_segs, st, r.get("off_peak"),
-                                            mc, r.get("kwh") or 0)
+                                            mc, r.get("kwh") or 0,
+                                            labelled=bool(r.get("buckets")))
                     if new_rate is None:
                         continue
                     cur_rate = cur.get("imp_rate") if _imp else cur.get("exp_rate")
@@ -8461,7 +8707,8 @@ async def repair_import_pricing(from_date=None, to_date=None, *,
                     continue
                 confirmed_ss.append(st)
                 ofp = node.get("off_peak")
-                rate = _billed_rate(rate_segs, st, ofp, mc, node.get("kwh") or 0)
+                rate = _billed_rate(rate_segs, st, ofp, mc, node.get("kwh") or 0,
+                                    labelled=bool(node.get("buckets")))
                 if _store.reprice_imported_block(st, meter_id, channel, rate, mc,
                                                  cost_exc=node.get("cost_excl"),
                                                  exc_source="measurement"):
@@ -8755,6 +9002,14 @@ async def _verify_allowance_low(headroom_frac: float) -> bool:
     return bool(rem is not None and lim and rem < headroom_frac * lim)
 
 
+def _run_wrote_blocks(job: dict) -> int:
+    """How many blocks a finished import/gap-fill job actually wrote."""
+    try:
+        return sum(int(v or 0) for v in (job.get("written") or {}).values())
+    except Exception:
+        return 0
+
+
 async def run_deferred_verify_pricing(*, chunk_days: int = 30, headroom_frac: float = 0.5,
                                       wait_s: float = 60.0, max_wait_cycles: int = 120,
                                       restart: bool = True) -> dict:
@@ -8804,6 +9059,17 @@ async def run_deferred_verify_pricing(*, chunk_days: int = 30, headroom_frac: fl
                         "from": None, "to": None, "corrections": [],
                         "started_at": _dt_now_iso_safe()})
     repriced = checked = skipped = 0
+    # Agreements an import already proved Octopus does not cost. Chunks falling wholly
+    # inside one are skipped without a single API call — the sweep can only ever confirm
+    # what is already known, and it burns a shared allowance for hours doing it while the
+    # panel tells the user to use their bills instead.
+    uncostable = _uncostable_ranges("import")
+    skipped_uncostable_chunks = 0
+    if uncostable:
+        logger.info("verify pricing: %d tariff period(s) will be skipped — Octopus "
+                    "publishes no costs for them: %s", len(uncostable),
+                    ", ".join(f"{r.get('tariff_code')} {str(r.get('from'))[:10]}"
+                              f"..{str(r.get('to') or 'now')[:10]}" for r in uncostable))
     logger.info("verify pricing: starting over %s..%s in ~%d chunk(s)",
                 lo.date(), hi.date(), total_chunks)
     try:
@@ -8823,6 +9089,24 @@ async def run_deferred_verify_pricing(*, chunk_days: int = 30, headroom_frac: fl
                 logger.info("verify pricing: paused (allowance low); cursor left at %s",
                             cursor.isoformat())
                 return {"ran": True, "paused": True, "repriced": repriced}
+            # Skip only a chunk that lies ENTIRELY inside an uncostable agreement. One
+            # straddling the boundary still has costable days in it and must be checked.
+            if uncostable and _in_uncostable_range(uncostable, c_from.isoformat()) \
+                    and _in_uncostable_range(uncostable, (c_to - _td(seconds=1)).isoformat()):
+                skipped_uncostable_chunks += 1
+                cursor = c_from
+                try:
+                    _store.set_kraken_state(_VERIFY_CURSOR_KEY, cursor.isoformat())
+                except Exception:
+                    pass
+                _verify_job.update({
+                    "chunks_done": _verify_job.get("chunks_done", 0) + 1,
+                    "skipped_uncostable_chunks": skipped_uncostable_chunks,
+                    "phase": "skipping a tariff period Octopus does not cost",
+                    "from": c_from.date().isoformat(), "to": c_to.date().isoformat()})
+                await _asyncio.sleep(0)        # keep the loop cooperative
+                continue
+
             _verify_job["status"] = "running"
             _verify_job["phase"] = "verifying"
             _verify_job["from"] = c_from.date().isoformat()
@@ -8871,6 +9155,7 @@ async def run_deferred_verify_pricing(*, chunk_days: int = 30, headroom_frac: fl
             pass
         _elapsed = int(__import__("time").monotonic() - _t0)
         _verify_job.update({"status": "done", "phase": "done",
+                            "skipped_uncostable_chunks": skipped_uncostable_chunks,
                             "repriced": repriced, "checked": checked, "skipped": skipped,
                             "elapsed_s": _elapsed, "corrections": list(corrections),
                             "finished_at": _dt_now_iso_safe()})
@@ -8894,6 +9179,24 @@ async def run_deferred_verify_pricing(*, chunk_days: int = 30, headroom_frac: fl
 
         # P3.3c: the forced sweep above now covers exc (superset coverage), so the legacy exc
         # backfill is no longer run here — it stays defined but dormant.
+
+        # A bulk import finishing is the strongest signal there is that settlement work is
+        # waiting, and nothing rang the bell: _maybe_drain_measured_history() is only reached
+        # from the HOURLY branch of _tick_dispatch_capture, so a fresh install wrote ~35k
+        # blocks and then sat silent until that branch next came round — up to an hour with
+        # the EV/House split visibly absent, because on a first import the bill is the only
+        # source (Octopus serves a short rolling dispatch window, so there is no completed
+        # dispatch to derive one from either). Worse, on a fresh install the hourly branch had
+        # ALREADY run once during startup, against an empty store, taking the slot with
+        # nothing to do. Kick it here, where the whole run is genuinely finished: the import
+        # job is terminal by now (so api_import_running() no longer blocks it), the helper is
+        # backlog-gated and re-entrancy-guarded, and it schedules its own task — so this is a
+        # no-op on every subsequent import that has nothing to settle.
+        try:
+            _maybe_drain_measured_history()
+        except Exception as _dr_e:
+            logger.warning("verify pricing: measured history drain schedule failed: %s", _dr_e)
+
         return {"ran": True, "repriced": repriced, "checked": checked,
                 "skipped": skipped, "elapsed_s": _elapsed}
     except Exception as e:
@@ -8993,6 +9296,68 @@ def _persist_import_health(j: dict) -> None:
     _store.set_kraken_state(_IMPORT_HEALTH_KEY, _json.dumps(summary))
 
 
+def debug_mode() -> bool:
+    """True when the add-on is running with `log_level: debug`.
+
+    run.sh already resolves the add-on option into LOG_LEVEL for both Supervised and
+    standalone startup, so this reuses a switch the user can see and set in the add-on
+    configuration rather than inventing a hidden one. Gates operator-only affordances
+    that a normal user must never meet.
+    """
+    return (os.environ.get("LOG_LEVEL") or "").strip().lower() == "debug"
+
+
+# ── Pricing-health DEMO payloads ──────────────────────────────────────────────────────
+# An operator whose own account is healthy can never see the unhappy states of the import
+# panel — which is exactly where the wording matters most and where a regression would go
+# unnoticed. These return the REAL payload shape (so the fixtures cannot drift from the
+# contract the panel reads) with synthetic numbers. Read-only: nothing is stored, no import
+# is affected, and the panel prints a banner so demo output can never be mistaken for a
+# real run. Reached only via an explicit ?health_demo=... in the page URL.
+_HEALTH_DEMO_RANGE = {"from": "2024-08-19T19:00:00", "to": "2026-08-17T23:30:00"}
+
+
+def _demo_era(code, frm, to, slots, costed, banded=False):
+    uncosted = slots - costed
+    frac = (uncosted / slots) if slots else 0.0
+    return {"tariff_code": code, "from": frm, "to": to, "slots": slots,
+            "costed": costed, "uncosted": uncosted, "banded": banded,
+            "uncosted_pct": round(100.0 * frac, 1),
+            "verdict": _coverage_verdict(slots, costed)}
+
+
+def api_import_health_demo(scenario: str) -> dict:
+    """Canned pricing-health payloads for eyeballing the panel. See above."""
+    flat = _demo_era("E-1R-OE-FIX-12M-24-05-11-H",
+                     "2024-05-14T23:00:00", "2024-09-11T23:00:00", 1150, 1150)
+    blank = _demo_era("E-1R-INTELLI-VAR-22-10-14-H",
+                      "2024-09-11T23:00:00", "2026-08-23T23:00:00", 33573, 0, banded=True)
+    starved = _demo_era("E-1R-INTELLI-FIX-12M-25-04-10-H",
+                        "2025-04-10T23:00:00", "2026-04-10T23:00:00", 17000, 16750, banded=True)
+    smb = _demo_era("E-1R-IOG-SMB-FIX-6M-26-03-05-H",
+                    "2026-08-23T23:00:00", None, 1200, 1200)
+
+    sets = {
+        # One tariff period Octopus never priced — nothing to retry, bills are the route.
+        "pdf": ([flat, blank, smb], 2091, 0, 2091),
+        # A blank period AND a starved one: the panel must offer Retry for the 250
+        # recoverable slots while still pointing at the bills for the blank period.
+        "mixed": ([flat, blank, starved, smb], 2341, 25, 2341),
+        # Classic starved fetch — Retry is the right answer and must still be offered.
+        "partial": ([flat, starved, smb], 250, 25, 250),
+        # Everything priced.
+        "clean": ([flat, smb], 0, 0, 0),
+    }
+    eras, raised, recovered, remaining = sets.get(scenario) or sets["pdf"]
+    return {"ok": True, "have": True, "debug": True,
+            "demo": scenario if scenario in sets else "pdf",
+            "raised": raised, "auto_recovered": recovered, "remaining": remaining,
+            "blocks": sum(e["slots"] for e in eras),
+            "uncosted_total": sum(e["uncosted"] for e in eras),
+            "eras": eras, "queue": {"import": [], "export": []},
+            **_HEALTH_DEMO_RANGE}
+
+
 def api_import_health() -> dict:
     """Post-import health summary for the import page's persistent panel. Reads the
     persisted run summary and overlays the LIVE remaining-queue count, so 'still
@@ -9011,6 +9376,40 @@ def api_import_health() -> dict:
         pass
     try:
         out["remaining"] = int(_store.reprice_queue_count())
+    except Exception:
+        pass
+    # Per-agreement billed-cost coverage, with a verdict per era. This is what lets the
+    # panel distinguish "a fetch was starved, retry will help" from "Octopus does not
+    # publish per-slot costs for this product, retry returns the same empty answer".
+    # Lets the panel offer its demo picker. The picker is the only way in: EMT is served
+    # through Home Assistant ingress, i.e. inside an iframe, so a query parameter typed
+    # into the browser's address bar belongs to the OUTER HA page and never reaches this
+    # document's location.search.
+    out["debug"] = debug_mode()
+    out["eras"] = []
+    out["uncosted_total"] = 0
+    try:
+        cov = (_store.get_meta(_COST_COVERAGE_KEY, None) or {}).get("import") or {}
+        for rec in cov.values():
+            slots = int(rec.get("slots") or 0)
+            costed = int(rec.get("costed") or 0)
+            if slots <= 0:
+                continue
+            uncosted = slots - costed
+            frac = uncosted / slots
+            out["uncosted_total"] += uncosted
+            out["eras"].append({
+                "tariff_code": rec.get("tariff_code"),
+                "from": rec.get("from"), "to": rec.get("to"),
+                "slots": slots, "costed": costed, "uncosted": uncosted,
+                # Banded => schedule pricing cannot be trusted for the uncosted slots.
+                "banded": bool(rec.get("banded")),
+                "uncosted_pct": round(100.0 * frac, 1),
+                # "pdf": no request shape recovers these — send the user to their bills.
+                # "partial": some slots priced, so a calm re-fetch can genuinely help.
+                "verdict": _coverage_verdict(slots, costed),
+            })
+        out["eras"].sort(key=lambda e: str(e.get("from") or ""))
     except Exception:
         pass
     # The actual queued slots (per channel), so the panel can list "which slots
@@ -9223,10 +9622,16 @@ async def run_gap_fill_job(from_ts, to_ts, *, channels=("import", "export"),
             _persist_import_health(j)
         except Exception as _e:
             logger.warning("run_gap_fill_job: health persist failed: %s", _e)
-        try:
-            asyncio.create_task(run_deferred_verify_pricing())
-        except Exception as _e:
-            logger.warning("run_gap_fill_job: verify launch failed: %s", _e)
+        _wrote = _run_wrote_blocks(j)
+        if _wrote:
+            try:
+                asyncio.create_task(run_deferred_verify_pricing())
+            except Exception as _e:
+                logger.warning("run_gap_fill_job: verify launch failed: %s", _e)
+        else:
+            logger.info("run_gap_fill_job: nothing written — skipping the pricing "
+                        "verification pass")
+            j["verify_skipped"] = "no_blocks_written"
         j["status"] = "done"; j["phase"] = "done"
         _persist_run_status(j)     # durable summary for reload (poll-on-load)
     except Exception as e:
@@ -9332,10 +9737,23 @@ async def run_api_import_job(requested_from=None, *, chunk_days: int = 60,
                 # bulk import couldn't (the small off-peak/peak-split error). Runs
                 # DETACHED on the loop so the import job reports 'done' immediately —
                 # the verify has its own live status the UI polls.
-                try:
-                    asyncio.create_task(run_deferred_verify_pricing())
-                except Exception as _e:
-                    logger.warning("run_api_import_job: verify launch failed: %s", _e)
+                # ...but only if this run actually wrote blocks. The verify scopes
+                # itself to the WHOLE imported history, not to what this run touched, so
+                # firing it after a no-op import (an empty window — the span already
+                # covered, or older than the API retains) re-checks everything that was
+                # already verified: minutes of work and a shared API allowance spent to
+                # confirm nothing, then a "split verified" verdict for an import that
+                # imported nothing.
+                _wrote = _run_wrote_blocks(j)
+                if _wrote:
+                    try:
+                        asyncio.create_task(run_deferred_verify_pricing())
+                    except Exception as _e:
+                        logger.warning("run_api_import_job: verify launch failed: %s", _e)
+                else:
+                    logger.info("run_api_import_job: nothing written — skipping the "
+                                "pricing verification pass")
+                    j["verify_skipped"] = "no_blocks_written"
                 j["status"] = "done"
                 j["phase"] = "done"
                 return
@@ -10219,6 +10637,12 @@ async def _tick_dispatch_capture() -> None:
             await run_smb_ev_resplit()
         except Exception as e:
             logger.warning("_tick_dispatch_capture: smb ev-resplit failed: %s", e)
+        # 4.5.13: give banded-IOG blocks the tariff rate they were charged at, and the
+        # matching band label, instead of the cost-derived rate rounding left behind.
+        try:
+            await run_band_rate_snap()
+        except Exception as e:
+            logger.warning("_tick_dispatch_capture: band rate snap failed: %s", e)
         # 4.5.9: carve the PREDICTED EV/Home split onto unsettled dispatched blocks whose
         # completed dispatch landed after finalise (else the car's charge sits in House until
         # settlement). Additive, dispatch-capped; recurring (no done-marker).
@@ -10237,6 +10661,13 @@ async def _tick_dispatch_capture() -> None:
             _maybe_drain_measured_history()
         except Exception as e:
             logger.warning("_tick_dispatch_capture: measured history drain schedule failed: %s", e)
+        # Blocks already settled house-only because the dispatch ceiling was ambiguous are
+        # stamped 'measured', so the drain's backlog can never revisit them. Heal from the
+        # cached bill buckets (no API calls); empty in the steady state.
+        try:
+            run_settled_ev_split_heal()
+        except Exception as e:
+            logger.warning("_tick_dispatch_capture: settled EV split heal failed: %s", e)
         try:
             if _MEASURED_APPLY:
                 apply_measured_settled()
@@ -10695,6 +11126,30 @@ def _chart_cap_from():
 _SMB_RATE_REPAIR_DONE_KEY = "smb_rate_repair_done_v2"   # one-off (4.5.7); removed in v5.0.0
 _SMB_DEVICE_RECOST_DONE_KEY = "smb_device_recost_done"   # one-off (4.5.7); removed in v5.0.0
 _SMB_EV_RESPLIT_DONE_KEY = "smb_ev_resplit_done"   # one-off (4.5.9); removed in v5.0.0
+_BAND_SNAP_DONE_KEY = "band_rate_snap_done_v2"   # one-off (4.5.13); removed in v5.0.0
+# _v2: the v1 pass wrote bands from the RATE alone. It had no attribution filter, so it
+# relabelled EV segments the four-bucket machinery owns; it overwrote bands that were
+# already explicit rather than only filling in the "unknown" fallback; and it emitted
+# 'peak' for house on the cap-classifier's vocabulary, collapsing ECO7_DAY into it.
+#
+# NOTE house genuinely uses BOTH vocabularies, depending on which path priced the slot:
+# iog_cap.classify_slot writes off_peak/day, while recover_device_breakdown (the settled
+# four-bucket read) writes `"off_peak" if label_band(lab) else "peak"`. So a house segment
+# banded 'peak' may be perfectly correct — common on an account with no home battery, where
+# house draw lands in a peak bucket routinely. That is why v1's damage CANNOT be repaired
+# here: a relabelled segment is indistinguishable from a legitimately settled one, and a
+# blanket "house peak must be wrong" rule would destroy correct labels on exactly the
+# accounts least like the one this was found on. Bumping the key re-runs the corrected
+# pass once; a tree that took v1 needs a pre-heal backup to undo it.
+# How close a stored rate must sit to a published band to be read as that band, expressed
+# as a FRACTION of the band — never an absolute figure. The error is rounding in the
+# billed cost the rate was divided out of, so it scales with the rate: on one live account
+# 7.0004p landed 1e-6 low while 7.4999p landed 2.9e-5 low. Any constant tuned on one of
+# those silently misses the other, and another user's IOG rates are different again. A
+# banded IOG tariff separates its bands by hundreds of percent (5.493p vs 32.3092p), so
+# 0.2% cannot reach across — while a genuine transition BLEND sits far from either band
+# and is left alone, which is what keeps this from flattening real boundary slots.
+_BAND_SNAP_REL_TOL = 0.002
 
 
 def _smb_migration_overlay(store, sched, start, base_rate, kwh):
@@ -10977,6 +11432,147 @@ def _smb_ev_resplit_core(store) -> dict:
             "skipped_mixed": skipped_mixed, "kwh_moved_to_house": round(moved, 3)}
 
 
+def _band_rate_snap_core(store, limit=None) -> dict:
+    """Give every banded-IOG block the tariff rate it was actually charged at, and the band
+    label to match — reading both from the published schedule, never from a constant.
+
+    An imported half-hour's rate is divided back out of Octopus's billed cost, so it carries
+    that cost's rounding: on one live account the 7.0004p off-peak band is stored as
+    0.070003 for ~9,500 blocks, and an earlier 7.4999p era as 0.07497. Cost stays right
+    (it is the billed figure) but the RATE is a whisker off the band, and every reader that
+    compares a rate to the schedule then disagrees with it -- most visibly the rate line,
+    which refuses a stored rate unless it sits strictly between the day's bounds and so
+    plotted peak over half-hours the bill charged at off-peak.
+
+    The band is resolved per DAY from the agreement-stitched schedule (`day_rate_bounds`),
+    so it follows whatever that account's tariff actually charged, in every era it has been
+    through. Nothing here knows a rate.
+
+    Scope, deliberately narrow:
+      * the agreement live on the block's OWN date must be an IOG/Intelligent tariff --
+        `_agreement_era`, not the current tariff, so a user who has since switched is still
+        healed correctly and a non-IOG era is never touched;
+      * the day must be genuinely BANDED (min < max) -- a flat tariff has no band to snap to;
+      * the stored rate must already be within _BAND_SNAP_REL_TOL of a band.
+    `imp_cost` is never written: the bill is authoritative and stays exactly as billed.
+    Segment inc/exc move with the block, so segment-derived displays shift by rounding --
+    reported as `cost_drift` so the change is auditable rather than silent."""
+    import api_import as _ai  # noqa: F401  (imported for _agreement_era's own use)
+    import vat_calendar as _vc
+    _learned_vat = None
+    try:
+        _learned_vat = store.get_vat_calendar()
+    except Exception:
+        pass
+    sched = _kraken_rate_schedules.get("import")
+    if sched is None or sched.is_empty():
+        return {"ok": False, "reason": "no import schedule"}
+    rows = store._conn.execute(
+        "SELECT block_start, imp_rate, imp_rate_exc FROM blocks "
+        "WHERE meter_id='electricity_main' AND imp_rate IS NOT NULL AND imp_kwh > 0 "
+        "ORDER BY block_start" + (" LIMIT %d" % int(limit) if limit else "")).fetchall()
+    n_rate = n_band = n_skip_tariff = n_skip_flat = n_skip_far = 0
+    drift = 0.0
+    _band_cache: dict = {}
+    for r in rows:
+        bs = r["block_start"]
+        era = _agreement_era("import", bs)
+        code = (era[0] if era else "") or ""
+        if not ("IOG" in code.upper() or "INTELLI" in code.upper()):
+            n_skip_tariff += 1
+            continue
+        day = bs[:10]
+        if day not in _band_cache:
+            lo, hi = sched.day_rate_bounds(bs)
+            _band_cache[day] = (None if lo is None else lo / 100.0,
+                                None if hi is None else hi / 100.0)
+        lo, hi = _band_cache[day]
+        if lo is None or hi is None or (hi - lo) <= 1e-9:
+            n_skip_flat += 1
+            continue
+        cur = float(r["imp_rate"])
+        target = lo if abs(cur - lo) <= abs(cur - hi) else hi
+        if target <= 0 or abs(cur - target) / target > _BAND_SNAP_REL_TOL:
+            n_skip_far += 1                      # a genuine blend, or not this band at all
+            continue
+        # House and EV use DIFFERENT vocabularies at the same rate — that is the whole
+        # point of the four buckets (ECO7_DAY vs EV_DEVICE_PEAK). This pass only ever
+        # writes HOUSE segments, so it speaks the house vocabulary: off_peak / day.
+        band = "off_peak" if target == lo else "day"
+        moved = abs(cur - target) > 1e-12
+        if moved:
+            # DERIVE exc from the snapped inc and the statutory VAT for that date, rather
+            # than scaling the stored exc by the same ratio. Scaling preserves the stored
+            # inc/exc ratio -- which in the very era this heal exists for is ITSELF a
+            # rounding artefact (0.070003/0.06667 = 1.049993, not 1.05), so the scaled exc
+            # would inherit the error being removed. The VAT calendar is the authority and
+            # knows the rate in force on the block's own date, so a 5%/20% era is right too.
+            _exc = r["imp_rate_exc"]
+            if _exc is None:
+                new_exc = None
+            else:
+                _v = _vc.resolve_vat(bs, _learned_vat)
+                new_exc = (round(target / (1.0 + _v), 8) if _v is not None
+                           else round(float(_exc) * (target / cur), 8) if cur else _exc)
+            store._conn.execute(
+                "UPDATE blocks SET imp_rate=?, imp_rate_exc=? "
+                "WHERE block_start=? AND meter_id='electricity_main'",
+                (round(target, 8), new_exc, bs))
+            for sg in store._conn.execute(
+                    "SELECT seq, kwh, inc_rate, exc_rate FROM block_segments "
+                    "WHERE block_start=? AND channel='import' AND attribution='house'",
+                    (bs,)).fetchall():
+                _ir = float(sg["inc_rate"] or 0.0)
+                if _ir <= 0 or abs(_ir - target) / target > _BAND_SNAP_REL_TOL:
+                    continue                      # a segment on the OTHER band: leave it
+                _er = sg["exc_rate"]
+                if _er is None:
+                    _new_er = None
+                else:
+                    _v = _vc.resolve_vat(bs, _learned_vat)
+                    _new_er = (round(target / (1.0 + _v), 8) if _v is not None
+                               else round(float(_er) * (target / _ir), 8))
+                store._conn.execute(
+                    "UPDATE block_segments SET inc_rate=?, exc_rate=?, band=? "
+                    "WHERE block_start=? AND channel='import' AND seq=?",
+                    (round(target, 8), _new_er, band, bs, sg["seq"]))
+                drift += float(sg["kwh"] or 0.0) * (target - _ir)
+            n_rate += 1
+        # Fill in the UNKNOWN fallback only. 'standard' is what pricing_segments writes
+        # when it was given no band; off_peak / day / peak are statements the pricing path
+        # actually made, and overwriting one loses information this pass cannot reconstruct
+        # (an EV slot billed off-peak at the peak RATE is exactly that case).
+        _n = store._conn.execute(
+            "UPDATE block_segments SET band=? WHERE block_start=? AND channel='import' "
+            "AND attribution='house' AND band='standard' AND ABS(inc_rate - ?) <= ?",
+            (band, bs, target, target * _BAND_SNAP_REL_TOL)).rowcount
+        if _n and not moved:
+            n_band += 1
+    store._conn.commit()
+    return {"ok": True, "rate_snapped": n_rate, "band_only": n_band,
+            "cost_drift": round(drift, 6), "skipped_non_iog": n_skip_tariff,
+            "skipped_flat": n_skip_flat, "skipped_off_band": n_skip_far,
+            "scanned": len(rows)}
+
+
+async def run_band_rate_snap(force: bool = False) -> dict:
+    """One-off band-rate snap (4.5.13). Gated (`band_rate_snap_done`), self-marking,
+    idempotent; retires in v5.0.0. Local; no API. The billed cost is never touched."""
+    if _store is None:
+        return {"ok": False, "reason": "no store"}
+    if not force and _store.get_kraken_state(_BAND_SNAP_DONE_KEY):
+        return {"ok": True, "skipped": "already done"}
+    res = _band_rate_snap_core(_store)
+    if res.get("ok"):
+        import datetime as _dtm
+        _store.set_kraken_state(_BAND_SNAP_DONE_KEY,
+                                _dtm.datetime.now(_dtm.timezone.utc).isoformat())
+        logger.info("run_band_rate_snap: %s", res)
+        if res.get("rate_snapped", 0) or res.get("band_only", 0):
+            _schedule_chart_regen()
+    return res
+
+
 async def run_smb_ev_resplit(force: bool = False) -> dict:
     """One-off EV-split heal (4.5.9). Gated (`smb_ev_resplit_done`), self-marking, idempotent;
     retires in v5.0.0. Re-splits settled off-peak slots where Octopus's EV_DEVICE bucket
@@ -11045,7 +11641,7 @@ async def measure_settled_dispatched_blocks() -> dict:
             return 0.0
 
     _use_buckets = _import_is_smb_capped()
-    n_store = n_absent = n_mixed = 0
+    n_store = n_absent = n_mixed = n_zero = 0
     if _use_buckets:
         # IOG-SMB: authoritative four-bucket read (cost + split + band), ONE small-window
         # fetch (recover_device_breakdown chunks internally to dodge the complexity strip).
@@ -11062,7 +11658,29 @@ async def measure_settled_dispatched_blocks() -> dict:
             _hk, _ek = _n(node.get("home_kwh")), _n(node.get("ev_kwh"))
             cost_incl = round(_n(node.get("home_cost")) + _n(node.get("ev_cost")), 6)
             if cost_incl <= 0 and (_hk + _ek) <= 1e-9:
-                n_absent += 1
+                # BL-70: Octopus ANSWERED, and the answer is "nothing was drawn". That is a
+                # settled fact, not a missing one — the node parsed (recover_device_breakdown
+                # counts it recovered), every bucket is simply zero. Filing it under `absent`
+                # wrote nothing, so `measured_slots_missing` handed the slot straight back on
+                # the next pass: eleven dispatched-but-idle half-hours were re-fetched every
+                # hour, forever, re-proving the same true fact six GraphQL calls at a time.
+                #
+                # Cache the zero and the loop ends — `missing` goes empty and the pass returns
+                # before any fetch. But only believe it when OUR OWN settled kWh agrees: a bill
+                # that simply hasn't run yet also reports zero, and caching that would be a
+                # permanent lie. Where the block HAS energy, keep the old retry behaviour.
+                #
+                # The breakdown columns stay NULL on purpose. A zero-kWh slot has no split to
+                # state, and leaving them NULL keeps the row out of slots_with_bill_split() and
+                # run_settled_ev_split_heal() entirely. The block itself needs no stamp: it
+                # already reads imp_kwh=0 / imp_cost=0, which is what the bill just confirmed,
+                # and apply_measured_to_block rightly refuses an empty half-hour.
+                if (by_start[slot]["imp_kwh"] or 0.0) <= 1e-9:
+                    store.upsert_measured_cost(slot, mpan=mpan, cost_incl=0.0, cost_excl=0.0,
+                                               label="ZERO", kwh=0.0)
+                    n_zero += 1
+                else:
+                    n_absent += 1
                 continue
             _hre, _ere = node.get("home_rate_exc"), node.get("ev_rate_exc")
             cost_excl = (round(_hk * _n(_hre) + _ek * _n(_ere), 6)
@@ -11100,11 +11718,14 @@ async def measure_settled_dispatched_blocks() -> dict:
                 slot, mpan=mpan, cost_incl=node.get("cost_incl"),
                 cost_excl=node.get("cost_excl"), label=label, kwh=node.get("kwh"))
             n_store += 1
-    logger.info("measure_settled: candidates=%d fetched=%d stored=%d mixed=%d absent=%d "
-                "(source=%s, apply=%s)", len(rows), len(missing), n_store, n_mixed,
-                n_absent, "buckets" if _use_buckets else "single-cost", _MEASURED_APPLY)
+    # BL-70: `zero` and `absent` were one counter, which made the log self-contradictory —
+    # "recovered 11/11" on one line and "absent=11" on the next. They mean opposite things:
+    # zero = the bill stated nothing was drawn; absent = the bill said nothing at all.
+    logger.info("measure_settled: candidates=%d fetched=%d stored=%d mixed=%d zero=%d "
+                "absent=%d (source=%s, apply=%s)", len(rows), len(missing), n_store, n_mixed,
+                n_zero, n_absent, "buckets" if _use_buckets else "single-cost", _MEASURED_APPLY)
     return {"candidates": len(rows), "fetched": len(missing), "stored": n_store,
-            "mixed": n_mixed, "absent": n_absent}
+            "mixed": n_mixed, "zero": n_zero, "absent": n_absent}
 
 
 def _review_band_reason(prior_band, new_band, prior_cost, new_cost) -> str:
@@ -11247,6 +11868,55 @@ def _measured_history_backlog() -> int:
         return 0
 
 
+def run_settled_ev_split_heal(limit: int = 2000) -> dict:
+    """Re-apply the bill's EV/Home split to blocks settled WITHOUT one.
+
+    Until the ambiguous-ceiling fix, `apply_measured_to_block` treated a dispatch ceiling of
+    zero as "no EV" even where no dispatch data existed for the slot at all. On imported
+    history that is always the case — Octopus serves a short rolling dispatch window — so a
+    freshly imported IOG-SMB era settled from the bill with `rate_source='measured'`, the
+    correct total cost, and a house-only split, discarding the EV_DEVICE bucket the bill had
+    already supplied.
+
+    Those blocks are stamped `measured`, so the drain's backlog (which excludes them) will
+    never revisit them. This heals them from the `measured_cost` rows already cached locally —
+    no API calls — by re-invoking the one settle path, which is idempotent. Recurring rather
+    than marker-gated: the candidate query is empty in the steady state, so it self-heals any
+    later occurrence instead of needing a second migration. Never touches a corrected block.
+    """
+    store = _store
+    if store is None or not _import_is_smb_capped():
+        return {"ok": True, "skipped": "not applicable"}
+    try:
+        rows = store._conn.execute(
+            "SELECT b.block_start, mc.cost_incl, mc.cost_excl, mc.label "
+            "FROM blocks b JOIN measured_cost mc ON mc.slot_start = b.block_start "
+            "WHERE b.meter_id = 'electricity_main' AND b.rate_source = 'measured' "
+            "  AND b.imp_kwh_ev IS NULL AND COALESCE(b.imp_kwh, 0) > 0 "
+            "  AND COALESCE(b.rate_corrected, 0) = 0 "
+            "  AND mc.ev_kwh IS NOT NULL AND mc.ev_kwh > 0 "
+            "  AND mc.cost_incl IS NOT NULL "
+            "ORDER BY b.block_start LIMIT ?", (int(limit),)).fetchall()
+    except Exception as e:
+        logger.warning("settled EV split heal: query failed: %s", e)
+        return {"ok": False, "reason": "query_failed"}
+    if not rows:
+        return {"ok": True, "healed": 0}
+    healed = 0
+    for r in rows:
+        try:
+            if apply_measured_to_block(r["block_start"], cost_incl=float(r["cost_incl"]),
+                                       cost_excl=r["cost_excl"], label=r["label"]):
+                healed += 1
+        except Exception as e:
+            logger.warning("settled EV split heal: %s failed: %s", r["block_start"], e)
+    if healed:
+        _schedule_chart_regen()
+        logger.info("settled EV split heal: restored the bill's EV/Home split on %d "
+                    "settled block(s) that had been stored house-only", healed)
+    return {"ok": True, "healed": healed}
+
+
 def _maybe_drain_measured_history() -> None:
     """Schedule the SMB history drain as a loop TASK when a first-time / bulk import has left a
     backlog of capped slots without Octopus's billed breakdown. Guarded by an in-process flag; a
@@ -11294,7 +11964,11 @@ def apply_measured_settled() -> dict:
     both bands, with NO age-gate and NO review-flag — a divergence from EMT's prediction is
     Octopus's own bill, not an anomaly to surface. The RATE is snapped to the tariff agreement
     in apply_measured_to_block (never cost/kWh). Idempotent: once a block is rate_source=
-    'measured' it drops out of the query. Only runs when _MEASURED_APPLY. Local writes only."""
+    'measured' it drops out of the query. Only runs when _MEASURED_APPLY. Local writes only.
+
+    (BL-70: `m.cost_incl > 0` skips the cached zero rows — a half-hour the bill says drew
+    nothing has no cost to apply and no rate to snap, and apply_measured_to_block refuses it
+    on `kwh <= 1e-9` anyway. Excluding them here just saves walking them every pass.)"""
     store = _store
     if store is None or not _MEASURED_APPLY:
         return {}
@@ -11312,6 +11986,7 @@ def apply_measured_settled() -> dict:
                  AND (b.rate_source IS NULL OR b.rate_source NOT IN ('measured','corrected'))
                  AND {_SETTLEABLE_SQL}
                  AND b.block_start >= ? AND m.cost_incl IS NOT NULL
+                 AND m.cost_incl > 0
                ORDER BY b.block_start""", (mpan, _measured_floor())).fetchall()
     except Exception as e:
         logger.warning("apply_measured: query failed: %s", e)
@@ -11394,7 +12069,30 @@ def apply_measured_to_block(bs: str, *, cost_incl: float, cost_excl=None,
     _bill_ev = float(_bd["ev_kwh"]) if (_bd and _bd.get("ev_kwh") is not None) else None
     _stored_ev = row["imp_kwh_ev"]
     _stored_ev = float(_stored_ev) if (_stored_ev is not None and float(_stored_ev) > 1e-9) else 0.0
+    # A dispatch ceiling of ZERO is ambiguous. Either the car genuinely did not charge (a LIVE
+    # slot we were watching) or we hold no dispatch data for that time AT ALL — imported
+    # history, or a slot older than the oldest record we have, because Octopus serves a short
+    # rolling dispatch window and no history. Treating both as "no EV" silently discarded the
+    # bill's own EV_DEVICE bucket on every imported IOG-SMB slot: a fresh install settled 438
+    # slots from the bill, 111 of them carrying EV, and stored a house-only split because
+    # dispatch_history held six rows from that morning. Where the ceiling is genuinely UNKNOWN
+    # the settled bucket is the only evidence there is, so trust it (grid-clipped). Where a
+    # dispatch record exists for the slot, the 4.5.9 measured-is-king cap is unchanged.
+    _ceiling_unknown = False
     if _disp <= 1e-9:
+        try:
+            _seen = store._conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM dispatch_history WHERE slot_start = ?), "
+                "       (SELECT MIN(slot_start) FROM dispatch_history)", (bs,)).fetchone()
+            _row_here, _oldest = bool(_seen[0]), _seen[1]
+        except Exception:
+            _row_here, _oldest = True, None       # unsure -> keep the strict 4.5.9 behaviour
+        _imported = str(row["source"] or "").startswith("imported")
+        _pre_observation = bool(_oldest) and str(bs) < str(_oldest)
+        _ceiling_unknown = (not _row_here) and (_imported or _pre_observation)
+    if _ceiling_unknown:
+        evk = min(_bill_ev, kwh) if _bill_ev is not None else 0.0
+    elif _disp <= 1e-9:
         evk = 0.0                                 # no measured EV session -> house
     else:
         _pref = _bill_ev if _bill_ev is not None else (_stored_ev if _stored_ev > 1e-9 else _disp)

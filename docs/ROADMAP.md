@@ -13,8 +13,9 @@ Nothing in this file has shipped.*
 | 2 | BL-50 — Unify user-job mutual exclusion | architecture · correctness | v5.0.0 | ⚠️ needs issue |
 | 3 | BL-33 — Remove the one-time legacy migrations | deprecation | v5.0.0 | ⚠️ needs issue |
 | 4 | BL-61 — 4.5.7 settlement/chart cleanup follow-ups | tech-debt | v5.0.0 | ⚠️ needs issue |
-| 5 | BL-51 — Reprice banner: upgrade vs import-triggered | UI | low | ⚠️ needs issue |
-| 6 | BL-60 — Usage Stats block inspector (pre/post-settlement) | diagnostics | proposed | ⚠️ needs issue |
+| 5 | BL-63 — Two pricing models: collapse onto one (Principle 0) | architecture · first-principles | v5.0.0 | ⚠️ needs issue |
+| 6 | BL-64 — Bill-parser fixtures + a pypdf bump gate | testing · tooling | next | ⚠️ needs issue |
+| 7 | BL-60 — Usage Stats block inspector (pre/post-settlement) | diagnostics | proposed | ⚠️ needs issue |
 
 ---
 
@@ -51,8 +52,49 @@ cost/buckets, not the label, so it can collapse to a plain small-window cost fet
 `'settled'`** to match the design hierarchy — deferred from 4.5.7 because it forces a data migration of
 every existing `'measured'` block row, best batched under one migration-gated release.
 
-#### BL-51 — Reprice banner should distinguish an upgrade from an import-triggered reprice  ·  *UI · low*  ·  ⚠️ **needs issue**
-*Surfaced during 4.5.4 gap-fill testing.* The global "Finishing your upgrade" advisory (base.html) is driven by `api_reprice_history_status` → `in_progress = (not done) and count_blocks_needing_reprice() > 0`. That backlog counter (missing segments / missing exc) is driven by **both** a genuine version upgrade **and** a gap-fill / import / delete-reimport — the unified reprice-history sweep covers all of them by design (P3.3d). So after a gap fill the banner correctly fires (the sweep really is running) but mislabels it "Finishing your upgrade", even though no upgrade occurred. The behaviour is correct; only the messaging is wrong, and it double-surfaces with the Historical Import page's own Pricing-health progress. **Fix:** record *why* the sweep is running. The `reprice_history_state` marker stores `done/swept/stalled` but no trigger — add a `reason` field set at the two kickoff sites (`"upgrade"` from the startup version-change gate; `"import"` from the post-import sweep). `api_reprice_history_status` returns it; the banner branches on it — keep the "avoid restarting" upgrade advisory for `reason == "upgrade"`, and for `reason == "import"` either use neutral wording ("Re-pricing your recent import…") or suppress the global banner entirely (the import page already owns that progress). Cosmetic/UX only — no pricing or data impact. Files: `engine.py` (marker reason), `web/server.py` (`api_reprice_history_status`), `web/templates/base.html` (banner text/visibility).
+#### BL-63 — Two pricing models: decide which one is the model, and collapse onto it  ·  *architecture · first-principles · target v5.0.0*  ·  ⚠️ **needs issue**
+
+*Surfaced during the BL-62 investigation (Sept 2026), where `reprice.py` reads as the canonical pricer, carries the exact arithmetic fingerprint of the rate being chased, and has no production caller at all — which cost most of a day's misdiagnosis.*
+
+**Where it came from.** The 4.4.0 design opens (§0) with the bug class it exists to kill: *"an authoritative input changed (a dispatch completed, a block settled, a reconcile ran, the VAT calendar changed) and we updated **some** derived fields but not others, so the ex-VAT figures, or the EV split, or the segments, or the bands went stale."* Root cause 2 was named as *"derived fields maintained piecemeal — no single operation owned 'recompute everything this block derives'."* The remedy was **Principle 0** — one pure function turning a block's authoritative inputs into every derived value, with all other paths conforming — implemented as `reprice.reprice_block`, with `pricing_segments` as its representation layer and `carbon.py` as the adjacent pass.
+
+**What actually happened.** §P3.3 chose option (A), *"to remain faithful to the one model"*, staged as route → prove conformance → collapse, with (B) rejected as *"Safer; two pricing models persist."* P3.3a/b/c then built `_reprice_history_block` **inside engine.py** and flipped the sweep onto that. The routing shipped; the collapse never did. The outcome is the rejected (B).
+
+**Current state (measured on prod-dev, 15 Sept 2026).**
+- **Live model:** engine's `_reprice_history_block` + the finalise/settlement seam. This is what runs.
+- **Shelved model:** `reprice.reprice_block` (169 lines), `carbon.ev_carbon` / `house_carbon` / `carbon_from_reprice`, and 9 of 11 public functions in `pricing_segments` (the whole "legacy imp_* columns become views over the segments" projection layer). Zero production callers; ~37 test references, so the suite is green and the code reads as load-bearing.
+- **The requirement is already met by the live path.** Block-vs-segment rate agreement across every measured block since 1 Sept: **0 mismatches**. The atomic-recompute invariant was reached incrementally (BL-27 segments-as-truth, P3.3a's unified sweep, the settlement seam writing all derived fields together) rather than via Principle 0.
+
+**The residue that is NOT solved.** Derived rates are back-computed from a 6-dp rounded cost rather than carrying the canonical band rate, so they scatter: 12 measured blocks hold `imp_rate != imp_rate_ev`, worst case 1.3e-5 (0.05493 vs 0.054917). Cost impact nil — but it is exactly what let a blended rate slip past reconcile's `abs(cur_rate - off_peak) < 1e-6` band test in BL-62, silently disarming the bump revert. Any exact-equality comparison against a canonical rate is defeatable this way.
+
+**Decision required at v5.0.0** (do not act before — switching live pricing to an unexercised path is the larger risk, and the 4.4.0 doc itself rates (A) *"higher risk, perf-sensitive (a re-price per block over years)"*):
+1. **Finish the collapse** — route everything through `reprice_block`, delete engine's copy. Faithful to Principle 0; highest risk; buys an invariant already held.
+2. **Adopt the live model** — retire `reprice.py`, `carbon_from_reprice`, `ev_carbon`/`house_carbon` and the unused projection layer with their tests; record in the 4.4.0 design that Principle 0 was satisfied incrementally. Lowest risk; removes the trap that a shelved-but-tested module reads as canonical.
+3. **Keep both** — rejected: it is the status quo, and it has already cost a misdiagnosis.
+
+**Recommendation: (2), plus the rounding fix** — carry the canonical band rate instead of re-deriving it from rounded cost, or compare bands with a tolerance that reflects storage precision (1e-4, matching the existing near-identical-rate clustering). Pairs naturally with BL-33 (one-time-migration removal) and BL-61 (4.5.7 tech-debt), both already v5.0.0.
+
+#### BL-64 — Bill-parser fixtures from real bills, and a pypdf bump gate  ·  *testing · tooling · target next*  ·  ⚠️ **needs issue**
+
+*Surfaced 16 Sept 2026 while clearing `pypdf==6.18.0`. Verifying a pypdf bump needs real Octopus bills, which cannot go in the repo — so there is no CI gate and the check depends on remembering to ask for one.*
+
+**Two risks are tangled here, and only one actually needs the PDFs.** `_read_pages` is the entire pypdf surface — one function, `list[str]` out. Everything above it is pure text → `Bill`.
+
+- **Risk A — pypdf changes what it extracts.** Needs real bills; genuinely not CI-able. But it only matters on a bump, which is deliberate and infrequent.
+- **Risk B — a parser change breaks real-world bills.** Needs realistic *text*, not PDFs — so it IS CI-able, and today it is not covered. `tests/test_bill_parser.py` hand-writes an idealised summary plus synthetic HH pages of 48 identical 0.1 kWh rows: no real-bill quirks, no mid-period standing-charge change, no export MPAN alongside import.
+
+**Evidence the distinction matters.** 6.16.1 → 6.18.0 over five real bills: all five parsed to **byte-identical `Bill` objects** (7,344 HH readings, standing charges, VAT, reconciliation, zero warnings) — but the extracted **text** changed on four. Leading whitespace (`Supply number` → ` Supply number`, from 6.16.2's space-width leniency), and on the 2024-03-06 bill a day header lost its newline: `Monday\n5th February 2024` → `Monday5th February 2024`. The parser absorbed it; a slightly different layout might not. The earlier token-count comparison (13 Sept, 6.16.1 vs 6.16.2) would **not** have surfaced that — counting probe strings is not enough, and one of those probes was itself wrong (`Standing charge` vs the bills' `Standing Charge`), reporting a phantom gap.
+
+**Proposed work.**
+1. **Commit redacted text fixtures** — snapshot `_read_pages()` output from the real bills; redact MPAN / meter serial / account number / name / address / direct-debit amounts; keep kWh and rates, which are what the reconciliation check exercises. ~70 KB each, ~350 KB total, plain text so diffs stay reviewable. Re-point the parser tests at these: five genuinely-shaped bills spanning 2024–2026, including a mid-period standing-charge change and import+export MPANs.
+2. **Commit the gate, not the bills** — a `skipUnless` harness keyed on an env var (e.g. `EMT_BILL_FIXTURES`) pointing at a private directory: absent in CI, one command locally on a bump. Compares extracted text AND the parsed `Bill` across old and new pins. A working prototype exists from this investigation.
+3. **Fold it into the bump procedure** so regenerating fixtures is a planned step.
+
+**Caveats to design for.**
+- Redaction is one-way risk: a sloppy pass puts an MPAN in git history permanently. The generator needs a verification pass that greps the finished fixtures for every real identifier and fails loudly.
+- A text fixture freezes one pypdf version's output, so a bump may require regenerating it. That must be deliberate, not a surprise CI failure that invites a blind refresh.
+
+*Related: `pypdf==6.18.0` was verified against five real bills on 16 Sept 2026; `requirements.txt` still pins 6.16.1.*
 
 #### BL-60 — Usage Stats block inspector: pre/post-settlement detail for a single block  ·  *diagnostics · proposed*  ·  ⚠️ **needs issue**
 *Turns the manual forensic we keep repeating into a self-serve drill-down.* Diagnosing a single
@@ -77,7 +119,8 @@ then the reference added to its heading and to the priority table:
 - [ ] **BL-50** — Unify user-job mutual exclusion (deny + idempotent-retry)
 - [ ] **BL-33** — Remove the one-time legacy migrations (v5.0.0 deprecation)
 - [ ] **BL-61** — 4.5.7 settlement/chart cleanup follow-ups
-- [ ] **BL-51** — Reprice banner should distinguish an upgrade from an import-triggered reprice
+- [ ] **BL-63** — Two pricing models: decide which one is the model, and collapse onto it
+- [ ] **BL-64** — Bill-parser fixtures from real bills, and a pypdf bump gate
 - [ ] **BL-60** — Usage Stats block inspector: pre/post-settlement detail for a single block
 
 *Convention: reference issues as `[#nnn]` on the item heading, with the link definition at the foot
