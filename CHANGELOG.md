@@ -1,6 +1,6 @@
 # Changelog
  
-## [4.5.13] — 2026-09-15
+## [4.5.13] — 2026-09-17
 
 *Puts the tariff's own rates and bands back onto imported Intelligent Octopus history.
 A half-hour brought in from the supplier had its rate divided back out of the billed
@@ -89,6 +89,21 @@ truth about what it is doing.*
   for the half-hour: present and carrying no EV, the bill is believed and a stray dispatch
   row still cannot invent any; absent, the bill is silent and dispatch decides, as before.
   Restores 4.91 kWh of EV attribution across four half-hours on a live account.
+- **A bill that says "nothing was drawn" is an answer, not a gap.** A dispatched half-hour
+  in which nothing was actually drawn comes back from the supplier as a fully parsed
+  reading with every bucket at zero: the fetch succeeded and the figure is £0. It was
+  being filed alongside the half-hours the supplier returned nothing at all for, so nothing
+  was written, so the next pass asked again. On one live account eleven idle half-hours were
+  re-fetched every hour indefinitely, six API calls at a time, re-establishing a figure
+  already known — and occupying eleven of the forty slots each pass is allowed, crowding
+  out half-hours still waiting for a real answer. The zero is now kept as the settled figure
+  it is, and the pass returns without fetching anything. It is believed only where the
+  half-hour's own settled reading is also zero: a bill that has simply not run yet reports
+  zero as well, and that case stays retryable rather than being cached as fact. The block
+  itself is left alone, since it already records no energy and no cost, which is precisely
+  what the bill confirmed. The two outcomes are now counted apart in the log (`zero=`
+  against `absent=`), which until now could report "recovered 11/11" and "absent=11" one
+  line from each other.
 - **A settlement for one channel no longer re-prices the other.** `needs_pass2_rerun` carries
   no channel, so an export-only settlement re-priced the import channel against unchanged kWh —
   rewriting a settled-looking historical block a day later. A channel with no newly settled
