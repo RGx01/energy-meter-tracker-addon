@@ -6,6 +6,23 @@ first; the release history follows, newest first.*
 
 ## Shipped / closed backlog items
 
+### BL-51 — 4.5.13 — the re-price banner names its own trigger
+
+*Surfaced during 4.5.4 gap-fill testing; closed by the 4.5.13 fresh-install case, where a box that
+had never run an earlier version was told EMT was "finishing your upgrade".*
+
+**The flaw.** The unified re-price sweep has two triggers by design (P3.3d) — the first run after a
+version change, and the forced pass following any import, gap-fill or delete-reimport — but the
+backlog counter driving the banner recorded only that a sweep was running, never why. So every
+non-upgrade sweep borrowed the upgrade's wording, and its advice to avoid restarting or rebuilding,
+on an install doing precisely what it had just been asked to do.
+
+**The fix, as specified.** `_reprice_sweep_cause` derives the trigger from the marker's own
+timestamps, `/api/reprice-history-status` returns it as `cause`, and `base.html` branches on it:
+`import` leads with "Finishing your import — EMT is pricing the history it just fetched", `upgrade`
+keeps its existing wording, and anything unrecognised falls back to the upgrade text. Cosmetic only —
+no pricing or data path was touched. Covered by `tests/test_reprice_banner_cause.py`.
+
 ### BL-62 — 4.5.13 — settlement re-run is scoped to the channel that settled
 
 *Closed by the 13 Sep 2026 prod case: a historical slot repriced peak → off-peak roughly thirty

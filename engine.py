@@ -11658,7 +11658,7 @@ async def measure_settled_dispatched_blocks() -> dict:
             _hk, _ek = _n(node.get("home_kwh")), _n(node.get("ev_kwh"))
             cost_incl = round(_n(node.get("home_cost")) + _n(node.get("ev_cost")), 6)
             if cost_incl <= 0 and (_hk + _ek) <= 1e-9:
-                # BL-68: Octopus ANSWERED, and the answer is "nothing was drawn". That is a
+                # BL-70: Octopus ANSWERED, and the answer is "nothing was drawn". That is a
                 # settled fact, not a missing one — the node parsed (recover_device_breakdown
                 # counts it recovered), every bucket is simply zero. Filing it under `absent`
                 # wrote nothing, so `measured_slots_missing` handed the slot straight back on
@@ -11718,7 +11718,7 @@ async def measure_settled_dispatched_blocks() -> dict:
                 slot, mpan=mpan, cost_incl=node.get("cost_incl"),
                 cost_excl=node.get("cost_excl"), label=label, kwh=node.get("kwh"))
             n_store += 1
-    # BL-68: `zero` and `absent` were one counter, which made the log self-contradictory —
+    # BL-70: `zero` and `absent` were one counter, which made the log self-contradictory —
     # "recovered 11/11" on one line and "absent=11" on the next. They mean opposite things:
     # zero = the bill stated nothing was drawn; absent = the bill said nothing at all.
     logger.info("measure_settled: candidates=%d fetched=%d stored=%d mixed=%d zero=%d "
@@ -11966,7 +11966,7 @@ def apply_measured_settled() -> dict:
     in apply_measured_to_block (never cost/kWh). Idempotent: once a block is rate_source=
     'measured' it drops out of the query. Only runs when _MEASURED_APPLY. Local writes only.
 
-    (BL-68: `m.cost_incl > 0` skips the cached zero rows — a half-hour the bill says drew
+    (BL-70: `m.cost_incl > 0` skips the cached zero rows — a half-hour the bill says drew
     nothing has no cost to apply and no rate to snap, and apply_measured_to_block refuses it
     on `kwh <= 1e-9` anyway. Excluding them here just saves walking them every pass.)"""
     store = _store
