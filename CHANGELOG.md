@@ -1,5 +1,61 @@
 # Changelog
  
+## [4.5.14] — unreleased
+
+*Records what a database is, so the next version can read it.* Energy Meter Tracker
+has never written down which supplier its history belongs to in a form a program can
+act on — the supplier field is a display label, holding a registry key on newer
+installs and whatever the user typed on older ones. That is fine while there is only
+one supplier and one reader. It stops being fine the moment a backup has to explain
+itself to something that was not there when it was written.
+
+### Fixed
+
+- **A smart charge that Octopus never confirmed no longer stays cheap forever.** EMT
+  decides at settlement whether a planned smart-charge slot really ran. The signal it
+  leans on is `started` — but Octopus does not report started dispatches at all: EMT
+  infers them by noticing the charger is under smart control while a planned slot is
+  running, checked every few minutes. That makes it an excellent *prediction* (on one
+  three-year account it was right 97.4% of the time, against 61.3% for the plan alone,
+  which is why it stays) — but it is a sample, not a record, so it is occasionally
+  wrong. And it was treated as final: once a slot looked started, nothing could ever
+  change its price again, even when Octopus's own completed-charge record never
+  arrived to back it up.
+
+  Octopus's completed record now settles it in both directions, which is what that
+  record was always for. A slot that looked started but was never confirmed — once the
+  settle window has passed and EMT was actually online to have seen a confirmation —
+  is re-priced from the tariff schedule like any other unconfirmed slot. Slots inside
+  the off-peak window are untouched, because their price never depended on a dispatch
+  in the first place. Nothing changes for a confirmed charge, nor for a charge that
+  finished mid-slot (the commonest miss, and one the completed record already
+  handles), and the immediate restore of a solar-supplied charge still happens within
+  minutes rather than waiting hours. If a confirmation lands late, the next hourly
+  pass simply restores off-peak.
+
+  *On the reference account this moved three half-hours in three years — about 10p.
+  The reason it matters is consistency: the same half-hour on two installs of one
+  account had been priced at 32.3p and 5.5p, purely on which of them happened to
+  sample the signal.*
+
+### Added
+
+- **A database now records which supplier its history belongs to.** The supplier field
+  on a billing period is a display and historical record: an install set up through the
+  setup wizard stores a registry key (`octopus`), while one predating the dropdown
+  stores free text (`Octopus Energy`) — both are correct, and the app already maps
+  between them when it decides whether an API-backed mode is even offered. That mapping
+  now also gets written down, once, as a normalised key alongside the existing data
+  lineage stamp, and is refreshed whenever the setup changes.
+
+  The value is **not** always Octopus. `not-listed` — local metering only, no supplier
+  API — is a real and supported answer, and one that anything reading a database must
+  not mistake for an Octopus account. Where a supplier has never been chosen at all
+  (a configuration predating the field), nothing is written: "never answered" and
+  "answered, and the answer was local-only" are different states and stay that way.
+
+  No behaviour changes. Nothing reads this marker yet.
+
 ## [4.5.13] — 2026-09-17
 
 *Puts the tariff's own rates and bands back onto imported Intelligent Octopus history.
