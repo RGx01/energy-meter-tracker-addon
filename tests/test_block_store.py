@@ -3327,7 +3327,13 @@ class TestPowerHistory(unittest.TestCase):
 
     @staticmethod
     def _ts(offset_hours=1):
-        """Return a UTC ISO timestamp offset_hours ago — always within 48h window."""
+        """Return a UTC ISO timestamp offset_hours ago — always within 48h window.
+
+        SECOND granularity: two calls with the same offset return the same string
+        only if they fall in the same wall-clock second. A test that needs two
+        timestamps to be EQUAL must capture one and reuse it, not call twice —
+        see test_upsert_on_conflict.
+        """
         from datetime import datetime, timezone, timedelta
         return (datetime.now(timezone.utc).replace(tzinfo=None)
                 - timedelta(hours=offset_hours)).strftime("%Y-%m-%dT%H:%M:%S")
@@ -3357,10 +3363,23 @@ class TestPowerHistory(unittest.TestCase):
 
     def test_upsert_on_conflict(self):
         """Duplicate captured_at updates the row."""
-        self.store.append_power_history(self._ts(3), 2.5, 180.0, 7.5)
-        self.store.append_power_history(self._ts(3), 3.0, 190.0, 9.5)
+        # ONE timestamp, reused. Calling _ts() twice made the test depend on both
+        # calls landing in the same wall-clock second (_ts is second-granular): if
+        # the clock ticked between them the captured_at values differed, there was
+        # no conflict to upsert, and two rows were inserted. Measured at roughly
+        # 1 run in 20,000 — rare enough to read as an unexplained flake, which is
+        # what it did. The identity of the two timestamps IS the subject of this
+        # test, so it must be guaranteed rather than sampled.
+        ts = self._ts(3)
+        self.store.append_power_history(ts, 2.5, 180.0, 7.5)
+        self.store.append_power_history(ts, 3.0, 190.0, 9.5)
         rows = self.store.get_power_history(hours=48)
-        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            len(rows), 1,
+            "expected one upserted row, got %d at %r — both inserts used the same "
+            "captured_at (%r), so if this ever fails the cause is NOT the "
+            "second-boundary race this test was fixed for"
+            % (len(rows), [r["captured_at"] for r in rows], ts))
         self.assertAlmostEqual(rows[0]["net_kw"], 3.0)
 
     def test_rows_ordered_oldest_first(self):
