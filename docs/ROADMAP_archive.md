@@ -6,6 +6,93 @@ first; the release history follows, newest first.*
 
 ## Shipped / closed backlog items
 
+### BL-72 — 4.5.14 — a database records the version that last opened it
+
+*Closed 19 Sep 2026. Scoped down drastically on the way: the item as written specified a computed
+"heal level"; what shipped is one key.*
+
+**The flaw.** Nothing in a database said what produced it. `store_meta.schema_version` reads `1` on
+a 4.3.1 and a 4.5.14 alike, and the version recorded at upgrade goes to a file in `DATA_DIR` —
+which `_backup_to_share` does not copy, it takes `blocks.db` and `meters_config.json` only. So a
+backup, or a `blocks.db` handed to anything, arrived anonymous. EMT (v5) needs to know, because v5
+carries none of v4's one-time heals and must refuse history they have not run against.
+
+**The fix, as shipped.** `stamp_version()` writes the running version to `store_meta.written_by` at
+startup, beside the existing `db_uuid` lineage stamp and BL-73's supplier stamp. It does not write
+when the version cannot be read, leaving the previous stamp — the last thing known to be true —
+rather than overwriting it with `unknown`. Covered by `tests/test_bl72_version_stamp.py`.
+
+**Why a version is enough, and the mechanism that was dropped.** The item originally specified an
+integer `heal_level`, computed by each heal re-verifying its own invariant at startup, plus a
+migration and a downgrade guard. That was dropped as unjustified. **Every heal is marker-gated, and
+an ungated marker runs at startup** — so upgrading any older database runs every heal the release
+carries: a 4.4.0 database has no markers at all and runs all of them; a restored 4.5.12 backup
+carries 4.5.12's markers, so a heal added in .13 is ungated and runs while the older ones correctly
+do not. *"Last opened by version X" therefore means "healed to X's standard"*, and a reader gates on
+a floor version. Heals are historical: if a later release adds one, the floor simply rises.
+
+The specification also did not survive contact with the code. It described "eight one-off heals
+marker-gated in `store_meta`"; there are more than eight, they live mostly in `kraken_state`, and
+one of the eight (`pre_live_snapshot_done`) takes a **backup** — it has no data invariant to verify,
+so the central mechanism could not have been implemented as written.
+
+### BL-73 — 4.5.14 — a database records which supplier its history belongs to
+
+*Raised and closed 19 Sep 2026, alongside BL-72 and through the same code path.*
+
+**The flaw.** v4 has had a supplier registry since the setup wizard shipped —
+`_API_CAPABLE_SUPPLIERS = frozenset({"octopus"})` with `normalize_supplier()`, and a dropdown
+offering `octopus` and `not-listed` ("My supplier isn't listed / local metering only"). What it
+never did is write the *answer* down in one place. `config_periods.supplier` is the display and
+historical record and holds either kind of value: a registry key on an install set up through the
+wizard, free text on one that predates it (`'Octopus Energy'` — which is what every real database
+to hand contains). Any later reader would have to reimplement the mapping against a mixed column.
+
+**The fix, as shipped.** `stamp_supplier()` writes the normalised key to `store_meta.supplier` at
+startup, refreshed on every config save so a supplier change follows. Three states are kept
+distinct: `octopus`, `not-listed`, and **absent** — a configuration predating the field, where
+nothing is written rather than a placeholder that would read as an answer. Covered by
+`tests/test_bl73_supplier_stamp.py`.
+
+**Scoped down twice.** The first draft proposed two keys. `account_ref` was dropped: the account is
+already stamped at `kraken_state.kraken_account_number`, with `get_db_account()` and
+`kraken_account_mismatch()` already implementing the match guard. The supplier key was then argued
+to be optional, on the grounds that "v4 is frozen, so every v4 database is Octopus" — **false**, and
+the reason the item shipped: `not-listed` is a supported local-metering state with real CAD-read kWh
+history and no Octopus account at any point, so it cannot be inferred from the version.
+
+### BL-71 — 4.5.14 — a `started` dispatch is adjudicated by `completed`, in both directions
+
+*Closed 19 Sep 2026. Surfaced by the 17 Sep case where prod and prod-dev priced the same half-hour
+at 32.3p and 5.5p.*
+
+**The flaw.** `_reconcile_decision` tested `has_started` first and returned `off_peak`
+unconditionally, so a slot that looked started could never be re-priced — the settle window governed
+only the other branches. But **`started` is not returned by the Octopus API**: it is derived from
+`SMART_CONTROL_IN_PROGRESS` observed while a planned dispatch is active, at the poll cadence. (The
+reference implementation says so on the field itself: *"Bit of a smell this being on the API client
+object as it's never returned from the API"*.) It is therefore a sample, not a record, and had a
+measurable false-positive rate being treated as permanently conclusive.
+
+**Measured, three years of one account.** `started` is a far better finalise-time predictor than the
+plan alone — 97.4% precision (406 of 417) against 61.3% for `planned` (446 of 727) — which is why it
+stays as the gate. Its 11 false positives all had **zero charger draw**. Of the 98 completed slots
+that never captured `started`, 63% are the **last** slot of a session at a median 0.25 kWh against
+3.10 for slots that did capture it: the charge ended mid-slot, so the state was only briefly true.
+Those are already handled — 91 of the 98 land off-peak, none in review — so the false negatives
+needed no change.
+
+**The fix, as shipped.** `started` keeps the fast restore, and gains the missing arm: past the
+settle window, EMT online to have seen a confirmation, and no `completed` → fall through to the
+existing revert, which re-derives from the tariff schedule rather than forcing peak. The caller
+passes `past_settle` rather than deferring, because deferring would cost the 40-minute restore that
+rescues a solar-supplied charge. Covered by `tests/test_bl71_started_revert.py`.
+
+**Blast radius: 3 slots in three years, about 10p.** The other 8 started-without-completed slots sit
+inside the off-peak window, where the base tariff is already the off-peak rate and the reconcile
+skips outright — the price never depended on a dispatch. The value is consistency, not money: two
+installs of one account had priced the same half-hour differently purely on which sampled the signal.
+
 ### BL-51 — 4.5.13 — the re-price banner names its own trigger
 
 *Surfaced during 4.5.4 gap-fill testing; closed by the 4.5.13 fresh-install case, where a box that

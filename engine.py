@@ -240,6 +240,13 @@ _ACCOUNT_KEY = "kraken_account_number"
 # Kraken anything and still has a supplier answer ("not-listed").
 _SUPPLIER_KEY = "supplier"
 
+# BL-72: the software version that last opened this database. The ONLY thing a
+# database could not previously say about itself — `schema_version` reads 1 on a
+# 4.3.1 and a 4.5.14 alike, and the upgrade-backup version file lives in DATA_DIR,
+# which backups do not contain. So a backup, or a blocks.db handed to anything,
+# carried no record of what produced it.
+_WRITTEN_BY_KEY = "written_by"
+
 
 def _norm_account(x) -> str:
     return (x or "").strip().upper()
@@ -373,6 +380,50 @@ def normalize_supplier(supplier: str) -> str:
 def supplier_is_api_capable(supplier: str) -> bool:
     """True if the (normalised) supplier supports an API-backed mode."""
     return normalize_supplier(supplier) in _API_CAPABLE_SUPPLIERS
+
+
+def stamp_version(store) -> str | None:
+    """BL-72: record the running app version in store_meta['written_by'].
+
+    What this is for: a future reader — EMT (v5) importing a v4 backup — needs to
+    know which software produced the history it has been handed, because that is
+    what says whether the one-off heals have run against it. All heals are
+    marker-gated and ungated markers run at startup, so upgrading ANY older
+    database to a given release runs every heal that release carries. "Opened by
+    version X" therefore means "healed to X's standard", and a reader gates on a
+    floor version rather than on the heals individually.
+
+    Deliberately NOT a computed heal level. An earlier design proposed one, on the
+    grounds that a level could rise without a reader learning v4's version
+    numbering. But heals are historical: if a later release adds one, the reader
+    simply raises the floor it accepts. A version string carries that with no
+    mechanism, and the same stamp continues into v5 (which records its own release
+    and uses the same marker mechanism for its own heals).
+
+    Stamped on every startup, so it names the LAST version to open the database —
+    which is the version whose heals have run. Absent only on a database no
+    stamping release has ever opened, and that absence is itself the answer.
+
+    Does NOT write when the version cannot be read: an unreadable config leaves the
+    previous stamp in place, which is the last thing actually known to be true,
+    rather than overwriting it with 'unknown'.
+
+    Returns the version stamped, or None if there was nothing to stamp.
+    """
+    if store is None:
+        return None
+    try:
+        ver = _read_config_version()
+        if not ver or ver == "unknown":
+            return None
+        if store.get_meta(_WRITTEN_BY_KEY) != ver:
+            store.set_meta(_WRITTEN_BY_KEY, ver)
+            logger.info("stamp_version: %s", ver)
+        return ver
+    except Exception as e:
+        # Never block startup for a marker.
+        logger.warning("stamp_version: failed: %s", e)
+        return None
 
 
 def stamp_supplier(store) -> str | None:
@@ -13280,9 +13331,11 @@ async def _engine_startup_impl(ha: HAClient):
         FOREIGN_RESTORE_NOTICE = {"foreign": False, "db_uuid": None,
                                   "acknowledged": False}
 
-    # BL-73: stamp the supplier registry key alongside the lineage stamp above.
+    # BL-72/73: stamp what this database is, alongside the lineage stamp above.
     # engine_startup re-runs on every config save, so a supplier change through
-    # the wizard is picked up here without a separate hook.
+    # the wizard is picked up here without a separate hook; the version stamp
+    # lands on every start, so it always names the last release to open the DB.
+    stamp_version(_store)
     stamp_supplier(_store)
 
     config = load_config()  # now reads from the open store ✓

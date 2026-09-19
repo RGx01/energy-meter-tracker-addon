@@ -40,6 +40,21 @@ itself to something that was not there when it was written.
 
 ### Added
 
+- **A database now records which version of Energy Meter Tracker last opened it.**
+  Nothing in a database has ever said what produced it. The one field that looks like
+  it should — `schema_version` — reads `1` on a three-year-old database and on this
+  one alike, and the version recorded at upgrade goes to a file that backups don't
+  include. So a backup, or a copied database, arrived anywhere as an anonymous file.
+
+  It now carries the running version, written on every start beside the existing data
+  lineage stamp. That is all it needs to be: the one-off repairs are gated by markers
+  that travel with the data, and an ungated marker runs at startup — so upgrading any
+  older database runs every repair the new release carries. "Last opened by version X"
+  therefore means "repaired to X's standard", which is the question anything reading a
+  database later actually needs answered. If it can't read the version it leaves the
+  previous stamp alone rather than overwriting it with a guess.
+
+  No behaviour changes. Nothing reads this yet.
 - **A database now records which supplier its history belongs to.** The supplier field
   on a billing period is a display and historical record: an install set up through the
   setup wizard stores a registry key (`octopus`), while one predating the dropdown
