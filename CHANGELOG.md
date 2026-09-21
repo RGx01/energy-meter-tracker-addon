@@ -1,6 +1,6 @@
 # Changelog
  
-## [4.5.14] — unreleased
+## [4.5.14] — 2026-09-21
 
 *Records what a database is, so the next version can read it.* Energy Meter Tracker
 has never written down which supplier its history belongs to in a form a program can
