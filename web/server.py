@@ -1517,9 +1517,73 @@ def api_billing():
                     meta  = (cfg.get("meters", {}).get(mid, {}).get("meta") or {})
                     device = meta.get("device") or mid
                     sub_rows.append({"label": f"↳ {device} ({kwh:.3f} kWh)",
-                                     "cost": cost, "bold": False})
+                                     "cost": cost, "bold": False,
+                                     "_meter_id": mid, "_kwh": kwh})
                     sub_kwh_total  += kwh
                     sub_cost_total += cost
+
+            # ── EV: show the GRID-CLIPPED figure the bill uses (#468) ────────────
+            # The rows above come from the `meters` table, so they only ever show a
+            # PHYSICAL sub-meter. That left two disagreements with the billing chart:
+            #
+            #   no EV device  — the dispatch-derived EV had nowhere to go, so it stayed
+            #                   folded inside 'Direct import' and never appeared at all.
+            #   an EV device  — the card showed the meter's own metered draw, while the
+            #                   bill charges the grid-clipped synthetic (on the reference
+            #                   account, 252.911 kWh against 248.129).
+            #
+            # Both are fixed by the one rule every other surface already uses,
+            # `_hybrid_ev_by_block`: SYNTHETIC wins wherever `imp_kwh_ev IS NOT NULL`
+            # (the BL-9 bill-authoritative column, written on any dispatched IOG slot —
+            # no device required, see engine._apply_iog_split), else the RECORDED
+            # physical meter. Expressed here as one aggregate rather than a per-block
+            # walk, because this endpoint feeds three cards on an SSE tick and the year
+            # card spans ~17.5k blocks. Verified to reproduce _hybrid_ev_by_block exactly
+            # (0.000000 kWh / £0.000000 over the bill period, the year and all history).
+            #
+            # DISPLAY-ONLY, exactly as the billing chart's carve is: 'Total Import' is the
+            # raw grid figure and never moves. Whatever EV is shown is taken out of
+            # 'Direct import', so the rows still sum to the total.
+            if start_date and end_date:
+                try:
+                    _ev_mid = _configured_ev_meter_id(cfg)
+                    _ev_r = store._conn.execute(
+                        """SELECT COALESCE(SUM(CASE WHEN m.imp_kwh_ev IS NOT NULL
+                                             THEN m.imp_kwh_ev
+                                             ELSE COALESCE(s.imp_kwh_grid, s.imp_kwh, 0)
+                                        END), 0.0) AS kwh,
+                                  COALESCE(SUM(CASE WHEN m.imp_kwh_ev IS NOT NULL
+                                             THEN COALESCE(m.imp_cost_ev, 0)
+                                             ELSE COALESCE(s.imp_cost, 0)
+                                        END), 0.0) AS cost
+                           FROM blocks m
+                           LEFT JOIN blocks s
+                             ON s.block_start = m.block_start AND s.meter_id = ?
+                           WHERE m.meter_id = 'electricity_main'
+                             AND m.block_start >= ? AND m.block_start < ?""",
+                        (_ev_mid, _sub_utc_s, _sub_utc_e)).fetchone()
+                    _ev_kwh  = float(_ev_r["kwh"] or 0.0)
+                    _ev_cost = round(float(_ev_r["cost"] or 0.0), 2)
+                except Exception:
+                    _ev_kwh = _ev_cost = 0.0
+                    _ev_mid = None
+                # Drop the physical EV meter's own row: the hybrid figure REPLACES it
+                # (same car — never both), and its contribution must leave the subtotal
+                # or 'Direct import' would be reduced twice.
+                if _ev_mid:
+                    for _r in [r for r in sub_rows if r.get("_meter_id") == _ev_mid]:
+                        sub_rows.remove(_r)
+                        sub_kwh_total  -= float(_r.get("_kwh") or 0.0)
+                        sub_cost_total -= float(_r["cost"])
+                if _ev_kwh > 0.001 or abs(_ev_cost) > 0.001:
+                    _ev_label = ((cfg.get("meters", {}).get(_ev_mid, {}).get("meta") or {})
+                                 .get("device") or "EV") if _ev_mid else "EV (from dispatch)"
+                    sub_rows.append({"label": f"↳ {_ev_label} ({_ev_kwh:.3f} kWh)",
+                                     "cost": _ev_cost, "bold": False})
+                    sub_kwh_total  += _ev_kwh
+                    sub_cost_total += _ev_cost
+            for _r in sub_rows:
+                _r.pop("_meter_id", None); _r.pop("_kwh", None)
 
             # Get raw grid import (before sub-meter deduction) for correct total
             raw_cur = store._conn.execute(

@@ -234,6 +234,19 @@ _VALID_MODES = ("cad", "cad+api", "api", "api+mini")
 # Credentials are KEPT either way; an explicit in-app reconnect re-associates.
 _ACCOUNT_KEY = "kraken_account_number"
 
+# BL-73: which supplier this database's history belongs to, as a normalised
+# registry key in store_meta. Lives in store_meta rather than kraken_state
+# because "which supplier" is not a Kraken fact — a local-only install has no
+# Kraken anything and still has a supplier answer ("not-listed").
+_SUPPLIER_KEY = "supplier"
+
+# BL-72: the software version that last opened this database. The ONLY thing a
+# database could not previously say about itself — `schema_version` reads 1 on a
+# 4.3.1 and a 4.5.14 alike, and the upgrade-backup version file lives in DATA_DIR,
+# which backups do not contain. So a backup, or a blocks.db handed to anything,
+# carried no record of what produced it.
+_WRITTEN_BY_KEY = "written_by"
+
 
 def _norm_account(x) -> str:
     return (x or "").strip().upper()
@@ -367,6 +380,98 @@ def normalize_supplier(supplier: str) -> str:
 def supplier_is_api_capable(supplier: str) -> bool:
     """True if the (normalised) supplier supports an API-backed mode."""
     return normalize_supplier(supplier) in _API_CAPABLE_SUPPLIERS
+
+
+def stamp_version(store) -> str | None:
+    """BL-72: record the running app version in store_meta['written_by'].
+
+    What this is for: a future reader — EMT (v5) importing a v4 backup — needs to
+    know which software produced the history it has been handed, because that is
+    what says whether the one-off heals have run against it. All heals are
+    marker-gated and ungated markers run at startup, so upgrading ANY older
+    database to a given release runs every heal that release carries. "Opened by
+    version X" therefore means "healed to X's standard", and a reader gates on a
+    floor version rather than on the heals individually.
+
+    Deliberately NOT a computed heal level. An earlier design proposed one, on the
+    grounds that a level could rise without a reader learning v4's version
+    numbering. But heals are historical: if a later release adds one, the reader
+    simply raises the floor it accepts. A version string carries that with no
+    mechanism, and the same stamp continues into v5 (which records its own release
+    and uses the same marker mechanism for its own heals).
+
+    Stamped on every startup, so it names the LAST version to open the database —
+    which is the version whose heals have run. Absent only on a database no
+    stamping release has ever opened, and that absence is itself the answer.
+
+    Does NOT write when the version cannot be read: an unreadable config leaves the
+    previous stamp in place, which is the last thing actually known to be true,
+    rather than overwriting it with 'unknown'.
+
+    Returns the version stamped, or None if there was nothing to stamp.
+    """
+    if store is None:
+        return None
+    try:
+        ver = _read_config_version()
+        if not ver or ver == "unknown":
+            return None
+        if store.get_meta(_WRITTEN_BY_KEY) != ver:
+            store.set_meta(_WRITTEN_BY_KEY, ver)
+            logger.info("stamp_version: %s", ver)
+        return ver
+    except Exception as e:
+        # Never block startup for a marker.
+        logger.warning("stamp_version: failed: %s", e)
+        return None
+
+
+def stamp_supplier(store) -> str | None:
+    """BL-73: record this database's supplier as a normalised registry key in
+    store_meta['supplier'].
+
+    Why stamp it when config_periods.supplier already exists: that column is the
+    DISPLAY + historical record and holds two different kinds of thing. An
+    install set up through the wizard writes a registry key ('octopus'); one that
+    predates the dropdown holds whatever the user typed ('Octopus Energy'), and
+    every real database we have carries the latter. normalize_supplier() is the
+    authoritative mapping and it lives here, so v4 records its OWN reading of its
+    own field, once — rather than leaving every future reader to reimplement
+    those rules against a field with mixed contents.
+
+    The answer is NOT always 'octopus'. 'not-listed' is a real, supported state:
+    a local-only install with no supplier API at all. Any reader that assumes
+    an Energy Meter Tracker database implies an Octopus account is wrong, and
+    this is the marker that says so.
+
+    CURRENT supplier, deliberately. The stamp answers "whose credentials does
+    this install use", which a reader needs in order to know what to ask for —
+    not "who supplied the oldest block". A supplier change opens a new config
+    period and engine_startup re-runs on config save, so the stamp follows.
+
+    ABSENT means never established — a v2-era config predating the field. That
+    is a real distinction from 'not-listed' (an answer given), so nothing is
+    written rather than a placeholder that would read as an answer.
+
+    Returns the key stamped, or None when there was nothing to stamp.
+    """
+    if store is None:
+        return None
+    try:
+        pid = store.get_current_config_period_id()
+        if pid is None:
+            return None
+        key = normalize_supplier((store.get_config_period(pid) or {}).get("supplier"))
+        if not key:
+            return None
+        if store.get_meta(_SUPPLIER_KEY) != key:
+            store.set_meta(_SUPPLIER_KEY, key)
+            logger.info("stamp_supplier: %s", key)
+        return key
+    except Exception as e:
+        # Never block startup for a marker. An absent stamp is a defined state.
+        logger.warning("stamp_supplier: failed: %s", e)
+        return None
 
 
 def _get_billing_source() -> str:
@@ -10971,6 +11076,7 @@ def _reconcile_decision(has_started: bool, has_completed: bool,
                         completed_energy, currently_off_peak: bool,
                         has_planned: bool = True, was_online: bool = False,
                         contemporaneous: bool = True,
+                        past_settle: bool = False,
                         small_kwh: float = _RECONCILE_SMALL_COMPLETED_KWH) -> tuple:
     """Settlement-time reconciliation of the dispatch overlay against the
     accumulated lifecycle (design §12, §14). Keys on whether the slot STARTED
@@ -10979,13 +11085,18 @@ def _reconcile_decision(has_started: bool, has_completed: bool,
     were online to see it (has_planned) and the completed ENERGY magnitude.
 
     Returns (target, reason) where target is one of:
-      - 'off_peak' : (a) started present → genuine smart charge (restore, incl. solar
+      - 'off_peak' : (a) started AND (completed, or still inside the settle window,
+                     or we were offline) → genuine smart charge (restore, incl. solar
                      slots the meter floor wrongly rejected); or (b) COMPLETED-ONLY
                      with substantial energy, NO planned/started ever captured, AND the
                      block is OFFLINE/imported (was_online=False) — EMT was down / it's a
                      re-import, so 'started' was never capturable. We accept Octopus's
                      completed dispatch as authoritative (design §14).
-      - 'peak'     : (a) neither started nor completed → planned but never charged;
+      - 'peak'     : (a0) STARTED but never COMPLETED once the settle window has
+                     passed and we were online to have seen it (BL-71) — `started` is
+                     sampled, not recorded, so it has a false-positive rate and must
+                     not be permanently conclusive; (a) neither started nor completed
+                     → planned but never charged;
                      (b) completed-without-started with NEGLIGIBLE energy
                      (|completed| < small_kwh) — the dispatch didn't materially run;
                      or (c) COMPLETED-ONLY on a LIVE block (was_online=True) — EMT was
@@ -11000,9 +11111,32 @@ def _reconcile_decision(has_started: bool, has_completed: bool,
       - 'ok'       : the correct target already matches the current rate.
     Only 'off_peak' and 'peak' are actionable; 'review' flags, 'ok' writes nothing.
     """
-    if has_started:
+    if has_started and (has_completed or not past_settle or not was_online):
+        # BL-71: `started` alone is not conclusive — it is a SAMPLED signal, not a
+        # record. Octopus never returns a started dispatch; EMT derives it from
+        # SMART_CONTROL_IN_PROGRESS observed while a planned slot is active, at the
+        # poll cadence. So it is kept as the finalise-time gate (measured 97.4%
+        # precise against 61.3% for `planned` alone) but `completed` now adjudicates
+        # it in BOTH directions, which is what the design always said `completed` was
+        # for. Off-peak still stands here when:
+        #   - completed confirms it, or
+        #   - the settle window has not passed (the fast RESTORE — `started` is
+        #     real-time, so a solar-supplied charge the meter floor rejected is put
+        #     right within the 40-minute gate rather than hours later), or
+        #   - we were offline, where absence of `completed` is not evidence of
+        #     anything (same principle as the completed-only branches below).
         target = "off_peak"
         reason = "started → off-peak (restore)"
+    elif has_started:
+        # started, past the settle window, we were online to see a completed — and
+        # none came. Measured on three years of one account: 11 such slots, every one
+        # with ZERO charger draw. Falls through to the same revert the never-started
+        # case takes, so an in-window slot is unaffected (the caller skips those
+        # outright) and the price is re-derived from the tariff schedule rather than
+        # forced to peak. Self-correcting: if `completed` lands late, the next hourly
+        # reconcile sees started+completed and restores off-peak.
+        target = "peak"
+        reason = "started but never completed after settle window → peak (revert)"
     elif not has_completed:
         target = "peak"
         reason = "never started or completed → peak (revert)"
@@ -12447,7 +12581,9 @@ async def reconcile_dispatch_overlay() -> dict:
         has_started = "started" in kinds
         # A no-started slot's fate (revert vs review) hinges on completed, which
         # lands late — defer it until it clears the settle gate. A started slot is
-        # decidable now.
+        # still decidable now: it restores immediately (BL-71 keeps that), and its
+        # own revert is gated inside _reconcile_decision by `past_settle` instead,
+        # because deferring it would cost the fast restore this gate exists to give.
         if not has_started and bs >= settle_cutoff:
             n_deferred += 1
             continue
@@ -12473,7 +12609,12 @@ async def reconcile_dispatch_overlay() -> dict:
             has_started, "completed" in kinds, completed_energy, currently_off_peak,
             has_planned=("planned" in kinds),
             was_online=(not bool(r["interpolated"])),
-            contemporaneous=contemporaneous)
+            contemporaneous=contemporaneous,
+            # BL-71: a STARTED slot deliberately skips the deferral above so the
+            # restore stays fast, so it cannot learn "the settle window has passed"
+            # by being deferred — it has to be told. Same cutoff, passed in rather
+            # than inferred.
+            past_settle=(bs < settle_cutoff))
         # 4.5.7 SETTLED = TRUTH (via the completed-dispatch proxy). A COMPLETED dispatch
         # is Octopus's own signal that the slot ran as a smart charge, so the settled
         # bill priced it OFF-PEAK; once the block is SETTLED (imp_kwh_api present) the
@@ -13189,6 +13330,13 @@ async def _engine_startup_impl(ha: HAClient):
         logger.warning("engine_startup: lineage check failed: %s", _fre)
         FOREIGN_RESTORE_NOTICE = {"foreign": False, "db_uuid": None,
                                   "acknowledged": False}
+
+    # BL-72/73: stamp what this database is, alongside the lineage stamp above.
+    # engine_startup re-runs on every config save, so a supplier change through
+    # the wizard is picked up here without a separate hook; the version stamp
+    # lands on every start, so it always names the last release to open the DB.
+    stamp_version(_store)
+    stamp_supplier(_store)
 
     config = load_config()  # now reads from the open store ✓
 
