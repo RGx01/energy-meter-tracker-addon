@@ -667,62 +667,11 @@
     <div class="insight-footnote" id="u-peak-footnote">Based on half-hour block totals converted to local time.</div>
   </div>
 
-  <!-- Battery card — shown only if battery sub-meter configured -->
-  <div class="insight-card" id="ucard-battery" style="display:none;">
-    <div class="insight-card-title">🔋 Battery — <span id="u-bat-label"></span></div>
-    <div class="insight-sub">Grid energy used to charge the battery this period.</div>
-    <div class="insight-grid">
-      <div class="insight-metric">
-        <div class="insight-metric-label">Charged from Grid</div>
-        <span class="insight-metric-value" id="u-bat-kwh">—</span>
-        <span class="insight-metric-unit">kWh</span>
-      </div>
-      <div class="insight-metric">
-        <div class="insight-metric-label">Charging Cost</div>
-        <span class="insight-metric-value" id="u-bat-cost">—</span>
-        <span class="insight-metric-unit" id="u-currency-bat"></span>
-      </div>
-    </div>
-    <div id="u-bat-rates" class="insight-equiv" style="display:none;"></div>
-  </div>
-
-  <!-- EV card — shown only if EV sub-meter configured -->
-  <div class="insight-card" id="ucard-ev" style="display:none;">
-    <div class="insight-card-title">🚗 EV Charger — <span id="u-ev-label"></span></div>
-    <div class="insight-sub">Grid energy delivered to your vehicle this period.</div>
-    <div class="insight-grid">
-      <div class="insight-metric">
-        <div class="insight-metric-label">Charged from Grid</div>
-        <span class="insight-metric-value" id="u-ev-kwh">—</span>
-        <span class="insight-metric-unit">kWh</span>
-      </div>
-      <div class="insight-metric">
-        <div class="insight-metric-label">Charging Cost</div>
-        <span class="insight-metric-value" id="u-ev-cost">—</span>
-        <span class="insight-metric-unit" id="u-currency-ev"></span>
-      </div>
-    </div>
-    <div id="u-ev-rates" class="insight-equiv" style="display:none;"></div>
-  </div>
-
-  <!-- Heat Pump card — shown only if heat pump sub-meter configured -->
-  <div class="insight-card" id="ucard-hp" style="display:none;">
-    <div class="insight-card-title">♨️ Heat Pump — <span id="u-hp-label"></span></div>
-    <div class="insight-sub">Grid energy consumed by your heat pump this period.</div>
-    <div class="insight-grid">
-      <div class="insight-metric">
-        <div class="insight-metric-label">Electricity Used</div>
-        <span class="insight-metric-value" id="u-hp-kwh">—</span>
-        <span class="insight-metric-unit">kWh</span>
-      </div>
-      <div class="insight-metric">
-        <div class="insight-metric-label">Running Cost</div>
-        <span class="insight-metric-value" id="u-hp-cost">—</span>
-        <span class="insight-metric-unit" id="u-currency-hp"></span>
-      </div>
-    </div>
-    <div id="u-hp-rates" class="insight-equiv" style="display:none;"></div>
-  </div>
+  <!-- Device cards — one per configured sub-meter, built in renderUsage().
+       Previously three fixed cards (battery / EV / heat pump), which could show
+       exactly ONE device of each type: a second heat pump had nowhere to render
+       (#450). The server has always sent every device, keyed by meter id. -->
+  <div id="ucard-devices"></div>
 
 </div><!-- /tab-usage -->
 
@@ -1111,205 +1060,214 @@ function renderInsights(d, _cmp) {
   }
 
   // Battery
-  var bat_sub = Object.entries(d.sub_meters || {}).find(function(e) {
-    return ['battery','inverter'].includes(e[1].meter_type);
-  });
-  if (bat_sub && bat_sub[1].imp_kwh > 0.1) {
-    var bat     = bat_sub[1];
-    var bat_kg  = bat.carbon_g / 1000;
-    var bat_int = bat.avg_charge_intensity != null ? bat.avg_charge_intensity
-               : (bat.ci_imp_kwh > 0 ? bat.carbon_g / bat.ci_imp_kwh : null);
-    var grid_avg = d.grid_avg_intensity;
+  // Battery — one card per configured battery/inverter (#450).
+  carbonCardsFor('card-battery',
+    Object.entries(d.sub_meters || {}).filter(function(e) {
+      return ['battery','inverter'].includes(e[1].meter_type) && e[1].imp_kwh > 0.1;
+    }),
+    function(bat, $) {
+      var bat_kg  = bat.carbon_g / 1000;
+      var bat_int = bat.avg_charge_intensity != null ? bat.avg_charge_intensity
+                 : (bat.ci_imp_kwh > 0 ? bat.carbon_g / bat.ci_imp_kwh : null);
+      var grid_avg = d.grid_avg_intensity;
 
-    document.getElementById('card-battery').style.display = 'block';
-    document.getElementById('bat-headline').textContent = bat_kg.toFixed(2) + ' kgCO₂';
-    document.getElementById('bat-sub').textContent =
-      'How cleanly your battery charged from the grid this period.';
-    var ci_kwh_bat = bat.ci_imp_kwh || 0;
-    var bat_ac_kwh = ci_kwh_bat > 0 ? ci_kwh_bat : bat.imp_kwh;
-    var bat_dc_kwh = bat_ac_kwh * (a.battery_roundtrip_efficiency || 0.85);
-    document.getElementById('bat-carbon').textContent   = bat_kg.toFixed(2);
-    document.getElementById('bat-kwh').textContent      = fmtKwh(bat_ac_kwh);
-    document.getElementById('bat-dc-kwh').textContent   = fmtKwh(bat_dc_kwh);
-    document.getElementById('bat-intensity').textContent = bat_int != null ? Math.round(bat_int) : '—';
-    document.getElementById('bat-vs-grid').textContent  = grid_avg != null ? Math.round(grid_avg) : '—';
+      $('card-battery').style.display = 'block';
+      $('bat-headline').textContent = bat_kg.toFixed(2) + ' kgCO₂';
+      $('bat-sub').textContent =
+        'How cleanly your battery charged from the grid this period.';
+      var ci_kwh_bat = bat.ci_imp_kwh || 0;
+      var bat_ac_kwh = ci_kwh_bat > 0 ? ci_kwh_bat : bat.imp_kwh;
+      var bat_dc_kwh = bat_ac_kwh * (a.battery_roundtrip_efficiency || 0.85);
+      $('bat-carbon').textContent   = bat_kg.toFixed(2);
+      $('bat-kwh').textContent      = fmtKwh(bat_ac_kwh);
+      $('bat-dc-kwh').textContent   = fmtKwh(bat_dc_kwh);
+      $('bat-intensity').textContent = bat_int != null ? Math.round(bat_int) : '—';
+      $('bat-vs-grid').textContent  = grid_avg != null ? Math.round(grid_avg) : '—';
 
-    var rte = a.battery_roundtrip_efficiency || 0.85;
+      var rte = a.battery_roundtrip_efficiency || 0.85;
 
-    var batLines = [];
-    if (bat_int != null && grid_avg != null) {
-      var bat_diff = bat_int - grid_avg;
-      var bat_pct  = Math.abs(Math.round(bat_diff / grid_avg * 100));
-      if (Math.abs(bat_pct) < 10) {
-        batLines.push('Your battery charged at roughly the grid average intensity this period.');
-      } else if (bat_diff < 0) {
-        batLines.push('✓ Your battery preferentially charged during cleaner grid periods — <strong>' +
-          bat_pct + '% below</strong> the grid average intensity. Good load-shifting behaviour.');
-        // Estimate carbon saving vs charging at grid average
-        // Use ci_imp_kwh (only kWh with CI data) to match the intensity figures
-        var ci_bat_kwh = bat.ci_imp_kwh || 0;
-        var saving_g = (grid_avg - bat_int) * ci_bat_kwh;
-        if (saving_g > 100 && ci_bat_kwh > 0) {
-          var bat_ci_pct = bat.imp_kwh > 0 ? Math.round(ci_bat_kwh / bat.imp_kwh * 100) : 0;
-          batLines.push('Estimated saving vs charging at grid average: <strong>' +
-            (saving_g / 1000).toFixed(2) + ' kgCO₂</strong>' +
-            (bat_ci_pct < 80 ? ' (' + bat_ci_pct + '% carbon coverage — estimate)' : '') + '.');
+      var batLines = [];
+      if (bat_int != null && grid_avg != null) {
+        var bat_diff = bat_int - grid_avg;
+        var bat_pct  = Math.abs(Math.round(bat_diff / grid_avg * 100));
+        if (Math.abs(bat_pct) < 10) {
+          batLines.push('Your battery charged at roughly the grid average intensity this period.');
+        } else if (bat_diff < 0) {
+          batLines.push('✓ Your battery preferentially charged during cleaner grid periods — <strong>' +
+            bat_pct + '% below</strong> the grid average intensity. Good load-shifting behaviour.');
+          // Estimate carbon saving vs charging at grid average
+          // Use ci_imp_kwh (only kWh with CI data) to match the intensity figures
+          var ci_bat_kwh = bat.ci_imp_kwh || 0;
+          var saving_g = (grid_avg - bat_int) * ci_bat_kwh;
+          if (saving_g > 100 && ci_bat_kwh > 0) {
+            var bat_ci_pct = bat.imp_kwh > 0 ? Math.round(ci_bat_kwh / bat.imp_kwh * 100) : 0;
+            batLines.push('Estimated saving vs charging at grid average: <strong>' +
+              (saving_g / 1000).toFixed(2) + ' kgCO₂</strong>' +
+              (bat_ci_pct < 80 ? ' (' + bat_ci_pct + '% carbon coverage — estimate)' : '') + '.');
+          }
+        } else {
+          batLines.push('Your battery charged during dirtier-than-average grid periods — <strong>' +
+            bat_pct + '% above</strong> the grid average. Shifting charging to overnight or high-renewable ' +
+            'windows could reduce this.');
         }
-      } else {
-        batLines.push('Your battery charged during dirtier-than-average grid periods — <strong>' +
-          bat_pct + '% above</strong> the grid average. Shifting charging to overnight or high-renewable ' +
-          'windows could reduce this.');
       }
-    }
-    batLines.push('<em>Note: export may include battery discharge — we cannot split solar vs battery ' +
-      'export without additional metering.</em>');
-    if (bat.carbon_g > 0) {
-      var batEquivStr = equivLines(bat.carbon_g, a, d.period_start, d.period_end, bat.data_start || d.data_start);
-      if (batEquivStr) batLines.push(batEquivStr);
-    }
-    document.getElementById('bat-equiv').innerHTML = batLines.join('<br>');
-  }
+      batLines.push('<em>Note: export may include battery discharge — we cannot split solar vs battery ' +
+        'export without additional metering.</em>');
+      if (bat.carbon_g > 0) {
+        var batEquivStr = equivLines(bat.carbon_g, a, d.period_start, d.period_end, bat.data_start || d.data_start);
+        if (batEquivStr) batLines.push(batEquivStr);
+      }
+      $('bat-equiv').innerHTML = batLines.join('<br>');
 
-  // Heat pump
-  var hp_sub = Object.entries(d.sub_meters || {}).find(function(e) {
-    return e[1].meter_type === 'heat_pump';
-  });
-  if (hp_sub && hp_sub[1].imp_kwh > 0.1) {
-    var hp         = hp_sub[1];
-    var cop        = a.hp_cop || 3.0;
-    var gas_co2    = a.gas_co2_g_per_kwh || 203.0;
-    var boiler_eff = a.gas_boiler_efficiency || 0.90;
-    var hp_kg      = hp.carbon_g / 1000;
-    var crossover  = Math.round((gas_co2 / boiler_eff) * cop);
+    });
 
-    // Heat delivered: use total kWh for display (best available estimate)
-    var heat_kwh_total = hp.imp_kwh * cop;
+  // Heat pump — one card per configured heat pump (#450). Previously .find(),
+  // which returned the FIRST and silently dropped any others.
+  carbonCardsFor('card-hp',
+    Object.entries(d.sub_meters || {}).filter(function(e) {
+      return e[1].meter_type === 'heat_pump' && e[1].imp_kwh > 0.1;
+    }),
+    function(hp, $) {
+      var cop        = a.hp_cop || 3.0;
+      var gas_co2    = a.gas_co2_g_per_kwh || 203.0;
+      var boiler_eff = a.gas_boiler_efficiency || 0.90;
+      var hp_kg      = hp.carbon_g / 1000;
+      var crossover  = Math.round((gas_co2 / boiler_eff) * cop);
 
-    // Gas comparison: use ci_imp_kwh only to match the carbon figure
-    var ci_hp_kwh  = hp.ci_imp_kwh || 0;
-    var hp_ci_pct  = hp.imp_kwh > 0 ? Math.round(ci_hp_kwh / hp.imp_kwh * 100) : 0;
-    var heat_kwh_ci = ci_hp_kwh * cop;
-    var gas_kwh_needed = heat_kwh_ci / boiler_eff;
-    var gas_kg     = gas_kwh_needed * gas_co2 / 1000;
-    var saving_kg  = gas_kg - hp_kg;
-    var cleaner_pct = gas_kg > 0 ? Math.round(saving_kg / gas_kg * 100) : null;
+      // Heat delivered: use total kWh for display (best available estimate)
+      var heat_kwh_total = hp.imp_kwh * cop;
 
-    document.getElementById('card-hp').style.display   = 'block';
-    document.getElementById('hp-headline').textContent = hp_kg.toFixed(2) + ' kgCO₂';
-    document.getElementById('hp-sub').textContent       = 'Carbon from heat pump electricity use this period.';
-    var ci_kwh_hp = hp.ci_imp_kwh || 0;
-    document.getElementById('hp-carbon').textContent    = hp_kg.toFixed(2);
-    document.getElementById('hp-kwh').textContent       = ci_kwh_hp > 0 ? fmtKwh(ci_kwh_hp) : fmtKwh(hp.imp_kwh);
-    document.getElementById('hp-heat').textContent      = fmtKwh(ci_kwh_hp > 0 ? ci_kwh_hp * cop : heat_kwh_total);
-    document.getElementById('hp-vs-gas').textContent    = gas_kg > 0 ? gas_kg.toFixed(2) : '—';
+      // Gas comparison: use ci_imp_kwh only to match the carbon figure
+      var ci_hp_kwh  = hp.ci_imp_kwh || 0;
+      var hp_ci_pct  = hp.imp_kwh > 0 ? Math.round(ci_hp_kwh / hp.imp_kwh * 100) : 0;
+      var heat_kwh_ci = ci_hp_kwh * cop;
+      var gas_kwh_needed = heat_kwh_ci / boiler_eff;
+      var gas_kg     = gas_kwh_needed * gas_co2 / 1000;
+      var saving_kg  = gas_kg - hp_kg;
+      var cleaner_pct = gas_kg > 0 ? Math.round(saving_kg / gas_kg * 100) : null;
 
-    var hpLines = [];
-    if (hp_ci_pct >= 80 && gas_kg > 0 && cleaner_pct != null) {
-      hpLines.push(
-        saving_kg > 0
-          ? '✓ Your heat pump saved <strong>' + saving_kg.toFixed(1) + ' kgCO₂</strong> vs an equivalent gas boiler — <strong>' + cleaner_pct + '% cleaner</strong>.'
-          : '↑ Your heat pump produced more carbon than an equivalent gas boiler this period.'
-      );
-    } else if (hp.carbon_g > 0) {
-      hpLines.push('<em>Carbon coverage ' + hp_ci_pct + '% — gas comparison needs more data to be reliable.</em>');
-    }
-    hpLines.push('Grid crossover intensity: <strong>' + crossover + ' gCO₂/kWh</strong> — above this, a gas boiler would be cleaner. ' +
-      'The UK grid rarely exceeds 400 gCO₂/kWh, so your heat pump is almost always cleaner than gas.');
-    if (hp.inverter_possible) {
-      hpLines.push('<em>⚠ This heat pump is marked as inverter-capable. Carbon shown assumes ' +
-        'full grid draw — actual carbon may be lower if solar or battery contributed.</em>');
-    }
-    if (hp.carbon_g > 0) {
-      var hpEquivStr = equivLines(hp.carbon_g, a, d.period_start, d.period_end, hp.data_start || d.data_start);
-      if (hpEquivStr) hpLines.push(hpEquivStr);
-    }
-    document.getElementById('hp-equiv').innerHTML = hpLines.join('<br>');
-  }
+      $('card-hp').style.display   = 'block';
+      $('hp-headline').textContent = hp_kg.toFixed(2) + ' kgCO₂';
+      $('hp-sub').textContent       = 'Carbon from heat pump electricity use this period.';
+      var ci_kwh_hp = hp.ci_imp_kwh || 0;
+      $('hp-carbon').textContent    = hp_kg.toFixed(2);
+      $('hp-kwh').textContent       = ci_kwh_hp > 0 ? fmtKwh(ci_kwh_hp) : fmtKwh(hp.imp_kwh);
+      $('hp-heat').textContent      = fmtKwh(ci_kwh_hp > 0 ? ci_kwh_hp * cop : heat_kwh_total);
+      $('hp-vs-gas').textContent    = gas_kg > 0 ? gas_kg.toFixed(2) : '—';
+
+      var hpLines = [];
+      if (hp_ci_pct >= 80 && gas_kg > 0 && cleaner_pct != null) {
+        hpLines.push(
+          saving_kg > 0
+            ? '✓ Your heat pump saved <strong>' + saving_kg.toFixed(1) + ' kgCO₂</strong> vs an equivalent gas boiler — <strong>' + cleaner_pct + '% cleaner</strong>.'
+            : '↑ Your heat pump produced more carbon than an equivalent gas boiler this period.'
+        );
+      } else if (hp.carbon_g > 0) {
+        hpLines.push('<em>Carbon coverage ' + hp_ci_pct + '% — gas comparison needs more data to be reliable.</em>');
+      }
+      hpLines.push('Grid crossover intensity: <strong>' + crossover + ' gCO₂/kWh</strong> — above this, a gas boiler would be cleaner. ' +
+        'The UK grid rarely exceeds 400 gCO₂/kWh, so your heat pump is almost always cleaner than gas.');
+      if (hp.inverter_possible) {
+        hpLines.push('<em>⚠ This heat pump is marked as inverter-capable. Carbon shown assumes ' +
+          'full grid draw — actual carbon may be lower if solar or battery contributed.</em>');
+      }
+      if (hp.carbon_g > 0) {
+        var hpEquivStr = equivLines(hp.carbon_g, a, d.period_start, d.period_end, hp.data_start || d.data_start);
+        if (hpEquivStr) hpLines.push(hpEquivStr);
+      }
+      $('hp-equiv').innerHTML = hpLines.join('<br>');
+
+    });
 
   // EV
-  var ev_sub = Object.entries(d.sub_meters || {}).find(function(e) {
-    return ['ev_charger','ev'].includes(e[1].meter_type);
+  // EV — one card per configured EV charger (#450). When there is NO physical EV
+  // meter the synthetic dispatch card below runs instead, on the prototype itself:
+  // it has no meter id to key a clone on, and that path is unchanged.
+  var evCarbonDevs = Object.entries(d.sub_meters || {}).filter(function(e) {
+    return ['ev_charger','ev'].includes(e[1].meter_type) && e[1].imp_kwh > 0.1;
   });
-  if (ev_sub && ev_sub[1].imp_kwh > 0.1) {
-    var ev = ev_sub[1];
-    var ev_kg  = ev.carbon_g / 1000;
-    var ev_ci_kwh = ev.ci_imp_kwh || 0;
-    var ev_int = ev.avg_charge_intensity != null ? Math.round(ev.avg_charge_intensity)
-               : (ev_ci_kwh > 0 ? Math.round(ev.carbon_g / ev_ci_kwh) : null);
-    document.getElementById('card-ev').style.display = 'block';
-    document.getElementById('ev-headline').textContent = ev_kg.toFixed(2) + ' kgCO₂';
-    document.getElementById('ev-sub').textContent = 'Carbon attributable to EV charging this period.';
-    var ci_kwh_ev  = ev.ci_imp_kwh || 0;
-    var charge_eff_display = a.ev_charge_efficiency || 0.88;
-    var dc_kwh     = ci_kwh_ev > 0
-      ? ci_kwh_ev * charge_eff_display
-      : ev.imp_kwh * charge_eff_display;
-    document.getElementById('ev-carbon').textContent    = ev_kg.toFixed(2);
-    document.getElementById('ev-kwh').textContent       = ci_kwh_ev > 0 ? fmtKwh(ci_kwh_ev) : fmtKwh(ev.imp_kwh);
-    document.getElementById('ev-dc-kwh').textContent    = fmtKwh(dc_kwh);
-    document.getElementById('ev-intensity').textContent = ev_int != null ? Math.round(ev_int) : '—';
-    document.getElementById('ev-vs-grid').textContent   = d.grid_avg_intensity != null ? Math.round(d.grid_avg_intensity) : '—';
+  // Called even when the list is empty, so clones from a previous period are
+  // cleared rather than left behind when the user moves to a range with no EV.
+  carbonCardsFor('card-ev', evCarbonDevs, function(ev, $) {
+        var ev_kg  = ev.carbon_g / 1000;
+        var ev_ci_kwh = ev.ci_imp_kwh || 0;
+        var ev_int = ev.avg_charge_intensity != null ? Math.round(ev.avg_charge_intensity)
+                   : (ev_ci_kwh > 0 ? Math.round(ev.carbon_g / ev_ci_kwh) : null);
+        $('card-ev').style.display = 'block';
+        $('ev-headline').textContent = ev_kg.toFixed(2) + ' kgCO₂';
+        $('ev-sub').textContent = 'Carbon attributable to EV charging this period.';
+        var ci_kwh_ev  = ev.ci_imp_kwh || 0;
+        var charge_eff_display = a.ev_charge_efficiency || 0.88;
+        var dc_kwh     = ci_kwh_ev > 0
+          ? ci_kwh_ev * charge_eff_display
+          : ev.imp_kwh * charge_eff_display;
+        $('ev-carbon').textContent    = ev_kg.toFixed(2);
+        $('ev-kwh').textContent       = ci_kwh_ev > 0 ? fmtKwh(ci_kwh_ev) : fmtKwh(ev.imp_kwh);
+        $('ev-dc-kwh').textContent    = fmtKwh(dc_kwh);
+        $('ev-intensity').textContent = ev_int != null ? Math.round(ev_int) : '—';
+        $('ev-vs-grid').textContent   = d.grid_avg_intensity != null ? Math.round(d.grid_avg_intensity) : '—';
 
-    var charge_eff = a.ev_charge_efficiency || 0.88;
-    var evEquiv = document.getElementById('ev-equiv');
-    var evLines = [];
-    // EV vs grid average intensity
-    if (ev_int != null && d.grid_avg_intensity != null) {
-      var ev_diff = ev_int - d.grid_avg_intensity;
-      var ev_pct  = Math.abs(Math.round(ev_diff / d.grid_avg_intensity * 100));
-      if (ev_pct < 10) {
-        evLines.push('Your EV charging intensity matched the grid average.');
-      } else if (ev_diff < 0) {
-        evLines.push('✓ Charged at <strong>' + ev_pct + '% below</strong> the grid average — good off-peak timing.');
-      } else {
-        evLines.push('Charged at <strong>' + ev_pct + '% above</strong> the grid average — shifting to low-carbon windows could help.');
-      }
-    }
-    // EV mileage and per-mile carbon comparison
-    var effic         = a.ev_efficiency || 3.2;
-    var isKm          = (a.distance_unit === 'km');
-    var distLabel     = isKm ? 'km' : 'miles';
-    var petrol_g_per_dist = isKm
-      ? (a.co2_car_petrol_g_per_mile || 180) / 1.60934
-      : (a.co2_car_petrol_g_per_mile || 180);
-    var charge_eff = a.ev_charge_efficiency || 0.88;
+        var charge_eff = a.ev_charge_efficiency || 0.88;
+        var evEquiv = $('ev-equiv');
+        var evLines = [];
+        // EV vs grid average intensity
+        if (ev_int != null && d.grid_avg_intensity != null) {
+          var ev_diff = ev_int - d.grid_avg_intensity;
+          var ev_pct  = Math.abs(Math.round(ev_diff / d.grid_avg_intensity * 100));
+          if (ev_pct < 10) {
+            evLines.push('Your EV charging intensity matched the grid average.');
+          } else if (ev_diff < 0) {
+            evLines.push('✓ Charged at <strong>' + ev_pct + '% below</strong> the grid average — good off-peak timing.');
+          } else {
+            evLines.push('Charged at <strong>' + ev_pct + '% above</strong> the grid average — shifting to low-carbon windows could help.');
+          }
+        }
+        // EV mileage and per-mile carbon comparison
+        var effic         = a.ev_efficiency || 3.2;
+        var isKm          = (a.distance_unit === 'km');
+        var distLabel     = isKm ? 'km' : 'miles';
+        var petrol_g_per_dist = isKm
+          ? (a.co2_car_petrol_g_per_mile || 180) / 1.60934
+          : (a.co2_car_petrol_g_per_mile || 180);
+        var charge_eff = a.ev_charge_efficiency || 0.88;
 
-    // Mileage from CI kWh (consistent with carbon data)
-    var ci_kwh   = ev.ci_imp_kwh || 0;
-    var ev_dist_total = ci_kwh * charge_eff * effic;
+        // Mileage from CI kWh (consistent with carbon data)
+        var ci_kwh   = ev.ci_imp_kwh || 0;
+        var ev_dist_total = ci_kwh * charge_eff * effic;
 
-    // Per-mile carbon uses same ci_kwh as mileage — consistent denominator
-    var ci_pct    = ev.imp_kwh > 0 ? Math.round(ci_kwh / ev.imp_kwh * 100) : 0;
-    var ev_dist_ci = ev_dist_total;  // same calculation
+        // Per-mile carbon uses same ci_kwh as mileage — consistent denominator
+        var ci_pct    = ev.imp_kwh > 0 ? Math.round(ci_kwh / ev.imp_kwh * 100) : 0;
+        var ev_dist_ci = ev_dist_total;  // same calculation
 
-    if (ev_dist_total > 1) {
-      evLines.push('🚗 Estimated <strong>' + Math.round(ev_dist_total).toLocaleString() +
-        ' ' + distLabel + '</strong> this period (' + effic + ' ' + distLabel +
-        '/kWh battery after ' + Math.round(charge_eff * 100) + '% charge efficiency).');
-      if (ci_pct >= 80 && ev_dist_ci > 1 && ev.carbon_g > 0) {
-        var ev_g_per_dist = ev.carbon_g / ev_dist_ci;
-        var cleaner_pct   = Math.round((1 - ev_g_per_dist / petrol_g_per_dist) * 100);
-        evLines.push('Carbon intensity: <strong>' + Math.round(ev_g_per_dist) +
-          ' gCO₂/' + distLabel + '</strong> — ' +
-          (cleaner_pct > 0
-            ? '<strong>' + cleaner_pct + '% cleaner</strong> than petrol (' + Math.round(petrol_g_per_dist) + ' gCO₂/' + distLabel + ')'
-            : Math.abs(cleaner_pct) + '% dirtier than petrol this period'));
-      } else if (ev.carbon_g > 0) {
-        evLines.push('<em>Carbon coverage ' + ci_pct + '% of charging kWh — per-mile carbon ' +
-          'comparison needs more data to be reliable.</em>');
-      }
-    }
-    if (ev.inverter_possible) {
-      evLines.push('<em>⚠ This EV charger is marked as inverter-capable. Carbon shown assumes ' +
-        'full grid draw — actual carbon may be lower if solar or battery contributed.</em>');
-    }
-    if (ev.carbon_g > 0) {
-      var evEquivStr = equivLines(ev.carbon_g, a, d.period_start, d.period_end, ev.data_start || d.data_start);
-      if (evEquivStr) evLines.push(evEquivStr);
-    }
-    evEquiv.innerHTML = evLines.join('<br>');
-  }
-  else if (d.ev_carbon) {
+        if (ev_dist_total > 1) {
+          evLines.push('🚗 Estimated <strong>' + Math.round(ev_dist_total).toLocaleString() +
+            ' ' + distLabel + '</strong> this period (' + effic + ' ' + distLabel +
+            '/kWh battery after ' + Math.round(charge_eff * 100) + '% charge efficiency).');
+          if (ci_pct >= 80 && ev_dist_ci > 1 && ev.carbon_g > 0) {
+            var ev_g_per_dist = ev.carbon_g / ev_dist_ci;
+            var cleaner_pct   = Math.round((1 - ev_g_per_dist / petrol_g_per_dist) * 100);
+            evLines.push('Carbon intensity: <strong>' + Math.round(ev_g_per_dist) +
+              ' gCO₂/' + distLabel + '</strong> — ' +
+              (cleaner_pct > 0
+                ? '<strong>' + cleaner_pct + '% cleaner</strong> than petrol (' + Math.round(petrol_g_per_dist) + ' gCO₂/' + distLabel + ')'
+                : Math.abs(cleaner_pct) + '% dirtier than petrol this period'));
+          } else if (ev.carbon_g > 0) {
+            evLines.push('<em>Carbon coverage ' + ci_pct + '% of charging kWh — per-mile carbon ' +
+              'comparison needs more data to be reliable.</em>');
+          }
+        }
+        if (ev.inverter_possible) {
+          evLines.push('<em>⚠ This EV charger is marked as inverter-capable. Carbon shown assumes ' +
+            'full grid draw — actual carbon may be lower if solar or battery contributed.</em>');
+        }
+        if (ev.carbon_g > 0) {
+          var evEquivStr = equivLines(ev.carbon_g, a, d.period_start, d.period_end, ev.data_start || d.data_start);
+          if (evEquivStr) evLines.push(evEquivStr);
+        }
+        evEquiv.innerHTML = evLines.join('<br>');
+
+    });
+  if (!evCarbonDevs.length && d.ev_carbon) {
     // Δ5b: device-less IOG (no physical charger) — render the EV carbon card from the
     // SYNTHETIC dispatch figure (single-source). Grid carbon = clipped × intensity; the
     // behind-meter saving is shown separately below. Mileage/efficiency lines need a device
@@ -1629,10 +1587,26 @@ function renderComparison(d, c) {
     }
   }
   // Battery charging delta
-  var _batCur = d.sub_meters ? Object.values(d.sub_meters).find(function(s){
-    return ['battery','inverter'].includes(s.meter_type); }) : null;
-  var _batCmp = c.sub_meters ? Object.values(c.sub_meters).find(function(s){
-    return ['battery','inverter'].includes(s.meter_type); }) : null;
+  // Summed across every battery/inverter (#450) — this sentence is about battery
+  // charging as a whole, so with two batteries it previously described one and
+  // ignored the other. Intensity is kWh-weighted; a plain mean of two batteries
+  // charging very different amounts would not mean anything.
+  function _batAgg(src) {
+    var list = Object.values(src || {}).filter(function(s){
+      return ['battery','inverter'].includes(s.meter_type); });
+    if (!list.length) return null;
+    var k = 0, g = 0, iw = 0, ik = 0;
+    list.forEach(function(s) {
+      k += s.imp_kwh || 0; g += s.carbon_g || 0;
+      if (s.avg_charge_intensity != null && s.imp_kwh) {
+        iw += s.avg_charge_intensity * s.imp_kwh; ik += s.imp_kwh;
+      }
+    });
+    return { imp_kwh: k, carbon_g: g,
+             avg_charge_intensity: ik > 0 ? iw / ik : null };
+  }
+  var _batCur = _batAgg(d.sub_meters);
+  var _batCmp = _batAgg(c.sub_meters);
   if (_batCur && _batCmp && Math.abs((_batCur.carbon_g||0) - (_batCmp.carbon_g||0)) > 100) {
     var batKgDelta  = ((_batCur.carbon_g||0) - (_batCmp.carbon_g||0)) / 1000;
     var batKwhDelta = (_batCur.imp_kwh||0) - (_batCmp.imp_kwh||0);
@@ -1693,21 +1667,26 @@ function renderComparison(d, c) {
   if (batKwh) addBadge('bat-kwh', batKwh, batCmpKwh, null);  // volume
   if (hpKwh)  addBadge('hp-kwh',  hpKwh,  hpCmpKwh,  null);  // volume
   // Headline carbon badges for sub-device cards
-  var evCgCmp  = c.sub_meters ? Object.values(c.sub_meters).find(function(s){ return ['ev_charger','ev'].includes(s.meter_type); }) : null;
-  var batCgCmp = c.sub_meters ? Object.values(c.sub_meters).find(function(s){ return ['battery','inverter'].includes(s.meter_type); }) : null;
-  var hpCgCmp  = c.sub_meters ? Object.values(c.sub_meters).find(function(s){ return s.meter_type === 'heat_pump'; }) : null;
-  var evCg     = d.sub_meters ? Object.values(d.sub_meters).find(function(s){ return ['ev_charger','ev'].includes(s.meter_type); }) : null;
-  var batCg    = d.sub_meters ? Object.values(d.sub_meters).find(function(s){ return ['battery','inverter'].includes(s.meter_type); }) : null;
-  var hpCg     = d.sub_meters ? Object.values(d.sub_meters).find(function(s){ return s.meter_type === 'heat_pump'; }) : null;
-  if (evCg  && evCgCmp) {
-    addBadge('ev-headline',  evCg.carbon_g,              evCgCmp.carbon_g,              true);
-    addBadge('ev-intensity', evCg.avg_charge_intensity,  evCgCmp.avg_charge_intensity,  true);
-  }
-  if (batCg && batCgCmp) {
-    addBadge('bat-headline',  batCg.carbon_g,             batCgCmp.carbon_g,             true);
-    addBadge('bat-intensity', batCg.avg_charge_intensity, batCgCmp.avg_charge_intensity, true);
-  }
-  if (hpCg  && hpCgCmp)  addBadge('hp-headline', hpCg.carbon_g, hpCgCmp.carbon_g, true);
+  // Carbon card deltas — matched PER DEVICE by meter id (#450). These used to
+  // .find() the first device of each type and address the fixed card ids; those
+  // ids now belong to hidden prototypes, so a badge written there would be
+  // invisible. Each clone's ids carry the device suffix.
+  var _cSubs = c.sub_meters || {};
+  Object.keys(d.sub_meters || {}).forEach(function(mid) {
+    var cur = d.sub_meters[mid], cmp = _cSubs[mid];
+    if (!cmp) return;                       // no like-for-like device last period
+    var t = (cur.meter_type || '').toLowerCase();
+    var sfx = '--' + uDeviceElId(mid);
+    if (['ev_charger','ev'].includes(t)) {
+      addBadge('ev-headline'  + sfx, cur.carbon_g,             cmp.carbon_g,             true);
+      addBadge('ev-intensity' + sfx, cur.avg_charge_intensity, cmp.avg_charge_intensity, true);
+    } else if (['battery','inverter'].includes(t)) {
+      addBadge('bat-headline'  + sfx, cur.carbon_g,             cmp.carbon_g,             true);
+      addBadge('bat-intensity' + sfx, cur.avg_charge_intensity, cmp.avg_charge_intensity, true);
+    } else if (t === 'heat_pump') {
+      addBadge('hp-headline' + sfx, cur.carbon_g, cmp.carbon_g, true);
+    }
+  });
   // Grid average intensity — the baseline everything is measured against
   addBadge('sum-grid-int', d.grid_avg_intensity, c.grid_avg_intensity, true);
 }
@@ -2117,6 +2096,85 @@ function renderUsageTierBars(tiers, totalKwh, containerId, currency) {
   el.innerHTML = html;
 }
 
+// ── Per-device CARBON cards (#450) ──────────────────────────────────────────
+// The carbon cards are rich, bespoke markup (metrics, narrative, footnotes with
+// template links), so rather than rebuild them in JS the static card is kept as a
+// PROTOTYPE and cloned once per device, with every id in the subtree suffixed.
+// Each block's own arithmetic is untouched — it just addresses its card through
+// the scoped lookup `$` instead of document.getElementById.
+//
+// Carbon deliberately keeps its own model (grid-intensity attribution and the
+// offsetting comparisons); this changes only WHICH devices get a card.
+function carbonCardsFor(protoId, devices, fill) {
+  var proto = document.getElementById(protoId);
+  if (!proto) return;
+  var host = proto.parentNode;
+  // Drop clones from a previous render before rebuilding.
+  var stale = host.querySelectorAll('[data-clone-of="' + protoId + '"]');
+  for (var i = stale.length - 1; i >= 0; i--) { host.removeChild(stale[i]); }
+  proto.style.display = 'none';          // the prototype itself never shows
+  (devices || []).forEach(function(entry) {
+    var mid = entry[0], dev = entry[1];
+    var sfx  = uDeviceElId(mid);
+    var node = proto.cloneNode(true);
+    node.id = protoId + '--' + sfx;
+    node.setAttribute('data-clone-of', protoId);
+    var kids = node.querySelectorAll('[id]');
+    for (var k = 0; k < kids.length; k++) { kids[k].id = kids[k].id + '--' + sfx; }
+    node.style.display = 'block';
+    host.insertBefore(node, proto);
+    var title = node.querySelector('.insight-card-title');
+    if (title) { title.textContent = title.textContent + ' — ' + (dev.label || mid); }
+    fill(dev, function (base) { return document.getElementById(base + '--' + sfx); }, mid, sfx);
+  });
+}
+
+// ── Per-device usage cards (#450) ───────────────────────────────────────────
+// The usage device cards are built one per meter id. These two helpers supply
+// the per-TYPE presentation (icon, wording) and a DOM-safe id, so the card
+// markup stays in one place rather than repeated per type as it was before.
+function escHtml(v) {
+  return String(v == null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// A meter id is user-supplied and can contain anything; an element id cannot.
+// Prefix-free ids could also collide ('a.b' and 'a-b' both → 'a-b'), so the
+// original is appended as a hex suffix to keep them distinct.
+function uDeviceElId(mid) {
+  var safe = String(mid).replace(/[^A-Za-z0-9_-]/g, '-');
+  var h = 0;
+  for (var i = 0; i < String(mid).length; i++) {
+    h = ((h << 5) - h + String(mid).charCodeAt(i)) | 0;
+  }
+  return safe + '-' + (h >>> 0).toString(16);
+}
+
+function uDeviceMeta(sm) {
+  var t = ((sm && sm.meter_type) || '').toLowerCase();
+  if (t === 'battery' || t === 'inverter') {
+    return { icon: '🔋', title: 'Battery', order: 1,
+             sub: 'Grid energy used to charge the battery this period.',
+             kwhLabel: 'Charged from Grid', costLabel: 'Charging Cost' };
+  }
+  if (t === 'ev' || t === 'ev_charger') {
+    return { icon: '🚗', title: 'EV Charger', order: 2,
+             sub: 'Grid energy delivered to your vehicle this period.',
+             kwhLabel: 'Charged from Grid', costLabel: 'Charging Cost' };
+  }
+  if (t === 'heat_pump') {
+    return { icon: '♨️', title: 'Heat Pump', order: 3,
+             sub: 'Grid energy consumed by your heat pump this period.',
+             kwhLabel: 'Electricity Used', costLabel: 'Running Cost' };
+  }
+  // An unrecognised meter_type used to render NOTHING — the three cards covered
+  // three types and anything else fell through. It now gets a generic card.
+  return { icon: '🔌', title: 'Device', order: 4,
+           sub: 'Grid energy used by this device this period.',
+           kwhLabel: 'Electricity Used', costLabel: 'Running Cost' };
+}
+
 function renderSubDeviceRates(tiers, totalKwh, containerId, currency) {
   var el = document.getElementById(containerId);
   if (!el || !tiers || !tiers.length) { if(el) el.style.display='none'; return; }
@@ -2306,9 +2364,12 @@ function generateUsageNarrative(cur, prev, cmpLabel) {
 
 function renderUsage(d, cmpData) {
   document.getElementById('tab-usage').style.display = 'block';
-  // Hide all device cards first
-  ['ucard-battery','ucard-ev','ucard-hp','ucard-narrative'].forEach(function(id) {
-    document.getElementById(id).style.display = 'none';
+  // Clear device cards first — they are rebuilt per meter id below (#450)
+  var _dw = document.getElementById('ucard-devices');
+  if (_dw) _dw.innerHTML = '';
+  ['ucard-narrative'].forEach(function(id) {
+    var _e = document.getElementById(id);
+    if (_e) _e.style.display = 'none';
   });
 
   var currency = '£';  // default — could be passed from config if needed
@@ -2389,36 +2450,50 @@ function renderUsage(d, cmpData) {
     }
   }
 
-  // ── Sub-meter device cards ────────────────────────────────────────────────
+  // ── Sub-meter device cards — ONE PER METER ID (#450) ──────────────────────
+  // The server keys sub_meters by meter id and sends every configured device.
+  // These cards used to be three fixed blocks keyed by TYPE, so a second heat
+  // pump overwrote the first and only one appeared. Build a card per id instead.
+  // The synthetic EV arrives here as an ordinary entry (derived: true), so a
+  // no-EV-device account gets its card for free.
   var subs = d.sub_meters || {};
-  Object.keys(subs).forEach(function(mid) {
-    var sm = subs[mid];
-    var type = (sm.meter_type || '').toLowerCase();
-    var label = sm.label || mid;
-
-    if (type === 'battery' || type === 'inverter') {
-      document.getElementById('ucard-battery').style.display = 'block';
-      document.getElementById('u-bat-label').textContent     = label;
-      document.getElementById('u-bat-kwh').textContent       = (sm.imp_kwh || 0).toFixed(1);
-      document.getElementById('u-bat-cost').textContent      = fmtCost(sm.imp_cost);
-      document.getElementById('u-currency-bat').textContent  = currency;
-      renderSubDeviceRates(sm.rate_tiers, sm.imp_kwh, 'u-bat-rates', currency);
-    } else if (type === 'ev' || type === 'ev_charger') {
-      document.getElementById('ucard-ev').style.display      = 'block';
-      document.getElementById('u-ev-label').textContent      = label;
-      document.getElementById('u-ev-kwh').textContent        = (sm.imp_kwh || 0).toFixed(1);
-      document.getElementById('u-ev-cost').textContent       = fmtCost(sm.imp_cost);
-      document.getElementById('u-currency-ev').textContent   = currency;
-      renderSubDeviceRates(sm.rate_tiers, sm.imp_kwh, 'u-ev-rates', currency);
-    } else if (type === 'heat_pump') {
-      document.getElementById('ucard-hp').style.display      = 'block';
-      document.getElementById('u-hp-label').textContent      = label;
-      document.getElementById('u-hp-kwh').textContent        = (sm.imp_kwh || 0).toFixed(1);
-      document.getElementById('u-hp-cost').textContent       = fmtCost(sm.imp_cost);
-      document.getElementById('u-currency-hp').textContent   = currency;
-      renderSubDeviceRates(sm.rate_tiers, sm.imp_kwh, 'u-hp-rates', currency);
-    }
-  });
+  var devWrap = document.getElementById('ucard-devices');
+  if (devWrap) {
+    devWrap.innerHTML = '';
+    Object.keys(subs).sort(function(a, b) {
+      var oa = uDeviceMeta(subs[a]).order, ob = uDeviceMeta(subs[b]).order;
+      return oa !== ob ? oa - ob
+           : String(subs[a].label || a).localeCompare(String(subs[b].label || b));
+    }).forEach(function(mid) {
+      var sm   = subs[mid];
+      var info = uDeviceMeta(sm);
+      var eid  = uDeviceElId(mid);
+      var card = document.createElement('div');
+      card.className = 'insight-card';
+      card.id = 'ucard-dev-' + eid;
+      card.innerHTML =
+        '<div class="insight-card-title">' + info.icon + ' ' + escHtml(info.title) +
+          ' — <span>' + escHtml(sm.label || mid) + '</span></div>' +
+        '<div class="insight-sub">' + escHtml(info.sub) + '</div>' +
+        '<div class="insight-grid">' +
+          '<div class="insight-metric">' +
+            '<div class="insight-metric-label">' + escHtml(info.kwhLabel) + '</div>' +
+            '<span class="insight-metric-value" id="u-dev-' + eid + '-kwh">—</span>' +
+            '<span class="insight-metric-unit">kWh</span>' +
+          '</div>' +
+          '<div class="insight-metric">' +
+            '<div class="insight-metric-label">' + escHtml(info.costLabel) + '</div>' +
+            '<span class="insight-metric-value" id="u-dev-' + eid + '-cost">—</span>' +
+            '<span class="insight-metric-unit">' + escHtml(currency) + '</span>' +
+          '</div>' +
+        '</div>' +
+        '<div id="u-dev-' + eid + '-rates" class="insight-equiv" style="display:none;"></div>';
+      devWrap.appendChild(card);
+      document.getElementById('u-dev-' + eid + '-kwh').textContent  = (sm.imp_kwh || 0).toFixed(1);
+      document.getElementById('u-dev-' + eid + '-cost').textContent = fmtCost(sm.imp_cost);
+      renderSubDeviceRates(sm.rate_tiers, sm.imp_kwh, 'u-dev-' + eid + '-rates', currency);
+    });
+  }
 
   // ── Delta badges on Usage metric values ─────────────────────────────────
   // lowerBetter: true/false = coloured, null = grey (volume — no direction judgement)
@@ -2462,18 +2537,10 @@ function renderUsage(d, cmpData) {
     Object.keys(subs).forEach(function(mid) {
       var sm  = subs[mid];
       var cmp = cmpSubs[mid];
-      if (!cmp) return;
-      var type = (sm.meter_type || '').toLowerCase();
-      if (type === 'battery' || type === 'inverter') {
-        uBadge('u-bat-kwh',  sm.imp_kwh,  cmp.imp_kwh,  null);
-        uBadge('u-bat-cost', sm.imp_cost, cmp.imp_cost, true);
-      } else if (type === 'ev' || type === 'ev_charger') {
-        uBadge('u-ev-kwh',   sm.imp_kwh,  cmp.imp_kwh,  null);
-        uBadge('u-ev-cost',  sm.imp_cost, cmp.imp_cost, true);
-      } else if (type === 'heat_pump') {
-        uBadge('u-hp-kwh',   sm.imp_kwh,  cmp.imp_kwh,  null);
-        uBadge('u-hp-cost',  sm.imp_cost, cmp.imp_cost, true);
-      }
+      if (!cmp) return;                      // no like-for-like device last period
+      var eid = uDeviceElId(mid);
+      uBadge('u-dev-' + eid + '-kwh',  sm.imp_kwh,  cmp.imp_kwh,  null);
+      uBadge('u-dev-' + eid + '-cost', sm.imp_cost, cmp.imp_cost, true);
     });
   }
 
@@ -2518,8 +2585,14 @@ function insExportPdf() {
     // The usage comparison narrative is inside ucard-narrative instead.
     // Each usage card checked individually — elHtml skips hidden ones.
     ['ucard-narrative','ucard-cost','ucard-rates','ucard-grid',
-     'ucard-peak','ucard-battery','ucard-ev','ucard-hp'].forEach(function(id) {
+     'ucard-peak'].forEach(function(id) {
       reportHtml += elHtml(id);
+    });
+    // Device cards are built per meter id, so enumerate them rather than
+    // naming a fixed three (#450).
+    var _dwE = document.getElementById('ucard-devices');
+    if (_dwE) Array.prototype.forEach.call(_dwE.children, function(c) {
+      reportHtml += elHtml(c.id);
     });
   } else {
     // Carbon: insights-body contains cmp-panel — capture whole body once

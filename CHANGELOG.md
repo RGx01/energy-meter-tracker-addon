@@ -11,6 +11,41 @@ itself to something that was not there when it was written.
 
 ### Fixed
 
+- **Usage Insights shows every device you have configured
+  ([#450](https://github.com/RGx01/energy-meter-tracker-addon/issues/450)).** The device cards
+  were three fixed panels — one for a battery, one for an EV charger, one for a heat pump — so a
+  second device of any type had nowhere to appear. With two heat pumps configured, only one was
+  ever shown. The figures behind it were always right, and the period comparison had been counting
+  both all along; it was only the cards that could not hold them.
+
+  There is now one card per device, built from what you have configured rather than from a fixed
+  list, so two heat pumps get two cards and a device type EMT doesn't recognise gets a card too
+  instead of being dropped. Cards are grouped by kind and named after the device.
+
+  The **Carbon** tab had the same limit and is fixed the same way — with one difference worth
+  knowing: its cards keep their own way of reckoning, comparing each device against a gas boiler
+  or against the grid average rather than simply reporting what was used. Only which devices get a
+  card has changed. Where a period-on-period comparison is about your batteries as a whole rather
+  than one of them, it now adds them up instead of describing whichever it happened to find first.
+
+- **The Overview cost cards now show your EV, and show it at the price you are billed
+  ([#468](https://github.com/RGx01/energy-meter-tracker-addon/issues/468)).** The breakdown
+  under Today / This Bill / This Year was built purely from configured sub-meters, so it
+  disagreed with the billing chart in two ways. On an account with **no EV device**, the
+  car's charging had nowhere to appear and sat silently inside "Direct import" — the
+  reported case. On an account **with** one, the card showed what the charger's own meter
+  recorded, while the bill charges the grid-clipped figure; on the reference account that
+  is 248.129 kWh against a metered 250.995.
+
+  Both now follow the same rule the billing chart, Usage Stats and the insight cards
+  already use: where Octopus has told us what the car took in a half-hour, that is the
+  figure — it is what you are charged for — and elsewhere the charger's own meter stands
+  in. The two are one continuous EV line rather than two competing ones.
+
+  **Display only.** "Total Import" is the raw grid figure and does not move; whatever the
+  EV row shows is taken out of "Direct import", so the rows still add up to the total and
+  no bill changes. An account with no dispatch history sees no change at all.
+
 - **A smart charge that Octopus never confirmed no longer stays cheap forever.** EMT
   decides at settlement whether a planned smart-charge slot really ran. The signal it
   leans on is `started` — but Octopus does not report started dispatches at all: EMT
