@@ -154,3 +154,121 @@ class TestMeasuredApply(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMeasuredApplyDeviceRecost(unittest.TestCase):
+    """Settlement re-costs devices from the GRID-ATTRIBUTED kWh, not the raw draw (#473).
+
+    `apply_measured_to_block` re-costs the slot's sub-meters to the settled rate, because
+    PASS 2 costs every device at its parent's rate and settlement moves that rate. It priced
+    from raw `imp_kwh`, which silently re-based the cost onto a different quantity than PASS 2
+    had used: a device that ran off solar or battery was billed as though the grid supplied
+    all of it.
+
+    That reaches the BILL, not just the device line. `compute_period_net` builds each day as
+    `max(0, main - SUM(devices)) + SUM(devices)` — algebraically `main`, except the clamp
+    stops the device terms cancelling once they exceed the main. So an over-costed device
+    becomes the period total.
+
+    The kWh COLUMNS were always correct, which is why this hid: the comment above the
+    statement promises "kWh is untouched; only the priced rate layer moves", and that is true
+    of the columns while being false of the cost.
+    """
+
+    SLOT = "2026-08-23T02:00:00"
+    OFF = 0.05493          # the off-peak band _Sched returns, in £
+
+    def setUp(self):
+        self._save = (engine._store, engine._kraken_rate_schedules)
+        self.st = BlockStore(":memory:")
+        engine._store = self.st
+        engine._kraken_rate_schedules = {"import": _Sched()}
+        self.st._conn.execute(
+            "INSERT OR IGNORE INTO config_periods (id, effective_from, billing_day, "
+            "block_minutes, timezone) VALUES (1,'2020-01-01T00:00:00',1,30,'UTC')")
+        # Main: 3 kWh settled, priced into the off-peak band. Deliberately started on the
+        # PEAK rate so settlement genuinely moves it and the device re-cost fires.
+        self.st._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+            "imp_kwh, imp_kwh_api, imp_rate, imp_cost, rate_source) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (self.SLOT, self.SLOT, "electricity_main", 1, 3.0, 3.0, 0.323092,
+             round(3.0*0.323092, 6), "reconciled"))
+        self.st._conn.commit()
+
+    def tearDown(self):
+        (engine._store, engine._kraken_rate_schedules) = self._save
+
+    def _device(self, mid, kwh, kwh_grid):
+        self.st._conn.execute(
+            "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, "
+            "imp_kwh, imp_kwh_grid, imp_rate, imp_cost) VALUES (?,?,?,?,?,?,?,?)",
+            (self.SLOT, self.SLOT, mid, 1, kwh, kwh_grid, 0.323092,
+             round((kwh if kwh_grid is None else kwh_grid) * 0.323092, 6)))
+        self.st._conn.commit()
+
+    def _settle(self):
+        ok = engine.apply_measured_to_block(
+            self.SLOT, cost_incl=round(3.0 * self.OFF, 6), label="OFF_PEAK")
+        self.assertTrue(ok, "settlement did not apply")
+        return ok
+
+    def _dev_row(self, mid):
+        return self.st._conn.execute(
+            "SELECT imp_kwh, imp_kwh_grid, imp_rate, imp_rate_exc, imp_cost, imp_cost_exc "
+            "FROM blocks WHERE block_start=? AND meter_id=?", (self.SLOT, mid)).fetchone()
+
+    def test_device_cost_uses_grid_attributed_kwh(self):
+        """4 kWh drawn, only 0.01 of it from the grid — bill the 0.01."""
+        self._device("battery", 4.0, 0.01)
+        self._settle()
+        r = self._dev_row("battery")
+        self.assertAlmostEqual(r["imp_rate"], self.OFF, places=6)        # rate did move
+        self.assertAlmostEqual(r["imp_cost"], round(0.01 * self.OFF, 6), places=6)
+        # and emphatically NOT the raw-kWh figure the old expression produced
+        self.assertNotAlmostEqual(r["imp_cost"], round(4.0 * self.OFF, 6), places=4)
+
+    def test_device_kwh_columns_are_untouched(self):
+        self._device("battery", 4.0, 0.01)
+        self._settle()
+        r = self._dev_row("battery")
+        self.assertEqual(r["imp_kwh"], 4.0)
+        self.assertEqual(r["imp_kwh_grid"], 0.01)
+
+    def test_exc_follows_the_same_quantity(self):
+        """inc and exc must derive from the same kWh or the ex-VAT view disagrees."""
+        self._device("battery", 4.0, 0.01)
+        self._settle()
+        r = self._dev_row("battery")
+        self.assertIsNotNone(r["imp_rate_exc"])
+        # exact: cost_exc is the SAME 0.01 kWh priced at the row's own ex-VAT rate
+        self.assertAlmostEqual(r["imp_cost_exc"], round(0.01 * r["imp_rate_exc"], 6), places=6)
+        self.assertNotAlmostEqual(r["imp_cost_exc"], round(4.0 * r["imp_rate_exc"], 6), places=4)
+
+    def test_unclipped_device_still_costs_from_raw_kwh(self):
+        """imp_kwh_grid NULL means PASS 2 never clipped — the COALESCE fallback.
+
+        A production database carries thousands of these; re-costing them to zero would be a
+        worse bug than the one being fixed.
+        """
+        self._device("nogrid", 0.5, None)
+        self._settle()
+        r = self._dev_row("nogrid")
+        self.assertIsNone(r["imp_kwh_grid"])
+        self.assertAlmostEqual(r["imp_cost"], round(0.5 * self.OFF, 6), places=6)
+
+    def test_devices_no_longer_exceed_the_main(self):
+        """The property that makes the bill safe: with costs clipped, SUM(devices) <= main,
+        so the per-day clamp in compute_period_net cannot fire."""
+        self._device("battery", 4.0, 0.01)
+        self._device("ev", 2.5, 0.40)
+        self._settle()
+        main = self.st._conn.execute(
+            "SELECT imp_cost FROM blocks WHERE block_start=? AND meter_id='electricity_main'",
+            (self.SLOT,)).fetchone()["imp_cost"]
+        devs = self.st._conn.execute(
+            "SELECT COALESCE(SUM(imp_cost),0) s FROM blocks WHERE block_start=? "
+            "AND meter_id != 'electricity_main'", (self.SLOT,)).fetchone()["s"]
+        self.assertLessEqual(devs, main + 1e-9)
+        # the raw-kWh forms would NOT have fitted — that is the defect, stated as arithmetic
+        self.assertGreater(round(4.0*self.OFF, 6) + round(2.5*self.OFF, 6), main)
