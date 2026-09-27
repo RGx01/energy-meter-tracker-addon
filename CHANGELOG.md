@@ -1,6 +1,6 @@
 # Changelog
  
-## [4.5.15] — 2026-09-26
+## [4.5.15] — 2026-09-27
 
 *A device can only cost what the grid supplied it.* Energy Meter Tracker has always
 known that — it works out, half-hour by half-hour, how much of what your battery or
