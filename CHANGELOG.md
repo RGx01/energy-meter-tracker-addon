@@ -1,5 +1,74 @@
 # Changelog
  
+## [4.5.15] — 2026-09-27
+
+*A device can only cost what the grid supplied it.* Energy Meter Tracker has always
+known that — it works out, half-hour by half-hour, how much of what your battery or
+heat pump drew actually came through the meter, and charges you for that rather than
+for everything the device recorded. Two places quietly stopped doing it, and because
+they left the kWh figures untouched, everything looked right.
+
+### Fixed
+
+- **The bill total could be substantially too high on a home with solar or a battery
+  ([#473](https://github.com/RGx01/energy-meter-tracker-addon/issues/473)).**
+  When Octopus settles a half-hour, EMT re-prices your devices to match the settled rate.
+  That re-pricing was charging for everything the device's own meter recorded, instead of
+  the part the grid supplied. On a sunny afternoon a battery charging from the roof
+  registers plenty of energy while the house imports almost nothing, so the devices could
+  add up to more than the meter ever saw — and the bill total was built by adding the
+  devices back together, so it followed them upwards instead of staying with the meter.
+
+  The more of your usage comes from stored or generated energy, the larger the
+  overstatement; on a storage-heavy home it can approach double. Your meter readings were
+  never affected, and neither was the breakdown table on the same screen — it was the
+  total above it that was wrong.
+
+  This starts when you move to a smart tariff, not when you update: settlement is what
+  sets the re-pricing running. Two homes on the same version were affected from different
+  days, each the day it migrated.
+
+  Existing history is repaired automatically on the next start. The repair only ever
+  removes cost that the grid did not supply; it cannot add any.
+
+- **A confirmed usage figure no longer changes the rate you were predicted
+  ([#475](https://github.com/RGx01/energy-meter-tracker-addon/issues/475)).**
+  Your supplier confirms each half-hour twice: first how much you used, then later what it
+  cost. EMT was treating the first of those as permission to re-decide the second. It is
+  not — a confirmed usage figure says how much energy moved, never what was charged for it.
+
+  On a smart-charging tariff this mattered. Whether a half-hour is billed at the cheap
+  overnight rate or the day rate depends on whether your car was charging under the
+  supplier's control, and EMT works that out from the charging signals it can see. When the
+  confirmed usage arrived, that decision was being made again — sometimes reaching a
+  different answer than it had at the time, on a half-hour the supplier had not yet priced.
+  The predicted price could move to the wrong band and then jump a second time when the
+  real bill landed.
+
+  Now a confirmed usage figure re-costs the half-hour and re-divides it between your car
+  and the rest of the house — both of those follow the energy, so they should move — but
+  the rate stays where it was. Only your supplier's actual billed cost can change the rate,
+  which is the one thing that genuinely knows it.
+
+  **Nothing needs repairing and nothing is repaired.** Only predicted prices were affected,
+  never a half-hour your supplier had already priced, and the band a block would have been
+  given depended on the charging state at the moment it was first worked out — which cannot
+  be reconstructed after the fact. Affected estimates correct themselves as usual when the
+  bill for that half-hour arrives.
+
+  Tariffs where the rate comes from the clock or from a published day-ahead price are
+  unaffected, because nothing about them was ever in doubt.
+
+- **Device costs now add up to your bill.** With the same fix, the per-device figures
+  reconcile against the meter: your devices plus the house remainder equal the metered
+  import. **Expect your device costs to go down** if you have storage, and the price per
+  kWh shown against a device to fall to something that matches your tariff. That is the
+  correction, not a new fault — the earlier figure was charging your devices for energy
+  your panels or battery provided.
+
+  A home without solar or a battery sees no change at all, because everything its devices
+  drew came from the grid anyway.
+
 ## [4.5.14] — 2026-09-21
 
 *Records what a database is, so the next version can read it.* Energy Meter Tracker

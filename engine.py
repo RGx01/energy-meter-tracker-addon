@@ -680,7 +680,7 @@ def _iog_site_tz(store=None) -> str:
 
 def _apply_iog_split(imp_ch: dict, block_start: str, block_end: str,
                      chosen_kwh: float, overlay_rate: float,
-                     tz_name: "str | None" = None) -> None:
+                     tz_name: "str | None" = None, hold_rate: bool = False) -> None:
     """Compute + apply the IOG house/EV billing split onto `imp_ch` IN PLACE.
 
     Sets `kwh_ev`/`cost_ev`/`rate_ev` for any dispatched IOG slot (all IOG tariffs
@@ -688,8 +688,32 @@ def _apply_iog_split(imp_ch: dict, block_start: str, block_end: str,
     (`rate`/`cost` → the blended 4-rate values); on UNCAPPED IOG it leaves
     `rate`/`cost` exactly as the overlay set them (byte-identical), carving the EV
     slice at that same rate. No-op when there's no import schedule or no EV this
-    slot — so non-IOG and non-dispatched slots are untouched. Callers must only
-    invoke this when no authoritative rate override is in force."""
+    slot — so non-IOG and non-dispatched slots are untouched.
+
+    `hold_rate=True` — PREDICTION MODE (4.5.15). Carve the split against the settled kWh,
+    but price every leg at `overlay_rate` and do NOT re-price the block. Use it when a
+    band is being held pending Octopus's cost.
+
+    Why the mode exists. The carve is a QUANTITY question — how much of this block was the
+    EV — and a settled kWh is the better answer to it, so it should follow. The per-leg
+    RATE is a pricing question, and on the capped tariff this function answers it from the
+    dispatch record and re-prices the block. That is correct when the caller has authority
+    (finalise resolving fresh, or Octopus's four-bucket cost). It is not correct on a
+    settlement re-run of an UNCOSTED block: a `completed` dispatch routinely lands ~an hour
+    after its block closes, so re-deriving there moves a band days later on the arrival of
+    a kWh figure that carries no price information. Measured: two instances of one site,
+    identical dispatch records and no billed cost on either, ended on different bands for
+    the same slot purely because their settlements arrived either side of that dispatch.
+
+    This is the second route to a band change (BL-62 found it: the overlay refuses below
+    its 0.1 kWh floor, "but `_apply_iog_split` carries no floor, so the capped seam
+    repriced the slot"). Suppressing the overlay alone does not close it.
+
+    Without the mode the rule has to be enforced from outside — pin `rate`, restamp
+    `rate_ev`/`cost_ev`, and drop the seam `segments` before they are persisted — which is
+    three corrections to one function's output and leaves the original contract
+    ("callers must only invoke this when no authoritative rate override is in force")
+    quietly broken."""
     import iog_cap
     import_sched = _kraken_rate_schedules.get("import")
     if import_sched is None or import_sched.is_empty():
@@ -718,8 +742,13 @@ def _apply_iog_split(imp_ch: dict, block_start: str, block_end: str,
     if res is None:
         return
     imp_ch["kwh_ev"] = res["imp_kwh_ev"]
-    imp_ch["cost_ev"] = res["imp_cost_ev"]
-    imp_ch["rate_ev"] = res["imp_rate_ev"]
+    if hold_rate:
+        # quantity follows the settled kWh; price stays on the held band
+        imp_ch["rate_ev"] = overlay_rate
+        imp_ch["cost_ev"] = round(float(res["imp_kwh_ev"] or 0.0) * overlay_rate, 6)
+    else:
+        imp_ch["cost_ev"] = res["imp_cost_ev"]
+        imp_ch["rate_ev"] = res["imp_rate_ev"]
     # The EV/Home rate bands (off_peak|peak|mixed / off_peak|day|mixed) so the
     # billing summary can show clean bands + one collapsed transition row.
     _cls = res.get("classification") or {}
@@ -728,8 +757,13 @@ def _apply_iog_split(imp_ch: dict, block_start: str, block_end: str,
     # BL-27: carry the seam's full-fidelity band segments so the persist step stores them
     # directly (a boundary block keeps all four bands) instead of re-deriving the collapsed
     # 1–2 from the columns. None on a non-dispatched slot → persist falls back to columns.
-    imp_ch["segments"] = res.get("segments")
-    if capped:                              # capped tariff RE-PRICES the block
+    _segs = res.get("segments")
+    if hold_rate and _segs:
+        # keep the seam's band/attribution fidelity, re-price each leg at the held rate so
+        # SUM(seg kwh x inc_rate) == imp_cost still holds (Billing prices from segments)
+        _segs = [(k, overlay_rate, band, attr) for (k, r, band, attr) in _segs]
+    imp_ch["segments"] = _segs
+    if capped and not hold_rate:            # capped tariff RE-PRICES the block
         imp_ch["rate"] = res["imp_rate"]
         imp_ch["cost"] = res["imp_cost"]
 
@@ -834,7 +868,8 @@ def _sanitise_inc_units(imp_ch: dict, start: str) -> bool:
 
 def _reprice_main_import_block(result: dict, start: str, meter_name: str,
                                meter: "dict | None" = None, *,
-                               apply_overlay: bool = True, persist: bool = True) -> None:
+                               apply_overlay: bool = True, persist: bool = True,
+                               hold_rate: bool = False) -> None:
     """The single per-block re-price for a MAIN import channel (design 4.4.0 §4): (optionally)
     apply the dispatch off-peak overlay (the finalise-time started-gate), carve the IOG
     EV/house split, derive ex-VAT from the post-split rate, and persist the segments — ALL
@@ -854,7 +889,8 @@ def _reprice_main_import_block(result: dict, start: str, meter_name: str,
                 result["cost"] = round((result.get("kwh") or 0.0) * _ov, 6)
         # IOG house/EV split — carve the dispatched EV portion (all IOG) and, on the capped
         # tariff, re-price live; settlement re-applies it when the DCC kWh re-materialises.
-        _apply_iog_split(result, start, "", result.get("kwh"), result.get("rate") or _base)
+        _apply_iog_split(result, start, "", result.get("kwh"), result.get("rate") or _base,
+                         hold_rate=hold_rate)
         # ex-VAT from the POST-split rate — one place, in the same breath as inc. Only when the
         # rate was (re)resolved here; the inherit path keeps the finalised rate AND its exc.
         if apply_overlay and _apply_import_exc(result, start) and meter is not None:
@@ -3443,6 +3479,7 @@ def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricit
             # only re-cost it against the settled kWh. (Ordering normally puts
             # reconcile after settlement, so this is belt-and-braces.)
             _override_rate = None
+            _preserved_prediction = False
             _override_why = "user correction / reconciled / measured"
             try:
                 if _store is not None:
@@ -3455,6 +3492,22 @@ def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricit
                     if (_mrow and (_mrow[0] or _mrow[1] or _mrow[3] == "measured")
                             and _mrow[2] is not None):
                         _override_rate = _mrow[2]
+                    elif use_dcc and _mrow and _mrow[2]:
+                        # 4.5.15: a PREDICTED band is held on the same terms.
+                        #
+                        # A SETTLED kWh HAS NOTHING TO DO WITH RATE. It says what was
+                        # drawn, never what it cost, so it may re-COST a block and must
+                        # never re-BAND one. Only Octopus's billed cost overrides a band,
+                        # via apply_measured_to_block. The split still follows the settled
+                        # kWh — see hold_rate on _apply_iog_split — because the carve is a
+                        # quantity question; only its pricing is held.
+                        #
+                        # GATED ON use_dcc like the BL-62 rule below: a CAD billing-source
+                        # switch re-materialises every block and is MEANT to re-derive.
+                        _override_rate = _mrow[2]
+                        _preserved_prediction = True
+                        _override_why = ("predicted band held — settled kWh re-costs, "
+                                         "never re-bands")
             except Exception:
                 _override_rate = None
             # BL-62: an EXPORT-only settlement must not re-price IMPORT. `needs_pass2_rerun`
@@ -3491,6 +3544,13 @@ def _rerun_pass2_for_settled_block(block: dict, main_meter_id: str = "electricit
                 imp_ch["cost"] = round(chosen * rate, 6)
                 if _apply_import_exc(imp_ch, block.get("start", "")) and main is not None:
                     main["exc_source"] = "tariff"
+                if _preserved_prediction:
+                    # Re-derive the carve + segments against the settled kWh, priced at the
+                    # HELD band (hold_rate=True). apply_overlay=False so the overlay itself
+                    # never re-resolves; hold_rate closes the capped seam's own re-price.
+                    _reprice_main_import_block(imp_ch, block.get("start", ""),
+                                               main_meter_id, main,
+                                               apply_overlay=False, hold_rate=True)
             else:
                 rate, rep = _resolve_block_rate(imp_ch, block.get("start", ""),
                                                 "import", rate_resolver)
@@ -10735,6 +10795,14 @@ async def _tick_dispatch_capture() -> None:
             await run_smb_device_recost()
         except Exception as e:
             logger.warning("_tick_dispatch_capture: smb device-recost failed: %s", e)
+        # One-off (4.5.15): re-cost sub-meter blocks left priced from RAW imp_kwh instead of the
+        # grid-attributed imp_kwh_grid — the over-cost reaches the BILL through the per-day
+        # clamp in compute_period_net. Runs AFTER run_smb_device_recost so it also repairs that
+        # heal's output. Gated + self-marking (smb_device_cost_clip_done).
+        try:
+            await run_smb_device_cost_clip()
+        except Exception as e:
+            logger.warning("_tick_dispatch_capture: smb device cost-clip failed: %s", e)
         # One-off (4.5.9): re-split settled off-peak slots where Octopus's EV_DEVICE bucket
         # absorbed a concurrent home-battery grid charge (EV over-read). Caps EV to the car's
         # completed dispatch; cost/total-neutral. Gated + self-marking (smb_ev_resplit_done).
@@ -11260,6 +11328,7 @@ def _chart_cap_from():
 _SMB_RATE_REPAIR_DONE_KEY = "smb_rate_repair_done_v2"   # one-off (4.5.7); removed in v5.0.0
 _SMB_DEVICE_RECOST_DONE_KEY = "smb_device_recost_done"   # one-off (4.5.7); removed in v5.0.0
 _SMB_EV_RESPLIT_DONE_KEY = "smb_ev_resplit_done"   # one-off (4.5.9); removed in v5.0.0
+_SMB_DEVICE_COST_CLIP_DONE_KEY = "smb_device_cost_clip_done"   # one-off (4.5.15); removed in v5.0.0
 _BAND_SNAP_DONE_KEY = "band_rate_snap_done_v2"   # one-off (4.5.13); removed in v5.0.0
 # _v2: the v1 pass wrote bands from the RATE alone. It had no attribution filter, so it
 # relabelled EV segments the four-bucket machinery owns; it overwrote bands that were
@@ -11463,8 +11532,10 @@ def _smb_device_recost_core(store) -> dict:
     flipped the main to the settled band but did NOT re-cost the devices (which PASS 2 had
     costed at the earlier, often peak, main rate) — so a configured-device account showed the
     EV/battery at the stale peak on Billing + Usage Stats while the bill was off-peak. PASS 2
-    costs every sub-meter at the parent rate, so this restores device == main == bill. kWh is
-    untouched; only the priced rate/cost moves. Idempotent (only rows where the rate differs)."""
+    costs every sub-meter at the parent rate, so this restores device == main == bill. Prices from
+    imp_kwh_grid (the grid-attributed draw) with a raw-kWh fallback for blocks PASS 2 never
+    clipped — costing from raw imp_kwh re-bases the cost onto a different quantity than PASS 2
+    used. Idempotent (only rows where the rate differs)."""
     if store is None:
         return {"ok": False, "reason": "no store"}
     with store._conn:
@@ -11472,11 +11543,11 @@ def _smb_device_recost_core(store) -> dict:
             "UPDATE blocks SET "
             "  imp_rate = (SELECT m.imp_rate FROM blocks m "
             "              WHERE m.meter_id='electricity_main' AND m.block_start=blocks.block_start), "
-            "  imp_cost = ROUND(COALESCE(imp_kwh,0) * (SELECT m.imp_rate FROM blocks m "
+            "  imp_cost = ROUND(COALESCE(imp_kwh_grid, imp_kwh, 0) * (SELECT m.imp_rate FROM blocks m "
             "              WHERE m.meter_id='electricity_main' AND m.block_start=blocks.block_start), 6), "
             "  imp_rate_exc = (SELECT m.imp_rate_exc FROM blocks m "
             "              WHERE m.meter_id='electricity_main' AND m.block_start=blocks.block_start), "
-            "  imp_cost_exc = ROUND(COALESCE(imp_kwh,0) * (SELECT m.imp_rate_exc FROM blocks m "
+            "  imp_cost_exc = ROUND(COALESCE(imp_kwh_grid, imp_kwh, 0) * (SELECT m.imp_rate_exc FROM blocks m "
             "              WHERE m.meter_id='electricity_main' AND m.block_start=blocks.block_start), 6), "
             "  exc_source = 'tariff' "
             "WHERE meter_id != 'electricity_main' AND imp_kwh IS NOT NULL "
@@ -11484,6 +11555,68 @@ def _smb_device_recost_core(store) -> dict:
             "              AND m.block_start = blocks.block_start AND m.imp_rate IS NOT NULL "
             "              AND ABS(COALESCE(m.imp_rate,0) - COALESCE(blocks.imp_rate,0)) > 0.0001)")
     return {"ok": True, "re_costed": cur.rowcount}
+
+
+def _smb_device_cost_clip_core(store) -> dict:
+    """One-off heal (4.5.15 device-cost clip fix): re-cost sub-meter blocks whose stored cost
+    was derived from RAW imp_kwh instead of the grid-attributed imp_kwh_grid.
+
+    PASS 2 costs a device at `imp_kwh_grid x parent_rate` — the portion of its draw the GRID
+    actually supplied. Two re-cost sites priced from raw `imp_kwh` instead (the settlement
+    device re-cost in `apply_measured`, and `_smb_device_recost_core`), so every settled slot
+    where a device ran partly off solar/battery had PASS 2's clipping silently undone. The kWh
+    columns were untouched, which is why it read as correct: the row ends up asserting that
+    0.004 kWh came from the grid while charging for 3.0 kWh.
+
+    WHY IT REACHES THE BILL. `compute_period_net` builds each day as
+    `max(0, main - SUM(devices)) + SUM(devices)` — algebraically `main`, except the clamp stops
+    the device terms cancelling once they exceed the main. So an over-costed device does not
+    merely mis-state a device line, it inflates the BILL. Measured on two 4.5.14 databases: on a storage-heavy
+    site the clamp turned the over-cost into an error approaching the size of the bill
+    itself; on a site that charges its battery from the grid overnight it was negligible.
+
+    ONSET is the tariff migration, not a release: migrating switches on settled costing, which
+    restates the parent rate, which makes the device rate drift, which fires the re-cost.
+
+    REPAIR DIRECTION IS DOWN ONLY. Measured across two databases there are ZERO rows where the
+    stored cost sits BELOW the clipped value, so this only ever removes cost the grid never
+    supplied; it cannot invent cost. Prices from the row's own rate, which the drift repair has
+    already aligned to the parent (verified: 0 rows drift beyond 1e-4).
+
+    Idempotent: matches only rows still above the clipped figure."""
+    if store is None:
+        return {"ok": False, "reason": "no store"}
+    with store._conn:
+        cur = store._conn.execute(
+            "UPDATE blocks SET "
+            "  imp_cost = ROUND(COALESCE(imp_kwh_grid, imp_kwh, 0) * imp_rate, 6), "
+            "  imp_cost_exc = CASE WHEN imp_rate_exc IS NOT NULL "
+            "       THEN ROUND(COALESCE(imp_kwh_grid, imp_kwh, 0) * imp_rate_exc, 6) "
+            "       ELSE imp_cost_exc END "
+            # sub-meters only; imp_kwh_grid IS NOT NULL means PASS 2 actually clipped this row,
+            # so a device on an unclipped block keeps costing from raw kWh exactly as before.
+            "WHERE meter_id IN (SELECT meter_id FROM meters WHERE is_sub_meter = 1) "
+            "  AND imp_kwh_grid IS NOT NULL AND imp_rate IS NOT NULL "
+            "  AND imp_cost > ROUND(imp_kwh_grid * imp_rate, 6) + 0.0000005")
+    return {"ok": True, "re_costed": cur.rowcount}
+
+
+async def run_smb_device_cost_clip(force: bool = False) -> dict:
+    """One-off device-cost clip heal (4.5.15). Gated (`smb_device_cost_clip_done`),
+    self-marking, idempotent; retires in v5.0.0. Local; no API."""
+    if _store is None:
+        return {"ok": False, "reason": "no store"}
+    if not force and _store.get_kraken_state(_SMB_DEVICE_COST_CLIP_DONE_KEY):
+        return {"ok": True, "skipped": "already done"}
+    res = _smb_device_cost_clip_core(_store)
+    if res.get("ok"):
+        import datetime as _dtm
+        _store.set_kraken_state(_SMB_DEVICE_COST_CLIP_DONE_KEY,
+                                _dtm.datetime.now(_dtm.timezone.utc).isoformat())
+        logger.info("run_smb_device_cost_clip: %s", res)
+        if res.get("re_costed", 0):
+            _schedule_chart_regen()
+    return res
 
 
 async def run_smb_device_recost(force: bool = False) -> dict:
@@ -12356,15 +12489,23 @@ def apply_measured_to_block(bs: str, *, cost_incl: float, cost_excl=None,
     # sub-meter (ev_charger / battery) was costed by PASS 2 at the EARLIER (pre-settlement,
     # often peak) main rate and is NOT re-costed by this write. PASS 2 costs every sub-meter at
     # the parent rate, so re-cost the sub-meter blocks for this slot to the settled rate in
-    # lock-step — device == main == bill. kWh (the grid-clipped device draw) is untouched; only
-    # the priced rate layer moves. No-op for a synthetic-EV account (no sub-meter blocks). This
+    # lock-step — device == main == bill. Price from imp_kwh_grid (the GRID-ATTRIBUTED draw),
+    # falling back to imp_kwh only where PASS 2 never clipped: the kWh COLUMNS are untouched,
+    # but costing from raw imp_kwh here silently re-based the cost onto a different quantity
+    # than PASS 2 used, so a device that ran off solar/battery was billed as if the grid had
+    # supplied it. On a storage-heavy site this can approach a doubling of the
+    # bill (see `run_smb_device_cost_clip`). Same expression as the reconcile path and the corrections
+    # tool, which already price from imp_kwh_grid.
+    # No-op for a synthetic-EV account (no sub-meter blocks). This
     # is the targeted equivalent of a PASS 2 re-run without round-tripping the whole block
     # (which would drop rate_source='measured').
     try:
         with store._conn:
             store._conn.execute(
-                "UPDATE blocks SET imp_rate = ?, imp_cost = ROUND(COALESCE(imp_kwh,0) * ?, 6), "
-                "imp_rate_exc = ?, imp_cost_exc = ROUND(COALESCE(imp_kwh,0) * ?, 6), "
+                "UPDATE blocks SET imp_rate = ?, "
+                "imp_cost = ROUND(COALESCE(imp_kwh_grid, imp_kwh, 0) * ?, 6), "
+                "imp_rate_exc = ?, "
+                "imp_cost_exc = ROUND(COALESCE(imp_kwh_grid, imp_kwh, 0) * ?, 6), "
                 "exc_source = 'tariff' "
                 # sub-meters only (ev_charger / battery); export meters have no imp_kwh
                 "WHERE block_start = ? AND meter_id != 'electricity_main' "

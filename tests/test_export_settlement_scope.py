@@ -196,15 +196,120 @@ class TestExportOnlySettlementScope(unittest.TestCase):
         self.assertAlmostEqual(exp_cost, round(0.9 * 0.12, 6), places=6,
                                msg="export cost re-derived from the settled kWh")
 
-    def test_import_settlement_still_reprices(self):
-        """Guard against over-fixing: a REAL import settlement still re-resolves."""
+    def test_import_kwh_settlement_holds_band_and_recosts(self):
+        """#475: a settled kWh re-costs and re-splits, but must NOT re-band.
+
+        Supersedes `test_import_settlement_still_reprices` (4.5.13/BL-62 model), which
+        asserted that a settled import kWh re-resolved the overlay to off-peak. That is
+        the defect: Octopus has not priced this slot yet — only its QUANTITY is known —
+        so the predicted band must stand until a settled COST arrives. Quantity is a
+        measurement and follows; price is a supplier decision and is held.
+        """
+        self._finalise(BIG, BIG_END, imp=4.0, exp=0.5)
+        self.assertAlmostEqual(self._row(BIG, "imp_rate")[0], PEAK, places=6,
+                               msg="priced peak at finalise (no dispatch yet)")
+        self._late_dispatch(BIG, 3.5)
+        self._settle(BIG, imp_api=4.5)
+        rate, kwh, cost = self._row(BIG, "imp_rate", "imp_kwh", "imp_cost")
+        self.assertAlmostEqual(
+            rate, PEAK, places=6,
+            msg="settled kWh must not move the band — no supplier price has arrived")
+        self.assertAlmostEqual(
+            kwh, 4.5, places=6,
+            msg="the settled QUANTITY is authoritative and is taken")
+        self.assertAlmostEqual(
+            cost, round(4.5 * PEAK, 6), places=6,
+            msg="cost re-derived from the settled kWh at the HELD band rate")
+
+    # ── #475: the settled-kWh band hold, in detail ───────────────────────────
+    def _segments(self, start, meter="electricity_main"):
+        return engine._store._conn.execute(
+            "SELECT seq, kwh, inc_rate, exc_rate, band, attribution "
+            "FROM block_segments WHERE block_start=? AND meter_id=? AND channel='import' "
+            "ORDER BY seq", (start, meter)).fetchall()
+
+    def test_settled_kwh_holds_exc_vat_rate_too(self):
+        """The hold applies to the ex-VAT rate as well as the inc-VAT one.
+
+        `imp_rate_exc` is a second pricing column written alongside `imp_rate`. A hold that
+        pinned only the inc rate would leave the exc figure re-derived from the moved band,
+        so the ex-VAT bill would disagree with the inc-VAT bill on the same block.
+
+        This harness's finalise path leaves `imp_rate_exc` NULL (no VAT calendar is
+        seeded), and asserting "still NULL" would pass under either model — a vacuous
+        test. So seed the exc rate explicitly to the peak band's ex-VAT value first;
+        the assertion then discriminates.
+        """
+        self._finalise(BIG, BIG_END, imp=4.0, exp=0.5)
+        peak_exc = round(PEAK / 1.05, 6)
+        with engine._store._conn:
+            engine._store._conn.execute(
+                "UPDATE blocks SET imp_rate_exc = ?, imp_cost_exc = ? "
+                "WHERE block_start=? AND meter_id='electricity_main'",
+                (peak_exc, round(4.0 * peak_exc, 6), BIG))
+        self._late_dispatch(BIG, 3.5)
+        self._settle(BIG, imp_api=4.5)
+        rate_inc, rate_exc = self._row(BIG, "imp_rate", "imp_rate_exc")
+        self.assertAlmostEqual(
+            rate_exc, peak_exc, places=6,
+            msg="the ex-VAT rate must be held on the peak band")
+        # The discriminating assertion: inc and exc must describe the SAME band. The
+        # pre-fix code moved imp_rate to off-peak and left imp_rate_exc on the peak
+        # value, so the two columns disagreed about what this block cost — checking
+        # only that exc was "unchanged" would pass for that wrong reason.
+        self.assertAlmostEqual(
+            rate_exc, round(rate_inc / 1.05, 6), places=6,
+            msg="inc and exc rates must describe the same band (pre-fix: imp_rate "
+                "re-banded to off-peak while imp_rate_exc stayed on peak)")
+
+    def test_settled_kwh_segments_agree_with_block_cost(self):
+        """Segments are the seam the hold has to reach, not just the columns.
+
+        NOTE: this is an INVARIANT guard, not a discriminator for the original defect —
+        it holds under the old model too (there, block and segments moved to off-peak
+        together). It exists because the FIX broke it twice during development.
+
+        `_persist_block_segments` prefers `imp_ch["segments"]` over rebuilding from the
+        block's columns, so pinning `imp_rate` alone left off-peak segments behind: the
+        block billed peak while its own breakdown billed off-peak, and the two
+        disagreed on the same row. Assert the invariant directly — segment costs sum to
+        the block cost, and no segment carries a rate the block does not.
+        """
         self._finalise(BIG, BIG_END, imp=4.0, exp=0.5)
         self._late_dispatch(BIG, 3.5)
-        self._settle(BIG, imp_api=4.0)
+        self._settle(BIG, imp_api=4.5)
+        rate, cost = self._row(BIG, "imp_rate", "imp_cost")
+        segs = self._segments(BIG)
+        if not segs:
+            self.skipTest("no segments persisted for this block shape")
+        seg_cost = round(sum(r["kwh"] * r["inc_rate"] for r in segs), 6)
         self.assertAlmostEqual(
-            self._row(BIG, "imp_rate")[0], OFF_PEAK, places=6,
-            msg="import settled -> the overlay/split must still run (above the floor, "
-                "this is the legitimate dispatch re-price)")
+            seg_cost, cost, places=5,
+            msg="segment costs must sum to the block cost (regression: the seam kept "
+                "off-peak segments after the block was held at peak)")
+        for r in segs:
+            self.assertAlmostEqual(
+                r["inc_rate"], rate, places=6,
+                msg="every segment must carry the held band rate, not a re-resolved one")
+
+    def test_settled_kwh_twice_is_stable(self):
+        """Idempotence: a second settlement of the same figure must not drift the band.
+
+        Also an INVARIANT guard rather than a discriminator — it passes under the old
+        model as well. Kept because a hold that decayed on re-drain would be silent.
+
+        The poll re-upserts a rolling window every cycle, so a held block is re-drained
+        repeatedly. A hold that only survived the first pass would decay silently.
+        """
+        self._finalise(BIG, BIG_END, imp=4.0, exp=0.5)
+        self._late_dispatch(BIG, 3.5)
+        self._settle(BIG, imp_api=4.5)
+        first = self._row(BIG, "imp_rate", "imp_kwh", "imp_cost")
+        self._settle(BIG, imp_api=4.5)
+        second = self._row(BIG, "imp_rate", "imp_kwh", "imp_cost")
+        for a, b, name in zip(first, second, ("imp_rate", "imp_kwh", "imp_cost")):
+            self.assertAlmostEqual(a, b, places=6,
+                                   msg=f"{name} drifted on a repeat settlement")
 
     def test_unsettled_import_with_no_rate_still_repairs(self):
         """`_resolve_block_rate`'s zero/missing-rate REPAIR must still reach a gap block."""
@@ -247,15 +352,18 @@ class TestImportOnlyAccountUnaffected(TestExportOnlySettlementScope):
     def test_export_only_settlement_still_settles_export(self):
         self.skipTest("no export channel on this account")
 
-    def test_import_only_settlement_reprices_as_before(self):
-        """Import settles on an export-less account -> the overlay/split still run."""
+    def test_import_only_kwh_settlement_holds_band(self):
+        """#475 on an export-less account: the hold is channel-config-agnostic."""
         self._finalise(BIG, BIG_END, imp=4.0, exp=0.0)
         self.assertAlmostEqual(self._row(BIG, "imp_rate")[0], PEAK, places=6)
         self._late_dispatch(BIG, 3.5)
-        self._settle(BIG, imp_api=4.0)
+        self._settle(BIG, imp_api=4.5)
+        rate, kwh, cost = self._row(BIG, "imp_rate", "imp_kwh", "imp_cost")
         self.assertAlmostEqual(
-            self._row(BIG, "imp_rate")[0], OFF_PEAK, places=6,
-            msg="no export channel must not change the import settlement path")
+            rate, PEAK, places=6,
+            msg="no export channel must not change the settled-kWh band hold")
+        self.assertAlmostEqual(kwh, 4.5, places=6)
+        self.assertAlmostEqual(cost, round(4.5 * PEAK, 6), places=6)
 
     def test_import_only_unsettled_rerun_preserves_rate(self):
         """A re-run raised by something OTHER than settlement (billing-source switch,
