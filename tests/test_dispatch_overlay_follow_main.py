@@ -227,32 +227,36 @@ class TestFollowMainDeviceOverlay(unittest.TestCase):
             msg="EV is above the floor -> off-peak regardless of order")
 
 
-    def test_settlement_prices_device_grid_on_main_offpeak_not_peak(self):
-        # The COST path at reconcile: a block finalises with the main sub-floor
-        # (over-report guard leaves it on PEAK), then DCC settlement raises the
-        # main import above the floor. The main is re-overlaid to off-peak, and
-        # the device's grid import must be re-costed at that off-peak rate.
+    def test_settled_kwh_holds_band_and_device_follows_held_rate(self):
+        # The device-follows-main COST contract, re-anchored on #475.
         #
-        # Regression: settlement applied the overlay to the main's COST but left
-        # its stored rate on the pre-overlay PEAK base, so PASS 2 re-priced every
-        # device's grid import at peak while the main billed off-peak — a real
-        # overcharge on every reconciled smart-charge block.
+        # Original form asserted that a DCC kWh settlement raising the main above the
+        # over-report floor re-overlaid the main to OFF_PEAK, and checked the device
+        # was re-costed at that off-peak rate. The device half of that is still the
+        # contract worth pinning; the band half was the #475 defect — a settled kWh
+        # carries no supplier price, so the predicted PEAK band must stand.
+        #
+        # What this now pins: (a) the settled quantity is taken, (b) the band is held,
+        # (c) the device's grid import is re-costed at whatever the main's EFFECTIVE
+        # rate is — which is the original regression (PASS 2 reading a stale rate),
+        # tested against the held rate instead of an overlaid one.
         self._finalise(SLOT, SLOT_END, main=0.05, batt=0.0, ev=0.05)
         # sub-floor at finalise -> main (and its follower EV) on peak, correctly
         self.assertAlmostEqual(self._rate(SLOT, "electricity_main"), PEAK, places=5)
         self._settle(SLOT, dcc_main_kwh=3.0)
-        # main re-overlaid to off-peak, and its stored rate now reflects that
         self.assertAlmostEqual(
-            self._rate(SLOT, "electricity_main"), OFF_PEAK, places=5,
-            msg="settled main effective rate must be off-peak")
+            self._rate(SLOT, "electricity_main"), PEAK, places=5,
+            msg="#475: a settled kWh re-costs but must not re-band — the supplier "
+                "has not priced this slot yet")
         self.assertAlmostEqual(
-            self._cost(SLOT, "electricity_main"), round(3.0 * OFF_PEAK, 6), places=5)
-        # THE COST REGRESSION: the EV's grid import settles at the main's off-peak
-        # rate, not the stale peak base.
+            self._cost(SLOT, "electricity_main"), round(3.0 * PEAK, 6), places=5,
+            msg="main cost re-derived from the settled kWh at the held band rate")
+        # THE DEVICE CONTRACT: the EV's grid import is costed at the main's effective
+        # rate, whatever that is — not at a stale or independently-resolved rate.
         self.assertAlmostEqual(
-            self._cost(SLOT, "ev_charger"), round(0.05 * OFF_PEAK, 6), places=5,
-            msg="device grid import must settle at the main's off-peak rate "
-                "(regression: PASS 2 read the main's stale pre-overlay peak rate)")
+            self._cost(SLOT, "ev_charger"), round(0.05 * PEAK, 6), places=5,
+            msg="device grid import must follow the main's effective rate "
+                "(regression: PASS 2 read a stale rate instead of the main's)")
 
 
     def test_own_rate_on_device_is_ignored_priced_at_main(self):

@@ -163,3 +163,48 @@ class TestTeeth(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSmbDeviceRecostCoreAlsoClips(_Base):
+    """The 4.5.7 one-off heal carried the same defect and is fixed the same way.
+
+    It re-costs a device whose priced rate has drifted from its parent — the same job the
+    settlement path does per slot, done as a sweep. It priced from raw `imp_kwh` too. Gated
+    and long since run on existing installs, so it matters for a fresh install or a forced
+    re-run rather than for the reported fault, but an unfixed copy of a fixed rule is how
+    this defect existed in the first place.
+    """
+
+    def _drift_the_device(self):
+        """Put the device on a different rate from its parent, so the sweep matches it."""
+        with self.store._conn:
+            self.store._conn.execute(
+                "UPDATE blocks SET imp_rate = 0.99, imp_cost = ROUND(imp_kwh * 0.99, 6) "
+                "WHERE block_start=? AND meter_id='battery'", (BS,))
+
+    def test_sweep_recosts_from_grid_attributed_kwh(self):
+        self._drift_the_device()
+        res = engine._smb_device_recost_core(self.store)
+        self.assertTrue(res["ok"])
+        self.assertGreaterEqual(res["re_costed"], 1)
+        r = self._row("battery")
+        self.assertAlmostEqual(r["imp_rate"], RATE, places=6)            # rate pulled to parent
+        self.assertAlmostEqual(r["imp_cost"], round(0.01 * RATE, 6), places=6)
+        self.assertNotAlmostEqual(r["imp_cost"], round(4.0 * RATE, 6), places=4)
+
+    def test_sweep_leaves_kwh_alone(self):
+        self._drift_the_device()
+        engine._smb_device_recost_core(self.store)
+        r = self._row("battery")
+        self.assertEqual(r["imp_kwh"], 4.0)
+        self.assertEqual(r["imp_kwh_grid"], 0.01)
+
+    def test_sweep_keeps_raw_costing_where_pass2_never_clipped(self):
+        with self.store._conn:
+            self.store._conn.execute(
+                "UPDATE blocks SET imp_rate = 0.99, imp_cost = ROUND(imp_kwh * 0.99, 6) "
+                "WHERE block_start=? AND meter_id='nogrid'", (BS,))
+        engine._smb_device_recost_core(self.store)
+        r = self._row("nogrid")
+        self.assertIsNone(r["imp_kwh_grid"])
+        self.assertAlmostEqual(r["imp_cost"], round(0.5 * RATE, 6), places=6)
