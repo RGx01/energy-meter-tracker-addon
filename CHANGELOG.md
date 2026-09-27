@@ -31,6 +31,34 @@ they left the kWh figures untouched, everything looked right.
   Existing history is repaired automatically on the next start. The repair only ever
   removes cost that the grid did not supply; it cannot add any.
 
+- **A confirmed usage figure no longer changes the rate you were predicted
+  ([#475](https://github.com/RGx01/energy-meter-tracker-addon/issues/475)).**
+  Your supplier confirms each half-hour twice: first how much you used, then later what it
+  cost. EMT was treating the first of those as permission to re-decide the second. It is
+  not — a confirmed usage figure says how much energy moved, never what was charged for it.
+
+  On a smart-charging tariff this mattered. Whether a half-hour is billed at the cheap
+  overnight rate or the day rate depends on whether your car was charging under the
+  supplier's control, and EMT works that out from the charging signals it can see. When the
+  confirmed usage arrived, that decision was being made again — sometimes reaching a
+  different answer than it had at the time, on a half-hour the supplier had not yet priced.
+  The predicted price could move to the wrong band and then jump a second time when the
+  real bill landed.
+
+  Now a confirmed usage figure re-costs the half-hour and re-divides it between your car
+  and the rest of the house — both of those follow the energy, so they should move — but
+  the rate stays where it was. Only your supplier's actual billed cost can change the rate,
+  which is the one thing that genuinely knows it.
+
+  **Nothing needs repairing and nothing is repaired.** Only predicted prices were affected,
+  never a half-hour your supplier had already priced, and the band a block would have been
+  given depended on the charging state at the moment it was first worked out — which cannot
+  be reconstructed after the fact. Affected estimates correct themselves as usual when the
+  bill for that half-hour arrives.
+
+  Tariffs where the rate comes from the clock or from a published day-ahead price are
+  unaffected, because nothing about them was ever in doubt.
+
 - **Device costs now add up to your bill.** With the same fix, the per-device figures
   reconcile against the meter: your devices plus the house remainder equal the metered
   import. **Expect your device costs to go down** if you have storage, and the price per
