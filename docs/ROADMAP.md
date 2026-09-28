@@ -23,6 +23,7 @@ raises the floor version EMT will import from.
 | 7 | BL-64 — Bill-parser fixtures + a pypdf bump gate | testing · tooling | next | ⚠️ needs issue |
 | 8 | BL-60 — Usage Stats block inspector (pre/post-settlement) | diagnostics | proposed | ⚠️ needs issue |
 | 9 | BL-74 — Retire the `needs_review` writes nothing can display | tech-debt | v5.0.0 | ⚠️ needs issue |
+| 10 | BL-76 — Device grid attribution: replace the ranked draw with a proportional split | attribution · correctness | proposed | ⚠️ needs issue |
 
 ---
 
@@ -156,6 +157,100 @@ impact. Would have made the 07:00 mis-band self-evident instead of a multi-hour 
 
 **Net effect.** `needs_review` ends with one writer, one reason and one action: a dispatch-reconcile ambiguity on a block whose band nothing else can decide. No flag has ever moved a billing figure, and the partial index `ON blocks (needs_review) WHERE needs_review = 1` keeps the dormant rows cheap — the cost is three unrelated meanings in one column, one of which cannot be reviewed.
 
+#### BL-76 — Device grid attribution: replace the ranked draw with a proportional split  ·  *attribution · correctness*  ·  ⚠️ **needs issue**
+
+*Surfaced from #473. The bill defect is fixed — device cost is now bounded to `imp_kwh_grid` and the
+day total follows the meter again. What it exposed is the rule underneath: how a block's grid
+import is apportioned **between** devices.*
+
+**The rule today.** `_apply_pass2` orders sub-meters **EV first, then by descending recorded kWh**,
+and walks them taking `claimed = min(entry["kwh"], grid_remaining)` from a pool that shrinks as it
+goes. First in the queue takes everything it asked for; whatever is left trickles down; the tail can
+get nothing.
+
+**Why that matters more than it looks.** The ordering only decides anything when the devices
+collectively recorded more than the main's grid import — but that is not a rare case. Measured on a
+user database: **7,378 of 12,998 blocks (57%)** are contested, and on those each device received
+roughly a sixth of what it claimed. So on more than half of all blocks the split is being decided by
+the sort order, and for everything below the EV that order is **raw size** — which says nothing
+about how much of that device's draw was actually grid-sourced. A big device is not a more likely
+grid consumer than a small one; it is just bigger.
+
+**The cliff.** Because the draw is greedy rather than shared, the outcome is discontinuous. Two
+devices running together with a short pool do not each get a reduced share — the larger one is
+satisfied first and the smaller one absorbs the entire shortfall. A device can read zero grid on a
+block where it genuinely drew from the grid, purely because something bigger was running at the same
+time.
+
+**Fix: proportional allocation of the post-EV remainder.** Each remaining device gets
+`grid_remaining x (its kwh / Σ kwh)`. That is:
+
+* **bounded** — the ratio is ≤ 1 whenever `Σ kwh ≥ grid_remaining`, so a device can never be
+  attributed more grid than it actually drew, which a flat even split would not guarantee;
+* **order-independent** — the sort stops deciding outcomes, and the meaningless size tiebreak goes
+  away with it;
+* **smooth** — a shortfall is shared in proportion to draw instead of landing entirely on whoever
+  sorted last.
+
+The real per-device consumption is never lost (`imp_kwh` is always the recorded figure), so the
+split is free to be reframed; only the derived `imp_kwh_grid` changes.
+
+**Keep the EV pre-allocation.** EV-first is not an artefact of the size sort, it is a deliberate
+correction: on IOG the supplier is deliberately pulling cheap grid for the car, so the car's import
+must land on the grid rather than being squeezed out. The comment records what happened without it —
+*"the old order (biggest draw first) handed the whole grid pool to a simultaneously-charging battery
+and labelled the car's grid charge as battery-sourced, so the car vanished"*. Proportional applies to
+what remains **after** the EV has claimed, not instead of that rule.
+
+**Same code, delete while you are there: the `unprotected` branch is dead.** `protected` and
+`unprotected` are both built, but the only `append` is to `protected` — *"all sub-meters are
+protected (inverter_possible removed)"*. `unprotected` is sorted (2466) and iterated (2523–2550) and
+is always empty. Leaving it implies two classes of device where the code has one.
+
+**And `kwh_battery` is computed and discarded.** The allocation sets
+`sub_import["kwh_battery"] = entry["kwh"] - claimed` on every block, and there is **no
+`imp_kwh_battery` column** — `blocks` carries `imp_kwh`, `imp_kwh_grid`, `imp_kwh_remainder`,
+`imp_kwh_ev` and nothing else. It is the non-grid share, which is the natural output of a
+proportional split and the figure that would answer "how much of this device ran off the roof".
+Persist it or stop deriving it.
+
+**History can be healed, and the machinery already exists.** The re-split needs only what is
+already stored — each sub-meter's recorded `imp_kwh` and the parent's grid import — so it is
+computable from the database with no recorder fetch and no supplier call. Three things make it
+tractable:
+
+* **It is bill-neutral.** Measured across all 12,998 blocks of a user database, the greedy draw
+  allocates *exactly* `min(Σ recorded, grid)` on **100%** of them — the pool is always fully
+  consumed. Proportional allocates the same total by construction, so Σ device cost is unchanged
+  and no day-level total moves. Energy and cost shift **between** devices only.
+* **The reconstruct-and-re-run pattern is already built.** `recompute_remainders_for_window`
+  reconstructs a parent block and calls `_apply_pass2` directly (deliberately *not*
+  `_rerun_pass2_for_settled_block`, so it cannot disturb DCC/CAD materialisation, the dispatch
+  overlay or `is_provisional`). A heal is that generalised from a window to the whole history.
+* **The recorder attribution path picks the new rule up for free.** `_write_device_into_block`
+  ends with `_apply_pass2(block)` → `_recompute_block_carbon(block)` → `append_block_replace(block)`,
+  so any block that utility touches is re-allocated under whatever rule is current. Change the rule
+  and that path conforms without modification.
+
+Note the recorder utility solves a *different* split and is not affected by this item: it
+distributes an hour of recorder energy across that hour's blocks in proportion to the **house import
+shape** (`_split_hour_to_blocks`), which is temporal, not inter-device. Worth noting only as
+precedent — that split is already proportional rather than ranked. It also never overwrites a live
+reading, so a heal and the utility cannot fight over the same block.
+
+Being a heal, it raises the v5 import floor (see BL-74 and the §6 floor note) even though no bill
+changes.
+
+**Scope.** Nothing here changes the bill. #473 already bounded device cost to what the grid
+supplied, and the day-level total follows the meter. This changes only how that grid energy is
+divided between devices, which affects Usage, Insights and per-device carbon.
+
+**Not in scope, recorded so it is not re-litigated:** a device sensor reporting energy the grid never
+supplied is a *sensor* problem, not an allocation one, and it cannot be detected reliably from the
+data — the signal only appears when there is generation to expose it, so a quiet winter looks
+identical to a compliant sensor. Proportional allocation does not fix a bad sensor; it stops one
+device's error from silently consuming another device's share.
+
 ---
 
 ## Issues to create
@@ -173,6 +268,7 @@ then the reference added to its heading and to the priority table:
 - [ ] **BL-60** — Usage Stats block inspector: pre/post-settlement detail for a single block
 - [ ] **BL-75** — Settlement visibility: both frontiers, retry from the pill, user-accepted CAD
 - [ ] **BL-74** — Retire the `needs_review` writes nothing can display
+- [ ] **BL-76** — Device grid attribution: replace the ranked draw with a proportional split
 
 *Convention: reference issues as `[#nnn]` on the item heading, with the link definition at the foot
 of the file (as the archive does).*
