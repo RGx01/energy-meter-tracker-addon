@@ -9,7 +9,13 @@ Companion to `check_graphql_deprecations.py` (which watches for *deprecations*).
 same unauthenticated introspection.
 
   * Watches every type whose NAME matches a reconstruction-relevant pattern (dispatch / measurement /
-    consumption / intelligent / interval / statistic / TOU / cap) — robust to type renames.
+    consumption / intelligent / interval / statistic / TOU / cap / band / rate-type) — robust to
+    type renames.
+  * Watches ENUM MEMBERSHIP as well as fields. #481: on 2026-09-28 Octopus added EV_BOOST to
+    AllBandSubCategories (and to two rate-type enums) and relabelled the device-breakdown buckets
+    in the same release. The enum addition was the one machine-readable warning that the band
+    vocabulary was moving; this check could not see it, because it introspected `fields` only and
+    no band/rate-type name matched the patterns.
   * Diffs the live watched-type field sets against a committed baseline
     (`.build/graphql_field_watch_baseline.json`). ADDED or REMOVED fields are reported; the weekly
     Action opens/updates an issue.
@@ -22,7 +28,15 @@ HONEST BOUNDARY — read this before trusting it:
   BL-28 — "has Octopus started stamping `source` on COMPLETED dispatches?" — is a *data-behaviour*
   change this check CANNOT see (`meta.source` already exists; it just returns null on completed).
   That one still needs an authenticated live query over a recent completed dispatch. This watcher
-  catches new schema SURFACE (added fields); it does not catch a field starting to be populated.
+  catches new schema SURFACE (added fields, added enum values); it does not catch a field starting
+  to be populated.
+
+  #481 is the worked example of that boundary. The change that BROKE EMT was a relabelling of the
+  free-text `label` strings inside `statistics[]` — data values, not schema, and therefore invisible
+  here NO MATTER how well this is configured. What IS visible is the enum addition shipped beside
+  it. So treat an enum-membership change as "the supplier is reworking this vocabulary — go and look
+  at the payload", not as a description of what changed. An authenticated probe
+  (`octopus_device_breakdown_probe.py --raw`) is what reads the labels.
 """
 import argparse
 import json
@@ -35,10 +49,14 @@ BASELINE_PATH = os.path.join(os.path.dirname(__file__), "graphql_field_watch_bas
 
 # Reconstruction-relevant type surface — matched as case-insensitive substrings on the type NAME,
 # so it survives renames (UpsideDispatchType → whatever). Keep this list tight to avoid noise.
+# "band" and "ratetype" catch the enums the bucket vocabulary is drawn from: AllBandSubCategories,
+# NonBespokeElectricityRateTypeChoices, BespokeNonHalfHourlyElectricityUnitRateRateType. Bare
+# "rate" is deliberately NOT here — it matches most of the tariff surface and would drown the diff.
 WATCH_PATTERNS = ("dispatch", "measurement", "consumption", "intelligent",
-                  "interval", "statistic", "tou", "cap")
+                  "interval", "statistic", "tou", "cap", "band", "ratetype")
 
-INTROSPECTION_QUERY = "{ __schema { types { name kind fields { name } } } }"
+INTROSPECTION_QUERY = ("{ __schema { types { name kind fields { name } "
+                       "enumValues(includeDeprecated: true) { name } } } }")
 
 
 def fetch_schema(endpoint):
@@ -59,15 +77,23 @@ def _matches(type_name):
 
 
 def watched_fields(schema):
-    """{typeName: sorted[field names]} for every watched type that has fields."""
+    """{typeName: sorted[member names]} for every watched type that has members.
+
+    A member is a FIELD on an object type or a VALUE on an enum type. Enum values are prefixed
+    `enum:` so an added value can never be mistaken for an added field in the diff, and so a type
+    that somehow reports both keeps them apart. The baseline format is unchanged — a plain
+    {type: [names]} map — so an existing seeded baseline stays loadable; enum entries simply appear
+    as additions on the first run after this change, which is correct.
+    """
     out = {}
     for t in (schema.get("types") or []):
         name = t.get("name") or ""
         if name.startswith("__") or not _matches(name):
             continue
-        fields = [f["name"] for f in (t.get("fields") or []) if f.get("name")]
-        if fields:
-            out[name] = sorted(fields)
+        members = [f["name"] for f in (t.get("fields") or []) if f.get("name")]
+        members += ["enum:" + v["name"] for v in (t.get("enumValues") or []) if v.get("name")]
+        if members:
+            out[name] = sorted(members)
     return out
 
 

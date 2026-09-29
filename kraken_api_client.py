@@ -404,11 +404,45 @@ def _looks_like_edge_block(body: str) -> bool:
 # Vocabulary seen in the wild (two real accounts, regions B and H):
 #   legacy IOG : OFF_PEAK, STANDARD_RATE
 #   flat/fixed : CONSUMPTION
-#   IOG-SMB    : CONSUMPTION_CHARGE_ECO7_DAY_x, CONSUMPTION_CHARGE_ECO7_NIGHT_x,
+#   IOG-SMB v1 : CONSUMPTION_CHARGE_ECO7_DAY_x, CONSUMPTION_CHARGE_ECO7_NIGHT_x,
 #                CONSUMPTION_CHARGE_EV_DEVICE_OFF_PEAK_x, CONSUMPTION_CHARGE_EV_DEVICE_PEAK_x
-# Note the two spellings of the SAME band: home off-peak is NIGHT, EV off-peak is OFF_PEAK.
-_OFF_PEAK_WORDS = ("OFF_PEAK", "OFFPEAK", "NIGHT")
+#   IOG-SMB v2 : HOME LOW RATE, HOME STANDARD RATE, EV LOW RATE, EV STANDARD RATE
+# Note the SAME band has several spellings: home off-peak is NIGHT (v1) or LOW RATE (v2),
+# EV off-peak is OFF_PEAK (v1) or LOW RATE (v2).
+#
+# v2 landed between 2026-09-27T22:21Z and 2026-09-28T13:33Z, RETROSPECTIVELY — the API now
+# serves the v2 labels for historical slots that were fetched under v1. Both vocabularies
+# must stay supported: v1 for any cached/replayed payload, v2 for anything fetched now.
+_OFF_PEAK_WORDS = ("OFF_PEAK", "OFFPEAK", "NIGHT", "LOW RATE", "LOW_RATE")
 _PEAK_WORDS = ("PEAK", "DAY", "STANDARD_RATE", "STANDARD")
+
+# Distinct unrecognised bucket labels already reported, so a vocabulary change is logged
+# once per label rather than on every slot of every poll.
+_UNKNOWN_BUCKET_LABELS: set = set()
+
+
+def bucket_side(label) -> Optional[str]:
+    """'ev' | 'home' | None — which side of the Home/EV split a bucket belongs to.
+
+    Recognises BOTH IOG-SMB vocabularies (v1 enum names, v2 display labels) and the
+    pre-SMB single-bucket labels, which are all house. Returns None for anything else so
+    the caller can REFUSE to classify rather than silently booking EV energy as home —
+    the v2 rename did exactly that, and the `else: # home` catch-all it replaced made an
+    account-wide loss of the EV split invisible (no flag, no log, no figure out of range).
+    ORDER MATTERS: the EV test runs first because 'EV STANDARD RATE' also matches the
+    home band words."""
+    lab = (label or "").upper().strip()
+    if not lab:
+        return None
+    if "EV_DEVICE" in lab or lab.startswith("EV "):
+        return "ev"
+    if "ECO7" in lab or lab.startswith("HOME "):
+        return "home"
+    # pre-SMB / flat: one un-prefixed bucket, all of it house.
+    if any(w in lab for w in ("OFF_PEAK", "OFFPEAK", "NIGHT", "STANDARD_RATE",
+                              "STANDARD", "PEAK", "DAY", "CONSUMPTION")):
+        return "home"
+    return None
 
 
 def label_band(label) -> Optional[bool]:
@@ -1387,13 +1421,27 @@ class KrakenAPIClient:
                 val = 0.0
             ci = s2.get("costInclTax") or {}
             ce = s2.get("costExclTax") or {}
-            if "EV_DEVICE" in lab:
+            side = bucket_side(lab)
+            if side is None:
+                # Unknown vocabulary. Do NOT fall through to home — that is what turned the
+                # 2026-09-28 label rename into a silent, account-wide loss of the EV split.
+                # Refuse the whole node so nothing is cached and the slot stays a candidate;
+                # the predicted carve stands until a parser that understands the label runs.
+                if lab not in _UNKNOWN_BUCKET_LABELS:
+                    _UNKNOWN_BUCKET_LABELS.add(lab)
+                    logger.error(
+                        "device breakdown: UNRECOGNISED bucket label %r — refusing to "
+                        "classify this slot (EV/Home split withheld rather than guessed). "
+                        "The supplier's bucket vocabulary has changed; update bucket_side().",
+                        s2.get("label"))
+                return None
+            if side == "ev":
                 ev_kwh += val; ev_cost += _amt(ci)
                 if val > 1e-9:
                     if _ppu(ci) is not None:
                         ev_rate = _ppu(ci); ev_rate_x = _ppu(ce)
                     ev_band = "off_peak" if label_band(lab) else "peak"
-            else:                                        # ECO7_* / home
+            else:                                        # ECO7_* / HOME * / pre-SMB
                 home_kwh += val; home_cost += _amt(ci)
                 if val > 1e-9:
                     if _ppu(ci) is not None:
