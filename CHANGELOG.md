@@ -1,5 +1,39 @@
 # Changelog
  
+## [4.5.16] — 2026-09-29
+
+*Your supplier renamed something, and your car disappeared.* Octopus changed the labels on
+the half-hourly cost breakdown EMT reads. The numbers were all still there and all still
+correct — but EMT no longer recognised which of them belonged to the car, so it filed the
+lot under the house.
+
+### Fixed
+
+- **EV charging stopped being separated from household use
+  ([#481](https://github.com/RGx01/energy-meter-tracker-addon/issues/481)).**
+  On 28 September your supplier renamed the categories in the per-half-hour breakdown behind
+  your bill — the same figures, new names. EMT matched on the old names, and anything it
+  didn't recognise it treated as ordinary household use. So from that date every settled
+  half-hour showed your EV charging as house consumption, and cheap overnight energy was
+  labelled as day-rate.
+
+  **Your bill was not affected.** Costs are taken from the billed amount itself, not from
+  these labels, so every total stayed correct. What went wrong was the breakdown: the EV and
+  Home figures on Usage and Insights, the band shown against a half-hour, and the carbon
+  attributed to each device.
+
+  This also applies backwards — the supplier serves the new names for older dates too, so any
+  day re-read after the change was affected regardless of when it happened.
+
+  EMT now understands both the old and new names. It also **refuses to guess**: if a category
+  turns up that it doesn't recognise, it declines to split that half-hour at all and logs the
+  unknown name, rather than quietly filing it under the house. That is what let this go
+  unnoticed — nothing was out of range, nothing was flagged, and the only visible symptom was
+  a chart that had stopped showing a split.
+
+  Days that settled between 28 September and this release keep the incorrect split; the
+  supplier's corrected figures can be re-read, and that is being handled separately.
+
 ## [4.5.15] — 2026-09-27
 
 *A device can only cost what the grid supplied it.* Energy Meter Tracker has always

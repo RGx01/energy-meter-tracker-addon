@@ -10837,6 +10837,13 @@ async def _tick_dispatch_capture() -> None:
         # Blocks already settled house-only because the dispatch ceiling was ambiguous are
         # stamped 'measured', so the drain's backlog can never revisit them. Heal from the
         # cached bill buckets (no API calls); empty in the steady state.
+        # One-off (4.5.16, #481): re-fetch breakdowns cached while the supplier's bucket
+        # labels were unrecognised, so the recurring heal below has real EV figures to
+        # work from. Gated + self-marking; no-op once done.
+        try:
+            await run_ev_bucket_refetch()
+        except Exception as e:
+            logger.warning("_tick_dispatch_capture: ev bucket refetch failed: %s", e)
         try:
             run_settled_ev_split_heal()
         except Exception as e:
@@ -11329,6 +11336,7 @@ _SMB_RATE_REPAIR_DONE_KEY = "smb_rate_repair_done_v2"   # one-off (4.5.7); remov
 _SMB_DEVICE_RECOST_DONE_KEY = "smb_device_recost_done"   # one-off (4.5.7); removed in v5.0.0
 _SMB_EV_RESPLIT_DONE_KEY = "smb_ev_resplit_done"   # one-off (4.5.9); removed in v5.0.0
 _SMB_DEVICE_COST_CLIP_DONE_KEY = "smb_device_cost_clip_done"   # one-off (4.5.15); removed in v5.0.0
+_EV_BUCKET_REFETCH_DONE_KEY = "ev_bucket_refetch_done"       # one-off (4.5.16); removed in v5.0.0
 _BAND_SNAP_DONE_KEY = "band_rate_snap_done_v2"   # one-off (4.5.13); removed in v5.0.0
 # _v2: the v1 pass wrote bands from the RATE alone. It had no attribution filter, so it
 # relabelled EV segments the four-bucket machinery owns; it overwrote bands that were
@@ -12133,6 +12141,103 @@ def _measured_history_backlog() -> int:
             (_measured_floor(), cutoff)).fetchone()[0])
     except Exception:
         return 0
+
+
+async def run_ev_bucket_refetch(force: bool = False) -> dict:
+    """One-off #481 recovery: re-fetch breakdowns cached while the bucket labels were
+    unrecognised. Gated (`ev_bucket_refetch_done`), self-marking; retires in v5.0.0.
+
+    On 2026-09-28 Octopus renamed the getDeviceConsumptionBreakdown statistic labels. The
+    parser matched EV on `"EV_DEVICE" in label` with an unconditional `else: home`, so every
+    EV bucket was SUMMED INTO home: the affected rows carry `ev_kwh = 0` and a `home_kwh`
+    that is really home+EV. That division is not recoverable locally — it was summed, not
+    mislabelled — but the rename is RETROSPECTIVE, so the supplier serves the true buckets
+    for those slots now. Delete the corrupted rows and re-fetch them under the fixed parser.
+
+    Deliberately does NOT touch `blocks`. Once the cached rows carry a real `ev_kwh`,
+    `run_settled_ev_split_heal` (recurring, every tick) already matches them
+    (`rate_source='measured' AND imp_kwh_ev IS NULL AND mc.ev_kwh > 0`) and re-invokes the
+    settle path, which restores the split and the bands. This pass is only the first half.
+
+    SCOPE: `ev_kwh = 0` on a slot that has a COMPLETED dispatch — i.e. rows that are
+    demonstrably wrong, because the car provably drew in that half-hour. A day the car did
+    not charge has no completed dispatch and is never touched. Cost-neutral: cost comes
+    from the billed amount, which the rename never affected."""
+    store = _store
+    if store is None or _kraken_client is None:
+        return {"ok": False, "reason": "no store/client"}
+    if not force and store.get_kraken_state(_EV_BUCKET_REFETCH_DONE_KEY):
+        return {"ok": True, "skipped": "already done"}
+    if not _import_is_smb_capped():
+        return {"ok": True, "skipped": "not applicable"}
+    imp = (_kraken_discovery or {}).get("import") or {}
+    mpan = imp.get("mpan")
+    if not mpan:
+        return {"ok": True, "skipped": "no mpan"}
+    try:
+        rows = store._conn.execute(
+            "SELECT mc.slot_start FROM measured_cost mc "
+            "WHERE mc.mpan = ? AND mc.direction = 'CONSUMPTION' "
+            "  AND mc.ev_kwh IS NOT NULL AND mc.ev_kwh <= 1e-9 "
+            "  AND EXISTS (SELECT 1 FROM dispatch_slots ds "
+            "              WHERE ds.slot_start = mc.slot_start "
+            "                AND ds.energy_completed IS NOT NULL) "
+            "ORDER BY mc.slot_start", (mpan,)).fetchall()
+    except Exception as e:
+        logger.warning("ev bucket refetch: query failed: %s", e)
+        return {"ok": False, "reason": "query_failed"}
+    slots = [r["slot_start"] for r in rows]
+    if not slots:
+        store.set_kraken_state(_EV_BUCKET_REFETCH_DONE_KEY, _dt_now_iso_safe())
+        return {"ok": True, "refetched": 0, "restored": 0}
+    logger.info("ev bucket refetch (#481): %d slot(s) cached with a zero EV bucket against "
+                "a completed dispatch — re-fetching under the corrected parser", len(slots))
+    try:
+        bd = await _kraken_client.recover_device_breakdown(mpan, slots)
+    except Exception as e:
+        logger.warning("ev bucket refetch: fetch failed (will retry next start): %s", e)
+        return {"ok": False, "reason": "fetch_failed"}
+
+    def _n(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    restored = unchanged = absent = 0
+    for slot in slots:
+        node = bd.get(slot)
+        if not node:
+            absent += 1
+            continue
+        _hk, _ek = _n(node.get("home_kwh")), _n(node.get("ev_kwh"))
+        if _ek <= 1e-9:
+            # Still no EV after a corrected read — the bill really does attribute this
+            # half-hour entirely to the house (an out-of-app bump is not an EV dispatch).
+            unchanged += 1
+            continue
+        cost_incl = round(_n(node.get("home_cost")) + _n(node.get("ev_cost")), 6)
+        _hre, _ere = node.get("home_rate_exc"), node.get("ev_rate_exc")
+        cost_excl = (round(_hk * _n(_hre) + _ek * _n(_ere), 6)
+                     if (_hre is not None or _ere is not None) else None)
+        _bands = {b for b in (node.get("home_band"), node.get("ev_band")) if b}
+        label = ("OFF_PEAK" if _bands == {"off_peak"}
+                 else ("STANDARD_RATE" if _bands == {"peak"} else "mixed"))
+        store.upsert_measured_cost(slot, mpan=mpan, cost_incl=cost_incl,
+                                   cost_excl=cost_excl, label=label,
+                                   kwh=round(_hk + _ek, 6))
+        store.upsert_measured_breakdown(
+            slot, mpan=mpan, home_kwh=_hk, home_rate=node.get("home_rate"),
+            ev_kwh=_ek, ev_rate=node.get("ev_rate"))
+        restored += 1
+    store.set_kraken_state(_EV_BUCKET_REFETCH_DONE_KEY, _dt_now_iso_safe())
+    res = {"ok": True, "candidates": len(slots), "refetched": restored,
+           "still_house_only": unchanged, "absent": absent}
+    logger.info("ev bucket refetch (#481): %s — run_settled_ev_split_heal will restore the "
+                "block splits on the next tick", res)
+    if restored:
+        _schedule_chart_regen()
+    return res
 
 
 def run_settled_ev_split_heal(limit: int = 2000) -> dict:

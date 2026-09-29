@@ -1,1 +1,522 @@
-{}
+{
+  "ActualizeContractOutput": [
+    "contract"
+  ],
+  "AllBandSubCategories": [
+    "enum:AMBER_UNIT",
+    "enum:BLACK_UNIT",
+    "enum:CAPACITY",
+    "enum:CAPACITY_MARKET",
+    "enum:DAY_AHEAD_HH_INDEX",
+    "enum:ECO7_DAY",
+    "enum:ECO7_NIGHT",
+    "enum:ECONOMY7",
+    "enum:EV_BOOST",
+    "enum:EV_DEVICE",
+    "enum:EV_DEVICE_OFF_PEAK",
+    "enum:EV_DEVICE_PEAK",
+    "enum:EXCESS_CAPACITY",
+    "enum:FER_POWER",
+    "enum:FIXED",
+    "enum:GREEN_UNIT",
+    "enum:HMC_GUARANTEE_ADVANCE",
+    "enum:HMC_GUARANTEE_FULL",
+    "enum:NUCLEAR_RAB",
+    "enum:REACTIVE",
+    "enum:RED_UNIT",
+    "enum:STANDARD",
+    "enum:SUMMER_OFF_PEAK",
+    "enum:SUMMER_PEAK",
+    "enum:SUPER_RED_UNIT",
+    "enum:THREE_RATE",
+    "enum:THREE_RATE_OFF_PEAK",
+    "enum:THREE_RATE_PEAK",
+    "enum:THREE_RATE_SHOULDER",
+    "enum:TNUOS",
+    "enum:WEEKDAYS",
+    "enum:WEEKDAY_OFF_PEAK",
+    "enum:WEEKDAY_PEAK",
+    "enum:WEEKENDS",
+    "enum:WEEKEND_OFF_PEAK",
+    "enum:WEEKEND_PEAK",
+    "enum:WINTER_OFF_PEAK",
+    "enum:WINTER_PEAK",
+    "enum:YELLOW_UNIT"
+  ],
+  "AmendContractSubjectOutput": [
+    "contract"
+  ],
+  "ApplicableRateType": [
+    "category",
+    "currency",
+    "isSalesTax",
+    "name",
+    "overridePrice",
+    "pricePerUnit",
+    "rateId",
+    "sourceSystem",
+    "unit",
+    "unitDisplay",
+    "validityPeriod",
+    "variantProfile"
+  ],
+  "BandChoices": [
+    "enum:CONSUMPTION",
+    "enum:DUOS",
+    "enum:RAG",
+    "enum:TNUOS"
+  ],
+  "BespokeNonHalfHourlyElectricityUnitRateRateType": [
+    "enum:CAPACITY_MARKET",
+    "enum:ECO7_DAY",
+    "enum:ECO7_NIGHT",
+    "enum:EV_BOOST",
+    "enum:EV_DEVICE",
+    "enum:EV_DEVICE_OFF_PEAK",
+    "enum:EV_DEVICE_PEAK",
+    "enum:HMC_GUARANTEE_ADVANCE",
+    "enum:HMC_GUARANTEE_FULL",
+    "enum:NUCLEAR_RAB",
+    "enum:OFF_PEAK",
+    "enum:OFF_PEAK_WEEKENDS",
+    "enum:PEAK",
+    "enum:STANDARD",
+    "enum:SUMMER",
+    "enum:SUMMER_OFF_PEAK",
+    "enum:SUMMER_PEAK",
+    "enum:SUMMER_WEEKENDS_OFF_PEAK_WINTER",
+    "enum:TNUOS",
+    "enum:WEEKDAY",
+    "enum:WEEKENDS_OTHER",
+    "enum:WINTER",
+    "enum:WINTER_OFF_PEAK",
+    "enum:WINTER_PEAK"
+  ],
+  "CancelRepaymentRequestOutputType": [
+    "requestId",
+    "status"
+  ],
+  "CloseDCAProceeding": [
+    "dcaProceedingClosureStatus"
+  ],
+  "CollectDepositOutput": [
+    "paymentDate",
+    "status"
+  ],
+  "CollectionProcessEventOutputType": [
+    "number"
+  ],
+  "CommenceDCAProceeding": [
+    "dcaProceedingCommencementStatus"
+  ],
+  "CompleteStandalonePaymentOutput": [
+    "status"
+  ],
+  "ConsentOutput": [
+    "code",
+    "value"
+  ],
+  "Consumption": [
+    "endDate",
+    "quantity",
+    "startDate",
+    "supplyCharge",
+    "unit",
+    "usageCost"
+  ],
+  "ConsumptionBreakdown": [
+    "sourceId",
+    "sourceName",
+    "usage"
+  ],
+  "ConsumptionBreakdownConnectionTypeConnection": [
+    "edgeCount",
+    "edges",
+    "pageInfo",
+    "totalCount"
+  ],
+  "ConsumptionBreakdownConnectionTypeEdge": [
+    "cursor",
+    "node"
+  ],
+  "ConsumptionBreakdownType": [
+    "charges",
+    "marketName"
+  ],
+  "ConsumptionComparisonInterval": [
+    "enum:HALF_HOURLY",
+    "enum:SINGLE"
+  ],
+  "ConsumptionConnection": [
+    "edgeCount",
+    "edges",
+    "pageInfo",
+    "totalCount"
+  ],
+  "ConsumptionDistributionCoefficients": [
+    "day",
+    "night"
+  ],
+  "ConsumptionEdge": [
+    "cursor",
+    "node"
+  ],
+  "ConsumptionEstimate": [
+    "elecAnnualConsumptionDay",
+    "elecAnnualConsumptionNight",
+    "elecAnnualConsumptionStandard",
+    "gasAnnualConsumption"
+  ],
+  "ConsumptionEstimates": [
+    "high",
+    "low",
+    "medium"
+  ],
+  "ConsumptionGroupings": [
+    "enum:DAY",
+    "enum:HALF_HOUR",
+    "enum:HOUR",
+    "enum:MONTH",
+    "enum:QUARTER",
+    "enum:QUARTER_HOUR",
+    "enum:WEEK"
+  ],
+  "ConsumptionSplitType": [
+    "splitPercentage",
+    "timeSlot"
+  ],
+  "ConsumptionType": [
+    "endAt",
+    "startAt",
+    "value"
+  ],
+  "ConsumptionUnit": [
+    "enum:L",
+    "enum:MJ",
+    "enum:Smc",
+    "enum:cubicMetres",
+    "enum:kWh"
+  ],
+  "CostOfUsageBandInterval": [
+    "bandSubcategory",
+    "consumption",
+    "consumptionUnit",
+    "cost",
+    "currency",
+    "period",
+    "rateApplied"
+  ],
+  "CreateContractOutput": [
+    "identifier",
+    "wasCreated"
+  ],
+  "CreateDepositAgreementOutput": [
+    "depositAmount",
+    "depositRequired"
+  ],
+  "CreateOrUpdateSiteworksAppointmentOutput": [
+    "appointmentCreated",
+    "appointmentUpdated"
+  ],
+  "CreateProductOutput": [
+    "product"
+  ],
+  "DCAProceedingClosureStatus": [
+    "accountNumber",
+    "ledgerNumber"
+  ],
+  "DCAProceedingCommencementStatus": [
+    "accountNumber",
+    "agency",
+    "campaign",
+    "commencementStatus",
+    "ledgerNumber"
+  ],
+  "DCAProceedingUpdateStatus": [
+    "accountNumber",
+    "commencementStatus"
+  ],
+  "DepositAgreementOutput": [
+    "acceptedAt",
+    "collectionDate",
+    "currentEligibilityStatus",
+    "depositAmount",
+    "depositKey",
+    "dueDate",
+    "fulfilledAt",
+    "returnStrategy"
+  ],
+  "ElectricityConsumptionLabelEco7": [
+    "day",
+    "isEstimate",
+    "night"
+  ],
+  "ElectricityConsumptionStandard": [
+    "consumption",
+    "isEstimate"
+  ],
+  "ElectricityConsumptionThreeRate": [
+    "day",
+    "isEstimate",
+    "night",
+    "offPeak"
+  ],
+  "ElectricityConsumptionType": [
+    "eac",
+    "eacEffectiveFromDate",
+    "hasErroneousTransfer",
+    "supplierEffectiveFromDate",
+    "supplierName"
+  ],
+  "EnrollFanClubAccountOutputType": [
+    "status"
+  ],
+  "EnrolmentOutcome": [
+    "octoplus"
+  ],
+  "ExtendedElectricityConsumptionType": [
+    "eacDay",
+    "eacNight",
+    "eacStandard"
+  ],
+  "FieldSalesVisitOutcomeType": [
+    "category",
+    "reason",
+    "type"
+  ],
+  "FlexIsChargingDurationCapped": [
+    "enum:DISABLED",
+    "enum:ENABLED",
+    "enum:NOT_APPLICABLE"
+  ],
+  "ForecastConsumptionEntryType": [
+    "consumptionSplit",
+    "identifier",
+    "touName",
+    "unit",
+    "validFrom",
+    "validTo",
+    "value"
+  ],
+  "GasConsumption": [
+    "consumption",
+    "isEstimate"
+  ],
+  "GasConsumptionType": [
+    "aq",
+    "aqEffectiveFromDate",
+    "supplierEffectiveFromDate",
+    "supplierName"
+  ],
+  "InitiateHostedStandalonePaymentOutput": [
+    "retrievalToken",
+    "url"
+  ],
+  "InitiateStandalonePaymentOutput": [
+    "retrievalToken",
+    "secretToken"
+  ],
+  "InitiateUnauthenticatedStandalonePaymentOutput": [
+    "retrievalToken",
+    "secretToken"
+  ],
+  "InstallationCapacityType": [
+    "declaredNetCapacity",
+    "extensionReference",
+    "installedCapacity"
+  ],
+  "Interval": [
+    "enum:MONTHLY",
+    "enum:QUARTERLY"
+  ],
+  "IntervalCostOfUsageType": [
+    "cost",
+    "endAt",
+    "startAt",
+    "usageKwh"
+  ],
+  "IntervalMeasurementType": [
+    "durationInSeconds",
+    "endAt",
+    "metaData",
+    "readAt",
+    "source",
+    "startAt",
+    "unit",
+    "value"
+  ],
+  "LimitedBandCategories": [
+    "enum:CONSUMPTION_CHARGE",
+    "enum:STANDING_CHARGE"
+  ],
+  "MeasurementClass": [
+    "enum:HH_METERED_LARGE",
+    "enum:HH_METERED_SMALL_CT",
+    "enum:HH_METERED_SMALL_DOM",
+    "enum:HH_METERED_SMALL_WC",
+    "enum:HH_UNMETERED",
+    "enum:NHH_METERED",
+    "enum:NHH_UNMETERED"
+  ],
+  "MeasurementConnection": [
+    "edgeCount",
+    "edges",
+    "pageInfo",
+    "totalCount"
+  ],
+  "MeasurementEdge": [
+    "cursor",
+    "node"
+  ],
+  "MeasurementInterface": [
+    "metaData",
+    "readAt",
+    "source",
+    "unit",
+    "value"
+  ],
+  "MeasurementType": [
+    "metaData",
+    "readAt",
+    "source",
+    "unit",
+    "value"
+  ],
+  "MeasurementsMetadataOutput": [
+    "extras",
+    "statistics",
+    "utilityFilters"
+  ],
+  "NonBespokeElectricityRateTypeChoices": [
+    "enum:CAPACITY_MARKET",
+    "enum:ECO7_DAY",
+    "enum:ECO7_NIGHT",
+    "enum:EV_BOOST",
+    "enum:EV_DEVICE",
+    "enum:EV_DEVICE_OFF_PEAK",
+    "enum:EV_DEVICE_PEAK",
+    "enum:HMC_GUARANTEE_ADVANCE",
+    "enum:HMC_GUARANTEE_FULL",
+    "enum:NUCLEAR_RAB",
+    "enum:OFF_PEAK",
+    "enum:OFF_PEAK_WEEKENDS",
+    "enum:PEAK",
+    "enum:STANDARD",
+    "enum:SUMMER",
+    "enum:SUMMER_OFF_PEAK",
+    "enum:SUMMER_PEAK",
+    "enum:SUMMER_WEEKENDS_OFF_PEAK_WINTER",
+    "enum:TNUOS",
+    "enum:WEEKDAY",
+    "enum:WEEKENDS_OTHER",
+    "enum:WINTER",
+    "enum:WINTER_OFF_PEAK",
+    "enum:WINTER_PEAK"
+  ],
+  "OctoplusEnrolmentOutcome": [
+    "hasEnrolled"
+  ],
+  "ProductRateBands": [
+    "enum:CONSUMPTION",
+    "enum:FEE",
+    "enum:TIME"
+  ],
+  "ProductRateType": [
+    "bandCategory",
+    "bandSubcategory",
+    "gsp",
+    "paymentMethod",
+    "pricePerUnit",
+    "validFrom",
+    "validTo"
+  ],
+  "RateTypeChoices": [
+    "enum:ECONOMY7",
+    "enum:STANDARD",
+    "enum:THREE_RATE"
+  ],
+  "ReadingStatisticTypeEnum": [
+    "enum:ADDITIONAL_CHARGE_COST",
+    "enum:ADDITIONAL_CREDIT_COST",
+    "enum:CAPACITY_CHARGE_COST",
+    "enum:CARBON_COST",
+    "enum:CO2_EMISSION_STATISTIC",
+    "enum:CONSUMPTION_BREAKDOWN",
+    "enum:CONSUMPTION_COST",
+    "enum:DEMAND_CHARGE_COST",
+    "enum:DISTANCE_CHARGE_COST",
+    "enum:GAS_READING_INFORMATION",
+    "enum:GENERATION_VALUE",
+    "enum:POWER_FACTOR_STATISTIC",
+    "enum:STANDING_CHARGE_COST",
+    "enum:TOU_BUCKET_COST"
+  ],
+  "RequestConsumptionData": [
+    "requestReference"
+  ],
+  "RequestPasswordResetOutputType": [
+    "email",
+    "userNumber"
+  ],
+  "RequestRepaymentOutputType": [
+    "requestId",
+    "status"
+  ],
+  "RescindContractOutput": [
+    "contract"
+  ],
+  "RevokeContractOutput": [
+    "contract"
+  ],
+  "SmartFlexDispatch": [
+    "end",
+    "energyAddedKwh",
+    "start",
+    "type"
+  ],
+  "StatisticOutput": [
+    "costExclTax",
+    "costInclTax",
+    "description",
+    "label",
+    "type",
+    "value"
+  ],
+  "TerminateContractOutput": [
+    "contract"
+  ],
+  "TestDispatchAssessmentFailureReason": [
+    "enum:ASSESSMENTS_FAILED",
+    "enum:DEVICE_DISCONNECTED",
+    "enum:ERROR",
+    "enum:NONE",
+    "enum:NOT_AT_HOME",
+    "enum:SOC_LIMIT_REACHED",
+    "enum:UNABLE_TO_COMMUNICATE",
+    "enum:UNKNOWN"
+  ],
+  "TestDispatchStatus": [
+    "enum:COMPLETE",
+    "enum:FAILED",
+    "enum:TRIGGERED"
+  ],
+  "ThirdPartyTariffIntervalType": [
+    "daysOfWeek",
+    "endTime",
+    "startTime",
+    "tariffType"
+  ],
+  "UpdateDCAProceeding": [
+    "dcaProceedingUpdateStatus"
+  ],
+  "UpsideDispatchMetaType": [
+    "location",
+    "source"
+  ],
+  "UpsideDispatchType": [
+    "delta",
+    "end",
+    "meta",
+    "start"
+  ]
+}
