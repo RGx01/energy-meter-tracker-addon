@@ -58,3 +58,59 @@ class TestFieldWatch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEnumMembershipWatch(unittest.TestCase):
+    """#481: an added ENUM VALUE must be reported, not just an added field.
+
+    On 2026-09-28 Octopus added EV_BOOST to AllBandSubCategories in the same release that
+    relabelled the device-breakdown buckets. The enum addition was the only machine-readable
+    warning available; the watcher introspected `fields` only and no band/rate-type name matched
+    WATCH_PATTERNS, so it saw nothing.
+    """
+
+    def _mod(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("fw", _SCRIPT)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
+
+    def test_band_and_ratetype_enums_are_watched(self):
+        m = self._mod()
+        for t in ("AllBandSubCategories",
+                  "NonBespokeElectricityRateTypeChoices",
+                  "BespokeNonHalfHourlyElectricityUnitRateRateType"):
+            self.assertTrue(m._matches(t), f"{t} must be in scope — it carries the band vocabulary")
+
+    def test_bare_rate_types_are_not_watched(self):
+        """`rate` alone would match most of the tariff surface and drown the diff.
+
+        GUARD, not a discriminator — this passed before the change too. It exists so a later
+        widening of WATCH_PATTERNS to bare "rate" is a deliberate decision, not a slip."""
+        m = self._mod()
+        self.assertFalse(m._matches("StandardUnitRate"))
+        self.assertFalse(m._matches("DayNightRate"))
+
+    def test_enum_values_are_collected_and_namespaced(self):
+        m = self._mod()
+        schema = {"types": [
+            {"name": "AllBandSubCategories", "kind": "ENUM", "fields": None,
+             "enumValues": [{"name": "EV_OFF_PEAK"}, {"name": "EV_BOOST"}]},
+            {"name": "ConsumptionStatistic", "kind": "OBJECT",
+             "fields": [{"name": "label"}, {"name": "value"}], "enumValues": None},
+        ]}
+        cur = m.watched_fields(schema)
+        self.assertEqual(cur["AllBandSubCategories"], ["enum:EV_BOOST", "enum:EV_OFF_PEAK"])
+        self.assertEqual(cur["ConsumptionStatistic"], ["label", "value"])
+
+    def test_added_enum_value_is_reported(self):
+        """GUARD, not a discriminator — diff_watch is generic over member-name strings, so it
+        already handled this shape. Pins the end-to-end report a seeded baseline would produce."""
+        m = self._mod()
+        baseline = {"AllBandSubCategories": ["enum:EV_OFF_PEAK", "enum:EV_PEAK"]}
+        current = {"AllBandSubCategories": ["enum:EV_BOOST", "enum:EV_OFF_PEAK", "enum:EV_PEAK"]}
+        rep = m.diff_watch(current, baseline)
+        self.assertIn("AllBandSubCategories", rep)
+        self.assertEqual(rep["AllBandSubCategories"]["added"], ["enum:EV_BOOST"])
+        self.assertEqual(rep["AllBandSubCategories"]["removed"], [])
