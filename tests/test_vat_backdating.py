@@ -124,8 +124,9 @@ class TheLearnerDoesNotBackdate(unittest.TestCase):
             self.assertEqual(self.store.get_vat_calendar(), [("2026-10-01", 0.0)])
             self.assertAlmostEqual(self.store.vat_rate_at("2026-09-10"), 0.05, places=6)
 
-    def test_a_closed_record_is_dated_at_its_start(self):
-        """GUARD: history Octopus versioned properly still says when it changed."""
+    def test_a_closed_period_teaches_nothing(self):
+        """A period that has ended never moves the calendar — not even a properly
+        versioned one: past VAT comes from the seed."""
         sched = RateSchedule(
             [("2026-01-01T00:00:00", "2026-03-01T00:00:00", 20.0),
              ("2026-03-01T00:00:00", "2026-05-01T00:00:00", 21.0)],
@@ -133,9 +134,22 @@ class TheLearnerDoesNotBackdate(unittest.TestCase):
                          ("2026-03-01T00:00:00", "2026-05-01T00:00:00", 20.0)])
         engine._kraken_rate_schedules = {"import": sched}
         with mock.patch.object(vc, "SEED", [("1997-09-01", 0.05)]):
+            self.assertFalse(engine._learn_vat_from_import_schedule("2026-10-01T08:00:00"))
+            self.assertEqual(self.store.get_vat_calendar(), [])
+
+    def test_iog_day_night_windows_do_not_relearn_july(self):
+        """The 4.5.17 regression. IOG's flat buckets are rebuilt into one CLOSED window
+        per half-day since 5 Jul, each carrying today's inc == exc. Read as versioned
+        history they re-learned "0% from 2026-07-05" (26 Aug on a stitched schedule)
+        on every refresh — straight after the heal removed it."""
+        s = run(build_rate_schedule(_Client([], DAY, NIGHT), PRODUCT, TARIFF, vat=[]))
+        engine._kraken_rate_schedules = {"import": s}
+        engine._learn_vat_from_import_schedule("2026-10-01T08:00:00")
+        self.assertEqual(self.store.get_vat_calendar(), [])
+        self.assertAlmostEqual(self.store.vat_rate_at("2026-09-10T12:00:00"), 0.05, places=6)
+        with mock.patch.object(vc, "SEED", [("1997-09-01", 0.05)]):
             engine._learn_vat_from_import_schedule("2026-10-01T08:00:00")
-            self.assertAlmostEqual(self.store.vat_rate_at("2026-02-01"), 0.0, places=6)
-            self.assertAlmostEqual(self.store.vat_rate_at("2026-03-15"), 0.05, places=6)
+            self.assertEqual(self.store.get_vat_calendar(), [("2026-10-01", 0.0)])
 
 
 class VatResolvesOnTheLocalDate(unittest.TestCase):
