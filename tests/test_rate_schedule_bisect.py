@@ -26,11 +26,18 @@ def _ref_resolve(periods, ts):
 
 
 def _ref_dayrates(periods, ts):
-    day = str(ts)[:10]
-    ds, de = day + "T00:00:00", day + "T23:59:59"
+    """Every period overlapping ts's UK-LOCAL day [local midnight, next local midnight),
+    in naive UTC — the day the tariff and VAT run on (4.5.18; it was the UTC date)."""
+    from datetime import timezone
+    from zoneinfo import ZoneInfo
+    lon = ZoneInfo("Europe/London")
+    loc = datetime.fromisoformat(str(ts)).replace(tzinfo=timezone.utc).astimezone(lon)
+    d0 = datetime(loc.year, loc.month, loc.day, tzinfo=lon)
+    d1 = d0 + timedelta(days=1)
+    ds, de = (x.astimezone(timezone.utc).replace(tzinfo=None).isoformat() for x in (d0, d1))
     out = []
     for vf, vt, r in periods:
-        if vf > de:
+        if vf >= de:
             break
         if vt is None or vt > ds:
             out.append(r)

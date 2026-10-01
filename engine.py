@@ -11578,7 +11578,10 @@ async def run_smb_rate_repair(force: bool = False) -> dict:
 # own closed day/night windows after this heal removed it, and the heal matched blocks
 # against schedules still restated at 0% — so it runs once more, on the fixed learner,
 # restating the schedules on the cleaned calendar first.
-_VAT_BACKDATE_HEAL_DONE_KEY = "vat_backdate_heal_done_v2"
+# _v3 (4.5.18, before release): also rows 4.5.17 wrote with BOTH sides a VAT short —
+# inc set to the tariff's ex-VAT figure, exc derived from it at the right rate — whose
+# ratio looks correct, so v2 passed them over (30 Sep's in-window EV slots).
+_VAT_BACKDATE_HEAL_DONE_KEY = "vat_backdate_heal_done_v3"
 _VAT_ZERO_FROM = "2026-10-01"
 
 
@@ -11632,7 +11635,7 @@ def _vat_backdate_heal_core(store, sched, std_sched, std_floor=None, *, eps: flo
         "FROM blocks WHERE is_provisional = 0 "
         "AND (rate_source IS NULL OR rate_source NOT IN ('measured', 'corrected')) "
         "ORDER BY block_start").fetchall()
-    n_inc = n_exc = n_unmatched = n_std = 0
+    n_inc = n_exc = n_both = n_unmatched = n_std = 0
     std_cache = {}
     for r in rows:
         start = r["block_start"]
@@ -11660,6 +11663,15 @@ def _vat_backdate_heal_core(store, sched, std_sched, std_floor=None, *, eps: flo
                 n_exc += 1
             else:
                 n_unmatched += 1
+        elif inc and exc and inc > 0 and exc > 0 and sched is not None and v > 0 \
+                and _near(inc, _figs(exc_s, start)) and not _near(inc, _figs(sched, start)):
+            # Ratio is right but the whole pair is one VAT short: inc IS the tariff's
+            # ex-VAT figure for the day (and no inc figure). Scale both, and the EV split.
+            for k in ("imp_rate", "imp_cost", "imp_rate_exc", "imp_cost_exc",
+                      "imp_rate_ev", "imp_cost_ev"):
+                if r[k]:
+                    upd[k] = round(r[k] * f, 6)
+            n_both += 1
         sc = r["standing_charge"]
         if sc and std_sched is not None and (std_floor is None or start >= str(std_floor)):
             day = _vc.local_day(start)
@@ -11677,7 +11689,8 @@ def _vat_backdate_heal_core(store, sched, std_sched, std_floor=None, *, eps: flo
             store.vat_heal_write_block(start, r["meter_id"], upd,
                                        rates_moved=any(k.startswith("imp_") for k in upd))
     return {"ok": True, "calendar_entries_dropped": n_cal, "candidates": len(rows),
-            "inc_rebuilt": n_inc, "exc_rebuilt": n_exc, "unmatched": n_unmatched,
+            "inc_rebuilt": n_inc, "exc_rebuilt": n_exc, "both_short_vat": n_both,
+            "unmatched": n_unmatched,
             "standing_fixed": n_std}
 
 
@@ -11726,7 +11739,7 @@ async def run_vat_backdate_heal(force: bool = False) -> dict:
         _store.set_kraken_state(_VAT_BACKDATE_HEAL_DONE_KEY,
                                 _dtm.datetime.now(_dtm.timezone.utc).isoformat())
         logger.info("run_vat_backdate_heal: %s", res)
-        if res["inc_rebuilt"] or res["exc_rebuilt"] or res["standing_fixed"]:
+        if any(res.get(k) for k in ("inc_rebuilt", "exc_rebuilt", "both_short_vat", "standing_fixed")):
             _schedule_chart_regen()
     return res
 

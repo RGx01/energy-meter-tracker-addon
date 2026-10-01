@@ -25,6 +25,13 @@ went on being priced without VAT.
   catches half-hours 4.5.17 could not match. Settled figures from your bill and prices you
   corrected yourself are still never changed.
 
+- **30 September's overnight EV charging was priced without VAT.**
+  To find a day's cheapest rate, EMT looked at the day as UTC counts it. In summer, the last
+  hour of the UTC day is already the next day here, so on 30 September it saw 1 October's
+  VAT-free prices and took the cheapest of those as 30 September's off-peak rate. EMT now uses
+  the day as it runs in the UK. The repair also catches half-hours where the price and its VAT
+  were *both* written short, so their ratio looked right.
+
 ## [4.5.17] — 2026-10-01
 
 *VAT changed today, and EMT applied it to the summer too.* Domestic energy VAT fell to 0% on

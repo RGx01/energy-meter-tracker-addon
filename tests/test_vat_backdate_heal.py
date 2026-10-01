@@ -59,6 +59,7 @@ class TheHeal(unittest.TestCase):
             ("2026-09-10T13:00:00", 1.0, 0.307707, 0.307707, 0.504559, "corrected"),  # the user: never
             ("2026-09-10T13:30:00", 1.0, 0.250000, 0.250000, 0.504559, "schedule"),  # no tariff figure
             ("2026-10-01T05:30:00", 2.0, 0.323092, 0.307707, 0.504559, "schedule"),  # 1 Oct at 5%
+            ("2026-09-30T00:00:00", 2.0, 0.052314, 0.049823, 0.504559, "schedule"),  # both a VAT short
         ]
         with self.st._conn:
             self.st._conn.execute(
@@ -105,6 +106,14 @@ class TheHeal(unittest.TestCase):
         self.assertAlmostEqual(r["imp_cost"], 0.615414, places=6)     # 2 kWh x 0.307707
         self.assertAlmostEqual(r["standing_charge"], 0.480532, places=6)
 
+    def test_a_pair_one_vat_short_is_scaled_up(self):
+        """4.5.17 wrote 30 Sep's in-window EV slots with inc = the ex-VAT figure and exc
+        derived from it at 5%: the ratio is right, so v2 passed them over."""
+        r = self._row("2026-09-30T00:00:00")
+        self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)
+        self.assertAlmostEqual(r["imp_rate_exc"], 0.052314, places=5)
+        self.assertAlmostEqual(r["imp_cost"], 0.10986, places=5)
+
     def test_a_correct_row_the_bill_and_the_user_are_untouched(self):
         self.assertAlmostEqual(self._row("2026-09-10T12:00:00")["imp_rate"], 0.323092, places=6)
         self.assertAlmostEqual(self._row("2026-09-10T12:30:00")["imp_rate"], 0.307707, places=6)
@@ -119,12 +128,14 @@ class TheHeal(unittest.TestCase):
 
     def test_counts_and_idempotence(self):
         self.assertEqual((self.res["inc_rebuilt"], self.res["exc_rebuilt"],
-                          self.res["standing_fixed"], self.res["calendar_entries_dropped"]),
-                         (2, 1, 1, 1))
+                          self.res["both_short_vat"], self.res["standing_fixed"],
+                          self.res["calendar_entries_dropped"]),
+                         (2, 1, 1, 1, 1))
         again = engine._vat_backdate_heal_core(self.st, _import_sched(), _standing_sched(),
                                                std_floor="2026-08-25T23:00:00")
-        self.assertEqual((again["inc_rebuilt"], again["exc_rebuilt"], again["standing_fixed"],
-                          again["calendar_entries_dropped"]), (0, 0, 0, 0))
+        self.assertEqual((again["inc_rebuilt"], again["exc_rebuilt"], again["both_short_vat"],
+                          again["standing_fixed"], again["calendar_entries_dropped"]),
+                         (0, 0, 0, 0, 0))
 
 
 class TheGate(unittest.TestCase):
@@ -213,8 +224,9 @@ class TheReArmedHealCleansBeforeItMatches(unittest.TestCase):
         self.assertAlmostEqual(
             engine._kraken_standing_schedule.resolve("2026-09-10T12:00:00"), 50.4559, places=4)
 
-    def test_it_runs_again_where_4_5_17_marked_itself_done(self):
+    def test_it_runs_again_where_an_earlier_heal_marked_itself_done(self):
         self.st.set_kraken_state("vat_backdate_heal_done", "2026-10-01T09:30:00+00:00")
+        self.st.set_kraken_state("vat_backdate_heal_done_v2", "2026-10-01T10:20:00+00:00")
         self.assertNotIn("skipped", asyncio.run(engine.run_vat_backdate_heal()))
 
 
