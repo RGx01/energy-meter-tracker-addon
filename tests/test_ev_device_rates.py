@@ -39,13 +39,13 @@ class TestEVDeviceSchedules(unittest.TestCase):
         client = _FakeEVClient({"ev-device-off-peak-unit-rates": self._OFF,
                                 "ev-device-peak-unit-rates": self._PEAK})
         off, peak = run(build_ev_device_schedules(
-            client, "P", "E-1R-IOG-SMB-TOU-25-12-12-H"))
+            client, "P", "E-1R-IOG-SMB-TOU-25-12-12-H", vat=[]))
         self.assertEqual(off.resolve("2026-06-01T12:00:00"), 7.0)
         self.assertEqual(peak.resolve("2026-06-01T12:00:00"), 25.0)
 
     def test_missing_buckets_yield_empty(self):
         off, peak = run(build_ev_device_schedules(
-            _FakeEVClient({}), "P", "E-1R-IOG-SMB-TOU-25-12-12-H"))
+            _FakeEVClient({}), "P", "E-1R-IOG-SMB-TOU-25-12-12-H", vat=[]))
         self.assertTrue(off.is_empty())
         self.assertTrue(peak.is_empty())
 
@@ -53,7 +53,7 @@ class TestEVDeviceSchedules(unittest.TestCase):
         class _Boom:
             async def get_unit_rates(self, *a, **k):
                 raise RuntimeError("boom")
-        off, peak = run(build_ev_device_schedules(_Boom(), "P", "T"))
+        off, peak = run(build_ev_device_schedules(_Boom(), "P", "T", vat=[]))
         self.assertTrue(off.is_empty() and peak.is_empty())
 
 
