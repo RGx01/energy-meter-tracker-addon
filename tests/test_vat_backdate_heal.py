@@ -138,6 +138,59 @@ class TheHeal(unittest.TestCase):
                          (0, 0, 0, 0, 0))
 
 
+class SubMeterRowsFollowTheirMain(unittest.TestCase):
+    """4.5.19 (heal v4). A device row is priced at its block's main rate when written; the
+    heal re-priced main rows only (device rows carry no exc), so 1 Oct's EV-charger and
+    battery rows written before 4.5.18 stayed at 5% beside a 0% main."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.st = BlockStore(self.tmp.name)
+        rows = [  # (start, meter, kwh, kwh_grid, rate, exc)
+            ("2026-10-01T00:00:00", "electricity_main", 6.0, None, 0.052314, 0.052314),
+            ("2026-10-01T00:00:00", "ev_charger", 3.44, 3.44, 0.05493, None),      # 5% beside 0%
+            ("2026-10-01T00:00:00", "house_battery", 2.0, 1.5, 0.05493, None),     # grid-clipped
+            ("2026-09-20T12:00:00", "electricity_main", 1.0, None, 0.05493, 0.052314),
+            ("2026-09-20T12:00:00", "ev_charger", 1.0, 1.0, 0.323092, None),       # EV at peak: real
+        ]
+        with self.st._conn:
+            self.st._conn.execute(
+                "INSERT INTO config_periods (id, effective_from, block_minutes, timezone) "
+                "VALUES (1, '2026-08-01T00:00:00', 30, 'Europe/London')")
+            for bs, mid, kwh, gk, rate, exc in rows:
+                self.st._conn.execute(
+                    "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, imp_kwh, "
+                    "imp_kwh_grid, imp_rate, imp_cost, imp_rate_exc, imp_cost_exc, rate_source, "
+                    "is_provisional, interpolated) VALUES (?,?,?,1,?,?,?,?,?,?,'schedule',0,0)",
+                    (bs, bs, mid, kwh, gk, rate, round((gk or kwh) * rate, 6), exc,
+                     None if exc is None else round(kwh * exc, 6)))
+        self.res = engine._vat_backdate_heal_core(self.st, _import_sched(), _standing_sched(),
+                                                  std_floor="2026-08-25T23:00:00")
+
+    def tearDown(self):
+        self.st._conn.close()
+        os.unlink(self.tmp.name)
+
+    def _dev(self, bs, mid):
+        return self.st._conn.execute("SELECT imp_rate, imp_cost FROM blocks WHERE block_start=? "
+                                     "AND meter_id=?", (bs, mid)).fetchone()
+
+    def test_device_rows_take_the_main_rate(self):
+        r = self._dev("2026-10-01T00:00:00", "ev_charger")
+        self.assertAlmostEqual(r["imp_rate"], 0.052314, places=6)
+        self.assertAlmostEqual(r["imp_cost"], round(3.44 * 0.052314, 6), places=6)
+
+    def test_device_cost_is_from_grid_kwh(self):
+        r = self._dev("2026-10-01T00:00:00", "house_battery")
+        self.assertAlmostEqual(r["imp_cost"], round(1.5 * 0.052314, 6), places=6)
+
+    def test_a_device_at_a_different_band_is_left(self):
+        """GUARD: an EV at peak beside an off-peak main is a real split, not a VAT factor."""
+        self.assertAlmostEqual(self._dev("2026-09-20T12:00:00", "ev_charger")["imp_rate"], 0.323092)
+        self.assertEqual(self.res["device_rows_aligned"], 2)
+
+
 class TheGate(unittest.TestCase):
     """GUARD-style plumbing: marks itself done; waits for a schedule; never re-runs."""
 
