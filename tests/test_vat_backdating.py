@@ -84,6 +84,16 @@ class TheImportScheduleIsTrueAtEachDate(unittest.TestCase):
         for ts in ("2026-09-10T12:00:00", "2026-10-01T12:00:00"):
             self.assertEqual(again.resolve(ts), self.s.resolve(ts))
 
+    def test_30_september_off_peak_is_its_own_days(self):
+        """The day a lookup scans is UK-local. The UTC day of 30 Sep also takes in
+        00:00-00:59 BST on 1 Oct — 0% figures — so its off-peak read 5.2314 and the
+        dispatch reconcile priced 30 Sep's EV slots without VAT."""
+        self.assertAlmostEqual(self.s.off_peak_rate_near("2026-09-30T01:00:00"), 5.493, places=4)
+        self.assertEqual(self.s.day_rate_bounds("2026-09-30T12:00:00"), (5.493, 32.3092))
+        self.assertEqual(self.s.day_rate_bounds("2026-10-01T12:00:00"), (5.2314, 30.7707))
+        # 23:30Z on 30 Sep is 00:30 BST on 1 Oct — that day's figures.
+        self.assertAlmostEqual(self.s.off_peak_rate_near("2026-09-30T23:30:00"), 5.2314, places=4)
+
     def test_export_is_never_grossed_up(self):
         """GUARD: export carries no VAT — inc == exc there is the truth."""
         exp = [{"value_inc_vat": 15.0, "value_exc_vat": 15.0,
