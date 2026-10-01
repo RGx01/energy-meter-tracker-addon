@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import asyncio
 import bisect
+import functools
 from typing import Optional
 
 from kraken_ingester import normalise_to_naive_utc
@@ -55,6 +56,21 @@ class RateFetchError(Exception):
     failed fetch is transient and must NOT be reported as an unsupported tariff.
     Only raised when `build_rate_schedule(..., raise_on_error=True)`.
     """
+
+
+@functools.lru_cache(maxsize=8192)
+def _local_day_bounds(ts_hour: str):
+    """[start, end) of the UK-local day containing the naive-UTC `ts_hour`
+    (YYYY-MM-DDTHH, or a bare date taken as local), as naive-UTC ISO strings. Tariff
+    days and VAT boundaries are UK-local; the schedule is naive UTC. Cached by hour."""
+    import vat_calendar as _vc
+    day = _vc.local_day(ts_hour + ":00:00" if len(ts_hour) == 13 else ts_hour)
+    tz = ZoneInfo(_vc.TZ_NAME)
+    d0 = datetime.fromisoformat(day).replace(tzinfo=tz)
+    d1 = (d0 + timedelta(days=1)).replace(tzinfo=tz)
+    def _u(d):
+        return d.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+    return _u(d0), _u(d1)
 
 
 class RateSchedule:
@@ -142,14 +158,20 @@ class RateSchedule:
         return p[k][2]
 
     def _day_rates(self, ts: str) -> list:
-        """Rates of every period overlapping ts's calendar day. Bisects to the day
-        for a monotonic schedule (O(log n + periods-in-day)); exact linear scan
-        otherwise. Shared by off_peak_rate_near / day_rate_bounds."""
+        """Rates of every period overlapping ts's UK-LOCAL day (local midnight to
+        local midnight, in naive UTC — _local_day_bounds). Bisects to the day for a
+        monotonic schedule (O(log n + periods-in-day)); exact linear scan otherwise.
+        Shared by off_peak_rate_near / day_rate_bounds.
+
+        It was the UTC date (ts[:10]), whose day also takes in the first local hour
+        of the NEXT day in BST. Harmless while every day carried the same prices —
+        until 1 Oct 2026's 0% VAT began at local midnight: 30 Sep's "day" then held
+        1 Oct's 0% figures, its off-peak read 5.2314 instead of 5.493, and the
+        dispatch reconcile priced 30 Sep's EV slots without VAT."""
         p = self._periods
         if not p:
             return []
-        day = str(ts)[:10]
-        day_start, day_end = day + "T00:00:00", day + "T23:59:59"
+        day_start, day_end = _local_day_bounds(str(ts)[:13])
         rates = []
         if self._monotonic:
             i = bisect.bisect_right(self._vfroms, day_start) - 1
@@ -158,14 +180,14 @@ class RateSchedule:
             n = len(p)
             while i < n:
                 vfrom, vto, rate = p[i]
-                if vfrom > day_end:
+                if vfrom >= day_end:
                     break
                 if vto is None or vto > day_start:
                     rates.append(rate)
                 i += 1
             return rates
         for vfrom, vto, rate in p:
-            if vfrom > day_end:
+            if vfrom >= day_end:
                 break
             if vto is None or vto > day_start:
                 rates.append(rate)

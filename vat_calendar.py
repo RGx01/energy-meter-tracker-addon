@@ -139,15 +139,19 @@ def merge_learned(existing, observed):
 
 
 def learn_from_records(records, now_utc, learned=None):
-    """VAT change-points observed in a tariff's (start, end, ratio) periods, dated
-    by when they can actually be known.
+    """VAT change-points observed in a tariff's (start, end, ratio) periods — about
+    TODAY AND LATER only.
 
     `records` are (valid_from, valid_to|None, vat) in naive UTC, vat = inc/exc - 1.
-    A CLOSED period (ended by `now_utc`) is history Octopus versioned: its start is
-    when its rate began. A period still RUNNING (or yet to start) may have been
-    edited in place — 1 Oct 2026's 0% arrived as an open record from 5 Jul reading
-    inc == exc — so a rate that disagrees with the calendar is dated no earlier than
-    today (UK-local): the record says what VAT is now, not since when.
+    A tariff's published VAT says what VAT is now, never since when: 1 Oct 2026's 0%
+    arrived as an open record from 5 Jul edited in place to read inc == exc. So a
+    period still running, or yet to start, that disagrees with the calendar is dated
+    no earlier than today (UK-local). A period that has ENDED teaches nothing — not
+    even as "versioned history": EMT itself splits IOG's flat day/night buckets into
+    one closed window per half-day (kraken_rates._synthesize_iog_tou_windowed), and
+    every past window carries today's edited figures. Learning from those put
+    "0% from 5 Jul" straight back after 4.5.17's heal removed it. Past VAT comes from
+    SEED; a past change missing from it is a SEED edit, not an inference.
     Returns [(date, rate)] for merge_learned; observations the calendar already
     agrees with change nothing there."""
     today = local_day(now_utc)
@@ -157,7 +161,6 @@ def learn_from_records(records, now_utc, learned=None):
         if r is None or not vf:
             continue
         if vt is not None and str(vt) <= str(now_utc):
-            out.append((local_day(vf), r))
             continue
         day = max(local_day(vf), today)
         if r != resolve_vat(day, learned):

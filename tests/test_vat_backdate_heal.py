@@ -59,6 +59,7 @@ class TheHeal(unittest.TestCase):
             ("2026-09-10T13:00:00", 1.0, 0.307707, 0.307707, 0.504559, "corrected"),  # the user: never
             ("2026-09-10T13:30:00", 1.0, 0.250000, 0.250000, 0.504559, "schedule"),  # no tariff figure
             ("2026-10-01T05:30:00", 2.0, 0.323092, 0.307707, 0.504559, "schedule"),  # 1 Oct at 5%
+            ("2026-09-30T00:00:00", 2.0, 0.052314, 0.049823, 0.504559, "schedule"),  # both a VAT short
         ]
         with self.st._conn:
             self.st._conn.execute(
@@ -105,6 +106,14 @@ class TheHeal(unittest.TestCase):
         self.assertAlmostEqual(r["imp_cost"], 0.615414, places=6)     # 2 kWh x 0.307707
         self.assertAlmostEqual(r["standing_charge"], 0.480532, places=6)
 
+    def test_a_pair_one_vat_short_is_scaled_up(self):
+        """4.5.17 wrote 30 Sep's in-window EV slots with inc = the ex-VAT figure and exc
+        derived from it at 5%: the ratio is right, so v2 passed them over."""
+        r = self._row("2026-09-30T00:00:00")
+        self.assertAlmostEqual(r["imp_rate"], 0.05493, places=5)
+        self.assertAlmostEqual(r["imp_rate_exc"], 0.052314, places=5)
+        self.assertAlmostEqual(r["imp_cost"], 0.10986, places=5)
+
     def test_a_correct_row_the_bill_and_the_user_are_untouched(self):
         self.assertAlmostEqual(self._row("2026-09-10T12:00:00")["imp_rate"], 0.323092, places=6)
         self.assertAlmostEqual(self._row("2026-09-10T12:30:00")["imp_rate"], 0.307707, places=6)
@@ -119,12 +128,14 @@ class TheHeal(unittest.TestCase):
 
     def test_counts_and_idempotence(self):
         self.assertEqual((self.res["inc_rebuilt"], self.res["exc_rebuilt"],
-                          self.res["standing_fixed"], self.res["calendar_entries_dropped"]),
-                         (2, 1, 1, 1))
+                          self.res["both_short_vat"], self.res["standing_fixed"],
+                          self.res["calendar_entries_dropped"]),
+                         (2, 1, 1, 1, 1))
         again = engine._vat_backdate_heal_core(self.st, _import_sched(), _standing_sched(),
                                                std_floor="2026-08-25T23:00:00")
-        self.assertEqual((again["inc_rebuilt"], again["exc_rebuilt"], again["standing_fixed"],
-                          again["calendar_entries_dropped"]), (0, 0, 0, 0))
+        self.assertEqual((again["inc_rebuilt"], again["exc_rebuilt"], again["both_short_vat"],
+                          again["standing_fixed"], again["calendar_entries_dropped"]),
+                         (0, 0, 0, 0, 0))
 
 
 class TheGate(unittest.TestCase):
@@ -135,6 +146,8 @@ class TheGate(unittest.TestCase):
             self.state = {}
         def get_kraken_state(self, k): return self.state.get(k)
         def set_kraken_state(self, k, v): self.state[k] = v
+        def get_vat_calendar(self): return []
+        def set_vat_calendar(self, e): pass
 
     def setUp(self):
         self._save = {k: getattr(engine, k) for k in
@@ -159,6 +172,62 @@ class TheGate(unittest.TestCase):
         asyncio.run(engine.run_vat_backdate_heal())
         self.assertIn(engine._VAT_BACKDATE_HEAL_DONE_KEY, engine._store.state)
         self.assertEqual(asyncio.run(engine.run_vat_backdate_heal())["skipped"], "already done")
+
+
+class TheReArmedHealCleansBeforeItMatches(unittest.TestCase):
+    """The 4.5.17 miss, end to end through run_vat_backdate_heal: the calendar says 0%
+    since 26 Aug and the cached schedule was restated on it, so 30.7707p looked like
+    the tariff's inc figure for September. A block 4.5.17 left at inc == exc == the
+    inc-VAT figure (exc derived at 0%) matched nothing and was skipped."""
+
+    def setUp(self):
+        self._save = {k: getattr(engine, k) for k in
+                      ("_store", "_kraken_rate_schedules", "_kraken_client",
+                       "_kraken_standing_schedule", "_kraken_current_agreement_from",
+                       "_schedule_chart_regen")}
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.st = BlockStore(self.tmp.name)
+        self.st.set_vat_calendar([("2023-06-02", 0.05), ("2026-08-26", 0.0)])   # 4.5.17 state
+        with self.st._conn:
+            self.st._conn.execute(
+                "INSERT INTO config_periods (id, effective_from, block_minutes, timezone) "
+                "VALUES (1, '2026-08-01T00:00:00', 30, 'Europe/London')")
+            self.st._conn.execute(
+                "INSERT INTO blocks (block_start, block_end, meter_id, config_period_id, imp_kwh, "
+                "imp_rate, imp_cost, imp_rate_exc, imp_cost_exc, rate_source, is_provisional, "
+                "interpolated) VALUES ('2026-09-10T11:30:00','2026-09-10T12:00:00',"
+                "'electricity_main',1,1.0,0.323092,0.323092,0.323092,0.323092,'schedule',0,0)")
+        poisoned = self.st.get_vat_calendar()
+        engine._store = self.st
+        engine._kraken_client = object()
+        engine._kraken_rate_schedules = {"import": _import_sched().with_vat(poisoned)}
+        engine._kraken_standing_schedule = _standing_sched().with_vat(poisoned)
+        engine._kraken_current_agreement_from = "2026-08-25T23:00:00"
+        engine._schedule_chart_regen = lambda: None
+
+    def tearDown(self):
+        for k, v in self._save.items():
+            setattr(engine, k, v)
+        self.st._conn.close()
+        os.unlink(self.tmp.name)
+
+    def test_the_block_is_healed_and_the_schedules_restated(self):
+        res = asyncio.run(engine.run_vat_backdate_heal())
+        self.assertEqual(res["calendar_entries_dropped"], 1)
+        self.assertEqual(res["exc_rebuilt"], 1)
+        r = self.st._conn.execute("SELECT imp_rate, imp_rate_exc FROM blocks").fetchone()
+        self.assertAlmostEqual(r["imp_rate"], 0.323092, places=6)
+        self.assertAlmostEqual(r["imp_rate_exc"], 0.307707, places=6)
+        self.assertAlmostEqual(
+            engine._kraken_rate_schedules["import"].resolve("2026-09-10T11:30:00"), 32.3092, places=4)
+        self.assertAlmostEqual(
+            engine._kraken_standing_schedule.resolve("2026-09-10T12:00:00"), 50.4559, places=4)
+
+    def test_it_runs_again_where_an_earlier_heal_marked_itself_done(self):
+        self.st.set_kraken_state("vat_backdate_heal_done", "2026-10-01T09:30:00+00:00")
+        self.st.set_kraken_state("vat_backdate_heal_done_v2", "2026-10-01T10:20:00+00:00")
+        self.assertNotIn("skipped", asyncio.run(engine.run_vat_backdate_heal()))
 
 
 if __name__ == "__main__":

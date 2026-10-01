@@ -1,5 +1,37 @@
 # Changelog
  
+## [4.5.18] — 2026-10-01
+
+*The repair worked, and then the old date came back.* 4.5.17's one-off repair removed the
+"0% VAT since July" entry, but the next tariff refresh put it straight back, and the summer
+went on being priced without VAT.
+
+### Fixed
+
+- **The 1 October VAT change was backdated again after 4.5.17's repair.**
+  On the Intelligent tariffs, your supplier publishes one flat day price and one flat night
+  price. EMT turns those into a day window and a night window for every day since the price
+  began, so it can tell day from night. Every one of those windows from the past carried the
+  supplier's edited, VAT-free figures, and EMT treated each finished window as a
+  properly-dated record of what VAT had been on that day. So it learned "0% since July" from
+  its own windows on every refresh.
+
+  EMT no longer learns past VAT rates from tariff prices at all. A price that disagrees with
+  the VAT it knows is taken as a change from today onward, never earlier. Past rates come
+  only from the dates EMT already holds: 5% up to 30 September, 0% from 1 October.
+
+  The repair runs once more on upgrade, including for anyone whose 4.5.17 repair already ran.
+  It now corrects the tariff prices before checking each half-hour against them, so it also
+  catches half-hours 4.5.17 could not match. Settled figures from your bill and prices you
+  corrected yourself are still never changed.
+
+- **30 September's overnight EV charging was priced without VAT.**
+  To find a day's cheapest rate, EMT looked at the day as UTC counts it. In summer, the last
+  hour of the UTC day is already the next day here, so on 30 September it saw 1 October's
+  VAT-free prices and took the cheapest of those as 30 September's off-peak rate. EMT now uses
+  the day as it runs in the UK. The repair also catches half-hours where the price and its VAT
+  were *both* written short, so their ratio looked right.
+
 ## [4.5.17] — 2026-10-01
 
 *VAT changed today, and EMT applied it to the summer too.* Domestic energy VAT fell to 0% on
