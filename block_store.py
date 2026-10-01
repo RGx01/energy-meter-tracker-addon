@@ -3166,6 +3166,30 @@ class BlockStore:
                     "AND channel = 'import'", (start, meter_id))
         return cur.rowcount > 0
 
+    _VAT_HEAL_COLS = ("imp_rate", "imp_cost", "imp_rate_exc", "imp_cost_exc", "imp_rate_ev",
+                      "imp_cost_ev", "standing_charge", "standing_charge_exc")
+
+    def vat_heal_write_block(self, start: str, meter_id: str, values: dict, *,
+                             rates_moved: bool) -> bool:
+        """One-off 4.5.17 VAT heal (engine._vat_backdate_heal_core): a targeted UPDATE of
+        the priced columns in `values` only — never a round-trip. Invalidates the row's
+        import segments when a rate moved so they rebuild. Never touches a provisional,
+        `measured` or `corrected` row. Returns True if the row changed."""
+        cols = [c for c in values if c in self._VAT_HEAL_COLS]
+        if not cols:
+            return False
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE blocks SET " + ", ".join(c + " = ?" for c in cols) + " "
+                "WHERE block_start = ? AND meter_id = ? AND is_provisional = 0 "
+                "AND (rate_source IS NULL OR rate_source NOT IN ('measured', 'corrected'))",
+                [values[c] for c in cols] + [start, meter_id])
+            if cur.rowcount > 0 and rates_moved:
+                self._conn.execute(
+                    "DELETE FROM block_segments WHERE block_start = ? AND meter_id = ? "
+                    "AND channel = 'import'", (start, meter_id))
+        return cur.rowcount > 0
+
     def smb_repair_write_block(self, start: str, meter_id: str, *, rate, cost,
                                rate_exc=None, cost_exc=None, ev_band=None,
                                home_band=None) -> bool:

@@ -1,5 +1,36 @@
 # Changelog
  
+## [Unreleased]
+
+*VAT changed today, and EMT applied it to the summer too.* Domestic energy VAT fell to 0% on
+1 October 2026. Your supplier didn't publish that as a new price from 1 October — it edited
+the price it had already published, so its record now says "no VAT" for a rate that began in
+July. EMT took that record at its word.
+
+### Fixed
+
+- **A VAT change could be backdated to the start of your current price.**
+  Two things went wrong once EMT read the edited prices. It noted "VAT became 0% on the day
+  this price began" — a date in July — and from then on split every bill since July as if no
+  VAT had been charged. And anywhere it filled in a price from the tariff, it filled in the
+  price without VAT. On some installs the opposite happened first: still holding the
+  prices from before the edit, EMT kept charging 5% on today's half-hours.
+
+  EMT now knows the 1 October change as a fixed date, the way it already knew the 5% rate,
+  and it no longer trusts a supplier price to say *when* its VAT applies. Each half-hour is
+  priced from the supplier's figure before VAT, with the VAT that was in force on that day —
+  5% up to 30 September, 0% from midnight on 1 October. Export is unaffected; it never
+  carries VAT.
+
+  On upgrade, a one-off repair puts back anything already affected: a "0% since July" entry
+  is removed, and any half-hour whose price and VAT disagree with its date is corrected —
+  from 1 October down to 0%, before it back to 5%. Settled figures from your bill and prices
+  you corrected yourself are never changed. The repair only runs once.
+
+- **The first day of the capped Intelligent tariff started a day early on the Billing
+  charts.** A tariff starting at midnight in summer time was dated by the UTC clock, which
+  still reads the day before, so that day was drawn as if the six-hour cap applied.
+
 ## [4.5.16] — 2026-09-29
 
 *Your supplier renamed something, and your car disappeared.* Octopus changed the labels on

@@ -11572,6 +11572,135 @@ async def run_smb_rate_repair(force: bool = False) -> dict:
     return res
 
 
+# One-off (4.5.17): 1 Oct 2026's 0% VAT backdated to July. Gated, self-marking,
+# idempotent; retires under BL-33 and raises the v5 import floor to 4.5.17.
+_VAT_BACKDATE_HEAL_DONE_KEY = "vat_backdate_heal_done"
+_VAT_ZERO_FROM = "2026-10-01"
+
+
+def _vat_backdate_heal_core(store, sched, std_sched, std_floor=None, *, eps: float = 1e-6) -> dict:
+    """One-off heal (4.5.17): undo what 4.5.16 wrote while it read Octopus's edited
+    rate records as published.
+
+    On 1 Oct 2026 Octopus applied the 0% VAT by editing its open records in place (a
+    record from 2026-07-05 reads inc == exc). 4.5.16 then (a) learned "0% from
+    <record start>" into the VAT calendar and (b) priced any block it re-wrote from the
+    schedule without VAT — and, the other way round, kept pricing 1 Oct's live blocks
+    at 5% from a schedule fetched before the edit. Tariff-agnostic, like the change.
+
+      1. Drop learned 0% entries dated before 1 Oct 2026 (no domestic 0% existed).
+      2. Every non-provisional import row (main and sub-meters) whose stored inc/exc
+         VAT disagrees with the calendar at its date: if its ex-VAT rate is one of the
+         tariff's ex-VAT figures that day, inc is rebuilt from it; else if its inc is one
+         of the (restated) tariff's inc figures, exc is rebuilt from that; else it is
+         left alone and counted. The EV split's inc moves by the same factor. Import
+         segments are invalidated to rebuild. `measured` (the bill) and `corrected`
+         (the user) rows are never touched.
+      3. From `std_floor` (the current agreement's start — the standing schedule is the
+         current tariff's only), a standing charge that differs from the (restated)
+         tariff figure for its local day by exactly a VAT factor is set to it.
+
+    `sched` / `std_sched` are the restated import and standing schedules (pence).
+    Local, no API. Returns counts."""
+    import vat_calendar as _vc
+    learned = store.get_vat_calendar()
+    kept = [(d, r) for d, r in learned if not (float(r) == 0.0 and str(d) < _VAT_ZERO_FROM)]
+    n_cal = len(learned) - len(kept)
+    if n_cal:
+        store.set_vat_calendar(kept)
+    exc_s = getattr(sched, "exc", None)
+
+    def _figs(s, ts):
+        out = set()
+        if s is None:
+            return out
+        for v in (s.resolve(ts),) + tuple(s.day_rate_bounds(ts) or ()):
+            if v is not None:
+                out.add(round(float(v) / 100.0, 6))
+        return out
+
+    def _near(x, figs):
+        return any(abs(x - f) <= eps for f in figs)
+
+    rows = store._conn.execute(
+        "SELECT block_start, meter_id, imp_kwh, imp_rate, imp_cost, imp_rate_exc, "
+        "imp_cost_exc, imp_rate_ev, imp_cost_ev, standing_charge, standing_charge_exc "
+        "FROM blocks WHERE is_provisional = 0 "
+        "AND (rate_source IS NULL OR rate_source NOT IN ('measured', 'corrected')) "
+        "ORDER BY block_start").fetchall()
+    n_inc = n_exc = n_unmatched = n_std = 0
+    std_cache = {}
+    for r in rows:
+        start = r["block_start"]
+        v = store.vat_rate_at(start)
+        f = 1.0 + v
+        inc, exc = r["imp_rate"], r["imp_rate_exc"]
+        upd = {}
+        if inc and exc and inc > 0 and exc > 0 and sched is not None \
+                and _vc.snap_vat(inc / exc - 1.0) != v:
+            if _near(exc, _figs(exc_s, start)):
+                new_inc = round(exc * f, 6)
+                upd["imp_rate"] = new_inc
+                upd["imp_cost"] = round((r["imp_cost_exc"] if r["imp_cost_exc"] is not None
+                                         else (r["imp_kwh"] or 0.0) * exc) * f, 6)
+                k = new_inc / inc
+                if r["imp_rate_ev"]:
+                    upd["imp_rate_ev"] = round(r["imp_rate_ev"] * k, 6)
+                if r["imp_cost_ev"]:
+                    upd["imp_cost_ev"] = round(r["imp_cost_ev"] * k, 6)
+                n_inc += 1
+            elif _near(inc, _figs(sched, start)):
+                upd["imp_rate_exc"] = round(inc / f, 6)
+                if r["imp_cost"] is not None:
+                    upd["imp_cost_exc"] = round(r["imp_cost"] / f, 6)
+                n_exc += 1
+            else:
+                n_unmatched += 1
+        sc = r["standing_charge"]
+        if sc and std_sched is not None and (std_floor is None or start >= str(std_floor)):
+            day = _vc.local_day(start)
+            if day not in std_cache:
+                p = std_sched.resolve(day + "T12:00:00")
+                std_cache[day] = None if p is None else round(p / 100.0, 6)
+            want = std_cache[day]
+            if want and abs(sc - want) > eps and any(
+                    abs(sc - want * k) <= 1e-5 for k in (1.05, 1 / 1.05, 1.20, 1 / 1.20)):
+                upd["standing_charge"] = want
+                if r["standing_charge_exc"] is not None:
+                    upd["standing_charge_exc"] = round(want / f, 6)
+                n_std += 1
+        if upd:
+            store.vat_heal_write_block(start, r["meter_id"], upd,
+                                       rates_moved=any(k.startswith("imp_") for k in upd))
+    return {"ok": True, "calendar_entries_dropped": n_cal, "candidates": len(rows),
+            "inc_rebuilt": n_inc, "exc_rebuilt": n_exc, "unmatched": n_unmatched,
+            "standing_fixed": n_std}
+
+
+async def run_vat_backdate_heal(force: bool = False) -> dict:
+    """One-off 4.5.17 heal (see _vat_backdate_heal_core). Gated
+    (`vat_backdate_heal_done`), self-marking, idempotent. Runs after a schedule refresh;
+    an account with no Kraken connection had no schedule to backdate from, so it only
+    gets the calendar step and is marked done."""
+    if _store is None:
+        return {"ok": False, "reason": "no store"}
+    if not force and _store.get_kraken_state(_VAT_BACKDATE_HEAL_DONE_KEY):
+        return {"ok": True, "skipped": "already done"}
+    sched = _kraken_rate_schedules.get("import")
+    if _kraken_client is not None and (sched is None or sched.is_empty()):
+        return {"ok": False, "reason": "schedule not ready"}   # retry; do NOT mark done
+    res = _vat_backdate_heal_core(_store, sched, _kraken_standing_schedule,
+                                  std_floor=_kraken_current_agreement_from)
+    if res.get("ok"):
+        import datetime as _dtm
+        _store.set_kraken_state(_VAT_BACKDATE_HEAL_DONE_KEY,
+                                _dtm.datetime.now(_dtm.timezone.utc).isoformat())
+        logger.info("run_vat_backdate_heal: %s", res)
+        if res["inc_rebuilt"] or res["exc_rebuilt"] or res["standing_fixed"]:
+            _schedule_chart_regen()
+    return res
+
+
 def _smb_device_recost_core(store) -> dict:
     """One-off heal (4.5.7 device-cost fix): re-cost physical sub-meter blocks (ev_charger /
     battery) to their parent MAIN rate wherever they DRIFTED. The measured-cost settlement
@@ -13333,6 +13462,11 @@ async def kraken_poll_task(ha: HAClient):
             # tariffs return ~1 record). The sync drain reads these via
             # _kraken_rate_resolver to repair zero/missing rates at reconcile.
             await _refresh_kraken_rate_schedules()
+            # One-off (4.5.17): undo the 1 Oct 2026 VAT backdating. Gated + self-marking.
+            try:
+                await run_vat_backdate_heal()
+            except Exception as e:
+                logger.warning("kraken_poll_task: vat backdate heal failed: %s", e)
             # Before the first LIVE write, ensure the rollback snapshot exists.
             # If it can't be taken, downgrade THIS cycle to dry-run rather than
             # mutate blocks without a backup.
