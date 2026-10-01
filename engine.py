@@ -11581,7 +11581,11 @@ async def run_smb_rate_repair(force: bool = False) -> dict:
 # _v3 (4.5.18, before release): also rows 4.5.17 wrote with BOTH sides a VAT short —
 # inc set to the tariff's ex-VAT figure, exc derived from it at the right rate — whose
 # ratio looks correct, so v2 passed them over (30 Sep's in-window EV slots).
-_VAT_BACKDATE_HEAL_DONE_KEY = "vat_backdate_heal_done_v3"
+# _v4 (4.5.19): sub-meter rows. A device row is priced at its block's MAIN rate when the
+# block is written; the heal re-priced main rows only (it needs an inc/exc pair, and device
+# rows carry no exc), so 1 Oct's EV-charger and battery rows written before 4.5.18 stayed
+# at 5% beside a 0% main — and the Direct-import remainder lost its 0% kWh.
+_VAT_BACKDATE_HEAL_DONE_KEY = "vat_backdate_heal_done_v4"
 _VAT_ZERO_FROM = "2026-10-01"
 
 
@@ -11688,7 +11692,27 @@ def _vat_backdate_heal_core(store, sched, std_sched, std_floor=None, *, eps: flo
         if upd:
             store.vat_heal_write_block(start, r["meter_id"], upd,
                                        rates_moved=any(k.startswith("imp_") for k in upd))
+    # 4. Sub-meter rows a VAT factor off their block's main rate: re-price at the main rate,
+    #    cost from the grid-attributed kWh (device cost derives from imp_kwh_grid).
+    n_dev = 0
+    devs = store._conn.execute(
+        "SELECT s.block_start, s.meter_id, s.imp_rate AS sr, m.imp_rate AS mr, "
+        "COALESCE(s.imp_kwh_grid, s.imp_kwh) AS gk "
+        "FROM blocks s JOIN blocks m ON m.block_start = s.block_start "
+        "AND m.meter_id = 'electricity_main' "
+        "WHERE s.meter_id != 'electricity_main' AND s.is_provisional = 0 "
+        "AND m.is_provisional = 0 AND s.imp_rate > 0 AND m.imp_rate > 0 "
+        "AND (s.rate_source IS NULL OR s.rate_source NOT IN ('measured', 'corrected'))").fetchall()
+    for d in devs:
+        k = d["sr"] / d["mr"]
+        if any(abs(k - f) <= 1e-4 for f in (1.05, 1 / 1.05, 1.20, 1 / 1.20)):
+            mr = round(d["mr"], 6)
+            store.vat_heal_write_block(d["block_start"], d["meter_id"],
+                                       {"imp_rate": mr, "imp_cost": round((d["gk"] or 0.0) * mr, 6)},
+                                       rates_moved=True)
+            n_dev += 1
     return {"ok": True, "calendar_entries_dropped": n_cal, "candidates": len(rows),
+            "device_rows_aligned": n_dev,
             "inc_rebuilt": n_inc, "exc_rebuilt": n_exc, "both_short_vat": n_both,
             "unmatched": n_unmatched,
             "standing_fixed": n_std}
@@ -11739,7 +11763,8 @@ async def run_vat_backdate_heal(force: bool = False) -> dict:
         _store.set_kraken_state(_VAT_BACKDATE_HEAL_DONE_KEY,
                                 _dtm.datetime.now(_dtm.timezone.utc).isoformat())
         logger.info("run_vat_backdate_heal: %s", res)
-        if any(res.get(k) for k in ("inc_rebuilt", "exc_rebuilt", "both_short_vat", "standing_fixed")):
+        if any(res.get(k) for k in ("inc_rebuilt", "exc_rebuilt", "both_short_vat",
+                                    "standing_fixed", "device_rows_aligned")):
             _schedule_chart_regen()
     return res
 
