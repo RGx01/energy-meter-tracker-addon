@@ -1095,6 +1095,21 @@ def _bill_split_rows(summary, currency, exc=False):
         return (f'\n        <tr><td>{label}</td><td>{rate:.4f}{note}</td>'
                 f'<td>{kwh:.3f}</td><td>{cs}</td></tr>')
 
+    if exc:
+        # The ex-VAT table bands on the EX-VAT rate (4.5.19). Keyed by inc rate, the same
+        # tariff band either side of a VAT change — 5.493 inc at 5% to 30 Sep 2026,
+        # 5.2314 inc at 0% from 1 Oct — showed as two identical-looking 0.0523 rows.
+        def _by_exc(series):
+            out = {}
+            for _r, _v in series.items():
+                _k = _v["kwh"]
+                _x = (_v.get(_ckr, _v.get(_ck, 0.0)) / _k) if _k > 1e-9 else _r
+                g = out.setdefault(round(_x, 6), {"kwh": 0.0, _ck: 0.0, _ckr: 0.0})
+                g["kwh"] += _k
+                g[_ck] += _v.get(_ck, 0.0)
+                g[_ckr] += _v.get(_ckr, _v.get(_ck, 0.0))
+            return out
+        ev_by_rate, home_by_rate = _by_exc(ev_by_rate), _by_exc(home_by_rate)
     # Cluster the rate keys of BOTH series together into bands (adjacent rates within
     # _SPLIT_BAND_EPS merge), so EV and Home stay aligned on the same displayed band.
     _rates = sorted(set(ev_by_rate) | set(home_by_rate))
@@ -1205,18 +1220,30 @@ def bill_slots_from_blocks(blocks, vat_rate=0.05):
     return slots
 
 
-def _bill_method_breakdown(blocks, period_vat=None, standing_inc_by_day=None):
+def _bill_method_breakdown(blocks, period_vat=None, standing_inc_by_day=None, vat_at=None):
     """BL-24: ex-VAT bill-method breakdown for a period — import energy by rate band, plus
     ex-VAT standing, a VAT row and the inc total. Matches how Octopus actually reconciles
     (verified against a real bill): the per-half-hour figures are summed RAW and rounding
     happens only at the SUBTOTAL — NOT per half-hour (that destroys the many sub-0.01 kWh
-    peak slots) and NOT the 1dp kWh the bill shows for display. VAT is derived from a real
-    inc/exc pair (snapped 0/5/20%; 0% once VAT is removed), else the default. Ex-VAT cost is
-    the stored exc where captured, else the billed inc ÷ (1+VAT) — same for standing, so the
-    standing charge still lands before ex-VAT capture. Returns a dict or None."""
+    peak slots) and NOT the 1dp kWh the bill shows for display. Ex-VAT cost is the stored
+    exc where captured, else the billed inc ÷ (1+VAT) — same for standing, so the standing
+    charge still lands before ex-VAT capture. Returns a dict or None.
+
+    VAT is PER DATE (4.5.19). A half-hour's VAT is its own inc/exc pair (snapped
+    0/5/20%), else `vat_at(start)` — the VAT calendar; a standing-charge day's is
+    `vat_at(day)`. Without `vat_at` every date falls back to one period rate: the first
+    real pair, else `period_vat` — which is what 4.5.18 did for every period, so a bill
+    period spanning 1 Oct 2026's change to 0% took 1 Oct's standing charge ÷ 1.05,
+    labelled the VAT "@ 5%", and showed 1 Oct's ex-VAT rows twice. Rows are grouped by
+    their ex-VAT rate (the table's own basis); the VAT line names each rate in force."""
     from collections import defaultdict as _dd
+    import vat_calendar as _vc
     blocks = list(blocks or [])
-    # ── Pass 1: VAT rate from a real inc/exc pair (else default) ────────────────
+
+    def _snap(x):
+        return min((0.0, 0.05, 0.20), key=lambda r: abs(r - x))
+
+    # ── Pass 1: the period fallback rate — a real inc/exc pair, else the default ──
     raw_vat = None
     for b in blocks:
         imp = (((b or {}).get("meters") or {}).get("electricity_main") or {})
@@ -1225,144 +1252,158 @@ def _bill_method_breakdown(blocks, period_vat=None, standing_inc_by_day=None):
         if c and ce and ce != 0:
             raw_vat = float(c) / float(ce) - 1.0
             break
-    # VAT rate: derived from a real inc/exc pair where present; else the period's
-    # statutory rate from the VAT calendar (passed in), NOT a hardcoded 5% — so a 0%/20%
-    # period labels + fills correctly. The *amount* is computed as inc − exc below, which
-    # is right regardless of the rate; this `vat` only sets the label and the fallbacks.
     _default_vat = 0.05 if period_vat is None else float(period_vat)
-    vat = _default_vat if raw_vat is None else min((0.0, 0.05, 0.20),
-                                                   key=lambda x: abs(x - raw_vat))
-    # ── Pass 2: raw ex-VAT sums per band + ex-VAT standing per day ──────────────
+    vat = _default_vat if raw_vat is None else _snap(raw_vat)
+
+    def _vat_of(when):
+        return float(vat_at(when)) if vat_at is not None else vat
+
+    vat_by_day = {}                      # local day → VAT in force (for the label)
+    # ── Pass 2: raw ex-VAT sums per (band, VAT) + ex-VAT standing per local day ──
     bands = _dd(lambda: {"kwh": 0.0, "exc": 0.0, "inc": 0.0})
     tot_kwh = with_exc = 0.0
-    stand_exc_day = {}   # local day → ex-VAT standing (first non-zero; stored else inc/(1+VAT))
+    stand_exc_day = {}   # local day → (ex-VAT standing, VAT) — first non-zero
     for b in blocks:
         m = ((b or {}).get("meters") or {}).get("electricity_main") or {}
         imp = (m.get("channels") or {}).get("import") or {}
-        d = (b.get("start") or "")[:10]
+        start = b.get("start") or ""
+        d = _vc.local_day(start) if start else ""
         if d and d not in stand_exc_day:
             se = m.get("standing_charge_exc")
-            if se:
-                stand_exc_day[d] = float(se)
-            else:
-                sc = m.get("standing_charge") or 0
-                if sc:
-                    stand_exc_day[d] = float(sc) / (1.0 + vat)
+            sc = m.get("standing_charge") or 0
+            if se or sc:
+                dv = _vat_of(d)
+                stand_exc_day[d] = (float(se) if se else float(sc) / (1.0 + dv), dv)
         kwh = imp.get("kwh") or 0
         if not kwh:
             continue
         tot_kwh += kwh
         inc_rate = imp.get("rate")
-        if imp.get("cost_exc") is not None or imp.get("rate_exc") is not None:
+        c, ce = imp.get("cost"), imp.get("cost_exc")
+        bvat = _snap(float(c) / float(ce) - 1.0) if (c and ce) else _vat_of(start)
+        if d:
+            vat_by_day.setdefault(d, bvat)
+        if ce is not None or imp.get("rate_exc") is not None:
             with_exc += kwh
         # Raw ex-VAT cost for this half-hour: the billed cost, ex-VAT.
-        if imp.get("cost_exc") is not None:
-            xc = float(imp["cost_exc"])
-        elif imp.get("cost") is not None:
-            xc = float(imp["cost"]) / (1.0 + vat)
+        if ce is not None:
+            xc = float(ce)
+        elif c is not None:
+            xc = float(c) / (1.0 + bvat)
         elif inc_rate is not None:
-            xc = kwh * (float(inc_rate) / (1.0 + vat))
+            xc = kwh * (float(inc_rate) / (1.0 + bvat))
         else:
             continue
         # Inc cost for this slot — paired with xc so the VAT amount is inc − exc (exact
-        # for any mix of rates across a period, e.g. a VAT-holiday boundary).
-        if imp.get("cost") is not None:
-            ic = float(imp["cost"])
+        # for any mix of rates across a period).
+        if c is not None:
+            ic = float(c)
         elif inc_rate is not None:
             ic = kwh * float(inc_rate)
         else:
-            ic = xc * (1.0 + vat)
-        # Band by the CLEAN inc-rate tariff band, NOT the per-slot derived exc rate
-        # (cost_exc ÷ kWh). The derived rate jitters with Octopus's per-slot rounding and
-        # shatters the two real bands into many near-duplicates (0.3075/0.3077/0.3078/…);
-        # the stored inc rate is a clean tariff value, so grouping on it reproduces the
-        # bill's band structure. We group on inc (not the exc rate) because Octopus stores
-        # only the exc COST on measurement slots — imp_rate_exc is NULL there — so there's
-        # no reliable exc-rate column to group on; inc↔exc are 1:1 (÷ (1+VAT)) so it's
-        # equivalent. Fall back to an inc-scale key from the exc figures only when a slot
-        # has no inc rate.
+            ic = xc * (1.0 + bvat)
+        # Band by the CLEAN inc-rate tariff band (not the per-slot derived exc rate, which
+        # jitters with Octopus's per-slot rounding) — WITH its VAT, so the displayed exc
+        # rate is inc ÷ (1 + that half-hour's VAT).
         if inc_rate is not None:
             band_key = round(float(inc_rate), 6)
         elif imp.get("rate_exc") is not None:
-            band_key = round(float(imp["rate_exc"]) * (1.0 + vat), 6)
+            band_key = round(float(imp["rate_exc"]) * (1.0 + bvat), 6)
         else:
-            # No inc rate / stored exc rate — derive an inc-scale key from this slot's
-            # ex-VAT cost so it still bands consistently (xc is always set by here).
-            band_key = round(xc / float(kwh) * (1.0 + vat), 6)
-        band = bands[band_key]
+            band_key = round(xc / float(kwh) * (1.0 + bvat), 6)
+        band = bands[(band_key, bvat)]
         band["kwh"] += kwh
         band["exc"] += xc
         band["inc"] += ic
     if not bands:
         return None
-    # B2: cluster adjacent band keys within _SPLIT_BAND_EPS before emitting rows. The band
-    # key is the CLEAN inc rate where the tariff supplies one, but rate-from-cost history
-    # (CSV import) derives it as cost÷kWh, which jitters (e.g. 0.070000 vs 0.070003 — the
-    # same off-peak tariff) and would otherwise show as two identical-looking rows. Sub-penny
-    # EPS, and PER-CLUSTER, so a genuine in-period rate change (≥ pence) stays its own row.
-    _keys = sorted(bands)
+    # B2: cluster adjacent band keys within _SPLIT_BAND_EPS (per VAT rate) before emitting
+    # rows, so cost÷kWh jitter doesn't show one tariff as two rows; a genuine in-period
+    # rate change (≥ pence) stays its own row.
     _clusters = []
-    for _k in _keys:
-        if _clusters and (_k - _clusters[-1][-1]) <= _SPLIT_BAND_EPS:
+    for _k in sorted(bands, key=lambda kv: (kv[1], kv[0])):
+        if _clusters and _k[1] == _clusters[-1][-1][1] and (_k[0] - _clusters[-1][-1][0]) <= _SPLIT_BAND_EPS:
             _clusters[-1].append(_k)
         else:
             _clusters.append([_k])
-    rows, energy_raw, energy_inc = [], 0.0, 0.0
+    by_exc, energy_raw, energy_inc = {}, 0.0, 0.0
     for _cl in _clusters:
         bk = sum(bands[k]["kwh"] for k in _cl)
         be = sum(bands[k]["exc"] for k in _cl)
         bi = sum(bands[k]["inc"] for k in _cl)
         energy_raw += be
         energy_inc += bi
-        # Displayed exc rate = the cluster's kWh-weighted inc-scale rate ÷ (1+VAT) — a
-        # deterministic ex-VAT label that matches the bill. Cost to 3dp (mills), like the
-        # bill — the summed raw cost is authoritative.
-        _wk = (sum(k * bands[k]["kwh"] for k in _cl) / bk) if bk > 1e-12 else _cl[0]
-        rows.append({"rate_exc": round(_wk / (1.0 + vat), 4),
-                     "kwh": round(bk, 3), "cost_exc": round(be, 3)})
-    # Collapse a long rate list (Agile: hundreds of distinct half-hourly rates across a
-    # bill period) into ONE kWh-weighted average row so the ex-VAT summary stays
-    # readable. Uses the raw sums (energy_raw = Σ exc), so Total (exc) is unchanged.
+        # Displayed exc rate = the cluster's kWh-weighted inc-scale rate ÷ (1+its VAT).
+        _wk = (sum(k[0] * bands[k]["kwh"] for k in _cl) / bk) if bk > 1e-12 else _cl[0][0]
+        rx = round(_wk / (1.0 + _cl[0][1]), 4)
+        # The table is ex-VAT: one row per ex-VAT rate, so the same tariff band either
+        # side of a VAT change (5.493 inc at 5%, 5.2314 inc at 0%) is ONE 5.2314 row.
+        r = by_exc.setdefault(rx, {"rate_exc": rx, "kwh": 0.0, "cost_exc": 0.0})
+        r["kwh"] += bk
+        r["cost_exc"] += be
+    rows = [{"rate_exc": r["rate_exc"], "kwh": round(r["kwh"], 3), "cost_exc": round(r["cost_exc"], 3)}
+            for _, r in sorted(by_exc.items())]
+    # Collapse a long rate list (Agile) into ONE kWh-weighted average row.
     if len(rows) > _MAX_RATE_ROWS:
         _tot_kwh = sum(bands[k]["kwh"] for k in bands)
         _avg_exc = (energy_raw / _tot_kwh) if _tot_kwh else 0.0
         rows = [{"rate_exc": round(_avg_exc, 4), "kwh": round(_tot_kwh, 3),
                  "cost_exc": round(energy_raw, 3),
                  "collapsed": True, "n_rates": len(bands)}]
-    # Standing: prefer the summary's per-LOCAL-day inc figure (correct day count across
-    # the BST midnight boundary), ex-VAT via ÷ (1+VAT) — exact-to-the-mill for a flat
-    # charge. Fall back to the block-derived exc standing when no summary is supplied.
-    def _group_standing(day_amounts, to_exc):
-        # {day: amount} → one row per DISTINCT daily rate, so a mid-period standing
-        # change (price-cap / tariff switch) shows as separate lines instead of a
-        # single averaged rate that matches neither. `to_exc(amount)` converts a
-        # daily amount to its ex-VAT value.
+
+    def _group_standing(day_exc):
+        # {day: ex-VAT amount} → one row per DISTINCT ex-VAT daily rate, so a mid-period
+        # standing change shows as separate lines (and a VAT change alone does not).
         by_rate: dict = {}
-        for _d, _amt in day_amounts.items():
-            k = round(_amt, 6)
-            g = by_rate.setdefault(k, [0, 0.0])
+        for _d, _amt in day_exc.items():
+            g = by_rate.setdefault(round(_amt, 6), [0, 0.0])
             g[0] += 1
             g[1] += _amt
-        return [{"days": g[0], "rate_exc": round(to_exc(k), 4),
-                 "cost_exc": round(to_exc(g[1]), 2)}
+        return [{"days": g[0], "rate_exc": round(k, 4), "cost_exc": round(g[1], 2)}
                 for k, g in sorted(by_rate.items())]
+
+    # Standing: prefer the summary's per-LOCAL-day inc figure (correct day count across the
+    # BST midnight boundary), ex-VAT at THAT day's VAT. Fall back to the block-derived exc.
     if standing_inc_by_day:
-        standing_days = len(standing_inc_by_day)
+        _inc = {str(d)[:10]: a for d, a in standing_inc_by_day.items()}   # keys may be dates
+        _vd = {d: _vat_of(d) for d in _inc}
+        day_exc = {d: a / (1.0 + _vd[d]) for d, a in _inc.items()}
         standing_inc_raw = sum(standing_inc_by_day.values())
-        standing_raw  = standing_inc_raw / (1.0 + vat)
-        standing_rows = _group_standing(standing_inc_by_day, lambda a: a / (1.0 + vat))
     else:
-        standing_days = len(stand_exc_day)
-        standing_raw  = sum(stand_exc_day.values())
-        standing_inc_raw = standing_raw * (1.0 + vat)
-        standing_rows = _group_standing(stand_exc_day, lambda a: a)   # already ex-VAT
+        _vd = {d: v for d, (_x, v) in stand_exc_day.items()}
+        day_exc = {d: x for d, (x, _v) in stand_exc_day.items()}
+        standing_inc_raw = sum(x * (1.0 + v) for x, v in stand_exc_day.values())
+    for d, v in _vd.items():
+        vat_by_day.setdefault(d, v)
+    standing_days = len(day_exc)
+    standing_raw = sum(day_exc.values())
+    standing_rows = _group_standing(day_exc)
     standing_rate = round(standing_raw / standing_days, 4) if standing_days else 0.0
     subtotal_raw  = energy_raw + standing_raw            # ex-VAT subtotal
     inc_raw       = energy_inc + standing_inc_raw        # inc-VAT subtotal
     subtotal = round(subtotal_raw, 2)
-    # VAT amount as inc − exc (a subtraction) — exact for any mix of rates across the
-    # period, so a VAT-holiday boundary inside a bill period is handled correctly.
+    # VAT amount as inc − exc — exact for any mix of rates across the period.
     vat_amount = round(inc_raw - subtotal_raw, 2)
+    # Label: each VAT rate in force, in date order, with the day it changes.
+    spans = []
+    for d in sorted(vat_by_day):
+        if not spans or spans[-1][1] != vat_by_day[d]:
+            spans.append([d, vat_by_day[d], d])
+        else:
+            spans[-1][2] = d
+    if len(spans) <= 1:
+        _v = spans[0][1] if spans else vat
+        vat_label = f"VAT @ {_v * 100:.0f}%"
+        vat_rate = _v
+    else:
+        from datetime import date as _date
+        _f = lambda s: _date.fromisoformat(s).strftime("%-d %b")
+        vat_label = "VAT @ " + ", ".join(
+            f"{v * 100:.0f}% " + (f"to {_f(e)}" if i == 0 else
+                                  f"from {_f(s)}" if i == len(spans) - 1 else
+                                  f"{_f(s)}–{_f(e)}")
+            for i, (s, v, e) in enumerate(spans))
+        vat_rate = None
     return {
         "rows": rows,
         "energy_exc":        round(energy_raw, 2),
@@ -1371,7 +1412,8 @@ def _bill_method_breakdown(blocks, period_vat=None, standing_inc_by_day=None):
         "standing_rows":     standing_rows,
         "standing_exc":      round(standing_raw, 2),
         "subtotal_exc":      subtotal,
-        "vat_rate":          vat,
+        "vat_rate":          vat_rate,
+        "vat_label":         vat_label,
         "vat_amount":        vat_amount,
         "inc_total":         round(inc_raw, 2),
         "coverage":          round(with_exc / tot_kwh, 3) if tot_kwh else 0.0,
@@ -1770,7 +1812,7 @@ def render_billing_summary(summary, currency='£', site_name=None):
                     html += f"""
         <tr class="standing"><td colspan="3">Standing charge (exc): {_bm['standing_days']} days @ {currency}{_bm['standing_rate_exc']:.4f}/day</td><td>{_bm['standing_exc']:.2f}</td></tr>"""
             html += f"""
-        <tr class="bill-method"><td colspan="3">VAT @ {_bm['vat_rate'] * 100:.0f}%</td><td>{currency}{_bm['vat_amount']:.2f}</td></tr>
+        <tr class="bill-method"><td colspan="3">{_bm.get('vat_label') or 'VAT @ %.0f%%' % (_bm['vat_rate'] * 100)}</td><td>{currency}{_bm['vat_amount']:.2f}</td></tr>
         <tr class="channel-total"><td colspan="3">Total incl. VAT</td><td>{currency}{_bm['inc_total']:.2f}</td></tr>"""
         else:
             _rate_html, raw_kwh_r, raw_cost_r = _bill_rate_rows(main_import_raw, currency)
@@ -2696,7 +2738,8 @@ def generate_daily_import_export_charts(blocks, timezone_name="UTC", block_minut
                                               label=_ev_label, fold_devices=_ev_fold_devices)
         if _bill_rounding:
             _bm = _bill_method_breakdown(_period_blocks, period_vat=_vat_at(_s),
-                                         standing_inc_by_day=_sm.get("standing"))
+                                         standing_inc_by_day=_sm.get("standing"),
+                                         vat_at=_vat_at)
             if _bm:
                 _sm["bill_method"] = _bm
         return _sm

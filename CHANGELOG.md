@@ -1,5 +1,23 @@
 # Changelog
  
+## [4.5.19] — 2026-10-01
+
+*One bill, two VAT rates.* The bill period running from 3 September to 2 October is the
+first to cross the VAT change, and the Bill Summary still treated it as all one rate.
+
+### Fixed
+
+- **The Bill Summary for a period spanning 1 October used 5% VAT throughout.**
+  The ex-VAT summary took one VAT rate for the whole period, from its first half-hour. So
+  1 October's standing charge — already VAT-free — had 5% taken off it again, the VAT line
+  read "VAT @ 5%", and 1 October's charging showed as its own EV and Home rows next to
+  September's, at what looked like the same rate.
+
+  Each half-hour and each day's standing charge now uses the VAT of its own date. The
+  ex-VAT table shows one row per ex-VAT rate, and the VAT line says what applied —
+  "VAT @ 5% to 30 Sep, 0% from 1 Oct". Your totals were not affected beyond a penny or two,
+  and nothing stored is changed: this was how the summary was worked out, not the data.
+
 ## [4.5.18] — 2026-10-01
 
 *The repair worked, and then the old date came back.* 4.5.17's one-off repair removed the
