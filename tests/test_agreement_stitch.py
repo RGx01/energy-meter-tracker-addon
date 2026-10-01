@@ -72,7 +72,7 @@ AGS = [
 def _stitch(client=None):
     client = client or _Mock()
     return _run(
-        build_agreement_stitched_schedule(client, AGS)), client
+        build_agreement_stitched_schedule(client, AGS, vat=[])), client
 
 
 class TestAgreementStitch(unittest.TestCase):
@@ -95,16 +95,16 @@ class TestAgreementStitch(unittest.TestCase):
         # two stitches on the same client → the CLOSED agreement is fetched once
         c = _Mock()
         _run(
-            build_agreement_stitched_schedule(c, AGS))
+            build_agreement_stitched_schedule(c, AGS, vat=[]))
         first = c.calls.get("E-1R-INTELLI-FIX-12M-26-03-17-B", 0)
         _run(
-            build_agreement_stitched_schedule(c, AGS))
+            build_agreement_stitched_schedule(c, AGS, vat=[]))
         second = c.calls.get("E-1R-INTELLI-FIX-12M-26-03-17-B", 0)
         self.assertEqual(second, first)  # no extra fetch — served from cache
 
     def test_empty_agreements(self):
         s = _run(
-            build_agreement_stitched_schedule(_Mock(), []))
+            build_agreement_stitched_schedule(_Mock(), [], vat=[]))
         self.assertTrue(s.is_empty())
 
 

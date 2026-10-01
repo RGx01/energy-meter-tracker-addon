@@ -42,6 +42,13 @@ logger = logging.getLogger("kraken_rates")
 _PREFERRED_PAYMENT = "DIRECT_DEBIT"
 
 
+# A builder's VAT context (C rule 2: required, no default). Pass the store's learned
+# VAT calendar (a list, possibly empty — the statutory seed always applies) for an
+# import tariff or standing charge, or NO_VAT for export: domestic export carries no
+# VAT, so its inc == exc is the truth and must never be grossed up.
+NO_VAT = "no-vat"
+
+
 class RateFetchError(Exception):
     """A rate fetch FAILED (transport error, HTTP 4xx/5xx, edge 403) — as opposed
     to succeeding and returning no records. The two must not be conflated: a
@@ -85,6 +92,9 @@ class RateSchedule:
         # charges, older callers). The sibling is built with exc_periods=None, so its
         # own `.exc` is None — no recursion.
         self.exc = RateSchedule(exc_periods) if exc_periods else None
+        # The schedule as Octopus published it, when with_vat() restated this one —
+        # the learner reads the published VAT ratios from it (vat_periods).
+        self.raw = None
 
     def __len__(self) -> int:
         return len(self._periods)
@@ -225,18 +235,61 @@ class RateSchedule:
         lo, hi = min(rates), max(rates)
         return lo if (hi - lo) <= tol else None
 
-    def vat_series(self):
-        """[(valid_from, vat_rate)] at each period boundary — vat = inc/exc − 1, from
-        this (inc) schedule vs its `.exc` sibling. The VAT-calendar learner collapses
-        this to change-points, so a VAT holiday (inc/exc stepping 1.05→1.00 at a
-        `valid_from`) is picked up automatically. Empty when no exc sibling."""
-        if self.exc is None:
+    def vat_periods(self):
+        """[(valid_from, valid_to, vat)] as PUBLISHED — vat = inc/exc − 1 from the
+        schedule Octopus returned (`.raw` when this one was restated) against its
+        `.exc` sibling. vat_calendar.learn_from_records dates them. Empty when no exc
+        sibling."""
+        src = self.raw if self.raw is not None else self
+        if src.exc is None:
             return []
         out = []
-        for vfrom, _vto, inc in self._periods:
-            exc = self.exc.resolve(vfrom)
+        for vfrom, vto, inc in src._periods:
+            exc = src.exc.resolve(vfrom)
             if exc is not None and abs(exc) > 1e-9 and inc is not None:
-                out.append((vfrom, float(inc) / float(exc) - 1.0))
+                out.append((vfrom, vto, float(inc) / float(exc) - 1.0))
+        return out
+
+    def with_vat(self, vat):
+        """This schedule with every inc-VAT figure TRUE AT ITS OWN DATE: ex-VAT x
+        (1 + the VAT calendar's rate there). `vat` is the learned calendar (seed
+        always applies), or NO_VAT to leave the schedule as published (export).
+
+        Octopus's inc figure is only right for the VAT in force when it was last
+        written: on 1 Oct 2026 it edited its open records in place, so a record from
+        5 Jul reads inc == exc and, used as published, prices July-September with no
+        VAT. A period is split at each calendar boundary inside it (local midnight,
+        in naive UTC); a piece whose published VAT agrees with the calendar keeps
+        Octopus's figure, and one that disagrees is rebuilt from ex-VAT, rounded to
+        the 4 dp Octopus publishes (30.7707 x 1.05 -> 32.3092). Idempotent: it
+        always restates from the published schedule."""
+        base = self.raw if self.raw is not None else self
+        if vat is NO_VAT or base.exc is None or not base._periods:
+            return base
+        import vat_calendar as _vc
+        merged = _vc._merged(vat)
+        cps = _vc.change_points_utc(vat)
+        rates = [r for _d, r in merged]
+
+        def _rate_at(ts):
+            k = bisect.bisect_right(cps, ts)
+            return rates[k - 1] if k > 0 else _vc.DEFAULT_RATE
+
+        inc = []
+        for vf, vt, val in base._periods:
+            exc = base.exc.resolve(vf)
+            if exc is None or abs(exc) <= 1e-9 or val is None:
+                inc.append((vf, vt, val))
+                continue
+            published = _vc.snap_vat(float(val) / float(exc) - 1.0)
+            lo = bisect.bisect_right(cps, vf)
+            hi = len(cps) if vt is None else bisect.bisect_left(cps, vt)
+            bounds = [vf] + cps[lo:hi] + [vt]
+            for a, b in zip(bounds, bounds[1:]):
+                r = _rate_at(a)
+                inc.append((a, b, val if r == published else round(float(exc) * (1.0 + r), 4)))
+        out = RateSchedule(inc, base.exc._periods)
+        out.raw = base
         return out
 
     @classmethod
@@ -287,7 +340,7 @@ class RateSchedule:
         return cls(periods, exc_periods or None)
 
 
-def _build_schedule_and_diag(records, product_code, tariff_code):
+def _build_schedule_and_diag(records, product_code, tariff_code, vat):
     """CPU-bound: build the RateSchedule from API records and log diagnostics.
 
     Runs in a worker thread (via run_in_executor) so a long half-hourly tariff
@@ -298,7 +351,7 @@ def _build_schedule_and_diag(records, product_code, tariff_code):
     the per-period distinct/date-span walk (O(n) + a multi-KB log line) is capped
     to a count, keeping both the CPU and the log cheap.
     """
-    sched = RateSchedule.from_api_records(records)
+    sched = RateSchedule.from_api_records(records).with_vat(vat)
     try:
         _p = sched._periods
         n = len(_p)
@@ -356,11 +409,12 @@ def _clip_periods(periods, ag_vf, ag_vt):
     return out
 
 
-async def build_agreement_stitched_schedule(client, agreements) -> "RateSchedule":
+async def build_agreement_stitched_schedule(client, agreements, *, vat) -> "RateSchedule":
     """Stitch a single import RateSchedule across ALL agreements so resolve(ts)
     prices ts on the tariff that applied then. Reuses build_rate_schedule per
     agreement; closed agreements cached by (tariff, from, to). On total failure
-    returns an empty schedule (caller keeps its last-known)."""
+    returns an empty schedule (caller keeps its last-known). Each agreement is
+    built (and cached) as published; `vat` is applied once, to the stitch."""
     if not agreements:
         return RateSchedule([])
     ttp = getattr(client, "_tariff_to_product_code", None)
@@ -392,7 +446,7 @@ async def build_agreement_stitched_schedule(client, agreements) -> "RateSchedule
                 continue
             try:
                 ag_sched = await build_rate_schedule(
-                    client, pc, tc, period_from=vf_raw, period_to=vt_raw)
+                    client, pc, tc, vat=NO_VAT, period_from=vf_raw, period_to=vt_raw)
             except Exception as e:
                 logger.warning("stitch: %s fetch failed (%s) — span uncovered", tc, e)
                 continue
@@ -408,7 +462,7 @@ async def build_agreement_stitched_schedule(client, agreements) -> "RateSchedule
         return RateSchedule([])
     logger.info("build_agreement_stitched_schedule: stitched %d/%d agreement(s) "
                 "→ %d periods", n_ok, len(ags), len(inc))
-    return RateSchedule(inc, exc or None)
+    return RateSchedule(inc, exc or None).with_vat(vat)
 
 
 # ── BL-52: reconstruct the windowed periods IOG's old standard-unit-rates gave ──
@@ -518,7 +572,7 @@ def _synthesize_iog_tou_windowed(day_records, night_records,
 
 async def build_rate_schedule(
     client, product_code: str, tariff_code: str,
-    *, period_from: Optional[str] = None, period_to: Optional[str] = None,
+    *, vat, period_from: Optional[str] = None, period_to: Optional[str] = None,
     raise_on_error: bool = False,
 ) -> RateSchedule:
     """Fetch a tariff's unit-rate history and build a RateSchedule.
@@ -531,6 +585,9 @@ async def build_rate_schedule(
     refresh, which drives the "tariff unsupported" banner) pass
     `raise_on_error=True`: a fetch failure then raises RateFetchError, while a
     successful-but-empty result still returns an empty schedule.
+
+    `vat` (required — C rule 2) is the learned VAT calendar, or NO_VAT for export;
+    see RateSchedule.with_vat.
     """
     if not product_code or not tariff_code:
         return RateSchedule([])
@@ -591,13 +648,13 @@ async def build_rate_schedule(
     # would otherwise stall the engine loop / HA WebSocket heartbeat here during a
     # rate refresh or first-time connect (the reported setup timeout).
     sched = await asyncio.get_event_loop().run_in_executor(
-        None, _build_schedule_and_diag, records, product_code, tariff_code)
+        None, _build_schedule_and_diag, records, product_code, tariff_code, vat)
     return sched
 
 
 async def build_ev_device_schedules(
     client, product_code: str, tariff_code: str,
-    *, period_from: Optional[str] = None, period_to: Optional[str] = None,
+    *, vat, period_from: Optional[str] = None, period_to: Optional[str] = None,
 ) -> tuple:
     """Fetch the IOG-SMB-TOU EV-device rate buckets — returns
     (off_peak_schedule, peak_schedule) from `ev-device-off-peak-unit-rates` /
@@ -608,7 +665,7 @@ async def build_ev_device_schedules(
     missing bucket yields an empty RateSchedule, so the cap classifier just has no
     EV-device rate for that slot and the caller falls back to the general overlay.
     Used to price the EV portion of a dispatched slot (off-peak within the 6-hour
-    cap, peak beyond). See docs/iog_6hr_cap_design.md."""
+    cap, peak beyond). See docs/iog_6hr_cap_design.md. `vat` as build_rate_schedule."""
     async def _one(rate_type: str) -> RateSchedule:
         if not product_code or not tariff_code:
             return RateSchedule([])
@@ -620,7 +677,7 @@ async def build_ev_device_schedules(
             logger.warning("build_ev_device_schedules: %s fetch failed for %s/%s: %s",
                            rate_type, product_code, tariff_code, e)
             return RateSchedule([])
-        return RateSchedule.from_api_records(recs or [])
+        return RateSchedule.from_api_records(recs or []).with_vat(vat)
 
     off_peak = await _one("ev-device-off-peak-unit-rates")
     peak = await _one("ev-device-peak-unit-rates")
@@ -629,13 +686,14 @@ async def build_ev_device_schedules(
 
 async def build_standing_charge_schedule(
     client, product_code: str, tariff_code: str,
-    *, period_from: Optional[str] = None, period_to: Optional[str] = None,
+    *, vat, period_from: Optional[str] = None, period_to: Optional[str] = None,
 ) -> RateSchedule:
     """Fetch a tariff's standing-charge history and build a RateSchedule.
 
     Same shape and caching story as build_rate_schedule, but hits the
     standing-charges endpoint. Values are pence/day (the consumer converts to
-    £/day). Returns an empty schedule on any failure.
+    £/day). Returns an empty schedule on any failure. `vat` as build_rate_schedule
+    (a standing charge carries VAT like the unit rate).
     """
     if not product_code or not tariff_code:
         return RateSchedule([])
@@ -647,7 +705,7 @@ async def build_standing_charge_schedule(
         logger.warning("build_standing_charge_schedule: fetch failed for %s/%s: %s",
                        product_code, tariff_code, str(e) or type(e).__name__)
         return RateSchedule([])
-    sched = RateSchedule.from_api_records(records)
+    sched = RateSchedule.from_api_records(records).with_vat(vat)
     logger.info("build_standing_charge_schedule: %s/%s → %d periods",
                 product_code, tariff_code, len(sched))
     return sched
