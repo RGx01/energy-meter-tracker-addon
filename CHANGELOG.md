@@ -1,6 +1,6 @@
 # Changelog
  
-## [Unreleased]
+## [4.5.17] — 2026-10-01
 
 *VAT changed today, and EMT applied it to the summer too.* Domestic energy VAT fell to 0% on
 1 October 2026. Your supplier didn't publish that as a new price from 1 October — it edited
