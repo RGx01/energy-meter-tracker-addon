@@ -116,7 +116,7 @@ class TestBuildRateScheduleScoping(unittest.TestCase):
         c = _MockClient([], DAY, NIGHT)
         s = _run(
             build_rate_schedule(c, "IOG-SMB-FIX-12M-26-03-17",
-                                "E-1R-IOG-SMB-FIX-12M-26-03-17-B"))
+                                "E-1R-IOG-SMB-FIX-12M-26-03-17-B", vat=[]))
         self.assertGreater(len(s), 2)  # windowed periods, not two flat ones
         self.assertEqual(_band(s.resolve("2026-08-23T10:00:00")), "day")
         self.assertEqual(_band(s.resolve("2026-08-23T02:00:00")), "night")
@@ -128,15 +128,17 @@ class TestBuildRateScheduleScoping(unittest.TestCase):
                 "valid_from": "2026-08-23T22:30:00Z", "valid_to": "2026-08-24T04:30:00Z"}]
         c = _MockClient(std, DAY, NIGHT)
         s = _run(
-            build_rate_schedule(c, "INTELLI-VAR-24-10-29", "E-1R-INTELLI-VAR-24-10-29-B"))
+            build_rate_schedule(c, "INTELLI-VAR-24-10-29", "E-1R-INTELLI-VAR-24-10-29-B", vat=[]))
         self.assertAlmostEqual(s.resolve("2026-08-23T10:00:00"), 28.557, places=3)
 
     def test_non_iog_windowless_not_reconstructed(self):
         # A non-IOG tariff with windowless day/night must NOT get the IOG window.
         c = _MockClient([], DAY, NIGHT)
         s = _run(
-            build_rate_schedule(c, "COSY-SOMETHING", "E-1R-COSY-SOMETHING-A"))
-        self.assertEqual(len(s), 2)  # plain concat, not reconstructed
+            build_rate_schedule(c, "COSY-SOMETHING", "E-1R-COSY-SOMETHING-A", vat=[]))
+        # plain concat, not reconstructed: 2 records, each split once at the
+        # 1 Oct 2026 VAT boundary (RateSchedule.with_vat) — not 48 windowed slots
+        self.assertEqual(len(s), 4)
 
 
 if __name__ == "__main__":

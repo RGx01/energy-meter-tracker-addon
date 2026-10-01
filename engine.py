@@ -6566,6 +6566,7 @@ async def _build_channel_rate_segs(channel: str):
             continue
         try:
             rs = await build_rate_schedule(_kraken_client, product, tariff,
+                                           vat=_vat_context(channel),
                                            period_from=vf, period_to=vt)
         except Exception as e:
             logger.warning("_build_channel_rate_segs: %s %s failed: %s",
@@ -6609,7 +6610,8 @@ async def _build_channel_standing_segs(channel: str):
             continue
         try:
             sc = await build_standing_charge_schedule(
-                _kraken_client, product, tariff, period_from=vf, period_to=vt)
+                _kraken_client, product, tariff, vat=_vat_context(channel),
+                period_from=vf, period_to=vt)
         except Exception as e:
             logger.warning("_build_channel_standing_segs: %s %s failed: %s",
                            channel, tariff, e)
@@ -10045,6 +10047,16 @@ def _agreement_priced_ok(block_start: str) -> bool:
     return str(block_start) >= caf
 
 
+def _vat_context(channel: str):
+    """What a rate-schedule builder takes as `vat` (C rule 2) for `channel`: the
+    store's learned VAT calendar for import (the statutory seed always applies, so
+    no store means seed only), NO_VAT for export — domestic export carries no VAT."""
+    from kraken_rates import NO_VAT
+    if channel == "export":
+        return NO_VAT
+    return _store.get_vat_calendar() if _store is not None else []
+
+
 async def _refresh_kraken_rate_schedules() -> None:
     """Build/refresh the cached rate schedules for import and export from the
     discovered tariffs. Cheap (fixed tariffs ≈ 1 record). Failures leave the
@@ -10073,7 +10085,7 @@ async def _refresh_kraken_rate_schedules() -> None:
             continue
         try:
             sched = await build_rate_schedule(
-                _kraken_client, product, tariff, raise_on_error=True)
+                _kraken_client, product, tariff, vat=_vat_context(ch), raise_on_error=True)
         except RateFetchError as e:
             # The fetch FAILED (transport / HTTP / edge 403) — this is NOT an
             # unsupported tariff. Keep the last-known schedule and the previous
@@ -10127,7 +10139,8 @@ async def _refresh_kraken_rate_schedules() -> None:
     if len(_ags) > 1:
         try:
             from kraken_rates import build_agreement_stitched_schedule
-            _stitched = await build_agreement_stitched_schedule(_kraken_client, _ags)
+            _stitched = await build_agreement_stitched_schedule(
+                _kraken_client, _ags, vat=_vat_context("import"))
             if not _stitched.is_empty():
                 new_cache["import"] = _stitched
                 _import_schedule_covers_history = True
@@ -10152,7 +10165,8 @@ async def _refresh_kraken_rate_schedules() -> None:
         try:
             from kraken_rates import build_ev_device_schedules
             _ev_off, _ev_peak = await build_ev_device_schedules(
-                _kraken_client, _imp["product_code"], _imp_tariff)
+                _kraken_client, _imp["product_code"], _imp_tariff,
+                vat=_vat_context("import"))
             if not _ev_off.is_empty():
                 new_cache["ev_device_off_peak"] = _ev_off
             if not _ev_peak.is_empty():
@@ -10168,14 +10182,21 @@ async def _refresh_kraken_rate_schedules() -> None:
                     len(_kraken_rate_schedules.get("export", []) or []),
                     len(_kraken_rate_schedules.get("ev_device_off_peak", []) or []),
                     len(_kraken_rate_schedules.get("ev_device_peak", []) or []))
-        _learn_vat_from_import_schedule()
+        if _learn_vat_from_import_schedule():
+            # A change seen this cycle starts today: restate the VAT-bearing
+            # schedules on the calendar that now has it.
+            _cal = _vat_context("import")
+            for _k in ("import", "ev_device_off_peak", "ev_device_peak"):
+                if _k in _kraken_rate_schedules:
+                    _kraken_rate_schedules[_k] = _kraken_rate_schedules[_k].with_vat(_cal)
 
     # Standing charge comes from the import tariff.
     imp = _kraken_discovery.get("import") or {}
     if imp.get("product_code") and imp.get("tariff_code"):
         try:
             sc = await build_standing_charge_schedule(
-                _kraken_client, imp["product_code"], imp["tariff_code"])
+                _kraken_client, imp["product_code"], imp["tariff_code"],
+                vat=_vat_context("import"))
             if not sc.is_empty():
                 _kraken_standing_schedule = sc
                 logger.info("_refresh_kraken_rate_schedules: standing_charge=%d periods",
@@ -10184,31 +10205,36 @@ async def _refresh_kraken_rate_schedules() -> None:
             logger.warning("_refresh_kraken_rate_schedules: standing build failed: %s", e)
 
 
-def _learn_vat_from_import_schedule() -> None:
-    """Update the persisted VAT calendar from the import tariff's inc/exc rates.
+def _learn_vat_from_import_schedule(now_utc: str | None = None) -> bool:
+    """Update the persisted VAT calendar from the import tariff's PUBLISHED inc/exc
+    rates; True when it changed.
 
-    Octopus versions `valid_from` on the same tariff, so a VAT change surfaces as the
-    inc/exc ratio stepping at a date; `vat_series()` reads it, `vat_calendar.collapse`
-    reduces it to change-points, and we merge into the stored calendar. This only feeds
-    the FALLBACK VAT rate (per-slot inc/exc pairs stay the primary source). No-op without
-    a store or an exc sibling on the schedule; idempotent (re-observing is a no change)."""
+    `vat_periods()` reads each period's published VAT; vat_calendar.learn_from_records
+    dates them — a closed period at its start, a running one no earlier than today,
+    because Octopus edits a running record in place (1 Oct 2026: a 5 Jul record turned
+    0%, which dated by its start backdated the 0% to July). Merged into the stored
+    calendar. Feeds the schedules' VAT (RateSchedule.with_vat) and the fallback rate.
+    No-op without a store or an exc sibling; idempotent."""
     if _store is None:
-        return
+        return False
     sched = _kraken_rate_schedules.get("import")
-    if sched is None or not hasattr(sched, "vat_series"):
-        return
+    if sched is None or not hasattr(sched, "vat_periods"):
+        return False
     try:
-        series = sched.vat_series()
-        if not series:
-            return
+        periods = sched.vat_periods()
+        if not periods:
+            return False
         import vat_calendar as _vc
+        now = now_utc or datetime.utcnow().replace(microsecond=0).isoformat()
         existing = _store.get_vat_calendar()
-        merged = _vc.merge_learned(existing, _vc.collapse(series))
+        merged = _vc.merge_learned(existing, _vc.learn_from_records(periods, now, existing))
         if merged != existing:
             _store.set_vat_calendar(merged)
             logger.info("vat calendar: learned from tariff → %s", merged)
+            return True
     except Exception as e:
         logger.debug("_learn_vat_from_import_schedule: skipped (%s)", e)
+    return False
 
 
 # Smart-charge source vocabulary across API versions: legacy meta.source =
@@ -11323,8 +11349,20 @@ def _chart_cap_from():
     """Per-day cap-gating date for the rate lines: the SMB agreement's valid_from when
     on the capped IOG-SMB tariff, else None (pre-cap / non-IOG days render uncapped TOU).
     Single source for BOTH the scheduled render (generate_charts) and the on-demand
-    /api/charts/regenerate path, so they can never diverge."""
-    return str(_measured_floor())[:10] if _import_is_smb_capped() else None
+    /api/charts/regenerate path, so they can never diverge.
+
+    The day is the SITE-LOCAL date the agreement starts: `_measured_floor()` is naive
+    UTC, so an agreement from 00:00 BST on 26 Aug 2026 is 2026-08-25T23:00:00, and its
+    first ten characters made 25 Aug a capped day."""
+    if not _import_is_smb_capped():
+        return None
+    floor = str(_measured_floor())
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.fromisoformat(floor).replace(tzinfo=timezone.utc)
+        return dt.astimezone(ZoneInfo(_iog_site_tz())).date().isoformat()
+    except Exception:
+        return floor[:10]
 
 
 # Versioned gate: bumped to _v2 when the repair gained the cap/boost-aware dispatch overlay
