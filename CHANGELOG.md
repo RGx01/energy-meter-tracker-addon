@@ -15,8 +15,16 @@ first to cross the VAT change, and the Bill Summary still treated it as all one 
 
   Each half-hour and each day's standing charge now uses the VAT of its own date. The
   ex-VAT table shows one row per ex-VAT rate, and the VAT line says what applied —
-  "VAT @ 5% to 30 Sep, 0% from 1 Oct". Your totals were not affected beyond a penny or two,
-  and nothing stored is changed: this was how the summary was worked out, not the data.
+  "VAT @ 5% to 30 Sep, 0% from 1 Oct".
+
+- **On 1 October, devices' half-hours could still be priced with 5% VAT.**
+  A sub-metered device (an EV charger, a battery) is priced at the main meter's rate when the
+  half-hour is recorded. The earlier repairs corrected the main meter's half-hours from
+  1 October but not the devices', so those recorded before you upgraded to 4.5.18 kept 5%.
+  On the Bill Summary that showed as a Direct import line with a cost but no kWh, and a
+  per-device breakdown that added up to more than the bill. A one-off repair now brings
+  each such device half-hour back to its main meter's rate. Your Total Bill was not
+  affected — it comes from the main meter.
 
 ## [4.5.18] — 2026-10-01
 
