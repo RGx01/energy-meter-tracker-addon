@@ -34,18 +34,18 @@ class _FakeClient:
 
 class TestRateScheduleOffload(unittest.IsolatedAsyncioTestCase):
     async def test_large_agile_schedule_builds_via_executor(self):
-        sched = await build_rate_schedule(_FakeClient(_records(3000)), "AGILE", "E-1R-AGILE")
+        sched = await build_rate_schedule(_FakeClient(_records(3000)), "AGILE", "E-1R-AGILE", vat=[])
         self.assertIsInstance(sched, RateSchedule)
         self.assertEqual(len(sched), 3000)
 
     async def test_small_schedule_builds_via_executor(self):
-        sched = await build_rate_schedule(_FakeClient(_records(12)), "P", "T")
+        sched = await build_rate_schedule(_FakeClient(_records(12)), "P", "T", vat=[])
         self.assertEqual(len(sched), 12)
 
     def test_build_helper_sync_small_and_large(self):
         self.assertTrue(callable(_build_schedule_and_diag))
-        self.assertEqual(len(_build_schedule_and_diag(_records(2500), "P", "T")), 2500)
-        self.assertEqual(len(_build_schedule_and_diag(_records(5), "P", "T")), 5)
+        self.assertEqual(len(_build_schedule_and_diag(_records(2500), "P", "T", [])), 2500)
+        self.assertEqual(len(_build_schedule_and_diag(_records(5), "P", "T", [])), 5)
 
     def test_offload_wired_in_source(self):
         import inspect
