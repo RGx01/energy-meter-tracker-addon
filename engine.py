@@ -11572,9 +11572,13 @@ async def run_smb_rate_repair(force: bool = False) -> dict:
     return res
 
 
-# One-off (4.5.17): 1 Oct 2026's 0% VAT backdated to July. Gated, self-marking,
-# idempotent; retires under BL-33 and raises the v5 import floor to 4.5.17.
-_VAT_BACKDATE_HEAL_DONE_KEY = "vat_backdate_heal_done"
+# One-off (4.5.17, re-armed 4.5.18): 1 Oct 2026's 0% VAT backdated to July. Gated,
+# self-marking, idempotent; retires under BL-33 and raises the v5 import floor.
+# _v2 (4.5.18): 4.5.17's learner re-learned "0% from <July/agreement start>" from IOG's
+# own closed day/night windows after this heal removed it, and the heal matched blocks
+# against schedules still restated at 0% — so it runs once more, on the fixed learner,
+# restating the schedules on the cleaned calendar first.
+_VAT_BACKDATE_HEAL_DONE_KEY = "vat_backdate_heal_done_v2"
 _VAT_ZERO_FROM = "2026-10-01"
 
 
@@ -11677,6 +11681,26 @@ def _vat_backdate_heal_core(store, sched, std_sched, std_floor=None, *, eps: flo
             "standing_fixed": n_std}
 
 
+def _restate_schedules_on_clean_calendar() -> int:
+    """Drop learned 0% entries dated before 1 Oct 2026 and restate the cached import,
+    EV-device and standing schedules on the result. Returns entries dropped."""
+    global _kraken_standing_schedule
+    if _store is None:
+        return 0
+    learned = _store.get_vat_calendar()
+    kept = [(d, r) for d, r in learned if not (float(r) == 0.0 and str(d) < _VAT_ZERO_FROM)]
+    if kept != learned:
+        _store.set_vat_calendar(kept)
+        logger.info("run_vat_backdate_heal: vat calendar %s -> %s", learned, kept)
+    cal = _vat_context("import")
+    for k in ("import", "ev_device_off_peak", "ev_device_peak"):
+        if k in _kraken_rate_schedules:
+            _kraken_rate_schedules[k] = _kraken_rate_schedules[k].with_vat(cal)
+    if _kraken_standing_schedule is not None and hasattr(_kraken_standing_schedule, "with_vat"):
+        _kraken_standing_schedule = _kraken_standing_schedule.with_vat(cal)
+    return len(learned) - len(kept)
+
+
 async def run_vat_backdate_heal(force: bool = False) -> dict:
     """One-off 4.5.17 heal (see _vat_backdate_heal_core). Gated
     (`vat_backdate_heal_done`), self-marking, idempotent. Runs after a schedule refresh;
@@ -11689,8 +11713,14 @@ async def run_vat_backdate_heal(force: bool = False) -> dict:
     sched = _kraken_rate_schedules.get("import")
     if _kraken_client is not None and (sched is None or sched.is_empty()):
         return {"ok": False, "reason": "schedule not ready"}   # retry; do NOT mark done
+    # Clean the calendar FIRST and restate every cached VAT-bearing schedule on it, so
+    # the blocks are matched against true per-date figures — not a schedule restated
+    # while the calendar still said 0% since July (4.5.17's miss).
+    n_cal = _restate_schedules_on_clean_calendar()
+    sched = _kraken_rate_schedules.get("import")
     res = _vat_backdate_heal_core(_store, sched, _kraken_standing_schedule,
                                   std_floor=_kraken_current_agreement_from)
+    res["calendar_entries_dropped"] = res.get("calendar_entries_dropped", 0) + n_cal
     if res.get("ok"):
         import datetime as _dtm
         _store.set_kraken_state(_VAT_BACKDATE_HEAL_DONE_KEY,
