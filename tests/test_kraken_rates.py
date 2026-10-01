@@ -115,16 +115,16 @@ class TestBuildRateSchedule(unittest.TestCase):
         c = _FakeClient([{"value_inc_vat": 24.5,
                           "valid_from": "2026-02-01T00:00:00Z", "valid_to": None}])
         s = run(build_rate_schedule(c, "INTELLI-FIX-12M-26-03-17",
-                                    "E-1R-INTELLI-FIX-12M-26-03-17-B"))
+                                    "E-1R-INTELLI-FIX-12M-26-03-17-B", vat=[]))
         self.assertEqual(len(s), 1)
 
     def test_missing_codes_returns_empty(self):
         c = _FakeClient([])
-        self.assertTrue(run(build_rate_schedule(c, "", "")).is_empty())
+        self.assertTrue(run(build_rate_schedule(c, "", "", vat=[])).is_empty())
 
     def test_fetch_failure_returns_empty(self):
         c = _FakeClient(raise_=True)
-        s = run(build_rate_schedule(c, "P", "T"))
+        s = run(build_rate_schedule(c, "P", "T", vat=[]))
         self.assertTrue(s.is_empty())
 
 
@@ -142,7 +142,7 @@ class TestBuildStandingChargeSchedule(unittest.TestCase):
         c = _FakeSCClient([{"value_inc_vat": 47.85,
                             "valid_from": "2026-02-01T00:00:00Z", "valid_to": None}])
         s = run(build_standing_charge_schedule(c, "INTELLI-FIX-12M-26-03-17",
-                                               "E-1R-INTELLI-FIX-12M-26-03-17-B"))
+                                               "E-1R-INTELLI-FIX-12M-26-03-17-B", vat=[]))
         self.assertEqual(len(s), 1)
         self.assertEqual(s.resolve("2026-05-01T00:00:00"), 47.85)
 
@@ -172,7 +172,7 @@ class TestNewIOGTariffFallback(unittest.TestCase):
         night = [{"value_inc_vat": 7.0, "valid_from": "2026-07-01T00:00:00Z",
                   "valid_to": None}]
         sched = asyncio.get_event_loop().run_until_complete(
-            build_rate_schedule(self._client([], day, night), "IOG-SMB-TOU", "E-1R-IOG-SMB-TOU-H"))
+            build_rate_schedule(self._client([], day, night), "IOG-SMB-TOU", "E-1R-IOG-SMB-TOU-H", vat=[]))
         self.assertFalse(sched.is_empty())
         self.assertGreater(len(sched), 2)                              # windowed, not flat concat
         self.assertEqual(sched.resolve("2026-07-01T12:00:00"), 32.0)   # day
@@ -183,12 +183,12 @@ class TestNewIOGTariffFallback(unittest.TestCase):
         std = [{"value_inc_vat": 24.5, "valid_from": "2026-07-01T00:00:00Z",
                 "valid_to": None}]
         sched = asyncio.get_event_loop().run_until_complete(
-            build_rate_schedule(self._client(std, [], []), "INTELLI-FIX", "E-1R-INTELLI-FIX-H"))
+            build_rate_schedule(self._client(std, [], []), "INTELLI-FIX", "E-1R-INTELLI-FIX-H", vat=[]))
         self.assertEqual(sched.resolve("2026-07-01T12:00:00"), 24.5)
 
     def test_empty_when_no_buckets_at_all(self):
         sched = asyncio.get_event_loop().run_until_complete(
-            build_rate_schedule(self._client([], [], []), "X", "E-1R-X-H"))
+            build_rate_schedule(self._client([], [], []), "X", "E-1R-X-H", vat=[]))
         self.assertTrue(sched.is_empty())   # guard territory
 
 
@@ -226,38 +226,38 @@ class TestBuildRateScheduleFetchErrors(unittest.TestCase):
 
     def test_success_returns_schedule(self):
         s = run(build_rate_schedule(_FakeRateClient(standard=_REC), "P",
-                                    "E-1R-P-A", raise_on_error=True))
+                                    "E-1R-P-A", raise_on_error=True, vat=[]))
         self.assertFalse(s.is_empty())
 
     def test_fetch_error_raises_when_requested(self):
         from kraken_rates import RateFetchError
         with self.assertRaises(RateFetchError):
             run(build_rate_schedule(_FakeRateClient(raise_std=True), "P",
-                                    "E-1R-P-A", raise_on_error=True))
+                                    "E-1R-P-A", raise_on_error=True, vat=[]))
 
     def test_fetch_error_returns_empty_by_default(self):
         # Default (raise_on_error=False) keeps the graceful-empty behaviour that
         # pricing/drain callers rely on.
         s = run(build_rate_schedule(_FakeRateClient(raise_std=True), "P",
-                                    "E-1R-P-A"))
+                                    "E-1R-P-A", vat=[]))
         self.assertTrue(s.is_empty())
 
     def test_genuinely_empty_returns_empty_without_raising(self):
         # Standard empty AND day/night empty = a real unsupported tariff: empty
         # schedule, NOT an error.
         s = run(build_rate_schedule(_FakeRateClient(standard=[], day=[], night=[]),
-                                    "P", "E-1R-P-A", raise_on_error=True))
+                                    "P", "E-1R-P-A", raise_on_error=True, vat=[]))
         self.assertTrue(s.is_empty())
 
     def test_daynight_fallback_error_raises(self):
         from kraken_rates import RateFetchError
         with self.assertRaises(RateFetchError):
             run(build_rate_schedule(_FakeRateClient(standard=[], raise_dn=True),
-                                    "P", "E-1R-P-A", raise_on_error=True))
+                                    "P", "E-1R-P-A", raise_on_error=True, vat=[]))
 
     def test_daynight_fallback_success(self):
         s = run(build_rate_schedule(_FakeRateClient(standard=[], day=_REC, night=[]),
-                                    "P", "E-1R-P-A", raise_on_error=True))
+                                    "P", "E-1R-P-A", raise_on_error=True, vat=[]))
         self.assertFalse(s.is_empty())
 
 

@@ -5772,7 +5772,11 @@ class TestVatCalendarLearning(unittest.TestCase):
         engine._store = self._s
         engine._kraken_rate_schedules = self._sched
 
-    def test_learns_holiday_boundaries_from_tariff(self):
+    def test_learns_a_versioned_change_at_its_own_date(self):
+        """Octopus publishing a FUTURE change as its own record: learned at that record's
+        start. Seen on 15 Sep 2026 — the 0% from 1 Oct is the statutory seed, so only
+        the return to 5% is new. (A RUNNING record is dated no earlier than today —
+        tests/test_vat_backdating.py.)"""
         from block_store import BlockStore
         from kraken_rates import RateSchedule
         store = BlockStore(":memory:")
@@ -5785,14 +5789,14 @@ class TestVatCalendarLearning(unittest.TestCase):
             exc_periods=[("2026-03-17T00:00:00", "2026-10-01T00:00:00", 28.5714),
                          ("2026-10-01T00:00:00", "2027-04-01T00:00:00", 28.5714),
                          ("2027-04-01T00:00:00", None, 28.5714)])}
-        engine._learn_vat_from_import_schedule()
-        self.assertEqual(store.get_vat_calendar(),
-                         [("2026-03-17", 0.05), ("2026-10-01", 0.0), ("2027-04-01", 0.05)])
+        engine._learn_vat_from_import_schedule("2026-09-15T12:00:00")
+        self.assertEqual(store.get_vat_calendar(), [("2027-04-01", 0.05)])
         self.assertAlmostEqual(store.vat_rate_at("2026-11-15"), 0.0, places=6)   # in holiday
         self.assertAlmostEqual(store.vat_rate_at("2026-08-11"), 0.05, places=6)  # before
+        self.assertAlmostEqual(store.vat_rate_at("2027-05-01"), 0.05, places=6)  # after
         # idempotent — re-observing the same tariff doesn't grow the calendar
-        engine._learn_vat_from_import_schedule()
-        self.assertEqual(len(store.get_vat_calendar()), 3)
+        self.assertFalse(engine._learn_vat_from_import_schedule("2026-09-15T12:00:00"))
+        self.assertEqual(len(store.get_vat_calendar()), 1)
         store.close()
 
 
