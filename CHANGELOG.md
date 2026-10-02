@@ -1,5 +1,30 @@
 # Changelog
  
+## [4.5.20] — 2026-10-02
+
+*A power cut, and a year's export in an hour.* After an outage, the half-hours the add-on
+had no readings for could be filled in from a meter reading of zero, and the next half-hours
+then counted everything from zero up to the real meter reading.
+
+### Fixed
+
+- **After a power cut, the whole export (or import) meter reading could be booked as one
+  hour's energy.** When the add-on comes back after an outage, it fills in the half-hours it
+  missed from the meter readings either side. If it had no readings for some of them, it
+  stored them with a meter reading of 0, and the next fill-in started from that 0. Your
+  meter's entire lifetime total then landed in a single hour: on the heatmap, every other
+  day looked empty next to it, and on the bill it showed as a very large export credit.
+  A device such as a battery could pick up phantom energy the same way.
+
+  A fill-in no longer starts from a zero reading, and no longer stores one. A half-hour on
+  the main meter that still comes out impossibly large (more than 500 kWh) is set to zero
+  and flagged for review, as a device's already was. If your supplier sends its own
+  half-hourly figures, those fill the half-hour in as usual.
+
+  This doesn't change half-hours already recorded. If you have a day like this, your
+  supplier's figures normally replace it within a day or two. If they don't, delete that
+  day for the main meter in Data Management and re-import it.
+
 ## [4.5.19] — 2026-10-01
 
 *One bill, two VAT rates.* The bill period running from 3 September to 2 October is the
