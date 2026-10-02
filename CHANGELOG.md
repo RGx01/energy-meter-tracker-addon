@@ -16,10 +16,10 @@ then counted everything from zero up to the real meter reading.
   day looked empty next to it, and on the bill it showed as a very large export credit.
   A device such as a battery could pick up phantom energy the same way.
 
-  A fill-in no longer starts from a zero reading, and no longer stores one. A half-hour on
-  the main meter that still comes out impossibly large (more than 500 kWh) is set to zero
-  and flagged for review, as a device's already was. If your supplier sends its own
-  half-hourly figures, those fill the half-hour in as usual.
+  A fill-in, or a restart, no longer starts counting from one of those zero readings. A
+  half-hour on the main meter that still comes out impossibly large (more than 500 kWh) is
+  set to zero and flagged for review, as a device's already was. If your supplier sends its
+  own half-hourly figures, those fill the half-hour in as usual.
 
   This doesn't change half-hours already recorded. If you have a day like this, your
   supplier's figures normally replace it within a day or two. If they don't, delete that

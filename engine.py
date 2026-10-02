@@ -1005,6 +1005,23 @@ async def _detect_and_log_integrations(ha) -> dict:
     return _detected_integrations
 
 
+def _is_gap_zero_register(block: dict, channel: dict) -> bool:
+    """#493: a gap-filled block's channel stored with registers 0.0 → 0.0 — the shape
+    build_gap_blocks writes for a channel it had no readings for. Those zeros keep the
+    block's shape; they are NOT a meter reading, and a reader that took one as the
+    opening register booked the whole lifetime register (from 0 up to the real
+    reading) as one interval. A LIVE block's 0.0 can be real (a daily-reset sensor at
+    midnight), so only a gap block's counts."""
+    if not block.get("interpolated"):
+        return False
+    try:
+        return (float(channel.get("read_start") or 0.0) == 0.0
+                and channel.get("read_end") is not None
+                and float(channel["read_end"]) == 0.0)
+    except (TypeError, ValueError):
+        return False
+
+
 def _reseed_opener_after_short_restart(last_block: dict, current_block: dict) -> list:
     """Restore the in-progress block's opener after a within-block restart.
 
@@ -1043,8 +1060,8 @@ def _reseed_opener_after_short_restart(last_block: dict, current_block: dict) ->
     for mn, lb_m in (last_block.get("meters") or {}).items():
         for cn, lb_ch in (lb_m.get("channels") or {}).items():
             read_end = lb_ch.get("read_end")
-            if read_end is None:
-                continue
+            if read_end is None or _is_gap_zero_register(last_block, lb_ch):
+                continue        # #493: a gap block's 0.0 is not an opening register
             cur_ch = (cur_meters.setdefault(mn, {})
                                  .setdefault("channels", {})
                                  .setdefault(cn, {}))
@@ -1470,16 +1487,11 @@ def extract_last_reads(block: dict):
                     reads[meter_name][channel_name] = last_read
                 else:
                     reads[meter_name][channel_name] = {"ts": block_end_iso, "value": float(last_read)}
-            elif channel.get("read_end") is not None and not (
-                    block.get("interpolated")
-                    and float(channel.get("read_start") or 0.0) == 0.0
-                    and float(channel["read_end"]) == 0.0):
+            elif channel.get("read_end") is not None and not _is_gap_zero_register(block, channel):
                 # Finalised DB block — read_end is the last sensor value, block end is the timestamp.
-                # #493: NOT a gap block's 0.0 → 0.0 register. A gap-fill with no reads
-                # stored zeros there, and the next gap took that 0.0 as its opening
-                # register, booking the whole lifetime register. Such a channel has no
-                # reading: the next gap treats it as missing (settlement fills the main
-                # meter; a device books nothing) instead of opening from zero.
+                # #493: not a gap block's 0.0 → 0.0 register — the next gap treats that
+                # channel as missing (settlement fills the main meter; a device books
+                # nothing) instead of opening from zero.
                 reads[meter_name][channel_name] = {
                     "ts":    block_end_iso,
                     "value": float(channel["read_end"]),
@@ -2110,11 +2122,6 @@ def build_gap_blocks(
                         "kwh": sub_kwh, "rate": sub_rate, "cost": sub_cost,
                         "read_start": sub_start, "read_end": sub_end, "interpolated": True,
                     }
-                    if skip_reason:
-                        # #493: skipped — no reads, so no registers (not a planted 0.0
-                        # the next gap-fill would open from).
-                        del meter_block["channels"][channel_name]["read_start"]
-                        del meter_block["channels"][channel_name]["read_end"]
                     continue
 
                 # ── Main meter ────────────────────────────────────────────
@@ -2135,11 +2142,9 @@ def build_gap_blocks(
                         continue
                     logger.warning("build_gap_blocks: missing reads for %s/%s", meter_name, channel_name)
                     _fallback_rate = _rate_value(last_known_rates.get(meter_name, {}).get(channel_name, 0.0))
-                    # #493: no read_start/read_end. A planted 0.0 register is not a
-                    # reading, and the next gap-fill opened from it.
                     meter_block["channels"][channel_name] = {
                         "kwh": 0.0, "rate": _fallback_rate, "cost": 0.0,
-                        "interpolated": True,
+                        "read_start": 0.0, "read_end": 0.0, "interpolated": True,
                     }
                     continue
 

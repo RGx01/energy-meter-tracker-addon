@@ -9,11 +9,14 @@ export register as an hour's export, and a device's register as phantom device e
 The 500 kWh rogue-total ceiling didn't catch it, because it lives in `compute_channel`
 and a gap block never passes through it.
 
-Three forward fixes, no heal:
+Forward fixes, no heal, and no change to what is stored. A gap block keeps its 0.0 → 0.0
+registers, because they keep every half-hour's shape for the charts. Only their readers change:
   * `_apply_pass2`, the write point every block passes, now applies the main meter's
     ceiling as well (it already held #307's device ceiling);
-  * `extract_last_reads` does not take a gap block's 0.0 → 0.0 register as a reading;
-  * `build_gap_blocks` no longer stores 0.0 registers for a channel it had no reads for.
+  * `extract_last_reads` (the next gap-fill's opening read) and
+    `_reseed_opener_after_short_restart` (a live half-hour's opening read after a short
+    restart) do not take a gap block's 0.0 → 0.0 register as a reading
+    (`_is_gap_zero_register`).
 
 The incident's figures are replaced by synthetic ones of the same shape. Every test here
 except those labelled GUARD fails on the unpatched tree.
@@ -119,15 +122,13 @@ class TheGapFill(unittest.TestCase):
         self.rates = {"electricity_main": {"import": 0.25, "export": 0.12},
                       "battery": {"import": 0.25}}
 
-    def test_no_zero_registers_are_planted(self):
-        """No reads for a channel → no registers, rather than 0.0 → 0.0."""
+    def test_a_gap_block_still_has_every_channel(self):
+        """GUARD: no reads → the half-hour is still built, every channel present at 0 kWh
+        (the 48-a-day shape the charts rely on)."""
         blocks = engine.build_gap_blocks(self.windows[:1], {}, {}, self.rates, self.config)
-        main = blocks[0]["meters"]["electricity_main"]["channels"]["import"]
-        dev = blocks[0]["meters"]["battery"]["channels"]["import"]
-        for ch in (main, dev):
-            self.assertEqual(ch["kwh"], 0.0)
-            self.assertNotIn("read_start", ch)
-            self.assertNotIn("read_end", ch)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["meters"]["electricity_main"]["channels"]["import"]["kwh"], 0.0)
+        self.assertEqual(blocks[0]["meters"]["battery"]["channels"]["import"]["kwh"], 0.0)
 
     def test_the_incident_end_to_end(self):
         """The last stored block is a gap block with 0.0 → 0.0 registers; the post-outage
@@ -158,6 +159,32 @@ class TheGapFill(unittest.TestCase):
         blocks = engine.build_gap_blocks(self.windows, pre, post, self.rates, self.config)
         self.assertAlmostEqual(sum(b["totals"]["export_kwh"] for b in blocks), 1.0, places=3)
         self.assertAlmostEqual(sum(b["totals"]["import_kwh"] for b in blocks), 1.0, places=3)
+
+
+
+class TheShortRestartReseed(unittest.TestCase):
+    """`_reseed_opener_after_short_restart` seeds the live half-hour's opening read from
+    the block before it. Its docstring said a finalised `read_end` "cannot reintroduce a
+    rogue total" — a gap block's planted 0.0 can."""
+
+    def _last(self, rs, re, *, interpolated):
+        return {"start": "2026-10-01T11:30:00", "end": "2026-10-01T12:00:00",
+                "interpolated": interpolated,
+                "meters": {"battery": {"channels": {"import": {"read_start": rs, "read_end": re}}}}}
+
+    def _current(self):
+        return {"start": "2026-10-01T12:00:00", "meters": {}}
+
+    def test_a_gap_blocks_zero_register_is_not_seeded(self):
+        cur = self._current()
+        engine._reseed_opener_after_short_restart(self._last(0.0, 0.0, interpolated=True), cur)
+        self.assertNotIn("reads", cur["meters"].get("battery", {}).get("channels", {}).get("import", {}))
+
+    def test_a_real_register_is(self):
+        """GUARD: passes on the unpatched tree too."""
+        cur = self._current()
+        engine._reseed_opener_after_short_restart(self._last(45.4, 45.5, interpolated=False), cur)
+        self.assertEqual(cur["meters"]["battery"]["channels"]["import"]["reads"][0]["value"], 45.5)
 
 
 if __name__ == "__main__":
