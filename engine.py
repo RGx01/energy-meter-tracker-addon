@@ -1005,6 +1005,23 @@ async def _detect_and_log_integrations(ha) -> dict:
     return _detected_integrations
 
 
+def _is_gap_zero_register(block: dict, channel: dict) -> bool:
+    """#493: a gap-filled block's channel stored with registers 0.0 → 0.0 — the shape
+    build_gap_blocks writes for a channel it had no readings for. Those zeros keep the
+    block's shape; they are NOT a meter reading, and a reader that took one as the
+    opening register booked the whole lifetime register (from 0 up to the real
+    reading) as one interval. A LIVE block's 0.0 can be real (a daily-reset sensor at
+    midnight), so only a gap block's counts."""
+    if not block.get("interpolated"):
+        return False
+    try:
+        return (float(channel.get("read_start") or 0.0) == 0.0
+                and channel.get("read_end") is not None
+                and float(channel["read_end"]) == 0.0)
+    except (TypeError, ValueError):
+        return False
+
+
 def _reseed_opener_after_short_restart(last_block: dict, current_block: dict) -> list:
     """Restore the in-progress block's opener after a within-block restart.
 
@@ -1043,8 +1060,8 @@ def _reseed_opener_after_short_restart(last_block: dict, current_block: dict) ->
     for mn, lb_m in (last_block.get("meters") or {}).items():
         for cn, lb_ch in (lb_m.get("channels") or {}).items():
             read_end = lb_ch.get("read_end")
-            if read_end is None:
-                continue
+            if read_end is None or _is_gap_zero_register(last_block, lb_ch):
+                continue        # #493: a gap block's 0.0 is not an opening register
             cur_ch = (cur_meters.setdefault(mn, {})
                                  .setdefault("channels", {})
                                  .setdefault(cn, {}))
@@ -1470,8 +1487,11 @@ def extract_last_reads(block: dict):
                     reads[meter_name][channel_name] = last_read
                 else:
                     reads[meter_name][channel_name] = {"ts": block_end_iso, "value": float(last_read)}
-            elif channel.get("read_end") is not None:
-                # Finalised DB block — read_end is the last sensor value, block end is the timestamp
+            elif channel.get("read_end") is not None and not _is_gap_zero_register(block, channel):
+                # Finalised DB block — read_end is the last sensor value, block end is the timestamp.
+                # #493: not a gap block's 0.0 → 0.0 register — the next gap treats that
+                # channel as missing (settlement fills the main meter; a device books
+                # nothing) instead of opening from zero.
                 reads[meter_name][channel_name] = {
                     "ts":    block_end_iso,
                     "value": float(channel["read_end"]),
@@ -2381,6 +2401,38 @@ def _apply_pass2(block: dict) -> None:
     sets kwh_grid and kwh_battery on each sub-meter channel.
     Called from both finalise_block and build_gap_blocks.
     """
+    # #493: the main meter's rogue-total backstop at the shared write point. The
+    # ceiling lived only in compute_channel, which a gap block never passes through:
+    # build_gap_blocks interpolates opener → closer itself, so a gap whose opening
+    # register was 0.0 booked the meter's whole lifetime register as an hour's
+    # export after a power cut (#493) — an export credit in the thousands. Same rule
+    # and the same ceiling as compute_channel: clamp to zero, collapse read_start onto
+    # read_end so the next block opens on the real register, and flag for review.
+    # Settlement still fills the true figure where DCC data exists.
+    for meter_name, meter_block in block["meters"].items():
+        if (meter_block.get("meta") or {}).get("sub_meter"):
+            continue
+        for channel_name, ch in (meter_block.get("channels") or {}).items():
+            _k = (ch or {}).get("kwh") or 0.0
+            if _k > _ROGUE_BLOCK_KWH_CEILING:
+                logger.warning(
+                    "PASS 2: %s/%s implausible %.1f kWh in one block (> %.1f kWh "
+                    "ceiling) — lost opener (read_start %s → read_end %s); clamping "
+                    "to 0, baselining register, flagged for review (#493).",
+                    meter_name, channel_name, _k, _ROGUE_BLOCK_KWH_CEILING,
+                    ch.get("read_start"), ch.get("read_end"))
+                _c = ch.get("cost") or 0.0
+                if ch.get("read_end") is not None:
+                    ch["read_start"] = ch["read_end"]
+                ch["kwh"] = 0.0
+                ch["cost"] = 0.0
+                ch["needs_review"] = True
+                meter_block["needs_review"] = True
+                _t = block.get("totals")
+                if channel_name in ("import", "export") and isinstance(_t, dict):
+                    _t[channel_name + "_kwh"] = (_t.get(channel_name + "_kwh") or 0.0) - _k
+                    _t[channel_name + "_cost"] = (_t.get(channel_name + "_cost") or 0.0) - _c
+
     # Build parent → sub_kwh_total map
     parent_sub_kwh: dict = {}
     for meter_name, meter_block in block["meters"].items():
