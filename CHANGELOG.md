@@ -25,6 +25,14 @@ then counted everything from zero up to the real meter reading.
   supplier's figures normally replace it within a day or two. If they don't, delete that
   day for the main meter in Data Management and re-import it.
 
+- **The day table's Total Import could disagree with the rows beside it.** With an EV
+  charger sub-meter on an Intelligent tariff, the EV column shows your supplier's charging
+  figure, and any difference from the charger's own reading moves into Direct import, so the
+  half-hour still adds up. Total Import didn't take that difference into account: on a
+  half-hour where the two EV figures differed, it was out by that difference, in kWh and in
+  £. It now matches the meter. This was display only: the bill, the Bill Summary and the
+  day's totals were always right.
+
 ## [4.5.19] — 2026-10-01
 
 *One bill, two VAT rates.* The bill period running from 3 September to 2 October is the
