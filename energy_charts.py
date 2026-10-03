@@ -2116,6 +2116,14 @@ def build_day_chart_html(day, day_blocks, meter_colors, chart_prefix='', block_m
                             meter_cost["electricity_main"][hh] += _d_c
                             summary_kwh["electricity_main"]    += _d_k
                             summary_cost["electricity_main"]   += _d_c
+                            # The slot's Total Import started from the remainder BEFORE this
+                            # fold and adds the EV AFTER it (below), so it must take the same
+                            # difference — or it reads remainder + dispatch EV, off by
+                            # (metered − dispatch) on every slot where the two differ, while
+                            # Direct + EV + devices still add up to the meter (3 Oct 2026).
+                            if not ti_kwh_has_total:
+                                ti_kwh += _d_k
+                            ti_cost += _d_c
                             summary_rates["electricity_main"][round(main_rate, 4)] += _d_k
                             sub_kwh_grid = _syn_k
                             sub_cost     = _syn_c
