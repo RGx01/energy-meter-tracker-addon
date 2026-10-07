@@ -1,5 +1,36 @@
 # Changelog
  
+## [4.5.21] — 2026-10-07
+
+*Whose grid was it?* When an EV and a home battery charged at the same time, the battery could be
+credited with grid energy the car actually used. Your bill total was always right; how it was
+split between the car, the battery and the house was not.
+
+### Fixed
+
+- **An EV charger lost its grid energy to a home battery charging at the same time.** When the
+  grid can't cover both at once (solar or the battery itself covers the rest), the add-on gives
+  the grid to the EV first. It did that when each half-hour was first recorded, but whenever a
+  half-hour was worked out again later (when your supplier's figures arrived, or when device
+  history was added afterwards), it lost track of which device was the EV and gave the grid to
+  whichever device drew more, usually the battery. On those half-hours the EV showed less grid
+  energy and cost than it really had, and the battery more. This applies to any tariff, not
+  only Intelligent Octopus, and dates from 3.0.0.
+
+  It now keeps the EV first every time. Half-hours already recorded are corrected once,
+  automatically, in the background after the update: only the grid energy and cost of the
+  devices concerned change. Each device's own meter readings, the main meter, your bill total
+  and carbon are not touched.
+
+- **Intelligent Octopus without an EV charger sub-meter: other devices could take the car's
+  grid energy.** If the car's charging comes only from your supplier's dispatch records, a
+  battery or heat pump was fitted against the whole grid import, and wasn't re-fitted when the
+  dispatch record arrived a few hours later. The car's share then had nowhere to go: the bill
+  shrank it, and Insights could show the house's usage as negative. The car's grid energy is now
+  set aside first, and the devices share what's left, including when the dispatch record
+  arrives later. Half-hours already recorded are corrected once, automatically. A half-hour your
+  supplier has already billed keeps its billed figures.
+
 ## [4.5.20] — 2026-10-02
 
 *A power cut, and a year's export in an hour.* After an outage, the half-hours the add-on
