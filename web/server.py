@@ -9105,14 +9105,26 @@ def api_corrections_apply():
                     ph = ",".join("?" * len(bs_list))
                     dev = (f"block_start IN ({ph}) AND meter_id IN "
                            "(SELECT meter_id FROM meters WHERE is_sub_meter = 1)")
+                    # 4.5.21: the ex-VAT rate follows too — the main's, as the UPDATE above has
+                    # just corrected it (BL-57). It didn't: a corrected device kept its
+                    # pre-correction imp_rate_exc / imp_cost_exc, so every ex-VAT view (Bill
+                    # Rounding, the device's exc rate) still priced it at the old band. Taken
+                    # from the MAIN rather than rescaled from the device's own, so re-applying a
+                    # correction also repairs a device an earlier one left stale.
+                    main_exc = ("(SELECT m.imp_rate_exc FROM blocks m "
+                                " WHERE m.block_start = blocks.block_start AND m.meter_id IN "
+                                "   (SELECT meter_id FROM meters WHERE is_sub_meter = 0) LIMIT 1)")
                     if recalc_cost:
                         store._conn.execute(
                             f"UPDATE blocks SET imp_rate = ?, "
-                            f"imp_cost = ROUND(COALESCE(imp_kwh_grid, imp_kwh, 0) * ?, 6) "
+                            f"imp_cost = ROUND(COALESCE(imp_kwh_grid, imp_kwh, 0) * ?, 6), "
+                            f"imp_rate_exc = {main_exc}, "
+                            f"imp_cost_exc = ROUND(COALESCE(imp_kwh_grid, imp_kwh, 0) * {main_exc}, 6) "
                             f"WHERE {dev}", [value, value] + bs_list)
                     else:
                         store._conn.execute(
-                            f"UPDATE blocks SET imp_rate = ? WHERE {dev}",
+                            f"UPDATE blocks SET imp_rate = ?, imp_rate_exc = {main_exc} "
+                            f"WHERE {dev}",
                             [value] + bs_list)
                     store._conn.commit()
 

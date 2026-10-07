@@ -119,7 +119,7 @@ _read_queue:               list         = []
 _last_known_sensor_values: dict         = {}
 _engine_loop_lock:         asyncio.Lock = None   # initialised in setup()
 _engine_paused:            bool         = False
-_pass2_quiet:              bool         = False   # suppress per-block PASS 2 INFO logs during bulk recompute
+_pass2_quiet:              bool         = False   # suppress per-block PASS 2 logs during bulk recompute (INFO, and the routine clip WARNINGs — 4.5.21; a bulk pass logs one summary instead)
 _last_ci_fetch:            datetime | None = None   # UTC — last carbon intensity fetch
 _last_dispatch_capture:    datetime | None = None   # UTC — last dispatch-slot capture (5-min cadence)
 _last_reconcile:           datetime | None = None   # UTC — last dispatch reconciliation (hourly cadence)
@@ -2583,7 +2583,7 @@ def _apply_pass2(block: dict) -> None:
                 if not clamp_overflow:
                     # Unsettled gap block — preserve energy attribution even if it
                     # exceeds grid import (the main is also an estimate here).
-                    logger.warning(
+                    if not _pass2_quiet: logger.warning(
                         "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
                         "unsettled gap block, recording as-is (settlement will re-clamp).",
                         entry["meter_name"], entry["kwh"], grid_kwh,
@@ -2592,7 +2592,7 @@ def _apply_pass2(block: dict) -> None:
                 else:
                     # Authoritative main (live or DCC-settled) — clip to grid
                     # import; the sub-meter cannot exceed what the house imported.
-                    logger.warning(
+                    if not _pass2_quiet: logger.warning(
                         "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
                         "clipping to grid import (%s).",
                         entry["meter_name"], entry["kwh"], grid_kwh,
@@ -2600,7 +2600,7 @@ def _apply_pass2(block: dict) -> None:
                     )
                     claimed = grid_remaining  # already set to min above
             elif claimed < entry["kwh"]:
-                logger.warning(
+                if not _pass2_quiet: logger.warning(
                     "PASS 2: %s protected load %.4f kWh clipped to %.4f kWh",
                     entry["meter_name"], entry["kwh"], claimed,
                 )
@@ -2626,7 +2626,7 @@ def _apply_pass2(block: dict) -> None:
             battery    = entry["kwh"] - claimed
             if entry["kwh"] > grid_kwh:
                 if not clamp_overflow:
-                    logger.warning(
+                    if not _pass2_quiet: logger.warning(
                         "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
                         "unsettled gap block, recording as-is (settlement will re-clamp).",
                         entry["meter_name"], entry["kwh"], grid_kwh,
@@ -2634,7 +2634,7 @@ def _apply_pass2(block: dict) -> None:
                     claimed = entry["kwh"]
                     battery = 0.0
                 else:
-                    logger.warning(
+                    if not _pass2_quiet: logger.warning(
                         "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
                         "clipping to grid import (%s).",
                         entry["meter_name"], entry["kwh"], grid_kwh,
@@ -12154,6 +12154,57 @@ async def run_dispatch_house_refit_heal(force: bool = False) -> dict:
     return total
 
 
+_CORRECTED_DEVICE_EXC_DONE_KEY = "corrected_device_exc_done"   # one-off (4.5.21); removed in v5.0.0
+
+
+def _corrected_device_exc_core(store) -> dict:
+    """One-off heal (4.5.21): give each device on a manually corrected block the main's corrected
+    ex-VAT rate, and the ex-VAT cost priced from its grid share at that rate.
+
+    On an API account the corrections route rewrites only the main's settled row in full (rate,
+    cost, and the ex-VAT rescale of BL-57). Devices were carried along with only their inc rate
+    and cost, so a device that already had an ex-VAT figure kept the pre-correction band: a half-
+    hour corrected to off-peak still read peak, for its devices, in every ex-VAT view. The route
+    now carries the main's figure; this repairs the blocks corrected before it.
+
+    Exact: the main's corrected ex-VAT rate is the authority for the block (devices follow the
+    main), and the device's grid share is untouched. Only devices whose ex-VAT rate is set AND
+    differs from the main's are written; a NULL one already falls back to inc ÷ VAT. Measured
+    (7 Oct 2026): ~320 corrected blocks on four databases, 2 stale per install (both from the
+    same day's corrections), 0 elsewhere. Idempotent: matches only rows still differing."""
+    if store is None:
+        return {"ok": False, "reason": "no store"}
+    main_exc = ("(SELECT m.imp_rate_exc FROM blocks m WHERE m.block_start = blocks.block_start "
+                " AND m.meter_id IN (SELECT meter_id FROM meters WHERE is_sub_meter = 0) "
+                " AND m.rate_corrected = 1 AND m.imp_rate_exc IS NOT NULL LIMIT 1)")
+    with store._conn:
+        cur = store._conn.execute(
+            "UPDATE blocks SET imp_rate_exc = %(e)s, "
+            "  imp_cost_exc = ROUND(COALESCE(imp_kwh_grid, imp_kwh, 0) * %(e)s, 6) "
+            "WHERE meter_id IN (SELECT meter_id FROM meters WHERE is_sub_meter = 1) "
+            "  AND imp_rate_exc IS NOT NULL AND %(e)s IS NOT NULL "
+            "  AND ABS(imp_rate_exc - %(e)s) > 0.000001" % {"e": main_exc})
+    return {"ok": True, "repaired": cur.rowcount}
+
+
+async def run_corrected_device_exc_heal(force: bool = False) -> dict:
+    """One-off corrected-device ex-VAT heal (4.5.21). Gated (`corrected_device_exc_done`),
+    self-marking, idempotent; retires in v5.0.0. Local; one UPDATE."""
+    if _store is None:
+        return {"ok": False, "reason": "no store"}
+    if not force and _store.get_kraken_state(_CORRECTED_DEVICE_EXC_DONE_KEY):
+        return {"ok": True, "skipped": "already done"}
+    res = _corrected_device_exc_core(_store)
+    if res.get("ok"):
+        import datetime as _dtm
+        _store.set_kraken_state(_CORRECTED_DEVICE_EXC_DONE_KEY,
+                                _dtm.datetime.now(_dtm.timezone.utc).isoformat())
+        logger.info("run_corrected_device_exc_heal: %s", res)
+        if res.get("repaired", 0):
+            _schedule_chart_regen()
+    return res
+
+
 async def run_ev_priority_resplit_heal(force: bool = False) -> dict:
     """One-off EV-priority re-split heal (4.5.21). Gated (`ev_priority_resplit_done`), self-marking,
     idempotent; retires in v5.0.0. Local; no API. Paced: a batch of blocks per pass with the loop
@@ -12193,7 +12244,8 @@ def _maybe_run_ev_priority_resplit() -> None:
         if _store is None or _ev_priority_resplit_running:
             return
         if (_store.get_kraken_state(_EV_PRIORITY_RESPLIT_DONE_KEY)
-                and _store.get_kraken_state(_DISPATCH_HOUSE_REFIT_DONE_KEY)):
+                and _store.get_kraken_state(_DISPATCH_HOUSE_REFIT_DONE_KEY)
+                and _store.get_kraken_state(_CORRECTED_DEVICE_EXC_DONE_KEY)):
             return
         import asyncio as _aio
         try:
@@ -12206,6 +12258,7 @@ def _maybe_run_ev_priority_resplit() -> None:
             try:
                 await run_ev_priority_resplit_heal()
                 await run_dispatch_house_refit_heal()
+                await run_corrected_device_exc_heal()
             except Exception as e:
                 logger.warning("_maybe_run_ev_priority_resplit: worker failed: %s", e)
             finally:

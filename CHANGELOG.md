@@ -31,6 +31,13 @@ split between the car, the battery and the house was not.
   arrives later. Half-hours already recorded are corrected once, automatically. A half-hour your
   supplier has already billed keeps its billed figures.
 
+- **Correcting a half-hour's rate left your devices on the old rate before VAT.** When you
+  corrected a half-hour (for example from peak to off-peak) on an account using your supplier's
+  figures, the main meter was corrected in full, but a battery or EV charger on that half-hour
+  kept its old rate and cost before VAT. Anywhere those were shown (with Bill Rounding on, for
+  instance) the device was still priced at the old rate. Devices now take the corrected rate
+  before VAT too, and half-hours corrected before this update are repaired once, automatically.
+
 ## [4.5.20] — 2026-10-02
 
 *A power cut, and a year's export in an hour.* After an outage, the half-hours the add-on
