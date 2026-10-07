@@ -119,7 +119,7 @@ _read_queue:               list         = []
 _last_known_sensor_values: dict         = {}
 _engine_loop_lock:         asyncio.Lock = None   # initialised in setup()
 _engine_paused:            bool         = False
-_pass2_quiet:              bool         = False   # suppress per-block PASS 2 INFO logs during bulk recompute
+_pass2_quiet:              bool         = False   # suppress per-block PASS 2 logs during bulk recompute (INFO, and the routine clip WARNINGs — 4.5.21; a bulk pass logs one summary instead)
 _last_ci_fetch:            datetime | None = None   # UTC — last carbon intensity fetch
 _last_dispatch_capture:    datetime | None = None   # UTC — last dispatch-slot capture (5-min cadence)
 _last_reconcile:           datetime | None = None   # UTC — last dispatch reconciliation (hourly cadence)
@@ -2550,6 +2550,19 @@ def _apply_pass2(block: dict) -> None:
             is_ev = ((e["meter_block"].get("meta", {}) or {}).get("meter_type")
                      == "ev")
             return (0 if is_ev else 1, -e["kwh"])   # EVs first, then desc by kWh
+        # 4.5.21: on a DISPATCH-ONLY account (the main carries Octopus's dispatch EV, `kwh_ev`,
+        # and no device is an EV meter) the car's grid is reserved before the devices are
+        # fitted, so they fit inside the house = grid − EV. Without it a battery charging
+        # alongside the car kept grid the car used, the EV then had nothing left to sit in
+        # (the bill capped it; Insights' house went negative), and the devices were never
+        # re-fitted once the completed dispatch arrived. With an EV meter the meter IS the EV
+        # and claims first (above), so this does nothing there. The remainder keeps its shape:
+        # grid − devices, the EV inside it — it simply can no longer be smaller than the EV.
+        _dispatch_ev = 0.0
+        if not any(((e["meter_block"].get("meta", {}) or {}).get("meter_type") in ("ev", "ev_charger"))
+                   for e in protected + unprotected):
+            _dispatch_ev = min(max(float(parent_import.get("kwh_ev") or 0.0), 0.0), max(grid_kwh, 0.0))
+            grid_remaining = max(grid_kwh - _dispatch_ev, 0.0)
         protected.sort(key=_grid_priority)
         unprotected.sort(key=lambda x: x["kwh"], reverse=True)
 
@@ -2570,7 +2583,7 @@ def _apply_pass2(block: dict) -> None:
                 if not clamp_overflow:
                     # Unsettled gap block — preserve energy attribution even if it
                     # exceeds grid import (the main is also an estimate here).
-                    logger.warning(
+                    if not _pass2_quiet: logger.warning(
                         "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
                         "unsettled gap block, recording as-is (settlement will re-clamp).",
                         entry["meter_name"], entry["kwh"], grid_kwh,
@@ -2579,7 +2592,7 @@ def _apply_pass2(block: dict) -> None:
                 else:
                     # Authoritative main (live or DCC-settled) — clip to grid
                     # import; the sub-meter cannot exceed what the house imported.
-                    logger.warning(
+                    if not _pass2_quiet: logger.warning(
                         "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
                         "clipping to grid import (%s).",
                         entry["meter_name"], entry["kwh"], grid_kwh,
@@ -2587,7 +2600,7 @@ def _apply_pass2(block: dict) -> None:
                     )
                     claimed = grid_remaining  # already set to min above
             elif claimed < entry["kwh"]:
-                logger.warning(
+                if not _pass2_quiet: logger.warning(
                     "PASS 2: %s protected load %.4f kWh clipped to %.4f kWh",
                     entry["meter_name"], entry["kwh"], claimed,
                 )
@@ -2613,7 +2626,7 @@ def _apply_pass2(block: dict) -> None:
             battery    = entry["kwh"] - claimed
             if entry["kwh"] > grid_kwh:
                 if not clamp_overflow:
-                    logger.warning(
+                    if not _pass2_quiet: logger.warning(
                         "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
                         "unsettled gap block, recording as-is (settlement will re-clamp).",
                         entry["meter_name"], entry["kwh"], grid_kwh,
@@ -2621,7 +2634,7 @@ def _apply_pass2(block: dict) -> None:
                     claimed = entry["kwh"]
                     battery = 0.0
                 else:
-                    logger.warning(
+                    if not _pass2_quiet: logger.warning(
                         "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
                         "clipping to grid import (%s).",
                         entry["meter_name"], entry["kwh"], grid_kwh,
@@ -2639,7 +2652,7 @@ def _apply_pass2(block: dict) -> None:
                 entry["meter_name"], claimed, battery,
             )
 
-        remainder_kwh  = max(grid_remaining, 0.0)
+        remainder_kwh  = max(grid_remaining, 0.0) + _dispatch_ev
 
         # cost_remainder is computed as remainder_kwh × rate, NOT as main_cost − sub_costs.
         #
@@ -7102,6 +7115,7 @@ async def _run_historical_iog_split_backfill(max_blocks: int = 20000,
         if updates:
             try:
                 filled += _store.set_blocks_iog_split(updates)   # one transaction / chunk
+                _refit_devices_to_house(_store, [u[0] for u in updates])   # 4.5.21: the devices re-fit inside the house now the EV is known (dispatch-only accounts)
             except Exception as e:
                 logger.warning("_run_historical_iog_split_backfill: chunk persist failed "
                                "(cursor=%s): %s", cursor, e)
@@ -7204,6 +7218,7 @@ async def run_iog_split_carve(max_blocks: int = 2000) -> dict:
         "              AND d.slot_start = b.block_start AND d.energy_kwh IS NOT NULL) "
         "ORDER BY b.block_start LIMIT ?", (int(max_blocks),)).fetchall()
     carved = 0
+    _refit_starts: list = []   # 4.5.21: blocks whose EV this wrote, for the device re-fit
     for r in rows:
         bs = r["block_start"]; kwh = float(r["imp_kwh"] or 0.0); rate = float(r["imp_rate"] or 0.0)
         if kwh <= 1e-9:
@@ -7242,8 +7257,10 @@ async def run_iog_split_carve(max_blocks: int = 2000) -> dict:
                     "AND imp_kwh_ev IS NULL",
                     (ev, round(ev * rate, 6), rate, ev_band, home_band, bs))
             carved += 1
+            _refit_starts.append(bs)
         except Exception as e:
             logger.warning("run_iog_split_carve: persist failed (%s): %s", bs, e)
+    _refit_devices_to_house(_store, _refit_starts)   # 4.5.21: the devices re-fit inside the house now the EV is known (dispatch-only accounts)
     if carved:
         _schedule_chart_regen()
         logger.info("run_iog_split_carve: carved predicted EV/Home split on %d unsettled "
@@ -7359,6 +7376,8 @@ def _reprice_history_blocks(rows, tz_name: "str | None" = None, rate_segs=None) 
             except Exception as e:
                 logger.warning("_reprice_history_blocks: segment persist failed (%s): %s", start, e)
     split_n = _store.set_blocks_iog_split(split_updates) if split_updates else 0
+    if split_updates:
+        _refit_devices_to_house(_store, [u[0] for u in split_updates])   # 4.5.21: the devices re-fit inside the house now the EV is known (dispatch-only accounts)
     exc_n = _store.set_blocks_exc(exc_updates) if exc_updates else 0
     # Q1 SELF-HEAL: force-repair the stored INC columns of legacy pence blocks (main + sub-meters)
     # so the columns match the £ segments just written. Overwrites by design; gated on the §4a
@@ -11914,6 +11933,344 @@ async def run_smb_device_cost_clip(force: bool = False) -> dict:
     return res
 
 
+# ── 4.5.21: EV grid priority on re-split blocks ────────────────────────────────────────────────
+_EV_PRIORITY_RESPLIT_DONE_KEY = "ev_priority_resplit_done"   # one-off (4.5.21); removed in v5.0.0
+_EV_PRIORITY_RESPLIT_BATCH = 200       # blocks per pass, then the loop breathes
+_EV_PRIORITY_RESPLIT_PACE_S = 0.05
+_ev_priority_resplit_running: bool = False
+
+
+def _ev_priority_resplit_candidates(store) -> list:
+    """Block starts holding an EV-typed sub-meter AND another sub-meter — the only blocks
+    whose split depends on the EV-first grid priority. Empty for an account with no EV meter."""
+    evs = [r[0] for r in store._conn.execute(
+        "SELECT DISTINCT meter_id FROM meters WHERE is_sub_meter = 1 AND meter_type = 'ev'")]
+    if not evs:
+        return []
+    ph = ",".join("?" * len(evs))
+    return [r[0] for r in store._conn.execute(
+        "SELECT DISTINCT e.block_start FROM blocks e "
+        "WHERE e.meter_id IN (%s) AND EXISTS (SELECT 1 FROM blocks o "
+        "      WHERE o.block_start = e.block_start AND o.meter_id IN "
+        "            (SELECT meter_id FROM meters WHERE is_sub_meter = 1) "
+        "        AND o.meter_id NOT IN (%s)) "
+        "ORDER BY e.block_start" % (ph, ph), tuple(evs) + tuple(evs))]
+
+
+def _ev_priority_resplit_core(store, starts) -> dict:
+    """One-off heal (4.5.21): re-split blocks whose devices were split WITHOUT the EV-first grid
+    priority, and write back only the device grid shares that move.
+
+    THE BUG. `BlockStore._row_to_block` read `meter_type` inside a try that first read
+    `power_source`, a column `_select_blocks` never selects; the IndexError skipped it, so every
+    REBUILT block lost it. `_apply_pass2` gives an EV-typed device grid first and keys on that
+    field, so each re-split — settlement, device history written into imported blocks, a
+    device delete — fell back to biggest draw first, and a battery charging alongside the car
+    took the EV's grid share. Since 3.0.0. The block's own close split EV-first, so it is only
+    re-split blocks that are wrong. The forward fix restores the field; this re-runs the same
+    split with it on the blocks already written.
+
+    WHAT IT WRITES. Per device: `imp_kwh_grid`, and the £ priced from it at the row's OWN stored
+    rate (as the 4.5.15 heal does) — `imp_cost`, and `imp_cost_exc` where the row has an ex-VAT
+    rate. Only devices whose grid share moves by more than 0.0005 kWh. Nothing else: not the
+    main (grid only moves between devices, so the remainder is unchanged — 0 of ~100k blocks
+    measured), not a device's own reading from Home Assistant (`imp_kwh`), not carbon (priced
+    from that reading). Re-pricing every device from the split's unrounded rate would move
+    thousands of rows by sub-penny rounding (≤ 0.013p each); those are left alone.
+
+    MEASURED (dry run, 7 Oct 2026, four databases with an EV meter): one moved EV grid back from a
+    battery on ~1,100 blocks; two others on 17 and 8; one on none. No block already in EV-first
+    order changes. Idempotent: a second run finds nothing to move."""
+    global _pass2_quiet
+    out = {"ok": True, "checked": 0, "resplit_blocks": 0, "devices_updated": 0,
+           "kwh_moved": 0.0}
+    updates = []
+    _prev_quiet = _pass2_quiet
+    _pass2_quiet = True
+    try:
+        for bs in starts:
+            blk = store.get_block_dict_by_start(bs)
+            if not blk:
+                continue
+            out["checked"] += 1
+            before = {}
+            for mid, mb in (blk.get("meters") or {}).items():
+                if (mb.get("meta") or {}).get("sub_meter"):
+                    imp = (mb.get("channels") or {}).get("import") or {}
+                    before[mid] = imp.get("kwh_grid")
+            _apply_pass2(blk)
+            moved_here = 0
+            for mid, old in before.items():
+                imp = (blk["meters"][mid].get("channels") or {}).get("import") or {}
+                new = imp.get("kwh_grid")
+                if new is None or old is None or abs(new - old) <= 0.0005:
+                    continue
+                updates.append((new, new, new, bs, mid))
+                out["kwh_moved"] += abs(new - old) / 2      # each kWh leaves one device for another
+                moved_here += 1
+            if moved_here:
+                out["resplit_blocks"] += 1
+                out["devices_updated"] += moved_here
+    finally:
+        _pass2_quiet = _prev_quiet
+    _write_resplit(store, updates, [])
+    out["kwh_moved"] = round(out["kwh_moved"], 3)
+    return out
+
+
+def _write_resplit(store, device_updates, main_updates) -> None:
+    """Write a re-split back with targeted UPDATEs (never the round-trip): per device its grid
+    share and the £ priced from it at the row's OWN stored rate; per main its kWh remainder, and
+    its £ remainder at its own rate UNLESS the block is measured — there Octopus's bill set the £
+    remainder (bill − EV, `apply_measured_to_block`) and it stays the authority.
+    device_updates: (grid_kwh, grid_kwh, grid_kwh, block_start, meter_id).
+    main_updates:   (remainder_kwh, remainder_kwh, block_start, meter_id)."""
+    if not (device_updates or main_updates):
+        return
+    with store._conn:
+        if device_updates:
+            store._conn.executemany(
+                "UPDATE blocks SET imp_kwh_grid = ?, "
+                "  imp_cost = CASE WHEN imp_rate IS NOT NULL "
+                "       THEN ROUND(? * imp_rate, 6) ELSE imp_cost END, "
+                "  imp_cost_exc = CASE WHEN imp_rate_exc IS NOT NULL "
+                "       THEN ROUND(? * imp_rate_exc, 6) ELSE imp_cost_exc END "
+                "WHERE block_start = ? AND meter_id = ?", device_updates)
+        if main_updates:
+            store._conn.executemany(
+                "UPDATE blocks SET imp_kwh_remainder = ?, "
+                "  imp_cost_remainder = CASE "
+                "       WHEN COALESCE(rate_source, '') = 'measured' THEN imp_cost_remainder "
+                "       WHEN imp_rate IS NOT NULL THEN ROUND(? * imp_rate, 6) "
+                "       ELSE imp_cost_remainder END "
+                "WHERE block_start = ? AND meter_id = ?", main_updates)
+
+
+_DISPATCH_HOUSE_REFIT_DONE_KEY = "dispatch_house_refit_done"   # one-off (4.5.21); removed in v5.0.0
+
+
+def _dispatch_house_candidates(store, starts=None) -> list:
+    """Block starts on a DISPATCH-ONLY account whose devices must fit inside the house: the main
+    carries a dispatch EV (imp_kwh_ev > 0) and there is at least one device. Empty for an account
+    with an EV meter (the meter is the EV there) and for one with no dispatches — so for nearly
+    every account this is one cheap query that finds nothing. `starts` narrows it to those."""
+    c = store._conn
+    if c.execute("SELECT 1 FROM meters WHERE is_sub_meter = 1 "
+                 "AND meter_type IN ('ev', 'ev_charger') LIMIT 1").fetchone():
+        return []
+    sql = ("SELECT m.block_start FROM blocks m WHERE m.meter_id = 'electricity_main' "
+           "AND m.imp_kwh_ev > 0 AND EXISTS (SELECT 1 FROM blocks o "
+           "    WHERE o.block_start = m.block_start AND o.meter_id IN "
+           "          (SELECT meter_id FROM meters WHERE is_sub_meter = 1))")
+    if starts is None:
+        return [r[0] for r in c.execute(sql + " ORDER BY m.block_start")]
+    want = sorted(set(starts))
+    out = []
+    for i in range(0, len(want), 500):
+        chunk = want[i:i + 500]
+        out += [r[0] for r in c.execute(
+            sql + " AND m.block_start IN (%s)" % ",".join("?" * len(chunk)), chunk)]
+    return out
+
+
+def _refit_devices_to_house(store, starts) -> dict:
+    """4.5.21: re-fit a dispatch-only account's devices inside the house once its dispatch EV is
+    known or changes. Every writer of `imp_kwh_ev` after a block's close calls this with the
+    blocks it wrote — before 4.5.21 none re-ran the split, so the devices stayed fitted against
+    the whole main for good. A no-op for any block that is not a candidate (above). Re-runs the
+    split on the rebuilt block and writes back only what moves (`_write_resplit`)."""
+    global _pass2_quiet
+    out = {"checked": 0, "refit_blocks": 0, "kwh_moved": 0.0}
+    if store is None or not starts:
+        return out
+    cands = _dispatch_house_candidates(store, starts)
+    if not cands:
+        return out
+    dev_u, main_u = [], []
+    _prev = _pass2_quiet
+    _pass2_quiet = True
+    try:
+        for bs in cands:
+            blk = store.get_block_dict_by_start(bs)
+            if not blk:
+                continue
+            out["checked"] += 1
+            before = {mid: ((mb.get("channels") or {}).get("import") or {}).get("kwh_grid")
+                      for mid, mb in (blk.get("meters") or {}).items()
+                      if (mb.get("meta") or {}).get("sub_meter")}
+            mi = ((blk.get("meters") or {}).get("electricity_main") or {}).get("channels", {}).get("import") or {}
+            rem_before = mi.get("kwh_remainder")
+            _apply_pass2(blk)
+            moved = False
+            for mid, old in before.items():
+                new = ((blk["meters"][mid].get("channels") or {}).get("import") or {}).get("kwh_grid")
+                if new is None or old is None or abs(new - old) <= 0.0005:
+                    continue
+                dev_u.append((new, new, new, bs, mid))
+                out["kwh_moved"] += abs(new - old)
+                moved = True
+            rem_after = mi.get("kwh_remainder")
+            if rem_after is not None and (rem_before is None or abs(rem_after - rem_before) > 0.0005):
+                main_u.append((rem_after, rem_after, bs, "electricity_main"))
+                moved = True
+            if moved:
+                out["refit_blocks"] += 1
+    finally:
+        _pass2_quiet = _prev
+    _write_resplit(store, dev_u, main_u)
+    out["kwh_moved"] = round(out["kwh_moved"], 3)
+    return out
+
+
+async def run_dispatch_house_refit_heal(force: bool = False) -> dict:
+    """One-off heal (4.5.21): re-fit every past dispatch-only block's devices inside the house
+    (grid − dispatch EV). The data is all kept — the devices' own readings, the main, the dispatch
+    EV — so the re-fit is exact; and it is reversible, since a grid share is always re-derivable
+    from them. Gated (`dispatch_house_refit_done`), self-marking, idempotent, paced; retires in
+    v5.0.0. Measured blocks keep their bill-set £ remainder. A no-op on any account with an EV
+    meter or no dispatches (0 candidates on every local database, 7 Oct 2026)."""
+    import asyncio as _aio
+    if _store is None:
+        return {"ok": False, "reason": "no store"}
+    if not force and _store.get_kraken_state(_DISPATCH_HOUSE_REFIT_DONE_KEY):
+        return {"ok": True, "skipped": "already done"}
+    starts = _dispatch_house_candidates(_store)
+    total = {"ok": True, "candidates": len(starts), "checked": 0, "refit_blocks": 0, "kwh_moved": 0.0}
+    for i in range(0, len(starts), _EV_PRIORITY_RESPLIT_BATCH):
+        if api_import_running() or delete_in_progress():
+            logger.info("run_dispatch_house_refit_heal: deferred — import/delete job active")
+            return {"ok": False, "reason": "job active", **total}
+        res = _refit_devices_to_house(_store, starts[i:i + _EV_PRIORITY_RESPLIT_BATCH])
+        for k in ("checked", "refit_blocks", "kwh_moved"):
+            total[k] += res[k]
+        await _aio.sleep(_EV_PRIORITY_RESPLIT_PACE_S)
+    total["kwh_moved"] = round(total["kwh_moved"], 3)
+    import datetime as _dtm
+    _store.set_kraken_state(_DISPATCH_HOUSE_REFIT_DONE_KEY,
+                            _dtm.datetime.now(_dtm.timezone.utc).isoformat())
+    logger.info("run_dispatch_house_refit_heal: %s", total)
+    if total["refit_blocks"]:
+        _schedule_chart_regen()
+    return total
+
+
+_CORRECTED_DEVICE_EXC_DONE_KEY = "corrected_device_exc_done"   # one-off (4.5.21); removed in v5.0.0
+
+
+def _corrected_device_exc_core(store) -> dict:
+    """One-off heal (4.5.21): give each device on a manually corrected block the main's corrected
+    ex-VAT rate, and the ex-VAT cost priced from its grid share at that rate.
+
+    On an API account the corrections route rewrites only the main's settled row in full (rate,
+    cost, and the ex-VAT rescale of BL-57). Devices were carried along with only their inc rate
+    and cost, so a device that already had an ex-VAT figure kept the pre-correction band: a half-
+    hour corrected to off-peak still read peak, for its devices, in every ex-VAT view. The route
+    now carries the main's figure; this repairs the blocks corrected before it.
+
+    Exact: the main's corrected ex-VAT rate is the authority for the block (devices follow the
+    main), and the device's grid share is untouched. Only devices whose ex-VAT rate is set AND
+    differs from the main's are written; a NULL one already falls back to inc ÷ VAT. Measured
+    (7 Oct 2026): ~320 corrected blocks on four databases, 2 stale per install (both from the
+    same day's corrections), 0 elsewhere. Idempotent: matches only rows still differing."""
+    if store is None:
+        return {"ok": False, "reason": "no store"}
+    main_exc = ("(SELECT m.imp_rate_exc FROM blocks m WHERE m.block_start = blocks.block_start "
+                " AND m.meter_id IN (SELECT meter_id FROM meters WHERE is_sub_meter = 0) "
+                " AND m.rate_corrected = 1 AND m.imp_rate_exc IS NOT NULL LIMIT 1)")
+    with store._conn:
+        cur = store._conn.execute(
+            "UPDATE blocks SET imp_rate_exc = %(e)s, "
+            "  imp_cost_exc = ROUND(COALESCE(imp_kwh_grid, imp_kwh, 0) * %(e)s, 6) "
+            "WHERE meter_id IN (SELECT meter_id FROM meters WHERE is_sub_meter = 1) "
+            "  AND imp_rate_exc IS NOT NULL AND %(e)s IS NOT NULL "
+            "  AND ABS(imp_rate_exc - %(e)s) > 0.000001" % {"e": main_exc})
+    return {"ok": True, "repaired": cur.rowcount}
+
+
+async def run_corrected_device_exc_heal(force: bool = False) -> dict:
+    """One-off corrected-device ex-VAT heal (4.5.21). Gated (`corrected_device_exc_done`),
+    self-marking, idempotent; retires in v5.0.0. Local; one UPDATE."""
+    if _store is None:
+        return {"ok": False, "reason": "no store"}
+    if not force and _store.get_kraken_state(_CORRECTED_DEVICE_EXC_DONE_KEY):
+        return {"ok": True, "skipped": "already done"}
+    res = _corrected_device_exc_core(_store)
+    if res.get("ok"):
+        import datetime as _dtm
+        _store.set_kraken_state(_CORRECTED_DEVICE_EXC_DONE_KEY,
+                                _dtm.datetime.now(_dtm.timezone.utc).isoformat())
+        logger.info("run_corrected_device_exc_heal: %s", res)
+        if res.get("repaired", 0):
+            _schedule_chart_regen()
+    return res
+
+
+async def run_ev_priority_resplit_heal(force: bool = False) -> dict:
+    """One-off EV-priority re-split heal (4.5.21). Gated (`ev_priority_resplit_done`), self-marking,
+    idempotent; retires in v5.0.0. Local; no API. Paced: a batch of blocks per pass with the loop
+    breathing between, so a large history does not stall the engine. Interrupted, it simply runs
+    again from the start (idempotent)."""
+    import asyncio as _aio
+    if _store is None:
+        return {"ok": False, "reason": "no store"}
+    if not force and _store.get_kraken_state(_EV_PRIORITY_RESPLIT_DONE_KEY):
+        return {"ok": True, "skipped": "already done"}
+    starts = _ev_priority_resplit_candidates(_store)
+    total = {"ok": True, "candidates": len(starts), "checked": 0, "resplit_blocks": 0,
+             "devices_updated": 0, "kwh_moved": 0.0}
+    for i in range(0, len(starts), _EV_PRIORITY_RESPLIT_BATCH):
+        if api_import_running() or delete_in_progress():
+            logger.info("run_ev_priority_resplit_heal: deferred — import/delete job active")
+            return {"ok": False, "reason": "job active", **total}
+        res = _ev_priority_resplit_core(_store, starts[i:i + _EV_PRIORITY_RESPLIT_BATCH])
+        for k in ("checked", "resplit_blocks", "devices_updated", "kwh_moved"):
+            total[k] += res[k]
+        await _aio.sleep(_EV_PRIORITY_RESPLIT_PACE_S)
+    total["kwh_moved"] = round(total["kwh_moved"], 3)
+    import datetime as _dtm
+    _store.set_kraken_state(_EV_PRIORITY_RESPLIT_DONE_KEY,
+                            _dtm.datetime.now(_dtm.timezone.utc).isoformat())
+    logger.info("run_ev_priority_resplit_heal: %s", total)
+    if total["resplit_blocks"]:
+        _schedule_chart_regen()
+    return total
+
+
+def _maybe_run_ev_priority_resplit() -> None:
+    """Schedule the 4.5.21 heal as a loop task (BlockStore access stays on the loop thread —
+    single SQLite connection). No-op once its marker is set, or while it is already running."""
+    global _ev_priority_resplit_running
+    try:
+        if _store is None or _ev_priority_resplit_running:
+            return
+        if (_store.get_kraken_state(_EV_PRIORITY_RESPLIT_DONE_KEY)
+                and _store.get_kraken_state(_DISPATCH_HOUSE_REFIT_DONE_KEY)
+                and _store.get_kraken_state(_CORRECTED_DEVICE_EXC_DONE_KEY)):
+            return
+        import asyncio as _aio
+        try:
+            loop = _aio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _task():
+            global _ev_priority_resplit_running
+            try:
+                await run_ev_priority_resplit_heal()
+                await run_dispatch_house_refit_heal()
+                await run_corrected_device_exc_heal()
+            except Exception as e:
+                logger.warning("_maybe_run_ev_priority_resplit: worker failed: %s", e)
+            finally:
+                _ev_priority_resplit_running = False
+
+        _ev_priority_resplit_running = True
+        loop.create_task(_task())
+    except Exception as e:
+        logger.warning("_maybe_run_ev_priority_resplit: schedule failed: %s", e)
+        _ev_priority_resplit_running = False
+
+
 async def run_smb_device_recost(force: bool = False) -> dict:
     """One-off device-cost heal (4.5.7). Gated (`smb_device_recost_done`), self-marking,
     idempotent; retires in v5.0.0. Heals sub-meter blocks the measured settlement left at a
@@ -11955,6 +12312,7 @@ def _smb_ev_resplit_core(store) -> dict:
         "FROM blocks b WHERE b.meter_id='electricity_main' AND b.rate_source='measured' "
         "  AND b.imp_kwh_ev IS NOT NULL AND b.imp_kwh_ev > 0").fetchall()
     resplit = 0; skipped_mixed = 0; zeroed = 0; moved = 0.0
+    _refit_starts: list = []   # 4.5.21: blocks whose EV this wrote, for the device re-fit
     for r in rows:
         bs = r["block_start"]; kwh = float(r["imp_kwh"] or 0.0)
         ev_old = float(r["imp_kwh_ev"] or 0.0)
@@ -11987,9 +12345,11 @@ def _smb_ev_resplit_core(store) -> dict:
                  round(ev_new * _rate, 6) if ev_new > 1e-9 else None,
                  _rate if ev_new > 1e-9 else None, bs))
         resplit += 1
+        _refit_starts.append(bs)
         moved += (ev_old - ev_new)
         if ev_new <= 1e-9:
             zeroed += 1
+    _refit_devices_to_house(store, _refit_starts)   # 4.5.21: the devices re-fit inside the house now the EV is known (dispatch-only accounts)
     return {"ok": True, "resplit": resplit, "zeroed_no_dispatch": zeroed,
             "skipped_mixed": skipped_mixed, "kwh_moved_to_house": round(moved, 3)}
 
@@ -12905,6 +13265,11 @@ def apply_measured_to_block(bs: str, *, cost_incl: float, cost_excl=None,
                 (imp_rate, imp_rate, exc_rate, exc_rate, bs))
     except Exception as e:
         logger.warning("apply_measured: device re-cost failed for %s: %s", bs, e)
+    # 4.5.21: the devices re-fit inside the house now the EV is known (dispatch-only accounts). Keeps this block's bill-set £ remainder (_write_resplit).
+    try:
+        _refit_devices_to_house(store, [bs])
+    except Exception as e:
+        logger.warning("apply_measured: device re-fit failed for %s: %s", bs, e)
     return {"prior_band": _prior_band, "new_band": band, "new_rate": imp_rate}
 
 
@@ -12955,6 +13320,7 @@ def _attribute_missing_ev_split() -> int:
         logger.warning("_attribute_missing_ev_split: query failed: %s", e)
         return 0
     n = 0
+    _refit_starts: list = []   # 4.5.21: blocks whose EV this wrote, for the device re-fit
     for r in rows:
         imp_ch = {"kwh": float(r["imp_kwh"] or 0.0), "cost": float(r["imp_cost"] or 0.0),
                   "rate": float(r["imp_rate"] or 0.0)}
@@ -12979,9 +13345,11 @@ def _attribute_missing_ev_split() -> int:
             # BL-27: rewrite the segments too (the readers' source of truth). Own txn.
             _persist_block_segments(r["block_start"], "electricity_main", imp_ch)
             n += 1
+            _refit_starts.append(r["block_start"])
         except Exception as e:
             logger.warning("_attribute_missing_ev_split: write failed for %s: %s",
                            r["block_start"], e)
+    _refit_devices_to_house(_store, _refit_starts)   # 4.5.21: the devices re-fit inside the house now the EV is known (dispatch-only accounts)
     if n:
         logger.info("ev attribution: back-attributed the EV/Home split on %d block(s) whose "
                     "completed dispatch arrived after pricing (was silently all-Home)", n)
@@ -14245,6 +14613,14 @@ async def _engine_startup_impl(ha: HAClient):
                     "for re-clamp (drain will re-materialise)", _flagged)
     except Exception as _b19e:
         logger.warning("engine_startup: BL-19 grid-invariant sweep failed: %s", _b19e)
+
+    # 4.5.21 one-time heal: re-split blocks whose devices lost the EV-first grid priority on a
+    # re-split (rebuilt blocks had no meter_type). Every account — rebuilds happen with or
+    # without the supplier API. A paced loop task; marker-gated.
+    try:
+        _maybe_run_ev_priority_resplit()
+    except Exception as _evp:
+        logger.warning("engine_startup: EV-priority re-split heal schedule failed: %s", _evp)
 
     # #307 one-time self-heal: a lost/zeroed opening register books a device's whole
     # lifetime register as one interval (prod: house_battery 0→6137 kWh in a

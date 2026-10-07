@@ -767,6 +767,15 @@ def _row_to_block(rows: list[sqlite3.Row]) -> dict:
                 meta["postcode_prefix"] = row["postcode_prefix"]
             if row["v2x_capable"]:
                 meta["v2x_capable"] = True
+            # 4.5.21: meter_type is read on its own, ahead of the try below. It sat inside it,
+            # after row["power_source"] — a column _select_blocks never selects — so the
+            # IndexError skipped it and EVERY rebuilt block (settlement, device history written
+            # in later, a device delete) lost it. _apply_pass2's EV-first grid priority keys on
+            # it, so each re-split handed the EV's grid share to a bigger concurrent device (a
+            # battery) — since 3.0.0. Only meter_type moves: the other fields in that try stay
+            # as they were, so nothing else about a rebuilt block changes.
+            if "meter_type" in row.keys() and row["meter_type"]:
+                meta["meter_type"] = row["meter_type"]
             try:
                 if row["power_source"]:
                     meta["power_source"] = row["power_source"]
@@ -774,8 +783,6 @@ def _row_to_block(rows: list[sqlite3.Row]) -> dict:
                     meta["rate_source"] = row["rate_source"]
                 if row["soc_sensor"]:
                     meta["soc_sensor"] = row["soc_sensor"]
-                if row["meter_type"]:
-                    meta["meter_type"] = row["meter_type"]
                 if row["inverter_power_sensor"]:
                     meta["inverter_power_sensor"] = row["inverter_power_sensor"]
                 if row["inverter_power_invert"]:
@@ -6946,6 +6953,7 @@ class BlockStore:
                        b.exp_kwh, b.exp_rate, b.exp_cost,
                        b.exp_read_start, b.exp_read_end,
                        b.standing_charge, b.carbon_g, b.carbon_intensity_g, b.interpolated,
+                       b.rate_corrected,
                        m.is_sub_meter, m.parent_meter_id, m.device_label,
                        m.inverter_possible, m.meter_type,
                        cp.billing_day, cp.block_minutes, cp.timezone,
@@ -7007,6 +7015,10 @@ class BlockStore:
                 imp_channel["kwh_remainder"] = float(row["imp_kwh_remainder"])
             if row["imp_rate"] is not None:
                 imp_channel["rate"] = float(row["imp_rate"])
+            # 4.5.21: a manually corrected rate is the user's decision, so the day chart's rate
+            # line must draw it (chart_emit.day_rate_series). Only when set, like the rest.
+            if row["rate_corrected"]:
+                imp_channel["rate_corrected"] = True
             # BL-23/BL-24: surface captured ex-VAT so the billing summary's bill method
             # and the data table's ex-VAT columns use the REAL figure (not inc÷1.05).
             # _row_to_block does this too; the lightweight chart fetch must match or the
