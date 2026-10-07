@@ -11914,6 +11914,161 @@ async def run_smb_device_cost_clip(force: bool = False) -> dict:
     return res
 
 
+# ── 4.5.21: EV grid priority on re-split blocks ────────────────────────────────────────────────
+_EV_PRIORITY_RESPLIT_DONE_KEY = "ev_priority_resplit_done"   # one-off (4.5.21); removed in v5.0.0
+_EV_PRIORITY_RESPLIT_BATCH = 200       # blocks per pass, then the loop breathes
+_EV_PRIORITY_RESPLIT_PACE_S = 0.05
+_ev_priority_resplit_running: bool = False
+
+
+def _ev_priority_resplit_candidates(store) -> list:
+    """Block starts holding an EV-typed sub-meter AND another sub-meter — the only blocks
+    whose split depends on the EV-first grid priority. Empty for an account with no EV meter."""
+    evs = [r[0] for r in store._conn.execute(
+        "SELECT DISTINCT meter_id FROM meters WHERE is_sub_meter = 1 AND meter_type = 'ev'")]
+    if not evs:
+        return []
+    ph = ",".join("?" * len(evs))
+    return [r[0] for r in store._conn.execute(
+        "SELECT DISTINCT e.block_start FROM blocks e "
+        "WHERE e.meter_id IN (%s) AND EXISTS (SELECT 1 FROM blocks o "
+        "      WHERE o.block_start = e.block_start AND o.meter_id IN "
+        "            (SELECT meter_id FROM meters WHERE is_sub_meter = 1) "
+        "        AND o.meter_id NOT IN (%s)) "
+        "ORDER BY e.block_start" % (ph, ph), tuple(evs) + tuple(evs))]
+
+
+def _ev_priority_resplit_core(store, starts) -> dict:
+    """One-off heal (4.5.21): re-split blocks whose devices were split WITHOUT the EV-first grid
+    priority, and write back only the device grid shares that move.
+
+    THE BUG. `BlockStore._row_to_block` read `meter_type` inside a try that first read
+    `power_source`, a column `_select_blocks` never selects; the IndexError skipped it, so every
+    REBUILT block lost it. `_apply_pass2` gives an EV-typed device grid first and keys on that
+    field, so each re-split — settlement, device history written into imported blocks, a
+    device delete — fell back to biggest draw first, and a battery charging alongside the car
+    took the EV's grid share. Since 3.0.0. The block's own close split EV-first, so it is only
+    re-split blocks that are wrong. The forward fix restores the field; this re-runs the same
+    split with it on the blocks already written.
+
+    WHAT IT WRITES. Per device: `imp_kwh_grid`, and the £ priced from it at the row's OWN stored
+    rate (as the 4.5.15 heal does) — `imp_cost`, and `imp_cost_exc` where the row has an ex-VAT
+    rate. Only devices whose grid share moves by more than 0.0005 kWh. Nothing else: not the
+    main (grid only moves between devices, so the remainder is unchanged — 0 of ~100k blocks
+    measured), not a device's own reading from Home Assistant (`imp_kwh`), not carbon (priced
+    from that reading). Re-pricing every device from the split's unrounded rate would move
+    thousands of rows by sub-penny rounding (≤ 0.013p each); those are left alone.
+
+    MEASURED (dry run, 7 Oct 2026, four databases with an EV meter): one moved EV grid back from a
+    battery on ~1,100 blocks; two others on 17 and 8; one on none. No block already in EV-first
+    order changes. Idempotent: a second run finds nothing to move."""
+    global _pass2_quiet
+    out = {"ok": True, "checked": 0, "resplit_blocks": 0, "devices_updated": 0,
+           "kwh_moved": 0.0}
+    updates = []
+    _prev_quiet = _pass2_quiet
+    _pass2_quiet = True
+    try:
+        for bs in starts:
+            blk = store.get_block_dict_by_start(bs)
+            if not blk:
+                continue
+            out["checked"] += 1
+            before = {}
+            for mid, mb in (blk.get("meters") or {}).items():
+                if (mb.get("meta") or {}).get("sub_meter"):
+                    imp = (mb.get("channels") or {}).get("import") or {}
+                    before[mid] = imp.get("kwh_grid")
+            _apply_pass2(blk)
+            moved_here = 0
+            for mid, old in before.items():
+                imp = (blk["meters"][mid].get("channels") or {}).get("import") or {}
+                new = imp.get("kwh_grid")
+                if new is None or old is None or abs(new - old) <= 0.0005:
+                    continue
+                updates.append((new, new, new, bs, mid))
+                out["kwh_moved"] += abs(new - old) / 2      # each kWh leaves one device for another
+                moved_here += 1
+            if moved_here:
+                out["resplit_blocks"] += 1
+                out["devices_updated"] += moved_here
+    finally:
+        _pass2_quiet = _prev_quiet
+    if updates:
+        with store._conn:
+            store._conn.executemany(
+                "UPDATE blocks SET imp_kwh_grid = ?, "
+                "  imp_cost = CASE WHEN imp_rate IS NOT NULL "
+                "       THEN ROUND(? * imp_rate, 6) ELSE imp_cost END, "
+                "  imp_cost_exc = CASE WHEN imp_rate_exc IS NOT NULL "
+                "       THEN ROUND(? * imp_rate_exc, 6) ELSE imp_cost_exc END "
+                "WHERE block_start = ? AND meter_id = ?", updates)
+    out["kwh_moved"] = round(out["kwh_moved"], 3)
+    return out
+
+
+async def run_ev_priority_resplit_heal(force: bool = False) -> dict:
+    """One-off EV-priority re-split heal (4.5.21). Gated (`ev_priority_resplit_done`), self-marking,
+    idempotent; retires in v5.0.0. Local; no API. Paced: a batch of blocks per pass with the loop
+    breathing between, so a large history does not stall the engine. Interrupted, it simply runs
+    again from the start (idempotent)."""
+    import asyncio as _aio
+    if _store is None:
+        return {"ok": False, "reason": "no store"}
+    if not force and _store.get_kraken_state(_EV_PRIORITY_RESPLIT_DONE_KEY):
+        return {"ok": True, "skipped": "already done"}
+    starts = _ev_priority_resplit_candidates(_store)
+    total = {"ok": True, "candidates": len(starts), "checked": 0, "resplit_blocks": 0,
+             "devices_updated": 0, "kwh_moved": 0.0}
+    for i in range(0, len(starts), _EV_PRIORITY_RESPLIT_BATCH):
+        if api_import_running() or delete_in_progress():
+            logger.info("run_ev_priority_resplit_heal: deferred — import/delete job active")
+            return {"ok": False, "reason": "job active", **total}
+        res = _ev_priority_resplit_core(_store, starts[i:i + _EV_PRIORITY_RESPLIT_BATCH])
+        for k in ("checked", "resplit_blocks", "devices_updated", "kwh_moved"):
+            total[k] += res[k]
+        await _aio.sleep(_EV_PRIORITY_RESPLIT_PACE_S)
+    total["kwh_moved"] = round(total["kwh_moved"], 3)
+    import datetime as _dtm
+    _store.set_kraken_state(_EV_PRIORITY_RESPLIT_DONE_KEY,
+                            _dtm.datetime.now(_dtm.timezone.utc).isoformat())
+    logger.info("run_ev_priority_resplit_heal: %s", total)
+    if total["resplit_blocks"]:
+        _schedule_chart_regen()
+    return total
+
+
+def _maybe_run_ev_priority_resplit() -> None:
+    """Schedule the 4.5.21 heal as a loop task (BlockStore access stays on the loop thread —
+    single SQLite connection). No-op once its marker is set, or while it is already running."""
+    global _ev_priority_resplit_running
+    try:
+        if _store is None or _ev_priority_resplit_running:
+            return
+        if _store.get_kraken_state(_EV_PRIORITY_RESPLIT_DONE_KEY):
+            return
+        import asyncio as _aio
+        try:
+            loop = _aio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _task():
+            global _ev_priority_resplit_running
+            try:
+                await run_ev_priority_resplit_heal()
+            except Exception as e:
+                logger.warning("_maybe_run_ev_priority_resplit: worker failed: %s", e)
+            finally:
+                _ev_priority_resplit_running = False
+
+        _ev_priority_resplit_running = True
+        loop.create_task(_task())
+    except Exception as e:
+        logger.warning("_maybe_run_ev_priority_resplit: schedule failed: %s", e)
+        _ev_priority_resplit_running = False
+
+
 async def run_smb_device_recost(force: bool = False) -> dict:
     """One-off device-cost heal (4.5.7). Gated (`smb_device_recost_done`), self-marking,
     idempotent; retires in v5.0.0. Heals sub-meter blocks the measured settlement left at a
@@ -14245,6 +14400,14 @@ async def _engine_startup_impl(ha: HAClient):
                     "for re-clamp (drain will re-materialise)", _flagged)
     except Exception as _b19e:
         logger.warning("engine_startup: BL-19 grid-invariant sweep failed: %s", _b19e)
+
+    # 4.5.21 one-time heal: re-split blocks whose devices lost the EV-first grid priority on a
+    # re-split (rebuilt blocks had no meter_type). Every account — rebuilds happen with or
+    # without the supplier API. A paced loop task; marker-gated.
+    try:
+        _maybe_run_ev_priority_resplit()
+    except Exception as _evp:
+        logger.warning("engine_startup: EV-priority re-split heal schedule failed: %s", _evp)
 
     # #307 one-time self-heal: a lost/zeroed opening register books a device's whole
     # lifetime register as one interval (prod: house_battery 0→6137 kWh in a
