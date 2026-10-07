@@ -199,6 +199,22 @@ class TheHeal(_Harness):
         self._finalise()                                  # the close split it EV-first
         self.assertEqual(self._heal()["resplit_blocks"], 0)
 
+    def test_the_heal_does_not_relog_every_clip(self):
+        """A heal re-splits thousands of old blocks; each clip used to log a WARNING again (561 on
+        a production-like install, 7 Oct 2026). Under _pass2_quiet the routine clip warnings are
+        silent; the heal logs one summary."""
+        self._damage()
+        with self.assertNoLogs("engine", level="WARNING"):
+            self._heal()
+
+    def test_a_normal_split_still_warns_of_a_clip(self):
+        """GUARD: outside a bulk pass the clip is still logged."""
+        self._damage()
+        blk = engine._store.get_block_dict_by_start(START)
+        with self.assertLogs("engine", level="WARNING") as cm:
+            engine._apply_pass2(blk)
+        self.assertTrue(any("clipped" in m or "EXCEEDS" in m for m in cm.output))
+
     def test_the_run_marks_itself_done(self):
         self._damage()
         res = asyncio.run(engine.run_ev_priority_resplit_heal())

@@ -119,7 +119,7 @@ _read_queue:               list         = []
 _last_known_sensor_values: dict         = {}
 _engine_loop_lock:         asyncio.Lock = None   # initialised in setup()
 _engine_paused:            bool         = False
-_pass2_quiet:              bool         = False   # suppress per-block PASS 2 INFO logs during bulk recompute
+_pass2_quiet:              bool         = False   # suppress per-block PASS 2 logs during bulk recompute (INFO, and the routine clip WARNINGs — 4.5.21; a bulk pass logs one summary instead)
 _last_ci_fetch:            datetime | None = None   # UTC — last carbon intensity fetch
 _last_dispatch_capture:    datetime | None = None   # UTC — last dispatch-slot capture (5-min cadence)
 _last_reconcile:           datetime | None = None   # UTC — last dispatch reconciliation (hourly cadence)
@@ -2583,7 +2583,7 @@ def _apply_pass2(block: dict) -> None:
                 if not clamp_overflow:
                     # Unsettled gap block — preserve energy attribution even if it
                     # exceeds grid import (the main is also an estimate here).
-                    logger.warning(
+                    if not _pass2_quiet: logger.warning(
                         "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
                         "unsettled gap block, recording as-is (settlement will re-clamp).",
                         entry["meter_name"], entry["kwh"], grid_kwh,
@@ -2592,7 +2592,7 @@ def _apply_pass2(block: dict) -> None:
                 else:
                     # Authoritative main (live or DCC-settled) — clip to grid
                     # import; the sub-meter cannot exceed what the house imported.
-                    logger.warning(
+                    if not _pass2_quiet: logger.warning(
                         "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
                         "clipping to grid import (%s).",
                         entry["meter_name"], entry["kwh"], grid_kwh,
@@ -2600,7 +2600,7 @@ def _apply_pass2(block: dict) -> None:
                     )
                     claimed = grid_remaining  # already set to min above
             elif claimed < entry["kwh"]:
-                logger.warning(
+                if not _pass2_quiet: logger.warning(
                     "PASS 2: %s protected load %.4f kWh clipped to %.4f kWh",
                     entry["meter_name"], entry["kwh"], claimed,
                 )
@@ -2626,7 +2626,7 @@ def _apply_pass2(block: dict) -> None:
             battery    = entry["kwh"] - claimed
             if entry["kwh"] > grid_kwh:
                 if not clamp_overflow:
-                    logger.warning(
+                    if not _pass2_quiet: logger.warning(
                         "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
                         "unsettled gap block, recording as-is (settlement will re-clamp).",
                         entry["meter_name"], entry["kwh"], grid_kwh,
@@ -2634,7 +2634,7 @@ def _apply_pass2(block: dict) -> None:
                     claimed = entry["kwh"]
                     battery = 0.0
                 else:
-                    logger.warning(
+                    if not _pass2_quiet: logger.warning(
                         "PASS 2: %s sub-meter %.4f kWh EXCEEDS parent grid import %.4f kWh — "
                         "clipping to grid import (%s).",
                         entry["meter_name"], entry["kwh"], grid_kwh,
