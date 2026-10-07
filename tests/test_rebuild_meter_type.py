@@ -78,8 +78,11 @@ def _cfg(ev_type="ev"):
 class _Harness(unittest.TestCase):
     ev_type = "ev"
 
+    def _make_cfg(self):
+        return _cfg(self.ev_type)
+
     def setUp(self):
-        self.cfg = _cfg(self.ev_type)
+        self.cfg = self._make_cfg()
         self._orig_cfg_path = engine.CONFIG_PATH
         self._cfg_dir = tempfile.mkdtemp(prefix="emt-test-cfg-")
         engine.CONFIG_PATH = os.path.join(self._cfg_dir, "meters_config.json")
