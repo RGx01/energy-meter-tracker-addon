@@ -38,6 +38,12 @@ split between the car, the battery and the house was not.
   instance) the device was still priced at the old rate. Devices now take the corrected rate
   before VAT too, and half-hours corrected before this update are repaired once, automatically.
 
+- **A corrected half-hour's rate line still showed the old rate.** After correcting a half-hour
+  (for example to off-peak), the day chart's rate line for the house and your devices could
+  still draw it at the old rate, unless an EV charge happened to fall in the same half-hour. The
+  bars, costs and bill were right; only the line was wrong. It now draws the rate you corrected
+  it to.
+
 ## [4.5.20] — 2026-10-02
 
 *A power cut, and a year's export in an hour.* After an outage, the half-hours the add-on

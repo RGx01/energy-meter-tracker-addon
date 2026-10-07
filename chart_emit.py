@@ -53,6 +53,7 @@ def day_rate_series(day_blocks, *, slots: int, block_minutes: int,
     house_seg: dict = {}   # slot -> HOUSE rate where the house genuinely DREW (priced segment)
     house_band: dict = {}  # slot -> the BAND the bill put it in ('off_peak'/'peak'), when known
     house_mr: dict = {}    # slot -> block-rate fallback (non-IOG / no house segment)
+    house_corrected: set = set()   # slots whose rate the user corrected by hand (4.5.21)
     ev_rate: dict = {}     # slot -> EV rate where the car DREW (segment or dispatch overlay)
     rates: set = set()     # the tariff rate values (clean off/peak extremes) for the EV baseline
     # 4.5.7: the rate line must STOP at the last real block, never PROJECT the tariff to
@@ -65,6 +66,8 @@ def day_rate_series(day_blocks, *, slots: int, block_minutes: int,
                .get("channels", {}) or {}).get("import", {}) or {}
         mr = _f(imp.get("rate_used", imp.get("rate")))
         segs = imp.get("segments") or []
+        if imp.get("rate_corrected"):
+            house_corrected.add(hh)
         for x in segs:
             r = _f(x.get("inc_rate"))
             if r:
@@ -145,7 +148,13 @@ def day_rate_series(day_blocks, *, slots: int, block_minutes: int,
         #   otherwise → the authoritative TOU (peak day / off-peak night).
         #   non-IOG fallback (no TOU passed) → the priced/stored house rate, byte-identical.
         _stored_h = house_seg.get(hh, house_mr.get(hh))
-        if capped and hh in ev_rate:
+        if hh in house_corrected and _stored_h is not None:
+            # 4.5.21: a corrected half-hour draws its corrected rate. The correction rewrites
+            # the block's segments to the new rate but not their band label, so without this
+            # the line fell to the schedule (peak) over a half-hour corrected to off-peak —
+            # unless an EV segment happened to carry the slot (21 Jul 2026, 05:30 vs 16:00).
+            house[hh] = round(_stored_h, 6)
+        elif capped and hh in ev_rate:
             house[hh] = round(ev_rate[hh], 6)
         elif hh in ev_rate and _stored_h is not None:
             # PRE-CAP (legacy Intelligent), slot with a dispatch: what the half-hour was
