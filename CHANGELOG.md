@@ -1,5 +1,30 @@
 # Changelog
  
+## [4.5.22] — 2026-10-09
+
+*Waiting for the supplier to correct itself.* Since VAT on home energy went to 0% on 1 October,
+Octopus's half-hourly cost figures have still included 5%, even though its tariff rates and its
+statements are right. Half-hours the add-on settled from those figures carry the extra 5%.
+
+### Fixed
+
+- **Half-hours settled from Octopus's October cost data are corrected once Octopus restates
+  them.** On Intelligent Octopus tariffs the add-on settles half-hours against the cost Octopus
+  reports for them: smart-charge half-hours on every Intelligent tariff and, where Octopus provides
+  the device breakdown, every half-hour once it has been billed. From 1 October those figures
+  still included 5% VAT, so those half-hours cost 5% more than they should, and the Billing Chart Summary's VAT line showed a mix
+  of 0% and 5% days. Your Octopus statement is correct. On accounts with an export meter most of
+  these half-hours already corrected themselves once the export reading arrived; without one,
+  they stayed at 5%.
+
+  Octopus is re-running its costing. Previously the add-on never asked again for a half-hour it
+  already had, so the corrected figures could not reach it. Now it watches for them: when newly
+  settled half-hours start agreeing with the add-on's VAT calendar, it checks every half-hour
+  since 1 October again. Only when **all** of them agree does it store Octopus's corrected figures
+  and re-settle the affected half-hours, in one pass. Until then nothing changes, and it checks
+  again once a day. The add-on never substitutes its own VAT figure for Octopus's; it only uses
+  the calendar to recognise when Octopus's figures are right again.
+
 ## [4.5.21] — 2026-10-07
 
 *Whose grid was it?* When an EV and a home battery charged at the same time, the battery could be
