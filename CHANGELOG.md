@@ -1,5 +1,26 @@
 # Changelog
  
+## [4.5.23] — 2026-10-12
+
+*Not settled until the car is on the bill.* Octopus can take a day or two longer to attribute a
+smart charge to your car than to bill the half-hour.
+
+### Fixed
+
+- **An overnight smart charge no longer loses its EV share when Octopus is slow to attribute it.**
+  On Intelligent Octopus tariffs with the device breakdown, the add-on settles each half-hour
+  against Octopus's own Home / EV split once Octopus has billed it. On 10 October, Octopus's first
+  answer for the night put every charging half-hour on the house, with no EV at all, and charged
+  05:30–06:00 at the standard rate. Days later it showed the true split, all at the low rate, but
+  the add-on only ever asks once, so it kept the first answer. That night's car charging showed
+  as house use, and its last half-hour was billed at the standard rate.
+
+  Now, when Octopus's split has no EV for a half-hour in which the add-on saw your car charge, the
+  add-on keeps its own split and asks Octopus again on later passes. It settles from Octopus as
+  soon as the car appears. If Octopus still shows no EV 28 days later, the add-on stops asking
+  and keeps its own split. On update, half-hours already settled this way are fetched again
+  once, and settled from Octopus's corrected figures where it now has them.
+
 ## [4.5.22] — 2026-10-09
 
 *Waiting for the supplier to correct itself.* Since VAT on home energy went to 0% on 1 October,
