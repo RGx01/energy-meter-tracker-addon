@@ -10947,6 +10947,12 @@ async def _tick_dispatch_capture() -> None:
             await run_ev_bucket_refetch()
         except Exception as e:
             logger.warning("_tick_dispatch_capture: ev bucket refetch failed: %s", e)
+        # One-off (4.5.23): the same re-fetch for bills cached with no EV against a completed
+        # dispatch before the hold-back existed (2026-10-10). Gated + self-marking.
+        try:
+            await run_bill_split_refetch()
+        except Exception as e:
+            logger.warning("_tick_dispatch_capture: bill split refetch failed: %s", e)
         try:
             run_settled_ev_split_heal()
         except Exception as e:
@@ -11452,6 +11458,7 @@ _SMB_DEVICE_RECOST_DONE_KEY = "smb_device_recost_done"   # one-off (4.5.7); remo
 _SMB_EV_RESPLIT_DONE_KEY = "smb_ev_resplit_done"   # one-off (4.5.9); removed in v5.0.0
 _SMB_DEVICE_COST_CLIP_DONE_KEY = "smb_device_cost_clip_done"   # one-off (4.5.15); removed in v5.0.0
 _EV_BUCKET_REFETCH_DONE_KEY = "ev_bucket_refetch_done"       # one-off (4.5.16); removed in v5.0.0
+_BILL_SPLIT_REFETCH_DONE_KEY = "bill_split_refetch_done"     # one-off (4.5.23); removed in v5.0.0
 _BAND_SNAP_DONE_KEY = "band_rate_snap_done_v2"   # one-off (4.5.13); removed in v5.0.0
 # _v2: the v1 pass wrote bands from the RATE alone. It had no attribution filter, so it
 # relabelled EV segments the four-bucket machinery owns; it overwrote bands that were
@@ -12540,7 +12547,7 @@ async def measure_settled_dispatched_blocks() -> dict:
         return {}
     try:
         rows = store._conn.execute(
-            """SELECT b.block_start, b.imp_kwh, b.imp_rate, b.imp_cost
+            """SELECT b.block_start, b.imp_kwh, b.imp_rate, b.imp_cost, b.imp_kwh_ev
                FROM blocks b
                WHERE b.meter_id = 'electricity_main' AND b.imp_kwh_api IS NOT NULL
                  AND b.rate_corrected = 0
@@ -12557,8 +12564,11 @@ async def measure_settled_dispatched_blocks() -> dict:
     if not rows:
         return {}
     by_start = {r["block_start"]: r for r in rows}
+    _wait = _bill_split_wait(store)                # 4.5.23: bills held back, still being asked
+    _wait_before = dict(_wait)
+    _kept = _bill_split_kept(store, _wait)
     missing = store.measured_slots_missing(
-        list(by_start.keys()), mpan=mpan)[:_MEASURED_MAX_PER_PASS]
+        [s for s in by_start if s not in _kept], mpan=mpan)[:_MEASURED_MAX_PER_PASS]
     if not missing:
         return {"candidates": len(rows), "fetched": 0}
 
@@ -12569,7 +12579,7 @@ async def measure_settled_dispatched_blocks() -> dict:
             return 0.0
 
     _use_buckets = _import_is_smb_capped()
-    n_store = n_absent = n_mixed = n_zero = 0
+    n_store = n_absent = n_mixed = n_zero = n_held = 0
     _fetched_pairs: list = []          # 4.5.22 (#505): (slot, cost_incl, cost_excl) for the hint
     if _use_buckets:
         # IOG-SMB: authoritative four-bucket read (cost + split + band), ONE small-window
@@ -12611,6 +12621,12 @@ async def measure_settled_dispatched_blocks() -> dict:
                 else:
                     n_absent += 1
                 continue
+            if _bill_drops_ev(by_start[slot]["imp_kwh_ev"], _ek):
+                # 4.5.23: the bill has not attributed the car yet — keep EMT's split, ask again.
+                _bill_split_hold(store, _wait, slot)
+                n_held += 1
+                continue
+            _bill_split_release(store, _wait, slot)
             _hre, _ere = node.get("home_rate_exc"), node.get("ev_rate_exc")
             cost_excl = (round(_hk * _n(_hre) + _ek * _n(_ere), 6)
                          if (_hre is not None or _ere is not None) else None)
@@ -12650,14 +12666,17 @@ async def measure_settled_dispatched_blocks() -> dict:
             _fetched_pairs.append((slot, node.get("cost_incl"), node.get("cost_excl")))
             n_store += 1
     _vat_resync_note_fetch(store, _fetched_pairs)   # 4.5.22 (#505): has Octopus restated?
+    if _wait != _wait_before:
+        _bill_split_wait_save(store, _wait)
     # BL-70: `zero` and `absent` were one counter, which made the log self-contradictory —
     # "recovered 11/11" on one line and "absent=11" on the next. They mean opposite things:
     # zero = the bill stated nothing was drawn; absent = the bill said nothing at all.
     logger.info("measure_settled: candidates=%d fetched=%d stored=%d mixed=%d zero=%d "
-                "absent=%d (source=%s, apply=%s)", len(rows), len(missing), n_store, n_mixed,
-                n_zero, n_absent, "buckets" if _use_buckets else "single-cost", _MEASURED_APPLY)
+                "absent=%d held=%d (source=%s, apply=%s)", len(rows), len(missing), n_store,
+                n_mixed, n_zero, n_absent, n_held, "buckets" if _use_buckets else "single-cost",
+                _MEASURED_APPLY)
     return {"candidates": len(rows), "fetched": len(missing), "stored": n_store,
-            "mixed": n_mixed, "zero": n_zero, "absent": n_absent}
+            "mixed": n_mixed, "zero": n_zero, "absent": n_absent, "held": n_held}
 
 
 # ── 4.5.22 (#505): pick up Octopus's restated costs after a VAT change ────────────────────
@@ -12826,9 +12845,15 @@ async def run_measured_vat_resync() -> dict:
         _vat_resync_save(store, st)
         return {"ok": False, "reason": "fetch_failed"}
     rows, wrong, unverified = {}, [], []
+    # 4.5.23: a re-fetch that drops the car from a half-hour whose cached bill had it is not a
+    # settled answer either — treat it as unverified, so nothing is overwritten (it waits a day).
+    cached_ev = {r[0]: r[1] for r in store._conn.execute(
+        "SELECT slot_start, ev_kwh FROM measured_cost WHERE mpan = ? AND direction = 'CONSUMPTION' "
+        "AND slot_start >= ?", (mpan, key)).fetchall()}
     for slot in slots:
         row = _vat_resync_row((fetched or {}).get(slot), use_buckets)
-        if row is None:
+        if row is None or (row.get("breakdown")
+                           and _bill_drops_ev(cached_ev.get(slot), row["breakdown"][2])):
             unverified.append(slot)
             continue
         rows[slot] = row
@@ -12951,7 +12976,7 @@ async def run_measured_history_drain(max_batches: int = 5000) -> dict:
     settled = 0
     for _ in range(max_batches):
         rows = store._conn.execute(
-            "SELECT b.block_start FROM blocks b WHERE b.meter_id = 'electricity_main' "
+            "SELECT b.block_start, b.imp_kwh_ev FROM blocks b WHERE b.meter_id = 'electricity_main' "
             "  AND b.imp_kwh > 0 "
             "  AND " + _SETTLEABLE_SQL + " "
             "  AND b.block_start >= ? AND b.block_start > ? AND b.block_start < ? "
@@ -12959,9 +12984,16 @@ async def run_measured_history_drain(max_batches: int = 5000) -> dict:
             "  AND NOT EXISTS (SELECT 1 FROM measured_cost mc WHERE mc.slot_start = b.block_start) "
             "ORDER BY b.block_start ASC LIMIT ?",
             (floor, cursor, cutoff, _MEASURED_MAX_PER_PASS)).fetchall()
-        missing = [r["block_start"] for r in rows]
-        if not missing:
+        if not rows:
             break
+        cursor = rows[-1]["block_start"]
+        emt_ev = {r["block_start"]: r["imp_kwh_ev"] for r in rows}
+        _wait = _bill_split_wait(store)            # 4.5.23: bills held back, still being asked
+        _wait_before = dict(_wait)
+        _kept = _bill_split_kept(store, _wait)
+        missing = [s for s in emt_ev if s not in _kept]
+        if not missing:
+            continue
         try:
             bd = await _kraken_client.recover_device_breakdown(mpan, missing)
         except Exception as e:
@@ -12977,6 +13009,10 @@ async def run_measured_history_drain(max_batches: int = 5000) -> dict:
             cost_incl = round(_n(node.get("home_cost")) + _n(node.get("ev_cost")), 6)
             if cost_incl <= 0 and (_hk + _ek) <= 1e-9:
                 continue
+            if _bill_drops_ev(emt_ev.get(slot), _ek):
+                _bill_split_hold(store, _wait, slot)   # 4.5.23: keep EMT's split, ask again
+                continue
+            _bill_split_release(store, _wait, slot)
             _hre, _ere = node.get("home_rate_exc"), node.get("ev_rate_exc")
             cost_excl = (round(_hk * _n(_hre) + _ek * _n(_ere), 6)
                          if (_hre is not None or _ere is not None) else None)
@@ -12994,7 +13030,8 @@ async def run_measured_history_drain(max_batches: int = 5000) -> dict:
         # 4.5.22 (#505): on IOG-SMB this drain settles every half-hour, dispatched or not, so its
         # newly fetched slots are a hint source too.
         _vat_resync_note_fetch(store, _batch_pairs)
-        cursor = missing[-1]
+        if _wait != _wait_before:
+            _bill_split_wait_save(store, _wait)
         if stored:
             settled += stored
             try:
@@ -13015,6 +13052,10 @@ def _measured_history_backlog() -> int:
         return 0
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     cutoff = (_dt.now(_tz.utc).replace(tzinfo=None) - _td(hours=_RECONCILE_SETTLE_HOURS)).isoformat()
+    # 4.5.23: a slot whose bill is held back is not backlog — it would reschedule the drain every
+    # tick. The live pass keeps asking for it (its split came from a dispatch, so it is a live
+    # candidate), and the drain still retries it whenever other backlog runs it.
+    held = sorted(_bill_split_wait(store))
     try:
         return int(store._conn.execute(
             "SELECT COUNT(*) FROM blocks b WHERE b.meter_id = 'electricity_main' "
@@ -13022,13 +13063,88 @@ def _measured_history_backlog() -> int:
             "  AND " + _SETTLEABLE_SQL + " "
             "  AND b.block_start >= ? AND b.block_start < ? "
             "  AND (b.rate_source IS NULL OR b.rate_source NOT IN ('measured','corrected')) "
-            "  AND NOT EXISTS (SELECT 1 FROM measured_cost mc WHERE mc.slot_start = b.block_start)",
-            (_measured_floor(), cutoff)).fetchone()[0])
+            "  AND NOT EXISTS (SELECT 1 FROM measured_cost mc WHERE mc.slot_start = b.block_start)"
+            + (" AND b.block_start NOT IN (%s)" % ",".join("?" * len(held)) if held else ""),
+            (_measured_floor(), cutoff, *held)).fetchone()[0])
     except Exception:
         return 0
 
 
-async def run_ev_bucket_refetch(force: bool = False) -> dict:
+# ── 4.5.23: a bill that drops the car's half-hour is not settled yet ────────────────────────
+# On 2026-10-10 Octopus's device breakdown, fetched ~29 h after the night, put every dispatched
+# half-hour wholly on the house (EV 0 kWh) and billed 05:30-06:00 BST at the standard rate; days
+# later it served the true split, all at the low rate. EMT caches a breakdown once and
+# applies it as the authority, so the provisional answer replaced EMT's own EV split for good.
+# Now: where EMT's split has the car drawing and the bill says the EV drew nothing, the bill is
+# HELD BACK — not cached, not applied, EMT's split kept — and asked again on later passes. If
+# Octopus still says so 28 days after the half-hour, EMT stops asking and keeps its own split.
+_BILL_SPLIT_WAIT_KEY = "bill_split_wait"    # JSON {slot: {"first": iso, "kept": iso?}}
+_BILL_SPLIT_WAIT_DAYS = 28
+_BILL_SPLIT_EMT_MIN_KWH = 0.05              # EMT's EV split below this is no evidence of a charge
+
+
+def _bill_drops_ev(emt_ev_kwh, bill_ev_kwh) -> bool:
+    """The bill's breakdown has no EV where EMT's own split has the car drawing."""
+    try:
+        emt = float(emt_ev_kwh or 0.0)
+        bill = float(bill_ev_kwh or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return emt > _BILL_SPLIT_EMT_MIN_KWH and bill <= 1e-9
+
+
+def _bill_split_wait(store) -> dict:
+    import json as _json
+    try:
+        w = _json.loads(store.get_kraken_state(_BILL_SPLIT_WAIT_KEY) or "{}")
+        return w if isinstance(w, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def _bill_split_wait_save(store, w: dict) -> None:
+    import json as _json
+    store.set_kraken_state(_BILL_SPLIT_WAIT_KEY, _json.dumps(w, sort_keys=True))
+
+
+def _bill_split_kept(store, w: dict) -> set:
+    """Slots held back for 28 days and more: EMT keeps its split and stops asking. Marks (and logs)
+    each one once, the first time it is seen past the limit."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    limit = (_dt.now(_tz.utc).replace(tzinfo=None) - _td(days=_BILL_SPLIT_WAIT_DAYS)).isoformat()
+    kept, changed = set(), False
+    for slot, ent in w.items():
+        if slot >= limit:
+            continue
+        kept.add(slot)
+        if isinstance(ent, dict) and not ent.get("kept"):
+            ent["kept"] = _dt_now_iso_safe()
+            changed = True
+            logger.warning("bill split (4.5.23): after %d days Octopus's breakdown for %s still has "
+                           "no EV where the car drew — keeping EMT's own split for it",
+                           _BILL_SPLIT_WAIT_DAYS, slot)
+    if changed:
+        _bill_split_wait_save(store, w)
+    return kept
+
+
+def _bill_split_hold(store, w: dict, slot: str) -> None:
+    if slot not in w:
+        w[slot] = {"first": _dt_now_iso_safe()}
+        logger.info("bill split (4.5.23): Octopus's breakdown for %s has no EV where EMT's split has "
+                    "the car drawing — holding it back and asking again later (up to %d days)",
+                    slot, _BILL_SPLIT_WAIT_DAYS)
+
+
+def _bill_split_release(store, w: dict, slot: str) -> None:
+    if w.pop(slot, None) is not None:
+        logger.info("bill split (4.5.23): Octopus's breakdown for %s now carries the EV — settled",
+                    slot)
+
+
+async def run_ev_bucket_refetch(force: bool = False, *,
+                                marker: str = _EV_BUCKET_REFETCH_DONE_KEY,
+                                why: str = "#481") -> dict:
     """One-off #481 recovery: re-fetch breakdowns cached while the bucket labels were
     unrecognised. Gated (`ev_bucket_refetch_done`), self-marking; retires in v5.0.0.
 
@@ -13047,11 +13163,14 @@ async def run_ev_bucket_refetch(force: bool = False) -> dict:
     SCOPE: `ev_kwh = 0` on a slot that has a COMPLETED dispatch — i.e. rows that are
     demonstrably wrong, because the car provably drew in that half-hour. A day the car did
     not charge has no completed dispatch and is never touched. Cost-neutral: cost comes
-    from the billed amount, which the rename never affected."""
+    from the billed amount, which the rename never affected.
+
+    4.5.23 re-arms it under its own marker (run_bill_split_refetch): `marker` and `why` name the
+    one-off running it."""
     store = _store
     if store is None or _kraken_client is None:
         return {"ok": False, "reason": "no store/client"}
-    if not force and store.get_kraken_state(_EV_BUCKET_REFETCH_DONE_KEY):
+    if not force and store.get_kraken_state(marker):
         return {"ok": True, "skipped": "already done"}
     if not _import_is_smb_capped():
         return {"ok": True, "skipped": "not applicable"}
@@ -13073,10 +13192,10 @@ async def run_ev_bucket_refetch(force: bool = False) -> dict:
         return {"ok": False, "reason": "query_failed"}
     slots = [r["slot_start"] for r in rows]
     if not slots:
-        store.set_kraken_state(_EV_BUCKET_REFETCH_DONE_KEY, _dt_now_iso_safe())
+        store.set_kraken_state(marker, _dt_now_iso_safe())
         return {"ok": True, "refetched": 0, "restored": 0}
-    logger.info("ev bucket refetch (#481): %d slot(s) cached with a zero EV bucket against "
-                "a completed dispatch — re-fetching under the corrected parser", len(slots))
+    logger.info("ev bucket refetch (%s): %d slot(s) cached with a zero EV bucket against "
+                "a completed dispatch — re-fetching", why, len(slots))
     try:
         bd = await _kraken_client.recover_device_breakdown(mpan, slots)
     except Exception as e:
@@ -13115,14 +13234,24 @@ async def run_ev_bucket_refetch(force: bool = False) -> dict:
             slot, mpan=mpan, home_kwh=_hk, home_rate=node.get("home_rate"),
             ev_kwh=_ek, ev_rate=node.get("ev_rate"))
         restored += 1
-    store.set_kraken_state(_EV_BUCKET_REFETCH_DONE_KEY, _dt_now_iso_safe())
+    store.set_kraken_state(marker, _dt_now_iso_safe())
     res = {"ok": True, "candidates": len(slots), "refetched": restored,
            "still_house_only": unchanged, "absent": absent}
-    logger.info("ev bucket refetch (#481): %s — run_settled_ev_split_heal will restore the "
-                "block splits on the next tick", res)
+    logger.info("ev bucket refetch (%s): %s — run_settled_ev_split_heal will restore the "
+                "block splits on the next tick", why, res)
     if restored:
         _schedule_chart_regen()
     return res
+
+
+async def run_bill_split_refetch(force: bool = False) -> dict:
+    """One-off (4.5.23): re-fetch the bills cached before 4.5.23 that put a dispatched half-hour
+    wholly on the house — what 2026-10-10's provisional breakdown did, before Octopus attributed the
+    car (see _BILL_SPLIT_WAIT_KEY). The same pass as #481's, under its own marker: where Octopus
+    now serves the EV, the cached row is replaced and run_settled_ev_split_heal re-settles the
+    block, cost and split; where it still says house, nothing changes. Gated, self-marking;
+    retires in v5.0.0."""
+    return await run_ev_bucket_refetch(force, marker=_BILL_SPLIT_REFETCH_DONE_KEY, why="4.5.23")
 
 
 def run_settled_ev_split_heal(limit: int = 2000) -> dict:
