@@ -418,6 +418,19 @@ def _build_schedule_and_diag(records, product_code, tariff_code, vat):
 _AGREEMENT_SCHED_CACHE: dict = {}
 
 
+def _agreement_ended(ag_vt) -> bool:
+    """Whether an agreement is over — its `valid_to` (naive-UTC iso) is in the past — so its
+    schedule can no longer change and may be cached for the life of the process.
+
+    Having a `valid_to` is not enough (4.5.24): a fixed-term agreement still in force has one, and
+    IOG-SMB's windows are synthesised only up to now + `_IOG_SYNTH_HORIZON_DAYS` (BL-52), so the
+    copy cached when the add-on started stopped two days later — and the measured-cost apply
+    refused every bill after that, for want of a rate to snap to."""
+    if not ag_vt:
+        return False
+    return str(ag_vt) <= datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0).isoformat()
+
+
 def _clip_periods(periods, ag_vf, ag_vt):
     """Clip (vfrom, vto, rate) periods to the agreement window [ag_vf, ag_vt)."""
     out = []
@@ -458,7 +471,7 @@ async def build_agreement_stitched_schedule(client, agreements, *, vat) -> "Rate
                 ag_vt = normalise_to_naive_utc(vt_raw)
             except ValueError:
                 ag_vt = None
-        is_open = ag_vt is None
+        is_open = not _agreement_ended(ag_vt)        # running, or open-ended: rebuilt every refresh
         ckey = (tc, vf_raw, vt_raw)
         ag_sched = None if is_open else _AGREEMENT_SCHED_CACHE.get(ckey)
         if ag_sched is None:
