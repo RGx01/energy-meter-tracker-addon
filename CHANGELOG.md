@@ -1,5 +1,24 @@
 # Changelog
  
+## [4.5.24] — 2026-10-18
+
+*Keeping the tariff up to date while the add-on keeps running.*
+
+### Fixed
+
+- **Octopus's billed costs are applied again, however long the add-on has been running.** On
+  Intelligent Octopus tariffs with the device breakdown, the add-on settles each half-hour by
+  applying Octopus's own billed cost, snapped to your tariff's off-peak or peak rate for that day.
+  On a fixed-term tariff, the add-on worked out those day and night rates once when it started,
+  and only for the next two days. After that it found no rate for newer days, so it stopped
+  applying bills. It said nothing in the log, and those half-hours stayed on the add-on's own
+  estimate. Restarting the add-on, or installing an update, fixed it again for two days, which is
+  why it went unnoticed while October's VAT updates were coming out every few days.
+
+  Now the add-on works out the rates for a running tariff again every time it refreshes them.
+  Bills that were already fetched but not applied are applied on the first refresh after the
+  update.
+
 ## [4.5.23] — 2026-10-12
 
 *Not settled until the car is on the bill.* Octopus can take a day or two longer to attribute a
