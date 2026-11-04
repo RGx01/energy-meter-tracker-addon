@@ -748,13 +748,42 @@ class KrakenAPIClient:
         return "-".join(middle) if middle else None
 
     @staticmethod
-    def _current_agreement(agreements: list[dict]) -> Optional[dict]:
-        """Pick the active agreement (valid_to is null), else the latest."""
+    def _current_agreement(agreements: list[dict], now=None) -> Optional[dict]:
+        """The agreement in force `now` (UTC; the clock's by default): started, and not ended — an open
+        one, or a fixed-term one whose `valid_to` is to come. A zero-length agreement (`valid_to` at
+        or before `valid_from`, a blip Octopus lists) is never in force; of several in force, the
+        latest start. With none in force, the latest started one, blips left out; else the latest.
+
+        4.5.25 (found in v5, 4 Nov 2026, a beta tester's support file): it was "the one with no
+        valid_to, else the latest start". Every agreement of a fixed-term tariff has a valid_to, and a
+        zero-length Agile blip two days after an IOG-SMB loyalty fixed started was "the latest" — so
+        discovery read the account as on Agile: `_import_is_smb_capped` went false and the bill passes
+        stopped, and the live half-hours took the blip's standing charge. An open renewal starting in
+        the future was taken over the agreement running, too."""
         if not agreements:
             return None
-        live = [a for a in agreements if not a.get("valid_to")]
-        if live:
-            return live[0]
+        from datetime import datetime, timezone
+
+        def _t(v):
+            if not v:
+                return None
+            try:
+                d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        rows = [(a, _t(a.get("valid_from")), _t(a.get("valid_to"))) for a in agreements]
+        real = [r for r in rows if r[1] is not None and (r[2] is None or r[2] > r[1])]
+        on = [r for r in real if r[1] <= now and (r[2] is None or now < r[2])]
+        if on:
+            return max(on, key=lambda r: r[1])[0]
+        started = [r for r in real if r[1] <= now]
+        if started:
+            return max(started, key=lambda r: r[1])[0]
         return sorted(agreements, key=lambda a: a.get("valid_from") or "")[-1]
 
     async def auto_discover(self, account_number: Optional[str] = None) -> dict:
