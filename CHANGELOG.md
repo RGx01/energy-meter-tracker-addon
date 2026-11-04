@@ -1,5 +1,27 @@
 # Changelog
  
+## [4.5.25] — 2026-11-04
+
+*The tariff you are on today.*
+
+### Fixed
+
+- **The add-on recognises your current tariff when Octopus lists an empty agreement after it.**
+  Octopus sometimes lists an agreement on your account that starts and ends at the same moment.
+  Seen so far after a switch to an Intelligent Octopus loyalty tariff, where an Agile agreement
+  showed up two days after it began. The add-on decided which tariff you're on now by taking the
+  agreement with no end date, or else the one that started last. Every agreement on a fixed-term
+  tariff has an end date, so it picked the empty one, and treated the account as on Agile:
+  - on Intelligent Octopus tariffs with the device breakdown, it stopped fetching and applying
+    Octopus's billed costs, so smart charges outside the night window stayed at the day rate;
+  - new half-hours took that tariff's standing charge, a few pence a day out.
+
+  It also took a renewal that hasn't started yet over the tariff you're on.
+
+  Now the add-on picks the agreement in force today, and never an empty one. Within an hour of
+  the update, it fetches Octopus's bills for the half-hours since your current tariff
+  began and applies them. Standing charges already recorded on those days are left as they are.
+
 ## [4.5.24] — 2026-10-18
 
 *Keeping the tariff up to date while the add-on keeps running.*
