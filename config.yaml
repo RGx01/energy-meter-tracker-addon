@@ -1,0 +1,71 @@
+name: "Energy Meter Tracker"
+description: "Electricity metering engine with configurable reconciliation periods, sub-meter support, gap filling, and billing charts"
+version: "4.5.25"
+slug: "energy_meter_tracker"
+init: false
+startup: application
+boot: auto
+arch:
+  - aarch64
+  - amd64
+
+# ── Persistent storage ────────────────────────────────────────────────────────
+# /data  → add-on private storage (blocks.db — single SQLite database)
+# /share → shared with HA so charts are accessible via /local/
+map:
+  - data:rw
+  - share:rw
+
+# ── Network ───────────────────────────────────────────────────────────────────
+# KEY = port INSIDE the container (always 8099 — the server binds this).
+# VALUE = port published on the HOST. Change only the VALUE to avoid a clash with
+# another instance; clear it entirely if you only use ingress.
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: "Web UI (direct access)"
+
+# ── Ingress ───────────────────────────────────────────────────────────────────
+# Enables the "Show in sidebar" toggle and embedded UI in HA
+ingress: true
+# Container-side port. Identical across instances — each add-on has its own
+# network namespace, so ingress can never collide. Only the HOST publish above can.
+ingress_port: 8099
+
+# ── HA API access ─────────────────────────────────────────────────────────────
+# Required for WebSocket + REST API calls to HA
+hassio_api: true
+homeassistant_api: true
+auth_api: true
+
+# ── Supervisor token ──────────────────────────────────────────────────────────
+# Injected automatically as SUPERVISOR_TOKEN env var — used by ha_client.py
+hassio_role: default
+
+# ── Panel (optional — adds a sidebar link to the config UI) ──────────────────
+panel_icon: "mdi:speedometer"
+panel_title: "Energy Meter"
+
+# ── Options schema ────────────────────────────────────────────────────────────
+# Minimal top-level options — meter config is managed via the UI, not here
+options:
+  log_level: "info"
+  ha_url: ""
+  ha_token: ""
+  timezone: "UTC"
+  # Meter reconciliation period in minutes (5, 15 or 30).
+  # Set once before data collection begins — cannot be changed without clearing data.
+  block_minutes: 30
+  # Optional label shown in the EMT footer to tell instances apart. Leave blank
+  # to use the add-on name (from config.yaml). Set it per instance — e.g. "Prod"
+  # / "Dev" — when two installs share the same add-on name (the repo-URL
+  # workaround), since it's a per-install setting, not stored in the database.
+  instance_name: ""
+
+schema:
+  log_level: "list(debug|info|warning|error)"
+  ha_url: "str?"
+  ha_token: "str?"
+  timezone: "str?"
+  block_minutes: "int?"  # Meter reconciliation period (5, 15 or 30)
+  instance_name: "str?"

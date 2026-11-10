@@ -1,0 +1,31 @@
+
+# VCS / CI / build metadata
+.git/
+.gitignore
+.github/
+.dockerignore
+Dockerfile
+Dockerfile.standalone
+run_tests.sh
+ 
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+ 
+# Tests (now under tests/ — old "test_*.py" no longer matched these)
+tests/
+test_*.py
+test_harness.log
+test_results.json
+ 
+# Docs & design notes — HA reads README/CHANGELOG from the repo, not the image
+*.md
+LICENSE
+ 
+# Store screenshots (~4 MB) — referenced by the README, never served at runtime
+screenshots/
+ 
+# Misc
+*.zip
+.DS_Store

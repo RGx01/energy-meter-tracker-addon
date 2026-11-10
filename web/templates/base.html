@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <script>
+    (function() {
+      var stored = localStorage.getItem('emt_chart_theme');
+      var sys = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', stored || sys);
+    })();
+  </script>
+  <meta charset="UTF-8">
+    <!-- Inline data-URI favicon: no separate request or path to resolve, so it
+         renders identically across ingress/standalone and every environment,
+         and sidesteps Safari's URL-keyed favicon cache (issue #249). -->
+    <link rel="icon" type="image/png" href="data:image/png;base64,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">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Energy Meter Tracker</title>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #f0f2f5;
+      --surface:   #ffffff;
+      --border:    #d0d5dd;
+      --accent:    #0a8c6a;
+      --accent2:   #5a48c7;
+      --text:      #1a1d27;
+      --muted:     #555970;
+      --danger:    #c0392b;
+      --success:   #1a7a3c;
+      --warning:   #b45309;
+      --nav-w:     220px;
+      --radius:    6px;
+      --mono:      'Courier New', Courier, monospace;
+      --sans:      -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    }
+
+    [data-theme="dark"] {
+      --bg:        #0f1117;
+      --surface:   #1a1d27;
+      --border:    #2a2d3a;
+      --accent:    #00d4aa;
+      --accent2:   #7c6af7;
+      --text:      #e8eaf0;
+      --muted:     #6b7080;
+      --danger:    #f05252;
+      --success:   #22c55e;
+      --warning:   #f59e0b;
+    }
+
+    [data-theme="light"] {
+      --bg:        #f0f2f5;
+      --surface:   #ffffff;
+      --border:    #d0d5dd;
+      --accent:    #0a8c6a;
+      --accent2:   #5a48c7;
+      --text:      #1a1d27;
+      --muted:     #555970;
+      --danger:    #c0392b;
+      --success:   #1a7a3c;
+      --warning:   #b45309;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    body {
+      overflow: hidden; /* prevent body scroll — content areas scroll individually */
+    }
+
+    /* ── Layout ── */
+    .layout {
+      display: flex;
+      min-height: 100vh;
+    }
+
+    /* ── Sidebar ── */
+    .sidebar {
+      width: var(--nav-w);
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      position: fixed;
+      top: 0; left: 0; bottom: 0;
+      z-index: 10;
+    }
+
+    .sidebar-brand {
+      padding: 20px 16px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .sidebar-brand img.logo {
+      width: 180px;
+      height: auto;
+      display: block;
+      transition: filter 0.3s ease;
+    }
+    [data-theme="light"] .sidebar-brand img.logo {
+      filter: invert(1) hue-rotate(150deg);
+    }
+
+    .sidebar-brand p {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 6px;
+    }
+
+    nav {
+      padding: 16px 12px;
+      flex: 1;
+    }
+
+    nav a {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 12px;
+      border-radius: var(--radius);
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 500;
+      transition: background 0.15s, color 0.15s;
+      margin-bottom: 2px;
+    }
+
+    nav a:hover {
+      background: rgba(255,255,255,0.05);
+      color: var(--text);
+    }
+
+    nav a.active {
+      background: rgba(0, 212, 170, 0.1);
+      color: var(--accent);
+    }
+
+    nav a .nav-icon { font-size: 16px; width: 20px; text-align: center; }
+
+    .meter-reset-banner {
+      display: none;
+      background: #f97316; color: #fff;
+      padding: 10px 16px; font-size: 13px;
+      border-bottom: 1px solid rgba(0,0,0,0.15);
+      align-items: center; gap: 12px; flex-wrap: wrap;
+    }
+
+    /* ── Global notification region (BL-6, fixes #219) ──────────────────────
+       Sits IN FLOW between the topbar and the scrolling .content, as a flex
+       sibling. Content is therefore pushed down, never covered — which is the
+       actual fix for #219 (a position:fixed toast painting over the tab row).
+       Because only .content scrolls, the region stays visible when scrolled.
+       Zero height when empty, so pages with no messages are unchanged. */
+    .notif-region {
+      flex: 0 0 auto;
+      display: flex;
+      flex-direction: column;
+    }
+    .notif-region:empty { display: none; }
+    .notif {
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      padding: 10px 24px; font-size: 13px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface); color: var(--text);
+    }
+    .notif a { color: inherit; font-weight: 600; text-decoration: underline; }
+    .notif .notif-msg { flex: 1; min-width: 0; }
+    .notif button {
+      background: rgba(255,255,255,0.16); color: inherit; border: 0;
+      border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer;
+    }
+    .notif.success { background: rgba(0,212,170,0.16); color: var(--accent);
+                     border-bottom-color: rgba(0,212,170,0.35); }
+    .notif.info    { background: rgba(70,140,230,0.16); color: #6aa6f0;
+                     border-bottom-color: rgba(70,140,230,0.35); }
+    .notif.warn    { background: rgba(230,160,30,0.16); color: #e0a020;
+                     border-bottom-color: rgba(230,160,30,0.35); }
+    .notif.critical{ background: rgba(220,60,60,0.18); color: #e05555;
+                     border-bottom-color: rgba(220,60,60,0.45); }
+    @media (max-width: 768px) { .notif { padding: 9px 14px; font-size: 12px; } }
+    .meter-reset-banner.visible { display: flex; }
+    .meter-reset-banner a { color: #fff; font-weight: 600; text-decoration: underline; }
+    .meter-reset-banner button { background: rgba(0,0,0,0.2); border: none; color: #fff;
+      padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+
+    .sidebar-footer {
+      padding: 16px 20px;
+      border-top: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+
+    /* ── Main content ── */
+    .main {
+      margin-left: var(--nav-w);
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+
+    .topbar {
+      padding: 12px 24px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: var(--surface);
+      flex-shrink: 0; /* never compress — always full height */
+    }
+
+    .settings-tabs {
+      display: flex;
+      gap: 8px;
+    }
+    .settings-tab {
+      padding: 7px 16px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--muted);
+      font-size: 13px;
+      font-family: var(--sans);
+      cursor: pointer;
+      text-decoration: none;
+      transition: all 0.15s;
+    }
+    .settings-tab:hover { background: rgba(255,255,255,0.05); color: var(--text); }
+    .settings-tab.active { background: rgba(0,212,170,0.1); color: var(--accent); border-color: var(--accent); }
+
+    .settings-subbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 24px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .topbar h2 {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .topbar .sub {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 1px;
+    }
+
+    .content {
+      padding: 16px 24px;
+      flex: 1;
+      min-width: 0;
+      overflow-y: auto;   /* content area scrolls, not the whole page */
+      overflow-x: hidden;
+    }
+
+    /* ── Cards ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+      margin-bottom: 12px;
+    }
+
+    .card-title {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    /* ── Buttons ── */
+    /* A disabled button must LOOK disabled. Without this a `disabled` .btn renders
+       identically to a live one — so a control the code has correctly locked still reads
+       as the thing to press, and clicking it does nothing (or is refused server-side).
+       Applies app-wide rather than per-screen so no future button can regress. */
+    .btn:disabled,
+    .btn[disabled] {
+      opacity: 0.45;
+      cursor: not-allowed;
+      filter: grayscale(35%);
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 16px;
+      border-radius: var(--radius);
+      font-size: 13px;
+      font-weight: 500;
+      font-family: var(--sans);
+      cursor: pointer;
+      border: 1px solid transparent;
+      transition: all 0.15s;
+      text-decoration: none;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #0f1117;
+      border-color: var(--accent);
+    }
+    .btn-primary:hover { filter: brightness(1.1); }
+
+    .btn-secondary {
+      background: transparent;
+      color: var(--text);
+      border-color: var(--border);
+    }
+    .btn-secondary:hover { background: rgba(255,255,255,0.05); }
+
+    .btn-danger {
+      background: transparent;
+      color: var(--danger);
+      border-color: var(--danger);
+    }
+    .btn-danger:hover { background: rgba(240,82,82,0.1); }
+
+    .btn-sm { padding: 5px 10px; font-size: 12px; }
+
+    /* ── Form elements ── */
+    .form-group { margin-bottom: 14px; }
+
+    label {
+      display: block;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--muted);
+      margin-bottom: 5px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    input[type=text], input[type=number], select, textarea {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 8px 12px;
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 13px;
+      transition: border-color 0.15s;
+      appearance: none;
+    }
+
+    input[type=text]:focus,
+    input[type=number]:focus,
+    select:focus,
+    textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    select option { background: var(--surface); }
+
+    input[type=checkbox] {
+      width: 16px; height: 16px;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+
+    .checkbox-row label {
+      margin: 0;
+      text-transform: none;
+      letter-spacing: 0;
+      font-size: 13px;
+      color: var(--text);
+      cursor: pointer;
+    }
+
+    /* ── Alerts ── */
+    .alert {
+      padding: 10px 16px;
+      border-radius: var(--radius);
+      font-size: 13px;
+      margin-bottom: 16px;
+      display: none;
+    }
+    .alert.show { display: block; }
+    .alert-success { background: rgba(34,197,94,0.1); border: 1px solid var(--success); color: var(--success); }
+    .alert-danger  { background: rgba(240,82,82,0.1);  border: 1px solid var(--danger);  color: var(--danger); }
+
+    /* ── Badge ── */
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 600;
+      font-family: var(--mono);
+    }
+    .badge-main { background: rgba(0,212,170,0.15); color: var(--accent); }
+    .badge-sub  { background: rgba(124,106,247,0.15); color: var(--accent2); }
+
+    /* ── Grid ── */
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+
+    /* ── Divider ── */
+    hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
+
+    /* ── Responsive ── */
+    /* ── Mobile — hamburger sidebar ── */
+    .hamburger {
+      display: none;
+      background: none;
+      border: none;
+      cursor: pointer;
+      padding: 4px 8px;
+      color: var(--text);
+      font-size: 22px;
+      line-height: 1;
+    }
+    .sidebar-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.5);
+      z-index: 9;
+    }
+    .sidebar-overlay.open { display: block; }
+
+    @media (max-width: 768px), (max-height: 500px) and (orientation: landscape) {
+      .hamburger { display: block; }
+      .sidebar {
+        position: fixed;
+        top: 0; left: 0; bottom: 0;
+        width: 240px;
+        transform: translateX(-100%);
+        transition: transform 0.25s ease;
+        z-index: 10;
+      }
+      .sidebar.open { transform: translateX(0); }
+      .main { margin-left: 0; }
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+      .content { padding: 16px; }
+      .topbar { padding: 8px 12px; }
+      .topbar h2 { font-size: 14px; }
+    }
+  </style>
+  {% block head %}{% endblock %}
+  <script>
+    // Ingress-aware base path — all fetch() calls should use this prefix
+    var BASE_PATH = "{{ request.environ.get('SCRIPT_NAME', '') }}";
+    function apiUrl(path) { return BASE_PATH + path; }
+    // Per-instance localStorage namespace (defined here in <head> so it exists
+    // before any page script runs). Multiple EMT instances in one browser share
+    // an origin, so a plain view-state key like 'emt_bar_state' collides across
+    // them — switching browser tabs made each instance adopt the last one's chart
+    // + scroll position. Suffixing view-state keys with a STABLE per-instance id
+    // keeps each instance's view its own. Browser-wide prefs (theme) stay global.
+    window.EMT = window.EMT || {};
+    EMT.instanceKey = ({{ instance_label|tojson }} || 'default')
+      .replace(/[^A-Za-z0-9_-]/g, '_') || 'default';
+    EMT.lsKey = function (name) { return name + '::' + EMT.instanceKey; };
+    // Human-readable byte size (shared: backup-ready confirmations, file lists).
+    EMT.fmtBytes = function (b) {
+      if (b == null) return '';
+      if (b >= 1048576) return (b / 1048576).toFixed(2) + ' MB';
+      if (b >= 1024)    return (b / 1024).toFixed(1) + ' KB';
+      return b + ' B';
+    };
+  </script>
+</head>
+<body>
+<div class="sidebar-overlay" id="sidebar-overlay" onclick="closeSidebar()"></div>
+<div class="layout">
+
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-brand">
+      <img class="logo" src="{{ url_for('serve_logo') }}" alt="Energy Meter Tracker" title="Toggle light/dark mode" style="cursor:pointer;" onclick="globalToggleTheme()" onerror="this.style.display='none';this.nextElementSibling.style.display='block'">
+      <span style="display:none;font-family:var(--mono);font-size:12px;font-weight:600;color:var(--accent);letter-spacing:0.08em;text-transform:uppercase;">Energy Meter<br>Tracker</span>
+      <p>Home Assistant Add-on</p>
+    </div>
+    <nav>
+      <a href="{{ url_for('settings_page') }}"  class="{{ 'active' if active == 'settings' }}">
+        <span class="nav-icon">⚙️</span> Settings
+      </a>
+      <a href="{{ url_for('charts_page') }}"  class="{{ 'active' if active == 'charts' }}">
+        <span class="nav-icon">📊</span> Charts
+      </a>
+      <a href="{{ url_for('insights_page') }}" class="{{ 'active' if active == 'insights' }}">
+        <span class="nav-icon">💡</span> Insights
+      </a>
+      {% if has_power_sensor or has_postcode %}
+      <a href="{{ url_for('live_power_page') }}" class="{{ 'active' if active == 'live_power' }}">
+        <span class="nav-icon">⚡</span> Overview
+      </a>
+      {% endif %}
+      <a href="{{ url_for('data_management_page') }}"  class="{{ 'active' if active == 'data_management' }}">
+        <span class="nav-icon">🗄️</span> Data Management
+      </a>
+      <a href="{{ url_for('logs_page') }}"    class="{{ 'active' if active == 'logs' }}">
+        <span class="nav-icon">📋</span> Logs
+      </a>
+      <a href="{{ url_for('help_page') }}"    class="{{ 'active' if active == 'help' }}">
+        <span class="nav-icon">📖</span> Help
+      </a>
+    </nav>
+    <div class="sidebar-footer">
+      <span>{% if app_version %}v{{ app_version }}{% endif %}{% if instance_label %} &middot; {{ instance_label }}{% elif server_port %} &middot; port {{ server_port }}{% endif %}</span>
+    </div>
+  </aside>
+
+  <div class="main">
+  <!-- Meter reset advisory banner -->
+  <div class="meter-reset-banner" id="meter-reset-banner">
+    <span>⚠️ <strong>Meter read reset detected</strong> — your import meter reading dropped significantly after a gap.
+    This may indicate a meter replacement or property move.
+    If so, consider <a href="{{ request.environ.get('SCRIPT_NAME', '') }}/billing-history">creating a new billing period</a>.</span>
+    <button onclick="dismissMeterResetBanner()">Dismiss</button>
+  </div>
+    <div id="mobile-topbar" style="display:none;background:var(--surface);border-bottom:1px solid var(--border);padding:10px 16px;">
+      <button class="hamburger" onclick="toggleSidebar()">&#9776;</button>
+    </div>
+    {% block topbar %}{% endblock %}
+    {% block subbar %}{% endblock %}
+    <!-- BL-6: global notification region — in flow, below the topbar, above the
+         scrolling content. Messages push content down rather than covering it. -->
+    <div class="notif-region" id="notif-region"></div>
+    <div class="content">
+      {% block content %}{% endblock %}
+    </div>
+  </div>
+
+</div>
+{% block scripts %}{% endblock %}
+<script>
+function toggleSidebar() {
+  document.getElementById('sidebar').classList.toggle('open');
+  document.getElementById('sidebar-overlay').classList.toggle('open');
+}
+function closeSidebar() {
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebar-overlay').classList.remove('open');
+}
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  localStorage.setItem('emt_chart_theme', theme);
+  // Sync global toggle icon
+  var btn = document.getElementById('global-theme-btn');
+  if (btn) btn.textContent = theme === 'dark' ? '\u263e' : '\u2600';
+  // Notify all iframes so their internal theme toggles stay in sync
+  document.querySelectorAll('iframe').forEach(function(f) {
+    try { f.contentWindow.postMessage({type:'emt-theme', theme:theme}, '*'); } catch(e) {}
+  });
+}
+function globalToggleTheme() {
+  var current = document.documentElement.getAttribute('data-theme');
+  applyTheme(current === 'light' ? 'dark' : 'light');
+}
+// Listen for theme changes from iframes (e.g. heatmap toggle button)
+window.addEventListener('message', function(e) {
+  if (e.data && e.data.type === 'emt-theme-change') {
+    applyTheme(e.data.theme);
+  }
+});
+// ── Meter reset advisory notification ──────────────────────────────────────
+(function() {
+  if (sessionStorage.getItem('meterResetDismissed')) return;
+  var base = "{{ request.environ.get('SCRIPT_NAME', '') }}";
+  fetch(base + '/api/engine/meter-reset-detected')
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.detected) {
+        var banner = document.getElementById('meter-reset-banner');
+        if (banner) banner.classList.add('visible');
+      }
+    })
+    .catch(function() {});
+})();
+
+function dismissMeterResetBanner() {
+  var banner = document.getElementById('meter-reset-banner');
+  if (banner) banner.classList.remove('visible');
+  sessionStorage.setItem('meterResetDismissed', '1');
+}
+
+/* ── BL-6: global notification region ────────────────────────────────────────
+   EMT.notify({id, level, html, transient, dismissible, onDismiss})
+   - transient  : auto-removes after ~10s (e.g. "Configuration saved")
+   - persistent : sticks until dismissed or resolved (update available,
+                  unsupported tariff)
+   Messages stack; the region is zero-height when empty, so pages without
+   messages are laid out exactly as before. */
+window.EMT = window.EMT || {};
+(function () {
+  var TRANSIENT_MS = 10000;
+
+  EMT.notify = function (opts) {
+    var region = document.getElementById('notif-region');
+    if (!region) return null;
+    var id = opts.id || ('n' + Date.now());
+    EMT.dismiss(id);                       // replace, never duplicate
+
+    var el = document.createElement('div');
+    el.className = 'notif ' + (opts.level || 'info');
+    el.setAttribute('data-notif-id', id);
+
+    var msg = document.createElement('span');
+    msg.className = 'notif-msg';
+    msg.innerHTML = opts.html || '';
+    el.appendChild(msg);
+
+    if (opts.dismissible) {
+      var btn = document.createElement('button');
+      btn.textContent = 'Dismiss';
+      btn.onclick = function () {
+        EMT.dismiss(id);
+        if (typeof opts.onDismiss === 'function') opts.onDismiss();
+      };
+      el.appendChild(btn);
+    }
+    region.appendChild(el);
+
+    if (opts.transient) {
+      setTimeout(function () { EMT.dismiss(id); }, opts.transientMs || TRANSIENT_MS);
+    }
+    return id;
+  };
+
+  EMT.dismiss = function (id) {
+    var el = document.querySelector('[data-notif-id="' + id + '"]');
+    if (el && el.parentNode) el.parentNode.removeChild(el);
+  };
+})();
+
+/* ── BL-6: "update available" check ──────────────────────────────────────────
+   Supervised users get update badges from the Supervisor; unsupervised (Docker)
+   users get nothing and only learn of a release by checking the repo. Server
+   caches the GitHub lookup daily. Dismissal is PER VERSION and sticks — dismiss
+   3.3.0 and you are not asked again until something newer than 3.3.0 ships. */
+(function () {
+  var DISMISS_KEY = 'emtUpdateDismissedVersion';
+  fetch(apiUrl('/api/update-check'))
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (!d || !d.update_available || !d.latest) return;
+      if (localStorage.getItem(DISMISS_KEY) === d.latest) return;  // no nagging
+      EMT.notify({
+        id: 'update-available',
+        level: 'info',
+        dismissible: true,
+        html: '\u2b06\ufe0f <strong>Update available</strong> \u2014 v' +
+              d.latest + ' (you have v' + (d.current || '?') + ').' +
+              (d.url ? ' <a href="' + d.url + '" target="_blank" rel="noopener">Release notes</a>' : ''),
+        onDismiss: function () { localStorage.setItem(DISMISS_KEY, d.latest); }
+      });
+    })
+    .catch(function () {});
+})();
+
+/* ── BL-5: "restored from another instance" notice ───────────────────────────
+   A restored DB carries another install's lineage id (db_uuid != install_id).
+   Dismissal is persisted server-side PER db_uuid (in /data, install-scoped), so
+   a routine repeated restore of the same source — e.g. prod -> prod dev — is
+   acknowledged once and stays quiet; a genuinely new lineage still surfaces. */
+(function () {
+  fetch(apiUrl('/api/instance/notice'))
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (!d || !d.foreign || d.acknowledged) return;
+      EMT.notify({
+        id: 'foreign-restore',
+        level: 'info',
+        dismissible: true,
+        html: 'ℹ️ <strong>Restored from another instance</strong> — ' +
+              'this database was created by a different EMT install. Its backups ' +
+              'are kept separate from that instance’s. Expected if you just ' +
+              'restored a backup from elsewhere.',
+        onDismiss: function () {
+          fetch(apiUrl('/api/instance/notice/dismiss'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ db_uuid: d.db_uuid })
+          }).catch(function () {});
+        }
+      });
+    })
+    .catch(function () {});
+})();
+
+/* ── Upgrade re-price sweep advisory ─────────────────────────────────────────
+   The first run after an upgrade re-prices history in the BACKGROUND (can be slow
+   on a large account; the engine keeps running throughout). Surface a patient-wait
+   banner via the global notification region — same style/dismiss pattern as the
+   other notices — and auto-clear it the moment the sweep completes. Dismissal is
+   per-session, so it reappears on a fresh load if still running but never nags. */
+(function () {
+  var ID = 'reprice-sweep';
+  var DISMISS_KEY = 'repriceSweepDismissed';
+  function check() {
+    fetch(apiUrl('/api/reprice-history-status'))
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || !d.in_progress) { EMT.dismiss(ID); return; }   // done → clear
+        if (sessionStorage.getItem(DISMISS_KEY)) return;         // hushed this session
+        // The sweep has TWO triggers and this banner used to name only one, so a fresh
+        // install that imported its history was told EMT was "finishing your upgrade" —
+        // on a box that had never run a previous version, and had just been asked to do
+        // precisely this work. Lead with what the user actually did.
+        var _imported = (d.cause === 'import');
+        var _lead = _imported
+          ? '<strong>Finishing your import</strong> \u2014 EMT is pricing the history it just '
+            + 'fetched'
+          : '<strong>Finishing your upgrade</strong> \u2014 EMT is re-pricing your history';
+        EMT.notify({
+          id: ID,
+          level: 'info',
+          dismissible: true,
+          html: '\u23f3 ' + _lead + ' in the background (' + d.remaining + ' block' +
+                (d.remaining === 1 ? '' : 's') + ' left). This can take a while on a large ' +
+                'account \u2014 please be patient and <strong>avoid restarting or rebuilding</strong>. ' +
+                'Some figures may look off until it finishes.',
+          onDismiss: function () { sessionStorage.setItem(DISMISS_KEY, '1'); }
+        });
+      })
+      .catch(function () {});
+  }
+  check();
+  setInterval(check, 30000);
+})();
+
+/* \u2500\u2500 BL-18: "blocks flagged for review" notice \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+   The dispatch reconciliation leaves genuinely-ambiguous blocks unpriced and
+   flags them. Surface a dismissible pointer to the Corrections review list.
+   Dismissal remembers the count dismissed, so it only reappears when NEW blocks
+   are flagged (count rises) \u2014 resolving blocks never re-nags. */
+(function () {
+  var DISMISS_KEY = 'emtReviewDismissedCount';
+  fetch(apiUrl('/api/review-blocks'))
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      var n = (d && d.count) || 0;
+      if (!n) return;
+      if (parseInt(localStorage.getItem(DISMISS_KEY) || '0', 10) >= n) return;
+      EMT.notify({
+        id: 'blocks-flagged-review',
+        level: 'info',
+        dismissible: true,
+        html: '\ud83d\udd0e <strong>' + n + ' block' + (n === 1 ? '' : 's') +
+              ' flagged for review</strong> \u2014 a smart charge couldn\u2019t be ' +
+              'priced with confidence. <a href="' + apiUrl('/corrections') + '">Review them</a>.',
+        onDismiss: function () { localStorage.setItem(DISMISS_KEY, String(n)); }
+      });
+    })
+    .catch(function () {});
+})();
+
+// Sync global theme toggle icon on load
+(function() {
+  var theme = document.documentElement.getAttribute('data-theme') || 'dark';
+  var btn = document.getElementById('global-theme-btn');
+  if (btn) btn.textContent = theme === 'dark' ? '\u263e' : '\u2600';
+})();
+// Remember last visited page — set on nav click and on every page load
+document.querySelectorAll('.sidebar nav a').forEach(function(a) {
+  a.addEventListener('click', function() {
+    var href = a.getAttribute('href');
+    var page = href.replace(/^\//, '').split('/')[0] || 'charts';
+    fetch(apiUrl('/api/last-page'), { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({page: page}) });
+    closeSidebar();
+  });
+});
+(function() {
+  var active = '{{ active }}';
+  if (active) {
+    fetch(apiUrl('/api/last-page'), { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({page: active}) });
+  }
+})();
+// Show mobile topbar only on small screens
+function checkMobile() {
+  var mt = document.getElementById('mobile-topbar');
+  var isMobile = window.innerWidth <= 768 || (window.innerHeight <= 500 && window.innerWidth > window.innerHeight);
+  if (mt) mt.style.display = isMobile ? 'block' : 'none';
+  if (!isMobile) closeSidebar();
+}
+checkMobile();
+window.addEventListener('resize', checkMobile);
+</script>
+</body>
+</html>

@@ -1,0 +1,3155 @@
+{% extends "base.html" %}
+<!-- EMT layout variant: WRAP-FILL (ACTIVE) — Cards wrap-and-fill: one filled row when wide; wraps left-aligned filling each row when narrow. -->
+
+{% block head %}
+<style>
+/* ── Summary page ── */
+/* Outer row — in layout-a contains both gauges and CI side by side */
+.gauge-ci-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 12px;
+  max-width: 1400px;
+  align-items: stretch;
+}
+
+/* Gauge grid sits inside gauge-ci-row */
+.summary-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: stretch;
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+/* Info banners (Mini enable / disable / add-sensor hint) align to the card
+   grid's max width instead of running full-bleed edge-to-edge. */
+#mini-enable, #power-hint, #mini-active-note {
+  max-width: 1400px;
+}
+
+/* In layout-b gauges get own full row */
+.layout-b .gauge-ci-row {
+  display: block;
+  margin-bottom: 12px;
+}
+.layout-b .summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+  max-width: 1400px;
+}
+
+/* CI card in layout-a — flex child of gauge-ci-row, expands to fill remaining space */
+.layout-a #carbon-card-wrap {
+  flex: 1 1 340px;
+  min-width: 340px;
+  margin-bottom: 0;
+}
+.layout-a #carbon-card-wrap .carbon-card {
+  height: 100%;
+  margin-bottom: 0;
+}
+
+/* ── Gauge row (layout-a): fill the row, wrap tidily when forced ──
+   The gauge cards sit in a wrapping flex row where every card flex-grows, so:
+   • while they all fit, they share one row and stretch to fill its full width
+     (no trailing gap on the right);
+   • when the window is too narrow, they wrap LEFT-ALIGNED and the cards on each
+     wrapped row grow to fill that row — so a wrapped card is never stranded at a
+     fixed width with dead space beside it.
+   Mix flexes too (cap lifted) and keeps a wider 280px basis so it stays the
+   roomy card. Carbon lives in the outer .gauge-ci-row (which wraps), so Carbon
+   drops to its own row. Scoped above the 600px mobile breakpoint so the
+   single-column mobile rules below are left completely untouched. */
+@media (min-width: 601px) {
+  .layout-a .summary-grid {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    flex: 1 1 auto;
+  }
+  .layout-a #mix-card {
+    flex: 1 1 280px;
+    max-width: none;
+  }
+  .layout-a .power-card,
+  .layout-a .soc-card {
+    flex: 1 1 220px;
+    max-width: none;
+  }
+}
+
+/* CI card in layout-b — fixed width beside history */
+.layout-b #carbon-card-wrap {
+  flex: 0 0 auto;
+}
+
+/* ── Wide row: CI + Power History side by side ── */
+.wide-row {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 12px;
+  align-items: stretch;
+  max-width: 1400px;
+}
+
+/* In layout-a the wide-row only contains history — goes full width */
+.layout-a .wide-row {
+  display: block;
+  margin-bottom: 12px;
+  max-width: 1400px;
+}
+.layout-a #power-history-card-wrap {
+  margin-bottom: 0;
+}
+.layout-a #power-history-card-wrap .power-history-card {
+  margin-bottom: 0;
+}
+
+/* In layout-b CI is in wide-row beside history */
+.wide-row .carbon-card {
+  flex: 0 0 auto;
+  min-width: 340px;
+  width: 340px;
+  align-self: stretch;
+  margin-bottom: 0;
+}
+.wide-row .power-history-card {
+  flex: 1 1 0;
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+/* ── Expand overlay ── */
+.expand-btn {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--muted);
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  transition: color 0.15s, background 0.15s;
+  z-index: 1;
+}
+.expand-btn:hover { color: var(--text); background: rgba(255,255,255,0.06); }
+.expand-btn svg { width: 14px; height: 14px; }
+
+.expand-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  z-index: 500;
+  backdrop-filter: blur(2px);
+  align-items: center;
+  justify-content: center;
+  overflow-y: auto;
+  padding: 16px;
+  box-sizing: border-box;
+}
+.expand-backdrop.active {
+  display: flex;
+}
+
+/* The modal container inside the backdrop */
+.expand-modal {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 24px;
+  width: min(1200px, 96vw);
+  height: min(900px, 96vh);
+  overflow: visible;
+  box-shadow: 0 24px 64px rgba(0,0,0,0.7);
+  position: relative;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+}
+.expand-modal .power-history-wrap {
+  flex: 1;
+  height: unset;
+}
+.expand-modal .power-history-legend {
+  flex-shrink: 0;
+}
+.expand-modal .carbon-forecast {
+  flex: 1;
+  height: unset;
+}
+.expand-modal .carbon-time-labels {
+  flex-shrink: 0;
+}
+.expand-modal .card-title {
+  flex-shrink: 0;
+}
+.expand-modal #carbon-content,
+.expand-modal #carbon-content-modal {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+.expand-modal-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: rgba(255,255,255,0.08);
+  cursor: pointer;
+  color: var(--text);
+  border-radius: 6px;
+  font-size: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1;
+}
+.expand-modal-close:hover { background: rgba(255,255,255,0.15); }
+
+/* BL-10 smart-charging card: match sibling row width; scroll the session list
+   inside the modal so the background always fills (its list can exceed 900px). */
+#charge-card-wrap { max-width: 1400px; box-sizing: border-box; }
+#charge-backdrop .expand-modal { height: auto; max-height: min(900px, 96vh); }
+#charge-modal-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.charge-section-h { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--muted); font-weight: 600; margin: 14px 0 4px; }
+.charge-section-h:first-child { margin-top: 0; }
+.charge-range-btn { background: transparent; border: 1px solid var(--border);
+  color: var(--muted); border-radius: 12px; padding: 2px 12px; font-size: 12px;
+  cursor: pointer; line-height: 1.7; }
+.charge-range-btn:hover { color: var(--text); }
+.charge-range-btn.active { background: #00d4aa; color: #04241c; border-color: #00d4aa;
+  font-weight: 600; }
+
+.expandable-card {
+  position: relative;
+}
+
+.power-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  min-width: 220px;
+  max-width: 300px;
+  flex: 0 0 auto;
+  overflow: hidden;
+}
+
+/* ── SoC dial card ── */
+.soc-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  min-width: 220px;
+  max-width: 300px;
+  flex: 0 0 auto;
+  overflow: hidden;
+  align-self: stretch;
+}
+
+/* ── Battery icon ── */
+.battery-icon-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  justify-content: center;
+}
+
+.battery-icon {
+  position: relative;
+  width: 80px;
+  height: 34px;
+  border: 2px solid var(--muted);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.battery-icon::after {
+  content: '';
+  position: absolute;
+  right: -7px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 5px;
+  height: 14px;
+  background: var(--muted);
+  border-radius: 0 2px 2px 0;
+}
+
+.battery-fill {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  border-radius: 2px;
+  transition: width 0.5s ease, background 0.5s ease;
+}
+
+.battery-pct {
+  font-size: 22px;
+  font-weight: 700;
+  font-family: var(--mono);
+  line-height: 1;
+}
+
+/* ── Inverter gauge (compact semicircle) ── */
+.inv-gauge-wrap {
+  position: relative;
+  width: 100%;
+  max-width: 180px;
+  height: 100px;
+  margin-top: auto;
+}
+
+.inv-gauge-wrap svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.inv-gauge-value {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  text-align: center;
+  white-space: nowrap;
+}
+
+.inv-gauge-kw {
+  font-size: 20px;
+  font-weight: 700;
+  font-family: var(--mono);
+  color: var(--text);
+  line-height: 1;
+}
+
+.inv-gauge-unit {
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 1px;
+}
+
+/* Wrapper used ONLY when a PV dial is present, so the inverter gauge keeps its
+   exact place. Replicates the card's own flex column (align/gap) and grows to
+   fill remaining height so the gauge's margin-top:auto still pins it to the
+   card bottom. Absent PV, the card doesn't use this wrapper (byte-identical). */
+.soc-gauge-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 auto;
+  width: 100%;
+  align-self: stretch;
+  position: relative;
+  min-width: 0;
+}
+
+/* Small red PV / solar dial, tucked top-right beside the INVERTER label. */
+.pv-gauge {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 84px;
+  text-align: center;
+  pointer-events: none;
+}
+.pv-gauge-label {
+  font-size: 10px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 1px;
+}
+.pv-gauge svg {
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+.pv-gauge-value { fill: #00d4aa; }
+
+.soc-power-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--bg);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.soc-power-label {
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.soc-power-value {
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 14px;
+  color: #7c6af7;
+}
+
+/* ── Gauge ── */
+.gauge-arc-bg { stroke: var(--border); }
+.gauge-wrap {
+  position: relative;
+  width: 100%;
+  max-width: 180px;
+  height: 100px;
+  margin-top: auto;
+}
+
+.gauge-wrap svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.gauge-value {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  text-align: center;
+}
+
+.gauge-kw {
+  font-size: 22px;
+  font-weight: 700;
+  font-family: var(--mono);
+  color: var(--text);
+  line-height: 1;
+}
+
+.gauge-unit {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.gauge-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+/* ── Power rows ── */
+.power-rows {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.power-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  background: var(--bg);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+
+.power-row-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.power-row-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.power-row-value {
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--mono);
+  color: var(--text);
+}
+
+.power-row-value.import  { color: #ff6b6b; }
+.power-row-value.export  { color: #00d4aa; }
+.power-row-value.battery { color: #7c6af7; }
+.power-row-value.ev      { color: #f59e0b; }
+.power-row-value.net-import { color: #ff6b6b; }
+.power-row-value.net-export { color: #00d4aa; }
+
+/* ── Status dot ── */
+.status-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-right: 4px;
+}
+.status-dot.live { background: var(--success); animation: pulse 2s infinite; }
+.status-dot.stale { background: var(--warning); }
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* ── Billing summary ── */
+.billing-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  max-width: 1400px;
+}
+
+.billing-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.billing-total {
+  font-size: clamp(18px, 4vw, 28px);
+  font-weight: 700;
+  font-family: var(--mono);
+  color: var(--accent);
+  line-height: 1;
+  margin-bottom: 3px;
+  word-break: break-all;
+}
+
+.billing-period {
+  font-size: 10px;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+
+.billing-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.billing-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  padding: 4px 8px;
+  background: var(--bg);
+  border-radius: 4px;
+}
+
+.billing-row-label { color: var(--muted); }
+.billing-row-value { font-family: var(--mono); font-weight: 600; color: var(--text); }
+
+/* ── Rolling power chart ── */
+.power-history-card {
+  margin-bottom: 20px;
+  position: relative;
+}
+.power-history-wrap {
+  position: relative;
+  width: 100%;
+  height: 120px;
+}
+.power-history-wrap canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.ph-tooltip {
+  position: absolute;
+  pointer-events: none;
+  display: none;
+  background: var(--surface, #1a1d2e);
+  border: 1px solid var(--border, rgba(255,255,255,0.1));
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text, #e2e8f0);
+  white-space: nowrap;
+  z-index: 10;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+}
+.power-history-legend {
+  display: flex;
+  gap: 16px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--muted);
+  flex-wrap: wrap;
+}
+.power-history-legend span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.power-history-legend i {
+  display: inline-block;
+  width: 20px;
+  height: 2px;
+  border-radius: 1px;
+}
+
+/* ── Power history toggle ── */
+.ph-toggle {
+  display: flex;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-left: auto;
+}
+.ph-toggle button {
+  background: none;
+  border: none;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--muted);
+  cursor: pointer;
+  line-height: 1.4;
+  transition: background 0.15s, color 0.15s;
+}
+.ph-toggle button.active {
+  background: var(--accent, #7c6af7);
+  color: #fff;
+}
+.ph-toggle button:not(.active):hover {
+  background: var(--hover, rgba(255,255,255,0.06));
+  color: var(--text);
+}
+
+/* ── Carbon intensity ── */
+.carbon-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 24px;
+  min-width: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.carbon-current {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.carbon-value {
+  font-size: 28px;
+  font-weight: 700;
+  font-family: var(--mono);
+  line-height: 1;
+}
+
+.carbon-unit {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.carbon-index {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin-bottom: 16px;
+  display: inline-block;
+  align-self: flex-start;
+}
+
+.carbon-index.very-low  { background: rgba(34,197,94,0.15);  color: #22c55e; }
+.carbon-index.low       { background: rgba(34,197,94,0.10);  color: #86efac; }
+.carbon-index.moderate  { background: rgba(245,158,11,0.15); color: #f59e0b; }
+.carbon-index.high      { background: rgba(240,82,82,0.15);  color: #ff6b6b; }
+.carbon-index.very-high { background: rgba(240,82,82,0.20);  color: #dc2626; }
+
+.carbon-forecast {
+  display: flex;
+  gap: 2px;
+  margin-top: 12px;
+  min-height: 60px;
+  flex-grow: 1;
+  align-items: flex-end;
+  position: relative;
+}
+
+.carbon-slot {
+  flex: 1;
+  border-radius: 2px 2px 0 0;
+  min-height: 4px;
+  cursor: default;
+  transition: opacity 0.15s;
+  align-self: flex-end;
+}
+
+#carbon-content {
+  display: flex;
+  flex-direction: column;
+  flex-grow: 1;
+}
+
+.carbon-slot {
+  flex: 1;
+  border-radius: 2px 2px 0 0;
+  min-height: 4px;
+  cursor: default;
+  transition: opacity 0.15s;
+}
+
+.carbon-slot:hover { opacity: 0.8; }
+
+.carbon-slot.current-slot {
+  outline: 2px solid var(--text);
+  outline-offset: 1px;
+}
+
+.carbon-time-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  color: var(--muted);
+  margin-top: 4px;
+  overflow: hidden;
+}
+
+.no-data {
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+  padding: 20px 0;
+}/* ── Responsive breakpoints ── */
+
+/* Tablet / HA app portrait ~600-900px — billing 1 col, gauges flex */
+@media (max-width: 900px) {
+  .billing-grid {
+    grid-template-columns: 1fr;
+  }
+  .wide-row { flex-direction: column; }
+  .wide-row .carbon-card { width: 100%; min-width: 0; }
+  .gauge-ci-row { flex-wrap: wrap; }
+  .layout-a #carbon-card-wrap { min-width: 0; max-width: 100%; flex: 1 1 100%; }
+}
+
+/* Mobile portrait ≤600px — everything single column */
+@media (max-width: 600px) {
+  .gauge-ci-row { flex-direction: column; }
+  .layout-a #carbon-card-wrap { min-width: 0; width: 100%; max-width: 100%; }
+
+  .power-card,
+  .soc-card {
+    min-width: 0;
+    max-width: 100%;
+    width: 100%;
+    flex: 1 1 100%;
+  }
+
+  .summary-grid {
+    display: flex;
+    flex-direction: column;
+  }
+  .layout-b .summary-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+
+</style>
+{% endblock %}
+
+{% block topbar %}
+<div class="topbar">
+  <div>
+    <h2>Overview</h2>
+    <div class="sub">Your energy at a glance</div>
+  </div>
+  <div style="font-size:12px;color:var(--muted);">
+    {% if has_power_sensor %}
+    <span class="status-dot live" id="status-dot"></span>
+    <span id="status-text">Connecting...</span>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+
+<!-- ── Live Power ── -->
+{% if mini_available and not mini_chosen %}
+<div class="card" id="mini-enable" style="display:flex;align-items:flex-start;gap:10px;padding:12px 14px;margin-bottom:12px;font-size:13px;">
+  <span style="font-size:16px;line-height:1.4;">⚡</span>
+  <span style="flex:1;color:var(--muted);">An <strong>Octopus Mini</strong> was found on your account. Use it to show a live power gauge here?<br>
+    <span style="color:var(--warning);">Heads up:</span> this polls the Octopus API about once a minute while the page is open and <strong>consumes your query allowance intensively</strong>.</span>
+  <button onclick="setMiniSource(true)" class="btn btn-primary btn-sm" style="flex-shrink:0;">Enable</button>
+</div>
+{% elif not has_power_sensor %}
+<div class="card" id="power-hint" style="display:flex;align-items:center;gap:10px;padding:10px 14px;margin-bottom:12px;font-size:13px;">
+  <span style="font-size:16px;">💡</span>
+  <span style="flex:1;color:var(--muted);">Add a power sensor in <a href="{{ url_for('settings_page') }}" style="color:var(--accent);">Meter Config</a> to show a live power gauge here.</span>
+  <button onclick="dismissPowerHint()" aria-label="Dismiss" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:18px;line-height:1;padding:0 4px;">&times;</button>
+</div>
+<script>
+function dismissPowerHint(){var e=document.getElementById('power-hint');if(e){e.style.display='none';}try{localStorage.setItem('emt_hide_power_hint','1');}catch(_){}}
+(function(){try{if(localStorage.getItem('emt_hide_power_hint')==='1'){var e=document.getElementById('power-hint');if(e){e.style.display='none';}}}catch(_){}})();
+</script>
+{% endif %}
+
+{% if mini_chosen %}
+<div id="mini-active-note" style="font-size:12px;color:var(--muted);margin-bottom:10px;">
+  ⚡ Live power from your <strong>Octopus Mini</strong> · <a href="#" onclick="setMiniSource(false);return false;" style="color:var(--accent);">disable</a>
+</div>
+{% endif %}
+
+{% if mini_available or mini_chosen %}
+<script>
+function setMiniSource(enabled){
+  fetch(apiUrl('/api/power-source/mini'), {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({enabled: enabled})
+  }).then(function(r){ return r.json(); })
+    .then(function(d){ if(d && d.ok){ location.reload(); } else { alert((d && d.error) || 'Could not update the Mini setting.'); } })
+    .catch(function(){ alert('Could not update the Mini setting.'); });
+}
+</script>
+{% endif %}
+
+<div class="live-power-page">
+<div class="gauge-ci-row">
+<div class="summary-grid">
+
+  <!-- Generation Mix card — first card, only shown when postcode configured -->
+  {% if has_postcode %}
+  <div class="soc-card" id="mix-card" style="min-width:280px;align-items:flex-start;">
+    <div class="card-title" style="font-size:12px;align-self:flex-start;">🌐 Current Grid Generation Mix</div>
+    <div style="display:flex;gap:12px;align-items:center;width:100%;">
+      <div id="mix-donut-wrap" style="position:relative;width:120px;height:120px;flex-shrink:0;">
+        <canvas id="mix-donut-canvas" width="120" height="120"></canvas>
+        <div id="mix-donut-centre" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;pointer-events:none;">
+          <div id="mix-centre-fuel" style="font-size:10px;color:var(--muted);"></div>
+          <div id="mix-centre-perc" style="font-size:16px;font-weight:700;color:var(--text);"></div>
+        </div>
+      </div>
+      <div style="flex:1;min-width:0;">
+        <div id="mix-legend" style="font-size:11px;display:flex;flex-direction:column;gap:2px;"></div>
+        <div id="mix-loading" style="color:var(--muted);font-size:12px;">Loading...</div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if has_power_sensor %}
+  <!-- Main gauge -->
+  <div class="power-card">
+    <div class="card-title">⚡ Live Power</div>
+    <div id="power-status" style="font-size:13px;font-weight:600;padding:6px 16px;border-radius:20px;background:var(--bg);border:1px solid var(--border);color:var(--muted);">—</div>
+    <div class="gauge-wrap">
+      <svg viewBox="0 0 220 120" xmlns="http://www.w3.org/2000/svg">
+        <!-- Background arc -->
+        <path d="M 20 110 A 90 90 0 0 1 200 110" class="gauge-arc-bg" fill="none" stroke="#2a2d3a" stroke-width="14" stroke-linecap="round"/>
+        <!-- Zero marker -->
+        <line x1="110" y1="24" x2="110" y2="36" stroke="#6b7080" stroke-width="2"/>
+        <!-- Value arc — drawn from centre outward -->
+        <path id="gauge-arc" d="M 20 110 A 90 90 0 0 1 200 110" fill="none" stroke="#00d4aa" stroke-width="14" stroke-linecap="round"
+              stroke-dasharray="283" stroke-dashoffset="283"
+              transform-origin="110 110"/>
+        <!-- Needle -->
+        <line id="gauge-needle" x1="110" y1="110" x2="110" y2="30"
+              stroke="#e8eaf0" stroke-width="2" stroke-linecap="round"
+              transform="rotate(0 110 110)"/>
+        <!-- Centre dot -->
+        <circle cx="110" cy="110" r="5" fill="#e8eaf0"/>
+        <!-- Labels -->
+        <text x="18" y="125" font-size="10" fill="#6b7080" text-anchor="middle">Export</text>
+        <text x="202" y="125" font-size="10" fill="#6b7080" text-anchor="middle">Import</text>
+        <text x="110" y="18" font-size="10" fill="#6b7080" text-anchor="middle">Net</text>
+      </svg>
+      <div class="gauge-value">
+        <div class="gauge-kw" id="net-kw">—</div>
+        <div class="gauge-unit" id="gauge-unit-label">kW net</div>
+      </div>
+    </div>
+
+    <!-- Hidden elements retained for JS compatibility -->
+    <span id="import-kw" style="display:none;"></span>
+    <span id="export-kw" style="display:none;"></span>
+  </div>
+  {% endif %}
+
+  <!-- Battery/EV/heat-pump device cards — render whenever sub-devices exist,
+       independent of the main gauge. updateSocCards() no-ops when the container
+       is absent; setGauge() is null-safe when the gauge isn't rendered. -->
+  {% if has_power_sensor or has_sub_devices %}
+  <div id="soc-cards-container" style="display:contents;"></div>
+  {% endif %}
+
+</div><!-- /.summary-grid -->
+
+<!-- ── CI card slot (moves here in layout-a, stays in wide-row in layout-b) ── -->
+<!-- In layout-a JS moves #carbon-card-wrap here; in layout-b it stays in wide-row -->
+</div><!-- /.gauge-ci-row -->
+
+{% if has_dispatch_data %}
+<!-- ── BL-10: IOG smart-charging card (full-width row; server-gated on dispatch
+     data, so it sits outside the gauge-ci-row flex system and leaves no gap when
+     absent). Hidden until the sessions API confirms data. ── -->
+<div class="card expandable-card" id="charge-card-wrap" style="display:none;margin-top:16px;">
+  <button class="expand-btn" title="Recent sessions" onclick="_openChargeModal()">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+      <path d="M3 3h4M3 3v4M13 3h-4M13 3v4M3 13h4M3 13v-4M13 13h-4M13 13v-4"/>
+    </svg>
+  </button>
+  <div class="card-title">🚗 Smart Charging</div>
+  <div style="font-size:11px;color:var(--muted);margin:-2px 0 4px;">Energy delivered to the car — not grid import</div>
+  <div id="charge-summary" style="color:var(--muted);font-size:13px;">Loading…</div>
+</div>
+
+<div class="expand-backdrop" id="charge-backdrop"
+     onclick="if(event.target===this)_closeChargeModal()">
+  <div class="expand-modal" role="dialog" aria-label="Smart charging detail">
+    <button class="expand-modal-close" onclick="_closeChargeModal()">✕</button>
+    <div class="card-title">🚗 Smart Charging</div>
+    <div style="font-size:12px;color:var(--muted);margin:2px 0 8px;">Energy delivered to the car (from Octopus dispatch) — not metered grid import, so solar offset and house load aren't reflected.</div>
+    <div id="charge-range" style="display:flex;gap:6px;margin:2px 0 10px;">
+      <button class="charge-range-btn" data-days="7"  onclick="_setChargeRange(7)">7 days</button>
+      <button class="charge-range-btn" data-days="30" onclick="_setChargeRange(30)">30 days</button>
+      <button class="charge-range-btn" data-days="90" onclick="_setChargeRange(90)">90 days</button>
+    </div>
+    <div id="charge-modal-body"></div>
+  </div>
+</div>
+{% endif %}
+
+<!-- ── Wide row: CI + Power History ── -->
+<div class="wide-row">
+
+  {% if has_postcode %}
+  <!-- Carbon intensity card -->
+  <div class="carbon-card card expandable-card" id="carbon-card-wrap">
+    <button class="expand-btn" id="carbon-expand-btn" title="Expand" onclick="_expandCard('carbon')">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M3 3h4M3 3v4M13 3h-4M13 3v4M3 13h4M3 13v-4M13 13h-4M13 13v-4"/>
+      </svg>
+    </button>
+    <div class="card-title">🌿 Carbon Intensity</div>
+    <div id="carbon-loading" style="color:var(--muted);font-size:13px;">Loading forecast...</div>
+    <div id="carbon-content" style="display:none;">
+      <div class="carbon-current">
+        <div class="carbon-value" id="carbon-value">—</div>
+        <div class="carbon-unit">gCO₂/kWh</div>
+      </div>
+      <div class="carbon-index" id="carbon-index">—</div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">Next 48 hours</div>
+      <div class="carbon-forecast" id="carbon-forecast"></div>
+      <div class="carbon-time-labels" id="carbon-time-labels"></div>
+    </div>
+    <div id="carbon-error" style="display:none;color:var(--muted);font-size:13px;">
+      Could not load forecast. Check your postcode prefix in <a href="{{ url_for('settings_page') }}" style="color:var(--accent);">Meter Config</a>.
+    </div>
+  </div>
+  {% endif %}
+
+  {% if has_power_sensor or has_postcode %}
+  <!-- Rolling Power Chart -->
+  <div class="card power-history-card expandable-card" id="power-history-card-wrap">
+    <button class="expand-btn" id="ph-expand-btn" title="Expand" onclick="_expandCard('ph')">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M3 3h4M3 3v4M13 3h-4M13 3v4M3 13h4M3 13v-4M13 13h-4M13 13v-4"/>
+      </svg>
+    </button>
+    <div class="card-title" style="display:flex;align-items:center;gap:12px;">
+      <span id="ph-title">📈 48-Hour Power History</span>
+      {% if has_postcode %}
+      <div class="ph-toggle" id="ph-toggle">
+        {% if has_power_sensor %}
+        <button id="ph-btn-kw"  class="active" onclick="_phSetMode('kw')">kW</button>
+        <button id="ph-btn-co2" onclick="_phSetMode('co2')">CO₂</button>
+        {% endif %}
+        <button id="ph-btn-mix" {% if not has_power_sensor %}class="active"{% endif %} onclick="_phSetMode('mix')">Mix</button>
+      </div>
+      {% endif %}
+    </div>
+    <div class="power-history-wrap">
+      <canvas id="power-history-canvas"></canvas>
+      <div class="ph-tooltip" id="ph-tooltip"></div>
+    </div>
+    <div class="power-history-legend" id="power-history-legend">
+      <span id="ph-legend-import"><i style="background:#ff6b6b;"></i>Importing</span>
+      <span id="ph-legend-export"><i style="background:#00d4aa;"></i>Exporting</span>
+      <span id="ph-legend-co2" style="display:none;">
+        <i style="background:linear-gradient(to right,#ff6b6b,#00d4aa);"></i>
+        Net carbon rate (gCO₂/min) — red = emitting, green = offsetting
+      </span>
+      <span id="ph-legend-mix" style="display:none;font-size:11px;color:var(--muted);">Grid fuel mix — % of generation by source</span>
+      <span id="power-history-status" style="margin-left:auto;font-size:11px;color:var(--muted);"></span>
+    </div>
+  </div>
+  {% endif %}
+
+</div><!-- /.wide-row -->
+</div><!-- /.live-power-page -->
+
+<!-- ── Billing Summary ── -->
+
+{# Macro for a billing card #}
+{% macro billing_card(title, total, rows, period, card_id) %}
+<div class="billing-card">
+  <div class="card-title">{{ title }}</div>
+  {% if total is not none %}
+  <div class="billing-total" id="billing-total-{{ card_id }}">
+    {% if total < 0 %}-{% endif %}{{ currency }}{{ "%.2f"|format(total|abs) }}
+  </div>
+  <div class="billing-period" id="billing-period-{{ card_id }}">{{ period }}</div>
+  <div class="billing-rows" id="billing-rows-{{ card_id }}">
+    {% for row in rows %}
+    <div class="billing-row" {% if row.bold %}style="background:rgba(255,255,255,0.04);border-color:var(--muted);"{% endif %}>
+      <div class="billing-row-label" {% if row.bold %}style="color:var(--text);font-weight:600;"{% endif %}>{{ row.label }}</div>
+      <div class="billing-row-value" style="color:{% if row.cost < 0 %}var(--accent){% else %}var(--text){% endif %};{% if row.bold %}font-weight:600;{% endif %}">
+        {% if row.cost < 0 %}-{% endif %}{{ currency }}{{ "%.2f"|format(row.cost|abs) }}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="no-data" id="billing-loading-{{ card_id }}" style="color:var(--muted);font-size:13px;">Loading…</div>
+  {% endif %}
+</div>
+{% endmacro %}
+
+<div class="billing-grid">
+  {{ billing_card("☀️ Today", today_total, today_rows, today_date, "today") }}
+  {{ billing_card("📅 This Bill", month_total, month_rows, month_period, "month") }}
+  {{ billing_card("📆 This Year", year_total, year_rows, year_period, "year") }}
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ── BL-10: IOG smart-charging card (unconditional — must render even for
+// API-only IOG users who have no power sensor, i.e. outside the has_power_sensor
+// gate below). Card visibility is decided at runtime by the sessions API. ──────
+var _chargeSessions = [];
+var _chargeUpcoming = [];
+var _chargeCurrency = '£';
+var _chargeDays = 7;   // modal range; 90 = the dispatch_history retention ceiling
+function _cesc(s){return String(s).replace(/[&<>"]/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+
+function _statusPill(st){
+  var m={completed:['#00d4aa','Completed'],
+         in_progress:['#f0a500','Charging'],
+         scheduled:['#6b7280','Scheduled']};
+  var x=m[st]||m.scheduled;
+  return '<span style="background:'+x[0]+';color:#fff;font-size:10px;font-weight:600;'
+       + 'padding:1px 8px;border-radius:10px;vertical-align:middle;">'+x[1]+'</span>';
+}
+
+function _offText(s){
+  if(s.off_peak_kwh>=s.kwh-0.05) return 'all off-peak';
+  if(s.off_peak_kwh<=0.05) return 'all at peak';
+  // Show the (small) peak figure at its true value so it matches the billing
+  // blocks; let the large off-peak absorb the rounding so the parts still sum
+  // to the displayed total.
+  var tot=Math.round(s.kwh*10)/10;
+  var pk=Math.round(s.peak_kwh*10)/10;
+  var op=Math.round((tot-pk)*10)/10;
+  return op.toFixed(1)+' kWh off-peak, '+pk.toFixed(1)+' peak';
+}
+
+function _fmtDur(m){
+  m=Math.round(m||0);
+  if(m<60) return m+'m';
+  var h=Math.floor(m/60), r=m%60;
+  return r ? (h+'h '+r+'m') : (h+'h');
+}
+
+// Time DISPATCHED = merged union of the completed-dispatch windows
+// (dispatch_minutes). Rate-limit-proof; falls back to the older energy-scaled
+// figure only if the newer field isn't present (pre-upgrade data).
+function _chargeTime(s){
+  return _fmtDur(s.dispatch_minutes!=null ? s.dispatch_minutes : s.charge_minutes);
+}
+// ≈CHARGING estimate = delivered energy ÷ inferred active power (fullest slot).
+// Present when the session had a slot full enough to anchor the power; else null.
+function _estChargeTime(s){
+  return (s.est_charge_minutes!=null) ? _fmtDur(s.est_charge_minutes) : null;
+}
+// Combined label: "≈1h 47m charging · 2h 30m dispatched", or just the dispatched
+// window when there's no anchor slot to estimate from.
+function _chargeLabel(s){
+  var est=_estChargeTime(s), disp=_chargeTime(s);
+  return est ? ('≈'+est+' charging · '+disp+' dispatched') : (disp+' dispatched');
+}
+// Info affordance explaining the two figures (native tooltip; shown on the summary only).
+var _CHARGE_HELP='Dispatched: the time Octopus had your car in a smart-charge window (recorded at half-hour granularity). ≈ Charging: an estimate of how long it actually drew power — energy delivered ÷ its peak charging rate. The two differ when a slot only charged briefly. As an estimate it assumes steady charging, so a slow low-power top-up near full can read a little low.';
+function _chargeHelp(){
+  return ' <span title="'+_CHARGE_HELP+'" style="cursor:help;opacity:0.55;" aria-label="What do these times mean?">ⓘ</span>';
+}
+function _slotsText(s){
+  var n=s.n_slots||0;
+  return n+(n===1?' slot':' slots');
+}
+
+function _chargeSummaryHtml(s){
+  var win=(s.local.start.time||'??')+'–'+(s.local.end.time||'??');
+  var off = _offText(s);
+  var save = s.saving ? ' <span style="color:var(--muted);font-size:12px;">· saved '
+           + _chargeCurrency+s.saving.toFixed(2)+'</span>' : '';
+  return _statusPill(s.status)
+       + ' <strong style="font-size:15px;">'+s.kwh.toFixed(1)+' kWh</strong>'
+       + ' <span style="color:var(--muted);">· '+_cesc(win)+' · '+_chargeLabel(s)+_chargeHelp()+' · '
+       + _slotsText(s)+' · '+off+'</span>'+save;
+}
+
+function _fillChartSVG(s){
+  var f=s.fill||[]; if(!f.length) return '';
+  var W=Math.max(f.length*40,160), H=88, base=H-16;
+  var max=Math.max.apply(null, f.map(function(x){return x.kwh;}).concat([0.1]));
+  var step=(W-4)/f.length;
+  var bars='', labels='', hits='';
+  f.forEach(function(x,i){
+    var h=(x.kwh/max)*(base-6);
+    var xx=i*step+4, bw=Math.max(step-6,6);
+    var col=x.off_peak?'#00d4aa':'#ff6b6b';
+    // Wall-clock (site tz) label, server-provided; fall back to UTC for old data.
+    var t=_cesc(x.local_time || x.slot.substr(11,5));
+    bars+='<rect x="'+xx.toFixed(1)+'" y="'+(base-h).toFixed(1)+'" width="'+bw.toFixed(1)
+        +'" height="'+Math.max(h,1).toFixed(1)+'" rx="2" fill="'+col+'"/>';
+    // Full-height, full-width transparent hit target so the tooltip comes up
+    // anywhere in the column — even when the bar itself is only a sliver.
+    hits+='<rect x="'+(i*step).toFixed(1)+'" y="0" width="'+step.toFixed(1)+'" height="'+base
+        +'" fill="#000" opacity="0" pointer-events="all">'
+        +'<title>'+t+' — '+x.kwh.toFixed(2)+' kWh</title></rect>';
+    // Time label under every block.
+    labels+='<text x="'+(xx+bw/2).toFixed(1)+'" y="'+(H-3)+'" font-size="8" fill="var(--muted)" '
+        +'text-anchor="middle">'+t+'</text>';
+  });
+  return '<svg viewBox="0 0 '+W+' '+H+'" width="100%" style="max-width:'+W
+       +'px;margin-top:6px;" preserveAspectRatio="xMinYMax meet">'+bars+labels+hits+'</svg>';
+}
+
+function _sessionRowHtml(s){
+  var d=s.local.start.date||s.start.substr(0,10);
+  var win=(s.local.start.time||'')+'–'+(s.local.end.time||'');
+  var save=s.saving?(' · saved '+_chargeCurrency+s.saving.toFixed(2)):'';
+  return '<div style="padding:10px 0;border-bottom:1px solid var(--border);font-size:13px;">'
+    + '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">'
+    + '<span><strong>'+_cesc(d)+'</strong> <span style="color:var(--muted);">'+_cesc(win)+'</span></span>'
+    + '<span>'+s.kwh.toFixed(1)+' kWh '+_statusPill(s.status)+'</span></div>'
+    + '<div style="color:var(--muted);font-size:11px;margin-top:2px;">'
+    + _chargeLabel(s)+' · '+_slotsText(s)+' · '+_offText(s)
+    + _cesc(save)+'</div>'
+    + _fillChartSVG(s) + '</div>';
+}
+
+function _chargeNextHint(u){
+  // Card-face hint for the soonest upcoming (planned) dispatch.
+  var win=(u.local.start.time||'??')+'–'+(u.local.end.time||'??');
+  return _statusPill('scheduled')
+       + ' <span style="color:var(--muted);">next '+_cesc(win)+' · '
+       + u.kwh.toFixed(1)+' kWh planned</span>';
+}
+
+function _openChargeModal(){
+  _renderChargeModalBody();
+  _updateChargeRangeBtns();
+  document.getElementById('charge-backdrop').classList.add('active');
+}
+function _renderChargeModalBody(){
+  var body=document.getElementById('charge-modal-body');
+  if(!body) return;
+  var html='';
+  if(_chargeUpcoming.length){
+    html += '<div class="charge-section-h">Upcoming</div>'
+          + _chargeUpcoming.map(_sessionRowHtml).join('')
+          + '<div class="charge-section-h">Recent</div>';
+  }
+  html += _chargeSessions.length
+    ? _chargeSessions.map(_sessionRowHtml).join('')
+    : '<div style="color:var(--muted);">No smart charges in this range.</div>';
+  body.innerHTML = html;
+}
+function _updateChargeRangeBtns(){
+  var btns=document.querySelectorAll('#charge-range .charge-range-btn');
+  for(var i=0;i<btns.length;i++){
+    btns[i].classList.toggle('active', parseInt(btns[i].getAttribute('data-days'),10)===_chargeDays);
+  }
+}
+function _setChargeRange(n){
+  if(n===_chargeDays) return;
+  _chargeDays=n;
+  _updateChargeRangeBtns();
+  var body=document.getElementById('charge-modal-body');
+  if(body) body.innerHTML='<div style="color:var(--muted);padding:10px 0;">Loading…</div>';
+  fetch(apiUrl('/api/charge-sessions?days='+n))
+    .then(function(r){return r.json();})
+    .then(function(d){
+      _chargeSessions=(d&&d.sessions)||[];
+      _chargeUpcoming=(d&&d.upcoming)||[];
+      _renderChargeModalBody();
+    })
+    .catch(function(){ _renderChargeModalBody(); });
+}
+function _closeChargeModal(){
+  var b=document.getElementById('charge-backdrop'); if(b) b.classList.remove('active');
+}
+
+function loadChargeSessions(){
+  var card=document.getElementById('charge-card-wrap');
+  if(!card) return;   // server-gated out (no dispatch data)
+  fetch(apiUrl('/api/charge-sessions?days='+_chargeDays))
+    .then(function(r){return r.json();})
+    .then(function(d){
+      _chargeSessions=(d&&d.sessions)||[];
+      _chargeUpcoming=(d&&d.upcoming)||[];
+      _chargeCurrency=(d&&d.currency)||'£';
+      if(!d||!d.has_data||(!_chargeSessions.length&&!_chargeUpcoming.length)){
+        card.style.display='none'; return; }
+      card.style.display='';
+      var sum = _chargeSessions.length ? _chargeSummaryHtml(_chargeSessions[0]) : '';
+      if(_chargeUpcoming.length){
+        var hint=_chargeNextHint(_chargeUpcoming[0]);
+        sum = sum ? (sum+'<div style="margin-top:4px;">'+hint+'</div>') : hint;
+      }
+      document.getElementById('charge-summary').innerHTML=sum;
+    })
+    .catch(function(){ card.style.display='none'; });
+}
+document.addEventListener('DOMContentLoaded', loadChargeSessions);
+// Auto-refresh so a revised IOG plan (or a newly-completed charge) shows without a
+// page reload — dispatches poll ~5-minutely, so a 60s card refresh is ample.
+setInterval(loadChargeSessions, 60000);
+</script>
+<script>
+// ── Server-provided gauge config ──
+var GAUGE_MAX_IMP  = {{ gauge_max_imp | default(10) }};
+var GAUGE_MAX_EXP  = {{ gauge_max_exp | default(5) }};
+var BLOCK_MINUTES  = {{ block_minutes | default(30) }};
+
+// ── Gauge helpers ──
+var GAUGE_ARC_LEN = 283;  // half-circle circumference for r=90
+
+var _currentCarbonIndex = null;
+
+function setGauge(netKw) {
+  var frac;
+  if (netKw >= 0) {
+    frac = Math.min(1, netKw / GAUGE_MAX_IMP);
+  } else {
+    frac = Math.max(-1, netKw / GAUGE_MAX_EXP);
+  }
+  var angle  = frac * 90;
+  var colour;
+  if (netKw < 0) {
+    colour = '#00d4aa';  // export — always teal
+  } else if (_currentCarbonIndex) {
+    // UK — carbon intensity based
+    colour = CARBON_COLOURS[_currentCarbonIndex.toLowerCase()] || '#6b7080';
+  } else {
+    // Global fallback — magnitude based (green → amber → red)
+    var impFrac = Math.min(1, netKw / (GAUGE_MAX_IMP || 10));
+    if (impFrac < 0.33)      colour = '#22c55e';  // low  — green
+    else if (impFrac < 0.66) colour = '#f59e0b';  // mid  — amber
+    else                     colour = '#ff6b6b';  // high — red
+  }
+
+  // Arc drawn from centre (offset=141.5 = half arc) outward to needle
+  // Positive frac (import) → extend right from centre
+  // Negative frac (export) → extend left from centre
+  var centreOffset = GAUGE_ARC_LEN / 2;  // 141.5 = zero point
+  var arcLen = Math.abs(frac) * centreOffset;
+
+  var arc    = document.getElementById('gauge-arc');
+  var needle = document.getElementById('gauge-needle');
+  var netEl  = document.getElementById('net-kw');
+
+  if (arc) {
+    if (frac >= 0) {
+      // Import — arc starts at centre, extends right
+      arc.style.strokeDasharray = arcLen + ' ' + (GAUGE_ARC_LEN - arcLen);
+      arc.style.strokeDashoffset = centreOffset;
+    } else {
+      // Export — arc starts at centre, extends left
+      arc.style.strokeDasharray = arcLen + ' ' + (GAUGE_ARC_LEN - arcLen);
+      arc.style.strokeDashoffset = -(centreOffset - arcLen);
+    }
+    arc.style.stroke = colour;
+  }
+  if (needle) needle.setAttribute('transform', 'rotate(' + angle + ' 110 110)');
+  if (netEl)  netEl.textContent = (netKw >= 0 ? '+' : '-') + fmtKw(Math.abs(netKw));
+  if (netEl)  netEl.style.color = colour;
+}
+
+function setRow(id, kw, showRow) {
+  var el  = document.getElementById(id);
+  var row = document.getElementById('row-' + id.replace('-kw', ''));
+  if (el)  el.textContent = (kw !== null ? fmtKw(kw) : '—');
+  if (row && showRow !== undefined) row.style.display = showRow ? '' : 'none';
+}
+
+// ── Polling ──
+var statusDot  = document.getElementById('status-dot');
+var statusText = document.getElementById('status-text');
+var pollTimer  = null;
+
+function fmtKw(kw) {
+  if (kw === null || kw === undefined) return '—';
+  var abs = Math.abs(kw);
+  if (abs < 1) return Math.round(abs * 1000) + ' W';
+  return abs.toFixed(2) + ' kW';
+}
+
+function updatePower() {
+  fetch(apiUrl('/api/power'))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (statusDot)  { statusDot.className = 'status-dot live'; }
+      if (statusText) statusText.textContent = 'Live';
+
+      var imp = d.import_kw !== null && d.import_kw !== undefined ? d.import_kw : 0;
+      var exp = d.export_kw !== null && d.export_kw !== undefined ? d.export_kw : 0;
+      var net = imp - exp;
+
+      setGauge(net);
+
+      var impEl = document.getElementById('import-kw');
+      var expEl = document.getElementById('export-kw');
+      if (impEl) impEl.textContent = fmtKw(imp);
+      if (expEl) expEl.textContent = fmtKw(exp);
+
+      // Status indicator
+      var statusEl = document.getElementById('power-status');
+      if (statusEl) {
+        if (net > 0) {
+          statusEl.textContent = '🔴 Importing ' + fmtKw(imp);
+          statusEl.style.color = '#ff6b6b';
+          statusEl.style.borderColor = '#ff6b6b';
+        } else {
+          statusEl.textContent = '🟢 Exporting ' + fmtKw(exp);
+          statusEl.style.color = '#00d4aa';
+          statusEl.style.borderColor = '#00d4aa';
+        }
+      }
+
+      // Battery SoC cards
+      updateSocCards(d.soc_sensors || {});
+      // Generation mix donut
+      if (d.generation_mix && d.generation_mix.length) {
+        _updateMixCard(d.generation_mix);
+      }
+    })
+    .catch(function(err) {
+      if (statusDot)  { statusDot.className = 'status-dot stale'; }
+      if (statusText) statusText.textContent = 'Error';
+      console.error('Power poll error', err);
+    });
+}
+
+function socColour(pct) {
+  if (pct === null || pct === undefined) return '#6b7080';
+  if (pct >= 60) return '#22c55e';
+  if (pct >= 20) return '#f59e0b';
+  return '#ef4444';
+}
+
+var _invMaxKw = {};  // per-meter inverter gauge scale, keyed by meter_id
+function _getInvMax(mid) { return _invMaxKw[mid] || 5.0; }
+function _setInvMax(mid, kw) { _invMaxKw[mid] = Math.max(_getInvMax(mid), kw); }
+
+var _pvMaxKw = {};  // per-meter PV gauge scale, keyed by meter_id
+function setPvGauge(meterId, pkw) {
+  var arc  = document.getElementById('pv-arc-' + meterId);
+  var kwEl = document.getElementById('pv-kw-' + meterId);
+  if (!arc) return;
+  // Measure the real path length rather than trusting a constant (an off-by-a-
+  // few-px path would otherwise scale the fill wrongly). Fall back if unmeasurable.
+  var PV_ARC_LEN = 113.1;  // half-circle, r=36 (fallback)
+  try { var _l = arc.getTotalLength(); if (_l && _l > 1) PV_ARC_LEN = _l; } catch (e) {}
+  if (pkw === null || pkw === undefined) {
+    arc.style.strokeDasharray = '0 ' + PV_ARC_LEN;
+    if (kwEl) kwEl.textContent = '—';
+    return;
+  }
+  var absKw = Math.abs(pkw);
+  var cur = _pvMaxKw[meterId] || 4;          // sensible default scale
+  if (absKw > cur) { cur = Math.ceil(absKw); _pvMaxKw[meterId] = cur; }
+  var frac = Math.max(0, Math.min(1, absKw / cur));
+  var arcLen = frac * PV_ARC_LEN;
+  arc.style.strokeDasharray = arcLen + ' ' + (PV_ARC_LEN - arcLen);
+  if (kwEl) kwEl.textContent = fmtKw(absKw);
+}
+
+function setInvGauge(meterId, pkw) {
+  var INV_ARC_LEN = 283;  // same as main gauge r=90
+  var centre = INV_ARC_LEN / 2;  // 141.5
+  var arc    = document.getElementById('inv-arc-' + meterId);
+  var needle = document.getElementById('inv-needle-' + meterId);
+  var kwEl   = document.getElementById('inv-kw-' + meterId);
+  var dirEl  = document.getElementById('inv-dir-' + meterId);
+  if (!arc) return;
+
+  // Determine if this is a bidirectional (battery/V2X) or unidirectional gauge
+  var cardEl  = document.getElementById('soc-card-' + meterId);
+  var cardType = cardEl ? cardEl.getAttribute('data-type') : 'battery';
+  var v2x      = cardEl && cardEl.getAttribute('data-v2x') === 'true';
+  var isBatt   = cardType === 'battery';
+  var isHeatPump = cardType === 'heat_pump';
+  var bidir    = isBatt || v2x;
+
+  if (pkw === null || pkw === undefined) {
+    arc.style.strokeDasharray  = '0 ' + INV_ARC_LEN;
+    arc.style.strokeDashoffset = bidir ? centre : INV_ARC_LEN;
+    if (kwEl)   kwEl.textContent = '—';
+    if (dirEl)  dirEl.textContent = 'kW';
+    if (needle) needle.setAttribute('transform', bidir ? 'rotate(0 110 110)' : 'rotate(-90 110 110)');
+    return;
+  }
+
+  // Scale capped at per-meter max — set from 48hr history on first load
+  var absKw = Math.abs(pkw);
+  if (absKw > _getInvMax(meterId)) _setInvMax(meterId, Math.ceil(absKw));  // safety fallback only
+
+  var col, label, arcLen, angle;
+
+  if (bidir) {
+    // Bidirectional — 0 at centre, fills left (discharge) or right (charge)
+    var frac = Math.max(-1, Math.min(1, pkw / _getInvMax(meterId)));
+    angle  = frac * 90;
+    arcLen = Math.abs(frac) * centre;
+    if (pkw >= 0) {
+      col   = '#7c6af7';
+      label = isBatt ? 'In' : 'Charging';
+      arc.style.strokeDasharray  = arcLen + ' ' + (INV_ARC_LEN - arcLen);
+      arc.style.strokeDashoffset = centre;
+    } else {
+      col   = '#00d4aa';
+      label = isBatt ? 'Out' : 'Discharging';
+      arc.style.strokeDasharray  = arcLen + ' ' + (INV_ARC_LEN - arcLen);
+      arc.style.strokeDashoffset = -(centre - arcLen);
+    }
+  } else {
+    // Unidirectional — 0 at left edge, fills rightward, needle sweeps -90° to +90°
+    var frac = Math.max(0, Math.min(1, Math.abs(pkw) / _getInvMax(meterId)));
+    angle  = -90 + frac * 180;
+    arcLen = frac * INV_ARC_LEN;
+    col   = isHeatPump ? '#f97316' : '#7c6af7';
+    label = isHeatPump ? 'Consumption' : 'Charging';
+    arc.style.strokeDasharray  = arcLen + ' ' + (INV_ARC_LEN - arcLen);
+    arc.style.strokeDashoffset = 0;
+  }
+
+  arc.style.stroke = col;
+  if (needle) needle.setAttribute('transform', 'rotate(' + angle + ' 110 110)');
+  if (kwEl)  { kwEl.textContent = fmtKw(Math.abs(pkw)); kwEl.style.color = col; }
+  if (dirEl) { dirEl.textContent = label; }
+
+  // Update scale labels
+  var lMax = document.getElementById('inv-max-l-' + meterId);
+  var rMax = document.getElementById('inv-max-r-' + meterId);
+  if (bidir) {
+    if (lMax) lMax.textContent = fmtKw(_getInvMax(meterId));
+    if (rMax) rMax.textContent = fmtKw(_getInvMax(meterId));
+  } else {
+    if (lMax) lMax.textContent = '0';
+    if (rMax) rMax.textContent = fmtKw(_getInvMax(meterId));
+  }
+}
+
+function buildSocCard(meterId, info) {
+  var label   = info.label || meterId;
+  var type    = info.type || 'battery';
+  var isBatt  = type === 'battery';
+  var isEV    = type === 'ev';
+  var isHeatPump = type === 'heat_pump';
+  var v2x     = info.v2x || false;
+  var icon    = isBatt ? '🔋' : (isEV ? '🚗' : '♨️');
+
+  // Left SVG label — only battery and V2X EV can discharge
+  var leftLabel  = (isBatt || v2x) ? 'Out' : '';
+  var rightLabel = isBatt ? 'In' : (isHeatPump ? 'Consumption' : 'Charging');
+
+  // Battery icon + SoC — only for battery type
+  var battSection = '';
+  if (isBatt) {
+    var pct    = info.soc;
+    var col    = socColour(pct);
+    var pctVal = pct !== null && pct !== undefined ? Math.max(0, Math.min(100, pct)) : 0;
+    var fillW  = pct !== null ? pctVal + '%' : '0%';
+    var pctStr = pct !== null && pct !== undefined ? Math.round(pct) + '%' : '—';
+    battSection =
+      '<div class="battery-icon-wrap">' +
+        '<div class="battery-icon" id="batt-icon-' + meterId + '">' +
+          '<div class="battery-fill" id="batt-fill-' + meterId + '" style="width:' + fillW + ';background:' + col + ';"></div>' +
+        '</div>' +
+        '<div class="battery-pct" id="batt-pct-' + meterId + '" style="color:' + col + ';">' + pctStr + '</div>' +
+      '</div>';
+  }
+
+  // Small PV / solar dial — battery only, shown when a PV sensor is configured.
+  var pvGauge = '';
+  if (isBatt && info.pv_entity) {
+    pvGauge =
+      '<div class="pv-gauge" id="pv-gauge-' + meterId + '">' +
+        '<div class="pv-gauge-label">☀️ PV</div>' +
+        '<svg viewBox="0 0 90 54" xmlns="http://www.w3.org/2000/svg">' +
+          '<path d="M 9 48 A 36 36 0 0 1 81 48" class="gauge-arc-bg" fill="none" stroke="#2a2d3a" stroke-width="8" stroke-linecap="round"/>' +
+          '<path id="pv-arc-' + meterId + '" d="M 9 48 A 36 36 0 0 1 81 48" fill="none" stroke="#00d4aa" stroke-width="8" stroke-linecap="round" stroke-dasharray="0 113" stroke-dashoffset="0"/>' +
+          '<text x="45" y="42" font-size="15" font-weight="700" class="pv-gauge-value" fill="#00d4aa" text-anchor="middle" id="pv-kw-' + meterId + '">—</text>' +
+        '</svg>' +
+      '</div>';
+  }
+
+  // Power gauge — shown when power_entity configured
+  var gaugeSection = '';
+  var _invHtml = '';
+  if (info.power_entity) {
+    var gaugeLabel = isBatt ? '⚡ Inverter' : (isEV ? '⚡ Charger' : '⚡ Heat Pump');
+    var bidir = isBatt || v2x;
+    var initOffset = bidir ? '141.5' : '283';
+    var initRotate = bidir ? 'rotate(0 110 110)' : 'rotate(-90 110 110)';
+    var zeroMarkerX1 = bidir ? '110' : '20';
+    var zeroMarkerX2 = bidir ? '110' : '20';
+    var zeroMarkerY1 = bidir ? '24' : '110';
+    var zeroMarkerY2 = bidir ? '36' : '98';
+    var zeroLabel = bidir ? '0' : '';
+    _invHtml =
+      '<div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;align-self:flex-start;margin-top:4px;">' + gaugeLabel + '</div>' +
+      '<div class="inv-gauge-wrap">' +
+        '<svg viewBox="0 0 220 120" xmlns="http://www.w3.org/2000/svg">' +
+          '<path d="M 20 110 A 90 90 0 0 1 200 110" class="gauge-arc-bg" fill="none" stroke="#2a2d3a" stroke-width="14" stroke-linecap="round"/>' +
+          '<line x1="' + zeroMarkerX1 + '" y1="' + zeroMarkerY1 + '" x2="' + zeroMarkerX2 + '" y2="' + zeroMarkerY2 + '" stroke="#6b7080" stroke-width="2"/>' +
+          '<path id="inv-arc-' + meterId + '" d="M 20 110 A 90 90 0 0 1 200 110" fill="none" stroke="#7c6af7" stroke-width="14" stroke-linecap="round"' +
+            ' stroke-dasharray="0 283" stroke-dashoffset="' + initOffset + '" transform-origin="110 110"/>' +
+          '<line id="inv-needle-' + meterId + '" x1="110" y1="110" x2="110" y2="30"' +
+            ' stroke="#e8eaf0" stroke-width="2" stroke-linecap="round" transform="' + initRotate + '"/>' +
+          '<circle cx="110" cy="110" r="5" fill="#e8eaf0"/>' +
+          '<text x="18" y="125" font-size="10" fill="#6b7080" text-anchor="middle">' + leftLabel + '</text>' +
+          '<text x="202" y="125" font-size="10" fill="#6b7080" text-anchor="middle">' + rightLabel + '</text>' +
+          '<text x="110" y="18" font-size="10" fill="#6b7080" text-anchor="middle">' + zeroLabel + '</text>' +
+        '</svg>' +
+        '<div class="inv-gauge-value">' +
+          '<div class="inv-gauge-kw" id="inv-kw-' + meterId + '">—</div>' +
+          '<div class="inv-gauge-unit" id="inv-dir-' + meterId + '">kW</div>' +
+        '</div>' +
+      '</div>';
+  }
+
+  // Assemble the gauge section. Wrap in a relative container only when the PV
+  // dial is present, so a battery card WITHOUT a PV sensor stays byte-identical.
+  if (_invHtml && pvGauge) {
+    gaugeSection = '<div class="soc-gauge-section" style="position:relative;min-height:190px;">' + _invHtml + pvGauge + '</div>';
+  } else if (_invHtml) {
+    gaugeSection = _invHtml;
+  } else if (pvGauge) {
+    gaugeSection = '<div class="soc-gauge-section" style="position:relative;min-height:64px;">' + pvGauge + '</div>';
+  }
+
+  return '<div class="soc-card" id="soc-card-' + meterId + '" data-type="' + type + '" data-v2x="' + v2x + '">' +
+    '<div class="card-title" style="font-size:12px;align-self:flex-start;">' + icon + ' ' + label + '</div>' +
+    battSection +
+    gaugeSection +
+  '</div>';
+}
+
+// ── Expand / collapse overlay ──────────────────────────────────────────────
+// Cards stay in the DOM. On expand, we clone the card's innerHTML into a
+// modal div inside the backdrop. Collapse destroys the modal content.
+// This avoids all DOM-move fragility.
+
+var _backdrop = document.createElement('div');
+_backdrop.className = 'expand-backdrop';
+_backdrop.addEventListener('click', function(e) {
+  if (e.target === _backdrop) _collapseAll();
+});
+document.body.appendChild(_backdrop);
+
+var _expandModal = document.createElement('div');
+_expandModal.className = 'expand-modal';
+_backdrop.appendChild(_expandModal);
+
+var _expandWhich = null;
+var _phOrigWrap = null; // original .power-history-wrap
+
+function _expandCard(which) {
+  if (event) event.stopPropagation();
+  _expandWhich = which;
+
+  var cardId = which === 'carbon' ? 'carbon-card-wrap' : 'power-history-card-wrap';
+  var card = document.getElementById(cardId);
+  if (!card) return;
+
+  // Clone card content (not the expand button) into modal
+  _expandModal.innerHTML = '';
+
+  // Close button
+  var closeBtn = document.createElement('button');
+  closeBtn.className = 'expand-modal-close';
+  closeBtn.innerHTML = '✕';
+  closeBtn.addEventListener('click', _collapseAll);
+  _expandModal.appendChild(closeBtn);
+
+  // Clone card children (skip the expand-btn)
+  Array.from(card.children).forEach(function(child) {
+    if (!child.classList.contains('expand-btn')) {
+      _expandModal.appendChild(child.cloneNode(true));
+    }
+  });
+
+  // Fix cloned carbon content — remove inline display:none so CSS flex takes over
+  if (which === 'carbon') {
+    var clonedContent = _expandModal.querySelector('#carbon-content');
+    var clonedLoading = _expandModal.querySelector('#carbon-loading');
+    var clonedError   = _expandModal.querySelector('#carbon-error');
+    if (clonedContent)  clonedContent.style.display = '';
+    if (clonedLoading)  clonedLoading.style.display = 'none';
+    if (clonedError)    clonedError.style.display = 'none';
+    if (clonedContent)  clonedContent.id = 'carbon-content-modal';
+
+    // Redraw bars at modal size after layout settles
+    setTimeout(function() {
+      var modalForecast = _expandModal.querySelector('.carbon-forecast');
+      if (!modalForecast || !_lastCarbonData) return;
+      var containerH = modalForecast.getBoundingClientRect().height || 200;
+      var slots = _lastCarbonData.slots || [];
+      var intensities = slots.map(function(s) { return s.intensity || 0; });
+      var maxI = Math.max.apply(null, intensities) || 1;
+      var bars = modalForecast.querySelectorAll('.carbon-slot');
+      bars.forEach(function(bar, i) {
+        if (slots[i]) {
+          var h = Math.max(4, Math.round((slots[i].intensity / maxI) * containerH));
+          bar.style.height = h + 'px';
+        }
+      });
+    }, 100);
+  }
+
+  // For power history: replace cloned canvas with the ACTUAL canvas element
+  // so all existing event listeners (hover, drag zoom etc.) keep working
+  if (which === 'ph' && _phCanvas) {
+    var modalWrap = _expandModal.querySelector('.power-history-wrap');
+    if (modalWrap) {
+      // Move actual canvas + tooltip into modal wrap
+      _phOrigWrap = _phCanvas.parentElement;
+      var tip = _phOrigWrap.querySelector('.ph-tooltip');
+      modalWrap.innerHTML = '';
+      modalWrap.appendChild(_phCanvas);
+      if (tip) modalWrap.appendChild(tip);
+      // Set explicit canvas CSS height so _phDraw can read correct dimensions
+      _phCanvas.style.height = '100%';
+      setTimeout(function() {
+        // Force canvas to fill the wrap using its actual pixel height
+        var wrapH = modalWrap.getBoundingClientRect().height || 500;
+        _phCanvas.style.height = wrapH + 'px';
+        if (typeof _phDraw === 'function') _phDraw();
+      }, 150);
+    }
+  }
+
+  _backdrop.classList.add('active');
+}
+
+function _collapseAll() {
+  // Restore canvas to original wrap before clearing modal
+  if (_expandWhich === 'ph' && _phOrigWrap && _phCanvas) {
+    var tip = _expandModal.querySelector('.ph-tooltip');
+    _phCanvas.style.height = '';  // restore CSS-controlled height
+    _phOrigWrap.appendChild(_phCanvas);
+    if (tip) _phOrigWrap.appendChild(tip);
+    _phOrigWrap = null;
+    setTimeout(function() { if (typeof _phDraw === 'function') _phDraw(); }, 50);
+  }
+
+  _backdrop.classList.remove('active');
+  _expandModal.innerHTML = '';
+  _expandWhich = null;
+}
+
+// ESC key to collapse
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') _collapseAll();
+});
+
+// ── Grid layout adjustment ─────────────────────────────────────────────────
+// Adjust CI card column span so it never sits as a thin orphan.
+// CI card is now in the wide-row, not the summary-grid — this function
+// is retained for future use but currently a no-op.
+function _adjustGridLayout() {
+  _applyLayout();
+}
+
+function updateSocCards(socSensors) {
+  var container = document.getElementById('soc-cards-container');
+  if (!container) return;
+
+  Object.keys(socSensors).forEach(function(mid) {
+    var info = socSensors[mid];
+    var existing = document.getElementById('soc-card-' + mid);
+    // Force rebuild if type has changed or data-type is missing (old card)
+    if (existing && existing.getAttribute('data-type') !== (info.type || 'battery')) {
+      existing.remove();
+      existing = null;
+    }
+    if (!existing) {
+      var tmp = document.createElement('div');
+      tmp.innerHTML = buildSocCard(mid, info);
+      container.appendChild(tmp.firstChild);
+      // Initialise gauge arc after DOM insertion
+      if (info.power_entity) {
+        setTimeout(function() { setInvGauge(mid, info.power_kw); }, 0);
+        // Fetch history to set gauge scale
+        fetch(apiUrl('/api/sub-meter/history?meter_id=' + encodeURIComponent(mid)))
+          .then(function(r) { return r.json(); })
+          .then(function(d) {
+            if (d.max_kw) {
+              _setInvMax(mid, Math.ceil(d.max_kw));
+            }
+            setInvGauge(mid, info.power_kw);
+          })
+          .catch(function() {});
+      }
+      if (info.pv_entity) {
+        setTimeout(function() { setPvGauge(mid, info.pv_kw); }, 0);
+      }
+    } else {
+      // Update battery fill — only for battery type cards
+      var cardEl = document.getElementById('soc-card-' + mid);
+      var cardType = cardEl ? cardEl.getAttribute('data-type') : 'battery';
+      if (cardType === 'battery') {
+        var pct = info.soc;
+        var col = socColour(pct);
+        var pctVal = pct !== null && pct !== undefined ? Math.max(0, Math.min(100, pct)) : 0;
+        var fill = document.getElementById('batt-fill-' + mid);
+        var pctEl = document.getElementById('batt-pct-' + mid);
+        if (fill) { fill.style.width = (pct !== null ? pctVal + '%' : '0%'); fill.style.background = col; }
+        if (pctEl) { pctEl.style.color = col; pctEl.textContent = pct !== null && pct !== undefined ? Math.round(pct) + '%' : '—'; }
+      }
+
+      // Update power gauge
+      if (info.power_entity) {
+        setInvGauge(mid, info.power_kw);
+      }
+      if (info.pv_entity) {
+        setPvGauge(mid, info.pv_kw);
+      }
+    }
+  });
+
+  // Remove cards for meters no longer in response
+  container.querySelectorAll('.soc-card').forEach(function(card) {
+    var mid = card.id.replace('soc-card-', '');
+    if (!socSensors[mid]) card.remove();
+  });
+
+  _adjustGridLayout();
+}
+
+
+// Set gauge scale labels
+(function() {
+  var impEl = document.getElementById('gauge-imp-max');
+  var expEl = document.getElementById('gauge-exp-max');
+  if (impEl) impEl.textContent = fmtKw(GAUGE_MAX_IMP);
+  if (expEl) expEl.textContent = fmtKw(GAUGE_MAX_EXP);
+})();
+
+// Poll the live gauge. A local sensor is cheap → 5s. The Mini reads the engine's
+// server-side polled value (the engine is the single Mini poller, page-independent),
+// so 60s is plenty and there's no per-page GraphQL cost to bound.
+{% if has_power_sensor or has_sub_devices %}
+var POWER_POLL_MS = {% if mini_chosen %}60000{% else %}5000{% endif %};
+updatePower();
+pollTimer = setInterval(updatePower, POWER_POLL_MS);
+{% endif %}
+// Initial layout adjustment — runs after first card render settles
+setTimeout(_adjustGridLayout, 500);
+
+window.addEventListener('beforeunload', function() {
+  if (pollTimer) clearInterval(pollTimer);
+});
+
+// ── Billing refresh — 1 minute after each block finalise ──
+function msUntilNextBillingRefresh() {
+  var now     = new Date();
+  var mins    = now.getMinutes();
+  var secs    = now.getSeconds();
+  var ms      = now.getMilliseconds();
+  var bm      = BLOCK_MINUTES || 30;
+  var elapsed = ((mins % bm) * 60 + secs) * 1000 + ms;
+  var blockMs = bm * 60 * 1000;
+  var msToNextBoundary = blockMs - elapsed;
+  return msToNextBoundary + 60 * 1000;  // 1 minute after boundary
+}
+
+function refreshBilling() {
+  // Reload just the billing section by fetching a new page and extracting the cards
+  fetch(apiUrl('/api/billing') + '?t=' + Date.now())
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      updateBillingCard('today',  d.today_total,  d.today_rows,  d.today_date,  d.currency);
+      updateBillingCard('month',  d.month_total,  d.month_rows,  d.month_period, d.currency);
+      updateBillingCard('year',   d.year_total,   d.year_rows,   d.year_period,  d.currency);
+      scheduleBillingRefresh();
+    })
+    .catch(function() { scheduleBillingRefresh(); });
+}
+
+function updateBillingCard(id, total, rows, period, currency) {
+  var totalEl   = document.getElementById('billing-total-' + id);
+  var periodEl  = document.getElementById('billing-period-' + id);
+  var rowsEl    = document.getElementById('billing-rows-' + id);
+  var loadingEl = document.getElementById('billing-loading-' + id);
+  // If card is still in loading state, rebuild it
+  if (!totalEl && loadingEl) {
+    var card = loadingEl.closest('.billing-card');
+    if (card && total !== null && total !== undefined) {
+      var sign = total < 0 ? '-' : '';
+      var absT = Math.abs(total).toFixed(2);
+      var rowsHtml = (rows || []).map(function(r) {
+        var absC = Math.abs(r.cost); var signC = r.cost < 0 ? '-' : '';
+        var col = r.cost < 0 ? 'var(--accent)' : 'var(--text)';
+        var boldRow = r.bold ? 'style="background:rgba(255,255,255,0.04);border-color:var(--muted);"' : '';
+        var boldLbl = r.bold ? 'style="color:var(--text);font-weight:600;"' : '';
+        var boldVal = r.bold ? ';font-weight:600;' : '';
+        return '<div class="billing-row" ' + boldRow + '>'
+          + '<div class="billing-row-label" ' + boldLbl + '>' + r.label + '</div>'
+          + '<div class="billing-row-value" style="color:' + col + boldVal + '">'
+          + signC + currency + absC.toFixed(2) + '</div></div>';
+      }).join('');
+      loadingEl.outerHTML =
+        '<div class="billing-total" id="billing-total-' + id + '" style="color:var(--accent);">'
+        + sign + currency + absT + '</div>'
+        + '<div class="billing-period" id="billing-period-' + id + '">' + (period || '') + '</div>'
+        + '<div class="billing-rows" id="billing-rows-' + id + '">' + rowsHtml + '</div>';
+    }
+    return;
+  }
+  if (!totalEl) return;
+  var absTotal = Math.abs(total);
+  var sign     = total < 0 ? '-' : '';
+  totalEl.textContent  = sign + currency + absTotal.toFixed(2);
+  totalEl.style.color  = total < 0 ? 'var(--accent)' : 'var(--accent)';
+  if (periodEl) periodEl.textContent = period;
+  if (rowsEl && rows) {
+    rowsEl.innerHTML = rows.map(function(r) {
+      var absC    = Math.abs(r.cost);
+      var signC   = r.cost < 0 ? '-' : '';
+      var col     = r.cost < 0 ? 'var(--accent)' : 'var(--text)';
+      var boldRow = r.bold ? 'style="background:rgba(255,255,255,0.04);border-color:var(--muted);"' : '';
+      var boldLbl = r.bold ? 'style="color:var(--text);font-weight:600;"' : '';
+      var boldVal = r.bold ? ';font-weight:600;' : '';
+      return '<div class="billing-row" ' + boldRow + '>'
+        + '<div class="billing-row-label" ' + boldLbl + '>' + r.label + '</div>'
+        + '<div class="billing-row-value" style="color:' + col + boldVal + '">'
+        + signC + currency + absC.toFixed(2)
+        + '</div></div>';
+    }).join('');
+  }
+}
+
+function scheduleBillingRefresh() {
+  setTimeout(refreshBilling, msUntilNextBillingRefresh());
+}
+
+// Load billing immediately on page load, then schedule future refreshes
+// Billing — defer 300ms so power gauge renders first
+setTimeout(function() { refreshBilling(); }, 300);
+
+// ── Carbon intensity ──
+var CARBON_COLOURS = {
+  'very low':  '#22c55e',
+  'low':       '#86efac',
+  'moderate':  '#f59e0b',
+  'high':      '#ff6b6b',
+  'very high': '#dc2626',
+};
+
+function carbonIndexClass(index) {
+  return (index || '').toLowerCase().replace(' ', '-');
+}
+
+var _lastCarbonData = null;
+
+function processCarbonData(d) {
+  var loadingEl  = document.getElementById('carbon-loading');
+  var contentEl  = document.getElementById('carbon-content');
+  var errorEl    = document.getElementById('carbon-error');
+  _lastCarbonData = d;
+
+  if (!d.slots || !d.slots.length) {
+    if (loadingEl) loadingEl.style.display = 'none';
+    if (errorEl)   errorEl.style.display = '';
+    return;
+  }
+  if (loadingEl) loadingEl.style.display = 'none';
+  if (errorEl)   errorEl.style.display = 'none';
+  if (contentEl) contentEl.style.display = '';
+
+  // Current slot
+  var now = new Date();
+  var current = d.slots[0];
+  for (var i = 0; i < d.slots.length; i++) {
+    var from = new Date(d.slots[i].from);
+    var to   = new Date(d.slots[i].to);
+    if (now >= from && now < to) { current = d.slots[i]; break; }
+  }
+
+  _currentCarbonIndex = current.index || null;
+
+  var valEl = document.getElementById('carbon-value');
+  var idxEl = document.getElementById('carbon-index');
+  if (valEl) {
+    valEl.textContent = current.intensity !== null ? current.intensity : '—';
+    valEl.style.color = CARBON_COLOURS[(current.index || '').toLowerCase()] || 'var(--text)';
+  }
+  if (idxEl) {
+    idxEl.textContent = current.index || '—';
+    idxEl.className = 'carbon-index ' + carbonIndexClass(current.index);
+  }
+
+  // Forecast bar
+  var forecastEl = document.getElementById('carbon-forecast');
+  var labelsEl   = document.getElementById('carbon-time-labels');
+  if (forecastEl) {
+    forecastEl.innerHTML = '';
+    var intensities = d.slots.map(function(s) { return s.intensity || 0; });
+    var maxI = Math.max.apply(null, intensities) || 1;
+    // Use actual rendered height of container, fallback to 60px
+    var containerH = forecastEl.getBoundingClientRect().height || 60;
+    d.slots.forEach(function(slot) {
+      var fromDt = new Date(slot.from);
+      var isNow  = (now >= fromDt && now < new Date(slot.to));
+      var h      = Math.max(4, Math.round((slot.intensity / maxI) * containerH));
+      var colour = CARBON_COLOURS[(slot.index || '').toLowerCase()] || '#6b7080';
+      var bar    = document.createElement('div');
+      bar.className = 'carbon-slot' + (isNow ? ' current-slot' : '');
+      bar.style.height = h + 'px';
+      bar.style.background = colour;
+      bar.title = fromDt.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})
+                + ' — ' + (slot.intensity || '?') + ' gCO₂/kWh (' + (slot.index || '?') + ')';
+      forecastEl.appendChild(bar);
+    });
+  }
+
+  // Time labels — every 6 hours (12 slots) for 48h view
+  if (labelsEl) {
+    labelsEl.innerHTML = '';
+    for (var j = 0; j < d.slots.length; j += 12) {
+      var s    = d.slots[j];
+      var span = document.createElement('span');
+      var dt   = new Date(s.from);
+      span.textContent = dt.toLocaleDateString([], {weekday:'short'}) + ' '
+                       + dt.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+      labelsEl.appendChild(span);
+    }
+  }
+}
+
+{% if has_postcode %}
+var _carbonFailCount = 0;
+var _carbonTimer = null;
+
+function scheduleCarbon() {
+  if (_carbonTimer) clearTimeout(_carbonTimer);
+  // Backoff: 5min normally, 15min after 1 failure, 30min after 2+
+  var delay = _carbonFailCount === 0 ? 5 * 60 * 1000
+            : _carbonFailCount === 1 ? 15 * 60 * 1000
+            : 30 * 60 * 1000;
+  _carbonTimer = setTimeout(function() { loadCarbonAndSchedule(); }, delay);
+}
+
+function loadCarbonAndSchedule() {
+  fetch(apiUrl('/api/carbon'))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      _carbonFailCount = 0;
+      processCarbonData(d);
+      scheduleCarbon();
+    })
+    .catch(function(err) {
+      _carbonFailCount++;
+      var loadingEl = document.getElementById('carbon-loading');
+      var errorEl   = document.getElementById('carbon-error');
+      if (loadingEl) loadingEl.style.display = 'none';
+      if (errorEl)   errorEl.style.display = '';
+      console.error('Carbon fetch error', err);
+      scheduleCarbon();
+    });
+}
+
+// Carbon — defer 600ms to avoid competing with power + billing on first load
+setTimeout(function() { loadCarbonAndSchedule(); }, 600);
+{% endif %}
+
+{% if has_power_sensor or has_postcode %}
+// ── Rolling power history chart ──────────────────────────────────────────────
+// ── Layout switcher ──────────────────────────────────────────────────────
+function _applyLayout() {
+  var container = document.getElementById('soc-cards-container');
+  // Count the live-power gauge only when it's actually rendered — on API-only
+  // setups (no main power source) there is no .power-card, so assuming +1 here
+  // over-counted and flipped a 3-device page into the wide layout-b prematurely.
+  var hasLivePower = !!document.querySelector('.power-card');
+  var gaugeCount = (container ? container.children.length : 0) + (hasLivePower ? 1 : 0);
+  var page = document.querySelector('.live-power-page');
+  if (!page) return;
+
+  var gaugeCiRow = document.querySelector('.gauge-ci-row');
+  var wideRow    = document.querySelector('.wide-row');
+  var carbonWrap = document.getElementById('carbon-card-wrap');
+
+  if (gaugeCount <= 8) {
+    page.classList.add('layout-a');
+    page.classList.remove('layout-b');
+    // Move CI card into gauge-ci-row so it sits beside gauges, expanding to fill
+    if (gaugeCiRow && carbonWrap && !gaugeCiRow.contains(carbonWrap)) {
+      gaugeCiRow.appendChild(carbonWrap);
+    }
+  } else {
+    page.classList.add('layout-b');
+    page.classList.remove('layout-a');
+    // Move CI card back into wide-row beside history
+    if (wideRow && carbonWrap && !wideRow.contains(carbonWrap)) {
+      wideRow.insertBefore(carbonWrap, wideRow.firstChild);
+    }
+  }
+}
+
+
+// Run on load and whenever soc cards update
+document.addEventListener('DOMContentLoaded', function() {
+  setTimeout(_applyLayout, 100);
+});
+
+var _phCanvas   = document.getElementById('power-history-canvas');
+var _phHasCI    = {{ 'true' if has_postcode else 'false' }};
+var _phData     = [];   // [{captured_at, net_kw, intensity, carbon_gco2_min}]
+var _phTimer    = null;
+var _phMode     = 'kw'; // 'kw', 'co2', or 'mix'
+var _phMixData  = [];   // [{block_start, fuels:{wind,solar,...}}]
+var _phZoomT0   = null; // null = default (now - 48h)
+var _phZoomSpan = null; // null = default (48h)
+
+function _phGetWindow() {
+  var now    = Date.now();
+  var t0     = _phZoomT0   !== null ? _phZoomT0   : now - 48 * 3600 * 1000;
+  var tSpan  = _phZoomSpan !== null ? _phZoomSpan : 48 * 3600 * 1000;
+  return { t0: t0, tSpan: tSpan };
+}
+
+function _phResetZoom() {
+  _phZoomT0   = null;
+  _phZoomSpan = null;
+  _phDraw();
+}
+
+// Restore persisted mode (default kw)
+(function() {
+  try {
+    var saved = localStorage.getItem('emt_ph_mode');
+    if (saved === 'co2' && _phHasCI) _phMode = 'co2';
+    if (saved === 'mix' && _phHasCI) _phMode = 'mix';
+  } catch(e) {}
+  {% if not has_power_sensor %}
+  _phMode = 'mix';  // no power readings → generation mix is the only meaningful view
+  {% endif %}
+  _phApplyMode();
+})();
+
+function _phSetMode(mode) {
+  _phMode = mode;
+  try { localStorage.setItem('emt_ph_mode', mode); } catch(e) {}
+  _phApplyMode();
+  _phDraw();
+}
+
+function _phUpdateTitle() {
+  var title = (_phMode === 'co2' && _phHasCI)
+    ? '☁️ 48-Hour Carbon Rate'
+    : (_phMode === 'mix' && _phHasCI)
+    ? '⚡ 48-Hour Generation Mix'
+    : '📈 48-Hour Power History';
+  // Update all instances — original and modal clone
+  [document, _expandModal].forEach(function(ctx) {
+    var el = ctx.querySelector('#ph-title');
+    if (el) el.textContent = title;
+  });
+}
+
+function _phApplyMode() {
+  _phUpdateTitle();
+  // Update all instances — original card and modal clone if open
+  // Modal canvas was moved so the card content is split: canvas in modal,
+  // buttons/legend cloned. Update both document and modal.
+  var isCo2 = _phMode === 'co2';
+
+  function applyToContext(ctx) {
+    var btnKw  = ctx.querySelector('#ph-btn-kw');
+    var btnCo2 = ctx.querySelector('#ph-btn-co2');
+    var btnMix = ctx.querySelector('#ph-btn-mix');
+    var legImp = ctx.querySelector('#ph-legend-import');
+    var legExp = ctx.querySelector('#ph-legend-export');
+    var legCo2 = ctx.querySelector('#ph-legend-co2');
+    var legMix = ctx.querySelector('#ph-legend-mix');
+    var isMix  = _phMode === 'mix';
+    if (btnKw)  btnKw.classList.toggle('active',  _phMode === 'kw');
+    if (btnCo2) btnCo2.classList.toggle('active', _phMode === 'co2');
+    if (btnMix) btnMix.classList.toggle('active', _phMode === 'mix');
+    if (legImp) legImp.style.display = (!isCo2 && !isMix) ? '' : 'none';
+    if (legExp) legExp.style.display = (!isCo2 && !isMix) ? '' : 'none';
+    if (legCo2) legCo2.style.display = isCo2 ? '' : 'none';
+    if (legMix) legMix.style.display = isMix ? '' : 'none';
+  }
+
+  applyToContext(document);
+  if (_expandWhich === 'ph' && _backdrop && _backdrop.classList.contains('active')) {
+    applyToContext(_expandModal);
+  }
+}
+
+function _phGetTheme() {
+  var isDark = document.documentElement.getAttribute('data-theme') !== 'light';
+  return {
+    grid:   isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.08)',
+    text:   isDark ? '#6b7080' : '#9ca3af',
+    zero:   isDark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.2)',
+    import: '#ff6b6b',
+    export: '#00d4aa',
+    bg:     isDark ? '#1a1d2e' : '#ffffff',
+  };
+}
+
+// ── Generation Mix helpers ────────────────────────────────────────────────────
+var _MIX_FUELS = ['wind','solar','nuclear','imports','biomass','gas','hydro','other','coal'];
+var _MIX_COLOURS = {
+  wind:'#3b82f6',
+  solar:'#facc15',
+  nuclear:'#7c3aed',
+  gas:'#f97316',
+  biomass:'#92400e',
+  hydro:'#38bdf8',
+  imports:'#9ca3af',
+  other:'#6b7280',
+  coal:'#374151'
+};
+function _mixFuelColour(fuel) { return _MIX_COLOURS[fuel] || '#9ca3af'; }
+function _mixFuelLabel(fuel)  {
+  return {wind:'Wind',solar:'Solar',nuclear:'Nuclear',imports:'Imports',
+          biomass:'Biomass',gas:'Gas',hydro:'Hydro',other:'Other',coal:'Coal'}[fuel] || fuel;
+}
+
+// ── Generation Mix donut ─────────────────────────────────────────────────────
+var _lastMixSlot = null; // avoid re-drawing identical data
+
+var _mixSegments = [];      // [{fuel, perc, startAngle, endAngle, colour}]
+var _mixDominant = null;    // default centre label data
+var _mixHoverFuel = null;   // currently hovered fuel
+
+function _drawMixDonut(mix) {
+  var canvas = document.getElementById('mix-donut-canvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var W = canvas.width, H = canvas.height;
+  var cx = W/2, cy = H/2, r = Math.min(W, H) / 2 - 8, inner = r * 0.55;
+
+  ctx.clearRect(0, 0, W, H);
+
+  if (!mix || !mix.length) {
+    document.getElementById('mix-loading').style.display = '';
+    return;
+  }
+  document.getElementById('mix-loading').style.display = 'none';
+
+  var data = mix.filter(function(d){ return d.perc > 0; })
+                .sort(function(a,b){ return b.perc - a.perc; });
+  var total = data.reduce(function(s, d){ return s + d.perc; }, 0);
+  if (total <= 0) return;
+
+  // Draw segments and store angle ranges for hit-testing
+  _mixSegments = [];
+  var startAngle = -Math.PI / 2;
+  data.forEach(function(d) {
+    var sweep = (d.perc / total) * Math.PI * 2;
+    var endAngle = startAngle + sweep;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, r, startAngle, endAngle);
+    ctx.closePath();
+    ctx.globalAlpha = 0.75;
+    ctx.fillStyle = _mixFuelColour(d.fuel);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    _mixSegments.push({fuel: d.fuel, perc: d.perc, col: _mixFuelColour(d.fuel),
+                       start: startAngle, end: endAngle});
+    startAngle = endAngle;
+  });
+
+  // Inner hole
+  ctx.beginPath();
+  ctx.arc(cx, cy, inner, 0, Math.PI * 2);
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--surface').trim() || '#1e2030';
+  ctx.fill();
+
+  _mixDominant = data[0];
+  _mixSetCentre(_mixDominant.fuel, _mixDominant.perc);
+
+  // Legend — show ALL fuels, compact
+  var legend = document.getElementById('mix-legend');
+  if (legend) {
+    legend.innerHTML = data.map(function(d) {
+      return '<div style="display:flex;align-items:center;gap:5px;">' +
+        '<span style="width:7px;height:7px;border-radius:50%;background:' + _mixFuelColour(d.fuel) + ';flex-shrink:0;"></span>' +
+        '<span style="color:var(--muted);font-size:10px;">' + _mixFuelLabel(d.fuel) + '</span>' +
+        '<span style="margin-left:auto;color:var(--text);font-weight:600;font-size:10px;">' + d.perc.toFixed(1) + '%</span>' +
+        '</div>';
+    }).join('');
+  }
+}
+
+function _mixSetCentre(fuel, perc) {
+  var centFuel = document.getElementById('mix-centre-fuel');
+  var centPerc = document.getElementById('mix-centre-perc');
+  if (centFuel) centFuel.textContent = _mixFuelLabel(fuel);
+  if (centPerc) { centPerc.textContent = perc.toFixed(0) + '%'; centPerc.style.color = _mixFuelColour(fuel); }
+}
+
+// Donut hover — hit test which segment the mouse is over
+(function() {
+  function initDonutHover() {
+    var canvas = document.getElementById('mix-donut-canvas');
+    if (!canvas) return;
+    var W = canvas.width, H = canvas.height;
+    var cx = W/2, cy = H/2;
+    var r = Math.min(W, H) / 2 - 8, inner = r * 0.55;
+
+    canvas.addEventListener('mousemove', function(e) {
+      if (!_mixSegments.length) return;
+      var rect = canvas.getBoundingClientRect();
+      var mx = (e.clientX - rect.left) * (W / rect.width);
+      var my = (e.clientY - rect.top)  * (H / rect.height);
+      var dx = mx - cx, dy = my - cy;
+      var dist = Math.sqrt(dx*dx + dy*dy);
+
+      if (dist < inner || dist > r) {
+        // Outside ring — restore dominant
+        if (_mixHoverFuel !== null) {
+          _mixHoverFuel = null;
+          if (_mixDominant) _mixSetCentre(_mixDominant.fuel, _mixDominant.perc);
+        }
+        return;
+      }
+
+      // Angle of mouse relative to canvas centre
+      var angle = Math.atan2(dy, dx);
+      // Normalise to same convention as drawing (start at -π/2)
+      if (angle < -Math.PI / 2) angle += Math.PI * 2;
+
+      var hit = null;
+      _mixSegments.forEach(function(seg) {
+        var s = seg.start, en = seg.end;
+        if (angle >= s && angle < en) hit = seg;
+      });
+
+      if (hit && hit.fuel !== _mixHoverFuel) {
+        _mixHoverFuel = hit.fuel;
+        _mixSetCentre(hit.fuel, hit.perc);
+      }
+    });
+
+    canvas.addEventListener('mouseleave', function() {
+      _mixHoverFuel = null;
+      if (_mixDominant) _mixSetCentre(_mixDominant.fuel, _mixDominant.perc);
+    });
+  }
+  // Init after DOM ready
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initDonutHover);
+  } else {
+    initDonutHover();
+  }
+})();
+
+function _updateMixCard(mix) {
+  if (!mix || !mix.length) return;
+  // Avoid re-rendering if identical to last
+  var sig = mix.map(function(d){ return d.fuel + ':' + d.perc; }).join(',');
+  if (sig === _lastMixSlot) return;
+  _lastMixSlot = sig;
+  _drawMixDonut(mix);
+}
+
+
+
+function _phDraw() {
+  if (!_phCanvas) return;
+  var dpr  = window.devicePixelRatio || 1;
+  var rect = _phCanvas.getBoundingClientRect();
+  var W    = rect.width  || 600;
+  var H    = rect.height || 180;
+  _phCanvas.width  = W * dpr;
+  _phCanvas.height = H * dpr;
+  var ctx = _phCanvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+
+  var th    = _phGetTheme();
+  var PAD_L = 42;
+  var PAD_T = 12;
+  var PAD_B = 24;
+  var CW    = W - PAD_L;
+  var CH    = H - PAD_T - PAD_B;
+
+  var _phMixMode = (_phMode === 'mix' && _phHasCI);
+  var _haveMix   = _phMixMode && _phMixData && _phMixData.length;
+  if ((!_phData || _phData.length < 2) && !_haveMix) {
+    // Mix mode draws from generation-mix data, not power readings, so it renders
+    // with no power history (postcode-only Overview). Only bail when there is
+    // genuinely nothing to show.
+    ctx.fillStyle = th.text;
+    ctx.font = '12px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Collecting data\u2026', W / 2, H / 2);
+    return;
+  }
+
+  var _win  = _phGetWindow();
+  var now   = Date.now();
+  var t0    = _win.t0;
+  var tSpan = _win.tSpan;
+
+  function tx(ts) {
+    var s = (ts && ts.slice(-1) !== 'Z') ? ts + 'Z' : ts;
+    return PAD_L + ((new Date(s).getTime() - t0) / tSpan) * CW;
+  }
+
+  // ── Shared helpers ────────────────────────────────────────────────────────
+
+  // Pick a nice time tick interval based on the visible span
+  function niceTimeInterval(spanMs) {
+    var m = spanMs / 60000; // span in minutes
+    if (m <=    5) return  1 * 60000;   //  1 min ticks
+    if (m <=   15) return  2 * 60000;   //  2 min ticks
+    if (m <=   30) return  5 * 60000;   //  5 min ticks
+    if (m <=   90) return 10 * 60000;   // 10 min ticks
+    if (m <=  240) return 30 * 60000;   // 30 min ticks
+    if (m <=  720) return  1 * 3600000; //  1 hr ticks
+    if (m <= 1440) return  2 * 3600000; //  2 hr ticks
+    if (m <= 2880) return  6 * 3600000; //  6 hr ticks
+    return 12 * 3600000;                // 12 hr ticks
+  }
+
+  // Format a timestamp as HH:MM
+  function fmtTime(ts) {
+    var d = new Date(ts);
+    return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+  }
+
+  // Format a timestamp — show date if it's midnight or a date boundary
+  function fmtTick(ts, prevTs) {
+    var d = new Date(ts);
+    var isDateChange = prevTs !== null && new Date(prevTs).getDate() !== d.getDate();
+    if ((d.getHours() === 0 && d.getMinutes() === 0) || isDateChange) {
+      return (d.getMonth()+1) + '/' + d.getDate();
+    }
+    return fmtTime(ts);
+  }
+
+  // Generate aligned time tick timestamps within the window
+  function getTimeTicks() {
+    var intervalMs = niceTimeInterval(tSpan);
+    var ticks = [];
+    var first = Math.ceil(t0 / intervalMs) * intervalMs;
+    for (var ts = first; ts <= t0 + tSpan; ts += intervalMs) {
+      ticks.push(ts);
+    }
+    return ticks;
+  }
+
+  function drawGrid(yFn, ticks) {
+    var timeTicks = getTimeTicks();
+    ctx.strokeStyle = th.grid;
+    ctx.lineWidth   = 0.5;
+    ticks.forEach(function(v) {
+      var y = yFn(v);
+      ctx.beginPath(); ctx.moveTo(PAD_L, y); ctx.lineTo(PAD_L + CW, y); ctx.stroke();
+    });
+    timeTicks.forEach(function(ts) {
+      var x = PAD_L + ((ts - t0) / tSpan) * CW;
+      ctx.beginPath(); ctx.moveTo(x, PAD_T); ctx.lineTo(x, PAD_T + CH); ctx.stroke();
+    });
+    ctx.strokeStyle = th.zero;
+    ctx.lineWidth   = 1;
+    ctx.beginPath();
+    ctx.moveTo(PAD_L, yFn(0)); ctx.lineTo(PAD_L + CW, yFn(0));
+    ctx.stroke();
+  }
+
+  function drawTimeAxis() {
+    var timeTicks = getTimeTicks();
+    var intervalMs = niceTimeInterval(tSpan);
+    var minGapPx = 36; // minimum pixels between labels to avoid overlap
+    ctx.fillStyle = th.text;
+    ctx.font      = '10px sans-serif';
+
+    // Always draw start label (left edge)
+    ctx.textAlign = 'left';
+    ctx.fillText(fmtTime(t0), PAD_L, PAD_T + CH + 14);
+
+    // Always draw end label (right edge)
+    ctx.textAlign = 'right';
+    ctx.fillText(fmtTime(t0 + tSpan), PAD_L + CW, PAD_T + CH + 14);
+
+    // Draw interior ticks, skip any too close to edges or each other
+    var lastX = PAD_L + minGapPx;
+    timeTicks.forEach(function(ts, i) {
+      var x = PAD_L + ((ts - t0) / tSpan) * CW;
+      // Skip if too close to left edge, right edge, or previous label
+      if (x < PAD_L + minGapPx) return;
+      if (x > PAD_L + CW - minGapPx) return;
+      if (x - lastX < minGapPx) return;
+      lastX = x;
+      var label = fmtTick(ts, i === 0 ? null : timeTicks[i - 1]);
+      ctx.textAlign = 'center';
+      ctx.fillText(label, x, PAD_T + CH + 14);
+    });
+  }
+
+  function drawNowMarker() {
+    ctx.strokeStyle = th.text;
+    ctx.lineWidth   = 1;
+    ctx.setLineDash([2, 3]);
+    ctx.beginPath();
+    ctx.moveTo(PAD_L + CW, PAD_T); ctx.lineTo(PAD_L + CW, PAD_T + CH);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  function drawYLabel(text, rotate) {
+    ctx.save();
+    if (rotate) {
+      ctx.translate(10, PAD_T + CH / 2);
+      ctx.rotate(-Math.PI / 2);
+    } else {
+      ctx.translate(W - 6, PAD_T + CH / 2);
+      ctx.rotate(Math.PI / 2);
+    }
+    ctx.textAlign = 'center';
+    ctx.fillStyle = th.text;
+    ctx.font      = '10px sans-serif';
+    ctx.fillText(text, 0, 0);
+    ctx.restore();
+  }
+
+  // ── kW mode ───────────────────────────────────────────────────────────────
+  function drawKw(winT0, winTSpan) {
+    // Independent extents but shared interval — interval derived from the larger side
+    // Only consider points within the visible window so zoom rescales the Y axis
+    var rawMax = 0, rawMin = 0;
+    var _visCount = 0;
+    _phData.forEach(function(r) {
+      var s = r.captured_at;
+      var ts = new Date((s && s.slice(-1) !== 'Z') ? s + 'Z' : s).getTime();
+      if (isNaN(ts) || ts < winT0 || ts > winT0 + winTSpan) return;
+      _visCount++;
+      var kw = r.net_kw || 0;
+      rawMax = Math.max(rawMax, kw);
+      rawMin = Math.min(rawMin, kw);
+    });
+    // Fallback to full dataset if nothing visible (shouldn't happen)
+    if (_visCount === 0) {
+      _phData.forEach(function(r) {
+        var kw = r.net_kw || 0;
+        rawMax = Math.max(rawMax, kw);
+        rawMin = Math.min(rawMin, kw);
+      });
+    }
+    // Ensure at least a 1kW range
+    if (rawMax < 1) rawMax = 1;
+    if (rawMin > -1) rawMin = -1;
+    rawMax *= 1.1; rawMin *= 1.1;
+
+    // Nice round interval from the larger magnitude
+    function niceInterval(v) {
+      var mag = Math.pow(10, Math.floor(Math.log10(v)));
+      var norm = v / mag;
+      if (norm <= 1) return mag * 0.2;
+      if (norm <= 2) return mag * 0.5;
+      if (norm <= 5) return mag;
+      return mag * 2;
+    }
+    var interval = niceInterval(Math.max(rawMax, Math.abs(rawMin)));
+
+    // Extent on each side: smallest multiple of interval that covers the data
+    var maxKw = Math.ceil(rawMax / interval) * interval;
+    var minKw = -Math.ceil(Math.abs(rawMin) / interval) * interval;
+    var kwRange = maxKw - minKw;
+    function ty(kw) { return PAD_T + ((maxKw - kw) / kwRange) * CH; }
+
+    // Ticks: multiples of interval from 0 up to maxKw / down to minKw
+    var allTicks = [];
+    for (var t = 0; t <= maxKw + 1e-9; t = Math.round((t + interval) * 1e6) / 1e6)
+      allTicks.push(t);
+    for (var t = -interval; t >= minKw - 1e-9; t = Math.round((t - interval) * 1e6) / 1e6)
+      allTicks.push(t);
+
+    drawGrid(ty, allTicks);
+
+    ctx.fillStyle = th.text;
+    ctx.font      = '10px sans-serif';
+    ctx.textAlign = 'right';
+    allTicks.forEach(function(kw) {
+      ctx.fillText(kw.toFixed(1), PAD_L - 4, ty(kw) + 3);
+    });
+    drawYLabel('kW', true);
+    drawTimeAxis();
+
+
+
+    var zeroY = ty(0);
+
+    // Import fill
+    ctx.fillStyle = 'rgba(255,107,107,0.15)';
+    ctx.beginPath();
+    var started = false;
+    _phData.forEach(function(r) {
+      var x = tx(r.captured_at), y = ty(Math.max(0, r.net_kw || 0));
+      if (!started) { ctx.moveTo(x, zeroY); started = true; }
+      ctx.lineTo(x, y);
+    });
+    ctx.lineTo(tx(_phData[_phData.length-1].captured_at), zeroY);
+    ctx.closePath(); ctx.fill();
+
+    // Export fill
+    ctx.fillStyle = 'rgba(0,212,170,0.15)';
+    ctx.beginPath();
+    started = false;
+    _phData.forEach(function(r) {
+      var x = tx(r.captured_at), y = ty(Math.min(0, r.net_kw || 0));
+      if (!started) { ctx.moveTo(x, zeroY); started = true; }
+      ctx.lineTo(x, y);
+    });
+    ctx.lineTo(tx(_phData[_phData.length-1].captured_at), zeroY);
+    ctx.closePath(); ctx.fill();
+
+    // Line — colour by segment midpoint
+    _phData.forEach(function(r, i) {
+      if (i === 0) return;
+      var prev = _phData[i-1];
+      var mid  = ((prev.net_kw || 0) + (r.net_kw || 0)) / 2;
+      ctx.strokeStyle = mid >= 0 ? th.import : th.export;
+      ctx.lineWidth   = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(tx(prev.captured_at), ty(prev.net_kw || 0));
+      ctx.lineTo(tx(r.captured_at),    ty(r.net_kw    || 0));
+      ctx.stroke();
+    });
+
+    drawNowMarker();
+  }
+
+  // ── CO2 mode ──────────────────────────────────────────────────────────────
+  function drawCo2() {
+    var pts = _phData.filter(function(r) {
+      if (r.carbon_gco2_min == null || r.carbon_gco2_min === 0) return false;
+      var s = r.captured_at;
+      var ts = new Date((s && s.slice(-1) !== 'Z') ? s + 'Z' : s).getTime();
+      return ts >= t0 && ts <= t0 + tSpan;
+    });
+
+    if (pts.length < 2) {
+      ctx.fillStyle = th.text;
+      ctx.font      = '12px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('No carbon data yet', W / 2, H / 2);
+      return;
+    }
+
+    var rawMaxCI = 10, rawMinCI = 0;
+    pts.forEach(function(r) {
+      var v = Math.max(-250, Math.min(250, r.carbon_gco2_min));
+      if (v > 0) rawMaxCI = Math.max(rawMaxCI, v);
+      if (v < 0) rawMinCI = Math.min(rawMinCI, v);
+    });
+    rawMaxCI *= 1.1; rawMinCI *= 1.1;
+
+    function niceIntervalCI(v) {
+      var mag = Math.pow(10, Math.floor(Math.log10(v)));
+      var norm = v / mag;
+      if (norm <= 1) return mag * 0.2;
+      if (norm <= 2) return mag * 0.5;
+      if (norm <= 5) return mag;
+      return mag * 2;
+    }
+    var ciInterval = niceIntervalCI(Math.max(rawMaxCI, Math.abs(rawMinCI) || 1));
+    var maxCI = Math.ceil(rawMaxCI / ciInterval) * ciInterval;
+    var minCI = rawMinCI < 0 ? -Math.ceil(Math.abs(rawMinCI) / ciInterval) * ciInterval : 0;
+    var ciRange = maxCI - minCI;
+
+    function clampCI(v) { return Math.max(-250, Math.min(250, v)); }
+    function ty(ci) { return PAD_T + CH - ((clampCI(ci) - minCI) / ciRange) * CH; }
+
+    // Ticks: multiples of ciInterval from 0 up/down to extents
+    var ticks = [];
+    for (var t = 0; t <= maxCI + 1e-9; t = Math.round((t + ciInterval) * 1e6) / 1e6)
+      ticks.push(t);
+    if (minCI < 0) {
+      for (var t = -ciInterval; t >= minCI - 1e-9; t = Math.round((t - ciInterval) * 1e6) / 1e6)
+        ticks.push(t);
+    }
+
+    drawGrid(ty, ticks);
+
+    ctx.font      = '10px sans-serif';
+    ctx.textAlign = 'right';
+    ticks.forEach(function(v) {
+      ctx.fillStyle = v > 0 ? 'rgba(255,107,107,0.9)'
+                    : v < 0 ? 'rgba(0,212,170,0.9)'
+                    : th.text;
+      ctx.fillText(v.toFixed(1), PAD_L - 4, ty(v) + 3);
+    });
+    drawYLabel('gCO\u2082/min', true);
+    drawTimeAxis();
+
+    var zeroY = ty(0);
+    var zeroFrac = Math.max(0, Math.min(1, (zeroY - PAD_T) / CH));
+    var grad = ctx.createLinearGradient(0, PAD_T, 0, PAD_T + CH);
+    grad.addColorStop(0,        'rgba(255,107,107,0.25)');
+    grad.addColorStop(zeroFrac, 'rgba(255,107,107,0.08)');
+    grad.addColorStop(zeroFrac, 'rgba(0,212,170,0.08)');
+    grad.addColorStop(1,        'rgba(0,212,170,0.25)');
+
+    ctx.save();
+    ctx.beginPath();
+    pts.forEach(function(r, i) {
+      var x = tx(r.captured_at), y = ty(r.carbon_gco2_min);
+      if (i === 0) ctx.moveTo(x, zeroY);
+      ctx.lineTo(x, y);
+    });
+    ctx.lineTo(tx(pts[pts.length-1].captured_at), zeroY);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+    ctx.restore();
+
+    ctx.lineWidth   = 1.5;
+    ctx.globalAlpha = 0.9;
+    pts.forEach(function(r, i) {
+      if (i === 0) return;
+      var prev = pts[i-1];
+      var mid  = (prev.carbon_gco2_min + r.carbon_gco2_min) / 2;
+      ctx.strokeStyle = mid >= 0 ? th.import : th.export;
+      ctx.beginPath();
+      ctx.moveTo(tx(prev.captured_at), ty(prev.carbon_gco2_min));
+      ctx.lineTo(tx(r.captured_at),    ty(r.carbon_gco2_min));
+      ctx.stroke();
+    });
+    ctx.globalAlpha = 1;
+
+    drawNowMarker();
+  }
+
+  // ── Dispatch ──────────────────────────────────────────────────────────────
+  // Pre-compute visible Y extents and pass explicitly to avoid any closure issues
+  var _visT0 = t0, _visTSpan = tSpan;
+  function drawMix() {
+    if (!_phMixData.length) {
+      ctx.fillStyle = th.text;
+      ctx.font = '12px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('Collecting mix data\u2026', W / 2, H / 2);
+      return;
+    }
+
+    var STACK_ORDER = ['wind','nuclear','hydro','solar','biomass','imports','other','gas','coal'];
+
+    // Filter to visible window (block resolution = 30 min so add half-hour padding)
+    var visible = _phMixData.filter(function(s) {
+      var ms = new Date(s.captured_at + 'Z').getTime();
+      return ms >= t0 - 1800000 && ms <= t0 + tSpan + 1800000;
+    });
+
+    if (!visible.length) {
+      ctx.fillStyle = th.text;
+      ctx.font = '12px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('No mix data in this window', W / 2, H / 2);
+      return;
+    }
+
+    var fuelsToShow = STACK_ORDER.filter(function(f) {
+      return visible.some(function(s){ return (s.fuels[f] || 0) > 0.1; });
+    });
+
+    // Pre-compute stacked positions for every slot
+    var stacks = visible.map(function(slot) {
+      var cum = 0, out = {};
+      fuelsToShow.forEach(function(f) {
+        var pct = slot.fuels[f] || 0;
+        out[f] = { bot: cum, top: cum + pct };
+        cum += pct;
+      });
+      return out;
+    });
+
+    function tyPct(pct) { return PAD_T + CH * (1 - pct / 100); }
+
+    // Clip to plot area
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(PAD_L, PAD_T, CW, CH);
+    ctx.clip();
+
+    // Draw stacked areas bottom to top
+    fuelsToShow.forEach(function(fuel) {
+      var col = _mixFuelColour(fuel);
+      ctx.beginPath();
+      visible.forEach(function(slot, i) {
+        var x = tx(slot.captured_at + 'Z');
+        var y = tyPct(stacks[i][fuel].top);
+        if (i === 0) ctx.moveTo(x, y);
+        else         ctx.lineTo(x, y);
+      });
+      for (var i = visible.length - 1; i >= 0; i--) {
+        ctx.lineTo(tx(visible[i].captured_at + 'Z'), tyPct(stacks[i][fuel].bot));
+      }
+      ctx.closePath();
+      ctx.globalAlpha = 0.15;
+      ctx.fillStyle = col;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      // Crisp top-edge stroke line
+      ctx.beginPath();
+      visible.forEach(function(slot, i) {
+        var x = tx(slot.captured_at + 'Z');
+        var y = tyPct(stacks[i][fuel].top);
+        if (i === 0) ctx.moveTo(x, y);
+        else         ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = col;
+      ctx.lineWidth   = 1.5;
+      ctx.stroke();
+    });
+
+    ctx.restore();
+
+    // Y-axis grid lines and labels
+    ctx.strokeStyle = th.grid;
+    ctx.lineWidth   = 1;
+    [0, 25, 50, 75, 100].forEach(function(pct) {
+      var y = tyPct(pct);
+      ctx.beginPath(); ctx.moveTo(PAD_L, y); ctx.lineTo(PAD_L + CW, y); ctx.stroke();
+      ctx.fillStyle = th.text;
+      ctx.font      = '10px sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText(pct + '%', PAD_L - 4, y + 3);
+    });
+
+    // X-axis — shared drawTimeAxis helper (same ticks as kW/CO₂)
+    drawTimeAxis();
+
+    drawNowMarker();
+  }
+
+  if (_phMode === 'co2' && _phHasCI) {
+    drawCo2();
+  } else if (_phMode === 'mix' && _phHasCI) {
+    drawMix();
+  } else {
+    drawKw(_visT0, _visTSpan);
+  }
+}
+
+async function _phLoad() {
+  try {
+    {% if has_power_sensor %}
+    var r = await fetch(apiUrl('/api/power/history'));
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json();
+    _phData = d.rows || [];
+    {% endif %}
+    // Also load mix data
+    if (_phHasCI) {
+      try {
+        var mr = await fetch(apiUrl('/api/power/mix-history'));
+        if (mr.ok) {
+          var md = await mr.json();
+          _phMixData = md.slots || [];
+        }
+      } catch(me) { _phMixData = []; }
+    }
+    var statusEl = document.getElementById('power-history-status');
+    if (statusEl) {
+      {% if has_power_sensor %}
+      statusEl.textContent = _phData.length > 0
+        ? _phData.length + ' readings'
+        : 'No data yet';
+      {% else %}
+      statusEl.textContent = (_phMixData && _phMixData.length)
+        ? _phMixData.length + ' slots'
+        : '';
+      {% endif %}
+    }
+    _phDraw();
+  } catch(e) {
+    var statusEl = document.getElementById('power-history-status');
+    if (statusEl) statusEl.textContent = 'Error loading history';
+  }
+}
+
+// Redraw on theme change — observe data-theme attribute on <html>
+// live_power.html is the main page (not an iframe) so postMessage('emt-theme')
+// never arrives here. MutationObserver fires immediately when applyTheme()
+// sets data-theme, guaranteeing the canvas picks up the new --surface colour.
+(function() {
+  function onThemeChange() {
+    _phDraw();
+    _lastMixSlot = null;
+    if (_mixSegments.length) {
+      _drawMixDonut(_mixSegments.map(function(s){ return {fuel:s.fuel, perc:s.perc}; }));
+    }
+  }
+  new MutationObserver(function(mutations) {
+    mutations.forEach(function(m) {
+      if (m.attributeName === 'data-theme') onThemeChange();
+    });
+  }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+})();
+
+// Redraw on resize
+window.addEventListener('resize', function() {
+  clearTimeout(_phTimer);
+  _phTimer = setTimeout(_phDraw, 200);
+  _adjustGridLayout();
+}, { passive: true });
+
+// Load immediately then refresh every 30s (synced with power poll cadence)
+// Power history — defer 900ms
+{% if has_power_sensor or has_postcode %}
+setTimeout(function() { _phLoad(); }, 900);
+setInterval(_phLoad, 30000);
+{% endif %}
+
+{% if has_postcode and not has_power_sensor and not has_sub_devices %}
+// Postcode-only Overview: the power poll that normally feeds the generation-mix
+// donut doesn't run (no power sensor and no sub-device cards), so drive the
+// donut directly from the current grid mix. Power-independent; helpers above.
+(function() {
+  function loadMix() {
+    fetch(apiUrl('/api/power'))
+      .then(function(r) { return r.json(); })
+      .then(function(d) { if (d && d.generation_mix) _updateMixCard(d.generation_mix); })
+      .catch(function() {});
+  }
+  loadMix();
+  setInterval(loadMix, 60000);
+})();
+{% endif %}
+
+// ── Hover tooltip ────────────────────────────────────────────────────────────
+(function() {
+  var tip = document.getElementById('ph-tooltip');
+  if (!_phCanvas || !tip) return;
+
+  // Convert canvas-relative mouse X back to a UTC ms timestamp
+  function xToTime(mouseX) {
+    var rect = _phCanvas.getBoundingClientRect();
+    var dpr  = window.devicePixelRatio || 1;
+    var PAD_L_px = 42 * (rect.width / (_phCanvas.width / dpr));
+    var CW_px    = rect.width - PAD_L_px;
+    var frac = Math.max(0, Math.min(1, (mouseX - PAD_L_px) / CW_px));
+    var win  = _phGetWindow();
+    return win.t0 + frac * win.tSpan;
+  }
+
+  // Convert UTC ms timestamp back to canvas X
+  function timeToX(ms) {
+    var rect = _phCanvas.getBoundingClientRect();
+    var dpr  = window.devicePixelRatio || 1;
+    var PAD_L_px = 42 * (rect.width / (_phCanvas.width / dpr));
+    var CW_px    = rect.width - PAD_L_px;
+    var win  = _phGetWindow();
+    return PAD_L_px + ((ms - win.t0) / win.tSpan) * CW_px;
+  }
+
+  // Find nearest data point to a UTC ms timestamp
+  function nearest(targetMs, rows) {
+    if (!rows || rows.length === 0) return null;
+    var best = null, bestDiff = Infinity;
+    rows.forEach(function(r) {
+      var s = (r.captured_at && r.captured_at.slice(-1) !== 'Z')
+              ? r.captured_at + 'Z' : r.captured_at;
+      var diff = Math.abs(new Date(s).getTime() - targetMs);
+      if (diff < bestDiff) { bestDiff = diff; best = r; }
+    });
+    return best;
+  }
+
+  _phCanvas.addEventListener('mousemove', function(e) {
+    if (!_phData || _phData.length === 0) return;
+    var rect    = _phCanvas.getBoundingClientRect();
+    var mouseX  = e.clientX - rect.left;
+    var mouseY  = e.clientY - rect.top;
+
+    // Only show tooltip over the data area
+    var PAD_L_px = 42 * (rect.width / (_phCanvas.width / (window.devicePixelRatio || 1)));
+    if (mouseX < PAD_L_px) { tip.style.display = 'none'; return; }
+
+    var rows = (_phMode === 'co2' && _phHasCI)
+      ? _phData.filter(function(r) { return r.carbon_gco2_min != null && r.carbon_gco2_min !== 0; })
+      : _phMode === 'mix' ? [] // handled separately
+      : _phData;
+
+    // Mix mode — find nearest block slot
+    if (_phMode === 'mix' && _phHasCI) {
+      var tMs = xToTime(mouseX);
+      var nearest_mix = null, bestDiff = Infinity;
+      _phMixData.forEach(function(slot) {
+        var slotMs = new Date(slot.captured_at + 'Z').getTime();
+        var diff   = Math.abs(slotMs - tMs);
+        if (diff < bestDiff) { bestDiff = diff; nearest_mix = slot; }
+      });
+      if (nearest_mix) {
+        var s  = nearest_mix.captured_at + 'Z';
+        var dt = new Date(s);
+        var timeStr = dt.toLocaleDateString([], {month:'numeric', day:'numeric'})
+                    + ' ' + dt.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+        var lines = ['<span style="color:var(--muted)">' + timeStr + '</span>'];
+        var fuels = nearest_mix.fuels || {};
+        var sorted = Object.keys(fuels).sort(function(a,b){ return (fuels[b]||0)-(fuels[a]||0); });
+        sorted.forEach(function(fuel) {
+          var pct = fuels[fuel] || 0;
+          if (pct < 0.5) return;
+          var col = _mixFuelColour(fuel);
+          lines.push('<span style="color:' + col + '">' + _mixFuelLabel(fuel) + ': ' + pct.toFixed(1) + '%</span>');
+        });
+        tip.innerHTML = lines.join('<br>');
+        tip.style.display = 'block';
+        var tipW = tip.offsetWidth, tipH = tip.offsetHeight, MARGIN = 12;
+        var left = mouseX + MARGIN, top = mouseY - tipH / 2;
+        if (left + tipW > rect.width - 4) left = mouseX - tipW - MARGIN;
+        if (top < 4) top = 4;
+        if (top + tipH > rect.height - 4) top = rect.height - tipH - 4;
+        tip.style.left = left + 'px'; tip.style.top = top + 'px';
+      } else { tip.style.display = 'none'; }
+      return;
+    }
+
+    var pt = nearest(xToTime(mouseX), rows);
+    if (!pt) { tip.style.display = 'none'; return; }
+
+    // Format local time from UTC captured_at
+    var s  = (pt.captured_at && pt.captured_at.slice(-1) !== 'Z')
+             ? pt.captured_at + 'Z' : pt.captured_at;
+    var dt = new Date(s);
+    var timeStr = dt.toLocaleDateString([], {month:'numeric', day:'numeric'})
+                + ' '
+                + dt.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+
+    var lines = ['<span style="color:var(--muted)">' + timeStr + '</span>'];
+
+    if (_phMode === 'co2' && _phHasCI) {
+      var co2 = pt.carbon_gco2_min;
+      var col = co2 >= 0 ? '#ff6b6b' : '#00d4aa';
+      var lbl = co2 >= 0 ? 'Emitting' : 'Offsetting';
+      lines.push('<span style="color:' + col + '">' + lbl + ' '
+               + Math.abs(co2).toFixed(2) + ' gCO₂/min</span>');
+      if (pt.intensity != null) {
+        lines.push('<span style="color:var(--muted)">Grid: ' + pt.intensity + ' gCO₂/kWh</span>');
+      }
+    } else {
+      var kw  = pt.net_kw || 0;
+      var col = kw >= 0 ? '#ff6b6b' : '#00d4aa';
+      var lbl = kw >= 0 ? 'Importing' : 'Exporting';
+      lines.push('<span style="color:' + col + '">' + lbl + ' '
+               + Math.abs(kw).toFixed(3) + ' kW</span>');
+      if (pt.intensity != null) {
+        lines.push('<span style="color:var(--muted)">CI: ' + pt.intensity + ' gCO₂/kWh</span>');
+      }
+    }
+
+    tip.innerHTML = lines.join('<br>');
+    tip.style.display = 'block';
+
+    // Position: follow mouse, flip left if near right edge
+    var tipW = tip.offsetWidth;
+    var tipH = tip.offsetHeight;
+    var MARGIN = 12;
+    var left = mouseX + MARGIN;
+    var top  = mouseY - tipH / 2;
+    if (left + tipW > rect.width - 4) left = mouseX - tipW - MARGIN;
+    if (top < 0) top = 0;
+    if (top + tipH > rect.height) top = rect.height - tipH;
+    tip.style.left = left + 'px';
+    tip.style.top  = top  + 'px';
+  });
+
+  _phCanvas.addEventListener('mouseleave', function() {
+    tip.style.display = 'none';
+  });
+
+  // ── Drag zoom ───────────────────────────────────────────────────────────
+  var _dragStart = null;
+  var _dragOverlay = null;
+
+  _phCanvas.addEventListener('mousedown', function(e) {
+    if (e.button !== 0) return;
+    var rect = _phCanvas.getBoundingClientRect();
+    var mouseX = e.clientX - rect.left;
+    var dpr = window.devicePixelRatio || 1;
+    var PAD_L_px = 42 * (rect.width / (_phCanvas.width / dpr));
+    if (mouseX < PAD_L_px) return;
+    _dragStart = { x: mouseX, t: xToTime(mouseX) };
+    // Create drag selection overlay
+    _dragOverlay = document.createElement('div');
+    _dragOverlay.style.cssText = 'position:absolute;top:0;height:100%;background:rgba(0,212,170,0.15);border:1px solid rgba(0,212,170,0.5);pointer-events:none;z-index:10;';
+    _dragOverlay.style.left = mouseX + 'px';
+    _dragOverlay.style.width = '0px';
+    _phCanvas.parentElement.style.position = 'relative';
+    _phCanvas.parentElement.appendChild(_dragOverlay);
+    e.preventDefault();
+  });
+
+  window.addEventListener('mousemove', function(e) {
+    if (!_dragStart || !_dragOverlay) return;
+    var rect = _phCanvas.getBoundingClientRect();
+    var mouseX = e.clientX - rect.left;
+    var left  = Math.min(_dragStart.x, mouseX);
+    var width = Math.abs(mouseX - _dragStart.x);
+    _dragOverlay.style.left  = left + 'px';
+    _dragOverlay.style.width = width + 'px';
+  });
+
+  window.addEventListener('mouseup', function(e) {
+    if (!_dragStart) return;
+    var rect = _phCanvas.getBoundingClientRect();
+    var mouseX = e.clientX - rect.left;
+    var endT   = xToTime(mouseX);
+    var startT = _dragStart.t;
+    if (_dragOverlay && _dragOverlay.parentElement) {
+      _dragOverlay.parentElement.removeChild(_dragOverlay);
+    }
+    _dragOverlay = null;
+    _dragStart   = null;
+    // Only zoom if drag was meaningful (>10px)
+    var pxDiff = Math.abs(timeToX(endT) - timeToX(startT));
+    if (pxDiff < 10) return;
+    var t0New   = Math.min(startT, endT);
+    var spanNew = Math.abs(endT - startT);
+    if (spanNew < 60 * 1000) return; // minimum 1 minute window
+    _phZoomT0   = t0New;
+    _phZoomSpan = spanNew;
+    _phDraw();
+  });
+
+  // Double-click to reset zoom
+  _phCanvas.addEventListener('dblclick', function() {
+    _phResetZoom();
+  });
+
+  // ── Touch drag zoom ──────────────────────────────────────────────────────
+  var _touchDragStart = null;
+  var _touchDragOverlay = null;
+  var _lastTapTime = 0;
+
+  _phCanvas.addEventListener('touchstart', function(e) {
+    // Double-tap to reset zoom
+    var now = Date.now();
+    if (now - _lastTapTime < 300) {
+      _phResetZoom();
+      _lastTapTime = 0;
+      e.preventDefault();
+      return;
+    }
+    _lastTapTime = now;
+
+    if (e.touches.length !== 1) return;
+    var touch = e.touches[0];
+    var rect = _phCanvas.getBoundingClientRect();
+    var touchX = touch.clientX - rect.left;
+    var dpr = window.devicePixelRatio || 1;
+    var PAD_L_px = 42 * (rect.width / (_phCanvas.width / dpr));
+    if (touchX < PAD_L_px) return;
+    _touchDragStart = { x: touchX, t: xToTime(touchX) };
+    _touchDragOverlay = document.createElement('div');
+    _touchDragOverlay.style.cssText = 'position:absolute;top:0;height:100%;background:rgba(0,212,170,0.15);border:1px solid rgba(0,212,170,0.5);pointer-events:none;z-index:10;';
+    _touchDragOverlay.style.left = touchX + 'px';
+    _touchDragOverlay.style.width = '0px';
+    _phCanvas.parentElement.style.position = 'relative';
+    _phCanvas.parentElement.appendChild(_touchDragOverlay);
+    e.preventDefault();
+  }, { passive: false });
+
+  _phCanvas.addEventListener('touchmove', function(e) {
+    if (!_touchDragStart || !_touchDragOverlay) return;
+    if (e.touches.length !== 1) return;
+    var touch = e.touches[0];
+    var rect = _phCanvas.getBoundingClientRect();
+    var touchX = touch.clientX - rect.left;
+    var left  = Math.min(_touchDragStart.x, touchX);
+    var width = Math.abs(touchX - _touchDragStart.x);
+    _touchDragOverlay.style.left  = left + 'px';
+    _touchDragOverlay.style.width = width + 'px';
+    e.preventDefault();
+  }, { passive: false });
+
+  _phCanvas.addEventListener('touchend', function(e) {
+    if (!_touchDragStart) return;
+    var touch = e.changedTouches[0];
+    var rect = _phCanvas.getBoundingClientRect();
+    var touchX = touch.clientX - rect.left;
+    var endT   = xToTime(touchX);
+    var startT = _touchDragStart.t;
+    if (_touchDragOverlay && _touchDragOverlay.parentElement) {
+      _touchDragOverlay.parentElement.removeChild(_touchDragOverlay);
+    }
+    _touchDragOverlay = null;
+    _touchDragStart   = null;
+    var pxDiff = Math.abs(timeToX(endT) - timeToX(startT));
+    if (pxDiff < 10) return;
+    var t0New   = Math.min(startT, endT);
+    var spanNew = Math.abs(endT - startT);
+    if (spanNew < 60 * 1000) return;
+    _phZoomT0   = t0New;
+    _phZoomSpan = spanNew;
+    _phDraw();
+  }, { passive: false });
+})();
+{% endif %}
+</script>
+{% endblock %}

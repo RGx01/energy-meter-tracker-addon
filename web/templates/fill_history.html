@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block topbar %}
+<div class="topbar">
+  <div>
+    <h2>Fill History &amp; Gaps</h2>
+    <div class="sub">Backfill your history, add a device's past share, or recover missing blocks</div>
+  </div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;">
+    <a href="{{ url_for('data_management_page') }}" class="btn btn-secondary">← Data Management</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+
+<div style="display:flex;flex-direction:column;gap:14px;max-width:820px;">
+
+  <!-- Historical Import -->
+  <a href="{{ url_for('historical_import_page') }}" class="card"
+     style="display:block;text-decoration:none;color:inherit;">
+    <div style="display:flex;align-items:flex-start;gap:14px;">
+      <div style="font-size:26px;line-height:1;">📥</div>
+      <div style="flex:1;">
+        <div class="card-title" style="margin-bottom:4px;">
+          Historical Import
+          <span style="font-size:10px;opacity:0.7;font-weight:400;">beta</span>
+        </div>
+        <div style="font-size:13px;color:var(--muted);line-height:1.7;">
+          Backfill your half-hourly history from the supplier API (Octopus) or a CSV,
+          and fill gaps a settlement outage left behind. Pick a source (API / CSV) then
+          a task — whole history, a date range, or a specific gap — and review the plan
+          before anything is written. Imported blocks are flagged and reversible.
+        </div>
+      </div>
+      <div style="font-size:20px;color:var(--muted);align-self:center;">→</div>
+    </div>
+  </a>
+
+  <!-- Device History -->
+  <a href="{{ url_for('historical_probe_page') }}" class="card"
+     style="display:block;text-decoration:none;color:inherit;">
+    <div style="display:flex;align-items:flex-start;gap:14px;">
+      <div style="font-size:26px;line-height:1;">📊</div>
+      <div style="flex:1;">
+        <div class="card-title" style="margin-bottom:4px;">
+          Device History
+          <span style="font-size:10px;opacity:0.7;font-weight:400;">beta</span>
+        </div>
+        <div style="font-size:13px;color:var(--muted);line-height:1.7;">
+          Reconstruct a device's past usage from Home Assistant's recorder — for an EV
+          charger, battery or heat pump you added to EMT after it was already recording
+          in HA. It splits each hour across the half-hour blocks by the house import
+          shape, never exceeding what the house drew, and joins cleanly onto the device's
+          live history. Every run is reversible with one-click Undo.
+        </div>
+      </div>
+      <div style="font-size:20px;color:var(--muted);align-self:center;">→</div>
+    </div>
+  </a>
+
+</div>
+
+{% endblock %}

@@ -1,0 +1,478 @@
+{% extends "base.html" %}
+
+{% block topbar %}
+<div class="topbar">
+  <div>
+    <h2>Help &amp; Reference</h2>
+    <div class="sub">How the Energy Meter Tracker works</div>
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+<style>
+.help-section { margin-bottom: 28px; }
+.help-section h3 { font-size: 15px; font-weight: 600; color: var(--accent); margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+.help-section p { font-size: 13px; color: var(--text); line-height: 1.7; margin-bottom: 10px; }
+.help-section ul { margin: 8px 0 10px 18px; font-size: 13px; line-height: 1.7; color: var(--text); }
+.help-section li { margin-bottom: 4px; }
+.help-section strong { color: var(--accent); }
+.help-section code { font-family: var(--mono); font-size: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; color: var(--accent2); word-break: break-all; }
+.note-box { background: rgba(124,106,247,0.07); border: 1px solid rgba(124,106,247,0.25); border-radius: var(--radius); padding: 12px 14px; font-size: 13px; line-height: 1.7; color: var(--text); margin: 12px 0; }
+.warn-box { background: rgba(245,158,11,0.07); border: 1px solid rgba(245,158,11,0.3); border-radius: var(--radius); padding: 12px 14px; font-size: 13px; line-height: 1.7; color: var(--text); margin: 12px 0; }
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 12px; }
+.help-pre { background: var(--bg); padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto; white-space: pre; word-break: normal; -webkit-overflow-scrolling: touch; border: 1px solid var(--border); }
+@media (max-width: 768px) {
+  .two-col { grid-template-columns: 1fr; gap: 12px; }
+  .help-section p, .help-section ul, .note-box, .warn-box { font-size: 13px; }
+  .card { padding: 14px 16px; }
+  .help-pre { font-size: 11px; }
+  .help-section code { font-size: 11px; }
+}
+</style>
+
+<!-- ── What is this? ─────────────────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">⚡ What is Energy Meter Tracker?</div>
+  <div class="warn-box" style="margin-bottom:16px;">
+    ⚠️ <strong>Accuracy depends on your data source.</strong> In local-metering mode (<code>cad</code>),
+    Energy Meter Tracker provides a close approximation of your consumption from local sensor readings —
+    treat it as informational, not as a substitute for your supplier's authoritative reconciliation.
+    In <code>cad+api</code> mode with <strong>Supplier API settlement</strong> enabled, blocks are
+    reconciled against the settled half-hourly data your supplier bills from (see Data Sources &amp;
+    Supplier Integration, below), which is billing-grade once settled.
+  </div>
+  <p>
+    <strong>Required Hardware</strong> — For local metering, the add-on uses an IHD/CAD capable of
+    providing meter readings at reliable regular intervals (0.1&nbsp;Hz). From 3.0 you can instead (or
+    additionally) run in <code>cad+api</code> mode using your supplier's API — and, on Octopus, an
+    Octopus Home Mini as a live-power source — so a local CAD is no longer strictly required.
+  </p>
+  <p>
+    <strong>Energy Meter Tracker</strong> is a Home Assistant add-on that records your electricity usage in
+    configurable reconciliation periods — matching the intervals used by your energy supplier for billing.
+    It stores meter readings at each boundary so you can see exactly what happened in any given period,
+    including how much of your usage was from the grid versus your battery, EV or other device.
+  </p>
+</div>
+
+<!-- ── The reconciliation period ─────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">🕐 Meter Reconciliation Period</div>
+  <p>
+    Each block covers exactly one reconciliation period: for example <code>09:00 → 09:30</code> at 30 minutes,
+    or <code>09:00 → 09:05</code> at 5 minutes. In the UK, energy suppliers use 30-minute half-hourly (HH)
+    settlement periods. Configure the reconciliation period to match your supplier
+    before data collection begins. <strong>It cannot be changed without clearing all historical data.</strong>
+  </p>
+  <div class="note-box">
+    <strong>Why interpolation matters:</strong> If your meter reads 1000.0 kWh at 09:28 and
+    1000.5 kWh at 09:32, the engine calculates that approximately 0.25 kWh crossed the 09:30
+    boundary — not 0.0 kWh (last reading before) or 0.5 kWh (total since last reading).
+  </div>
+</div>
+
+<!-- ── Main meter vs devices ──────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">⚖️ Main Meter &amp; Devices</div>
+  <p>
+    The <strong>main meter</strong> reads directly from your smart meter via a Consumer Access
+    Device (CAD) and is the authoritative source of truth for how much energy crossed the grid boundary.
+  </p>
+  <p>
+    <strong>Devices</strong> let you track individual loads — a home battery, EV charger, or heat pump.
+    Each device has a <strong>Meter Type</strong> which enables additional configuration and
+    drives the Overview page display:
+  </p>
+  <ul>
+    <li>🔋 <strong>Battery</strong> — enables SoC sensor and inverter power sensor fields. Shows a battery icon with charge level and an inverter gauge on Overview.</li>
+    <li>🚗 <strong>EV Charger</strong> — enables a charger power sensor field. Shows a unidirectional charge gauge on Overview. Mark as V2X capable if the vehicle supports vehicle-to-grid.</li>
+    <li>♨️ <strong>Heat Pump</strong> — enables a heat pump power sensor field. Shows a unidirectional power gauge on Overview.</li>
+  </ul>
+
+  <div class="two-col">
+    <div class="note-box">
+      <strong>Direct import</strong><br>
+      In each block, device consumption is subtracted from the main meter's total import.
+      Whatever is left is <em>direct import</em> — the portion of grid import not accounted for
+      by any device. This is what's used for billing calculations.
+    </div>
+    <div class="note-box">
+      <strong>Grid vs self-supply attribution</strong><br>
+      When several devices draw at once and grid import covers only part of the total (solar or a
+      battery supplying the rest), the <strong>EV is given grid-import priority</strong> — it's the
+      intended grid load, especially on an Intelligent Octopus Go smart-charge slot — and other devices
+      clip to whatever grid remains. Bill totals are unaffected; only the per-device split is a
+      modelling choice (issue&nbsp;#212).
+    </div>
+  </div>
+
+  <div class="warn-box">
+    ⚠️ <strong>Per-device export tracking and solar generation are not yet supported.</strong> Individual
+    device export (e.g. battery discharging to grid, V2G from a V2X-capable EV) is not yet broken
+    down by device. Solar generation tracking is planned for a future release.
+  </div>
+</div>
+
+<!-- ── Meter Config ───────────────────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">⚙️ Meter Configuration</div>
+  <p>
+    Meter IDs are assigned automatically and not shown in the UI — the <strong>Device Name</strong>
+    (for devices) and <strong>Site Name</strong> (for the main meter) are the user-facing identifiers
+    used throughout charts and reports. Names must be unique, 40 characters or fewer, and contain only
+    letters, numbers, spaces and <code>' - &amp; ( ) .</code>
+  </p>
+  <p>
+    <strong>Deleting a device permanently removes all associated historical data</strong> from the
+    database. There is no recovery path — ensure you have a backup before deleting.
+  </p>
+  <p>
+    The <strong>change reason</strong> prompt only appears when billing-significant fields change
+    (billing day, block period, timezone, currency). Routine sensor or name updates save immediately.
+  </p>
+
+  <div class="two-col">
+    <div>
+      <p><strong>Battery sensors</strong></p>
+      <ul>
+        <li><strong>Read sensor</strong> — cumulative kWh consumed (required)</li>
+        <li><strong>SoC sensor</strong> — battery state of charge in % (optional, Overview only)</li>
+        <li><strong>Inverter power sensor</strong> — live inverter power in W or kW (optional, Overview only)</li>
+      </ul>
+    </div>
+    <div>
+      <p><strong>EV / Heat Pump sensors</strong></p>
+      <ul>
+        <li><strong>Read sensor</strong> — cumulative kWh consumed (required)</li>
+        <li><strong>Charger / Heat Pump power sensor</strong> — live power in W or kW (optional, Overview only)</li>
+      </ul>
+    </div>
+  </div>
+  <div class="note-box">
+    ⓘ The SoC, inverter power, charger power and heat pump power sensors are <strong>informational only</strong> —
+    they are displayed on the Overview page but are not recorded in blocks or used in any billing calculations.
+  </div>
+</div>
+
+<!-- ── Sensors ───────────────────────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">📡 Sensor Requirements</div>
+  <div class="two-col">
+    <div>
+      <p><strong>Main meter — Read sensors</strong></p>
+      <ul>
+        <li>Must be <strong>cumulative kWh</strong> — ever-increasing total, never resets</li>
+        <li>High-frequency updates preferred (10–60s) for better boundary interpolation</li>
+        <li>Typically from your CAD via MQTT integration</li>
+        <li>Example: <code>sensor.smart_meter_electricity_import</code></li>
+      </ul>
+    </div>
+    <div>
+      <p><strong>Rate sensors</strong></p>
+      <ul>
+        <li>Must be the <strong>current rate per kWh</strong> — the live tariff rate</li>
+        <li>For Agile/flexible tariffs these change each period</li>
+        <li>Example: <code>sensor.octopus_energy_electricity_current_rate</code></li>
+      </ul>
+    </div>
+    <div>
+      <p><strong>Device — Read sensors</strong></p>
+      <ul>
+        <li>Must be <strong>cumulative kWh consumed (import only)</strong> — not net, not export, not watts</li>
+        <li>Can update less frequently (60s+)</li>
+        <li>CT clamp via PowerCalc, or native device integration (Zappi, Solax, etc.)</li>
+        <li>If no rate sensor is configured the main meter import rate is used</li>
+      </ul>
+    </div>
+    <div>
+      <p><strong>Standing charge sensor</strong></p>
+      <ul>
+        <li>Must be a <strong>daily standing charge</strong> value</li>
+        <li>Can be a fixed <a href="https://www.home-assistant.io/integrations/input_number/" style="color:var(--accent);" target="_blank">input_number</a> helper</li>
+        <li>Only needed on the main import channel</li>
+      </ul>
+    </div>
+  </div>
+  <div class="note-box">
+    ⓘ <strong>Power sensor sign &amp; unit overrides</strong> — any power sensor (main or device) can be
+    sign-<strong>inverted</strong> or have its unit forced to <strong>W</strong> or <strong>kW</strong>
+    in its Edit view, for sensors whose convention is opposite EMT's (importing shown as exporting) or
+    that mis-declare their unit (e.g. emit watt-scale numbers labelled kW, reading 1000× too high).
+    These affect the Overview display only.
+  </div>
+</div>
+
+<!-- ── Data sources & supplier ──────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">🔌 Data Sources &amp; Supplier Integration</div>
+  <p>
+    From 3.0, the Setup Wizard starts with your <strong>supplier and meter situation</strong>, which
+    sets your <strong>data-source mode</strong>:
+  </p>
+  <ul>
+    <li><strong><code>cad</code></strong> — local CAD/sensor readings only, exactly as before. No supplier account needed.</li>
+    <li><strong><code>cad+api</code></strong> — local readings <em>plus</em> your supplier's API: settled-data reconciliation, API-sourced rates, Octopus Home Mini, and Intelligent Octopus Go pricing.</li>
+  </ul>
+  <p>
+    You can switch modes later via <strong>Change Setup</strong> — behind a confirmation, because a
+    switch can trigger a full recalculation.
+  </p>
+  <div class="two-col">
+    <div class="note-box">
+      <strong>Supplier settlement (Octopus / Kraken DCC)</strong><br>
+      In <code>cad+api</code> mode EMT can reconcile each block against the <strong>settled half-hourly
+      data your supplier bills from</strong>. A <strong>billing source</strong> toggle (Meter sensor vs
+      Supplier API) chooses which figures drive your bill; with the API source a block is provisional
+      until settled, then updates to the settled value. Credentials are entered in-app — no YAML.
+    </div>
+    <div class="note-box">
+      <strong>Rate source — sensor or API</strong><br>
+      Each rate channel can take its unit rate from a sensor or directly from the supplier API,
+      independently — so you can mix (e.g. API import rates with a sensor export rate). The standing
+      charge is fetched from the API too when that source is selected.
+    </div>
+  </div>
+  <div class="note-box">
+    ⓘ <strong>Octopus Home Mini</strong> — if you have one, EMT can use its real-time demand feed as a
+    live-power source for the Overview gauge and 48-hour history without a separate CAD sensor. Mini
+    figures are provisional; cost settlement corrects the recorded history once available.
+  </div>
+</div>
+
+<!-- ── Intelligent Octopus Go ───────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">🚗 Intelligent Octopus Go</div>
+  <p>
+    On Intelligent Octopus Go (IOG), your EV often smart-charges in <strong>dispatch slots</strong> at
+    the cheap off-peak rate, at times the standard tariff wouldn't predict. EMT captures those slots
+    live and reprices the affected energy with a <strong>dispatch overlay</strong>, applied at both
+    block finalise and cost settlement.
+  </p>
+  <ul>
+    <li>Enable per device via the <strong>"use dispatch overlay"</strong> rate option in Meter Config, so your EV bills at the dispatch rate while the rest of the house stays on the standard tariff.</li>
+    <li>Dispatch slots are real-time only and can't be reconstructed later — a slot EMT didn't capture (add-on down) may price at the standard rate until corrected.</li>
+    <li>Works wherever Octopus exposes dispatch data (vehicle integrations, Zappi; Ohme conservatively). A <strong>Hypervolt via the charger route</strong> is metered fine but can't get dispatch pricing.</li>
+  </ul>
+  <div class="warn-box">
+    ⚠️ The dispatched-cost figure is a <strong>best estimate</strong>: where EMT can only infer a
+    smart-charge (e.g. Ohme), it optimistically assumes off-peak and marks the block, so it can read
+    slightly cheaper than your real Octopus bill. Settlement corrects the kWh; the dispatch rate stays
+    a best estimate. Correct any that matter with the block correction tool.
+  </div>
+  <div class="note-box">
+    ⓘ <strong>How the bill and the car/home split relate.</strong> Your bill is built from half-hour
+    blocks stacked up. Each block carries two different things, and it helps to keep them apart:
+    <ul style="margin:6px 0 8px 18px;">
+      <li><strong>The total</strong> — what that half-hour cost you. On Intelligent Octopus Go this is
+        Octopus's own billed figure, and it already has the car/home (and, on the capped tariff, the
+        4-rate) split <em>baked into it</em> — Octopus works out the split behind the scenes and hands
+        EMT the finished number. The totals stack up into your bill, so <strong>your bill is always
+        correct</strong>, whether the data was captured live or imported later.</li>
+      <li><strong>The split</strong> — how much of that total was the <em>car</em> versus the
+        <em>home</em>. EMT shows this by decomposing each block's total, and to do that it needs
+        Octopus's live smart-charge <strong>dispatch</strong> records (which slots the car charged, and
+        how much).</li>
+    </ul>
+    Octopus only exposes dispatch records in <strong>real time</strong>, so they can't be fetched for the
+    past. That's the whole limitation: for a <strong>backfilled or imported history</strong> EMT has each
+    block's correct total but not the dispatch behind it, so it can't pull the total back apart into car
+    versus home — <em>like trying to un-bake a cake to get the eggs back out</em>. The split (and the
+    capped cap-boundary rate breakdown) is therefore only precise from the day EMT started capturing
+    dispatch. If your EV was on a <strong>physical sub-meter already recording in Home Assistant</strong>,
+    the historical car/home <em>energy</em> split can be rebuilt from HA's recorder (see Device History) —
+    that's a second recording to lean on; the cap-boundary <em>rate</em> split still can't be recovered.
+    To be clear: <strong>nothing about your bill is affected</strong> — only the car/home split and
+    rate-band breakdown detail.
+  </div>
+</div>
+
+<!-- ── Overview ─────────────────────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">⚡ Overview Page</div>
+  <p>
+    The Overview page shows your current grid power and billing totals. The summary row at the top
+    adapts to your configuration:
+  </p>
+  <ul>
+    <li><strong>Live power gauge</strong> — net grid power (negative = exporting). Status pill shows Importing/Exporting/Net Zero with current kW.</li>
+    <li><strong>🔋 Battery card</strong> — appears when a battery device has SoC or inverter power sensors configured. Shows charge level (colour-coded green/amber/red) and a bidirectional inverter gauge (teal = discharging, purple = charging).</li>
+    <li><strong>🚗 EV Charger card</strong> — appears when an EV device has a charger power sensor configured. Shows a unidirectional charge gauge (0 on left, max on right). Gauge scale is derived from the 48-hour history.</li>
+    <li><strong>♨️ Heat Pump card</strong> — appears when a heat pump device has a power sensor configured. Same unidirectional gauge as the EV charger.</li>
+    <li><strong>🌿 Carbon Intensity card</strong> — appears when a postcode prefix is configured. Shows current gCO₂/kWh and 48-hour forecast.</li>
+  </ul>
+  <div class="note-box">
+    ⓘ Device name detection for Overview cards uses the <strong>Meter Type</strong> field set in
+    Meter Config. If no type is set, keywords in the device name or meter ID are used as a fallback
+    (e.g. "battery", "charger", "zappi", "heat pump"). Setting the Meter Type explicitly is recommended.
+  </div>
+</div>
+
+<!-- ── Gap filling ───────────────────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">🔧 Gap Filling</div>
+  <p>
+    If the add-on is stopped or Home Assistant restarts, the engine detects any missing blocks
+    when it comes back online. It uses the last known reading before the outage and the first
+    reading after to <strong>interpolate the missing blocks</strong>. Gaps longer than 12 hours
+    are not interpolated — the blocks are left as zero to avoid misleading data.
+  </p>
+  <div class="note-box">
+    ⓘ <strong>Device gap attribution:</strong> The main meter uses boundary interpolation to
+    correctly allocate energy to each block window. Devices use raw cumulative deltas — if no
+    intermediate reads arrived during a gap, the full delta may be attributed to a single block
+    even if it spans multiple windows. This can cause a device to appear to exceed the parent
+    grid import for that block. The engine logs a WARNING and preserves the raw value. This is a
+    known limitation and will be improved in a future release.
+  </div>
+</div>
+
+<!-- ── Carbon intensity ─────────────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">🌿 Carbon Intensity</div>
+  <p>
+    When a <strong>postcode prefix</strong> is configured (e.g. <code>DE1</code>), the engine
+    fetches half-hourly regional carbon intensity data from the
+    <a href="https://carbonintensity.org.uk" target="_blank" style="color:var(--accent);">National Grid ESO API</a>.
+    Carbon intensity (gCO₂/kWh) is recorded against each block at the time of finalisation.
+  </p>
+  <ul>
+    <li><strong>Forecast vs actual</strong> — the API provides a forecast for upcoming slots and actual values ~24 hours later. Both are stored; actual is preferred when available.</li>
+    <li><strong>Generation mix</strong> — alongside intensity, the fuel type breakdown (wind, solar, gas, nuclear, biomass, hydro, imports) is stored per block. This data is the foundation for future generation mix features.</li>
+    <li><strong>Historical backfill</strong> — on first run with a postcode, the engine backfills up to 60 days of carbon data. Subsequent restarts check only the last 48 hours.</li>
+    <li><strong>Coverage</strong> — the Insights page shows the percentage of blocks with carbon data. Blocks from before a postcode was configured will not have carbon data.</li>
+  </ul>
+  <div class="note-box">
+    ⓘ Only UK postcodes are supported via the National Grid ESO regional API. Enter the outward
+    code only — e.g. <code>DE1</code> not <code>DE1 3AT</code>. The engine normalises the postcode
+    automatically on save.
+  </div>
+</div>
+
+<!-- ── Insights ──────────────────────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">📊 Insights</div>
+  <p>
+    The Insights page provides carbon analysis for any calendar month or year. Use the floating
+    toolbar to switch between Month and Year view, navigate with ← →, and compare against the
+    previous period or same period last year.
+  </p>
+  <ul>
+    <li><strong>Carbon Summary</strong> — net carbon emitted, your effective intensity vs grid average, export offset.</li>
+    <li><strong>Solar Export</strong> — carbon displaced by export, weighted by grid intensity at time of export.</li>
+    <li><strong>Direct Import</strong> — grid import attributable to house loads, excluding EV and battery charging.</li>
+    <li><strong>Battery Charging</strong> — carbon cost of grid energy used to charge the battery, including AC from grid and usable DC stored (adjusted for round-trip efficiency).</li>
+    <li><strong>EV Charging</strong> — carbon cost of EV charging with mileage estimate and petrol comparison.</li>
+    <li><strong>Heat Pump</strong> — carbon cost vs equivalent gas boiler.</li>
+  </ul>
+  <div class="note-box">
+    ⓘ Insights requires carbon intensity data. Blocks without carbon data (predating postcode
+    configuration) are excluded from carbon calculations. The coverage percentage is shown on the
+    Carbon Summary card.
+  </div>
+</div>
+
+<!-- ── Data storage ──────────────────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">💾 Data Storage &amp; Backup</div>
+  <p>All data is stored in a single SQLite database:</p>
+  <ul>
+    <li><code>blocks.db</code> — everything: all finalised blocks, config history, meter definitions, and current block state. This is the only file you need to back up.</li>
+    <li><code>meters_config.json</code> — human-readable config export only. The database is authoritative.</li>
+  </ul>
+  <p style="margin-top:12px;">
+    Data is stored in <code>/data/energy_meter_tracker/</code>. After every block finalise,
+    <code>blocks.db</code> is copied to <code>/share/energy_meter_tracker_backup/</code>.
+    A zip snapshot is created automatically before every config save and on demand from the
+    <a href="{{ url_for('data_management_page') }}" style="color:var(--accent);">Data Management page</a>.
+  </p>
+  <div class="warn-box">
+    ⚠️ <strong>Uninstalling the add-on will wipe <code>/data/</code>.</strong> Always ensure you
+    have a recent backup in <code>/share/</code> before uninstalling.
+  </div>
+</div>
+
+<!-- ── Standalone Docker ─────────────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">🐳 Standalone Docker</div>
+  <p>
+    When running in standalone Docker mode, the add-on connects to your HA instance using a
+    Long-Lived Access Token. The UI is accessible directly at the configured port (default <code>http://&lt;host&gt;:8099</code>).
+  </p>
+  <pre class="help-pre">panel_iframe:
+  energy_meter:
+    title: "Energy Meter"
+    icon: mdi:speedometer
+    url: "http://192.168.1.x:8099"</pre>
+  <p style="margin-top:8px;">
+    <strong>Embedding charts in Lovelace</strong> — use the dedicated Lovelace endpoints:
+  </p>
+  <pre class="help-pre">http://192.168.1.x:8099/lovelace/billing   # Billing chart
+http://192.168.1.x:8099/lovelace/heatmap   # Net energy heatmap</pre>
+  <div class="warn-box">
+    ⚠️ <strong>The volume mount is essential.</strong> Always run with
+    <code>-v /path/to/data:/data/energy_meter_tracker</code>.
+  </div>
+</div>
+
+<!-- ── HA sensors ────────────────────────────────────────────────────────── -->
+<div class="card help-section">
+  <div class="card-title">🏠 Home Assistant Sensors</div>
+  <p>After each block finalises, the engine updates four synthetic HA sensors:</p>
+  <ul>
+    <li><code>sensor.energy_meter_import_kwh</code> — total grid import (kWh)</li>
+    <li><code>sensor.energy_meter_export_kwh</code> — total grid export (kWh)</li>
+    <li><code>sensor.energy_meter_import_cost</code> — total import cost (£)</li>
+    <li><code>sensor.energy_meter_export_credit</code> — total export credit (£)</li>
+  </ul>
+  <p style="margin-top:12px;">
+    These sensors use <code>state_class: total_increasing</code> and <code>device_class: energy</code>
+    so they are compatible with the HA Energy dashboard and Utility Meter integrations.
+  </p>
+  <div class="note-box">
+    ⓘ With the <strong>Supplier API</strong> billing source (<code>cad+api</code>), the cost sensors
+    reflect DCC-settled figures once a block settles (provisional until then). In <code>cad</code> mode
+    they reflect your local rate × kWh as before.
+  </div>
+</div>
+
+<div class="card help-section">
+  <div class="card-title">📖 Further Reading &amp; Support</div>
+  <ul>
+    <li><a href="https://github.com/RGx01/EMT/issues" target="_blank" style="color:var(--accent);">GitHub Issues</a> — bug reports and feature requests</li>
+    <li><a href="https://github.com/RGx01/energy-meter-tracker-addon" target="_blank" style="color:var(--accent);">GitHub Repository</a> — source code and releases</li>
+  </ul>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+  if (window.innerWidth > 768) return;
+  var cards = document.querySelectorAll('.help-section');
+  cards.forEach(function(card, idx) {
+    var title = card.querySelector('.card-title');
+    if (!title) return;
+    var siblings = [];
+    var el = title.nextElementSibling;
+    while (el) { siblings.push(el); el = el.nextElementSibling; }
+    var wrapper = document.createElement('div');
+    siblings.forEach(function(s){ wrapper.appendChild(s); });
+    card.appendChild(wrapper);
+    var open = idx === 0;
+    wrapper.style.display = open ? 'block' : 'none';
+    var ind = document.createElement('span');
+    ind.style.cssText = 'margin-left:auto;font-size:11px;color:var(--muted);';
+    ind.textContent = open ? '▲' : '▼';
+    title.style.cssText += 'cursor:pointer;user-select:none;display:flex;align-items:center;';
+    title.appendChild(ind);
+    title.addEventListener('click', function() {
+      open = !open;
+      wrapper.style.display = open ? 'block' : 'none';
+      ind.textContent = open ? '▲' : '▼';
+    });
+  });
+})();
+</script>
+{% endblock %}

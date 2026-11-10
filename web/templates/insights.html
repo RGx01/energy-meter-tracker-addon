@@ -1,0 +1,2674 @@
+{% extends "base.html" %}
+
+{% block topbar %}
+<div class="topbar">
+  <div style="flex:1;">
+    <h2>Insights</h2>
+    <div class="sub">Energy, carbon and cost analysis</div>
+  </div>
+  <div class="insights-tabs" style="flex:0 0 auto;">
+    <button class="insights-tab active" data-tab="carbon" onclick="showInsightTab('carbon', this)">🌿 <span class="insights-tab-label">Carbon</span></button>
+    <button class="insights-tab" data-tab="usage" onclick="showInsightTab('usage', this)">💷 <span class="insights-tab-label">Usage</span></button>
+  </div>
+  <div style="flex:1;"></div>
+</div>
+{% endblock %}
+
+{% block head %}
+<style>
+  /* Floating insights toolbar — matches Usage Stats pattern */
+  .ins-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--surface);
+    padding: 8px 16px;
+    border-radius: 0 0 8px 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+    position: sticky;
+    top: 0;
+    z-index: 9;
+  }
+  .ins-toolbar .bar-seg {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+  .ins-toolbar .bar-seg-btn {
+    background: transparent;
+    border: none;
+    border-right: 1px solid var(--border);
+    padding: 5px 13px;
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+    font-family: var(--sans);
+  }
+  .ins-toolbar .bar-seg-btn:last-child { border-right: none; }
+  .ins-toolbar .bar-seg-btn.active { background: rgba(0,212,170,0.1); color: var(--accent); }
+  .ins-toolbar .bar-seg-btn:hover:not(.active) { background: rgba(255,255,255,0.05); color: var(--text); }
+  .ins-sep {
+    width: 1px;
+    height: 20px;
+    background: var(--border);
+    flex-shrink: 0;
+  }
+  .ins-nav-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 5px 12px;
+    font-size: 13px;
+    color: var(--muted);
+    cursor: pointer;
+    font-family: var(--sans);
+    transition: all 0.15s;
+  }
+  .ins-nav-btn:hover { color: var(--text); background: rgba(255,255,255,0.05); }
+  .ins-nav-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+  #ins-period-label {
+    font-size: 13px;
+    font-weight: 600;
+    min-width: 120px;
+    text-align: center;
+    color: var(--text);
+    cursor: ns-resize;
+    user-select: none;
+    touch-action: none;
+    padding: 2px 6px;
+    border-radius: var(--radius);
+    border: 1px solid transparent;
+    transition: border-color .12s, background .12s;
+  }
+  @media (max-width: 768px) {
+    .topbar .sub { display: none; }
+    .topbar { padding: 8px 12px; gap: 6px; flex-wrap: nowrap; align-items: center; }
+    .insights-tab { padding: 6px 10px; font-size: 18px; }
+    .insights-tab-label { display: none; }
+    .ins-toolbar { gap: 4px; }
+    #ins-period-label { min-width: 80px; font-size: 11px; }
+    .ins-nav-btn { padding: 4px 8px; }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<style>
+  .insights-tabs { display:flex; gap:8px; }
+  .insights-tab {
+    padding: 7px 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: transparent;
+    color: var(--muted);
+    font-size: 13px;
+    font-family: var(--sans);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .insights-tab:hover { background: rgba(255,255,255,0.05); color: var(--text); }
+  .insights-tab.active { background: rgba(0,212,170,0.1); color: var(--accent); border-color: var(--accent); }
+
+  .insight-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 20px;
+    margin-bottom: 12px;
+  }
+  .insight-card-title {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }
+  .insight-headline {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text);
+    font-family: var(--mono);
+    margin-bottom: 2px;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .insight-sub {
+    font-size: 13px;
+    color: var(--muted);
+    margin-bottom: 12px;
+    line-height: 1.5;
+  }
+  .insight-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .insight-metric {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 9px 12px;
+  }
+  .insight-metric-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:3px; }
+  .insight-metric-value { font-size:18px; font-weight:600; font-family:var(--mono); color:var(--text); display:inline; }
+  .insight-metric-unit  { font-size:11px; color:var(--muted); margin-left:3px; display:inline; }
+  .insight-verdict {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    border-radius: var(--radius);
+    font-size: 13px;
+    font-weight: 500;
+    margin-bottom: 10px;
+  }
+  .insight-verdict.positive { background:rgba(26,122,60,0.12); color:var(--success); border:1px solid rgba(26,122,60,0.25); }
+  .insight-verdict.neutral  { background:rgba(180,83,9,0.08);  color:var(--warning); border:1px solid rgba(180,83,9,0.2); }
+  .insight-verdict.negative { background:rgba(192,57,43,0.08); color:var(--danger);  border:1px solid rgba(192,57,43,0.2); }
+  .insight-equiv {
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.6;
+    border-top: 1px solid var(--border);
+    padding-top: 10px;
+    margin-top: 4px;
+  }
+  .insight-equiv strong { color: var(--text); }
+  .insight-footnote {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+    line-height: 1.6;
+  }
+  .insight-footnote a { color:var(--accent); text-decoration:none; }
+  .insight-footnote a:hover { text-decoration:underline; }
+  .coverage-warn { font-size:12px; color:var(--warning); margin-top:6px; }
+  #trend-wrap { margin-top:12px; border-top:1px solid var(--border); padding-top:10px; }
+
+  /* Postcode prompt */
+  .postcode-prompt {
+    background: rgba(0,212,170,0.06);
+    border: 1px solid rgba(0,212,170,0.25);
+    border-radius: var(--radius);
+    padding: 16px 20px;
+    margin-bottom: 12px;
+  }
+  .postcode-prompt h3 { font-size:15px; font-weight:600; margin-bottom:6px; }
+  .postcode-prompt p  { font-size:13px; color:var(--muted); line-height:1.6; margin-bottom:12px; }
+  .postcode-input-row { display:flex; gap:8px; align-items:center; }
+  .postcode-field {
+    width: 130px;
+    padding: 7px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    font-family: var(--mono);
+    text-transform: uppercase;
+  }
+  .postcode-field:focus { outline:none; border-color:var(--accent); }
+
+</style>
+
+<!-- Floating insights toolbar -->
+<div id="period-nav" class="ins-toolbar" style="display:none;">
+  <div class="bar-seg" id="ins-mode-seg">
+    <button class="bar-seg-btn active" onclick="insSetMode('month', this)">Month</button>
+    <button class="bar-seg-btn"        onclick="insSetMode('year',  this)">Year</button>
+  </div>
+  <div class="ins-sep"></div>
+  <button class="ins-nav-btn" id="btn-prev" onclick="navPeriod(-1)">←</button>
+  <span id="ins-period-label"></span>
+  <button class="ins-nav-btn" id="btn-next" onclick="navPeriod(1)">→</button>
+  <div class="ins-sep" id="ins-cmp-sep" style="display:none;"></div>
+  <div class="bar-seg" id="ins-compare-seg" style="display:none;">
+    <button class="bar-seg-btn" onclick="insSetCompare('prev',     this)">vs Last Month</button>
+    <button class="bar-seg-btn" onclick="insSetCompare('year',     this)">vs Same Month Last Year</button>
+  </div>
+  <div class="bar-seg" id="ins-compare-year-seg" style="display:none;">
+    <button class="bar-seg-btn" onclick="insSetCompare('lastyear', this)">vs Last Year</button>
+  </div>
+  <div style="margin-left:auto;">
+    <button class="ins-nav-btn" onclick="insExportPdf()" title="Export as PDF" style="padding:4px 10px;font-size:12px;">⬇ PDF</button>
+  </div>
+</div>
+
+<div id="insights-loading" style="text-align:center; padding:60px; color:var(--muted); font-size:13px;">
+  Loading…
+</div>
+
+<!-- ── Carbon tab ─────────────────────────────────────────────────────────── -->
+<div id="tab-carbon" style="display:none;">
+
+  <!-- No postcode state -->
+  <div id="no-postcode" style="display:none;">
+    <div class="postcode-prompt">
+      <h3>🌿 Enable Carbon Insights</h3>
+      <p>
+        Carbon insights require a postcode prefix to fetch grid carbon intensity data
+        from the National Grid ESO API (🇬🇧 UK only).<br>
+        EMT records the actual grid intensity at the time of every half-hour block —
+        enabling genuine per-period carbon accounting rather than monthly estimates.
+      </p>
+      <div class="postcode-input-row">
+        <input type="text" id="postcode-input" class="postcode-field"
+               placeholder="e.g. DE1" maxlength="6"
+               onkeydown="if(event.key==='Enter') savePostcode()">
+        <button class="btn btn-primary" onclick="savePostcode()">Enable carbon tracking</button>
+      </div>
+      <div id="postcode-error" style="font-size:12px; color:var(--danger); margin-top:8px; display:none;"></div>
+    </div>
+    <div class="insight-card" style="text-align:center; padding:32px;">
+      <div style="font-size:13px; color:var(--muted); line-height:1.7;">
+        Once a postcode is saved, carbon intensity recording begins on the next block finalise
+        (~30 minutes). Carbon insights will appear after your first full billing period with data.
+      </div>
+    </div>
+  </div>
+
+  <!-- No carbon data yet -->
+  <div id="no-carbon" style="display:none;">
+    <div class="insight-card" style="text-align:center; padding:48px 32px;">
+      <div style="font-size:48px; margin-bottom:16px;">🌿</div>
+      <div style="font-size:16px; font-weight:600; margin-bottom:8px;">Collecting carbon data</div>
+      <div style="font-size:13px; color:var(--muted); max-width:440px; margin:0 auto; line-height:1.7;">
+        Carbon intensity is being recorded. Insights will appear once you have data covering
+        at least one billing period. Check back soon.
+      </div>
+    </div>
+  </div>
+
+  <!-- Carbon insights body -->
+  <div id="insights-body" style="display:none;">
+
+    <!-- Summary card -->
+    <!-- Comparison narrative panel — shown when compare mode active -->
+    <div id="cmp-panel" style="display:none; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; margin-bottom:12px;">
+      <div id="cmp-panel-title" style="font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; color:var(--muted); margin-bottom:10px;"></div>
+      <div id="cmp-panel-lines" style="display:flex; flex-direction:column; gap:6px; font-size:13px; color:var(--text);"></div>
+    </div>
+
+    <div class="insight-card" id="card-summary">
+      <div class="insight-card-title">🌍 Carbon Summary</div>
+      <div class="insight-headline" id="sum-net-headline"></div>
+      <div class="insight-sub"     id="sum-net-sub"></div>
+      <div id="sum-verdict" class="insight-verdict"></div>
+      <div class="insight-grid">
+        <div class="insight-metric">
+          <div class="insight-metric-label">Grid carbon imported</div>
+          <div class="insight-metric-value" id="sum-imp"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+        <div class="insight-metric" id="sum-exp-wrap">
+          <div class="insight-metric-label">Export offset</div>
+          <div class="insight-metric-value" id="sum-exp"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Your intensity</div>
+          <div class="insight-metric-value" id="sum-eff-int"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Grid average</div>
+          <div class="insight-metric-value" id="sum-grid-int"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Grid import</div>
+          <div class="insight-metric-value" id="sum-ci-imp-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric" id="sum-ci-exp-wrap">
+          <div class="insight-metric-label">Grid export</div>
+          <div class="insight-metric-value" id="sum-ci-exp-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+      </div>
+      <div class="insight-equiv"   id="sum-equiv"></div>
+      <div class="coverage-warn"   id="sum-coverage"></div>
+      <div id="trend-wrap">
+        <div style="font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); margin-bottom:10px;">Net carbon per billing period</div>
+        <div id="trend-chart" style="width:100%; overflow-x:auto;"></div>
+      </div>
+      <!-- Generation mix bar — hidden when no mix data -->
+      <div id="mix-bar-wrap" style="display:none;margin-top:16px;">
+        <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);margin-bottom:8px;">
+          Grid generation mix this period
+        </div>
+        <div id="mix-bar" style="display:flex;height:10px;border-radius:5px;overflow:hidden;width:100%;gap:1px;"></div>
+        <div id="mix-bar-legend" style="display:flex;flex-wrap:wrap;gap:6px 12px;margin-top:8px;font-size:11px;"></div>
+        <!-- Comparison bars (shown when compare mode active) -->
+        <div id="mix-bar-cmp-wrap" style="display:none;margin-top:10px;">
+          <div style="font-size:11px;color:var(--muted);margin-bottom:4px;" id="mix-bar-cmp-label"></div>
+          <div id="mix-bar-cmp" style="display:flex;height:10px;border-radius:5px;overflow:hidden;width:100%;gap:1px;"></div>
+        </div>
+      </div>
+
+      <div class="insight-footnote">
+        Carbon intensity from <a href="https://carbonintensity.org.uk" target="_blank" rel="noopener">National Grid ESO</a>
+        half-hourly regional API. Both figures are derived from recorded intensity at the time of each block.<br><br>
+        <strong>Your intensity vs grid average</strong> — your effective intensity is weighted by how much you consumed
+        or exported in each slot. The grid average is weighted equally across all slots. The comparison is only
+        shown when you have solar, an EV or a battery — for import-only households without flexible loads the
+        two figures will be nearly identical and the comparison adds little. A meaningful difference indicates
+        your consumption pattern was skewed toward cleaner or dirtier grid periods than average.<br><br>
+        Export offset assumes displaced generation at grid average intensity (conservative —
+        <a href="{{ url_for('settings_page') }}?tab=carbon">edit in Settings</a>).
+      </div>
+    </div>
+
+    <!-- Solar card -->
+    <div class="insight-card" id="card-solar" style="display:none;">
+      <div class="insight-card-title">☀️ Solar Export Offset</div>
+      <div class="insight-headline" id="sol-headline"></div>
+      <div class="insight-sub"     id="sol-sub"></div>
+      <div class="insight-grid">
+        <div class="insight-metric" style="display:none;">
+          <div class="insight-metric-label">Export offset</div>
+          <div class="insight-metric-value" id="sol-offset"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Export kWh</div>
+          <div class="insight-metric-value" id="sol-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Avg export intensity</div>
+          <div class="insight-metric-value" id="sol-intensity"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">vs grid average</div>
+          <div class="insight-metric-value" id="sol-vs-grid"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+      </div>
+      <div class="insight-equiv" id="sol-equiv"></div>
+      <div class="insight-verdict" id="sol-verdict" style="display:none;"></div>
+      <div class="insight-footnote">
+        Calculated using actual grid intensity at the time of each export block.
+        <a href="{{ url_for('settings_page') }}?tab=carbon">Edit assumptions →</a>
+      </div>
+    </div>
+
+    
+<!-- House card -->
+    <div class="insight-card" id="card-house" style="display:none;">
+      <div class="insight-card-title">🏠 Direct Import</div>
+      <div class="insight-headline" id="house-headline"></div>
+      <div class="insight-sub"     id="house-sub"></div>
+      <div class="insight-grid">
+        <div class="insight-metric">
+          <div class="insight-metric-label">Direct import</div>
+          <div class="insight-metric-value" id="house-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric" id="house-carbon-wrap" style="display:none;">
+          <div class="insight-metric-label">Direct import carbon</div>
+          <div class="insight-metric-value" id="house-carbon"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Avg intensity</div>
+          <div class="insight-metric-value" id="house-intensity"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">vs grid average</div>
+          <div class="insight-metric-value" id="house-vs-grid"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+        <div class="insight-metric" id="house-pct-wrap">
+          <div class="insight-metric-label">% direct import</div>
+          <div class="insight-metric-value" id="house-pct"></div>
+          <div class="insight-metric-unit">% of total</div>
+        </div>
+      </div>
+      <div class="insight-equiv" id="house-equiv"></div>
+      <div class="insight-verdict" id="house-verdict" style="display:none;"></div>
+      <div class="insight-footnote">
+        Grid import attributable directly to the house, excluding EV and battery charging.
+        Any electricity the battery discharged into the house is not captured here — that energy
+        was already accounted for when the battery charged from the grid. Battery export vs
+        house usage cannot be separated without generation-side metering.
+        <a href="{{ url_for('settings_page') }}?tab=carbon">Edit assumptions →</a>
+      </div>
+    </div>
+
+    
+<!-- Battery card -->
+    <div class="insight-card" id="card-battery" style="display:none;">
+      <div class="insight-card-title">🔋 Battery Charging Behaviour</div>
+      <div class="insight-headline" id="bat-headline"></div>
+      <div class="insight-sub"     id="bat-sub"></div>
+      <div class="insight-grid">
+        <div class="insight-metric" id="bat-carbon-wrap" style="display:none;">
+          <div class="insight-metric-label">Grid carbon to charge</div>
+          <div class="insight-metric-value" id="bat-carbon"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">AC from grid</div>
+          <div class="insight-metric-value" id="bat-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Usable DC stored</div>
+          <div class="insight-metric-value" id="bat-dc-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Avg intensity</div>
+          <div class="insight-metric-value" id="bat-intensity"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">vs grid average</div>
+          <div class="insight-metric-value" id="bat-vs-grid"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+      </div>
+      <div class="insight-equiv" id="bat-equiv"></div>
+      <div class="insight-footnote">
+        Carbon shown is the cost of grid energy used to charge the battery. The battery
+        device records direct grid consumption only — solar contribution to charging is not captured
+        here (it appears as reduced main meter import instead). The key question is whether
+        grid charging was timed to cleaner periods.<br>
+        Battery discharge carbon (to house or export) cannot be separated without
+        generation-side metering.
+        <a href="{{ url_for('settings_page') }}?tab=carbon">Edit assumptions →</a>
+      </div>
+    </div>
+
+    
+<!-- Heat pump card -->
+    <div class="insight-card" id="card-hp" style="display:none;">
+      <div class="insight-card-title">♨️ Heat Pump Carbon</div>
+      <div class="insight-headline" id="hp-headline"></div>
+      <div class="insight-sub"     id="hp-sub"></div>
+      <div class="insight-grid">
+        <div class="insight-metric" id="hp-carbon-wrap" style="display:none;">
+          <div class="insight-metric-label">HP carbon</div>
+          <div class="insight-metric-value" id="hp-carbon"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Electricity used</div>
+          <div class="insight-metric-value" id="hp-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Heat delivered</div>
+          <div class="insight-metric-value" id="hp-heat"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">vs gas boiler</div>
+          <div class="insight-metric-value" id="hp-vs-gas"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+      </div>
+      <div class="insight-equiv" id="hp-equiv"></div>
+      <div class="insight-footnote">
+        Heat delivered = electricity × COP. Gas equivalent = heat ÷ boiler efficiency × gas carbon factor.
+        Crossover intensity shown is the grid intensity above which gas becomes cleaner than your heat pump.
+        <a href="{{ url_for('settings_page') }}?tab=carbon">Edit assumptions →</a>
+      </div>
+    </div>
+
+  
+<!-- EV card -->
+    <div class="insight-card" id="card-ev" style="display:none;">
+      <div class="insight-card-title">🔌 EV Charging Carbon</div>
+      <div class="insight-headline" id="ev-headline"></div>
+      <div class="insight-sub"     id="ev-sub"></div>
+      <div class="insight-grid">
+        <div class="insight-metric" id="ev-carbon-wrap" style="display:none;">
+          <div class="insight-metric-label">EV carbon</div>
+          <div class="insight-metric-value" id="ev-carbon"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+        <div class="insight-metric" id="ev-saving-wrap" style="display:none;">
+          <div class="insight-metric-label">Behind-meter avoided</div>
+          <div class="insight-metric-value" id="ev-saving"></div>
+          <div class="insight-metric-unit">kgCO₂</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">AC delivered</div>
+          <div class="insight-metric-value" id="ev-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Usable DC stored</div>
+          <div class="insight-metric-value" id="ev-dc-kwh"></div>
+          <div class="insight-metric-unit">kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">Avg intensity</div>
+          <div class="insight-metric-value" id="ev-intensity"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+        <div class="insight-metric">
+          <div class="insight-metric-label">vs grid average</div>
+          <div class="insight-metric-value" id="ev-vs-grid"></div>
+          <div class="insight-metric-unit">gCO₂/kWh</div>
+        </div>
+      </div>
+      <div class="insight-equiv" id="ev-equiv"></div>
+      <div class="insight-footnote">
+        EV carbon based on AC import × grid intensity at time of charging (smart-charge dispatch
+        on Intelligent Octopus, single-source). "Behind-meter avoided" is energy the car drew from
+        battery/solar that never crossed the grid meter — counted as avoided grid carbon.
+        Mileage: AC import × charge efficiency (AC→DC loss) × EV efficiency (miles/kWh battery).
+        Efficiency figure should be from your trip computer or manufacturer spec — not derived
+        from wall/smart meter energy, which would double-count the charging loss.
+        <a href="{{ url_for('settings_page') }}?tab=carbon">Edit assumptions →</a>
+      </div>
+    </div>
+
+    
+    </div><!-- /insights-body -->
+</div><!-- /tab-carbon -->
+<!-- ── Usage tab ──────────────────────────────────────────────────────────── -->
+<div id="tab-usage" style="display:none;">
+
+  <!-- Narrative comparison card — only shown when a comparison period is active -->
+  <div class="insight-card" id="ucard-narrative" style="display:none;">
+    <div class="insight-card-title" id="u-narrative-title">Compared to…</div>
+    <div id="u-narrative-headline" class="insight-headline" style="font-size:1.1rem;margin-bottom:8px;"></div>
+    <div id="u-narrative-bullets" style="margin-top:4px;"></div>
+  </div>
+
+  <!-- Cost & Earnings card -->
+  <div class="insight-card" id="ucard-cost">
+    <div class="insight-card-title">💷 Cost &amp; Earnings</div>
+    <div class="insight-headline" id="u-net-headline">—</div>
+    <div class="insight-sub" id="u-net-sub">Net cost this period.</div>
+    <div class="insight-grid">
+      <div class="insight-metric">
+        <div class="insight-metric-label">Grid Import</div>
+        <span class="insight-metric-value" id="u-imp-cost">—</span>
+        <span class="insight-metric-unit" id="u-currency-imp"></span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Export Earnings</div>
+        <span class="insight-metric-value" id="u-exp-cost">—</span>
+        <span class="insight-metric-unit" id="u-currency-exp"></span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Standing Charge</div>
+        <span class="insight-metric-value" id="u-standing">—</span>
+        <span class="insight-metric-unit" id="u-currency-sc"></span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Avg Import Rate</div>
+        <span class="insight-metric-value" id="u-avg-rate">—</span>
+        <span class="insight-metric-unit">p/kWh</span>
+      </div>
+    </div>
+    <div id="u-sc-note" class="insight-footnote" style="display:none;"></div>
+  </div>
+
+  <!-- Rate Period Usage card — only shown when >1 rate tier -->
+  <div class="insight-card" id="ucard-rates" style="display:none;">
+    <div class="insight-card-title">📊 Rate Period Usage</div>
+    <div class="insight-sub" id="u-rates-sub">How your import is distributed across tariff rate periods.</div>
+    <div id="u-rate-bars"></div>
+    <div class="insight-footnote">Rate periods are determined by the import rate recorded on each half-hour block. Percentages show share of total grid import kWh.</div>
+  </div>
+
+  <!-- Net Grid Position card -->
+  <div class="insight-card" id="ucard-grid">
+    <div class="insight-card-title">🔌 Grid Position</div>
+    <div class="insight-headline" id="u-net-grid-headline">—</div>
+    <div class="insight-sub" id="u-net-grid-sub"></div>
+    <div class="insight-grid">
+      <div class="insight-metric">
+        <div class="insight-metric-label">Grid Import</div>
+        <span class="insight-metric-value" id="u-imp-kwh">—</span>
+        <span class="insight-metric-unit">kWh</span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Export</div>
+        <span class="insight-metric-value" id="u-exp-kwh">—</span>
+        <span class="insight-metric-unit">kWh</span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Direct to House</div>
+        <span class="insight-metric-value" id="u-house-kwh">—</span>
+        <span class="insight-metric-unit">kWh</span>
+      </div>
+      <div class="insight-metric">
+        <div class="insight-metric-label">Net Exporter Days</div>
+        <span class="insight-metric-value" id="u-exporter-days">—</span>
+        <span class="insight-metric-unit" id="u-exporter-days-unit"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Peak Demand card -->
+  <div class="insight-card" id="ucard-peak">
+    <div class="insight-card-title">⚡ Peak Demand Window</div>
+    <div class="insight-headline" id="u-peak-headline">—</div>
+    <div class="insight-sub" id="u-peak-sub">The 2-hour window with the highest house grid import.</div>
+    <div class="insight-footnote" id="u-peak-footnote">Based on half-hour block totals converted to local time.</div>
+  </div>
+
+  <!-- Device cards — one per configured sub-meter, built in renderUsage().
+       Previously three fixed cards (battery / EV / heat pump), which could show
+       exactly ONE device of each type: a second heat pump had nowhere to render
+       (#450). The server has always sent every device, keyed by meter id. -->
+  <div id="ucard-devices"></div>
+
+</div><!-- /tab-usage -->
+
+
+{% include '_period_spinner.html' %}
+<script>
+var _periods    = [];
+var _periodIdx  = 0;
+var _insMode    = 'month';   // 'month' | 'year'
+var _insCompare = null;      // null | 'prev' | 'year' | 'lastyear'
+var _calYear    = new Date().getFullYear();
+var _calMonth   = new Date().getMonth() + 1;  // 1-12
+var _dataBounds  = { earliest: null, latest: null };  // CARBON range — from /api/insights/data-bounds
+var _usageBounds = { earliest: null, latest: null };  // full energy range (incl. imported history)
+// The Usage tab has kWh/cost back through imported history that predates carbon,
+// so its nav/compare gating must use the full energy range, not the carbon one.
+function insBounds() { return _activeInsightTab === 'usage' ? _usageBounds : _dataBounds; }
+var _trendChart = null;
+
+var _EMT_VERSION = "{{ app_version or '2.8.1' }}";
+var _activeInsightTab = 'carbon';
+
+function _insSaveState() {
+  try {
+    localStorage.setItem('emt_insights_state', JSON.stringify({
+      tab:     _activeInsightTab,
+      mode:    _insMode,
+      year:    _calYear,
+      month:   _calMonth,
+      compare: _insCompare
+    }));
+  } catch(e) {}
+}
+
+function showInsightTab(name, btn) {
+  _activeInsightTab = name;
+  document.querySelectorAll('.insights-tab').forEach(function(b) { b.classList.remove('active'); });
+  btn.classList.add('active');
+  document.getElementById('tab-carbon').style.display = name === 'carbon' ? 'block' : 'none';
+  document.getElementById('tab-usage').style.display  = name === 'usage'  ? 'block' : 'none';
+  _insSaveState();
+  loadPeriod();
+}
+
+// ── Formatting ──────────────────────────────────────────────────────────────
+function fmtKg(g) {
+  if (g == null) return '—';
+  var kg = Math.abs(g) / 1000;
+  return kg >= 10 ? kg.toFixed(1) : kg.toFixed(2);
+}
+function fmtInt(v) { return v != null ? Math.round(v) : '—'; }
+function fmtKwh(v) { return v != null ? v.toFixed(1) : '—'; }
+
+function periodLabel(p) {
+  var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  var s = new Date(p.period_start + 'T12:00:00Z');
+  var e = new Date(p.period_end   + 'T12:00:00Z');
+  return MONTHS[s.getUTCMonth()] + ' ' + s.getUTCDate() + ' – ' +
+         MONTHS[e.getUTCMonth()] + ' ' + e.getUTCDate() + ' ' + e.getUTCFullYear();
+}
+
+// ── Equivalences ────────────────────────────────────────────────────────────
+function equivLines(carbon_g, a, period_start, period_end, data_start) {
+  if (!carbon_g || carbon_g <= 0) return '';
+  var kg  = carbon_g / 1000;
+  var isKm = (a.distance_unit === 'km');
+  var distLabel = isKm ? 'km' : 'miles';
+  // Convert gCO2/mile to gCO2/km if needed
+  var petrol_g_per_dist = isKm
+    ? (a.co2_car_petrol_g_per_mile || 180) / 1.60934
+    : (a.co2_car_petrol_g_per_mile || 180);
+  var car_dist   = Math.round(kg * 1000 / petrol_g_per_dist);
+  var tree_kg_yr = a.co2_tree_kg_per_year || 21;
+  var tree_days  = Math.round(kg / (tree_kg_yr / 365));
+  var flight_pct = (kg / (a.co2_flight_lhr_nyc_kg || 670) * 100).toFixed(1);
+
+  // Multi-tree calculation based on actual data span
+  var treeStr = '';
+  if (tree_days > 0 && period_start && period_end) {
+    // Use actual data start if available (avoids counting empty period before first block)
+    var effective_start = data_start
+      ? new Date(data_start + 'T12:00:00Z')
+      : new Date(period_start + 'T12:00:00Z');
+    var pe = new Date(period_end + 'T12:00:00Z');
+    // Cap period end at today for partial periods
+    var today = new Date();
+    today.setUTCHours(12, 0, 0, 0);
+    var effective_end = pe < today ? pe : today;
+    var days_in_period = Math.max(1, Math.round((effective_end - effective_start) / 86400000));
+    var period_years   = days_in_period / 365;
+    var trees_needed   = Math.ceil(kg / (tree_kg_yr * period_years));
+    var months_in_period = days_in_period / 30.44;
+    var timeframe;
+    if (_insMode === 'month') {
+      // In month mode, use actual days if less than ~3 weeks
+      if (days_in_period < 21) {
+        timeframe = days_in_period + ' days';
+      } else {
+        timeframe = '1 month';
+      }
+    } else if (Math.round(months_in_period) <= 1) {
+      timeframe = days_in_period + ' days';
+    } else if (Math.round(months_in_period) >= 11) {
+      timeframe = '1 year';
+    } else {
+      timeframe = Math.round(months_in_period) + ' months';
+    }
+    if (trees_needed === 1) {
+      treeStr = '🌳 1 tree clears this in ' + timeframe + ' · would take <strong>' + tree_days + ' days</strong> alone';
+    } else {
+      treeStr = '🌳 <strong>' + trees_needed + ' trees</strong> clear this in ' + timeframe + ' · a single tree takes <strong>' + tree_days + ' days</strong>';
+    }
+  } else if (tree_days > 0) {
+    treeStr = '🌳 A tree would absorb this in <strong>' + tree_days + ' days</strong>';
+  }
+
+  var lines = [];
+  if (car_dist > 0)   lines.push('🚗 Equivalent to <strong>' + car_dist.toLocaleString() + ' ' + distLabel + '</strong> in a petrol car');
+  if (treeStr)        lines.push(treeStr);
+  if (flight_pct > 0) lines.push('✈️ <strong>' + flight_pct + '%</strong> of a return flight LHR→NYC per passenger');
+  return lines.join(' &nbsp;·&nbsp; ');
+}
+
+// ── Render ──────────────────────────────────────────────────────────────────
+// ── Generation Mix bar helpers ────────────────────────────────────────────────
+var _INS_MIX_COLOURS = {
+  wind:'#3b82f6',
+  solar:'#facc15',
+  nuclear:'#7c3aed',
+  gas:'#f97316',
+  biomass:'#92400e',
+  hydro:'#38bdf8',
+  imports:'#9ca3af',
+  other:'#6b7280',
+  coal:'#374151'
+};
+var _INS_MIX_LABELS  = {
+  wind:'Wind', solar:'Solar', nuclear:'Nuclear', imports:'Imports',
+  biomass:'Biomass', gas:'Gas', hydro:'Hydro', other:'Other', coal:'Coal'
+};
+var _INS_MIX_ORDER = ['wind','solar','nuclear','biomass','hydro','imports','gas','other','coal'];
+
+function _renderMixBar(mix, barId, legendId) {
+  var barEl = document.getElementById(barId);
+  if (!barEl) return;
+  if (!mix || !mix.length) { barEl.style.display = 'none'; return; }
+  var total = mix.reduce(function(s,d){ return s + (d.perc||0); }, 0);
+  if (total <= 0) { barEl.style.display = 'none'; return; }
+
+  // Sort by _INS_MIX_ORDER for consistent visual stacking
+  var sorted = _INS_MIX_ORDER.map(function(f) {
+    var found = mix.find(function(m){ return m.fuel === f; });
+    return found || {fuel: f, perc: 0};
+  }).filter(function(d){ return d.perc > 0; });
+
+  barEl.innerHTML = sorted.map(function(d) {
+    var w = (d.perc / total * 100).toFixed(2);
+    var col = _INS_MIX_COLOURS[d.fuel] || '#9ca3af';
+    return '<div style="flex:0 0 ' + w + '%;height:100%;background:' + col +
+           ';min-width:' + (d.perc > 1 ? '2px' : '1px') + ';" ' +
+           'title="' + (_INS_MIX_LABELS[d.fuel]||d.fuel) + ': ' + d.perc.toFixed(1) + '%"></div>';
+  }).join('');
+
+  if (legendId) {
+    var legEl = document.getElementById(legendId);
+    if (legEl) {
+      legEl.innerHTML = sorted.slice(0, 6).map(function(d) {
+        var col = _INS_MIX_COLOURS[d.fuel] || '#9ca3af';
+        return '<span style="display:flex;align-items:center;gap:4px;">' +
+          '<span style="width:8px;height:8px;border-radius:50%;background:' + col + ';flex-shrink:0;"></span>' +
+          '<span style="color:var(--muted);">' + (_INS_MIX_LABELS[d.fuel]||d.fuel) + '</span>' +
+          '<span style="color:var(--text);font-weight:600;">' + d.perc.toFixed(1) + '%</span>' +
+          '</span>';
+      }).join('');
+    }
+  }
+}
+
+function _renderInsightsMix(d, cmpData, cmpLabel) {
+  var wrap = document.getElementById('mix-bar-wrap');
+  if (!wrap) return;
+  var mix = d.generation_mix;
+  if (!mix || !mix.length) { wrap.style.display = 'none'; return; }
+  wrap.style.display = '';
+  _renderMixBar(mix, 'mix-bar', 'mix-bar-legend');
+
+  // Comparison bar
+  var cmpWrap = document.getElementById('mix-bar-cmp-wrap');
+  if (cmpData && cmpData.generation_mix && cmpData.generation_mix.length && cmpLabel) {
+    _renderMixBar(cmpData.generation_mix, 'mix-bar-cmp', null);
+    var lbl = document.getElementById('mix-bar-cmp-label');
+    if (lbl) lbl.textContent = 'Compared to ' + cmpLabel + ':';
+    cmpWrap.style.display = '';
+  } else if (cmpWrap) {
+    cmpWrap.style.display = 'none';
+  }
+}
+
+// ── Mix change narrative for comparison panel ─────────────────────────────────
+function _mixChangeNarrative(mix, cmpMix) {
+  if (!mix || !mix.length || !cmpMix || !cmpMix.length) return null;
+  var changes = [];
+  mix.forEach(function(cur) {
+    var prev = cmpMix.find(function(m){ return m.fuel === cur.fuel; });
+    if (!prev) return;
+    var diff = (cur.perc || 0) - (prev.perc || 0);
+    if (Math.abs(diff) >= 5) {
+      changes.push({ fuel: cur.fuel, diff: diff, perc: cur.perc });
+    }
+  });
+  if (!changes.length) return null;
+  changes.sort(function(a,b){ return Math.abs(b.diff) - Math.abs(a.diff); });
+  var top = changes.slice(0, 2);
+  var highCarbon = ['gas','coal','other'];
+  return top.map(function(c) {
+    var lbl  = _INS_MIX_LABELS[c.fuel] || c.fuel;
+    var col  = _INS_MIX_COLOURS[c.fuel] || '#9ca3af';
+    var dir  = c.diff > 0 ? 'up' : 'down';
+    var isHC = highCarbon.indexOf(c.fuel) !== -1;
+    var impact = (isHC && c.diff > 0) ? ' — higher carbon intensity' :
+                 (isHC && c.diff < 0) ? ' — lower carbon intensity' :
+                 (!isHC && c.diff < 0) ? ' — higher carbon intensity' :
+                 (!isHC && c.diff > 0) ? ' — lower carbon intensity' : '';
+    return '→ <span style="color:' + col + '">' + lbl + '</span> was ' +
+           c.perc.toFixed(0) + '% of the mix (' + (c.diff > 0 ? '+' : '') +
+           c.diff.toFixed(0) + 'pp)' + impact + '.';
+  }).join(' ');
+}
+
+function renderInsights(d, _cmp) {
+  document.getElementById('insights-loading').style.display = 'none';
+  document.getElementById('insights-body').style.display    = 'none';
+  document.getElementById('no-carbon').style.display        = 'none';
+  ['card-house','card-solar','card-ev','card-battery','card-hp'].forEach(function(id) {
+    document.getElementById(id).style.display = 'none';
+  });
+
+  if (!d.has_carbon) {
+    document.getElementById('no-carbon').style.display = 'block';
+    return;
+  }
+
+  document.getElementById('insights-body').style.display = 'block';
+  var a = d.assumptions;
+
+  // Summary
+  var net_kg = d.carbon_g_net / 1000;
+  document.getElementById('sum-net-headline').textContent =
+    (net_kg < 0 ? '−' : '') + Math.abs(net_kg).toFixed(2) + ' kgCO₂';
+  document.getElementById('sum-net-sub').textContent =
+    'Net carbon ' + (net_kg < 0 ? 'offset' : 'emitted') + (d.period_label ? ' — ' + d.period_label : ' this period') + '.';
+
+  var verdict = document.getElementById('sum-verdict');
+  var hasFlexible = d.exp_kwh > 0.1 || Object.values(d.sub_meters || {}).some(function(m) {
+    return ['ev_charger','ev','battery','inverter'].includes(m.meter_type) && m.imp_kwh > 0.1;
+  });
+  if (d.effective_intensity != null && d.grid_avg_intensity != null && hasFlexible) {
+    var diff = d.effective_intensity - d.grid_avg_intensity;
+    var pct  = Math.abs(Math.round(diff / d.grid_avg_intensity * 100));
+    if (Math.abs(diff) < 5) {
+      verdict.className = 'insight-verdict neutral';
+      verdict.textContent = '≈ Your consumption pattern matched the grid average intensity this period.';
+    } else if (diff < 0) {
+      verdict.className = 'insight-verdict positive';
+      verdict.textContent = '✓ Your consumption was weighted toward cleaner grid periods — ' + pct + '% below the grid average intensity.';
+    } else {
+      verdict.className = 'insight-verdict negative';
+      verdict.textContent = '↑ Your consumption was weighted toward dirtier grid periods — ' + pct + '% above the grid average intensity. Shifting flexible loads (EV, battery) to lower-intensity windows could help.';
+    }
+    verdict.style.display = '';
+  } else {
+    verdict.style.display = 'none';
+  }
+
+  document.getElementById('sum-imp').textContent = fmtKg(d.carbon_g_imp);
+  if (d.exp_kwh > 0.01) {
+    document.getElementById('sum-exp').textContent = fmtKg(d.carbon_g_exp);
+  } else {
+    document.getElementById('sum-exp-wrap').style.display = 'none';
+  }
+  document.getElementById('sum-eff-int').textContent  = fmtInt(d.effective_intensity);
+  document.getElementById('sum-grid-int').textContent = fmtInt(d.grid_avg_intensity);
+  document.getElementById('sum-ci-imp-kwh').textContent = d.ci_imp_kwh != null ? fmtKwh(d.ci_imp_kwh) : '—';
+  if (d.ci_exp_kwh > 0.01) {
+    document.getElementById('sum-ci-exp-kwh').textContent = fmtKwh(d.ci_exp_kwh);
+  } else {
+    document.getElementById('sum-ci-exp-wrap').style.display = 'none';
+  }
+  document.getElementById('sum-equiv').innerHTML = equivLines(Math.max(0, d.carbon_g_net), a, d.period_start, d.period_end, d.data_start);
+
+  if (d.carbon_coverage_pct < 95) {
+    document.getElementById('sum-coverage').textContent =
+      '⚠ Carbon data covers ' + d.carbon_coverage_pct + '% of blocks — some blocks predate carbon recording.';
+  }
+
+  // ── Render in display order: solar, house, battery, hp, ev ─────────────────
+
+  // Solar
+  if (d.exp_kwh > 0.1 && d.carbon_g_exp > 0) {
+    document.getElementById('card-solar').style.display = 'block';
+    var off_kg = d.carbon_g_exp / 1000;
+    document.getElementById('sol-headline').textContent = off_kg.toFixed(2) + ' kgCO₂ offset';
+    document.getElementById('sol-sub').textContent = 'Your solar export displaced this much carbon from the grid.';
+    document.getElementById('sol-offset').textContent = off_kg.toFixed(2);
+    document.getElementById('sol-kwh').textContent    = fmtKwh(d.ci_exp_kwh > 0 ? d.ci_exp_kwh : d.exp_kwh);
+    document.getElementById('sol-intensity').textContent = d.avg_export_intensity != null ? Math.round(d.avg_export_intensity) : '—';
+    document.getElementById('sol-vs-grid').textContent   = d.grid_avg_intensity   != null ? Math.round(d.grid_avg_intensity)   : '—';
+    // Solar verdict — higher export intensity = better (displaced dirtier generation)
+    var has_battery = Object.values(d.sub_meters || {}).some(function(s) {
+      return ['battery','inverter'].includes(s.meter_type) && s.imp_kwh > 0.1;
+    });
+    if (d.avg_export_intensity != null && d.grid_avg_intensity != null) {
+      var sol_diff = d.avg_export_intensity - d.grid_avg_intensity;
+      var sol_pct  = Math.abs(Math.round(sol_diff / d.grid_avg_intensity * 100));
+      var solV = document.getElementById('sol-verdict');
+      solV.style.display = '';
+      if (sol_pct < 10) {
+        solV.className = 'insight-verdict neutral';
+        if (has_battery) {
+          solV.innerHTML = 'Your export matched the grid average intensity. If your battery can be scheduled to export, you could store solar during clean periods and export from the battery when the grid is dirtier to increase your offset.';
+        } else {
+          solV.innerHTML = 'Your export matched the grid average intensity — timing follows generation so there is little you can directly control.';
+        }
+      } else if (sol_diff > 0) {
+        solV.className = 'insight-verdict positive';
+        if (has_battery) {
+          solV.innerHTML = '✓ You exported during dirtier-than-average periods — displacing ' + sol_pct + '% more carbon than average. Good battery export timing.';
+        } else {
+          solV.innerHTML = '✓ You exported during dirtier-than-average periods — displacing ' + sol_pct + '% more carbon than average.';
+        }
+      } else {
+        solV.className = 'insight-verdict neutral';
+        if (has_battery) {
+          solV.innerHTML = 'Export was weighted toward cleaner grid periods — displacing ' + sol_pct + '% less carbon than average. You could increase your offset by storing solar generation during clean periods and scheduling your battery to export when the grid is dirtier.';
+        } else {
+          solV.innerHTML = 'Export was weighted toward cleaner grid periods — displacing ' + sol_pct + '% less carbon than average. Solar export timing follows generation so this is not something you can directly control.';
+        }
+      }
+    }
+    document.getElementById('sol-equiv').innerHTML    = equivLines(d.carbon_g_exp, a, d.period_start, d.period_end, d.data_start);
+  }
+
+  // Direct import
+  if (d.house_ci_imp_kwh > 0.1 || d.house_imp_kwh > 0.1) {
+    var house_kg   = d.house_carbon_g != null ? d.house_carbon_g / 1000 : null;
+    // Use CI kWh alongside carbon for consistent pairing
+    var house_kwh_display = d.house_ci_imp_kwh > 0 ? d.house_ci_imp_kwh : d.house_imp_kwh;
+    var house_pct  = d.ci_imp_kwh > 0
+      ? Math.round(d.house_ci_imp_kwh / d.ci_imp_kwh * 100)
+      : (d.imp_kwh > 0 ? Math.round(d.house_imp_kwh / d.imp_kwh * 100) : null);
+    document.getElementById('card-house').style.display = 'block';
+    document.getElementById('house-headline').textContent =
+      house_kg != null ? house_kg.toFixed(2) + ' kgCO₂' : fmtKwh(house_kwh_display) + ' kWh';
+    document.getElementById('house-sub').textContent =
+      'Grid import attributable to house loads (excluding EV and battery charging)' +
+      (d.house_ci_imp_kwh > 0 && d.house_ci_imp_kwh < d.house_imp_kwh
+        ? ' — showing kWh with carbon data only.' : '.');
+    document.getElementById('house-kwh').textContent      = fmtKwh(house_kwh_display);
+    document.getElementById('house-pct').textContent      = house_pct != null ? house_pct + '%' : '—';
+    document.getElementById('house-intensity').textContent = d.house_avg_intensity != null ? Math.round(d.house_avg_intensity) : '—';
+    document.getElementById('house-vs-grid').textContent   = d.grid_avg_intensity  != null ? Math.round(d.grid_avg_intensity)  : '—';
+    // House verdict — lower intensity = better (consumed during cleaner periods)
+    if (d.house_avg_intensity != null && d.grid_avg_intensity != null) {
+      var house_diff = d.house_avg_intensity - d.grid_avg_intensity;
+      var house_pct  = Math.abs(Math.round(house_diff / d.grid_avg_intensity * 100));
+      var houseV = document.getElementById('house-verdict');
+      houseV.style.display = '';
+      if (house_pct < 10) {
+        houseV.className = 'insight-verdict neutral';
+        houseV.innerHTML = 'Your house consumption matched the grid average intensity — timing had little effect.';
+      } else if (house_diff < 0) {
+        houseV.className = 'insight-verdict positive';
+        houseV.innerHTML = '✓ Your house loads ran during cleaner-than-average periods — <strong>' + house_pct + '% below</strong> the grid average intensity.';
+      } else {
+        houseV.className = 'insight-verdict negative';
+        houseV.innerHTML = 'Your house loads ran during dirtier-than-average periods — <strong>' + house_pct + '% above</strong> the grid average.';
+      }
+    }
+    if (house_kg != null) {
+      document.getElementById('house-carbon').textContent = house_kg.toFixed(2);
+    } else {
+      document.getElementById('house-carbon-wrap').style.display = 'none';
+    }
+    document.getElementById('house-equiv').innerHTML =
+      house_kg != null ? equivLines(d.house_carbon_g, a, d.period_start, d.period_end, d.data_start) : '';
+  }
+
+  // Battery
+  // Battery — one card per configured battery/inverter (#450).
+  carbonCardsFor('card-battery',
+    Object.entries(d.sub_meters || {}).filter(function(e) {
+      return ['battery','inverter'].includes(e[1].meter_type) && e[1].imp_kwh > 0.1;
+    }),
+    function(bat, $) {
+      var bat_kg  = bat.carbon_g / 1000;
+      var bat_int = bat.avg_charge_intensity != null ? bat.avg_charge_intensity
+                 : (bat.ci_imp_kwh > 0 ? bat.carbon_g / bat.ci_imp_kwh : null);
+      var grid_avg = d.grid_avg_intensity;
+
+      $('card-battery').style.display = 'block';
+      $('bat-headline').textContent = bat_kg.toFixed(2) + ' kgCO₂';
+      $('bat-sub').textContent =
+        'How cleanly your battery charged from the grid this period.';
+      var ci_kwh_bat = bat.ci_imp_kwh || 0;
+      var bat_ac_kwh = ci_kwh_bat > 0 ? ci_kwh_bat : bat.imp_kwh;
+      var bat_dc_kwh = bat_ac_kwh * (a.battery_roundtrip_efficiency || 0.85);
+      $('bat-carbon').textContent   = bat_kg.toFixed(2);
+      $('bat-kwh').textContent      = fmtKwh(bat_ac_kwh);
+      $('bat-dc-kwh').textContent   = fmtKwh(bat_dc_kwh);
+      $('bat-intensity').textContent = bat_int != null ? Math.round(bat_int) : '—';
+      $('bat-vs-grid').textContent  = grid_avg != null ? Math.round(grid_avg) : '—';
+
+      var rte = a.battery_roundtrip_efficiency || 0.85;
+
+      var batLines = [];
+      if (bat_int != null && grid_avg != null) {
+        var bat_diff = bat_int - grid_avg;
+        var bat_pct  = Math.abs(Math.round(bat_diff / grid_avg * 100));
+        if (Math.abs(bat_pct) < 10) {
+          batLines.push('Your battery charged at roughly the grid average intensity this period.');
+        } else if (bat_diff < 0) {
+          batLines.push('✓ Your battery preferentially charged during cleaner grid periods — <strong>' +
+            bat_pct + '% below</strong> the grid average intensity. Good load-shifting behaviour.');
+          // Estimate carbon saving vs charging at grid average
+          // Use ci_imp_kwh (only kWh with CI data) to match the intensity figures
+          var ci_bat_kwh = bat.ci_imp_kwh || 0;
+          var saving_g = (grid_avg - bat_int) * ci_bat_kwh;
+          if (saving_g > 100 && ci_bat_kwh > 0) {
+            var bat_ci_pct = bat.imp_kwh > 0 ? Math.round(ci_bat_kwh / bat.imp_kwh * 100) : 0;
+            batLines.push('Estimated saving vs charging at grid average: <strong>' +
+              (saving_g / 1000).toFixed(2) + ' kgCO₂</strong>' +
+              (bat_ci_pct < 80 ? ' (' + bat_ci_pct + '% carbon coverage — estimate)' : '') + '.');
+          }
+        } else {
+          batLines.push('Your battery charged during dirtier-than-average grid periods — <strong>' +
+            bat_pct + '% above</strong> the grid average. Shifting charging to overnight or high-renewable ' +
+            'windows could reduce this.');
+        }
+      }
+      batLines.push('<em>Note: export may include battery discharge — we cannot split solar vs battery ' +
+        'export without additional metering.</em>');
+      if (bat.carbon_g > 0) {
+        var batEquivStr = equivLines(bat.carbon_g, a, d.period_start, d.period_end, bat.data_start || d.data_start);
+        if (batEquivStr) batLines.push(batEquivStr);
+      }
+      $('bat-equiv').innerHTML = batLines.join('<br>');
+
+    });
+
+  // Heat pump — one card per configured heat pump (#450). Previously .find(),
+  // which returned the FIRST and silently dropped any others.
+  carbonCardsFor('card-hp',
+    Object.entries(d.sub_meters || {}).filter(function(e) {
+      return e[1].meter_type === 'heat_pump' && e[1].imp_kwh > 0.1;
+    }),
+    function(hp, $) {
+      var cop        = a.hp_cop || 3.0;
+      var gas_co2    = a.gas_co2_g_per_kwh || 203.0;
+      var boiler_eff = a.gas_boiler_efficiency || 0.90;
+      var hp_kg      = hp.carbon_g / 1000;
+      var crossover  = Math.round((gas_co2 / boiler_eff) * cop);
+
+      // Heat delivered: use total kWh for display (best available estimate)
+      var heat_kwh_total = hp.imp_kwh * cop;
+
+      // Gas comparison: use ci_imp_kwh only to match the carbon figure
+      var ci_hp_kwh  = hp.ci_imp_kwh || 0;
+      var hp_ci_pct  = hp.imp_kwh > 0 ? Math.round(ci_hp_kwh / hp.imp_kwh * 100) : 0;
+      var heat_kwh_ci = ci_hp_kwh * cop;
+      var gas_kwh_needed = heat_kwh_ci / boiler_eff;
+      var gas_kg     = gas_kwh_needed * gas_co2 / 1000;
+      var saving_kg  = gas_kg - hp_kg;
+      var cleaner_pct = gas_kg > 0 ? Math.round(saving_kg / gas_kg * 100) : null;
+
+      $('card-hp').style.display   = 'block';
+      $('hp-headline').textContent = hp_kg.toFixed(2) + ' kgCO₂';
+      $('hp-sub').textContent       = 'Carbon from heat pump electricity use this period.';
+      var ci_kwh_hp = hp.ci_imp_kwh || 0;
+      $('hp-carbon').textContent    = hp_kg.toFixed(2);
+      $('hp-kwh').textContent       = ci_kwh_hp > 0 ? fmtKwh(ci_kwh_hp) : fmtKwh(hp.imp_kwh);
+      $('hp-heat').textContent      = fmtKwh(ci_kwh_hp > 0 ? ci_kwh_hp * cop : heat_kwh_total);
+      $('hp-vs-gas').textContent    = gas_kg > 0 ? gas_kg.toFixed(2) : '—';
+
+      var hpLines = [];
+      if (hp_ci_pct >= 80 && gas_kg > 0 && cleaner_pct != null) {
+        hpLines.push(
+          saving_kg > 0
+            ? '✓ Your heat pump saved <strong>' + saving_kg.toFixed(1) + ' kgCO₂</strong> vs an equivalent gas boiler — <strong>' + cleaner_pct + '% cleaner</strong>.'
+            : '↑ Your heat pump produced more carbon than an equivalent gas boiler this period.'
+        );
+      } else if (hp.carbon_g > 0) {
+        hpLines.push('<em>Carbon coverage ' + hp_ci_pct + '% — gas comparison needs more data to be reliable.</em>');
+      }
+      hpLines.push('Grid crossover intensity: <strong>' + crossover + ' gCO₂/kWh</strong> — above this, a gas boiler would be cleaner. ' +
+        'The UK grid rarely exceeds 400 gCO₂/kWh, so your heat pump is almost always cleaner than gas.');
+      if (hp.inverter_possible) {
+        hpLines.push('<em>⚠ This heat pump is marked as inverter-capable. Carbon shown assumes ' +
+          'full grid draw — actual carbon may be lower if solar or battery contributed.</em>');
+      }
+      if (hp.carbon_g > 0) {
+        var hpEquivStr = equivLines(hp.carbon_g, a, d.period_start, d.period_end, hp.data_start || d.data_start);
+        if (hpEquivStr) hpLines.push(hpEquivStr);
+      }
+      $('hp-equiv').innerHTML = hpLines.join('<br>');
+
+    });
+
+  // EV
+  // EV — one card per configured EV charger (#450). When there is NO physical EV
+  // meter the synthetic dispatch card below runs instead, on the prototype itself:
+  // it has no meter id to key a clone on, and that path is unchanged.
+  var evCarbonDevs = Object.entries(d.sub_meters || {}).filter(function(e) {
+    return ['ev_charger','ev'].includes(e[1].meter_type) && e[1].imp_kwh > 0.1;
+  });
+  // Called even when the list is empty, so clones from a previous period are
+  // cleared rather than left behind when the user moves to a range with no EV.
+  carbonCardsFor('card-ev', evCarbonDevs, function(ev, $) {
+        var ev_kg  = ev.carbon_g / 1000;
+        var ev_ci_kwh = ev.ci_imp_kwh || 0;
+        var ev_int = ev.avg_charge_intensity != null ? Math.round(ev.avg_charge_intensity)
+                   : (ev_ci_kwh > 0 ? Math.round(ev.carbon_g / ev_ci_kwh) : null);
+        $('card-ev').style.display = 'block';
+        $('ev-headline').textContent = ev_kg.toFixed(2) + ' kgCO₂';
+        $('ev-sub').textContent = 'Carbon attributable to EV charging this period.';
+        var ci_kwh_ev  = ev.ci_imp_kwh || 0;
+        var charge_eff_display = a.ev_charge_efficiency || 0.88;
+        var dc_kwh     = ci_kwh_ev > 0
+          ? ci_kwh_ev * charge_eff_display
+          : ev.imp_kwh * charge_eff_display;
+        $('ev-carbon').textContent    = ev_kg.toFixed(2);
+        $('ev-kwh').textContent       = ci_kwh_ev > 0 ? fmtKwh(ci_kwh_ev) : fmtKwh(ev.imp_kwh);
+        $('ev-dc-kwh').textContent    = fmtKwh(dc_kwh);
+        $('ev-intensity').textContent = ev_int != null ? Math.round(ev_int) : '—';
+        $('ev-vs-grid').textContent   = d.grid_avg_intensity != null ? Math.round(d.grid_avg_intensity) : '—';
+
+        var charge_eff = a.ev_charge_efficiency || 0.88;
+        var evEquiv = $('ev-equiv');
+        var evLines = [];
+        // EV vs grid average intensity
+        if (ev_int != null && d.grid_avg_intensity != null) {
+          var ev_diff = ev_int - d.grid_avg_intensity;
+          var ev_pct  = Math.abs(Math.round(ev_diff / d.grid_avg_intensity * 100));
+          if (ev_pct < 10) {
+            evLines.push('Your EV charging intensity matched the grid average.');
+          } else if (ev_diff < 0) {
+            evLines.push('✓ Charged at <strong>' + ev_pct + '% below</strong> the grid average — good off-peak timing.');
+          } else {
+            evLines.push('Charged at <strong>' + ev_pct + '% above</strong> the grid average — shifting to low-carbon windows could help.');
+          }
+        }
+        // EV mileage and per-mile carbon comparison
+        var effic         = a.ev_efficiency || 3.2;
+        var isKm          = (a.distance_unit === 'km');
+        var distLabel     = isKm ? 'km' : 'miles';
+        var petrol_g_per_dist = isKm
+          ? (a.co2_car_petrol_g_per_mile || 180) / 1.60934
+          : (a.co2_car_petrol_g_per_mile || 180);
+        var charge_eff = a.ev_charge_efficiency || 0.88;
+
+        // Mileage from CI kWh (consistent with carbon data)
+        var ci_kwh   = ev.ci_imp_kwh || 0;
+        var ev_dist_total = ci_kwh * charge_eff * effic;
+
+        // Per-mile carbon uses same ci_kwh as mileage — consistent denominator
+        var ci_pct    = ev.imp_kwh > 0 ? Math.round(ci_kwh / ev.imp_kwh * 100) : 0;
+        var ev_dist_ci = ev_dist_total;  // same calculation
+
+        if (ev_dist_total > 1) {
+          evLines.push('🚗 Estimated <strong>' + Math.round(ev_dist_total).toLocaleString() +
+            ' ' + distLabel + '</strong> this period (' + effic + ' ' + distLabel +
+            '/kWh battery after ' + Math.round(charge_eff * 100) + '% charge efficiency).');
+          if (ci_pct >= 80 && ev_dist_ci > 1 && ev.carbon_g > 0) {
+            var ev_g_per_dist = ev.carbon_g / ev_dist_ci;
+            var cleaner_pct   = Math.round((1 - ev_g_per_dist / petrol_g_per_dist) * 100);
+            evLines.push('Carbon intensity: <strong>' + Math.round(ev_g_per_dist) +
+              ' gCO₂/' + distLabel + '</strong> — ' +
+              (cleaner_pct > 0
+                ? '<strong>' + cleaner_pct + '% cleaner</strong> than petrol (' + Math.round(petrol_g_per_dist) + ' gCO₂/' + distLabel + ')'
+                : Math.abs(cleaner_pct) + '% dirtier than petrol this period'));
+          } else if (ev.carbon_g > 0) {
+            evLines.push('<em>Carbon coverage ' + ci_pct + '% of charging kWh — per-mile carbon ' +
+              'comparison needs more data to be reliable.</em>');
+          }
+        }
+        if (ev.inverter_possible) {
+          evLines.push('<em>⚠ This EV charger is marked as inverter-capable. Carbon shown assumes ' +
+            'full grid draw — actual carbon may be lower if solar or battery contributed.</em>');
+        }
+        if (ev.carbon_g > 0) {
+          var evEquivStr = equivLines(ev.carbon_g, a, d.period_start, d.period_end, ev.data_start || d.data_start);
+          if (evEquivStr) evLines.push(evEquivStr);
+        }
+        evEquiv.innerHTML = evLines.join('<br>');
+
+    });
+  if (!evCarbonDevs.length && d.ev_carbon) {
+    // Δ5b: device-less IOG (no physical charger) — render the EV carbon card from the
+    // SYNTHETIC dispatch figure (single-source). Grid carbon = clipped × intensity; the
+    // behind-meter saving is shown separately below. Mileage/efficiency lines need a device
+    // AC meter, so they are skipped here.
+    var evc0 = d.ev_carbon;
+    var ev_kg0  = (evc0.grid_g || 0) / 1000;
+    var ev_int0 = evc0.clipped_kwh > 0 ? Math.round(evc0.grid_g / evc0.clipped_kwh) : null;
+    var ce0     = a.ev_charge_efficiency || 0.88;
+    document.getElementById('card-ev').style.display = 'block';
+    document.getElementById('ev-headline').textContent = ev_kg0.toFixed(2) + ' kgCO₂';
+    document.getElementById('ev-sub').textContent = 'EV charging carbon (smart-charge dispatch).';
+    document.getElementById('ev-carbon').textContent    = ev_kg0.toFixed(2);
+    document.getElementById('ev-kwh').textContent       = fmtKwh(evc0.clipped_kwh || 0);
+    document.getElementById('ev-dc-kwh').textContent    = fmtKwh((evc0.clipped_kwh || 0) * ce0);
+    document.getElementById('ev-intensity').textContent = ev_int0 != null ? ev_int0 : '—';
+    document.getElementById('ev-vs-grid').textContent   = d.grid_avg_intensity != null ? Math.round(d.grid_avg_intensity) : '—';
+    document.getElementById('ev-equiv').innerHTML = '';
+  }
+
+  // Δ5b: behind-meter avoided (synthetic dispatch) — additive, feature-detected. The credit is
+  // the draw gap (car's full completed-dispatch draw − grid-clipped billing kWh) × grid
+  // intensity: energy the car took from battery/solar that never crossed the grid meter.
+  (function(){
+    var wrap = document.getElementById('ev-saving-wrap');
+    var val  = document.getElementById('ev-saving');
+    if (!wrap || !val) return;
+    if (d.ev_carbon && d.ev_carbon.saving_g != null && d.ev_carbon.saving_g > 0) {
+      val.textContent = (d.ev_carbon.saving_g / 1000).toFixed(2);
+      wrap.style.display = 'block';
+    } else {
+      wrap.style.display = 'none';
+    }
+  })();
+
+  // Render comparison deltas if _cmp provided — must happen before renderTrend
+  try {
+    if (_cmp && _cmp.has_carbon) {
+      renderComparison(d, _cmp);
+    } else {
+      document.querySelectorAll('.ins-delta').forEach(function(el) { el.remove(); });
+      document.getElementById('cmp-panel').style.display = 'none';
+    }
+  } catch(e) {
+  }
+
+  // Mix bar
+  _renderInsightsMix(d, _cmp,
+    _insCompare === 'prev' ? 'last month' :
+    _insCompare === 'year' ? 'same month last year' :
+    _insCompare === 'lastyear' ? 'last year' : null
+  );
+
+  renderTrend();
+}
+function _trendNavTo(idx) {
+  if (idx < 0 || idx >= _periods.length || idx === _periodIdx) return;
+  _periodIdx = idx;
+  loadPeriod();
+}
+
+function renderTrend() {
+  var wrap = document.getElementById('trend-chart');
+  if (!wrap || _periods.length === 0) return;
+
+  var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  var values = _periods.map(function(p) {
+    return p.carbon_g_net != null ? +(p.carbon_g_net / 1000) : null;
+  });
+  var labels = _periods.map(function(p) {
+    var d = new Date(p.period_start + 'T12:00:00Z');
+    return MONTHS[d.getUTCMonth()] + " '" + String(d.getUTCFullYear()).slice(2);
+  });
+
+  var validValues = values.filter(function(v) { return v != null; });
+  if (validValues.length === 0) return;
+
+  var maxAbs = Math.max.apply(null, validValues.map(Math.abs));
+  if (maxAbs === 0) maxAbs = 1;
+
+  var W = Math.max(wrap.clientWidth || 600, 300);
+  var H = 100;
+  var PAD_L = 38, PAD_R = 8, PAD_T = 8, PAD_B = 28;
+  var chartW = W - PAD_L - PAD_R;
+  var chartH = H - PAD_T - PAD_B;
+  var n = values.length;
+  var barW = Math.max(4, Math.floor(chartW / n) - 2);
+  var zeroY = PAD_T + chartH / 2;  // zero line in middle if mixed pos/neg
+
+  // Determine if all values same sign
+  var hasNeg = validValues.some(function(v) { return v < 0; });
+  var hasPos = validValues.some(function(v) { return v > 0; });
+  var baseline, scale;
+  if (!hasNeg) {
+    // All positive — zero at bottom
+    baseline = PAD_T + chartH;
+    scale = chartH / maxAbs;
+  } else if (!hasPos) {
+    // All negative — zero at top
+    baseline = PAD_T;
+    scale = chartH / maxAbs;
+  } else {
+    // Mixed
+    baseline = zeroY;
+    scale = (chartH / 2) / maxAbs;
+  }
+
+  var isDark = document.documentElement.getAttribute('data-theme') !== 'light';
+  var mutedC = isDark ? '#4a5060' : '#999aaa';
+  var textC  = isDark ? '#6b7080' : '#666677';
+
+  var svgParts = ['<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '">'];
+
+  // Zero line
+  svgParts.push('<line x1="' + PAD_L + '" y1="' + baseline + '" x2="' + (W - PAD_R) +
+    '" y2="' + baseline + '" stroke="' + mutedC + '" stroke-width="1"/>');
+
+  // Y axis labels
+  var yLabel = maxAbs >= 10 ? Math.round(maxAbs) : maxAbs.toFixed(1);
+  svgParts.push('<text x="' + (PAD_L - 4) + '" y="' + (PAD_T + 4) +
+    '" text-anchor="end" font-size="9" fill="' + textC + '">' + yLabel + '</text>');
+  svgParts.push('<text x="' + (PAD_L - 4) + '" y="' + (baseline + 4) +
+    '" text-anchor="end" font-size="9" fill="' + textC + '">0</text>');
+
+  // Bars
+  for (var i = 0; i < n; i++) {
+    var v = values[i];
+    var x = PAD_L + Math.round(i * chartW / n) + Math.round((chartW / n - barW) / 2);
+    var isCurrent = (i === _periodIdx);
+
+    if (v == null) {
+      // No data placeholder
+      svgParts.push('<rect x="' + x + '" y="' + (baseline - 2) + '" width="' + barW +
+        '" height="4" rx="2" fill="' + mutedC + '" opacity="0.3"' +
+        (i !== _periodIdx ? ' style="cursor:pointer;" onclick="_trendNavTo(' + i + ')"' : '') + '>');
+      svgParts.push('<title>' + labels[i] + ': no carbon data' +
+        (i !== _periodIdx ? ' — click to view' : '') + '</title></rect>');
+    } else {
+      var barH = Math.max(2, Math.abs(v) * scale);
+      var barY = v >= 0 ? (baseline - barH) : baseline;
+      var col = v < 0
+        ? (isCurrent ? '#1a7a3c' : 'rgba(26,122,60,0.45)')
+        : (isCurrent ? '#c0392b' : 'rgba(192,57,43,0.45)');
+      var clickable = (i !== _periodIdx);
+      svgParts.push('<rect x="' + x + '" y="' + barY + '" width="' + barW +
+        '" height="' + barH + '" rx="2" fill="' + col + '"' +
+        (clickable ? ' style="cursor:pointer;" onclick="_trendNavTo(' + i + ')"' : '') + '>');
+      svgParts.push('<title>' + labels[i] + ': ' + v.toFixed(2) + ' kgCO₂' +
+        (clickable ? ' — click to view' : ' — current view') + '</title>');
+      svgParts.push('</rect>');
+    }
+
+    // X label — show every period if few, else alternate
+    if (n <= 6 || i % 2 === 0 || i === n - 1) {
+      svgParts.push('<text x="' + (x + barW / 2) + '" y="' + (H - 6) +
+        '" text-anchor="middle" font-size="9" fill="' + textC + '">' + labels[i] + '</text>');
+    }
+  }
+
+  svgParts.push('</svg>');
+  wrap.innerHTML = svgParts.join('');
+}
+
+function renderComparison(d, c) {
+  // Remove previous delta badges
+  document.querySelectorAll('.ins-delta').forEach(function(el) { el.remove(); });
+
+  if (!c || !c.has_carbon) {
+    document.getElementById('cmp-panel').style.display = 'none';
+    return;
+  }
+
+  // ── Determine comparison label ────────────────────────────────────────────
+  var cmpLabel = c.period_label || 'previous period';
+
+  // ── Narrative lines ───────────────────────────────────────────────────────
+  var lines = [];
+  var a = d.assumptions || {};
+
+  function pct(val, cmp) {
+    if (!val || !cmp || cmp === 0) return null;
+    return Math.round((val - cmp) / Math.abs(cmp) * 100);
+  }
+  function sign(n) { return n > 0 ? '+' : ''; }
+  function col(n, lowerBetter) {
+    if (Math.abs(n) < 3) return 'var(--muted)';
+    return (lowerBetter ? n < 0 : n > 0) ? '#00d4aa' : '#ff6b6b';
+  }
+  function line(icon, text, positive) {
+    var c = positive === null ? 'var(--muted)' : (positive ? '#00d4aa' : '#ff6b6b');
+    return '<span style="color:' + c + ';">' + icon + '</span> ' + text;
+  }
+
+  // Net carbon — always show this one
+  if (d.carbon_g_net != null && c.carbon_g_net != null) {
+    var netPct = pct(d.carbon_g_net, c.carbon_g_net);
+    var netBetter = d.carbon_g_net < c.carbon_g_net;
+    lines.push(line(
+      netBetter ? '✓' : '↑',
+      'Net carbon <strong>' + (netBetter ? 'down' : 'up') + ' ' + Math.abs(netPct) + '%</strong> vs ' + cmpLabel
+      + ' (' + (d.carbon_g_net/1000).toFixed(1) + ' vs ' + (c.carbon_g_net/1000).toFixed(1) + ' kgCO₂)',
+      netBetter
+    ));
+  }
+
+  // Grid intensity — always show
+  if (d.effective_intensity != null && c.effective_intensity != null) {
+    var intPct = pct(d.effective_intensity, c.effective_intensity);
+    var intBetter = d.effective_intensity < c.effective_intensity;
+    lines.push(line(
+      intBetter ? '✓' : '↑',
+      'Grid was <strong>' + Math.abs(intPct) + '% ' + (intBetter ? 'greener' : 'dirtier') + '</strong> '
+      + '(' + Math.round(d.effective_intensity) + ' vs ' + Math.round(c.effective_intensity) + ' gCO₂/kWh)',
+      intBetter
+    ));
+  }
+
+  // Export / solar — show if either period has export
+  if (d.exp_kwh > 0.1 || c.exp_kwh > 0.1) {
+    var expPct = pct(d.exp_kwh, c.exp_kwh);
+    if (expPct !== null) {
+      lines.push(line(
+        expPct > 0 ? '✓' : '↓',
+        'Solar export <strong>' + sign(expPct) + expPct + '%</strong>'
+        + ' (' + d.exp_kwh.toFixed(0) + ' vs ' + c.exp_kwh.toFixed(0) + ' kWh)',
+        expPct > 0
+      ));
+    }
+  }
+
+  // Sub-meters
+  var evKwh = 0, evCmpKwh = 0, batKwh = 0, batCmpKwh = 0, hpKwh = 0, hpCmpKwh = 0;
+  Object.keys(d.sub_meters || {}).forEach(function(mid) {
+    var sm = d.sub_meters[mid]; var cSm = (c.sub_meters || {})[mid];
+    if (!cSm) return;
+    if (sm.meter_type === 'ev_charger' || sm.meter_type === 'ev') {
+      evKwh += sm.imp_kwh; evCmpKwh += cSm.imp_kwh;
+    } else if (sm.meter_type === 'battery') {
+      batKwh += sm.imp_kwh; batCmpKwh += cSm.imp_kwh;
+    } else if (sm.meter_type === 'heat_pump') {
+      hpKwh += sm.imp_kwh; hpCmpKwh += cSm.imp_kwh;
+    }
+  });
+
+  if (evKwh > 0 || evCmpKwh > 0) {
+    var evPct = pct(evKwh, evCmpKwh);
+    if (evPct !== null) {
+      var eff  = parseFloat(a.ev_efficiency  || 3.2);
+      var chEff = parseFloat(a.ev_charge_eff || 0.88);
+      var miles    = Math.round((evKwh    * chEff) * eff);
+      var cmpMiles = Math.round((evCmpKwh * chEff) * eff);
+      var diff = miles - cmpMiles;
+      lines.push(line(
+        '⚡',
+        'EV charged <strong>' + sign(evPct) + evPct + '%</strong>'
+        + ' — est. ' + miles + ' miles (' + (diff >= 0 ? '+' : '') + diff + ' vs ' + cmpLabel + ')',
+        null
+      ));
+    }
+  }
+
+  if (batKwh > 0 || batCmpKwh > 0) {
+    var batPct = pct(batKwh, batCmpKwh);
+    if (batPct !== null) {
+      lines.push(line(
+        '🔋',
+        'Battery charged <strong>' + sign(batPct) + batPct + '%</strong>'
+        + ' (' + batKwh.toFixed(0) + ' vs ' + batCmpKwh.toFixed(0) + ' kWh)',
+        null
+      ));
+    }
+  }
+
+  if (hpKwh > 0 || hpCmpKwh > 0) {
+    var hpPct = pct(hpKwh, hpCmpKwh);
+    if (hpPct !== null) {
+      lines.push(line(
+        '♨️',
+        'Heat pump <strong>' + sign(hpPct) + hpPct + '%</strong>'
+        + ' (' + hpKwh.toFixed(0) + ' vs ' + hpCmpKwh.toFixed(0) + ' kWh)',
+        null
+      ));
+    }
+  }
+
+  // Direct import
+  if (d.house_imp_kwh != null && c.house_imp_kwh != null) {
+    var hPct = pct(d.house_imp_kwh, c.house_imp_kwh);
+    if (hPct !== null) {
+      lines.push(line(
+        hPct < 0 ? '✓' : '↑',
+        'Direct import <strong>' + sign(hPct) + hPct + '%</strong>'
+        + ' (' + d.house_imp_kwh.toFixed(0) + ' vs ' + c.house_imp_kwh.toFixed(0) + ' kWh)',
+        hPct < 0
+      ));
+    }
+  }
+
+  // ── Render panel ─────────────────────────────────────────────────────────
+  var panel = document.getElementById('cmp-panel');
+  if (lines.length === 0) {
+    panel.style.display = 'none';
+    return;
+  }
+  // House import delta
+  if (d.house_carbon_g != null && c.house_carbon_g != null) {
+    var houseKgDelta  = d.house_carbon_g - c.house_carbon_g;
+    var houseKwhDelta = d.house_imp_kwh  - c.house_imp_kwh;
+    if (Math.abs(houseKgDelta) > 100) {
+      var hKgPct = pct(d.house_carbon_g, c.house_carbon_g);
+      lines.push(line(
+        houseKgDelta < 0 ? '✓' : '↑',
+        'Direct house carbon <strong>' + sign(hKgPct) + hKgPct + '%</strong>'
+        + ' (' + (houseKwhDelta > 0 ? '+' : '') + houseKwhDelta.toFixed(0) + ' kWh, '
+        + (d.house_carbon_g/1000).toFixed(1) + ' vs ' + (c.house_carbon_g/1000).toFixed(1) + ' kgCO₂)',
+        houseKgDelta < 0
+      ));
+    }
+  }
+  // Battery charging delta
+  // Summed across every battery/inverter (#450) — this sentence is about battery
+  // charging as a whole, so with two batteries it previously described one and
+  // ignored the other. Intensity is kWh-weighted; a plain mean of two batteries
+  // charging very different amounts would not mean anything.
+  function _batAgg(src) {
+    var list = Object.values(src || {}).filter(function(s){
+      return ['battery','inverter'].includes(s.meter_type); });
+    if (!list.length) return null;
+    var k = 0, g = 0, iw = 0, ik = 0;
+    list.forEach(function(s) {
+      k += s.imp_kwh || 0; g += s.carbon_g || 0;
+      if (s.avg_charge_intensity != null && s.imp_kwh) {
+        iw += s.avg_charge_intensity * s.imp_kwh; ik += s.imp_kwh;
+      }
+    });
+    return { imp_kwh: k, carbon_g: g,
+             avg_charge_intensity: ik > 0 ? iw / ik : null };
+  }
+  var _batCur = _batAgg(d.sub_meters);
+  var _batCmp = _batAgg(c.sub_meters);
+  if (_batCur && _batCmp && Math.abs((_batCur.carbon_g||0) - (_batCmp.carbon_g||0)) > 100) {
+    var batKgDelta  = ((_batCur.carbon_g||0) - (_batCmp.carbon_g||0)) / 1000;
+    var batKwhDelta = (_batCur.imp_kwh||0) - (_batCmp.imp_kwh||0);
+    var batIntDelta = (_batCur.avg_charge_intensity && _batCmp.avg_charge_intensity)
+                      ? _batCur.avg_charge_intensity - _batCmp.avg_charge_intensity : null;
+    var batMsg = 'Battery charging: ' + (batKwhDelta > 0 ? '+' : '') + batKwhDelta.toFixed(0) + ' kWh';
+    if (batIntDelta !== null && Math.abs(batIntDelta) > 5) {
+      batMsg += ', grid was ' + (batIntDelta < 0 ? 'cleaner' : 'dirtier') +
+                ' (' + Math.round(_batCur.avg_charge_intensity) + ' vs ' +
+                Math.round(_batCmp.avg_charge_intensity) + ' gCO₂/kWh)';
+    }
+    batMsg += ' (' + (batKgDelta > 0 ? '+' : '') + batKgDelta.toFixed(1) + ' kgCO₂).';
+    lines.push(line(batKgDelta < 0 ? '✓' : '↑', batMsg, batKgDelta < 0));
+  }
+  // Add mix change narrative if available
+  var mixNarr = _mixChangeNarrative(d.generation_mix, c.generation_mix);
+  if (mixNarr) lines.push(mixNarr);
+
+  document.getElementById('cmp-panel-title').textContent = 'Compared to ' + cmpLabel;
+  document.getElementById('cmp-panel-lines').innerHTML = lines.map(function(l) {
+    return '<div>' + l + '</div>';
+  }).join('');
+  panel.style.display = '';
+
+  // ── Delta badges (subtle, secondary to narrative) ─────────────────────────
+  // lowerBetter: true/false = coloured, null = always grey (volume — no direction)
+  function addBadge(elId, val, cmpVal, lowerBetter) {
+    var el = document.getElementById(elId);
+    if (!el || val == null || cmpVal == null) return;
+    if (cmpVal === 0 && val === 0) return;
+    if (cmpVal === 0) {
+      // New this period — show as new entry rather than % change
+      el.insertAdjacentHTML('beforeend',
+        '<span class="ins-delta" style="font-size:11px;margin-left:6px;color:#00d4aa;">new</span>');
+      return;
+    }
+    var p = pct(val, cmpVal);
+    if (p === null) return;
+    var c2 = (lowerBetter === null) ? 'var(--muted)' : col(p, lowerBetter);
+    el.insertAdjacentHTML('beforeend',
+      '<span class="ins-delta" style="font-size:11px;margin-left:6px;color:' + c2 + '">'
+      + sign(p) + p + '%</span>');
+  }
+
+  // ── Carbon tab badges ─────────────────────────────────────────────────────
+  addBadge('sum-net-headline',  d.carbon_g_net,          c.carbon_g_net,          true);
+  addBadge('sum-eff-int',       d.effective_intensity,   c.effective_intensity,   true);
+  addBadge('sum-ci-imp-kwh',    d.ci_imp_kwh,            c.ci_imp_kwh,            null);  // volume
+  addBadge('sum-ci-exp-kwh',    d.ci_exp_kwh,            c.ci_exp_kwh,            null);  // volume — Grid Export kWh
+  addBadge('sum-imp',           d.carbon_g_imp,          c.carbon_g_imp,          true);
+  addBadge('sum-exp',           d.carbon_g_exp,          c.carbon_g_exp,          false); // more offset = better
+  addBadge('house-kwh',         d.house_imp_kwh,         c.house_imp_kwh,         null);  // volume
+  addBadge('house-carbon',      d.house_carbon_g,        c.house_carbon_g,        true);
+  addBadge('house-intensity',   d.house_avg_intensity,   c.house_avg_intensity,   true);
+  addBadge('sol-kwh',           d.exp_kwh,               c.exp_kwh,               false);
+  addBadge('sol-offset',        d.carbon_g_exp,          c.carbon_g_exp,          false);
+  if (evKwh)  addBadge('ev-kwh',  evKwh,  evCmpKwh,  null);  // volume
+  if (batKwh) addBadge('bat-kwh', batKwh, batCmpKwh, null);  // volume
+  if (hpKwh)  addBadge('hp-kwh',  hpKwh,  hpCmpKwh,  null);  // volume
+  // Headline carbon badges for sub-device cards
+  // Carbon card deltas — matched PER DEVICE by meter id (#450). These used to
+  // .find() the first device of each type and address the fixed card ids; those
+  // ids now belong to hidden prototypes, so a badge written there would be
+  // invisible. Each clone's ids carry the device suffix.
+  var _cSubs = c.sub_meters || {};
+  Object.keys(d.sub_meters || {}).forEach(function(mid) {
+    var cur = d.sub_meters[mid], cmp = _cSubs[mid];
+    if (!cmp) return;                       // no like-for-like device last period
+    var t = (cur.meter_type || '').toLowerCase();
+    var sfx = '--' + uDeviceElId(mid);
+    if (['ev_charger','ev'].includes(t)) {
+      addBadge('ev-headline'  + sfx, cur.carbon_g,             cmp.carbon_g,             true);
+      addBadge('ev-intensity' + sfx, cur.avg_charge_intensity, cmp.avg_charge_intensity, true);
+    } else if (['battery','inverter'].includes(t)) {
+      addBadge('bat-headline'  + sfx, cur.carbon_g,             cmp.carbon_g,             true);
+      addBadge('bat-intensity' + sfx, cur.avg_charge_intensity, cmp.avg_charge_intensity, true);
+    } else if (t === 'heat_pump') {
+      addBadge('hp-headline' + sfx, cur.carbon_g, cmp.carbon_g, true);
+    }
+  });
+  // Grid average intensity — the baseline everything is measured against
+  addBadge('sum-grid-int', d.grid_avg_intensity, c.grid_avg_intensity, true);
+}
+
+// ── Period nav ───────────────────────────────────────────────────────────────
+function insSetMode(mode, el) {
+  _insMode    = mode;
+  _insCompare = null;
+  _insCompareManuallyCleared = false;
+  document.querySelectorAll('#ins-mode-seg .bar-seg-btn').forEach(function(b) {
+    b.classList.toggle('active', b === el);
+  });
+  document.querySelectorAll('#ins-compare-seg .bar-seg-btn, #ins-compare-year-seg .bar-seg-btn').forEach(function(b) {
+    b.classList.remove('active');
+  });
+  document.getElementById('ins-compare-seg').style.display      = mode === 'month' ? '' : 'none';
+  document.getElementById('ins-compare-year-seg').style.display = mode === 'year'  ? '' : 'none';
+  document.getElementById('ins-cmp-sep').style.display          = '';
+  _insSaveState();
+  updatePeriodNav();
+  loadPeriod();
+}
+
+var _insCompareManuallyCleared = false;
+
+function insSetCompare(cmp, el) {
+  _insCompare = (_insCompare === cmp) ? null : cmp;  // toggle
+  _insCompareManuallyCleared = (_insCompare === null);  // track manual clear
+  document.querySelectorAll('#ins-compare-seg .bar-seg-btn, #ins-compare-year-seg .bar-seg-btn').forEach(function(b) {
+    b.classList.remove('active');
+  });
+  if (_insCompare) el.classList.add('active');
+  loadPeriod();
+}
+
+function navPeriod(dir) {
+  _insSaveState();
+  if (_insMode === 'month') {
+    _calMonth += dir;
+    if (_calMonth > 12) { _calMonth = 1;  _calYear++; }
+    if (_calMonth < 1)  { _calMonth = 12; _calYear--; }
+  } else {
+    _calYear += dir;
+  }
+  updatePeriodNav();
+  loadPeriod();
+}
+
+// ── Rolodex period scrubber (wheel + drag on the period label) ────────────────
+// Unlike the Charts page, each period change here triggers a network fetch, so
+// we update the label text LIVE as you scrub and DEBOUNCE the fetch until the
+// gesture settles. The label element is static (not rebuilt per render), so the
+// listeners are attached once. Steps are clamped to the available data range,
+// which on the Usage tab is the full energy range (see insBounds()).
+var _insScrubTimer = null;
+function insStep(delta) {
+  if (!delta) return;
+  var now = new Date();
+  var b = insBounds();
+  var earliest = b.earliest ? new Date(b.earliest) : null;
+  if (_insMode === 'month') {
+    var y = _calYear, m = _calMonth + delta;
+    while (m > 12) { m -= 12; y++; }
+    while (m < 1)  { m += 12; y--; }
+    var maxY = now.getFullYear(), maxM = now.getMonth() + 1;   // current month is the newest viewable
+    if (y > maxY || (y === maxY && m > maxM)) { y = maxY; m = maxM; }
+    if (earliest) {
+      var eY = earliest.getFullYear(), eM = earliest.getMonth() + 1;
+      if (y < eY || (y === eY && m < eM)) { y = eY; m = eM; }
+    }
+    if (y === _calYear && m === _calMonth) return;
+    _calYear = y; _calMonth = m;
+  } else {
+    var yy = _calYear + delta;
+    if (yy > now.getFullYear()) yy = now.getFullYear();
+    if (earliest && yy < earliest.getFullYear()) yy = earliest.getFullYear();
+    if (yy === _calYear) return;
+    _calYear = yy;
+  }
+  // Live label preview
+  document.getElementById('ins-period-label').textContent = (_insMode === 'month')
+    ? new Date(_calYear, _calMonth - 1, 1).toLocaleString('default', {month: 'long', year: 'numeric'})
+    : String(_calYear);
+  // Debounce the expensive fetch until scrubbing stops
+  clearTimeout(_insScrubTimer);
+  _insScrubTimer = setTimeout(function() {
+    _insSaveState(); updatePeriodNav(); loadPeriod();
+  }, 260);
+}
+
+var _insWheelAcc = 0, _insWheelLast = 0, _insRolodexAttached = false;
+var INS_WHEEL_THRESHOLD = 50, INS_WHEEL_MAX = 6, INS_DRAG_STEP = 44;
+function insGetPeriods() {
+  var list = [], curIdx = -1;
+  var b = insBounds();
+  var earliest = b.earliest ? new Date(b.earliest) : null;
+  var now = new Date();
+  if (_insMode === 'month') {
+    var loIdx = (earliest ? earliest.getFullYear() : now.getFullYear()) * 12 + (earliest ? earliest.getMonth() : 0);
+    var hiIdx = now.getFullYear() * 12 + now.getMonth();          // current month is newest
+    var curAbs = _calYear * 12 + (_calMonth - 1);
+    for (var mi = loIdx; mi <= hiIdx; mi++) {
+      if (mi === curAbs) curIdx = list.length;
+      var yy = Math.floor(mi / 12), mm0 = mi % 12;
+      list.push({ label: new Date(yy, mm0, 1).toLocaleString('default', { month: 'long', year: 'numeric' }), value: { y: yy, m: mm0 + 1 } });
+    }
+  } else {
+    var eY = earliest ? earliest.getFullYear() : now.getFullYear();
+    for (var y = eY; y <= now.getFullYear(); y++) {
+      if (y === _calYear) curIdx = list.length;
+      list.push({ label: String(y), value: { y: y } });
+    }
+  }
+  if (curIdx < 0) curIdx = list.length - 1;
+  list.reverse(); curIdx = list.length - 1 - curIdx;              // newest first (top of the wheel)
+  return { list: list, curIdx: curIdx };
+}
+function insSelectPeriod(v) {
+  if (_insMode === 'month') { _calYear = v.y; _calMonth = v.m; }
+  else { _calYear = v.y; }
+  _insSaveState(); updatePeriodNav(); loadPeriod();
+}
+function insAttachRolodex() {
+  if (_insRolodexAttached) return;
+  var lbl = document.getElementById('ins-period-label');
+  if (!lbl) return;
+  _insRolodexAttached = true;
+  PeriodSpinner.attach(lbl, { getPeriods: insGetPeriods, onSelect: insSelectPeriod });
+}
+
+function updatePeriodNav() {
+  var now      = new Date();
+  var _bounds  = insBounds();  // carbon range on the Carbon tab, full energy range on Usage
+  var earliest = _bounds.earliest ? new Date(_bounds.earliest) : null;
+  var label, atFuture, atPast;
+
+  if (_insMode === 'month') {
+    var d = new Date(_calYear, _calMonth - 1, 1);
+    label    = d.toLocaleString('default', {month: 'long', year: 'numeric'});
+    atFuture = (_calYear > now.getFullYear() || (_calYear === now.getFullYear() && _calMonth >= now.getMonth() + 1));
+    atPast   = earliest ? (d <= new Date(earliest.getFullYear(), earliest.getMonth(), 1)) : false;
+
+    // Gate compare buttons
+    var earliestYear  = earliest ? earliest.getFullYear() : 9999;
+    var earliestMonth = earliest ? earliest.getMonth() : 11;  // 0-based
+    // Compare at month granularity — if we have ANY data in the target month, allow it
+    var prevMonthYear  = _calMonth === 1 ? _calYear - 1 : _calYear;
+    var prevMonthMonth = _calMonth === 1 ? 11 : _calMonth - 2;  // 0-based
+    var lastYearMonth  = _calMonth - 1;  // 0-based, same month
+    var hasPrevMonth = (prevMonthYear > earliestYear) || (prevMonthYear === earliestYear && prevMonthMonth >= earliestMonth);
+    var hasLastYear  = (_calYear - 1 > earliestYear) || (_calYear - 1 === earliestYear && lastYearMonth >= earliestMonth);
+    document.querySelector('#ins-compare-seg .bar-seg-btn:nth-child(1)').disabled = !hasPrevMonth;
+    document.querySelector('#ins-compare-seg .bar-seg-btn:nth-child(2)').disabled = !hasLastYear;
+    if (_insCompare === 'prev' && !hasPrevMonth) { _insCompare = null; }
+    if (_insCompare === 'year' && !hasLastYear)  { _insCompare = null; }
+    // Auto-default to prev month comparison when nothing is active and it's available
+    if (_insCompare === null && hasPrevMonth && !_insCompareManuallyCleared) {
+      _insCompare = 'prev';
+    }
+    // Re-sync active state
+    document.querySelectorAll('#ins-compare-seg .bar-seg-btn').forEach(function(b) {
+      b.classList.remove('active');
+    });
+    if (_insCompare === 'prev') document.querySelector('#ins-compare-seg .bar-seg-btn:nth-child(1)').classList.add('active');
+    if (_insCompare === 'year') document.querySelector('#ins-compare-seg .bar-seg-btn:nth-child(2)').classList.add('active');
+
+  } else {
+    label    = String(_calYear);
+    atFuture = _calYear >= now.getFullYear();
+    atPast   = earliest ? _calYear <= earliest.getFullYear() : false;
+
+    var hasLastYear = earliest ? (_calYear - 1) >= earliest.getFullYear() : false;
+    document.querySelector('#ins-compare-year-seg .bar-seg-btn').disabled = !hasLastYear;
+    if (_insCompare === 'lastyear' && !hasLastYear) { _insCompare = null; }
+    // Auto-default to last year comparison when nothing is active and it's available
+    if (_insCompare === null && hasLastYear && !_insCompareManuallyCleared) {
+      _insCompare = 'lastyear';
+    }
+    document.querySelector('#ins-compare-year-seg .bar-seg-btn').classList.toggle('active', _insCompare === 'lastyear');
+  }
+
+  document.getElementById('ins-period-label').textContent = label;
+  document.getElementById('btn-next').disabled = atFuture;
+  document.getElementById('btn-prev').disabled = atPast;
+}
+
+async function loadPeriod() {
+  document.getElementById('insights-body').style.display = 'none';
+  document.getElementById('no-carbon').style.display     = 'none';
+  document.getElementById('tab-usage').style.display     = 'none';
+  document.getElementById('insights-loading').style.display = 'block';
+  document.getElementById('insights-loading').textContent = 'Loading…';
+
+  // Capture compare mode BEFORE updatePeriodNav runs (which may reset _insCompare)
+  var compareMode = _insCompare;
+  updatePeriodNav();
+
+  try {
+    var url, cmpUrl;
+    var isUsage = (_activeInsightTab === 'usage');
+    var apiBase = isUsage ? '/api/usage' : '/api/insights';
+
+    if (_insMode === 'month') {
+      url = apiUrl(apiBase + '/calendar-month?year=' + _calYear + '&month=' + _calMonth);
+      if (compareMode === 'prev') {
+        var pm = _calMonth - 1, py = _calYear;
+        if (pm < 1) { pm = 12; py--; }
+        cmpUrl = apiUrl(apiBase + '/calendar-month?year=' + py + '&month=' + pm);
+      } else if (compareMode === 'year') {
+        cmpUrl = apiUrl(apiBase + '/calendar-month?year=' + (_calYear - 1) + '&month=' + _calMonth);
+      }
+    } else {
+      url = apiUrl(apiBase + '/calendar-year?year=' + _calYear);
+      if (compareMode === 'lastyear') {
+        cmpUrl = apiUrl(apiBase + '/calendar-year?year=' + (_calYear - 1));
+      }
+    }
+
+    var r = await fetch(url);
+    var d = await r.json();
+    if (d.error) throw new Error(d.error);
+
+    var cmpData = null;
+    if (cmpUrl) {
+      var cr = await fetch(cmpUrl);
+      cmpData = await cr.json();
+      if (cmpData.error) cmpData = null;
+    }
+
+    document.getElementById('insights-loading').style.display = 'none';
+    if (isUsage) {
+      renderUsage(d, cmpData);
+    } else {
+      renderInsights(d, cmpData);
+    }
+  } catch(e) {
+    document.getElementById('insights-loading').textContent = 'Failed to load insights: ' + e.message;
+  }
+}
+
+// ── Postcode ─────────────────────────────────────────────────────────────────
+async function savePostcode() {
+  var val = (document.getElementById('postcode-input').value || '').trim().toUpperCase();
+  var errEl = document.getElementById('postcode-error');
+  errEl.style.display = 'none';
+  if (!val) return;
+  try {
+    var r   = await fetch(apiUrl('/api/config'));
+    var cfg = await r.json();
+    for (var mid in (cfg.meters || {})) {
+      if (!((cfg.meters[mid].meta) || {}).sub_meter) {
+        cfg.meters[mid].meta = cfg.meters[mid].meta || {};
+        cfg.meters[mid].meta.postcode_prefix = val;
+        break;
+      }
+    }
+    var sr = await fetch(apiUrl('/api/config'), {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(cfg)
+    });
+    var sd = await sr.json();
+    if (sd.ok) {
+      document.getElementById('no-postcode').style.display = 'none';
+      document.getElementById('no-carbon').style.display   = 'block';
+    } else {
+      errEl.textContent = sd.error || 'Save failed';
+      errEl.style.display = 'block';
+    }
+  } catch(e) {
+    errEl.textContent = 'Save failed: ' + e.message;
+    errEl.style.display = 'block';
+  }
+}
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+async function initInsights() {
+  try {
+    // Check postcode first
+    var cr  = await fetch(apiUrl('/api/config'));
+    var cfg = await cr.json();
+    var hasPostcode = false;
+    for (var mid in (cfg.meters || {})) {
+      if (((cfg.meters[mid].meta) || {}).postcode_prefix) { hasPostcode = true; break; }
+    }
+
+    document.getElementById('insights-loading').style.display = 'none';
+    document.getElementById('tab-carbon').style.display       = 'block';
+
+    if (!hasPostcode) {
+      document.getElementById('no-postcode').style.display = 'block';
+      return;
+    }
+
+    document.getElementById('period-nav').style.display      = 'flex';
+    document.getElementById('ins-compare-seg').style.display = '';
+    document.getElementById('ins-cmp-sep').style.display     = '';
+
+    // Fetch data bounds to gate navigation and compare buttons
+    var br = await fetch(apiUrl('/api/insights/data-bounds'));
+    var bd = await br.json();
+    if (!bd.error) {
+      if (bd.earliest)       _dataBounds  = { earliest: bd.earliest,       latest: bd.latest };
+      if (bd.usage_earliest) _usageBounds = { earliest: bd.usage_earliest, latest: bd.usage_latest };
+    }
+
+    // Fetch billing periods for trend chart
+    var pr = await fetch(apiUrl('/api/insights/periods'));
+    var pd = await pr.json();
+    if (!pd.error) {
+      _periods = (pd.periods || []).filter(function(p) { return p.has_carbon; });
+    }
+
+    // Restore last position
+    try {
+      var _saved = JSON.parse(localStorage.getItem('emt_insights_state') || '{}');
+      if (_saved.mode   && ['bill','month','year'].indexOf(_saved.mode) !== -1) _insMode = _saved.mode;
+      if (_saved.year   && _saved.year > 2000)  _calYear  = _saved.year;
+      if (_saved.month  && _saved.month >= 1 && _saved.month <= 12) _calMonth = _saved.month;
+      if (_saved.compare) {
+        _insCompare = _saved.compare;
+      } else if (_saved.hasOwnProperty('compare')) {
+        // compare was explicitly saved as null — respect it, suppress auto-default
+        _insCompareManuallyCleared = true;
+      }
+      if (_saved.tab    && ['carbon','usage'].indexOf(_saved.tab) !== -1) {
+        _activeInsightTab = _saved.tab;
+        var tabBtn = document.querySelector('.insights-tab[data-tab="' + _saved.tab + '"]');
+        if (tabBtn) {
+          document.querySelectorAll('.insights-tab').forEach(function(b) { b.classList.remove('active'); });
+          tabBtn.classList.add('active');
+        }
+        document.getElementById('tab-carbon').style.display = _saved.tab === 'carbon' ? 'block' : 'none';
+        document.getElementById('tab-usage').style.display  = _saved.tab === 'usage'  ? 'block' : 'none';
+      }
+      // Restore compare button state
+      if (_saved.compare) {
+        document.querySelectorAll('.bar-seg-btn').forEach(function(b) {
+          if (b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'" + _saved.compare + "'") !== -1) {
+            b.classList.add('active');
+          }
+        });
+      }
+    } catch(e) {}
+
+    updatePeriodNav();
+    insAttachRolodex();
+    loadPeriod();
+
+  } catch(e) {
+    document.getElementById('insights-loading').textContent = 'Failed to load: ' + e.message;
+  }
+}
+
+
+// ── Usage Insights Renderer ──────────────────────────────────────────────────
+function fmtCost(v, decimals) {
+  if (v == null) return '—';
+  return Math.abs(v).toFixed(decimals != null ? decimals : 2);
+}
+function fmtRate(v) {
+  if (v == null) return '—';
+  return (v * 100).toFixed(2);  // convert £/kWh to p/kWh
+}
+function fmtHour(h) {
+  var pad = function(n) { return n < 10 ? '0' + n : '' + n; };
+  return pad(h) + ':00–' + pad((h + 2) % 24) + ':00';
+}
+
+function renderUsageTierBars(tiers, totalKwh, containerId, currency) {
+  var el = document.getElementById(containerId);
+  if (!el || !tiers || !tiers.length) return;
+  // Sort cheapest first
+  var sorted = tiers.slice().sort(function(a,b) { return a.rate - b.rate; });
+  var html = '';
+  sorted.forEach(function(t, i) {
+    var pct     = totalKwh > 0 ? (t.kwh / totalKwh * 100) : 0;
+    var pctDisp = pct < 1 ? pct.toFixed(1) : Math.round(pct);
+    var rateP   = (t.rate * 100).toFixed(2);
+    // Collapsed (Agile) rows carry a "(avg of N rates)" note, matching Billing.
+    var rateLbl = rateP + 'p/kWh' + (t.collapsed
+      ? ' <span style="opacity:0.6;">(avg of ' + t.n_rates + ' rates)</span>' : '');
+    var cur     = currency || '£';
+    // A plunge-price period nets a CREDIT (negative cost) — show it in parens like
+    // the Billing summary rather than a bare minus sign.
+    var costStr = t.cost < 0 ? '(' + cur + Math.abs(t.cost).toFixed(2) + ')'
+                             : cur + t.cost.toFixed(2);
+    // Bar width: minimum 2px so even 0% tiers show a sliver
+    var barW    = Math.max(pct, 0.3);
+    // Colour: cheapest = accent, others step through muted palette
+    var colours = ['var(--accent)', 'var(--warning, #f59e0b)', 'var(--danger, #ef4444)', 'var(--muted)'];
+    var col     = colours[Math.min(i, colours.length - 1)];
+    html +=
+      '<div style="margin-bottom:14px;">' +
+        '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;">' +
+          '<span style="font-family:var(--mono);font-size:13px;color:var(--text);">' + rateLbl + '</span>' +
+          '<span style="font-size:12px;color:var(--muted);">' +
+            t.kwh.toFixed(1) + ' kWh &nbsp;·&nbsp; ' +
+            costStr + ' &nbsp;·&nbsp; ' +
+            '<strong style="color:var(--text);">' + pctDisp + '%</strong>' +
+          '</span>' +
+        '</div>' +
+        '<div style="height:5px;background:var(--bg);border-radius:3px;overflow:visible;">' +
+          '<div style="height:100%;width:' + barW + '%;min-width:3px;background:' + col + ';border-radius:3px;transition:width 0.4s;"></div>' +
+        '</div>' +
+      '</div>';
+  });
+  el.innerHTML = html;
+}
+
+// ── Per-device CARBON cards (#450) ──────────────────────────────────────────
+// The carbon cards are rich, bespoke markup (metrics, narrative, footnotes with
+// template links), so rather than rebuild them in JS the static card is kept as a
+// PROTOTYPE and cloned once per device, with every id in the subtree suffixed.
+// Each block's own arithmetic is untouched — it just addresses its card through
+// the scoped lookup `$` instead of document.getElementById.
+//
+// Carbon deliberately keeps its own model (grid-intensity attribution and the
+// offsetting comparisons); this changes only WHICH devices get a card.
+function carbonCardsFor(protoId, devices, fill) {
+  var proto = document.getElementById(protoId);
+  if (!proto) return;
+  var host = proto.parentNode;
+  // Drop clones from a previous render before rebuilding.
+  var stale = host.querySelectorAll('[data-clone-of="' + protoId + '"]');
+  for (var i = stale.length - 1; i >= 0; i--) { host.removeChild(stale[i]); }
+  proto.style.display = 'none';          // the prototype itself never shows
+  (devices || []).forEach(function(entry) {
+    var mid = entry[0], dev = entry[1];
+    var sfx  = uDeviceElId(mid);
+    var node = proto.cloneNode(true);
+    node.id = protoId + '--' + sfx;
+    node.setAttribute('data-clone-of', protoId);
+    var kids = node.querySelectorAll('[id]');
+    for (var k = 0; k < kids.length; k++) { kids[k].id = kids[k].id + '--' + sfx; }
+    node.style.display = 'block';
+    host.insertBefore(node, proto);
+    var title = node.querySelector('.insight-card-title');
+    if (title) { title.textContent = title.textContent + ' — ' + (dev.label || mid); }
+    fill(dev, function (base) { return document.getElementById(base + '--' + sfx); }, mid, sfx);
+  });
+}
+
+// ── Per-device usage cards (#450) ───────────────────────────────────────────
+// The usage device cards are built one per meter id. These two helpers supply
+// the per-TYPE presentation (icon, wording) and a DOM-safe id, so the card
+// markup stays in one place rather than repeated per type as it was before.
+function escHtml(v) {
+  return String(v == null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// A meter id is user-supplied and can contain anything; an element id cannot.
+// Prefix-free ids could also collide ('a.b' and 'a-b' both → 'a-b'), so the
+// original is appended as a hex suffix to keep them distinct.
+function uDeviceElId(mid) {
+  var safe = String(mid).replace(/[^A-Za-z0-9_-]/g, '-');
+  var h = 0;
+  for (var i = 0; i < String(mid).length; i++) {
+    h = ((h << 5) - h + String(mid).charCodeAt(i)) | 0;
+  }
+  return safe + '-' + (h >>> 0).toString(16);
+}
+
+function uDeviceMeta(sm) {
+  var t = ((sm && sm.meter_type) || '').toLowerCase();
+  if (t === 'battery' || t === 'inverter') {
+    return { icon: '🔋', title: 'Battery', order: 1,
+             sub: 'Grid energy used to charge the battery this period.',
+             kwhLabel: 'Charged from Grid', costLabel: 'Charging Cost' };
+  }
+  if (t === 'ev' || t === 'ev_charger') {
+    return { icon: '🚗', title: 'EV Charger', order: 2,
+             sub: 'Grid energy delivered to your vehicle this period.',
+             kwhLabel: 'Charged from Grid', costLabel: 'Charging Cost' };
+  }
+  if (t === 'heat_pump') {
+    return { icon: '♨️', title: 'Heat Pump', order: 3,
+             sub: 'Grid energy consumed by your heat pump this period.',
+             kwhLabel: 'Electricity Used', costLabel: 'Running Cost' };
+  }
+  // An unrecognised meter_type used to render NOTHING — the three cards covered
+  // three types and anything else fell through. It now gets a generic card.
+  return { icon: '🔌', title: 'Device', order: 4,
+           sub: 'Grid energy used by this device this period.',
+           kwhLabel: 'Electricity Used', costLabel: 'Running Cost' };
+}
+
+function renderSubDeviceRates(tiers, totalKwh, containerId, currency) {
+  var el = document.getElementById(containerId);
+  if (!el || !tiers || !tiers.length) { if(el) el.style.display='none'; return; }
+  var lines = tiers.map(function(t) {
+    var pct = totalKwh > 0 ? Math.round(t.kwh / totalKwh * 100) : 0;
+    var lbl = (t.rate * 100).toFixed(2) + 'p/kWh' + (t.collapsed ? ' (avg of ' + t.n_rates + ' rates)' : '');
+    return lbl + ': ' + t.kwh.toFixed(1) + ' kWh (' + pct + '%)';
+  });
+  el.textContent = 'Rate breakdown: ' + lines.join(' · ');
+  el.style.display = '';
+}
+
+function generateUsageNarrative(cur, prev, cmpLabel) {
+  // Returns {headline, bullets[]} explaining what drove the cost difference
+  var deltas = [];
+  var currency = '£';
+
+  var costDelta = cur.net_cost - prev.net_cost;  // positive = worse
+
+  function fmtCostAbs(v) { return currency + Math.abs(v).toFixed(2); }
+
+  // ── Import cost ───────────────────────────────────────────────────────────
+  var impDelta = cur.imp_cost - prev.imp_cost;
+  if (Math.abs(impDelta) > 0.50) {
+    var kwhDelta   = cur.imp_kwh - prev.imp_kwh;
+    var rateChanged = cur.weighted_rate && prev.weighted_rate &&
+                      Math.abs(cur.weighted_rate - prev.weighted_rate) > 0.002;
+    var kwhMoved    = Math.abs(kwhDelta) >= 10;
+    var kwhSign     = kwhDelta > 0 ? '+' : '';
+    var msg;
+
+    if (rateChanged && !kwhMoved) {
+      // Rate changed, volume similar
+      var rateDir = cur.weighted_rate < prev.weighted_rate ? 'cheaper' : 'more expensive';
+      msg = 'Your average import rate was approximately ' +
+            Math.abs(fmtRate(cur.weighted_rate) - fmtRate(prev.weighted_rate)).toFixed(0) +
+            'p/kWh ' + rateDir + ' on average' +
+            (impDelta > 0 ? ', increasing' : ', reducing') + ' import cost by ' +
+            fmtCostAbs(impDelta) + '.';
+    } else if (rateChanged && kwhMoved && Math.sign(kwhDelta) !== Math.sign(impDelta)) {
+      // Volume up but cost down (or vice versa) — rate change dominant
+      var rateDir2 = cur.weighted_rate < prev.weighted_rate ? 'cheaper' : 'more expensive';
+      msg = 'Grid import ' + (kwhDelta > 0 ? 'increased' : 'decreased') + ' by ' +
+            Math.abs(kwhDelta).toFixed(0) + ' kWh' +
+            ' but rates were approximately ' +
+            Math.abs(fmtRate(cur.weighted_rate) - fmtRate(prev.weighted_rate)).toFixed(0) +
+            'p/kWh ' + rateDir2 + ' on average' +
+            ', so import cost ' + (impDelta < 0 ? 'fell' : 'rose') +
+            ' by ' + fmtCostAbs(impDelta) + '.';
+    } else if (rateChanged && kwhMoved) {
+      // Both moved in same direction
+      var rateDir3 = cur.weighted_rate < prev.weighted_rate ? 'cheaper' : 'more expensive';
+      msg = 'Grid import ' + (kwhDelta > 0 ? 'increased' : 'decreased') + ' by ' +
+            Math.abs(kwhDelta).toFixed(0) + ' kWh, with rates approximately ' +
+            Math.abs(fmtRate(cur.weighted_rate) - fmtRate(prev.weighted_rate)).toFixed(0) +
+            'p/kWh ' + rateDir3 + ' on average, ' +
+            (impDelta > 0 ? 'adding ' : 'saving ') + fmtCostAbs(impDelta) + '.';
+    } else {
+      // Volume drove cost, rate stable
+      msg = 'Grid import ' + (kwhDelta > 0 ? 'increased' : 'decreased') + ' by ' +
+            Math.abs(kwhDelta).toFixed(0) + ' kWh, ' +
+            (impDelta > 0 ? 'adding ' : 'saving ') + fmtCostAbs(impDelta) + ' in import cost.';
+    }
+    deltas.push({ magnitude: Math.abs(impDelta), text: msg });
+  }
+
+  // ── Export earnings ───────────────────────────────────────────────────────
+  var expDelta    = cur.exp_cost - prev.exp_cost;  // positive = earned more
+  var expKwhDelta = cur.exp_kwh  - prev.exp_kwh;
+  if (Math.abs(expDelta) > 0.50) {
+    deltas.push({
+      magnitude: Math.abs(expDelta),
+      text: 'Export earnings ' + (expDelta > 0 ? 'increased' : 'decreased') + ' by ' +
+            fmtCostAbs(expDelta) +
+            ' (' + (expKwhDelta > 0 ? '+' : '') + expKwhDelta.toFixed(0) + ' kWh exported)' +
+            (expDelta < 0 && expKwhDelta < 0 ? ' — likely less solar generation.' : '.')
+    });
+  }
+
+  // ── Standing charge ───────────────────────────────────────────────────────
+  var scDelta = cur.standing_charge - prev.standing_charge;
+  if (Math.abs(scDelta) > 0.20) {
+    var daysDiff = Math.abs((cur.total_days || 0) - (prev.total_days || 0));
+    deltas.push({
+      magnitude: Math.abs(scDelta),
+      text: 'Standing charge ' + (scDelta > 0 ? 'increased' : 'decreased') + ' by ' +
+            fmtCostAbs(scDelta) +
+            (daysDiff > 1
+              ? ' (' + (cur.total_days || '?') + ' days vs ' + (prev.total_days || '?') + ' days).'
+              : '.')
+    });
+  }
+
+  // ── Sub-meter devices ────────────────────────────────────────────────────
+  var curSubs  = cur.sub_meters  || {};
+  var prevSubs = prev.sub_meters || {};
+  var allMids  = Object.keys(curSubs).concat(
+    Object.keys(prevSubs).filter(function(m){ return !curSubs[m]; })
+  );
+  allMids.forEach(function(mid) {
+    var cs = curSubs[mid]  || { imp_kwh: 0, imp_cost: 0, label: mid, meter_type: '', rate_tiers: [] };
+    var ps = prevSubs[mid] || { imp_kwh: 0, imp_cost: 0, label: mid, meter_type: '', rate_tiers: [] };
+    var subCostDelta = (cs.imp_cost || 0) - (ps.imp_cost || 0);
+    var subKwhDelta  = (cs.imp_kwh  || 0) - (ps.imp_kwh  || 0);
+    if (Math.abs(subCostDelta) < 0.50 && Math.abs(subKwhDelta) < 10) return;
+    var label    = cs.label || ps.label || mid;
+    var type     = (cs.meter_type || ps.meter_type || '').toLowerCase();
+    var typeHint = type === 'ev' || type === 'ev_charger' ? ' — EV charging' :
+                   type === 'battery' || type === 'inverter' ? ' — battery charging' :
+                   type === 'heat_pump' ? ' — heat pump' : '';
+    var kwhSign  = subKwhDelta > 0 ? '+' : '';
+
+    // Detect rate change by comparing effective avg rate (cost/kwh) — this is a weighted
+    // average across tiers, so we express it as "approx Xp/kWh cheaper/more expensive"
+    // rather than implying a specific rate changed.
+    var curRate  = cs.imp_kwh  > 0.1 ? cs.imp_cost  / cs.imp_kwh  : null;
+    var prevRate = ps.imp_kwh  > 0.1 ? ps.imp_cost  / ps.imp_kwh  : null;
+    var devRateDiff = (curRate && prevRate) ? curRate - prevRate : null;  // negative = cheaper
+    var devRateChanged = devRateDiff !== null && Math.abs(devRateDiff) > 0.002;
+    var kwhMoved = Math.abs(subKwhDelta) >= 5;
+    var subMsg;
+
+    // Rate description: "approximately Xp/kWh cheaper/more expensive on average"
+    function fmtRateDiff(diff) {
+      var dir = diff < 0 ? 'cheaper' : 'more expensive';
+      return 'approximately ' + Math.abs(diff * 100).toFixed(0) + 'p/kWh ' + dir + ' on average';
+    }
+
+    var costDiverged = kwhMoved && Math.sign(subKwhDelta) !== Math.sign(subCostDelta);
+    if (!kwhMoved && Math.abs(subCostDelta) >= 0.50) {
+      // Cost changed without significant volume change — rate driven
+      subMsg = label + typeHint + ' cost ' + (subCostDelta > 0 ? 'increased' : 'decreased') +
+               ' by ' + fmtCostAbs(subCostDelta) + ' despite similar usage' +
+               (devRateChanged ? ' (' + fmtRateDiff(devRateDiff) + ').' : '.');
+    } else if (costDiverged || (devRateChanged && kwhMoved)) {
+      // Volume moved with a rate change — always state cost outcome regardless of size
+      var ratePart = devRateChanged
+                     ? ' (' + fmtRateDiff(devRateDiff) + ')'
+                     : ' (rate changed between periods)';
+      subMsg = label + typeHint + ' used ' + kwhSign + subKwhDelta.toFixed(0) + ' kWh' +
+               ' but cost ' + (subCostDelta > 0 ? fmtCostAbs(subCostDelta) + ' more' :
+                                                   fmtCostAbs(subCostDelta) + ' less') +
+               ratePart + '.';
+    } else {
+      subMsg = label + typeHint + ' used ' + kwhSign + subKwhDelta.toFixed(0) + ' kWh, ' +
+               (subCostDelta > 0 ? 'adding ' : 'saving ') + fmtCostAbs(subCostDelta) + '.';
+    }
+    deltas.push({ magnitude: Math.abs(subCostDelta) || Math.abs(subKwhDelta * 0.1), text: subMsg });
+  });
+
+  // ── House direct import ──────────────────────────────────────────────────
+  // Must be after curSubs/prevSubs are defined above
+  var houseKwhDelta = (cur.house_imp_kwh || 0) - (prev.house_imp_kwh || 0);
+  if (Math.abs(houseKwhDelta) >= 10) {
+    // Estimate house cost delta: total imp_cost minus sub-meter costs
+    var curHouseCost  = (cur.imp_cost  || 0) - Object.values(curSubs).reduce(function(s,m){ return s+(m.imp_cost||0); }, 0);
+    var prevHouseCost = (prev.imp_cost || 0) - Object.values(prevSubs).reduce(function(s,m){ return s+(m.imp_cost||0); }, 0);
+    var houseCostDelta = curHouseCost - prevHouseCost;
+    var houseText = 'Direct house import ' + (houseKwhDelta > 0 ? 'increased' : 'decreased') +
+                    ' by ' + Math.abs(houseKwhDelta).toFixed(0) + ' kWh';
+    if (Math.abs(houseCostDelta) >= 0.50) {
+      houseText += ', ' + (houseCostDelta > 0 ? 'adding ' : 'saving ') + currency + Math.abs(houseCostDelta).toFixed(2) + '.';
+    } else {
+      houseText += ' — similar overall cost.';
+    }
+    deltas.push({
+      magnitude: Math.abs(houseKwhDelta) * 0.05,  // weight below cost items
+      text: houseText
+    });
+  }
+
+  // ── Headline ─────────────────────────────────────────────────────────────
+  var headline;
+  var absDelta = Math.abs(costDelta);
+  if (absDelta < 0.50) {
+    headline = 'Cost was similar to ' + cmpLabel + '.';
+  } else if (costDelta > 0) {
+    headline = currency + absDelta.toFixed(2) + ' more than ' + cmpLabel + '.';
+  } else {
+    headline = currency + absDelta.toFixed(2) + ' less than ' + cmpLabel + '.';
+  }
+
+  // Sort by magnitude, take top 5 — covers export, import, battery, EV, house
+  deltas.sort(function(a, b) { return b.magnitude - a.magnitude; });
+  return { headline: headline, bullets: deltas.slice(0, 5).map(function(d){ return d.text; }) };
+}
+
+function renderUsage(d, cmpData) {
+  document.getElementById('tab-usage').style.display = 'block';
+  // Clear device cards first — they are rebuilt per meter id below (#450)
+  var _dw = document.getElementById('ucard-devices');
+  if (_dw) _dw.innerHTML = '';
+  ['ucard-narrative'].forEach(function(id) {
+    var _e = document.getElementById(id);
+    if (_e) _e.style.display = 'none';
+  });
+
+  var currency = '£';  // default — could be passed from config if needed
+
+  // ── Cost & Earnings ───────────────────────────────────────────────────────
+  var netPositive = d.net_cost >= 0;
+  var netAbs = Math.abs(d.net_cost);
+  document.getElementById('u-net-headline').textContent =
+    (netPositive ? '' : '−') + currency + netAbs.toFixed(2);
+  document.getElementById('u-net-headline').style.color =
+    netPositive ? 'var(--text)' : 'var(--success)';
+  document.getElementById('u-net-sub').textContent =
+    (netPositive
+      ? 'Net cost this period — import + standing charge minus export earnings.'
+      : 'Net earnings this period — you exported more than you spent on import.');
+
+  ['u-currency-imp','u-currency-exp','u-currency-sc'].forEach(function(id) {
+    document.getElementById(id).textContent = currency;
+  });
+  document.getElementById('u-imp-cost').textContent = fmtCost(d.imp_cost);
+  document.getElementById('u-exp-cost').textContent = fmtCost(d.exp_cost);
+  document.getElementById('u-standing').textContent = fmtCost(d.standing_charge);
+  document.getElementById('u-avg-rate').textContent = fmtRate(d.weighted_rate);
+
+  if (d.total_days > 0 && d.standing_charge > 0) {
+    var scNote = document.getElementById('u-sc-note');
+    scNote.textContent = 'Standing charge: ' + currency +
+      (d.standing_charge / d.total_days).toFixed(4) + '/day × ' + d.total_days + ' days.';
+    scNote.style.display = '';
+  }
+
+  // ── Rate Period Usage ────────────────────────────────────────────────────
+  var rateTiers = d.rate_tiers || [];
+  // Show for >1 rate, OR a single COLLAPSED row (Agile folded to an avg-of-N) — but
+  // hide for a genuine single flat rate, where a lone 100% bar says nothing.
+  if (rateTiers.length > 1 || (rateTiers.length === 1 && rateTiers[0].collapsed)) {
+    document.getElementById('ucard-rates').style.display = 'block';
+    renderUsageTierBars(rateTiers, d.imp_kwh, 'u-rate-bars', currency);
+  } else {
+    document.getElementById('ucard-rates').style.display = 'none';
+  }
+
+  // ── Grid Position ─────────────────────────────────────────────────────────
+  var netKwh = d.net_grid_kwh;
+  var netExp = netKwh < 0;
+  document.getElementById('u-net-grid-headline').textContent =
+    (netExp ? '−' : '+') + Math.abs(netKwh).toFixed(1) + ' kWh';
+  document.getElementById('u-net-grid-headline').style.color =
+    netExp ? 'var(--success)' : 'var(--text)';
+  document.getElementById('u-net-grid-sub').textContent =
+    netExp
+      ? 'Net exporter this period — you exported more than you imported from the grid.'
+      : 'Net importer this period — grid import exceeded export.';
+  document.getElementById('u-imp-kwh').textContent   = (d.imp_kwh || 0).toFixed(1);
+  document.getElementById('u-exp-kwh').textContent   = (d.exp_kwh || 0).toFixed(1);
+  document.getElementById('u-house-kwh').textContent = (d.house_imp_kwh || 0).toFixed(1);
+  var expDays = d.net_exporter_days || 0;
+  document.getElementById('u-exporter-days').textContent      = expDays;
+  document.getElementById('u-exporter-days-unit').textContent = expDays === 1 ? 'day' : 'days';
+
+  // ── Peak Demand Window ────────────────────────────────────────────────────
+  if (d.peak_window_start != null) {
+    document.getElementById('u-peak-headline').textContent = fmtHour(d.peak_window_start);
+    document.getElementById('u-peak-sub').textContent =
+      'Highest house grid draw: ' + (d.peak_window_kwh || 0).toFixed(1) +
+      ' kWh in the ' + fmtHour(d.peak_window_start) + ' window.';
+    // Dynamic footnote — only mention device types that are configured
+    var subTypes = Object.values(d.sub_meters || {}).map(function(s) { return (s.meter_type||'').toLowerCase(); });
+    var excl = [];
+    if (subTypes.some(function(t){ return t==='ev'||t==='ev_charger'; }))    excl.push('EV charging');
+    if (subTypes.some(function(t){ return t==='battery'||t==='inverter'; })) excl.push('battery charging');
+    if (subTypes.some(function(t){ return t==='heat_pump'; }))               excl.push('heat pump');
+    var fnEl = document.getElementById('u-peak-footnote');
+    if (fnEl) {
+      fnEl.textContent = (excl.length
+        ? excl.join(' and ') + ' excluded — '
+        : '') + 'based on half-hour block totals converted to local time.';
+    }
+  }
+
+  // ── Sub-meter device cards — ONE PER METER ID (#450) ──────────────────────
+  // The server keys sub_meters by meter id and sends every configured device.
+  // These cards used to be three fixed blocks keyed by TYPE, so a second heat
+  // pump overwrote the first and only one appeared. Build a card per id instead.
+  // The synthetic EV arrives here as an ordinary entry (derived: true), so a
+  // no-EV-device account gets its card for free.
+  var subs = d.sub_meters || {};
+  var devWrap = document.getElementById('ucard-devices');
+  if (devWrap) {
+    devWrap.innerHTML = '';
+    Object.keys(subs).sort(function(a, b) {
+      var oa = uDeviceMeta(subs[a]).order, ob = uDeviceMeta(subs[b]).order;
+      return oa !== ob ? oa - ob
+           : String(subs[a].label || a).localeCompare(String(subs[b].label || b));
+    }).forEach(function(mid) {
+      var sm   = subs[mid];
+      var info = uDeviceMeta(sm);
+      var eid  = uDeviceElId(mid);
+      var card = document.createElement('div');
+      card.className = 'insight-card';
+      card.id = 'ucard-dev-' + eid;
+      card.innerHTML =
+        '<div class="insight-card-title">' + info.icon + ' ' + escHtml(info.title) +
+          ' — <span>' + escHtml(sm.label || mid) + '</span></div>' +
+        '<div class="insight-sub">' + escHtml(info.sub) + '</div>' +
+        '<div class="insight-grid">' +
+          '<div class="insight-metric">' +
+            '<div class="insight-metric-label">' + escHtml(info.kwhLabel) + '</div>' +
+            '<span class="insight-metric-value" id="u-dev-' + eid + '-kwh">—</span>' +
+            '<span class="insight-metric-unit">kWh</span>' +
+          '</div>' +
+          '<div class="insight-metric">' +
+            '<div class="insight-metric-label">' + escHtml(info.costLabel) + '</div>' +
+            '<span class="insight-metric-value" id="u-dev-' + eid + '-cost">—</span>' +
+            '<span class="insight-metric-unit">' + escHtml(currency) + '</span>' +
+          '</div>' +
+        '</div>' +
+        '<div id="u-dev-' + eid + '-rates" class="insight-equiv" style="display:none;"></div>';
+      devWrap.appendChild(card);
+      document.getElementById('u-dev-' + eid + '-kwh').textContent  = (sm.imp_kwh || 0).toFixed(1);
+      document.getElementById('u-dev-' + eid + '-cost').textContent = fmtCost(sm.imp_cost);
+      renderSubDeviceRates(sm.rate_tiers, sm.imp_kwh, 'u-dev-' + eid + '-rates', currency);
+    });
+  }
+
+  // ── Delta badges on Usage metric values ─────────────────────────────────
+  // lowerBetter: true/false = coloured, null = grey (volume — no direction judgement)
+  function uBadge(elId, val, cmpVal, lowerBetter) {
+    var el = document.getElementById(elId);
+    if (!el || val == null || cmpVal == null) return;
+    if (cmpVal === 0 && val === 0) return;
+    if (cmpVal === 0) {
+      // New this period — show as new entry rather than % change
+      el.insertAdjacentHTML('beforeend',
+        '<span class="ins-delta" style="font-size:11px;margin-left:6px;color:#00d4aa;">new</span>');
+      return;
+    }
+    var existing = el.nextElementSibling;
+    if (existing && existing.classList.contains('ins-delta')) existing.remove();
+    var p = Math.round((val - cmpVal) / Math.abs(cmpVal) * 100);
+    var c2;
+    if (lowerBetter === null) {
+      c2 = 'var(--muted)';
+    } else {
+      c2 = (Math.abs(p) < 3) ? 'var(--muted)'
+         : ((lowerBetter ? p < 0 : p > 0) ? '#00d4aa' : '#ff6b6b');
+    }
+    el.insertAdjacentHTML('beforeend',
+      '<span class="ins-delta" style="font-size:11px;margin-left:6px;color:' + c2 + '">'
+      + (p > 0 ? '+' : '') + p + '%</span>');
+  }
+
+  if (cmpData && !cmpData.error) {
+    var cmpSubs = cmpData.sub_meters || {};
+    // Cost & Earnings — cost is directional, standing charge is fixed so neutral
+    uBadge('u-net-headline', d.net_cost,        cmpData.net_cost,        true);
+    uBadge('u-imp-cost',     d.imp_cost,        cmpData.imp_cost,        true);
+    uBadge('u-exp-cost',     d.exp_cost,        cmpData.exp_cost,        false);
+    uBadge('u-standing',     d.standing_charge, cmpData.standing_charge, null);
+    // Grid position — all volume
+    uBadge('u-imp-kwh',      d.imp_kwh,         cmpData.imp_kwh,         null);
+    uBadge('u-exp-kwh',      d.exp_kwh,         cmpData.exp_kwh,         null);
+    uBadge('u-house-kwh',    d.house_imp_kwh,   cmpData.house_imp_kwh,   null);
+    // Device cards — kWh neutral, cost directional
+    Object.keys(subs).forEach(function(mid) {
+      var sm  = subs[mid];
+      var cmp = cmpSubs[mid];
+      if (!cmp) return;                      // no like-for-like device last period
+      var eid = uDeviceElId(mid);
+      uBadge('u-dev-' + eid + '-kwh',  sm.imp_kwh,  cmp.imp_kwh,  null);
+      uBadge('u-dev-' + eid + '-cost', sm.imp_cost, cmp.imp_cost, true);
+    });
+  }
+
+  // ── Narrative comparison ──────────────────────────────────────────────────
+  if (cmpData && !cmpData.error) {
+    // Use actual period name (e.g. "March 2026") for consistency with Carbon tab
+    var cmpLabel = cmpData.period_label ||
+                   (_insCompare === 'prev' ? 'last month' :
+                    _insCompare === 'year' ? 'same month last year' :
+                    _insCompare === 'lastyear' ? 'last year' : 'previous period');
+    var narrative = generateUsageNarrative(d, cmpData, cmpLabel);
+    document.getElementById('u-narrative-title').textContent = 'Compared to ' + cmpLabel;
+    document.getElementById('u-narrative-headline').textContent = narrative.headline;
+    var bulletsHtml = narrative.bullets.map(function(b) {
+      return '<div style="display:flex;gap:8px;margin-bottom:6px;">' +
+             '<span style="color:var(--accent);flex-shrink:0;">→</span>' +
+             '<span style="color:var(--muted);font-size:13px;">' + b + '</span>' +
+             '</div>';
+    }).join('');
+    document.getElementById('u-narrative-bullets').innerHTML = bulletsHtml;
+    document.getElementById('ucard-narrative').style.display = 'block';
+  }
+}
+
+function insExportPdf() {
+  var label   = document.getElementById('ins-period-label');
+  var tab     = _activeInsightTab === 'usage' ? 'Usage Insights' : 'Carbon Insights';
+  var period  = label ? label.textContent.trim() : '';
+  var genDate = new Date().toLocaleDateString([], {year:'numeric', month:'long', day:'numeric'});
+
+  // Collect visible content for the report
+  function elHtml(id) {
+    var el = document.getElementById(id);
+    if (!el || el.style.display === 'none') return '';
+    return el.outerHTML;
+  }
+
+  var reportHtml = '';
+
+  if (_activeInsightTab === 'usage') {
+    // Usage: cmp-panel contains carbon bullets — do NOT include it here.
+    // The usage comparison narrative is inside ucard-narrative instead.
+    // Each usage card checked individually — elHtml skips hidden ones.
+    ['ucard-narrative','ucard-cost','ucard-rates','ucard-grid',
+     'ucard-peak'].forEach(function(id) {
+      reportHtml += elHtml(id);
+    });
+    // Device cards are built per meter id, so enumerate them rather than
+    // naming a fixed three (#450).
+    var _dwE = document.getElementById('ucard-devices');
+    if (_dwE) Array.prototype.forEach.call(_dwE.children, function(c) {
+      reportHtml += elHtml(c.id);
+    });
+  } else {
+    // Carbon: insights-body contains cmp-panel — capture whole body once
+    var bodyEl = document.getElementById('insights-body');
+    if (bodyEl) reportHtml = bodyEl.outerHTML;
+  }
+
+  var win = window.open('', '_blank');
+  if (!win) { alert('Please allow pop-ups for this page to export PDF.'); return; }
+
+  win.document.write('<!DOCTYPE html><html><head>' +
+    '<meta charset="UTF-8">' +
+    '<title>EMT ' + _EMT_VERSION + ' — ' + tab + ' — ' + period + '</title>' +
+    '<style>' +
+    '  body{font-family:-apple-system,sans-serif;margin:0;padding:24px;color:#111;background:#fff;max-width:1000px;}' +
+    '  .report-header{display:flex;align-items:center;gap:14px;border-bottom:2px solid #00a080;padding-bottom:12px;margin-bottom:20px;}' +
+    '  .report-header img{width:44px;height:44px;object-fit:contain;}' +
+    '  .report-header h1{margin:0;font-size:18px;color:#00a080;}' +
+    '  .report-header .sub{font-size:12px;color:#555;margin-top:3px;}' +
+    '  .report-date{margin-left:auto;font-size:11px;color:#888;text-align:right;}' +
+    '  .report-version{font-size:10px;color:#aaa;}' +
+    '  :root{--accent:#00d4aa;--text:#111;--muted:#555;--surface:#fff;--bg:#f5f5f5;--border:#ddd;--radius:8px;--mono:ui-monospace,monospace;--sans:-apple-system,sans-serif;}' +
+    '  .insight-card{border:1px solid #ddd;border-radius:8px;padding:16px;margin-bottom:16px;break-inside:avoid;}' +
+    '  .insight-card-title{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#555;margin-bottom:10px;}' +
+    '  .insight-headline{font-size:20px;font-weight:700;color:#111;font-family:ui-monospace,monospace;margin-bottom:2px;display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;}' +
+    '  .insight-sub{font-size:12px;color:#555;margin-bottom:8px;}' +
+    '  .insight-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin:10px 0;}' +
+    '  .insight-metric{background:#f9f9f9;border:1px solid #eee;border-radius:6px;padding:8px 10px;}' +
+    '  .insight-metric-label{font-size:10px;color:#777;text-transform:uppercase;letter-spacing:.04em;margin-bottom:3px;}' +
+    '  .insight-metric-value{font-size:15px;font-weight:700;color:#111;font-family:ui-monospace,monospace;}' +
+    '  .insight-metric-unit{font-size:10px;color:#777;margin-top:2px;}' +
+    '  .ins-delta{font-size:10px;margin-left:4px;}' +
+    '  .insight-equiv{font-size:11px;color:#555;margin:6px 0;}' +
+    '  .insight-footnote{font-size:10px;color:#aaa;margin-top:10px;}' +
+    '  .insight-note,.insight-tip{font-size:11px;color:#555;background:#f5f5f5;padding:7px 10px;border-radius:5px;margin:6px 0;}' +
+    '  #period-nav,.ins-nav-btn,.ins-toolbar,.no-print,#trend-wrap,#trend-chart,canvas{display:none!important;}' +
+    '  #cmp-panel{border:1px solid #ddd;border-radius:8px;padding:14px;margin-bottom:14px;}' +
+    '  .ucard{border:1px solid #ddd;border-radius:8px;padding:14px;margin-bottom:12px;break-inside:avoid;}' +
+    '  .ucard-title{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#555;margin-bottom:8px;}' +
+    '  .ucard-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:6px;margin:8px 0;}' +
+    '  .ucard-metric{background:#f9f9f9;border:1px solid #eee;border-radius:5px;padding:7px 9px;}' +
+    '  .ucard-metric-label{font-size:10px;color:#777;margin-bottom:3px;}' +
+    '  .ucard-metric-value{font-size:13px;font-weight:700;color:#111;font-family:ui-monospace,monospace;}' +
+    '  .rate-bar-wrap,.rate-bar-row{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:11px;}' +
+    '  .rate-bar{height:8px;border-radius:4px;background:#00d4aa;}' +
+    '  @media print{@page{margin:12mm;size:A4;}body{padding:0;}}' +
+    '</style>' +
+    '</head><body>' +
+    '<div class="report-header">' +
+    '  <img src="' + BASE_PATH + '/static/icon.png">' +
+    '  <div><h1>Energy Meter Tracker</h1>' +
+    '    <div class="sub">' + tab + ' — ' + period + '</div>' +
+    '  </div>' +
+    '  <div class="report-date">Generated ' + genDate + '<br>' +
+    '    <span class="report-version">EMT v' + _EMT_VERSION + '</span>' +
+    '  </div>' +
+    '</div>' +
+    reportHtml +
+    '</body></html>');
+  win.document.close();
+}
+
+initInsights();
+
+// Redraw trend chart on container resize (e.g. browser zoom)
+(function() {
+  var trendWrap = document.getElementById('trend-chart');
+  if (!trendWrap || typeof ResizeObserver === 'undefined') return;
+  var _trendResizeTimer = null;
+  new ResizeObserver(function() {
+    // Debounce — only redraw after resize settles
+    clearTimeout(_trendResizeTimer);
+    _trendResizeTimer = setTimeout(function() {
+      if (typeof renderTrend === 'function') renderTrend();
+    }, 150);
+  }).observe(trendWrap);
+})();
+</script>
+{% endblock %}

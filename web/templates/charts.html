@@ -1,0 +1,3087 @@
+{% extends "base.html" %}
+
+{% block head %}
+<style>
+  .chart-tabs {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 0;
+  }
+  /* When chart-tabs is in topbar, reduce padding to fit */
+  .topbar .chart-tabs {
+    margin-bottom: 0;
+  }
+
+  /* Mobile topbar collapse */
+  #topbar-toggle {
+    display: none;
+  }
+  @media (max-width: 768px), (max-height: 500px) and (orientation: landscape) {
+    #topbar-toggle {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      width: 100%;
+      padding: 4px 12px;
+      background: var(--surface);
+      border: none;
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 11px;
+      cursor: pointer;
+      font-family: var(--sans);
+      margin-top: -1px;
+    }
+    #topbar-toggle .toggle-chevron {
+      font-size: 9px;
+      transition: transform 0.2s;
+    }
+    .topbar-collapsed .topbar {
+      display: none;
+    }
+    .topbar-collapsed #topbar-toggle .toggle-chevron {
+      transform: rotate(180deg);
+    }
+  }
+
+  @media (max-width: 768px), (max-height: 500px) and (orientation: landscape) {
+    /* Hide subtitle — saves vertical space */
+    .topbar .sub { display: none; }
+    /* Compact topbar */
+    .topbar { padding: 8px 12px; gap: 6px; flex-wrap: nowrap; align-items: center; }
+    /* Icon-only tab buttons — small and square */
+    .chart-tabs { gap: 4px; }
+    .topbar .chart-tab { padding: 6px 8px; font-size: 20px; min-width: 44px; justify-content: center; }
+    .topbar .chart-tab .tab-label { display: none; }
+    /* Regenerate — icon only */
+    .topbar .btn-regen-text { display: none; }
+    .topbar .btn-secondary { padding: 6px 10px; min-width: 36px; }
+    /* Compact floating toolbar — single row */
+    .bar-toolbar {
+      padding: 5px 8px;
+      gap: 4px;
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      position: sticky;
+      top: 0; /* .content has padding:0 on charts page */
+      z-index: 9;
+    }
+    .bar-toolbar-left { gap: 3px; flex-wrap: nowrap; }
+    .bar-toolbar-right { flex-shrink: 0; }
+    .bar-seg { flex-shrink: 0; }
+    .bar-seg-btn { padding: 3px 7px; font-size: 11px; }
+    /* Standing charge label shorter on mobile */
+    #bar-standing-wrap span { display: none; }
+    #bar-standing-wrap::after { content: "SC"; font-size: 11px; color: var(--muted); }
+  }
+
+  .chart-tab {
+    padding: 8px 20px;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: var(--sans);
+    transition: all 0.15s;
+  }
+  .chart-tab:hover { background: rgba(255,255,255,0.05); color: var(--text); }
+  .chart-tab.active { background: rgba(0,212,170,0.1); color: var(--accent); border-color: var(--accent); }
+  .dcc-settle-note { display:inline-flex; align-items:center; gap:5px; margin-left:10px; padding:5px 10px; border-radius:14px; font-size:12px; font-weight:600; background:rgba(130,140,150,0.14); color:var(--muted); border:1px solid rgba(130,140,150,0.30); white-space:nowrap; cursor:default; }
+  .dcc-settle-note.amber { background:rgba(230,160,30,0.14); color:#e0a020; border-color:rgba(230,160,30,0.35); }
+  @media (max-width:768px){ .dcc-settle-note { margin-left:6px; padding:4px 8px; font-size:11px; } }
+
+  /* Usage Stats floating toolbar — matches billing chart period-nav style */
+  /* position:sticky works because .content is the scroll container */
+  .bar-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    background: var(--surface);
+    padding: 8px 12px;
+    border-radius: 0 0 8px 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+    position: sticky;
+    top: 0; /* .content has padding:0 on charts page */
+    z-index: 9;
+  }
+  .bar-toolbar-left {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .bar-toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  /* Bar chart controls */
+  .bar-seg {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .bar-seg-btn {
+    background: transparent;
+    border: none;
+    border-right: 1px solid var(--border);
+    padding: 5px 13px;
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+    font-family: var(--sans);
+  }
+  .bar-seg-btn:last-child { border-right: none; }
+  .bar-seg-btn.active { background: rgba(0,212,170,0.1); color: var(--accent); }
+  .bar-seg-btn:hover:not(.active) { background: rgba(255,255,255,0.05); color: var(--text); }
+  .bar-nav-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 4px 10px;
+    font-size: 13px;
+    color: var(--muted);
+    cursor: pointer;
+    font-family: var(--sans);
+  }
+  .bar-nav-btn:hover { background: rgba(255,255,255,0.05); color: var(--text); }
+  .bar-period-label {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text);
+    min-width: 110px;
+    text-align: center;
+  }
+  .bar-year-btn {
+    font-size: 12px;
+    padding: 3px 10px;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    font-family: var(--sans);
+  }
+  .bar-legend-dot { width:10px; height:10px; border-radius:2px; display:inline-block; margin-right:4px; }
+  #bar-table-wrap { min-height: 0; }
+  #bar-table thead th { position: sticky; top: 0; background: var(--surface); z-index: 1; }
+  #bar-table thead tr.totals-row td { position: sticky; top: 33px; background: var(--surface); z-index: 1; font-weight: 600; color: var(--text); border-top: 1px solid var(--border); border-bottom: 2px solid var(--border); }
+  @media (max-width: 768px) {
+    #chart-bar { height: auto !important; overflow: visible !important; }
+    #bar-table-wrap { flex: none !important; overflow-y: visible !important; }
+    #bar-chart-wrap { height: 240px !important; }
+  }
+  #bar-table th, #bar-table td {
+    padding: 6px 10px;
+    text-align: right;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  #bar-table th:first-child, #bar-table td:first-child { text-align: left; }
+  #bar-table th {
+    font-size: 11px;
+    color: var(--muted);
+    font-weight: 500;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+    position: sticky;
+    top: 0;
+    vertical-align: middle;
+    white-space: nowrap;
+  }
+  #bar-table th .bar-legend-dot { vertical-align: middle; display: inline-block; position: relative; top: -1px; }
+  #bar-table td { color: var(--muted); }
+  #bar-table td.col-total {
+    font-weight: 500;
+    color: var(--text);
+    border-left: 2px solid var(--border);
+  }
+  #bar-table th.col-total {
+    border-left: 2px solid var(--border);
+  }
+  #bar-table tbody tr:nth-child(even) td { background: var(--bg); }
+  #bar-table tbody tr:nth-child(odd) td { background: var(--surface); }
+  #bar-table tr:hover td { background: rgba(127,127,127,0.1) !important; }
+
+  .chart-frame-wrap {
+    background: white;
+    border-radius: var(--radius);
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+  /* Iframe-based charts (billing, heatmap) fill the full content height */
+  #chart-daily, #chart-heatmap {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+  }
+  #chart-daily .chart-content-wrap,
+  #chart-heatmap .chart-content-wrap {
+    flex: 1;
+    min-height: 0;
+  }
+  /* Content area flex column so iframe charts can fill remaining height */
+  .content {
+    display: flex;
+    flex-direction: column;
+    padding: 0; /* charts fill edge-to-edge — no surrounding padding */
+  }
+  #chart-bar {
+    background: var(--surface);
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    overflow: visible; /* override chart-frame-wrap overflow:hidden — allows content to scroll in .content */
+  }
+  .chart-frame-wrap iframe {
+    width: 100%;
+    height: 100%;  /* fill the content-wrap which is sized by getChartHeight() */
+    border: none;
+    display: block;
+  }
+  .chart-content-wrap {
+    height: 100%;
+  }
+  .chart-placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 300px;
+    color: var(--muted);
+    font-size: 14px;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .chart-placeholder .icon { font-size: 40px; }
+</style>
+{% endblock %}
+
+{% block topbar %}
+<div class="topbar">
+  <div>
+    <h2>Charts</h2>
+    <div class="sub">Billing, net energy heatmap and usage stats</div>
+  </div>
+  <div class="chart-tabs" style="margin-bottom:0;">
+    <button class="chart-tab active" data-chart="daily"   onclick="showChart('daily', this)" title="Billing">📊<span class="tab-label"> Billing</span></button>
+    <button class="chart-tab"        data-chart="heatmap" onclick="showChart('heatmap', this)" title="Heatmaps">🔥<span class="tab-label"> Heatmaps</span></button>
+    <button class="chart-tab"        data-chart="spiral"  onclick="showChart('spiral', this)" title="Spiral">🌀<span class="tab-label"> Spiral</span></button>
+    <button class="chart-tab"        data-chart="bar"     onclick="showChart('bar', this)" title="Usage Stats">📈<span class="tab-label"> Usage Stats</span></button>
+  </div>
+  <span id="dcc-settle-note" class="dcc-settle-note" style="display:none;"></span>
+  <button class="btn btn-secondary" onclick="chartsPdfExport()" title="Export current view as PDF" id="charts-pdf-btn">⬇ PDF</button>
+</div>
+{% endblock %}
+
+{% block content %}
+<button id="topbar-toggle" onclick="toggleTopbar()" aria-label="Toggle chart controls">
+  <span class="toggle-chevron">▼</span>
+  <span id="topbar-toggle-label">Usage Stats</span>
+  <span class="toggle-chevron">▼</span>
+</button>
+
+<div id="alert-error" class="alert alert-danger" style="margin: 8px 16px 0;"></div>
+
+{% if block_count == 0 %}
+<div style="background:rgba(180,83,9,0.1);border:1px solid rgba(180,83,9,0.4);border-radius:var(--radius);padding:16px 20px;margin:16px 16px 0;display:flex;align-items:center;gap:14px;">
+  <span style="font-size:24px;">⚠️</span>
+  <div>
+    <div style="font-weight:600;margin-bottom:4px;">No data blocks loaded</div>
+    <div style="font-size:13px;color:var(--muted);">No blocks recorded yet. If you have existing data, use the <a href="{{ url_for('data_management_page') }}" style="color:var(--accent);">Data Management page</a> to load it. Otherwise data will appear after the first block boundary.</div>
+  </div>
+</div>
+{% endif %}
+
+
+
+<!-- Daily usage chart -->
+<div id="chart-daily" class="chart-frame-wrap">
+  {% if daily_exists %}
+    <div id="chart-daily-content" class="chart-content-wrap" style="width:100%;overflow:auto;">
+      <div style="padding:40px;text-align:center;color:var(--muted);">Loading chart...</div>
+    </div>
+  {% else %}
+    <div class="chart-placeholder">
+      <span class="icon">📊</span>
+      <span>No chart data yet — charts generate after the first block finalises.</span>
+    </div>
+  {% endif %}
+</div>
+
+<!-- Heatmap chart -->
+<div id="chart-heatmap" class="chart-frame-wrap" style="display:none;">
+  {% if heatmap_exists %}
+    <div id="chart-heatmap-content" class="chart-content-wrap" style="width:100%;overflow:auto;">
+      <div style="padding:40px;text-align:center;color:var(--muted);">Loading chart...</div>
+    </div>
+  {% else %}
+    <div class="chart-placeholder">
+      <span class="icon">🔥</span>
+      <span>No heatmap data yet.</span>
+    </div>
+  {% endif %}
+</div>
+
+<!-- Cumulative spiral chart -->
+<div id="chart-spiral" class="chart-frame-wrap" style="display:none;">
+  <style>
+    #chart-spiral{background:var(--surface)}
+    #chart-spiral .sp-board{display:grid;grid-template-columns:1fr 260px;gap:18px;padding:16px}
+    @media (max-width:820px){
+      /* Single-column: charts on top, options below. Let the panel grow and the
+         page scroll to the options (was clipped by chart-frame-wrap overflow). */
+      #chart-spiral{overflow:visible; height:auto;}
+      #chart-spiral .sp-board{grid-template-columns:1fr}
+      #chart-spiral .sp-chart{min-height:300px}
+      #chart-spiral .sp-side{max-width:none}
+    }
+    /* Cost / Usage / Carbon / Standing as equal-size tiles. On desktop cap at 3
+       columns so the 4th (Standing) wraps to its own row and each chart stays big;
+       narrower screens fall back to responsive wrapping. */
+    #chart-spiral .sp-charts{display:flex;flex-direction:column;gap:14px}
+    #chart-spiral .sp-main{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+    @media (min-width:1100px){ #chart-spiral .sp-main{grid-template-columns:repeat(3,1fr)} }
+    #chart-spiral .sp-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)}
+    #chart-spiral .sp-chart{padding:8px 8px 6px;position:relative;display:flex;flex-direction:column;align-items:center}
+    #chart-spiral .sp-chart svg{max-width:100%}
+    #chart-spiral .sp-ctitle{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);align-self:flex-start;margin:0 0 2px 2px}
+    /* Expand affordance + modal (mirrors the Overview expandable-card pattern). */
+    #chart-spiral .sp-expand{position:absolute;top:8px;right:8px;width:22px;height:22px;border:none;background:none;cursor:pointer;color:var(--muted);border-radius:4px;display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .12s,color .12s,background .12s;z-index:2}
+    #chart-spiral .sp-chart:hover .sp-expand{opacity:1}
+    #chart-spiral .sp-expand:hover{color:var(--text);background:rgba(127,127,127,.14)}
+    #chart-spiral .sp-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:600;backdrop-filter:blur(2px);align-items:center;justify-content:center;padding:20px;box-sizing:border-box}
+    #chart-spiral .sp-backdrop.on{display:flex}
+    #chart-spiral .sp-modal{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px 22px;width:min(680px,96vw);position:relative;box-shadow:0 24px 64px rgba(0,0,0,.7);display:flex;flex-direction:column;align-items:center}
+    #chart-spiral .sp-modal .sp-ctitle{align-self:flex-start}
+    #chart-spiral .sp-modal svg{width:100%;max-width:600px}
+    #chart-spiral .sp-mclose{position:absolute;top:10px;right:12px;width:28px;height:28px;border:none;background:rgba(127,127,127,.12);color:var(--muted);border-radius:6px;cursor:pointer;font-size:15px;line-height:1}
+    #chart-spiral .sp-mclose:hover{background:rgba(127,127,127,.22);color:var(--text)}
+    #chart-spiral .sp-side{padding:16px;display:flex;flex-direction:column;gap:18px}
+    #chart-spiral .sp-standing-wrap{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);cursor:pointer}
+    #chart-spiral .sp-standing-wrap input{width:14px;height:14px;accent-color:var(--accent);cursor:pointer}
+    #chart-spiral .sp-gl{font-family:var(--mono);font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);opacity:.8;margin:0 0 9px}
+    #chart-spiral .sp-seg{display:flex;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:3px}
+    #chart-spiral .sp-seg button{flex:1;border:0;background:transparent;color:var(--muted);font:inherit;font-size:12.5px;padding:7px 6px;border-radius:6px;cursor:pointer}
+    #chart-spiral .sp-seg button.on{background:var(--accent);color:var(--surface);font-weight:600}
+    #chart-spiral .sp-items{display:flex;flex-direction:column;gap:2px;margin-top:10px}
+    #chart-spiral .sp-metric{display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:7px;cursor:pointer;border:1px solid transparent}
+    #chart-spiral .sp-metric:hover{background:var(--bg)}
+    #chart-spiral .sp-metric.on{background:var(--accent);border-color:var(--accent)}
+    #chart-spiral .sp-metric .sp-nm{font-size:13.5px;flex:1;color:var(--text)}
+    #chart-spiral .sp-metric.hd .sp-nm{font-weight:600}
+    #chart-spiral .sp-metric .sp-kd{font-family:var(--mono);font-size:9.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+    #chart-spiral .sp-metric.on .sp-nm{color:var(--surface)}
+    #chart-spiral .sp-metric.on .sp-kd{color:var(--surface);opacity:.8}
+    #chart-spiral .sp-years{display:flex;flex-direction:column;gap:2px}
+    #chart-spiral .sp-yr{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:7px;cursor:pointer}
+    #chart-spiral .sp-yr:not(.off){background:rgba(0,212,170,.12)}
+    #chart-spiral .sp-yr:hover{background:var(--bg)} #chart-spiral .sp-yr.off{opacity:.32;background:transparent}
+    #chart-spiral .sp-sw{width:22px;height:3px;border-radius:2px;flex:none}
+    #chart-spiral .sp-yl{font-family:var(--mono);font-size:12px} #chart-spiral .sp-yt{margin-left:auto;font-variant-numeric:tabular-nums;font-size:12.5px;color:var(--muted)}
+    #chart-spiral svg{display:block;width:100%;max-width:min(100%,70vh);height:auto;margin:0 auto;touch-action:none}
+    #chart-spiral .sp-mo{font-family:var(--mono);font-size:15px;letter-spacing:.06em;fill:var(--text);opacity:.72;font-weight:600}
+    #chart-spiral .sp-rl{font-family:var(--mono);font-size:15px;fill:var(--text);opacity:.6;font-weight:500}
+    #chart-spiral .sp-cm{font-family:var(--mono);font-size:11px;letter-spacing:.13em;text-transform:uppercase;fill:var(--muted)}
+    #chart-spiral .sp-cv{font-size:29px;font-weight:650;fill:var(--text)} #chart-spiral .sp-cu{font-size:12px;fill:var(--muted)}
+    #chart-spiral .sp-tip{position:absolute;pointer-events:none;opacity:0;transform:translate(-50%,-115%);background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 11px;font-size:12px;line-height:1.45;white-space:nowrap;box-shadow:0 8px 26px rgba(0,0,0,.4);transition:opacity .09s}
+    #chart-spiral .sp-tip .sp-d{font-family:var(--mono);color:var(--muted);font-size:10.5px;margin-bottom:3px}
+    #chart-spiral .sp-tip .sp-b{font-weight:650;font-variant-numeric:tabular-nums} #chart-spiral .sp-tip .sp-i{color:var(--muted);font-variant-numeric:tabular-nums}
+    #chart-spiral .sp-hint{min-height:28px;color:var(--muted);opacity:.75;font-size:11.5px;line-height:1.5;margin-top:11px}
+    #chart-spiral .sp-status{color:var(--muted);font-size:13px;text-align:center;padding:60px 20px}
+  </style>
+  <div class="sp-board">
+    <div class="sp-charts" id="sp-charts">
+      <div class="sp-status" id="sp-status">Loading&#8230;</div>
+      <div class="sp-main" id="sp-main"></div>
+    </div>
+    <div class="sp-side">
+      <div><p class="sp-gl">Grouping</p><div class="sp-items" id="sp-items"></div></div>
+      <label class="sp-standing-wrap" id="sp-standing-toggle" style="display:none">
+        <input type="checkbox" id="sp-inc-standing"> Include standing charge in net cost
+      </label>
+      <div><p class="sp-gl">Winding</p><div class="sp-seg" id="sp-mode">
+        <button data-mode="lifetime" class="on">Lifetime</button><button data-mode="year">Year&#8209;aligned</button>
+      </div><div class="sp-hint" id="sp-hint"></div></div>
+      <div><p class="sp-gl">Years</p><div class="sp-years" id="sp-years"></div></div>
+    </div>
+  </div>
+</div>
+<script>
+window.EMTSpiral=(function(){
+  var ENDPOINT="api/charts/blocks-summary";
+  var ROWS=[],YEARS=[],DEVICE_IDS=[],LABELS={},inited=false;
+  var HAS_CARBON=false,HAS_EXPORT=false;
+  // One shared grouping (Net / Import / Export / device) + winding + years drives
+  // all spirals at once, so Cost / Usage / Carbon are read side by side.
+  var state={grouping:"net",mode:"lifetime",hidden:new Set(),incStanding:false};
+  var YC=["#00d4aa","#7c6af7","#f9a825","#38bdf8","#ef4444","#fb7185"];
+  var NS="http://www.w3.org/2000/svg",VBW=440,VBH=448,CX=220,CY=212,R_IN=34,R_OUT=184,A0=-Math.PI/2;
+  var CARDS={};   // kind -> {svg, tip}
+  var MODAL=null; // expand overlay: {backdrop, title, card:{svg,tip}, spec}
+
+  function buildMetaFrom(meters,rows){
+    LABELS={};(meters||[]).forEach(function(m){var id=m.meter_id||m.id;if(id)LABELS[id]=m.label||id;});
+    var seen=new Set();rows.forEach(function(r){Object.keys(r.meters||{}).forEach(function(k){if(k!=="electricity_main")seen.add(k);});});
+    DEVICE_IDS=Array.from(seen);
+    HAS_EXPORT=rows.some(function(r){return (r.exp_kwh||0)>0||(r.exp_cost||0)>0;});
+  }
+  // Grouping options shared by every spiral: Net, Import, Export (if any), devices.
+  function groupingOptions(){
+    var o=[{key:"net",name:"Net",kind:"import \u2212 export"},{key:"import",name:"Import",kind:"+"}];
+    if(HAS_EXPORT)o.push({key:"export",name:"Export",kind:"\u2212"});
+    DEVICE_IDS.forEach(function(id){o.push({key:id,name:LABELS[id]||id,kind:"device"});});
+    return o;
+  }
+  function isDevice(g){return DEVICE_IDS.indexOf(g)>=0;}
+  // Per-row increment for a given spiral (kind) under the shared grouping. Net is
+  // consistent across all three: import \u2212 export (usage kWh, cost \u00a3, carbon kg),
+  // so the three spirals compare like-for-like. Standing ignores grouping.
+  function incValue(row,kind){
+    var M=row.meters||{},main=M.electricity_main||{},g=state.grouping,dev=M[g]||{};
+    if(kind==="standing")return row.standing||0;
+    if(kind==="cost"){
+      if(isDevice(g))return dev.imp_cost||0;
+      if(g==="net")return (row.net_cost||0)-(state.incStanding?0:(row.standing||0));
+      if(g==="import")return row.imp_cost||0;
+      if(g==="export")return row.exp_cost||0;
+      return 0;
+    }
+    if(kind==="usage"){
+      if(isDevice(g))return dev.imp_kwh||0;
+      if(g==="net")return (row.imp_kwh||0)-(row.exp_kwh||0);
+      if(g==="import")return row.imp_kwh||0;
+      if(g==="export")return row.exp_kwh||0;
+      return 0;
+    }
+    // carbon (kg)
+    if(isDevice(g))return (dev.carbon_g||0)/1000;
+    if(g==="net")return ((main.carbon_g_imp||0)-(main.carbon_g_exp||0))/1000;
+    if(g==="import")return (main.carbon_g_imp||0)/1000;
+    if(g==="export")return (main.carbon_g_exp||0)/1000;
+    return 0;
+  }
+  // Active main spirals (carbon only when carbon data exists); standing is separate.
+  function mainSpirals(){
+    var s=[{kind:"cost",unit:"\u00a3",title:"Cost"},{kind:"usage",unit:"kWh",title:"Usage"}];
+    if(HAS_CARBON)s.push({kind:"carbon",unit:"kg",title:"Carbon"});
+    return s;
+  }
+  function fmtS(v){var a=Math.abs(v);if(a>=1000){var t=(v/1000).toFixed(a>=10000?0:1);return (t.indexOf(".")<0?t:t.replace(/\.?0+$/,""))+"k";}if(a>=100)return v.toFixed(0);return v.toFixed(a>=10?0:1);}
+  // Auto-scale a base unit up its ladder once a magnitude crosses 1000:
+  // kWh -> MWh -> GWh, kg(CO2) -> t -> kt. Other units (e.g. £) unchanged.
+  function scaleUnit(u,mag){mag=Math.abs(mag);
+    if(u==="kWh"){if(mag>=1e6)return{u:"GWh",d:1e6};if(mag>=1e3)return{u:"MWh",d:1e3};return{u:"kWh",d:1};}
+    if(u==="kg"){if(mag>=1e6)return{u:"kt",d:1e6};if(mag>=1e3)return{u:"t",d:1e3};return{u:"kg",d:1};}
+    return{u:u,d:1};}
+  // Compact number, trailing zeros trimmed (e.g. 1.0->1, 4.598->4.6, 0.42->0.42).
+  function fmtC(x){var a=Math.abs(x),d=a>=100?0:a>=1?1:2,s=x.toFixed(d);return s.indexOf(".")<0?s:s.replace(/\.?0+$/,"");}
+  // Ring/centre value in the chart-wide scale sc, no unit suffix (£ keeps k-abbrev).
+  function lblV(v,u,sc){return u==="\u00a3"?"\u00a3"+fmtS(v):fmtC(v/sc.d);}
+  // Year-row value WITH unit, in the chart-wide scale sc.
+  function lblU(v,u,sc){return u==="\u00a3"?fmt(v,"\u00a3"):fmtC(v/sc.d)+" "+sc.u;}
+  // Full value with unit; for tooltips it auto-scales by the value's own magnitude.
+  function fmt(v,u){
+    if(u==="\u00a3")return "\u00a3"+v.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+    var sc=scaleUnit(u,v),x=v/sc.d,a=Math.abs(x),d=a>=100?0:a>=10?1:2;
+    return x.toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:d})+" "+sc.u;}
+  function dayFrac(row){var y=row.year,d=new Date(Date.UTC(y,(row.month||1)-1,row.day||1));var diy=(y%4===0&&(y%100!==0||y%400===0))?366:365;var doy=Math.floor((d-Date.UTC(y,0,1))/86400000);return doy/diy;}
+  function el(t,a){var e=document.createElementNS(NS,t);for(var k in a)e.setAttribute(k,a[k]);return e;}
+  // Round a range to a "nice" number (1/2/5 x 10^n) so axis ticks land on clean
+  // values (0,50,100,150,200) instead of raw quarter-fractions (41,82,123,164).
+  function niceNum(range,round){
+    if(!(range>0))return 1;
+    var exp=Math.floor(Math.log(range)/Math.LN10),f=range/Math.pow(10,exp),nf;
+    if(round){nf=f<1.5?1:f<3?2:f<7?5:10;}else{nf=f<=1?1:f<=2?2:f<=5?5:10;}
+    return nf*Math.pow(10,exp);
+  }
+
+  // Cumulative series for one spiral (kind), under the shared grouping/mode.
+  function computeSeries(kind){
+    var life=0,perYear={};YEARS.forEach(function(y){perYear[y]=0;});
+    var pts=[];
+    ROWS.forEach(function(r){var inc=incValue(r,kind);life+=inc;perYear[r.year]+=inc;pts.push({r:r,inc:inc,life:life,yearCum:perYear[r.year],frac:dayFrac(r)});});
+    var yearTotals={};YEARS.forEach(function(y){yearTotals[y]=perYear[y];});
+    // Radial scale spans the cumulative range and always includes 0, so net
+    // metrics that go negative map inward toward the centre instead of producing
+    // a negative radius (which would flip the point 180deg to the wrong month).
+    var vals=pts.map(function(p){return state.mode==="lifetime"?p.life:p.yearCum;});
+    var lo=vals.length?Math.min.apply(null,vals):0,hi=vals.length?Math.max.apply(null,vals):1;
+    lo=Math.min(lo,0);hi=Math.max(hi,0);if(hi-lo<1e-9)hi=lo+1;
+    // Snap the scale to nice round bounds so the ring labels read cleanly and the
+    // outer ring is a round ceiling the cumulative spiral climbs toward.
+    var step=niceNum((hi-lo)/4,true);
+    lo=Math.floor(lo/step)*step;hi=Math.ceil(hi/step)*step;if(hi-lo<1e-9)hi=lo+step;
+    var span=hi-lo;
+    pts.forEach(function(p){
+      var v=state.mode==="lifetime"?p.life:p.yearCum;
+      var radius=R_IN+((v-lo)/span)*(R_OUT-R_IN);
+      var a=A0+p.frac*2*Math.PI;p.x=CX+radius*Math.cos(a);p.y=CY+radius*Math.sin(a);p.val=v;
+    });
+    return {pts:pts,yearTotals:yearTotals,lo:lo,hi:hi,step:step};
+  }
+  // Draw one spiral into its card's SVG. Small enough to sit alongside the others.
+  // cardOverride lets the expand modal render the same spiral into a larger SVG.
+  function renderSpiral(spec,cardOverride){
+    var card=cardOverride||CARDS[spec.kind];if(!card)return;
+    var SVG=card.svg,unit=spec.unit,cs=computeSeries(spec.kind),sc=scaleUnit(unit,Math.max(Math.abs(cs.hi),Math.abs(cs.lo)));
+    SVG.textContent="";
+    var grid=el("g",{});
+    var nring=Math.max(1,Math.round((cs.hi-cs.lo)/cs.step));
+    for(var i=1;i<=nring;i++){var rr=R_IN+(R_OUT-R_IN)*i/nring;
+      grid.appendChild(el("circle",{cx:CX,cy:CY,r:rr,fill:"none","stroke-width":1,opacity:.5,style:"stroke:var(--muted)"}));
+      var lab=el("text",{x:CX+6,y:CY-rr+13,class:"sp-rl"});lab.textContent=lblV(cs.lo+cs.step*i,unit,sc);grid.appendChild(lab);}
+    var MO=["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
+    for(var m=0;m<12;m++){var a=A0+(m/12)*2*Math.PI;
+      grid.appendChild(el("line",{x1:CX+(R_IN-6)*Math.cos(a),y1:CY+(R_IN-6)*Math.sin(a),x2:CX+(R_OUT+8)*Math.cos(a),y2:CY+(R_OUT+8)*Math.sin(a),"stroke-width":1,opacity:.3,style:"stroke:var(--muted)"}));
+      var t=el("text",{x:CX+(R_OUT+24)*Math.cos(a),y:CY+(R_OUT+24)*Math.sin(a),"text-anchor":"middle","dominant-baseline":"middle",class:"sp-mo"});t.textContent=MO[m];grid.appendChild(t);}
+    SVG.appendChild(grid);
+    var visible=[];
+    YEARS.forEach(function(y,yi){
+      if(state.hidden.has(y))return;
+      var seg=cs.pts.filter(function(p){return p.r.year===y;});if(seg.length<2)return;
+      var d="M "+seg[0].x.toFixed(2)+" "+seg[0].y.toFixed(2);
+      for(var i=1;i<seg.length;i++)d+=" L "+seg[i].x.toFixed(2)+" "+seg[i].y.toFixed(2);
+      var c=YC[yi%YC.length];
+      SVG.appendChild(el("path",{d:d,fill:"none",stroke:c,"stroke-width":2.6,"stroke-linecap":"round","stroke-linejoin":"round",opacity:.95,style:"filter:drop-shadow(0 0 3px "+c+"55)"}));
+      var L=seg[seg.length-1];SVG.appendChild(el("circle",{cx:L.x,cy:L.y,r:3.2,fill:c}));
+      seg.forEach(function(p){visible.push(p);});
+    });
+    var latest=cs.pts[cs.pts.length-1];
+    var cv=!latest?0:(state.mode==="lifetime"?latest.life:cs.yearTotals[YEARS[YEARS.length-1]]);
+    var cg=el("g",{});
+    var q1=el("text",{x:CX,y:CY-18,"text-anchor":"middle",class:"sp-cm"});q1.textContent=spec.title;
+    var q2=el("text",{x:CX,y:CY+10,"text-anchor":"middle",class:"sp-cv"});q2.textContent=lblV(cv,unit,sc);
+    var q3=el("text",{x:CX,y:CY+28,"text-anchor":"middle",class:"sp-cu"});q3.textContent=(state.mode==="lifetime"?"total to date":"latest year")+(unit==="\u00a3"?"":" \u00b7 "+sc.u);
+    cg.appendChild(q1);cg.appendChild(q2);cg.appendChild(q3);SVG.appendChild(cg);
+    attachHover(card,visible,unit);
+  }
+  function attachHover(card,points,unit){
+    var SVG=card.svg,TIP=card.tip;
+    var hoverDot=el("circle",{r:4.5,opacity:0,"pointer-events":"none",style:"fill:var(--text)"});SVG.appendChild(hoverDot);
+    SVG.onpointermove=function(ev){
+      var r=SVG.getBoundingClientRect(),pt={x:(ev.clientX-r.left)/r.width*VBW,y:(ev.clientY-r.top)/r.height*VBH};
+      var best=null,bd=1e9;points.forEach(function(p){var dx=p.x-pt.x,dy=p.y-pt.y,dd=dx*dx+dy*dy;if(dd<bd){bd=dd;best=p;}});
+      if(!best||bd>26*26){TIP.style.opacity=0;hoverDot.setAttribute("opacity",0);return;}
+      hoverDot.setAttribute("cx",best.x);hoverDot.setAttribute("cy",best.y);hoverDot.setAttribute("opacity",1);hoverDot.setAttribute("fill",YC[YEARS.indexOf(best.r.year)%YC.length]);
+      var cardR=SVG.parentElement.getBoundingClientRect();var sx=r.left+(best.x/VBW)*r.width,sy=r.top+(best.y/VBH)*r.height;
+      var dstr=new Date(Date.UTC(best.r.year,(best.r.month||1)-1,best.r.day||1)).toLocaleDateString(undefined,{day:"numeric",month:"short",year:"numeric"});
+      TIP.innerHTML='<div class="sp-d">'+dstr+'</div><div class="sp-b">'+fmt(best.val,unit)+'</div><div class="sp-i">that day: '+fmt(best.inc,unit)+'</div>';
+      TIP.style.left=(sx-cardR.left)+"px";TIP.style.top=(sy-cardR.top)+"px";TIP.style.opacity=1;
+      hoverDot.setAttribute("data-x",0);
+    };
+    SVG.onpointerleave=function(){TIP.style.opacity=0;hoverDot.setAttribute("opacity",0);};
+  }
+  // Build a spiral card (title + svg + tooltip + expand button) and register it.
+  function makeCard(container,spec){
+    var card=document.createElement("div");card.className="sp-card sp-chart";
+    var title=document.createElement("p");title.className="sp-ctitle";title.textContent=spec.title;
+    var svg=document.createElementNS(NS,"svg");svg.setAttribute("viewBox","0 0 "+VBW+" "+VBH);svg.setAttribute("class","sp-svg");
+    var tip=document.createElement("div");tip.className="sp-tip";
+    var exp=document.createElement("button");exp.className="sp-expand";exp.title="Expand";
+    exp.innerHTML='<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3H5a2 2 0 0 0-2 2v4M15 3h4a2 2 0 0 1 2 2v4M9 21H5a2 2 0 0 1-2-2v-4M15 21h4a2 2 0 0 0 2-2v-4"/></svg>';
+    exp.onclick=function(ev){ev.stopPropagation();openExpand(spec);};
+    card.appendChild(title);card.appendChild(exp);card.appendChild(svg);card.appendChild(tip);container.appendChild(card);
+    CARDS[spec.kind]={svg:svg,tip:tip};
+  }
+  var SPECS={};   // kind -> spec, so the modal can re-render on state changes
+  function renderAll(){
+    mainSpirals().concat([{kind:"standing",unit:"\u00a3",title:"Standing charges"}]).forEach(function(spec){
+      SPECS[spec.kind]=spec; renderSpiral(spec);
+    });
+    if(MODAL&&MODAL.spec&&MODAL.backdrop.classList.contains("on")) renderSpiral(MODAL.spec,MODAL.card);
+  }
+  function openExpand(spec){
+    if(!MODAL)return;
+    MODAL.spec=spec; MODAL.title.textContent=spec.title;
+    MODAL.backdrop.classList.add("on"); renderSpiral(spec,MODAL.card);
+  }
+  function closeExpand(){ if(MODAL){MODAL.backdrop.classList.remove("on");MODAL.spec=null;} }
+  function buildModal(){
+    var bd=document.createElement("div");bd.className="sp-backdrop";
+    var md=document.createElement("div");md.className="sp-modal";
+    var mclose=document.createElement("button");mclose.className="sp-mclose";mclose.textContent="\u2715";mclose.title="Close";
+    var mtitle=document.createElement("p");mtitle.className="sp-ctitle";
+    var msvg=document.createElementNS(NS,"svg");msvg.setAttribute("viewBox","0 0 "+VBW+" "+VBH);msvg.setAttribute("class","sp-svg");
+    var mtip=document.createElement("div");mtip.className="sp-tip";
+    md.appendChild(mclose);md.appendChild(mtitle);md.appendChild(msvg);md.appendChild(mtip);bd.appendChild(md);
+    document.getElementById("chart-spiral").appendChild(bd);
+    MODAL={backdrop:bd,title:mtitle,card:{svg:msvg,tip:mtip},spec:null};
+    mclose.onclick=closeExpand;
+    bd.onclick=function(e){if(e.target===bd)closeExpand();};
+    document.addEventListener("keydown",function(e){if(e.key==="Escape")closeExpand();});
+  }
+  // Grouping list (shared across spirals). Selecting one re-renders everything.
+  function buildItems(){var h=document.getElementById("sp-items");h.textContent="";
+    groupingOptions().forEach(function(it,i){var row=document.createElement("div");row.className="sp-metric"+(it.key===state.grouping?" on":"")+(i===0?" hd":"");
+      row.innerHTML='<span class="sp-nm"></span><span class="sp-kd"></span>';row.children[0].textContent=it.name;row.children[1].textContent=it.kind||"";
+      row.onclick=function(){state.grouping=it.key;buildItems();syncStandingToggle();renderAll();};h.appendChild(row);});}
+  // The "include standing charge in net cost" toggle only bites on grouping=net.
+  function syncStandingToggle(){var w=document.getElementById("sp-standing-toggle");if(w)w.style.display=(state.grouping==="net")?"flex":"none";}
+  function buildYears(){var h=document.getElementById("sp-years");h.textContent="";
+    YEARS.forEach(function(y,i){var row=document.createElement("div");row.className="sp-yr"+(state.hidden.has(y)?" off":"");var partial=(y===YEARS[YEARS.length-1]);
+      row.innerHTML='<span class="sp-sw"></span><span class="sp-yl"></span>';
+      row.children[0].style.background=YC[i%YC.length];row.children[1].textContent=y+(partial?" \u00b7":"");
+      row.onclick=function(){state.hidden.has(y)?state.hidden.delete(y):state.hidden.add(y);buildYears();renderAll();};h.appendChild(row);});}
+  function wireMode(){
+    Array.prototype.forEach.call(document.querySelectorAll("#sp-mode button"),function(b){b.onclick=function(){
+      Array.prototype.forEach.call(document.querySelectorAll("#sp-mode button"),function(x){x.classList.remove("on");});b.classList.add("on");state.mode=b.dataset.mode;
+      document.getElementById("sp-hint").textContent=state.mode==="lifetime"?"Radius = running total. One continuous coil; a fatter gap between loops = a heavier year.":"Every year starts from the centre on the same scale, so loops overlay \u2014 an outer loop at any angle used more by that date. Where loops cross, one year overtook another.";
+      renderAll();
+    };});
+  }
+  function wireStanding(){var cb=document.getElementById("sp-inc-standing");if(cb)cb.onchange=function(){state.incStanding=cb.checked;renderAll();};}
+  function fail(msg){var s=document.getElementById("sp-status");if(s){s.style.display="block";s.textContent=msg;}}
+
+  async function init(){
+    if(inited)return; inited=true;
+    try{
+      var res=await fetch(ENDPOINT,{headers:{Accept:"application/json"}});
+      if(!res.ok)throw new Error("HTTP "+res.status);
+      var j=await res.json();
+      if(!j.rows||!j.rows.length){fail("No data yet \u2014 the spirals fill in once blocks are recorded.");inited=false;return;}
+      ROWS=j.rows.slice().sort(function(a,b){return (a.year-b.year)||(a.month-b.month)||(a.day-b.day);});
+      YEARS=Array.from(new Set(ROWS.map(function(r){return r.year;}))).sort();
+      buildMetaFrom(j.meters||[],ROWS);
+      HAS_CARBON=!!j.has_postcode||ROWS.some(function(r){return r.carbon_g_net!=null;});
+      // Build equal-size spiral cards: Cost / Usage / (Carbon) / Standing charges.
+      var mainEl=document.getElementById("sp-main");mainEl.textContent="";
+      mainSpirals().forEach(function(spec){makeCard(mainEl,spec);});
+      makeCard(mainEl,{kind:"standing",unit:"\u00a3",title:"Standing charges"});
+      if(!MODAL)buildModal();
+      document.getElementById("sp-status").style.display="none";
+      document.getElementById("sp-hint").textContent="Radius = running total. One continuous coil; a fatter gap between loops = a heavier year.";
+      buildItems();syncStandingToggle();buildYears();wireMode();wireStanding();renderAll();
+    }catch(e){inited=false;fail("Couldn't load chart data \u2014 "+(e&&e.message?e.message:e));}
+  }
+  return { init: init };
+})();
+</script>
+
+<!-- Import / Export bar chart -->
+<div id="chart-bar" class="chart-frame-wrap" style="display:none; flex-direction:column; height:calc(100vh - 56px); overflow:hidden;">
+
+  <!-- Floating toolbar — matches billing chart period-nav pattern -->
+  <div class="bar-toolbar" style="flex-shrink:0;">
+    <div class="bar-toolbar-left">
+      <div class="bar-seg" id="bar-period-seg">
+        <button class="bar-seg-btn"        onclick="barSetPeriod('hh',this)" title="Half-hourly breakdown of a single day">HH</button>
+        <button class="bar-seg-btn active" onclick="barSetPeriod('daily',this)">Daily</button>
+        <button class="bar-seg-btn"        onclick="barSetPeriod('monthly',this)">Monthly</button>
+        <button class="bar-seg-btn"        onclick="barSetPeriod('yearly',this)">Yearly</button>
+      </div>
+      <div class="bar-seg" id="bar-cal-seg">
+        <button class="bar-seg-btn active" onclick="barSetCalendar(false,this)">Billing</button>
+        <button class="bar-seg-btn"        onclick="barSetCalendar(true,this)">Calendar</button>
+      </div>
+      <div class="bar-seg" id="bar-metric-seg">
+        <button class="bar-seg-btn active" onclick="barSetMetric('kwh',this)">kWh</button>
+        <button class="bar-seg-btn"        onclick="barSetMetric('cost',this)" id="bar-cost-btn">Cost</button>
+        <button class="bar-seg-btn"        onclick="barSetMetric('co2',this)"  id="bar-co2-btn"  style="display:none">CO₂</button>
+      </div>
+      <div class="bar-seg" id="bar-view-seg">
+        <button class="bar-seg-btn active" onclick="barSetView('totals',this)">Totals</button>
+        <button class="bar-seg-btn"        onclick="barSetView('net',this)">Net</button>
+      </div>
+      <div class="bar-seg" id="bar-order-seg" style="display:none;" title="Order monthly bars by calendar date, or grouped by month across years">
+        <button class="bar-seg-btn active" onclick="barSetOrder('date',this)">Date</button>
+        <button class="bar-seg-btn"        onclick="barSetOrder('month',this)">Month</button>
+      </div>
+      <label id="bar-standing-wrap" style="display:none; align-items:center; gap:6px; font-size:12px; color:var(--muted); cursor:pointer;">
+        <input type="checkbox" id="bar-standing-cb" onchange="barSaveState(); barRender();" style="width:14px;height:14px;accent-color:var(--accent);cursor:pointer;">
+        Inc. standing charge
+      </label>
+    </div>
+    <div class="bar-toolbar-right">
+      <button class="bar-seg-btn" id="bar-sort-btn" onclick="barToggleSort()" style="font-size:11px;">↑ Oldest first</button>
+    </div>
+  </div>
+
+  <!-- Period navigator (daily) / year selector (monthly+yearly) -->
+  <div id="bar-sub-bar" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:16px; min-height:28px; padding: 0 24px; flex-shrink:0;"></div>
+
+  <!-- Legend -->
+  <div id="bar-legend" style="display:flex; gap:16px; margin-bottom:12px; font-size:12px; color:var(--muted); flex-wrap:wrap; padding: 0 24px; flex-shrink:0;"></div>
+
+  <!-- Chart canvas -->
+  <div id="bar-chart-wrap" style="position:relative; width:100%; max-width:100%; overflow:hidden; height:300px; padding: 0 24px; box-sizing:border-box; flex-shrink:0;">
+    <canvas id="barChart" style="max-width:100%;"></canvas>
+    <!-- Shown while the first fetch/build runs (no cached data to paint) — matches the
+         "Loading chart..." placeholder the daily/heatmap/spiral tabs use. -->
+    <div id="bar-loading" style="position:absolute; inset:0; display:none; align-items:center; justify-content:center; color:var(--muted); font-size:14px; background:var(--surface);">Loading chart…</div>
+  </div>
+
+  <!-- Tabular view -->
+  <div style="display:flex; align-items:center; justify-content:space-between; margin-top:12px; margin-bottom:8px; padding: 0 24px; flex-shrink:0;">
+    <span style="font-size:12px; font-weight:500; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em;">Data table</span>
+    <button class="btn btn-secondary btn-sm" onclick="barCopyTable()" id="bar-copy-btn">⎘ Copy to clipboard</button>
+  </div>
+  <div id="bar-table-wrap" style="overflow-x:auto; overflow-y:auto; padding: 0 24px 24px 24px; flex:1; min-height:0;">
+    <table id="bar-table" style="width:100%; border-collapse:collapse; font-size:12px; font-family:var(--mono);">
+    </table>
+  </div>
+
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+{% include '_period_spinner.html' %}
+<script>
+var chartsLoaded = {};
+var _activeChart = 'daily';
+var _EMT_VERSION = "{{ app_version or '2.10.0' }}";
+function getChartHeight() {
+  // .content has padding:0 on the charts page so clientHeight = full usable height
+  var contentEl = document.querySelector('.content');
+  if (contentEl) {
+    var h = contentEl.clientHeight;
+    if (h > 100) return Math.max(h, 350) + 'px';
+  }
+  // Fallback: viewport minus topbar height
+  var tb = document.querySelector('.topbar');
+  var tbH = tb ? tb.getBoundingClientRect().height : 72;
+  return Math.max(window.innerHeight - tbH, 350) + 'px';
+}
+
+var _resizeTimer = null;
+var _suppressResize = false;
+var _resizeObserverW = 0;
+
+function resizeChartIframes() {
+  if (_suppressResize) return;
+  var h = getChartHeight();
+  document.querySelectorAll('.chart-content-wrap').forEach(function(el) {
+    el.style.height = h;
+    var iframe = el.querySelector('iframe');
+    if (iframe) iframe.style.height = h;
+  });
+}
+
+// Use ResizeObserver on the chart container — catches HA sidebar open/close.
+// Posts the new width into the iframe via postMessage so the iframe can
+// relayout its Plotly charts without a full reload.
+(function() {
+  if (typeof ResizeObserver === 'undefined') return;
+  var target = document.querySelector('.main-content') || document.body;
+  var ro = new ResizeObserver(function(entries) {
+    var w = entries[0].contentRect.width;
+    if (Math.abs(w - _resizeObserverW) < 20) return;
+    _resizeObserverW = w;
+    if (_suppressResize) return;
+    resizeChartIframes();
+    // Notify the active chart iframe of its new available width
+    clearTimeout(_resizeTimer);
+    _resizeTimer = setTimeout(function() {
+      var activeId = document.querySelector('.chart-tab.active[data-chart="daily"]')
+                     ? 'chart-daily-content' : 'chart-heatmap-content';
+      var iframe = document.getElementById(activeId) &&
+                   document.getElementById(activeId).querySelector('iframe');
+      if (iframe && iframe.contentWindow) {
+        iframe.contentWindow.postMessage({ type: 'emt-resize', width: w }, '*');
+      }
+    }, 400);
+  });
+  ro.observe(target);
+})();
+
+window.addEventListener('resize', resizeChartIframes, { passive: true });
+
+// On orientation change, force a full bar chart redraw after layout settles
+var _orientTimer = null;
+function _handleOrientationChange() {
+  clearTimeout(_orientTimer);
+  _orientTimer = setTimeout(function() {
+    // Usage Stats — destroy and redraw Chart.js instance
+    if (document.getElementById('chart-bar').style.display !== 'none' && barInited) {
+      if (barChartInstance) { barChartInstance.destroy(); barChartInstance = null; }
+      barRender();
+    }
+    resizeChartIframes();
+    // Force reload of active iframe chart — orientation change requires fresh render
+    // since Plotly/billing chart bakes dimensions at load time
+    var activeName = _activeChart;
+    if (activeName === 'daily' || activeName === 'heatmap') {
+      chartsLoaded[activeName] = false;  // mark stale
+      loadChartContent(activeName, true); // force fresh load at new dimensions
+    }
+  }, 600); // wait for browser to complete orientation layout
+}
+
+window.addEventListener('orientationchange', _handleOrientationChange, { passive: true });
+
+// Also handle resize-based orientation change (some browsers fire resize not orientationchange)
+var _lastOrientation = window.innerWidth > window.innerHeight ? 'landscape' : 'portrait';
+window.addEventListener('resize', function() {
+  var current = window.innerWidth > window.innerHeight ? 'landscape' : 'portrait';
+  if (current !== _lastOrientation) {
+    _lastOrientation = current;
+    _handleOrientationChange();
+  }
+}, { passive: true });
+
+// Suppress resize reload when iframe content triggers layout changes
+window.addEventListener('message', function(e) {
+  if (e.data && e.data.type === 'suppressResize') {
+    _suppressResize = true;
+    clearTimeout(_resizeTimer);
+    setTimeout(function() { _suppressResize = false; }, 1000);
+  }
+  // Theme toggle from parent shell — reload active iframe chart with new theme
+  if (e.data && e.data.type === 'emt-theme') {
+    var activeTab = document.querySelector('.chart-tab.active');
+    var activeName = activeTab && activeTab.textContent.indexOf('Billing') !== -1 ? 'daily'
+                   : activeTab && activeTab.textContent.indexOf('Heatmap') !== -1 ? 'heatmap'
+                   : null;
+    if (activeName) {
+      chartsLoaded[activeName] = false;
+      loadChartContent(activeName, true);
+    }
+    // Update bar chart if visible
+    var btn = document.getElementById('bar-theme-btn');
+    if (btn) btn.textContent = e.data.theme === 'dark' ? '\u263e' : '\u2600';
+    if (barInited && barData && window.Chart) barRender();
+  }
+});
+
+// Pending html waiting to be injected once chart container becomes visible
+var _pendingHtml = {};
+
+function _injectChartHtml(name, html) {
+  var containerId = name === 'daily' ? 'chart-daily-content' : 'chart-heatmap-content';
+  var outerEl = document.getElementById(name === 'daily' ? 'chart-daily' : 'chart-heatmap');
+  var el = document.getElementById(containerId);
+  if (!el) return;
+
+  // If the outer container is hidden, defer injection until it is shown.
+  // Setting srcdoc while display:none means window.innerWidth inside the
+  // iframe is 0, causing Plotly to render at the wrong width.
+  if (outerEl && outerEl.style.display === 'none') {
+    _pendingHtml[name] = html;
+    return;
+  }
+
+  var h = getChartHeight();
+  var iframe = document.createElement('iframe');
+  iframe.className = 'chart-iframe';
+  iframe.style.cssText = 'width:100%;height:' + h + ';border:none;display:block;';
+  el.style.height = h;
+
+  // Capture open table IDs from the existing iframe before replacing it
+  var _openTables = [];
+  var existing = el.querySelector('iframe');
+  if (existing && existing.contentDocument) {
+    existing.contentDocument.querySelectorAll('.day-data-tables').forEach(function(t) {
+      if (t.style.display !== 'none' && t.style.display !== '') {
+        _openTables.push(t.id);
+      }
+    });
+  }
+
+  function _nudgeIframe(ifrm) {
+    // Send the actual container width to the iframe after it loads so
+    // scaleChart inside uses the correct value rather than window.innerWidth
+    // which may still be settling at load time.
+    var _w = (document.querySelector('.main-content') || document.body).getBoundingClientRect().width;
+    ifrm._lastSentWidth = _w;
+    if (ifrm.contentWindow) {
+      ifrm.contentWindow.postMessage({ type: 'emt-resize', width: _w }, '*');
+      if (_openTables.length) {
+        ifrm.contentWindow.postMessage({ type: 'emt-restore-tables', open: _openTables }, '*');
+      }
+    }
+  }
+  if (existing) {
+    iframe.style.opacity = '0';
+    el.appendChild(iframe);
+    iframe.onload = function() {
+      if (existing.parentNode) existing.parentNode.removeChild(existing);
+      iframe.style.opacity = '1';
+      _nudgeIframe(iframe);
+    };
+  } else {
+    el.appendChild(iframe);
+    iframe.onload = function() { _nudgeIframe(iframe); };
+  }
+  // Use a Blob URL instead of srcdoc to avoid WebKit's srcdoc size limit
+  var blob = new Blob([html], {type: 'text/html'});
+  var blobUrl = URL.createObjectURL(blob);
+  iframe.src = blobUrl;
+  iframe.addEventListener('load', function() { URL.revokeObjectURL(blobUrl); }, {once: true});
+  chartsLoaded[name] = true;
+  delete _pendingHtml[name];
+}
+
+async function loadChartContent(name, force) {
+  if (chartsLoaded[name] && !force) return;
+  var endpoint = name === 'daily' ? '/api/charts/daily' : '/api/charts/heatmap';
+  var containerId = name === 'daily' ? 'chart-daily-content' : 'chart-heatmap-content';
+  var el = document.getElementById(containerId);
+  if (!el) return;
+  // Remove any non-iframe placeholder content (e.g. "Loading chart..." div)
+  Array.from(el.children).forEach(function(child) {
+    if (child.tagName !== 'IFRAME') el.removeChild(child);
+  });
+  try {
+    var r = await fetch(apiUrl(endpoint) + '?t=' + Date.now());
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText);
+    var text = await r.text();
+    var data;
+    try { data = JSON.parse(text); }
+    catch(parseErr) { throw new Error('JSON parse failed: ' + parseErr.message); }
+    if (data.html) {
+      _injectChartHtml(name, data.html);
+    } else {
+      throw new Error('No html in response — keys: ' + Object.keys(data).join(', '));
+    }
+  } catch(e) {
+    el.innerHTML = '<div style="padding:40px;text-align:center;color:var(--danger);">Failed to load chart: ' + e.message + '</div>';
+  }
+}
+
+// Auto-refresh charts every 2 minutes — force reload of active chart
+// and clear cached state for all charts so switching tabs fetches fresh data
+// Refresh all tabs at 1 minute past each block boundary — same timing as
+// Live Power billing card refresh. This avoids hitting the DB during active
+// block finalisation which can cause WAL lock conflicts and partial responses.
+function msUntilNextBarRefresh() {
+  var now  = new Date();
+  var mins = now.getMinutes();
+  var secs = now.getSeconds();
+  var ms   = now.getMilliseconds();
+  var bm   = barBlockMinutes || 30;
+  var elapsed   = ((mins % bm) * 60 + secs) * 1000 + ms;
+  var blockMs   = bm * 60 * 1000;
+  return (blockMs - elapsed) + 90 * 1000;  // 90 seconds after next boundary — ensures block is fully written
+}
+
+function scheduleChartRefresh() {
+  var delay = msUntilNextBarRefresh();
+  setTimeout(function() {
+    try {
+      chartsLoaded = {};  // clear all — forces re-fetch on next tab switch too
+      barLastFetch = 0;   // always reset bar TTL so next barInit() always fetches fresh data
+      var activeTab = document.querySelector('.chart-tab.active');
+      if (activeTab) {
+        var name = activeTab.dataset.chart || (activeTab.textContent.indexOf('Heatmap') !== -1 ? 'heatmap' : 'daily');
+        if (name === 'daily' || name === 'heatmap') {
+          loadChartContent(name, true);
+        } else if (name === 'bar') {
+          barInit();
+        }
+      }
+    } catch(e) {
+      console.error('scheduleChartRefresh error:', e);
+    }
+    scheduleChartRefresh();  // always reschedule regardless of errors
+  }, delay);
+}
+scheduleChartRefresh();
+
+function toggleTopbar() {
+  var main = document.querySelector('.main');
+  if (!main) return;
+  main.classList.toggle('topbar-collapsed');
+  try { localStorage.setItem('emt_topbar_collapsed',
+    main.classList.contains('topbar-collapsed') ? '1' : '0'); } catch(e) {}
+}
+
+function updateToggleLabel(name) {
+  var labels = { daily: 'Billing', heatmap: 'Heatmaps', spiral: 'Spiral', bar: 'Usage Stats' };
+  var el = document.getElementById('topbar-toggle-label');
+  if (el) el.textContent = labels[name] || name;
+}
+
+function showChart(name, btn) {
+  _suppressResize = true;
+  var _prevChart = _activeChart;  // capture before overwrite
+  document.querySelectorAll('.chart-tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('chart-daily').style.display   = name === 'daily'   ? 'block' : 'none';
+  document.getElementById('chart-heatmap').style.display = name === 'heatmap' ? 'block' : 'none';
+  document.getElementById('chart-bar').style.display     = name === 'bar'     ? 'flex' : 'none';
+  var _spEl = document.getElementById('chart-spiral'); if (_spEl) _spEl.style.display = name === 'spiral' ? 'block' : 'none';
+  _activeChart = name;
+  // Hide regenerate button on Usage Stats — it auto-refreshes via setInterval
+
+  if (name === 'bar') {
+    barInit();
+  } else if (name === 'spiral') {
+    if (window.EMTSpiral) EMTSpiral.init();
+  } else {
+    // Flush any pending html that was deferred because container was hidden
+    if (_pendingHtml[name]) {
+      _injectChartHtml(name, _pendingHtml[name]);
+    } else {
+      loadChartContent(name);
+    }
+    // Mark the previously active tab stale so switching back forces a fresh
+    // load with the correct current viewport dimensions. This ensures resize
+    // at any browser zoom level — the fresh iframe measures the correct
+    // window.innerWidth on load rather than relying on a resize nudge.
+    // If the container width has changed since the previous tab's iframe was
+    // created, mark it stale so switching back forces a fresh load at the
+    // correct dimensions. This handles browser zoom changes between tab switches
+    // without forcing a reload on every switch.
+    if (_prevChart && _prevChart !== name && (_prevChart === 'daily' || _prevChart === 'heatmap')) {
+      var _prevCId = _prevChart === 'daily' ? 'chart-daily-content' : 'chart-heatmap-content';
+      var _prevIfrm = document.getElementById(_prevCId) && document.getElementById(_prevCId).querySelector('iframe');
+      var _curW = (document.querySelector('.main-content') || document.body).getBoundingClientRect().width;
+      if (!_prevIfrm || Math.abs(_curW - (_prevIfrm._lastSentWidth || 0)) > 10) {
+        chartsLoaded[_prevChart] = false;
+      }
+    }
+  }
+  try { localStorage.setItem(EMT.lsKey('emt_chart_tab'), name); } catch(e) {}
+  updateToggleLabel(name);
+  setTimeout(function() { _suppressResize = false; }, 200);
+}
+
+// ── PDF Export ────────────────────────────────────────────────────────────────
+function chartsPdfExport() {
+  // Open popup SYNCHRONOUSLY (required for Safari's popup whitelist)
+  var win = window.open('', '_blank');
+  if (!win) { alert('Please allow pop-ups for this page to export PDF.'); return; }
+
+  // Write loading page — leave document OPEN (no win.document.close()) so we can
+  // update it later via win.document.body.innerHTML without a second write() call
+  win.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Generating PDF\u2026</title>' +
+    '<style>' +
+    'body{font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;' +
+    'min-height:100vh;margin:0;background:#f9f9f9;color:#333;}' +
+    '.loader{text-align:center;}' +
+    '.spinner{width:48px;height:48px;border:4px solid #ddd;border-top-color:#00a080;' +
+    'border-radius:50%;animation:spin 0.8s linear infinite;margin:0 auto 16px;}' +
+    '@keyframes spin{to{transform:rotate(360deg)}}' +
+    'h2{margin:0 0 8px;color:#00a080;}p{color:#777;font-size:13px;margin:0;}' +
+    '</style></head>' +
+    '<body><div class="loader"><div class="spinner"></div>' +
+    '<h2>Generating PDF\u2026</h2><p>Capturing charts, please wait.</p></div></body></html>');
+  // Do NOT call win.document.close() here — keep stream open so _doPdfExport can overwrite
+
+  // Fetch logo as data URL (async, popup already open and showing spinner)
+  var iconSrc = '';
+  var iconImg = new Image();
+  iconImg.crossOrigin = 'anonymous';
+  iconImg.onload = function() {
+    try {
+      var canvas = document.createElement('canvas');
+      canvas.width = iconImg.width; canvas.height = iconImg.height;
+      canvas.getContext('2d').drawImage(iconImg, 0, 0);
+      iconSrc = canvas.toDataURL('image/png');
+    } catch(e) {}
+    _doPdfExport(win, iconSrc);
+  };
+  iconImg.onerror = function() { _doPdfExport(win, ''); };
+  iconImg.src = BASE_PATH + '/static/icon.png';
+}
+
+function _doPdfExport(win, iconSrc) {
+  var genDate   = new Date().toLocaleString();
+  var tabLabels = { daily: 'Billing Charts', heatmap: 'Heatmaps', bar: 'Usage Stats' };
+  var tabLabel  = tabLabels[_activeChart] || _activeChart;
+
+  var commonStyles =
+    // Force light theme — override all CSS variables and media queries
+    ':root{color-scheme:light;' +
+    '--bg:#fff;--surface:#fff;--text:#111;--muted:#555;--border:#ddd;--accent:#00d4aa;' +
+    '--accent-dark:#00a080;--sidebar-bg:#f9f9f9;}' +
+    'html,body{background:#fff!important;color:#111!important;}' +
+    'body{font-family:-apple-system,sans-serif;margin:0;padding:24px;color:#111;background:#fff;}' +
+    '.report-header{display:flex;align-items:center;gap:14px;border-bottom:2px solid #00a080;padding-bottom:12px;margin-bottom:20px;}' +
+    '.report-header img{width:44px;height:44px;object-fit:contain;}' +
+    '.report-header h1{margin:0;font-size:18px;color:#00a080;}' +
+    '.report-header .sub{font-size:12px;color:#555;margin-top:3px;}' +
+    '.report-date{margin-left:auto;font-size:11px;color:#888;text-align:right;}' +
+    '.report-version{font-size:10px;color:#aaa;}' +
+    '@media print{@page{margin:12mm;size:A4 landscape;}body{padding:0;}}' +
+    // Override any dark mode media queries in iframe styles
+    '@media(prefers-color-scheme:dark){' +
+    ':root{--bg:#fff!important;--surface:#fff!important;--text:#111!important;--muted:#555!important;--border:#ddd!important;}' +
+    'html,body{background:#fff!important;color:#111!important;}}';
+
+  var header =
+    '<div class="report-header">' +
+    (iconSrc ? '<img src="' + iconSrc + '">' : '') +
+    '<div><h1>Energy Meter Tracker</h1><div class="sub">' + tabLabel + '</div></div>' +
+    '<div class="report-date">Generated ' + genDate + '<br><span class="report-version">EMT v' + _EMT_VERSION + '</span></div>' +
+    '</div>';
+
+  function _getIframe(name) {
+    var id = name === 'daily' ? 'chart-daily-content' : 'chart-heatmap-content';
+    var el = document.getElementById(id);
+    return el ? el.querySelector('iframe') : null;
+  }
+
+  // ── Billing Charts ─────────────────────────────────────────────────────────
+  if (_activeChart === 'daily') {
+    var ifrm = _getIframe('daily');
+    if (!ifrm || !ifrm.contentDocument) {
+      win.close(); alert('Billing chart not loaded yet.'); return;
+    }
+    var iDoc = ifrm.contentDocument;
+    var iWin = ifrm.contentWindow;
+
+    // Get current mode from active pmode-btn
+    var activeMode = 'month';
+    var activeModeBtn = iDoc.querySelector('.pmode-btn.active');
+    if (activeModeBtn) activeMode = activeModeBtn.dataset.mode || 'month';
+
+    // Get active section via select value (exact match)
+    var modeSelectMap = { month:'period-select-month', calmonth:'period-select-calmonth', quarter:'period-select-quarter', year:'period-select-year' };
+    var selectEl = iDoc.getElementById(modeSelectMap[activeMode] || 'period-select-month');
+    var activeSectionId = selectEl ? selectEl.value : null;
+    var visibleSection = activeSectionId ? iDoc.getElementById(activeSectionId) : null;
+    if (!visibleSection) {
+      var allSections = Array.from(iDoc.querySelectorAll('.period-section'));
+      for (var _si = 0; _si < allSections.length; _si++) {
+        if (allSections[_si].style.visibility === 'visible') { visibleSection = allSections[_si]; break; }
+      }
+    }
+    if (!visibleSection) { win.close(); alert('No visible billing period found.'); return; }
+
+    var currentView = 'vanilla';
+    try { currentView = iWin.sessionStorage.getItem('energyView') || 'vanilla'; } catch(e) {}
+
+    // Extract iframe styles, patching out position:fixed/sticky which breaks print layout
+    var iframeStyles = Array.from(iDoc.querySelectorAll('style')).map(function(s) {
+      return s.textContent
+        .replace(/position\s*:\s*fixed/g, 'position:static')
+        .replace(/position\s*:\s*sticky/g, 'position:static')
+        .replace(/overflow\s*:\s*hidden/g, 'overflow:visible')
+        .replace(/overflow\s*:\s*scroll/g, 'overflow:visible')
+        .replace(/overflow\s*:\s*auto/g, 'overflow:visible');
+    }).join('\n');
+
+    // Force light theme — override CSS variables and dark mode media queries
+    var lightThemeOverride =
+      ':root{color-scheme:light;background:#fff;color:#111;' +
+      '--bg:#fff;--surface:#f9f9f9;--text:#111;--muted:#555;--border:#ddd;' +
+      '--card-bg:#fff;--hover:#f5f5f5;}' +
+      'html,body{background:#fff!important;color:#111!important;}' +
+      // Strip dark mode overrides by re-asserting light values inside the query
+      '@media(prefers-color-scheme:dark){' +
+      ':root{--bg:#fff!important;--surface:#f9f9f9!important;--text:#111!important;' +
+      '--muted:#555!important;--border:#ddd!important;--card-bg:#fff!important;}' +
+      'html,body{background:#fff!important;color:#111!important;}}';
+    iframeStyles = lightThemeOverride + '\n' + iframeStyles;
+
+    // PDF-specific overrides
+    var pdfOverrides =
+      '.period-nav,.day-tbl-toolbar,.day-tbl-toggle,.pmode-btn,.view-btn,' +
+      '.period-mode-toggle,.period-select-wrap,.nav-right,.sticky-bill-strip,' +
+      '#sticky-bill-strip,.chart-tab-bar,.pdf-btn,.expand-btn,' +
+      'button:not(.no-hide){display:none!important;}' +
+      '.period-section{visibility:visible!important;position:relative!important;}' +
+      '.bill-toggle-body{display:block!important;}' +
+      '.bill-view{display:none!important;}' +
+      '.bill-view[data-view="' + currentView + '"]{display:block!important;}' +
+      'body{overflow:visible!important;background:#fff!important;}' +
+      '.day-chart-wrap{break-inside:avoid;}' +
+      '.chart-container{margin-bottom:4px;}' +
+      '.day-data-tables{display:none!important;}' + // hide data tables in chart section (shown separately below chart)
+      '@media print{@page{margin:12mm;size:A4;}body{padding:0;}}';
+
+    // Collect chart containers from visible section that need image capture
+    var chartContainers = Array.from(visibleSection.querySelectorAll('.chart-container'));
+    var chartImages = {}; // chartId → dataUrl
+
+    // Async: capture all charts, then write PDF
+    var chartPromises = chartContainers.map(function(container) {
+      var plotDiv = container.querySelector('.js-plotly-plot') || container.querySelector('[id]');
+      var cid = container.id || (plotDiv && plotDiv.id);
+      if (!cid || !iWin.Plotly) return Promise.resolve();
+      var div = iDoc.getElementById(cid) || plotDiv;
+      if (!div || !div._fullLayout) return Promise.resolve();
+      var _fl = div._fullLayout || {};
+      var _savedBg = _fl.paper_bgcolor; var _savedPl = _fl.plot_bgcolor;
+      var _savedFont = (_fl.font || {}).color;
+      // Hide iframe during relayout so user doesn't see the colour change
+      var _iframeEl = document.getElementById('chart-daily-content') && document.getElementById('chart-daily-content').querySelector('iframe');
+      if (_iframeEl) _iframeEl.style.visibility = 'hidden';
+      // Only change background and font colours — touching axis config mangles traces
+      return iWin.Plotly.relayout(div, {
+        paper_bgcolor: '#ffffff',
+        plot_bgcolor:  '#f8f9fa',
+        'font.color':  '#111111'
+      }).then(function() {
+        return iWin.Plotly.toImage(div, {
+          format:'png',
+          width:Math.max(div.offsetWidth||700,700),
+          height:Math.max(div.offsetHeight||220,220)
+        });
+      }).then(function(url) {
+        chartImages[cid] = url;
+        return iWin.Plotly.relayout(div, {
+          paper_bgcolor: _savedBg,
+          plot_bgcolor:  _savedPl,
+          'font.color':  _savedFont || ''
+        });
+      }).then(function() {
+        if (_iframeEl) _iframeEl.style.visibility = '';
+      }).catch(function() {
+        if (_iframeEl) _iframeEl.style.visibility = '';
+      });
+    });
+
+    Promise.all(chartPromises).then(function() {
+      var reportHtml = '';
+
+      // Billing summaries
+      var billToggles = visibleSection.querySelectorAll('.bill-toggle');
+      billToggles.forEach(function(toggle) {
+        var summaryEl = toggle.querySelector('.bill-toggle-summary');
+        var bodyEl    = toggle.querySelector('.bill-toggle-body');
+        var activeView = null;
+        if (bodyEl) {
+          var views = bodyEl.querySelectorAll('.bill-view');
+          for (var v = 0; v < views.length; v++) {
+            if (views[v].dataset.view === currentView) { activeView = views[v]; break; }
+          }
+          if (!activeView && views.length) activeView = views[0];
+        }
+        reportHtml += '<div style="margin-bottom:24px;break-inside:avoid;">';
+        if (summaryEl) reportHtml += '<div style="font-size:14px;font-weight:700;color:#00a080;margin-bottom:10px;border-bottom:2px solid #00a080;padding-bottom:6px;">' +
+          summaryEl.innerText.replace(/^[▶▼◀▸]\s*/, '').trim() + '</div>';
+        if (activeView) reportHtml += activeView.innerHTML;
+        else if (bodyEl) reportHtml += bodyEl.innerHTML;
+        reportHtml += '</div>';
+      });
+
+      // Daily sections with chart images
+      visibleSection.querySelectorAll('.day-chart-wrap').forEach(function(wrap) {
+        var summaryEl = wrap.querySelector('.chart-summary');
+        var tableEl   = wrap.querySelector('.day-data-tables');
+        if (!summaryEl) return;
+
+        var dayLabel = summaryEl.querySelector('.day-label');
+        var stotals  = summaryEl.querySelector('.stotals');
+        var scols    = summaryEl.querySelector('.scols');
+
+        // Find chart image
+        var chartContainer = wrap.querySelector('.chart-container');
+        var plotDiv = chartContainer ? (chartContainer.querySelector('.js-plotly-plot') || chartContainer.firstElementChild) : null;
+        var cid = chartContainer ? (chartContainer.id || (plotDiv && plotDiv.id)) : null;
+        var imgUrl = cid ? chartImages[cid] : null;
+
+        // Build stotals as block lines — spans are display:block via CSS (not inline style)
+        // so we must force display:block explicitly
+        var stotalsHtml = '';
+        if (stotals) {
+          stotals.querySelectorAll('span').forEach(function(sp) {
+            var t = sp.innerText.trim();
+            if (!t) return;
+            var inlineStyle = sp.getAttribute('style') || '';
+            // Ensure display:block so each stat is on its own line
+            stotalsHtml += '<div style="display:block;' + inlineStyle + '">' + t + '</div>';
+          });
+          if (!stotalsHtml) stotalsHtml = '<div>' + stotals.innerText.trim() + '</div>';
+        }
+
+        // Build scols sidebar — each .scol is a meter, spans are display:block via CSS
+        var scolsHtml = '';
+        if (scols) {
+          scols.querySelectorAll('.scol').forEach(function(col) {
+            // Get colour from first span's inline style
+            var firstSpan = col.querySelector('span');
+            var borderColor = '#00a080';
+            if (firstSpan) {
+              var m = (firstSpan.getAttribute('style') || '').match(/color\s*:\s*([^;]+)/);
+              if (m) borderColor = m[1].trim();
+            }
+            scolsHtml += '<div style="margin-top:6px;padding-left:8px;border-left:3px solid ' + borderColor + ';display:flex;flex-direction:column;gap:1px;">';
+            col.querySelectorAll('span').forEach(function(sp) {
+              var t = sp.innerText.trim();
+              if (!t) return;
+              var inlineStyle = sp.getAttribute('style') || '';
+              scolsHtml += '<div style="display:block;' + inlineStyle + '">' + t + '</div>';
+            });
+            scolsHtml += '</div>';
+          });
+        }
+
+        var sidebarHtml =
+          '<div style="min-width:160px;max-width:220px;flex-shrink:0;font-size:11px;">' +
+          (dayLabel ? '<div style="font-size:13px;font-weight:700;color:#00a080;margin-bottom:4px;">' + dayLabel.innerText.trim() + '</div>' : '') +
+          (stotalsHtml ? '<div style="display:flex;flex-direction:column;gap:1px;margin-bottom:6px;">' + stotalsHtml + '</div>' : '') +
+          (scolsHtml ? scolsHtml : '') +
+          '</div>';
+
+        var chartHtml = imgUrl
+          ? '<div style="flex:1;min-width:0;"><img src="' + imgUrl + '" style="width:100%;height:auto;display:block;"></div>'
+          : '<div style="flex:1;"></div>';
+
+        reportHtml += '<div style="margin-bottom:16px;break-inside:avoid;padding-bottom:12px;border-bottom:1px solid #eee;">';
+        reportHtml += '<div style="display:flex;gap:12px;align-items:flex-start;">' + sidebarHtml + chartHtml + '</div>';
+        if (tableEl && tableEl._built) {
+          reportHtml += '<div style="font-size:10px;overflow-x:auto;margin-top:8px;">' + tableEl.innerHTML + '</div>';
+        }
+        reportHtml += '</div>';
+      });
+
+      win.document.open();
+      win.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8">' +
+        '<title>EMT — ' + tabLabel + '</title>' +
+        '<style>' + commonStyles + '</style>' +
+        '<style>' + iframeStyles + '</style>' +
+        '<style>' + pdfOverrides + '</style>' +
+        '</head><body>' + header + reportHtml + '</body></html>');
+      win.document.close();
+    });
+
+  // ── Heatmaps ───────────────────────────────────────────────────────────────
+  } else if (_activeChart === 'heatmap') {
+    var ifrm = _getIframe('heatmap');
+    if (!ifrm || !ifrm.contentDocument) {
+      win.close(); alert('Heatmap not loaded yet.'); return;
+    }
+    var iDoc  = ifrm.contentDocument;
+    var iWin  = ifrm.contentWindow;
+
+    // Capture heatmap as image via Plotly toImage if available, else canvas
+    var hmDiv = iDoc.getElementById('heatmap');
+    var hmImg = null;
+    if (hmDiv && iWin.Plotly && typeof iWin.Plotly.toImage === 'function') {
+      // Async path — use Plotly.toImage
+      var _hmFl = hmDiv._fullLayout || {};
+      var _hmSavedBg = _hmFl.paper_bgcolor; var _hmSavedPl = _hmFl.plot_bgcolor;
+      var _hmSavedFont = (_hmFl.font || {}).color;
+      var _hmIframeEl = document.getElementById('chart-heatmap-content') && document.getElementById('chart-heatmap-content').querySelector('iframe');
+      if (_hmIframeEl) _hmIframeEl.style.visibility = 'hidden';
+      iWin.Plotly.relayout(hmDiv, {
+        paper_bgcolor: '#ffffff',
+        plot_bgcolor:  '#f8f9fa',
+        'font.color':  '#111111'
+      }).then(function() {
+        return iWin.Plotly.toImage(hmDiv, {format:'png', width: hmDiv.offsetWidth || 1100, height: hmDiv.offsetHeight || 700});
+      }).then(function(imgUrl) {
+        iWin.Plotly.relayout(hmDiv, {
+          paper_bgcolor: _hmSavedBg,
+          plot_bgcolor:  _hmSavedPl,
+          'font.color':  _hmSavedFont || ''
+        }).then(function(){ if (_hmIframeEl) _hmIframeEl.style.visibility = ''; })
+          .catch(function(){ if (_hmIframeEl) _hmIframeEl.style.visibility = ''; });
+        // Capture toolbar state from iframe
+        var activeMetrics = [];
+        iDoc.querySelectorAll('.hm-metric-btn.active').forEach(function(b) { activeMetrics.push(b.textContent.trim()); });
+        var toolbarHtml = activeMetrics.length
+          ? '<div style="font-size:12px;color:#555;margin-bottom:12px;padding:6px 10px;background:#f5f5f5;border-radius:4px;border:1px solid #ddd;">Metric: <strong>' + activeMetrics.join(' · ') + '</strong></div>'
+          : '';
+        win.document.open();
+      win.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8">' +
+          '<title>EMT — ' + tabLabel + '</title>' +
+          '<style>' + commonStyles + '</style>' +
+          '</head><body>' + header + toolbarHtml +
+          '<img src="' + imgUrl + '" style="max-width:100%;border:1px solid #eee;border-radius:6px;">' +
+          '</body></html>');
+        win.document.close();
+      }).catch(function() {
+        // Fallback: just show the iframe body
+        win.document.open();
+      win.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8">' +
+          '<title>EMT — ' + tabLabel + '</title>' +
+          '<style>' + commonStyles + 'body{overflow:visible;}.period-nav{position:static;}</style>' +
+          Array.from(iDoc.querySelectorAll('style')).map(function(s){return s.outerHTML;}).join('') +
+          '</head><body>' + header + iDoc.body.innerHTML + '</body></html>');
+        win.document.close();
+      });
+      return; // async — return early
+    } else {
+      // No Plotly.toImage — extract raw body
+      win.document.open();
+      win.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8">' +
+        '<title>EMT — ' + tabLabel + '</title>' +
+        '<style>' + commonStyles + 'body{overflow:visible;}.period-nav{position:static;}</style>' +
+        Array.from(iDoc.querySelectorAll('style')).map(function(s){return s.outerHTML;}).join('') +
+        '</head><body>' + header + iDoc.body.innerHTML + '</body></html>');
+      win.document.close();
+    }
+
+  // ── Usage Stats ────────────────────────────────────────────────────────────
+  } else if (_activeChart === 'bar') {
+    var canvas  = document.getElementById('barChart');
+    var imgData = (canvas && typeof canvas.toDataURL === 'function') ? canvas.toDataURL('image/png') : null;
+    var tblEl   = document.getElementById('bar-table');
+    var tblHtml = tblEl ? tblEl.outerHTML : '<p>No data table.</p>';
+
+    // Clone the actual toolbar HTML, stripping onclick handlers, marking active state visually
+    var barToolbar = document.querySelector('.bar-toolbar');
+    var toolbarHtml = '';
+    if (barToolbar) {
+      var clone = barToolbar.cloneNode(true);
+      // Remove onclick attrs and make active buttons visually distinct via inline style
+      clone.querySelectorAll('[onclick]').forEach(function(el) { el.removeAttribute('onclick'); });
+      clone.querySelectorAll('.bar-seg-btn.active').forEach(function(el) {
+        el.style.background = '#00a080';
+        el.style.color = '#fff';
+        el.style.fontWeight = '600';
+      });
+      clone.querySelectorAll('.bar-seg-btn:not(.active)').forEach(function(el) {
+        el.style.background = '#f0f0f0';
+        el.style.color = '#555';
+      });
+      // Replace checkboxes with visible text indicators — native checkbox checked
+      // state doesn't render reliably in PDF/print popup windows.
+      clone.querySelectorAll('input[type=checkbox]').forEach(function(el) {
+        var liveEl = el.id ? document.getElementById(el.id) : null;
+        var isChecked = liveEl ? liveEl.checked : el.checked;
+        var indicator = document.createElement('span');
+        indicator.textContent = isChecked ? '☑' : '☐';
+        indicator.style.cssText = 'font-size:14px;line-height:1;margin-right:2px;';
+        el.parentNode.insertBefore(indicator, el);
+        el.style.display = 'none';
+      });
+      // Also make the standing charge label text visible in the clone
+      clone.querySelectorAll('#bar-standing-wrap, [id$="-standing-wrap"]').forEach(function(el) {
+        el.style.display = 'flex';
+        // Remove the ::after pseudo-element workaround by showing the real text
+        el.querySelectorAll('span').forEach(function(s) { s.style.display = ''; });
+      });
+      clone.style.position = 'static';
+      clone.style.marginBottom = '16px';
+      toolbarHtml = clone.outerHTML;
+    }
+
+    var barStyles =
+      'table{border-collapse:collapse;width:100%;font-size:11px;font-family:ui-monospace,monospace;}' +
+      'th,td{border:1px solid #ddd;padding:4px 8px;text-align:right;}' +
+      'th{background:#f5f5f5;font-weight:600;text-align:center;}' +
+      'td:first-child,th:first-child{text-align:left;}' +
+      'tr.totals-row{font-weight:700;background:#f0faf7;}' +
+      'tr:nth-child(even){background:#fafafa;}' +
+      '.col-total{font-weight:600;background:#f5f5f5;}' +
+      '.bar-legend-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;}' +
+      '.bar-toolbar{display:flex;flex-wrap:wrap;gap:8px;padding:8px;background:#f9f9f9;border:1px solid #ddd;border-radius:6px;margin-bottom:16px;}' +
+      '.bar-toolbar-right{margin-left:auto;}' +
+      '.bar-seg{display:flex;gap:2px;}' +
+      '.bar-seg-btn{padding:3px 10px;border-radius:4px;border:none;cursor:default;font-size:12px;}';
+
+    var chartSection = imgData
+      ? '<img src="' + imgData + '" style="max-width:100%;margin-bottom:20px;border:1px solid #eee;border-radius:6px;">'
+      : '<p style="color:#888;">Chart image not available.</p>';
+
+    win.document.open();
+      win.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8">' +
+      '<title>EMT — ' + tabLabel + '</title>' +
+      '<style>' + commonStyles + barStyles + '</style>' +
+      '</head><body>' +
+      header + toolbarHtml + chartSection +
+      '<div style="margin-top:16px;">' + tblHtml + '</div>' +
+      '</body></html>');
+    win.document.close();
+  } else if (_activeChart === 'spiral') {
+    // Spiral is an inline SVG using CSS-var colours; inject a light-theme
+    // stylesheet so it renders on white in the PDF (issue #250).
+    // Capture every spiral card (Cost / Usage / Carbon / Standing) with its title.
+    var spCards = document.querySelectorAll('#chart-spiral .sp-chart');
+    var cardsHtml = '';
+    Array.prototype.forEach.call(spCards, function(card) {
+      var svg = card.querySelector('svg.sp-svg');
+      if (!svg) return;
+      var titleEl = card.querySelector('.sp-ctitle');
+      var title = titleEl ? titleEl.textContent : '';
+      var sclone = svg.cloneNode(true);
+      sclone.setAttribute('style', 'display:block;width:100%;max-width:300px;height:auto;');
+      cardsHtml += '<div class="pdf-sp-card">' +
+        (title ? '<div class="sp-h">' + title + '</div>' : '') + sclone.outerHTML + '</div>';
+    });
+    var svgHtml = cardsHtml || '<p style="color:#888;">Spiral chart not available.</p>';
+    var spiralStyles =
+      ':root{--text:#1a1a1a;--muted:#8a8f98;--accent:#00a080;--mono:ui-monospace,monospace;}' +
+      '.sp-mo{font-family:var(--mono);font-size:15px;letter-spacing:.06em;fill:var(--text);opacity:.72;font-weight:600;}' +
+      '.sp-rl{font-family:var(--mono);font-size:15px;fill:var(--text);opacity:.6;font-weight:500;}' +
+      '.sp-cm{font-family:var(--mono);font-size:11px;fill:var(--muted);letter-spacing:.08em;}' +
+      '.sp-cv{font-size:29px;font-weight:650;fill:var(--text);} .sp-cu{font-size:12px;fill:var(--muted);}' +
+      '#pdf-sp{display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap;justify-content:center;}' +
+      '.pdf-sp-card{flex:0 0 auto;break-inside:avoid;text-align:center;}' +
+      '.sp-h{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#888;margin:0 0 8px;}';
+    win.document.open();
+    win.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8">' +
+      '<title>EMT \u2014 ' + tabLabel + '</title>' +
+      // Swap the shared landscape @page for portrait — the spiral is square-ish.
+      // Replacing (not adding) avoids Chrome honouring the first @page it sees.
+      '<style>' + commonStyles.replace('size:A4 landscape', 'size:A4 portrait') + spiralStyles + '</style></head><body>' +
+      header +
+      '<div id="pdf-sp">' + svgHtml + '</div>' +
+      '</body></html>');
+    win.document.close();
+  }
+}
+
+// ── Usage Stats Bar Chart ─────────────────────────────────────────────────────
+var barData = null;
+var barSortDesc = (localStorage.getItem(EMT.lsKey('emt_bar_sort_desc')) !== 'false'); // default newest first
+var barCurrency = '£';
+var barPeriod = 'daily';
+var barMetric = 'kwh';
+var barView = 'totals';
+var barMonthOrder = 'date';  // monthly bar ordering: 'date' (chronological) or 'month' (month-first, then year)
+var barCalendar = false;   // false = billing periods, true = calendar periods
+var barBillingDay = 1;
+var barDailyMonth = null;  // now a bKey string e.g. "2026-04-15"
+function barTodayStr() {
+  var n = new Date();
+  return n.getFullYear() + '-' + String(n.getMonth()+1).padStart(2,'0') + '-' + String(n.getDate()).padStart(2,'0');
+}
+var barHHDate = barTodayStr();   // HH view: local day being viewed (YYYY-MM-DD), default today
+var barHHRows = null;            // cached 48-slot rows for barHHDataDate
+var barHHDataDate = null;        // date barHHRows currently holds
+var barActiveYears = null;
+var barChartInstance = null;
+var barInited = false;
+var barLastFetch = 0;        // timestamp of last successful fetch
+var BAR_TTL_MS = 5 * 60 * 1000;  // re-fetch if data older than 5 minutes
+var _lastDataVersion = null; // /api/charts/data-version token at last render (gate refreshes)
+var _refreshInFlight = false;
+var barBlockMinutes = 30;    // populated from api/blocks_summary response
+var barMeters = [];       // [{id, label, color, is_sub}]
+var barExportColor = '#ff7f0e';
+
+var MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+function barIncStanding() {
+  var cb = document.getElementById('bar-standing-cb');
+  return cb ? cb.checked : false;
+}
+
+function barSaveState() {
+  try {
+    var cb = document.getElementById('bar-standing-cb');
+    localStorage.setItem(EMT.lsKey('emt_bar_state'), JSON.stringify({
+      period:   barPeriod,
+      metric:   barMetric,
+      view:     barView,
+      order:    barMonthOrder,
+      calendar: barCalendar,
+      hhDate:   barHHDate,
+      bKey:     typeof barDailyMonth === 'string' ? barDailyMonth : (barDailyMonth ? (barDailyMonth.year + '-' + String(barDailyMonth.month).padStart(2,'0') + '-01') : null),
+      years:    barActiveYears ? [...barActiveYears] : [],
+      standing: cb ? cb.checked : false,
+    }));
+  } catch(e) {}
+}
+
+function barLoadState(availableYears) {
+  try {
+    var raw = localStorage.getItem(EMT.lsKey('emt_bar_state'));
+    if (!raw) return;
+    var st = JSON.parse(raw);
+    if (['daily','monthly','yearly','hh'].indexOf(st.period) !== -1) barPeriod = st.period;
+    if (['kwh','cost','co2'].indexOf(st.metric) !== -1)       barMetric = st.metric;
+    if (['totals','net'].indexOf(st.view) !== -1)              barView   = st.view;
+    if (['date','month'].indexOf(st.order) !== -1)             barMonthOrder = st.order;
+    if (typeof st.calendar === 'boolean')                      barCalendar = st.calendar;
+    // HH day: restore, but never a future day (default today).
+    if (typeof st.hhDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(st.hhDate)) {
+      barHHDate = st.hhDate > barTodayStr() ? barTodayStr() : st.hhDate;
+    }
+    // Restore billing period selection (bKey e.g. "2026-04-15")
+    if (st.bKey) {
+      var hasData = barData.some(function(r){ return barBillingKey(r).bKey === st.bKey; });
+      if (hasData) barDailyMonth = st.bKey;
+    }
+    // Restore active years — only keep those that still exist in the data
+    if (st.years && st.years.length) {
+      var validYears = st.years.filter(function(y){ return availableYears.indexOf(y) !== -1; });
+      if (validYears.length) barActiveYears = new Set(validYears);
+    }
+    // Restore standing charge checkbox
+    var cb = document.getElementById('bar-standing-cb');
+    if (cb && typeof st.standing === 'boolean') cb.checked = st.standing;
+  } catch(e) {}
+}
+
+// Per-instance cache of the last blocks-summary payload, so returning to the Charts
+// page (a full navigation from Overview etc.) can paint instantly from the last
+// result instead of showing a blank chart while the fresh fetch runs.
+function _barCacheKey() { try { return EMT.lsKey('emt_bar_summary'); } catch(e) { return 'emt_bar_summary'; } }
+function _loadBarCache() {
+  try { var raw = localStorage.getItem(_barCacheKey()); return raw ? JSON.parse(raw) : null; }
+  catch(e) { return null; }
+}
+function _saveBarCache(json) {
+  try { localStorage.setItem(_barCacheKey(), JSON.stringify(json)); } catch(e) { /* quota — non-fatal */ }
+}
+
+// Apply a blocks-summary JSON (fresh or cached) into the bar-chart state.
+function _applyBarJson(json) {
+  barData        = json.rows || [];
+  barCurrency    = json.currency || '£';
+  barBillingDay  = json.billing_day || 1;
+  barMeters      = json.meters  || [];
+  barExportColor = json.export_color || '#ff7f0e';  // palette colour for export/credit bars
+  var costBtn = document.getElementById('bar-cost-btn');
+  if (costBtn) costBtn.textContent = barCurrency + ' Cost';
+  var co2Btn = document.getElementById('bar-co2-btn');
+  if (co2Btn) co2Btn.style.display = json.has_postcode ? '' : 'none';
+  if (barMetric === 'co2' && !json.has_postcode) barMetric = 'kwh';
+  var years = [...new Set(barData.map(r => r.year))].sort();
+  if (barData.length > 0) {
+    barDailyMonth = barBillingKey(barData[barData.length - 1]).bKey;
+  } else {
+    barDailyMonth = null;
+  }
+  barActiveYears = new Set(years);
+  barLoadState(years);          // restore saved view state (validated against data)
+  barSyncUI();
+  barBlockMinutes = json.block_minutes || 30;
+  barInited = true;
+  if (json.data_version) _lastDataVersion = json.data_version;
+  var _prevErr = document.getElementById('bar-load-error');
+  if (_prevErr) _prevErr.remove();
+}
+
+function _setBarLoading(show) {
+  var el = document.getElementById('bar-loading');
+  if (el) el.style.display = show ? 'flex' : 'none';
+}
+
+async function _barFetchFresh() {
+  // Only show the "Loading…" overlay when there's nothing on screen yet (fresh build,
+  // no cached paint) — a background refresh of an already-drawn chart shouldn't flash it.
+  if (!barInited || !barData || !barData.length) _setBarLoading(true);
+  try {
+    var r = await fetch(apiUrl('/api/charts/blocks-summary'));
+    var json = await r.json();
+    if (json.error) throw new Error(json.error);
+    _applyBarJson(json);
+    barLastFetch = Date.now();
+    _saveBarCache(json);
+    barRender();
+  } catch(e) {
+    _setBarLoading(false);
+    var _errDiv = document.getElementById('bar-load-error') || document.createElement('div');
+    _errDiv.id = 'bar-load-error';
+    _errDiv.style.cssText = 'color:var(--danger);padding:20px;';
+    _errDiv.textContent = 'Failed to load data: ' + e.message;
+    var host = document.getElementById('chart-bar');
+    if (host && !host.contains(_errDiv)) host.appendChild(_errDiv);
+  }
+}
+
+async function barInit() {
+  var now = Date.now();
+  if (barInited && barData && (now - barLastFetch) < BAR_TTL_MS) { barRender(); return; }
+  // Fresh page load: paint from the cached payload immediately (no blank chart),
+  // then confirm freshness against the tiny data-version token — only re-fetching
+  // the full summary if the data actually changed.
+  if (!barInited) {
+    var cached = _loadBarCache();
+    if (cached && cached.rows) {
+      _applyBarJson(cached);
+      barLastFetch = Date.now();   // treat cache as fresh for TTL; version check corrects it
+      barRender();                 // instant
+      var cv = cached.data_version;
+      _fetchDataVersion().then(function(v) {
+        if (v && cv && v === cv) { _lastDataVersion = v; return; }   // unchanged → keep cache
+        _barFetchFresh();          // changed / unknown → refresh in the background
+      });
+      return;
+    }
+  }
+  await _barFetchFresh();
+}
+
+function barSyncUI() {
+  // Sync period/metric/view segment buttons to current state vars
+  ['hh','daily','monthly','yearly'].forEach(function(v) {
+    document.querySelectorAll('#bar-period-seg .bar-seg-btn').forEach(function(b){
+      if (b.textContent.toLowerCase() === v) b.classList.toggle('active', barPeriod === v);
+    });
+  });
+  // Billing/Calendar toggle is meaningless for the HH (single-day) view — hide it.
+  var calSeg = document.getElementById('bar-cal-seg');
+  if (calSeg) calSeg.style.display = (barPeriod === 'hh') ? 'none' : '';
+  document.querySelectorAll('#bar-cal-seg .bar-seg-btn').forEach(function(b){
+    var isCal = b.getAttribute('onclick') && b.getAttribute('onclick').indexOf('true') !== -1;
+    b.classList.toggle('active', isCal === barCalendar);
+  });
+  document.querySelectorAll('#bar-metric-seg .bar-seg-btn').forEach(function(b){
+    b.classList.toggle('active', b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'"+barMetric+"'") !== -1);
+  });
+  document.querySelectorAll('#bar-view-seg .bar-seg-btn').forEach(function(b){
+    b.classList.toggle('active', b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'"+barView+"'") !== -1);
+  });
+  // Order toggle — only meaningful for the monthly view
+  var orderSeg = document.getElementById('bar-order-seg');
+  if (orderSeg) orderSeg.style.display = (barPeriod === 'monthly') ? 'inline-flex' : 'none';
+  document.querySelectorAll('#bar-order-seg .bar-seg-btn').forEach(function(b){
+    b.classList.toggle('active', b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'"+barMonthOrder+"'") !== -1);
+  });
+  // Sync sort button label
+  var sortBtn = document.getElementById('bar-sort-btn');
+  if (sortBtn) sortBtn.textContent = barSortDesc ? '↓ Latest first' : '↑ Oldest first';
+}
+
+function barGetYears() {
+  return [...new Set(barData.map(r => r.year))].sort();
+}
+
+// Aggregate rows for a given filter function, returning per-meter sums
+function barVal(meterAgg, mid, isExport) {
+  var m = meterAgg.meters[mid];
+  if (!m) return 0;
+  if (barMetric === 'kwh')  return isExport ? m.exp_kwh  : m.imp_kwh;
+  if (barMetric === 'cost') return isExport ? m.exp_cost : m.imp_cost;
+  // co2 totals mode: main meter shows remainder (carbon_g), sub-meters show gross
+  // carbon_g_imp/exp are only used for the export-offset dataset below zero
+  if (isExport) return m.carbon_g_exp != null ? m.carbon_g_exp : 0;
+  return m.carbon_g != null ? m.carbon_g : 0;
+}
+
+function barStandingVal(agg) {
+  if (!barIncStanding() || barMetric === 'kwh' || barMetric === 'co2') return 0;
+  return agg.standing || 0;
+}
+
+function barGetDatasets(labels, aggList) {
+  if (barView === 'net') {
+    return [{
+      label: 'Net',
+      data: aggList.map(function(agg) {
+        if (barMetric === 'co2') {
+          var v = agg.carbon_g_net;
+          return v != null ? Math.round(v * 100) / 100 : null;
+        }
+        var imp = barMetric === 'kwh' ? agg.imp_kwh  : (agg.imp_cost + barStandingVal(agg));
+        var exp = barMetric === 'kwh' ? agg.exp_kwh  :  agg.exp_cost;
+        return Math.round((imp - exp) * 1000) / 1000;
+      }),
+      backgroundColor: aggList.map(function(agg) {
+        if (barMetric === 'co2') {
+          var v = agg.carbon_g_net;
+          return (v == null || v >= 0) ? (barMeters[0] && barMeters[0].color || '#1f77b4') : barExportColor;
+        }
+        var imp = barMetric === 'kwh' ? agg.imp_kwh : (agg.imp_cost + barStandingVal(agg));
+        var exp = barMetric === 'kwh' ? agg.exp_kwh : agg.exp_cost;
+        return imp >= exp ? (barMeters[0] && barMeters[0].color || '#1f77b4') : barExportColor;
+      }),
+      borderRadius: 3
+    }];
+  }
+
+  // Totals — import meters stacked above axis, export below, all in same stack
+  var datasets = [];
+
+  barMeters.forEach(function(meter) {
+    datasets.push({
+      label: meter.label + ' import',
+      data: aggList.map(function(agg) { return Math.round(barVal(agg, meter.id, false) * 1000) / 1000; }),
+      backgroundColor: meter.color,
+      borderRadius: 0,
+      stack: 'main'   // single stack so import/export are vertically aligned per bucket
+    });
+  });
+
+  if (barMetric === 'cost') {
+    datasets.push({
+      label: 'Standing charge',
+      data: aggList.map(function(agg) { return barIncStanding() ? Math.round(barStandingVal(agg) * 1000) / 1000 : 0; }),
+      backgroundColor: '#4b5563',
+      borderRadius: 0,
+      stack: 'main'
+    });
+  }
+
+  var hasExport;
+  if (barMetric === 'co2') {
+    // CO2 export: carbon offset from exporting — shown below zero like kWh export
+    hasExport = aggList.some(function(agg) {
+      return Object.values(agg.meters || {}).some(function(m) { return m.carbon_g_exp != null && m.carbon_g_exp > 0; });
+    });
+    if (hasExport) {
+      datasets.push({
+        label: 'Export offset',
+        data: aggList.map(function(agg) {
+          var total = Object.values(agg.meters || {}).reduce(function(s,m){ return s+(m.carbon_g_exp||0); }, 0);
+          return -Math.round(total * 100) / 100;
+        }),
+        backgroundColor: barExportColor,
+        borderRadius: 3,
+        stack: 'main'
+      });
+    }
+  } else {
+    hasExport = aggList.some(function(agg) {
+      return Object.values(agg.meters || {}).some(function(m) { return (barMetric==='kwh'?m.exp_kwh:m.exp_cost) > 0; });
+    });
+    if (hasExport) {
+      datasets.push({
+        label: 'Export',
+        data: aggList.map(function(agg) {
+          var total = Object.values(agg.meters || {}).reduce(function(s,m){ return s+(barMetric==='kwh'?m.exp_kwh:m.exp_cost); }, 0);
+          return -Math.round(total * 1000) / 1000;
+        }),
+        backgroundColor: barExportColor,
+        borderRadius: 3,
+        stack: 'main'
+      });
+    }
+  }
+
+  return datasets;
+}
+
+function barAggRows(filterFn) {
+  var filtered = barData.filter(filterFn);
+  var result = { standing:0, imp_kwh:0, exp_kwh:0, imp_cost:0, exp_cost:0, net_cost:0,
+                 carbon_g_net: null, carbon_g_total: null, avg_intensity: null, meters:{} };
+  // For avg_intensity: throughput-weighted mean of the server's per-day value
+  var _aiNum = 0, _aiTp = 0, _aiHasData = false;
+  filtered.forEach(function(row) {
+    result.standing  += row.standing  || 0;
+    result.imp_kwh   += row.imp_kwh   || 0;
+    result.exp_kwh   += row.exp_kwh   || 0;
+    result.imp_cost  += row.imp_cost  || 0;
+    result.exp_cost  += row.exp_cost  || 0;
+    result.net_cost  += row.net_cost  || 0;
+    // carbon_g: NULL-aware — only accumulate when data exists (post-2.3.0 blocks)
+    if (row.carbon_g_net != null)   result.carbon_g_net   = (result.carbon_g_net   || 0) + row.carbon_g_net;
+    if (row.carbon_g_total != null) result.carbon_g_total = (result.carbon_g_total || 0) + row.carbon_g_total;
+    // avg_intensity: use the server's per-day figure, weighted by throughput
+    // (import + export kWh). Re-deriving abs(carbon)/abs(net_kwh) blows up on
+    // near-balanced days where net kWh collapses toward zero.
+    if (row.avg_intensity != null) {
+      var _tp = (row.imp_kwh || 0) + (row.exp_kwh || 0);
+      if (_tp > 0) { _aiNum += row.avg_intensity * _tp; _aiTp += _tp; _aiHasData = true; }
+    }
+    Object.keys(row.meters || {}).forEach(function(mid) {
+      if (!result.meters[mid]) result.meters[mid] = {imp_kwh:0,imp_cost:0,exp_kwh:0,exp_cost:0,carbon_g:null,carbon_g_imp:null,carbon_g_exp:null};
+      var m = row.meters[mid];
+      result.meters[mid].imp_kwh  += m.imp_kwh  || 0;
+      result.meters[mid].imp_cost += m.imp_cost || 0;
+      result.meters[mid].exp_kwh  += m.exp_kwh  || 0;
+      result.meters[mid].exp_cost += m.exp_cost || 0;
+      if (m.carbon_g     != null) result.meters[mid].carbon_g     = (result.meters[mid].carbon_g     || 0) + m.carbon_g;
+      if (m.carbon_g_imp != null) result.meters[mid].carbon_g_imp = (result.meters[mid].carbon_g_imp || 0) + m.carbon_g_imp;
+      if (m.carbon_g_exp != null && m.carbon_g_exp !== undefined) result.meters[mid].carbon_g_exp = (result.meters[mid].carbon_g_exp || 0) + m.carbon_g_exp;
+    });
+  });
+  // Round kWh and carbon from daily sums
+  result.imp_kwh  = Math.round(result.imp_kwh  * 10000) / 10000;
+  result.exp_kwh  = Math.round(result.exp_kwh  * 10000) / 10000;
+  if (result.carbon_g_net   != null) result.carbon_g_net   = Math.round(result.carbon_g_net   * 100) / 100;
+  if (result.carbon_g_total != null) result.carbon_g_total = Math.round(result.carbon_g_total * 100) / 100;
+  if (_aiHasData && _aiTp > 0) result.avg_intensity = Math.round((_aiNum / _aiTp) * 10) / 10;
+
+  // Round period totals from accumulated daily values.
+  // One method everywhere: sum daily rows, round at period level.
+  // net_cost is the sum of per-day rounded nets — ensures parts sum to whole.
+  result.standing = Math.round(result.standing * 10000) / 10000;
+  result.imp_cost = Math.round(result.imp_cost * 10000) / 10000;
+  result.exp_cost = Math.round(result.exp_cost * 10000) / 10000;
+  result.net_cost = Math.round(result.net_cost * 100)   / 100;
+  return result;
+}
+
+function barBillingKey(r) {
+  // Use the pre-computed billing_period_start from the server (authoritative).
+  // Falls back to computing from billing_day for rows without it.
+  if (r.billing_period_start) {
+    return { bKey: r.billing_period_start };
+  }
+  // Legacy fallback
+  var bd = r.billing_day || barBillingDay;
+  var startDay = bd, startMonth = r.month, startYear = r.year;
+  if (r.day < bd) {
+    startMonth = r.month - 1;
+    if (startMonth < 1) { startMonth = 12; startYear--; }
+  }
+  return { bKey: startYear + '-' + String(startMonth).padStart(2,'0') + '-' + String(startDay).padStart(2,'0') };
+}
+
+function barGetDataForPeriod() {
+  if (barPeriod === 'hh') {
+    // 48 (or n) half-hour slots for one local day. Rows come pre-aggregated from
+    // /api/charts/blocks-day in exactly the barAggRows shape, so no re-aggregation.
+    var rows = barHHRows || [];
+    return {
+      labels:  rows.map(function(r){ return r.label; }),
+      aggList: rows,
+      isHH:    true
+    };
+  }
+  if (barPeriod === 'daily') {
+    var filtered;
+    if (barCalendar) {
+      filtered = barData.filter(function(r){
+        var _dm;
+        if (typeof barDailyMonth === 'object' && barDailyMonth) {
+          _dm = barDailyMonth.year + '-' + String(barDailyMonth.month).padStart(2,'0');
+        } else if (typeof barDailyMonth === 'string') {
+          _dm = barDailyMonth.slice(0,7);
+        }
+        return _dm && (r.year + '-' + String(r.month).padStart(2,'0')) === _dm;
+      });
+    } else {
+      filtered = barData.filter(function(r){
+        var k = barBillingKey(r);
+        return k.bKey === barDailyMonth;
+      });
+    }
+    filtered = filtered.slice().sort(function(a,b){
+      return (a.year*10000+a.month*100+a.day) - (b.year*10000+b.month*100+b.day);
+    });
+    var seen = {}, uniqueDates = [];
+    filtered.forEach(function(r) {
+      var k = r.year+'-'+r.month+'-'+r.day;
+      if (!seen[k]) { seen[k] = true; uniqueDates.push({year:r.year,month:r.month,day:r.day}); }
+    });
+    return {
+      labels:  uniqueDates.map(function(d){ return String(d.day); }),
+      aggList: uniqueDates.map(function(d){
+        return barAggRows(function(r){ return r.year===d.year && r.month===d.month && r.day===d.day; });
+      }),
+      rawDates: uniqueDates
+    };
+  }
+  if (barPeriod === 'monthly') {
+    var activeYrs = barGetYears().filter(function(y){ return barActiveYears.has(y); });
+    var monthFirst = (barMonthOrder === 'month');
+    var buckets = [];
+    if (barCalendar) {
+      activeYrs.forEach(function(y) {
+        var months = [...new Set(barData.filter(function(r){return r.year===y;}).map(function(r){return r.month;}))].sort(function(a,b){return a-b;});
+        months.forEach(function(m){ buckets.push({y:y,m:m}); });
+      });
+      // Month order: sort by month, then year (Jan '24, Jan '25, Jan '26, Feb '24 …).
+      // Date order: chronological (year, then month).
+      if (monthFirst) buckets.sort(function(a,b){ return a.m!==b.m ? a.m-b.m : a.y-b.y; });
+      else            buckets.sort(function(a,b){ return a.y!==b.y ? a.y-b.y : a.m-b.m; });
+      // In month order the year must always show on the axis (no legend).
+      var showYear = monthFirst || activeYrs.length > 1;
+      return {
+        labels:  buckets.map(function(b){ return MONTHS_SHORT[b.m-1]+(showYear?' '+b.y:''); }),
+        aggList: buckets.map(function(b){ return barAggRows(function(r){ return r.year===b.y && r.month===b.m; }); }),
+        bucketYears: buckets.map(function(b){ return b.y; }),
+        monthOrder: monthFirst
+      };
+    } else {
+      var seen = {};
+      barData.forEach(function(r) {
+        var k = barBillingKey(r);
+        if (!seen[k.bKey]) seen[k.bKey] = true;
+      });
+      var keys = Object.keys(seen);
+      // Respect the year filter (the toggle chips) — a billing period belongs to the
+      // year it STARTS in, which is what its axis label shows. Without this the year
+      // toggles did nothing in billing mode (they only worked in calendar mode).
+      keys = keys.filter(function(bk){ return activeYrs.indexOf(+bk.slice(0,4)) !== -1; });
+      // Month order: sort by the billing period's start month, then the full key (year).
+      if (monthFirst) keys.sort(function(a,b){ var ma=+a.slice(5,7), mb=+b.slice(5,7); return ma!==mb ? ma-mb : a.localeCompare(b); });
+      else            keys.sort();
+      return {
+        labels:  keys.map(function(bk){
+          // Label: "Apr 2026" from first row with this bKey
+          var sample = barData.find(function(r){ return barBillingKey(r).bKey===bk; });
+          if (!sample) return bk.slice(0,7);
+          var d = new Date(bk + 'T00:00:00Z');
+          return MONTHS_SHORT[d.getUTCMonth()] + ' ' + d.getUTCFullYear();
+        }),
+        aggList: keys.map(function(bk){
+          return barAggRows(function(r){ return barBillingKey(r).bKey===bk; });
+        }),
+        bucketYears: keys.map(function(bk){ return +bk.slice(0,4); }),
+        monthOrder: monthFirst
+      };
+    }
+  }
+  if (barPeriod === 'yearly') {
+    if (barCalendar) {
+      var activeYrs = barGetYears().filter(function(y){ return barActiveYears.has(y); });
+      return {
+        labels:  activeYrs.map(String),
+        aggList: activeYrs.map(function(y){ return barAggRows(function(r){ return r.year===y; }); })
+      };
+    } else {
+      var activeYrs = barGetYears().filter(function(y){ return barActiveYears.has(y); });
+      var bYears = [...new Set(barData.map(function(r){ return barBillingKey(r).bKey.slice(0,4); }))].sort();
+      // Keep only billing years the year filter has active (a billing period belongs
+      // to the year it starts in) — so the toggles work in billing mode too.
+      bYears = bYears.filter(function(by){ return activeYrs.indexOf(+by) !== -1; });
+      return {
+        labels:  bYears.map(String),
+        aggList: bYears.map(function(by){
+          return barAggRows(function(r){ return barBillingKey(r).bKey.slice(0,4)===by; });
+        })
+      };
+    }
+  }
+}
+var _barCo2Unit = 'g';  // 'g' or 'kg' — set once per render based on max value
+
+function barCo2SetUnit(aggList) {
+  // Determine unit from the largest absolute CO2 value across all datasets/meters
+  var maxAbs = 0;
+  aggList.forEach(function(agg) {
+    if (agg.carbon_g_net   != null) maxAbs = Math.max(maxAbs, Math.abs(agg.carbon_g_net));
+    if (agg.carbon_g_total != null) maxAbs = Math.max(maxAbs, Math.abs(agg.carbon_g_total));
+    Object.values(agg.meters || {}).forEach(function(m) {
+      if (m.carbon_g_imp != null) maxAbs = Math.max(maxAbs, Math.abs(m.carbon_g_imp));
+      if (m.carbon_g_exp != null) maxAbs = Math.max(maxAbs, Math.abs(m.carbon_g_exp));
+      if (m.carbon_g     != null) maxAbs = Math.max(maxAbs, Math.abs(m.carbon_g));
+    });
+  });
+  _barCo2Unit = maxAbs >= 1000 ? 'kg' : 'g';
+}
+
+function barCo2Fmt(v, forCopy) {
+  // Format using the unit determined for this render — consistent across all values
+  if (v == null) return forCopy ? '' : '—';
+  var abs = Math.abs(v);
+  var sign = v < 0 ? '-' : '';
+  if (_barCo2Unit === 'kg') {
+    return sign + (abs / 1000).toFixed(abs >= 10000 ? 2 : 3) + ' kgCO₂';
+  }
+  return sign + abs.toFixed(0) + ' gCO₂';
+}
+
+
+function barYLabel(v) {
+  if (barMetric === 'co2') return barCo2Fmt(v);
+  var sym  = barMetric === 'cost' ? barCurrency : '';
+  var unit = barMetric === 'kwh'  ? ' kWh' : '';
+  // Use 1 decimal for cost so Chart.js half-unit ticks don't duplicate
+  // e.g. -1.0 and -1.5 both showing as "-£1"
+  var dp = barMetric === 'cost' ? 1 : 0;
+  return (v < 0 ? '-' : '') + sym + Math.abs(v).toFixed(dp) + unit;
+}
+
+function barRender() {
+  if (!barData) return;
+  _setBarLoading(false);   // data's here — clear any "Loading…" overlay
+  // HH (single-day) view: Billing/Calendar toggle is irrelevant — hide it. If the
+  // cached day doesn't match the selected day, fetch it first (async), then this
+  // function is re-entered with data ready.
+  var _calSeg = document.getElementById('bar-cal-seg');
+  if (barPeriod === 'hh') {
+    if (_calSeg) _calSeg.style.display = 'none';
+    if (barHHDataDate !== barHHDate) { barLoadHH(); return; }
+  } else if (_calSeg) {
+    _calSeg.style.display = '';
+  }
+  // Order toggle (Date/Month) is only meaningful for the monthly view
+  var _orderSeg = document.getElementById('bar-order-seg');
+  if (_orderSeg) _orderSeg.style.display = (barPeriod === 'monthly') ? 'inline-flex' : 'none';
+  // Show/hide standing charge toggle (cost mode only)
+  var sw = document.getElementById('bar-standing-wrap');
+  if (sw) sw.style.display = barMetric === 'cost' ? 'flex' : 'none';
+
+  // CO2 null notice — shown when CO2 selected but no data yet
+  var _co2Notice = document.getElementById('bar-co2-notice');
+  if (barMetric === 'co2') {
+    var _hasAnyCo2 = barData.some(function(r){ return r.carbon_g_net != null; });
+    if (!_hasAnyCo2) {
+      if (!_co2Notice) {
+        _co2Notice = document.createElement('div');
+        _co2Notice.id = 'bar-co2-notice';
+        _co2Notice.style.cssText = 'color:var(--muted);font-size:12px;padding:8px 0;';
+        _co2Notice.textContent = 'Carbon recording started in v2.3.0. Historical blocks show no data.';
+        var _wrap = document.getElementById('bar-chart-wrap');
+        if (_wrap && _wrap.parentNode) _wrap.parentNode.insertBefore(_co2Notice, _wrap);
+      }
+      _co2Notice.style.display = '';
+    } else {
+      if (_co2Notice) _co2Notice.style.display = 'none';
+    }
+  } else {
+    if (_co2Notice) _co2Notice.style.display = 'none';
+  }
+
+  // Normalise barDailyMonth before any rendering — barBuildSubBar would fix it
+  // later but barGetDataForPeriod is called first so it must be correct now.
+  if (barPeriod === 'daily') {
+    if (!barCalendar) {
+      // Billing mode: barDailyMonth must be a string bKey
+      var _allBKeys = [...new Set(barData.map(function(r){ return barBillingKey(r).bKey; }))].sort();
+      if (!barDailyMonth || typeof barDailyMonth !== 'string' || _allBKeys.indexOf(barDailyMonth) < 0) {
+        barDailyMonth = _allBKeys.length > 0 ? _allBKeys[_allBKeys.length - 1] : null;
+      }
+    } else {
+      // Calendar mode: barDailyMonth must be an object {year, month}
+      if (!barDailyMonth || typeof barDailyMonth !== 'object') {
+        if (typeof barDailyMonth === 'string') {
+          var _d = new Date(barDailyMonth + 'T00:00:00Z');
+          barDailyMonth = { year: _d.getUTCFullYear(), month: _d.getUTCMonth() + 1 };
+        } else {
+          var _now = new Date();
+          barDailyMonth = { year: _now.getFullYear(), month: _now.getMonth() + 1 };
+        }
+      }
+    }
+  }
+
+  var pd = barGetDataForPeriod();
+  // Set consistent CO2 unit for this render before building datasets or labels
+  if (barMetric === 'co2') barCo2SetUnit(pd.aggList);
+  var datasets = barGetDatasets(pd.labels, pd.aggList);
+  // Month order: shade each bar by its year (older lighter → newer darker) so
+  // adjacent same-month bars from different years are distinguishable. No legend
+  // is needed — the x-axis already carries the month and year.
+  if (pd.monthOrder && pd.bucketYears) barApplyYearGradient(datasets, pd.bucketYears);
+  var ctx = document.getElementById('barChart');
+  var wrap = document.getElementById('bar-chart-wrap');
+  if (barChartInstance) { barChartInstance.destroy(); barChartInstance = null; }
+  // Reset canvas dimensions so Chart.js measures fresh from the container
+  ctx.style.width = ''; ctx.style.height = '';
+  ctx.removeAttribute('width'); ctx.removeAttribute('height');
+  barChartInstance = new Chart(ctx, {
+    type: 'bar',
+    data: { labels: pd.labels, datasets: datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: barGetTheme().tooltipBg,
+          borderColor: barGetTheme().tooltipBorder,
+          borderWidth: 1,
+          titleColor: barGetTheme().tooltipTitle,
+          bodyColor: barGetTheme().tooltipBody,
+          footerColor: barGetTheme().tooltipBody,
+          callbacks: {
+          label: function(c) {
+            var v = c.raw;
+            if (barMetric === 'co2') return ' ' + c.dataset.label + ': ' + barCo2Fmt(v);
+            var sym = barMetric==='cost' ? barCurrency : '';
+            var unit = barMetric==='kwh' ? ' kWh' : '';
+            return ' ' + c.dataset.label + ': ' + (v<0?'-':'') + sym + Math.abs(v).toFixed(barMetric==='cost'?2:3) + unit;
+          },
+          footer: function(items) {
+            if (items.length === 0) return '';
+            var idx = items[0].dataIndex;
+            var agg = barGetDataForPeriod().aggList[idx];
+            if (!agg) return '';
+            if (barMetric === 'co2') {
+              if (barView === 'net') return '';
+              var net = agg.carbon_g_net; var tot = agg.carbon_g_total;
+              return '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nNet: ' + barCo2Fmt(net) + '  Total: ' + barCo2Fmt(tot);
+            }
+            var sym = barMetric==='cost' ? barCurrency : '';
+            var unit = barMetric==='kwh' ? ' kWh' : '';
+            var imp = barMetric === 'kwh' ? agg.imp_kwh : (agg.imp_cost + barStandingVal(agg));
+            var exp = barMetric === 'kwh' ? agg.exp_kwh : agg.exp_cost;
+            var net = imp - exp;
+            var dp = barMetric === 'cost' ? 2 : 3;
+            var netStr = (net < 0 ? '-' : '') + sym + Math.abs(net).toFixed(dp) + unit;
+            var impStr = sym + imp.toFixed(dp) + unit;
+            var expStr = sym + exp.toFixed(dp) + unit;
+            if (barView === 'net') return '';
+            return '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nImport: ' + impStr + '  Export: ' + expStr + '\nNet: ' + netStr;
+          }
+        }}
+      },
+      scales: {
+        x: { stacked: true, grid: { display: false }, ticks: { font:{size:11}, color:barGetTheme().axisC, autoSkip: true, maxRotation: 45 } },
+        y: { stacked: true, grid: { color:barGetTheme().gridC },
+             ticks: { font:{size:11}, color:barGetTheme().axisC, callback: barYLabel, maxTicksLimit: 8 },
+             grace: '2%' }
+      }
+    }
+  });
+  barBuildLegend();
+  barBuildSubBar();
+  barBuildTable();
+}
+
+function barBuildLegend() {
+  var el = document.getElementById('bar-legend');
+  el.innerHTML = '';
+  function dot(color, label) {
+    return '<span style="display:flex;align-items:center;gap:5px;"><span class="bar-legend-dot" style="background:' + color + '"></span>' + label + '</span>';
+  }
+  if (barView === 'net') {
+    if (barMetric === 'co2') {
+      el.innerHTML = dot(barMeters[0]&&barMeters[0].color||'#1f77b4','Net emitting') + dot(barExportColor,'Net offsetting');
+    } else {
+      el.innerHTML = dot(barMeters[0]&&barMeters[0].color||'#1f77b4','Net import') + dot(barExportColor,'Net export');
+    }
+    return;
+  }
+  if (barMetric === 'co2') {
+    barMeters.forEach(function(m) { el.innerHTML += dot(m.color, m.label + ' carbon'); });
+    el.innerHTML += dot(barExportColor, 'Export offset');
+    return;
+  }
+  barMeters.forEach(function(m) { el.innerHTML += dot(m.color, m.label + ' import'); });
+  if (barMetric === 'cost' && barIncStanding()) { el.innerHTML += dot('#4b5563', 'Standing charge'); }
+  el.innerHTML += dot(barExportColor, 'Export');
+}
+
+// ── Year gradient (month-ordered monthly view) ──────────────────────────────
+function barParseColor(col) {
+  if (typeof col !== 'string') return null;
+  col = col.trim();
+  if (col[0] === '#') {
+    var h = col.slice(1);
+    if (h.length === 3) h = h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+    if (h.length >= 6) return { r:parseInt(h.slice(0,2),16), g:parseInt(h.slice(2,4),16), b:parseInt(h.slice(4,6),16), a:1 };
+  }
+  var m = col.match(/rgba?\(([^)]+)\)/);
+  if (m) { var p = m[1].split(',').map(function(x){ return parseFloat(x); }); return { r:p[0], g:p[1], b:p[2], a:(p[3]==null?1:p[3]) }; }
+  return null;
+}
+function barMixWhite(col, t) {
+  // t in [0,1]: 0 = original colour, 1 = white
+  var c = barParseColor(col); if (!c) return col;
+  var r = Math.round(c.r + (255-c.r)*t),
+      g = Math.round(c.g + (255-c.g)*t),
+      b = Math.round(c.b + (255-c.b)*t);
+  return 'rgba(' + r + ',' + g + ',' + b + ',' + (c.a==null?1:c.a) + ')';
+}
+function barApplyYearGradient(datasets, years) {
+  var uniq = [...new Set(years)].sort(function(a,b){ return a-b; });
+  var minY = uniq[0], maxY = uniq[uniq.length-1];
+  var span = Math.max(1, maxY - minY);
+  datasets.forEach(function(ds) {
+    var base = ds.backgroundColor;
+    ds.backgroundColor = years.map(function(y, i) {
+      var c = Array.isArray(base) ? base[i] : base;   // preserve per-point colours (e.g. Net view)
+      var t = ((maxY - y) / span) * 0.6;              // oldest year lightened up to 60% toward white
+      return barMixWhite(c, t);
+    });
+  });
+}
+
+// ── Rolodex stepper for the daily period navigator ──────────────────────────
+function barStepDaily(delta) {
+  if (!delta) return;
+  if (!barCalendar) {
+    var keys = [...new Set(barData.map(function(r){ return barBillingKey(r).bKey; }))].sort();
+    if (!keys.length) return;
+    var i = keys.indexOf(barDailyMonth);
+    if (i < 0) i = keys.length - 1;
+    var ni = Math.min(keys.length - 1, Math.max(0, i + delta));
+    if (ni !== i) { barDailyMonth = keys[ni]; barSaveState(); barRender(); }
+  } else {
+    if (typeof barDailyMonth === 'string') {
+      var d = new Date(barDailyMonth + 'T00:00:00Z');
+      barDailyMonth = { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1 };
+    }
+    if (!barDailyMonth || typeof barDailyMonth !== 'object') {
+      var n = new Date(); barDailyMonth = { year: n.getFullYear(), month: n.getMonth() + 1 };
+    }
+    // Clamp to the available calendar-month range so scrolling can't run off into empty months.
+    var lo = null, hi = null;
+    barData.forEach(function(r){
+      var ym = r.year*12 + (r.month-1);
+      if (lo === null || ym < lo) lo = ym;
+      if (hi === null || ym > hi) hi = ym;
+    });
+    var cur = barDailyMonth.year*12 + (barDailyMonth.month-1);
+    var tgt = cur + delta;
+    if (lo !== null) tgt = Math.min(hi, Math.max(lo, tgt));
+    if (tgt !== cur) {
+      barDailyMonth = { year: Math.floor(tgt/12), month: (tgt%12) + 1 };
+      barSaveState(); barRender();
+    }
+  }
+}
+// ── HH (half-hour) single-day view ──────────────────────────────────────────
+// Short date label for the day rolodex, e.g. "Sun, 2 Aug 2026".
+function barHHLabel(ds) {
+  try { return new Date(ds + 'T00:00:00').toLocaleDateString(undefined,
+    { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' }); }
+  catch(e) { return ds; }
+}
+// Day list for the shared rolodex: every day from the earliest data day (or the
+// selected day, whichever is older) up to today, newest at the top — mirroring
+// barGetPeriods so PeriodSpinner behaves identically to the other periods.
+function barHHGetPeriods() {
+  var today = barTodayStr(), earliest = today;
+  if (barData && barData.length) {
+    earliest = barData.reduce(function(a, r) {
+      var s = r.year + '-' + String(r.month).padStart(2,'0') + '-' + String(r.day).padStart(2,'0');
+      return s < a ? s : a;
+    }, today);
+  }
+  if (barHHDate < earliest) earliest = barHHDate;
+  var list = [], curIdx = -1;
+  var d = new Date(earliest + 'T00:00:00'), end = new Date(today + 'T00:00:00');
+  while (d <= end) {
+    var ds = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+    if (ds === barHHDate) curIdx = list.length;
+    list.push({ label: barHHLabel(ds), value: ds });
+    d.setDate(d.getDate() + 1);
+  }
+  if (curIdx < 0) curIdx = list.length - 1;
+  list.reverse(); curIdx = list.length - 1 - curIdx;   // newest first (top of the wheel)
+  return { list: list, curIdx: curIdx };
+}
+function barHHSelect(v) { if (v && v !== barHHDate) { barHHDate = v; barSaveState(); barLoadHH(); } }
+function barMakeHHRolodex(lbl) { PeriodSpinner.attach(lbl, { getPeriods: barHHGetPeriods, onSelect: barHHSelect }); }
+// Step the HH day by ±delta days (clamped so we never view a future day).
+function barStepHH(delta) {
+  if (!delta) return;
+  var d = new Date(barHHDate + 'T00:00:00');
+  d.setDate(d.getDate() + delta);
+  var ns = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+  var today = barTodayStr();
+  if (ns > today) ns = today;
+  if (ns === barHHDate) return;
+  barHHDate = ns; barSaveState(); barLoadHH();
+}
+// Fetch the 48-slot breakdown for barHHDate, then render. Uses the same
+// billing-accurate endpoint the daily/monthly/yearly views roll up from.
+async function barLoadHH() {
+  try {
+    var r = await fetch(apiUrl('/api/charts/blocks-day?date=' + encodeURIComponent(barHHDate)));
+    var j = await r.json();
+    if (j.error) throw new Error(j.error);
+    barHHRows     = j.rows || [];
+    barHHDataDate = barHHDate;
+    if (j.currency) barCurrency = j.currency;
+    if (j.block_minutes) barBlockMinutes = j.block_minutes;
+    var _prevErr = document.getElementById('bar-load-error');
+    if (_prevErr) _prevErr.remove();
+    barRender();
+  } catch(e) {
+    var _errDiv = document.getElementById('bar-load-error') || document.createElement('div');
+    _errDiv.id = 'bar-load-error';
+    _errDiv.style.cssText = 'color:var(--danger);padding:20px;';
+    _errDiv.textContent = 'Failed to load half-hourly data: ' + e.message;
+    document.getElementById('chart-bar').appendChild(_errDiv);
+  }
+}
+// Sorted list of billing-period keys present in the data.
+function barDailyKeys() {
+  return [...new Set(barData.map(function(r){ return barBillingKey(r).bKey; }))].sort();
+}
+// "3 Jul – 2 Aug 2026" style range label for a billing-period key. Self-contained
+// so the drag-preview can render any period without committing to it.
+function barBillingRangeLabel(bk) {
+  if (!bk) return '—';
+  var periodRows = barData.filter(function(r){ return barBillingKey(r).bKey === bk; });
+  if (!periodRows.length) return bk;
+  var sorted = periodRows.slice().sort(function(a,b){
+    return (a.year*10000+a.month*100+a.day)-(b.year*10000+b.month*100+b.day);
+  });
+  var first = sorted[0];
+  var fStr = first.day + ' ' + MONTHS_SHORT[first.month-1];
+  var endStr;
+  if (first.billing_period_end) {
+    var epd = new Date(first.billing_period_end + 'T00:00:00Z');
+    epd.setUTCDate(epd.getUTCDate() - 1); // exclusive→inclusive
+    endStr = epd.getUTCDate() + ' ' + MONTHS_SHORT[epd.getUTCMonth()] + ' ' + epd.getUTCFullYear();
+  } else {
+    var keys = barDailyKeys();
+    var idx = keys.indexOf(bk);
+    if (idx >= 0 && idx + 1 < keys.length) {
+      var nextD = new Date(keys[idx + 1] + 'T00:00:00Z');
+      nextD.setUTCDate(nextD.getUTCDate() - 1);
+      endStr = nextD.getUTCDate() + ' ' + MONTHS_SHORT[nextD.getUTCMonth()] + ' ' + nextD.getUTCFullYear();
+    } else {
+      var bkDate  = new Date(bk + 'T00:00:00Z');
+      var bd      = first.billing_day || barBillingDay;
+      var bkDay   = bkDate.getUTCDate();
+      var bkMonth = bkDate.getUTCMonth() + 1;
+      var bkYear  = bkDate.getUTCFullYear();
+      var endM, endY;
+      if (bkDay < bd) { endM = bkMonth; endY = bkYear; }
+      else { endM = bkMonth + 1; endY = bkYear; if (endM > 12) { endM = 1; endY++; } }
+      var endDay = bd - 1;
+      if (endDay < 1) { endM--; if (endM < 1) { endM = 12; endY--; } endDay = new Date(endY, endM, 0).getDate(); }
+      endStr = endDay + ' ' + MONTHS_SHORT[endM-1] + ' ' + endY;
+    }
+  }
+  return fStr + ' – ' + endStr;
+}
+
+// --- Rolodex scroll sensitivity -------------------------------------------
+// TRACKPAD two-finger scroll and MOUSE WHEEL both come through the `wheel`
+// handler below. It's a proportional scrubber: accumulate scroll distance and
+// move one month per BAR_WHEEL_THRESHOLD px, carrying any remainder forward, so
+// a small nudge moves one month and a longer swipe moves several — no time
+// throttle. LOWER the threshold = MORE sensitive (fewer px per month).
+// (BAR_DRAG_STEP only affects click-and-drag with the button held down.)
+var _barWheelAcc = 0;      // accumulated wheel delta (module-scope: element is recreated each render)
+var _barWheelLast = 0;     // timestamp of last wheel event (to detect a gesture pause)
+var BAR_WHEEL_THRESHOLD = 50;   // normalized px of scroll per month step (lower = more sensitive)
+var BAR_WHEEL_MAX_STEPS = 6;    // cap months moved by a single event, so a hard flick can't rocket away
+var BAR_DRAG_STEP = 44;         // px of click-drag needed per month step (does NOT affect scrolling)
+function barGetPeriods() {
+  var list = [], curIdx = -1;
+  if (!barData || !barData.length) return { list: list, curIdx: -1 };
+  if (!barCalendar) {
+    var keys = barDailyKeys();
+    keys.forEach(function (k, i) { if (k === barDailyMonth) curIdx = i; list.push({ label: barBillingRangeLabel(k), value: k }); });
+  } else {
+    var lo = null, hi = null;
+    barData.forEach(function (r) { var ym = r.year * 12 + (r.month - 1); if (lo === null || ym < lo) lo = ym; if (hi === null || ym > hi) hi = ym; });
+    var cur;
+    if (typeof barDailyMonth === 'object' && barDailyMonth) cur = barDailyMonth.year * 12 + (barDailyMonth.month - 1);
+    else { var nn = new Date(); cur = nn.getFullYear() * 12 + nn.getMonth(); }
+    for (var m = lo; m <= hi; m++) { if (m === cur) curIdx = list.length; list.push({ label: MONTHS_SHORT[m % 12] + ' ' + Math.floor(m / 12), value: m }); }
+  }
+  if (curIdx < 0) curIdx = list.length - 1;
+  list.reverse(); curIdx = list.length - 1 - curIdx;   // newest first (top of the wheel)
+  return { list: list, curIdx: curIdx };
+}
+function barSelectPeriod(v) {
+  if (!barCalendar) { if (v !== barDailyMonth) { barDailyMonth = v; barSaveState(); barRender(); } }
+  else { barDailyMonth = { year: Math.floor(v / 12), month: (v % 12) + 1 }; barSaveState(); barRender(); }
+}
+function barMakeRolodex(lbl) {
+  PeriodSpinner.attach(lbl, { getPeriods: barGetPeriods, onSelect: barSelectPeriod });
+}
+
+function barBuildSubBar() {
+  var bar = document.getElementById('bar-sub-bar');
+  bar.innerHTML = '';
+  if (barPeriod === 'hh') {
+    // Day navigator using the SAME shared rolodex (PeriodSpinner) as the other
+    // periods — so hover-scroll shows the ±4-day preview and scrolls in the same
+    // direction. Arrows step a day; a calendar button jumps to any date.
+    var today = barTodayStr();
+    var prev = document.createElement('button');
+    prev.className = 'bar-nav-btn'; prev.textContent = '←';
+    prev.title = 'Previous day';
+    prev.onclick = function() { barStepHH(-1); };
+
+    var lbl = document.createElement('span');
+    lbl.className = 'bar-period-label';
+    lbl.textContent = barHHLabel(barHHDate) + (barHHDate === today ? ' · today' : '');
+    barMakeHHRolodex(lbl);
+
+    var next = document.createElement('button');
+    next.className = 'bar-nav-btn'; next.textContent = '→';
+    next.title = 'Next day';
+    next.disabled = (barHHDate >= today);
+    next.onclick = function() { barStepHH(1); };
+
+    // Calendar jump: a small button that opens the native date picker for
+    // arbitrary dates (scrolling day-by-day through months would be tedious).
+    var calWrap = document.createElement('span');
+    calWrap.style.cssText = 'position:relative;display:inline-flex;';
+    var calBtn = document.createElement('button');
+    calBtn.className = 'bar-nav-btn'; calBtn.textContent = '📅';
+    calBtn.title = 'Jump to a date';
+    var calInp = document.createElement('input');
+    calInp.type = 'date'; calInp.value = barHHDate; calInp.max = today;
+    calInp.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;opacity:0;pointer-events:none;';
+    calBtn.onclick = function() {
+      calInp.value = barHHDate;
+      if (calInp.showPicker) { try { calInp.showPicker(); return; } catch(e) {} }
+      calInp.style.pointerEvents = 'auto'; calInp.focus(); calInp.click();
+    };
+    calInp.onchange = function() {
+      if (!calInp.value) return;
+      barHHDate = calInp.value > today ? today : calInp.value;
+      barSaveState(); barLoadHH();
+    };
+    calWrap.appendChild(calBtn); calWrap.appendChild(calInp);
+
+    bar.appendChild(prev); bar.appendChild(lbl); bar.appendChild(next); bar.appendChild(calWrap);
+    return;
+  }
+  if (barPeriod === 'daily') {
+    if (!barCalendar) {
+      // Billing mode: navigate between bKey values (billing period start dates)
+      var allBKeys = [...new Set(barData.map(function(r){ return barBillingKey(r).bKey; }))].sort();
+      // barDailyMonth may be an object (from calendar mode) or a string not in allBKeys — reset if so
+      if (!barDailyMonth || typeof barDailyMonth !== 'string' || allBKeys.indexOf(barDailyMonth) < 0) {
+        barDailyMonth = allBKeys.length > 0 ? allBKeys[allBKeys.length - 1] : null;
+      }
+      var curIdx = allBKeys.indexOf(barDailyMonth);
+
+      var prev = document.createElement('button'); prev.className = 'bar-nav-btn'; prev.textContent = '\u2190';
+      prev.disabled = (curIdx <= 0);
+      prev.onclick = function() { barStepDaily(-1); };
+
+      var lbl = document.createElement('span'); lbl.className = 'bar-period-label';
+      barMakeRolodex(lbl);
+      var periodRows = barData.filter(function(r){ return barBillingKey(r).bKey === barDailyMonth; });
+      if (periodRows.length > 0 && barDailyMonth) {
+        var sorted = periodRows.slice().sort(function(a,b){
+          return (a.year*10000+a.month*100+a.day)-(b.year*10000+b.month*100+b.day);
+        });
+        var first = sorted[0];
+        var fStr = first.day + ' ' + MONTHS_SHORT[first.month-1];
+        // End date: use billing_period_end from server if available (authoritative,
+        // handles truncated periods). Fall back to nextBKey or bd arithmetic.
+        var endStr;
+        if (first.billing_period_end) {
+          var epd = new Date(first.billing_period_end + 'T00:00:00Z');
+          epd.setUTCDate(epd.getUTCDate() - 1); // exclusive→inclusive
+          endStr = epd.getUTCDate() + ' ' + MONTHS_SHORT[epd.getUTCMonth()] + ' ' + epd.getUTCFullYear();
+        } else if (curIdx + 1 < allBKeys.length) {
+          var nextD = new Date(allBKeys[curIdx + 1] + 'T00:00:00Z');
+          nextD.setUTCDate(nextD.getUTCDate() - 1);
+          endStr = nextD.getUTCDate() + ' ' + MONTHS_SHORT[nextD.getUTCMonth()] + ' ' + nextD.getUTCFullYear();
+        } else {
+          var bkDate  = new Date(barDailyMonth + 'T00:00:00Z');
+          var bd      = first.billing_day || barBillingDay;
+          var bkDay   = bkDate.getUTCDate();
+          var bkMonth = bkDate.getUTCMonth() + 1;
+          var bkYear  = bkDate.getUTCFullYear();
+          var endM, endY;
+          if (bkDay < bd) {
+            endM = bkMonth; endY = bkYear;
+          } else {
+            endM = bkMonth + 1; endY = bkYear;
+            if (endM > 12) { endM = 1; endY++; }
+          }
+          var endDay = bd - 1;
+          if (endDay < 1) {
+            endM--; if (endM < 1) { endM = 12; endY--; }
+            endDay = new Date(endY, endM, 0).getDate();
+          }
+          endStr = endDay + ' ' + MONTHS_SHORT[endM-1] + ' ' + endY;
+        }
+        lbl.textContent = fStr + ' \u2013 ' + endStr;
+      } else {
+        lbl.textContent = barDailyMonth || '\u2014';
+      }
+      var next = document.createElement('button'); next.className = 'bar-nav-btn'; next.textContent = '\u2192';
+      next.disabled = (curIdx >= allBKeys.length - 1);
+      next.onclick = function() { barStepDaily(1); };
+
+      bar.appendChild(prev); bar.appendChild(lbl); bar.appendChild(next);
+    } else {
+      // Calendar mode: navigate by year+month
+      if (!barDailyMonth || typeof barDailyMonth !== 'object') {
+        var now2 = new Date();
+        barDailyMonth = { year: now2.getFullYear(), month: now2.getMonth() + 1 };
+      }
+      var prev = document.createElement('button'); prev.className = 'bar-nav-btn'; prev.textContent = '\u2190';
+      prev.onclick = function() { barStepDaily(-1); };
+      var lbl = document.createElement('span'); lbl.className = 'bar-period-label';
+      barMakeRolodex(lbl);
+      var _dm = typeof barDailyMonth === 'object' ? barDailyMonth : { year: parseInt(barDailyMonth), month: parseInt(barDailyMonth.slice(5,7)) };
+      lbl.textContent = MONTHS_SHORT[_dm.month-1] + ' ' + _dm.year;
+      var next = document.createElement('button'); next.className = 'bar-nav-btn'; next.textContent = '\u2192';
+      next.onclick = function() { barStepDaily(1); };
+      bar.appendChild(prev); bar.appendChild(lbl); bar.appendChild(next);
+    }  } else {
+    var lbl2 = document.createElement('span');
+    lbl2.style.cssText = 'font-size:12px;color:var(--muted);margin-right:4px;';
+    lbl2.textContent = 'Years:';
+    bar.appendChild(lbl2);
+    var years = barGetYears();
+    years.forEach(function(y) {
+      var i = years.indexOf(y);
+      var on = barActiveYears.has(y);
+      var color = barMeters[0] ? barMeters[0].color : '#1f77b4';
+      var btn = document.createElement('button');
+      btn.className = 'bar-year-btn';
+      btn.textContent = String(y);
+      if (on) { btn.style.borderColor = color; btn.style.background = color+'22'; btn.style.color = color; }
+      btn.onclick = function() {
+        if (barActiveYears.has(y) && barActiveYears.size === 1) return;
+        barActiveYears.has(y) ? barActiveYears.delete(y) : barActiveYears.add(y);
+        barSaveState();
+        barRender();
+      };
+      bar.appendChild(btn);
+    });
+  }
+}
+
+function barFmt(v, forCopy) {
+  if (barMetric === 'co2') return barCo2Fmt(v, forCopy);
+  var sym = barMetric === 'cost' ? barCurrency : '';
+  var unit = barMetric === 'kwh' ? ' kWh' : '';
+  var abs = Math.abs(v);
+  var str = sym + abs.toFixed(barMetric==='cost'?2:3) + unit;
+  return (v < 0 ? '-' : '') + str;
+}
+
+function barPeriodLabel(lbl, idx, pd) {
+  if (barPeriod === 'hh') {
+    // Slot label is the half-hour start time (e.g. "14:30"); show it as a range.
+    if (pd && pd.aggList && pd.aggList[idx] && pd.aggList[idx].label) return pd.aggList[idx].label;
+    return lbl;
+  }
+  if (barPeriod === 'daily') {
+    var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    // Use rawDates if available (billing mode may span multiple calendar months)
+    if (pd && pd.rawDates && pd.rawDates[idx]) {
+      var d = pd.rawDates[idx];
+      return d.day + ' ' + MONTHS[d.month - 1] + ' ' + d.year;
+    }
+    var _bmd = barDailyMonth && typeof barDailyMonth === 'string' ? { year: parseInt(barDailyMonth), month: parseInt(barDailyMonth.slice(5,7)) } : (barDailyMonth || { year: new Date().getFullYear(), month: new Date().getMonth()+1 });
+    return lbl + ' ' + MONTHS[_bmd.month - 1] + ' ' + _bmd.year;
+  }
+  if (barPeriod === 'monthly') {
+    var _bmy = barDailyMonth && typeof barDailyMonth === 'string' ? barDailyMonth.slice(0,4) : (barDailyMonth ? String(barDailyMonth.year) : '');
+    if (lbl.indexOf(' ') === -1) return lbl + ' ' + _bmy;
+    return lbl;
+  }
+  return lbl;
+}
+
+function barBuildTable() {
+  var tbl = document.getElementById('bar-table');
+  if (!tbl || !barData) return;
+  var pd = barGetDataForPeriod();
+  var aggList = pd.aggList;
+  var labels  = pd.labels;
+
+  // Build column headers
+  var cols = []; // [{key, label}]
+  if (barView === 'net') {
+    cols.push({key:'net_imp', label: barMetric==='co2' ? 'Import CO₂' : 'Import'});
+    cols.push({key:'net_exp', label: barMetric==='co2' ? 'Export offset' : 'Export', color: barExportColor});
+    if (barMetric === 'co2') cols.push({key:'avg_intensity', label:'Avg intensity'});
+  } else {
+    if (barMetric === 'co2') {
+      barMeters.forEach(function(m) { cols.push({key:'co2_imp_'+m.id, label: m.label + ' carbon', mid: m.id, color: m.color}); });
+      cols.push({key:'co2_exp', label:'Export offset', color: barExportColor});
+      cols.push({key:'avg_intensity', label:'Avg intensity'});
+    } else {
+      barMeters.forEach(function(m) { cols.push({key:'imp_'+m.id, label: m.label + ' import', mid: m.id, dir:'imp', color: m.color}); });
+      if (barMetric === 'cost' && barIncStanding()) cols.push({key:'standing', label:'Standing charge', color:'#4b5563'});
+      cols.push({key:'exp', label:'Export', dir:'exp', color: barExportColor});
+    }
+  }
+
+  var sym = barMetric === 'cost' ? barCurrency : '';
+  var unit = barMetric === 'kwh' ? ' kWh' : '';
+
+  function cellVal(agg, col) {
+    if (col.key === 'net') {
+      if (barMetric === 'co2') return agg.carbon_g_net != null ? agg.carbon_g_net : null;
+      var imp = barMetric === 'kwh' ? agg.imp_kwh : (agg.imp_cost + barStandingVal(agg));
+      var exp = barMetric === 'kwh' ? agg.exp_kwh : agg.exp_cost;
+      return imp - exp;
+    }
+    if (col.key === 'net_imp') {
+      // Net view = gross import vs gross export, netting to Total (carbon_g_net),
+      // identical in shape to the kWh/£ Net columns. For CO2 the gross import
+      // carbon is the main meter's carbon_g_imp (sub-meters draw through it and
+      // carry no carbon_g_imp, so the sum collapses to the main's figure).
+      // Using the net-positive split here was the bug: it forced import to 0 on
+      // any net-offsetting day and to the net (not gross) value otherwise.
+      if (barMetric === 'co2') {
+        return Object.values(agg.meters||{}).reduce(function(s,m){ return s+(m.carbon_g_imp||0); }, 0);
+      }
+      return barMetric === 'kwh' ? (agg.imp_kwh || 0) : ((agg.imp_cost || 0) + barStandingVal(agg));
+    }
+    if (col.key === 'net_exp') {
+      if (barMetric === 'co2') {
+        return Object.values(agg.meters||{}).reduce(function(s,m){ return s+(m.carbon_g_exp||0); }, 0);
+      }
+      return barMetric === 'kwh' ? (agg.exp_kwh || 0) : (agg.exp_cost || 0);
+    }
+    if (col.key === 'co2_total') return agg.carbon_g_total != null ? agg.carbon_g_total : null;
+    if (col.key === 'avg_intensity') return agg.avg_intensity != null ? agg.avg_intensity : null;
+    if (col.key === 'standing') return barStandingVal(agg);
+    if (col.key === 'exp') {
+      var expVal = barMetric === 'kwh'
+        ? Object.values(agg.meters||{}).reduce(function(s,m){return s+m.exp_kwh;},0)
+        : Object.values(agg.meters||{}).reduce(function(s,m){return s+m.exp_cost;},0);
+      return -expVal;
+    }
+    // CO2 export offset column
+    if (col.key === 'co2_exp') {
+      var expCarbon = Object.values(agg.meters||{}).reduce(function(s,m){ return s+(m.carbon_g_exp||0); }, 0);
+      return expCarbon > 0 ? -expCarbon : null;
+    }
+    // per-meter (co2 import or kwh/cost import)
+    var m = (agg.meters||{})[col.mid];
+    if (!m) return barMetric === 'co2' ? null : 0;
+    if (barMetric === 'co2') {
+      // Each meter's import-side carbon contribution:
+      //   main meter -> carbon_g is the DIRECT remainder (import carbon minus
+      //                 the sub-meters that draw through it)
+      //   sub-meters -> carbon_g is their gross import carbon (no export)
+      // carbon_g_imp is the main's *un-subtracted* gross import and must NOT be
+      // used here — it already contains the sub carbon, so reading it would
+      // double-count the subs against the Direct column (and inflate the row
+      // Total). This matches barVal()'s chart logic and the Insights page.
+      var cgi = m.carbon_g;
+      return cgi != null ? cgi : null;
+    }
+    return barMetric === 'kwh' ? m.imp_kwh : m.imp_cost;
+  }
+
+  // Build HTML — add Total column header
+  var html = '<thead><tr><th style="cursor:pointer;user-select:none;" onclick="barToggleSort()" title="Click to change sort order">Period <span id="bar-sort-arrow">' + (barSortDesc ? '↓' : '↑') + '</span></th>';
+  cols.forEach(function(c){
+    var dotHtml = c.color ? '<span class="bar-legend-dot" style="background:' + c.color + ';margin-right:5px;"></span>' : '';
+    html += '<th>' + dotHtml + c.label + '</th>';
+  });
+  html += '<th class="col-total">Total</th>';
+  html += '</tr>';
+  // Totals header row — built after data rows, inserted into thead
+  var _totalsHtml = '';
+  html += '</thead><tbody>';
+  var rowIndices = labels.map(function(_,i){return i;});
+  if (barSortDesc) rowIndices = rowIndices.slice().reverse();
+
+  var colTotals = {};
+  cols.forEach(function(c){ colTotals[c.key] = 0; });
+  var grandTotal = 0;
+
+  rowIndices.forEach(function(i) {
+    var lbl = labels[i];
+    var agg = aggList[i];
+    var rowTotal = 0;
+    html += '<tr><td>' + barPeriodLabel(lbl, i, pd) + '</td>';
+    var _rowHasVal = false;
+    cols.forEach(function(c) {
+      var v = cellVal(agg, c);
+      var fmtd;
+      if (c.key === 'avg_intensity') {
+        // Intensity is not summed into row total and shows as gCO₂/kWh
+        fmtd = v != null ? (Math.round(v * 10) / 10) + ' gCO₂/kWh' : '—';
+        if (v != null) _rowHasVal = true;
+      } else {
+        if (v != null) {
+          // Round to display precision before accumulating so column totals
+          // match the sum of displayed cell values
+          var vr = barMetric === 'cost' ? (Math.round(v * 10000) / 10000)
+                 : barMetric === 'kwh'  ? (Math.round(v * 1000)  / 1000)
+                 : v;
+          colTotals[c.key] = (colTotals[c.key] || 0) + vr;
+          if (c.key === 'net_imp') rowTotal += vr;
+          else if (c.key === 'net_exp') rowTotal -= vr;
+          else if (c.key !== 'avg_intensity') rowTotal += vr;
+          _rowHasVal = true;
+        }
+        fmtd = v != null ? barFmt(v) : '—';
+      }
+      html += '<td>' + fmtd + '</td>';
+    });
+    // In cost mode use agg.net_cost directly — it is pre-rounded per day and
+    // summed consistently. Re-deriving from column vr values gives a different
+    // result because column values are rounded independently then summed.
+    // net_cost bakes in the standing charge (server: imp + standing − exp), so
+    // when "Inc. standing charge" is unchecked we subtract it back out — otherwise
+    // the Total/grand-total ignored the toggle (issue #255).
+    var _sc = barMetric === 'cost' && !barIncStanding() ? (agg.standing || 0) : 0;
+    var rowTotalFmt = barMetric === 'cost'
+      ? (agg.net_cost != null ? Math.round((agg.net_cost - _sc) * 100) / 100 : Math.round(rowTotal * 100) / 100)
+      : barMetric === 'kwh' ? (Math.round(rowTotal * 1000) / 1000)
+      : rowTotal;
+    if (_rowHasVal) grandTotal += rowTotalFmt;
+    html += '<td class="col-total">' + (_rowHasVal ? barFmt(rowTotalFmt) : '—') + '</td>';
+    html += '</tr>';
+  });
+
+  // Totals row
+  // For avg_intensity: compute weighted average across all aggs rather than summing
+  var _totalIntensityCarbon = 0, _totalIntensityKwh = 0;
+  if (colTotals['avg_intensity'] !== undefined) {
+    aggList.forEach(function(agg) {
+      if (agg.avg_intensity != null && agg.carbon_g_net != null) {
+        var absKwh = agg.imp_kwh > 0 || agg.exp_kwh > 0
+          ? Math.abs(agg.imp_kwh - agg.exp_kwh) : 0;
+        _totalIntensityCarbon += Math.abs(agg.carbon_g_net || 0);
+        _totalIntensityKwh   += absKwh;
+      }
+    });
+  }
+  // Build totals as second thead row for sticky visibility
+  _totalsHtml = '<tr class="totals-row"><td style="font-weight:600;">Totals</td>';
+  cols.forEach(function(c) {
+    if (c.key === 'avg_intensity') {
+      var _ai = _totalIntensityKwh > 0
+        ? Math.round((_totalIntensityCarbon / _totalIntensityKwh) * 10) / 10
+        : null;
+      _totalsHtml += '<td>' + (_ai != null ? _ai + ' gCO₂/kWh' : '—') + '</td>';
+    } else {
+      var tot = colTotals[c.key];
+      if (tot != null) {
+        tot = barMetric === 'cost' ? (Math.round(tot * 100) / 100)
+            : barMetric === 'kwh'  ? (Math.round(tot * 1000) / 1000)
+            : tot;
+      }
+      _totalsHtml += '<td>' + (tot != null ? barFmt(tot) : '—') + '</td>';
+    }
+  });
+  var grandTotalFmt = barMetric === 'cost' ? (Math.round(grandTotal * 100) / 100)
+                    : barMetric === 'kwh'  ? (Math.round(grandTotal * 1000) / 1000)
+                    : grandTotal;
+  // In cost mode, use sum of per-bucket net_cost values for grand total.
+  // net_cost per bucket = sum of daily net_cost values (pre-rounded per day).
+  // This ensures: parts sum to daily total, daily totals sum to period total.
+  if (barMetric === 'cost') {
+    var _netSum = 0;
+    var _incSc = barIncStanding();
+    aggList.forEach(function(agg) {
+      _netSum += (agg.net_cost || 0) - (_incSc ? 0 : (agg.standing || 0));
+    });
+    grandTotalFmt = Math.round(_netSum * 100) / 100;
+  }
+  _totalsHtml += '<td class="col-total">' + barFmt(grandTotalFmt) + '</td>';
+  _totalsHtml += '</tr>';
+
+  html += '</tbody>';
+  // Insert totals row as second row in thead
+  html = html.replace('</tr></thead>', '</tr>' + _totalsHtml + '</thead>');
+  tbl.innerHTML = html;
+}
+
+function barToggleSort() {
+  barSortDesc = !barSortDesc;
+  localStorage.setItem(EMT.lsKey('emt_bar_sort_desc'), barSortDesc ? 'true' : 'false');
+  var btn = document.getElementById('bar-sort-btn');
+  if (btn) btn.textContent = barSortDesc ? '↓ Latest first' : '↑ Oldest first';
+  var arrow = document.getElementById('bar-sort-arrow');
+  if (arrow) arrow.textContent = barSortDesc ? '↓' : '↑';
+  barBuildTable();
+}
+
+function barCopyTable() {
+  var tbl = document.getElementById('bar-table');
+  if (!tbl) return;
+  var lines = [];
+  tbl.querySelectorAll('tr').forEach(function(row) {
+    var cells = [];
+    row.querySelectorAll('th,td').forEach(function(cell){ cells.push(cell.textContent.trim()); });
+    lines.push(cells.join('\t'));
+  });
+  var text = lines.join('\n');
+
+  function onSuccess() {
+    var btn = document.getElementById('bar-copy-btn');
+    if (btn) { btn.textContent = '✓ Copied'; setTimeout(function(){ btn.textContent = '⎘ Copy to clipboard'; }, 2000); }
+  }
+
+  // Always use the execCommand fallback — works over HTTP and in iframes
+  var ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.style.cssText = 'position:fixed;top:0;left:0;width:2em;height:2em;padding:0;border:none;outline:none;box-shadow:none;background:transparent;opacity:0;';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  ta.setSelectionRange(0, ta.value.length);
+  var ok = false;
+  try { ok = document.execCommand('copy'); } catch(e) {}
+  document.body.removeChild(ta);
+  if (ok) { onSuccess(); return; }
+
+  // Try modern API as fallback (HTTPS only)
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(onSuccess).catch(function(){});
+  }
+}
+
+function barGetTheme() {
+  var dark = document.documentElement.getAttribute('data-theme') !== 'light';
+  return {
+    axisC:  dark ? '#6b7080' : '#555566',
+    gridC:  dark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.08)',
+    tooltipBg: dark ? '#1a1d27' : '#ffffff',
+    tooltipBorder: dark ? '#2a2d3a' : '#dddddd',
+    tooltipTitle: dark ? '#e8eaf0' : '#1a1a2e',
+    tooltipBody: dark ? '#6b7080' : '#555566',
+  };
+}
+
+function barToggleTheme() {
+  var current = document.documentElement.getAttribute('data-theme');
+  var next = current === 'light' ? 'dark' : 'light';
+  var btn = document.getElementById('bar-theme-btn');
+  if (btn) btn.textContent = next === 'dark' ? '\u263e' : '\u2600';
+  if (typeof applyTheme === 'function') {
+    applyTheme(next);
+  } else {
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('emt_chart_theme', next);
+  }
+  if (barInited && barData && window.Chart) barRender();
+}
+
+function barSetActive(segId, el) { document.querySelectorAll('#'+segId+' .bar-seg-btn').forEach(b=>b.classList.remove('active')); el.classList.add('active'); }
+function barSetPeriod(v, el) { barPeriod = v; barSetActive('bar-period-seg', el); barSaveState(); barRender(); }
+function barSetMetric(v, el) { barMetric = v; barSetActive('bar-metric-seg', el); barSaveState(); barRender(); }
+function barSetView(v, el)   { barView = v;   barSetActive('bar-view-seg', el);   barSaveState(); barRender(); }
+function barSetOrder(v, el)  { barMonthOrder = v; barSetActive('bar-order-seg', el); barSaveState(); barRender(); }
+function barSetCalendar(v, el) { barCalendar = v; barSetActive('bar-cal-seg', el); barSaveState(); barRender(); }
+
+if (!window.Chart) {
+  var s = document.createElement('script');
+  s.src = 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js';
+  document.head.appendChild(s);
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+  // Billing-source status indicator. Reflects the actual source config so the
+  // "N blocks awaiting DCC settlement" message only appears when DCC settlement
+  // can actually happen (an API is configured). Without an API the unsettled
+  // count is expected and permanent (local/CAD billing), so it must NOT read as
+  // "awaiting settlement" (issue: alarmed a user who had no API configured).
+  (function loadSettleNote(){
+    try {
+      fetch(apiUrl('/api/billing-source')).then(function(r){return r.json();}).then(function(d){
+        var el = document.getElementById('dcc-settle-note');
+        if (!el || !d) return;
+        var label = '', tip = '', amber = false, show = true;
+        if (d.unsupported_tariff) {
+          // BL-6: an unsupported tariff breaks billing app-wide, not just on this
+          // page — surface it in the GLOBAL notification region, not a pill in the
+          // charts topbar. Persistent (not dismissible): it must not be hidden
+          // while the bill is wrong.
+          var _tc = (d.unsupported_tariff && d.unsupported_tariff.tariff) || '';
+          if (window.EMT && EMT.notify) {
+            EMT.notify({
+              id: 'unsupported-tariff',
+              level: 'critical',
+              html: '\u26a0 <strong>Tariff not supported \u2014 rates unavailable.</strong> Your import tariff' +
+                    (_tc ? ' (' + _tc + ')' : '') + ' returns no standard unit rates. Billing for this meter will be incorrect until support is added.'
+            });
+          }
+          show = false;   // the pill is superseded by the global notification
+        } else if (d.credentials_missing) {
+          // API/DCC mode is set but the stored key is gone (typically after a
+          // restore onto a fresh install; creds are not in the backup). NOT the
+          // same as "no API" - this is a broken API config the user must fix.
+          label = '⚠ API mode · credentials missing';
+          tip = 'This meter is in supplier-API/DCC mode, but no API credentials are stored — usually after restoring a backup onto a fresh install (credentials aren’t part of the backup). Import readings and settlement are paused. Re-enter your API key in Settings to resume.';
+          amber = true;
+        } else if (!d.api_available) {
+          // No supplier API — billing is on the local/CAD figure, never reconciled
+          label = 'No API \u00b7 local billing';
+          tip = 'No supplier API is configured, so blocks are billed on the local/CAD meter figure and are never reconciled to a settled DCC figure. The unsettled count is expected \u2014 not a problem.';
+        } else if (d.source !== 'dcc') {
+          // API available but billing uses the local CAD figure as the source
+          label = 'CAD source \u00b7 API ready';
+          tip = 'A supplier API is available, but billing uses the local CAD meter figure as the source rather than cost settlement.';
+        } else if (d.unsettled > 0) {
+          // DCC path with blocks still awaiting the supplier's settled figure
+          label = '\u23f3 ' + d.unsettled + ' block' + (d.unsettled === 1 ? '' : 's') + ' awaiting cost settlement';
+          tip = 'These blocks are billed on EMT\u2019s provisional figure and haven\u2019t yet been reconciled to your supplier\u2019s settled cost figure. See Data Management for detail.';
+          amber = true;
+        } else {
+          // DCC path, everything settled — nothing to flag
+          show = false;
+        }
+        el.textContent = label;
+        el.title = tip;
+        el.classList.toggle('amber', amber);
+        el.style.display = show ? 'inline-flex' : 'none';
+      }).catch(function(){});
+    } catch(e) {}
+  })();
+
+  // Sync theme toggle icon immediately
+  var theme = document.documentElement.getAttribute('data-theme') || 'dark';
+  var btn = document.getElementById('bar-theme-btn');
+  if (btn) btn.textContent = theme === 'dark' ? '\u263e' : '\u2600';
+
+  // Note: toolbar sticks within .content scroll area — no topbar offset needed
+
+  // Restore collapsed state on mobile/landscape
+  try {
+    var _isMobile = window.innerWidth <= 768 ||
+                    (window.innerHeight <= 500 && window.innerWidth > window.innerHeight);
+    if (_isMobile && localStorage.getItem('emt_topbar_collapsed') === '1') {
+      var main = document.querySelector('.main');
+      if (main) main.classList.add('topbar-collapsed');
+    }
+  } catch(e) {}
+
+  // Defer chart load to let the page layout (including HA sidebar animation)
+  // settle before we measure container dimensions or inject iframes.
+  // DOMContentLoaded fires before the sidebar animation completes (~300ms),
+  // so we wait 350ms — enough for layout to be stable without feeling slow.
+  setTimeout(function() {
+    var saved = null;
+    try { saved = localStorage.getItem(EMT.lsKey('emt_chart_tab')); } catch(e) {}
+    var tabs = document.querySelectorAll('.chart-tab');
+    if (saved === 'heatmap') { showChart('heatmap', tabs[1]); }
+    else if (saved === 'spiral') { showChart('spiral', tabs[2]); }
+    else if (saved === 'bar') { showChart('bar', tabs[3]); }
+    else { loadChartContent('daily'); updateToggleLabel('daily'); }
+  }, 350);
+});
+
+// Refresh the active chart whenever the page becomes visible again
+// (handles tab switching, browser tab focus, and ingress navigation).
+// The refresh rebuilds the chart's DOM, which would otherwise snap scroll back
+// to the top every time you switch apps/tabs and return — so we capture the
+// scroll position first and restore it once the (async) rebuild has laid out.
+function _captureChartScroll() {
+  var bw = document.getElementById('bar-table-wrap');
+  return {
+    win: window.scrollY || document.documentElement.scrollTop || 0,
+    bar: bw ? bw.scrollTop : 0
+  };
+}
+function _restoreChartScroll(s) {
+  if (!s) return;
+  if (s.win) window.scrollTo(0, s.win);
+  var bw = document.getElementById('bar-table-wrap');
+  if (bw && s.bar) bw.scrollTop = s.bar;
+}
+// Lightweight change token; null on failure.
+async function _fetchDataVersion() {
+  try {
+    var r = await fetch(apiUrl('/api/charts/data-version'));
+    var j = await r.json();
+    return (j && j.version) || null;
+  } catch (e) { return null; }
+}
+
+// Rebuild the active chart ONLY when the block data actually changed since the last
+// render (or `force`). A tab-focus or poll on unchanged data is a no-op — so the
+// chart never blanks just because you switched away and back. When data HAS changed
+// (a new live half-hour, an import, settlement) it refetches and re-renders, and
+// clears the HH cache so today's half-hour view tracks live data without a reload.
+async function _refreshIfChanged(force) {
+  if (_refreshInFlight) return false;
+  var v = await _fetchDataVersion();
+  if (!force) {
+    if (!v) return false;
+    if (_lastDataVersion === null) { _lastDataVersion = v; return false; }  // seed only
+    if (v === _lastDataVersion) return false;                               // unchanged → no-op
+  }
+  _refreshInFlight = true;
+  try {
+    barLastFetch  = 0;      // force barInit past its TTL
+    barHHDataDate = null;   // force today's HH to refetch on next render
+    if (_activeChart === 'bar') { await barInit(); }
+    else if (_activeChart === 'spiral') { if (window.EMTSpiral) EMTSpiral.init(); }
+    else { chartsLoaded = {}; await loadChartContent(_activeChart || 'daily'); }
+    if (v) _lastDataVersion = v;
+    return true;
+  } finally { _refreshInFlight = false; }
+}
+
+document.addEventListener('visibilitychange', async function() {
+  if (document.visibilityState !== 'visible') return;
+  var _scroll = _captureChartScroll();
+  try { await _refreshIfChanged(false); } catch (e) { /* leave scroll as-is on failure */ }
+  // Restore after layout settles (rebuild + lazy day-chart render).
+  requestAnimationFrame(function() {
+    _restoreChartScroll(_scroll);
+    setTimeout(function() { _restoreChartScroll(_scroll); }, 80);
+    setTimeout(function() { _restoreChartScroll(_scroll); }, 250);
+  });
+});
+
+// While the page is visible, quietly refresh only when new data has landed — keeps
+// the live HH / current-period views fresh without a manual reload and without the
+// periodic blanking the old unconditional rebuild caused.
+setInterval(function() {
+  if (document.visibilityState === 'visible') { _refreshIfChanged(false); }
+}, 60000);
+
+
+function show(id) {
+  document.getElementById(id).classList.add('show');
+  setTimeout(() => document.getElementById(id)?.classList.remove('show'), 4000);
+}
+function hideAlerts() {
+  document.getElementById('alert-error').classList.remove('show');
+}
+function showError(msg) {
+  const el = document.getElementById('alert-error');
+  el.textContent = '✕ ' + msg;
+  el.classList.add('show');
+}
+</script>
+{% endblock %}

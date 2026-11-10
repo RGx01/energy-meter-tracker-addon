@@ -1,0 +1,949 @@
+{% extends "base.html" %}
+
+{% block topbar %}
+<div class="topbar">
+  <div>
+    <h2>Data Management</h2>
+    <div class="sub">Bring data in · safety &amp; housekeeping</div>
+  </div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;">
+    <button class="btn btn-secondary" id="btn-backup" onclick="doManualBackup()">💾 Backup Now</button>
+    <a href="{{ url_for('fill_history_page') }}" class="btn btn-secondary">📥 Fill History &amp; Gaps</a>
+    <a href="{{ url_for('corrections_page') }}" class="btn btn-secondary">🔧 Cost Corrections</a>
+    <a href="{{ url_for('delete_blocks_page') }}" class="btn btn-secondary" style="color:var(--danger);">🗑️ Delete Blocks</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+
+<div id="alert-success" class="alert alert-success"></div>
+<div id="alert-error"   class="alert alert-danger"></div>
+
+<!-- ── Restore modal ─────────────────────────────────────────────────────── -->
+<div id="restore-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;overflow-y:auto;">
+  <div style="max-width:520px;margin:60px auto;padding:0 16px 60px;">
+    <div class="card" style="padding:28px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+        <h3 style="margin:0;font-size:15px;font-weight:600;">Restore from Backup</h3>
+        <button onclick="closeRestoreModal()" style="background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;">✕</button>
+      </div>
+
+      <div style="background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.3);border-radius:var(--radius);padding:12px 14px;margin-bottom:20px;font-size:13px;line-height:1.7;">
+        ⚠️ Select which files to restore. Deselect any you want to keep as-is.
+        A backup of your current data will be created automatically before restoring.
+      </div>
+
+      <div id="restore-file-list" style="margin-bottom:16px;"></div>
+
+      <div id="restore-mismatch-warn" style="display:none;background:rgba(240,82,82,0.08);border:1px solid var(--danger);border-radius:var(--radius);padding:12px 14px;margin-bottom:16px;font-size:13px;line-height:1.7;color:var(--danger);">
+        ℹ️ <strong>Note:</strong> <code>blocks.db</code> contains all data including config — restoring it alone is safe and complete.
+      </div>
+
+      <div style="display:flex;gap:10px;justify-content:flex-end;">
+        <button class="btn btn-secondary" onclick="closeRestoreModal()">Cancel</button>
+        <button class="btn btn-primary" id="restore-confirm-btn" onclick="confirmRestore()">↩ Restore Selected</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Zip restore confirm modal ─────────────────────────────────────────────── -->
+<div id="zip-restore-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1001;overflow-y:auto;">
+  <div style="max-width:480px;margin:80px auto;padding:0 16px 60px;">
+    <div class="card" style="padding:28px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+        <h3 style="margin:0;font-size:15px;font-weight:600;">Restore from Zip</h3>
+        <button onclick="closeZipConfirm()" style="background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;">✕</button>
+      </div>
+
+      <div style="background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.3);border-radius:var(--radius);padding:12px 14px;margin-bottom:20px;font-size:13px;line-height:1.7;">
+        ⚠️ This will <strong>replace all current data</strong> with the contents of the selected zip. This cannot be undone.
+      </div>
+
+      <div id="zip-file-info" style="background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;margin-bottom:16px;font-size:13px;line-height:1.8;font-family:var(--mono);"></div>
+
+      <label style="display:flex;align-items:center;gap:10px;font-size:13px;margin-bottom:20px;cursor:pointer;">
+        <input type="checkbox" id="zip-backup-first" checked style="width:15px;height:15px;accent-color:var(--accent);">
+        <span>Create a backup of current data before restoring</span>
+      </label>
+
+      <div style="display:flex;gap:10px;justify-content:flex-end;">
+        <button class="btn btn-secondary" onclick="closeZipConfirm()">Cancel</button>
+        <button class="btn btn-primary" id="zip-confirm-btn" onclick="doZipRestore()">↩ Restore</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Generic confirm modal (styled, reusable) ─────────────────────────────── -->
+<div id="confirm-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1002;overflow-y:auto;">
+  <div style="max-width:460px;margin:90px auto;padding:0 16px 60px;">
+    <div class="card" style="padding:28px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+        <h3 id="confirm-title" style="margin:0;font-size:15px;font-weight:600;"></h3>
+        <button onclick="closeConfirm()" style="background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;">✕</button>
+      </div>
+      <div id="confirm-message" style="font-size:13px;line-height:1.7;color:var(--muted);margin-bottom:20px;"></div>
+      <div style="display:flex;gap:10px;justify-content:flex-end;">
+        <button class="btn btn-secondary" onclick="closeConfirm()">Cancel</button>
+        <button class="btn btn-primary" id="confirm-ok-btn">Confirm</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<style>
+  .dm-group-head { margin: 30px 0 12px; }
+  .dm-group-head.first { margin-top: 4px; }
+  .dm-group-head h3 { margin: 0 0 4px; font-size: 15px; font-weight: 600; color: var(--text); }
+  .dm-group-head p  { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.6; }
+  .dm-links { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+</style>
+
+<!-- Bring-data-in tools (Historical Import + Device History) now live on the
+     "Fill History & Gaps" landing page, linked from the topbar. -->
+
+<!-- ── Missing-data nudge (deep-links to the unified backfill flow) ─────────────
+     The full find/fill flow now lives on Historical Import (scope → source →
+     preview → apply). Here we only surface a nudge WHEN gaps exist; loadGapNudge()
+     reveals it. When history is continuous the card stays hidden. -->
+<div class="card" id="gap-nudge" style="display:none;">
+  <div class="card-title">🕳️ Missing Data</div>
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+    <span id="gap-nudge-text" style="font-size:13px;color:var(--muted);line-height:1.6;"></span>
+    <a href="{{ url_for('historical_import_page') }}" class="btn btn-primary" style="white-space:nowrap;">🩹 Fill gaps →</a>
+  </div>
+</div>
+
+<!-- Correct & review (settlement source + unsettled blocks) moved to the Cost
+     Corrections page — they belong with the other billing/cost tools and only
+     apply to a cad+api setup. -->
+
+<!-- ═══ Intent 3: Safety & housekeeping ═══════════════════════════════════════
+     Marked `first` because the earlier groups (Bring data in, Correct & review)
+     moved to their own pages — so this is now the first content and shouldn't carry
+     the large inter-group top margin (which read as a gap under the top bar). -->
+<div class="dm-group-head first">
+  <h3>🧰 Safety &amp; housekeeping</h3>
+  <p>Create and restore backups, delete data, and keep the database healthy.</p>
+</div>
+
+<!-- ── Backups ──────────────────────────────────────────────────────────────── -->
+<div class="card">
+  <div class="card-title">💾 Backups</div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;line-height:1.7;">
+    A backup zip is created automatically before every config save. Backups are stored in
+    <code id="backup-path-display" style="font-family:var(--mono);font-size:12px;">/share/energy_meter_tracker_backup/backups/</code>
+    and the 20 most recent are kept.
+  </p>
+  <button class="btn btn-secondary" onclick="doManualBackup()" id="btn-backup2" style="margin-bottom:16px;">💾 Create Backup Now</button>
+  <div id="backup-list" style="font-size:13px;color:var(--muted);">Loading...</div>
+</div>
+
+<!-- Delete Blocks now lives in the topbar. -->
+
+<!-- ── Import DB (restore from a .db / backup zip) ──────────────────────────── -->
+<div class="card">
+  <div class="card-title">📥 Import DB</div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:20px;line-height:1.7;">
+    Drag in a <strong>backup zip</strong> or <strong>blocks.db</strong> file to restore data.
+    <strong style="color:var(--warning);">Warning:</strong> importing will overwrite existing data.
+  </p>
+
+  <div id="drop-zone" style="
+    border: 2px dashed var(--border);
+    border-radius: var(--radius);
+    padding: 40px;
+    text-align: center;
+    margin-bottom: 24px;
+    transition: border-color 0.15s;
+    cursor: pointer;
+  " ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)" onclick="document.getElementById('file-input').click()">
+    <div style="font-size:32px;margin-bottom:8px;">📂</div>
+    <div style="color:var(--text);font-size:14px;margin-bottom:4px;">Drop a backup zip or blocks.db here, or click to browse</div>
+    <div style="color:var(--muted);font-size:12px;">Accepts .zip backup archives or blocks.db</div>
+    <input type="file" id="file-input" multiple accept=".zip,.db" style="display:none" onchange="onFileSelect(this.files)">
+  </div>
+
+  <div id="file-list" style="margin-bottom:20px;display:none;">
+    <div class="card-title">Files to import</div>
+    <div id="file-items"></div>
+  </div>
+
+  <button class="btn btn-primary" onclick="doImport()" id="import-btn" disabled>
+    📥 Import Selected Files
+  </button>
+</div>
+
+
+<!-- ── Database maintenance ──────────────────────────────────────────────────── -->
+<div class="card" id="storage-card">
+  <div class="card-title">💽 Storage</div>
+  <div id="storage-loading" style="font-size:13px;color:var(--muted);">Loading…</div>
+  <div id="storage-info" style="display:none;">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">Database size</div>
+        <div id="si-db-size" style="font-size:20px;font-weight:600;color:var(--text);font-family:var(--mono);"></div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">Disk free</div>
+        <div id="si-disk-free" style="font-size:20px;font-weight:600;color:var(--text);font-family:var(--mono);"></div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">Growth rate</div>
+        <div id="si-growth" style="font-size:20px;font-weight:600;color:var(--text);font-family:var(--mono);"></div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">Estimated runway</div>
+        <div id="si-runway" style="font-size:20px;font-weight:600;font-family:var(--mono);"></div>
+      </div>
+    </div>
+    <!-- Disk usage bar -->
+    <div style="margin-bottom:4px;display:flex;justify-content:space-between;font-size:11px;color:var(--muted);">
+      <span id="si-bar-label"></span>
+      <span id="si-bar-pct"></span>
+    </div>
+    <div style="height:6px;border-radius:3px;background:var(--border);overflow:hidden;">
+      <div id="si-bar-fill" style="height:100%;border-radius:3px;background:var(--accent);transition:width 0.4s;"></div>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-top:8px;" id="si-note"></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">🗜️ Compact Database</div>
+  <div style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.7;">
+    Rebuild the database file to reclaim free pages left by deleted or updated rows.
+    The engine is paused briefly during compaction. At ~40 KB/day growth this is
+    rarely urgent — most useful after bulk deletions.
+  </div>
+  <div id="vacuum-result" style="font-size:13px;color:var(--muted);margin-bottom:12px;display:none;"></div>
+  <button class="btn btn-secondary" id="btn-vacuum" onclick="doVacuum()">🗜️ Compact Now</button>
+</div>
+
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const KNOWN_FILES = ['blocks.db'];
+let selectedFiles = {};
+let _restoreZip   = null;
+let _restoreFlat  = false;
+let _restoreFiles = {};
+
+// ── Drag & drop ───────────────────────────────────────────────────────────────
+function onDragOver(e) {
+  e.preventDefault();
+  document.getElementById('drop-zone').style.borderColor = 'var(--accent)';
+}
+function onDragLeave(e) {
+  document.getElementById('drop-zone').style.borderColor = 'var(--border)';
+}
+function onDrop(e) {
+  e.preventDefault();
+  document.getElementById('drop-zone').style.borderColor = 'var(--border)';
+  onFileSelect(e.dataTransfer.files);
+}
+
+let _pendingZipFile = null;
+
+function onFileSelect(files) {
+  for (const f of Array.from(files)) {
+    if (f.name.endsWith('.zip')) {
+      showZipConfirm(f);
+      return;
+    } else if (f.name.endsWith('.db')) {
+      selectedFiles[f.name] = f;
+    }
+  }
+  renderFileList();
+}
+
+function showZipConfirm(zipFile) {
+  _pendingZipFile = zipFile;
+  const sizeKb = (zipFile.size / 1024).toFixed(1);
+  document.getElementById('zip-file-info').innerHTML =
+    '<strong>File:</strong> ' + zipFile.name + '<br>' +
+    '<strong>Size:</strong> ' + sizeKb + ' KB';
+  document.getElementById('zip-restore-overlay').style.display = 'block';
+}
+
+function closeZipConfirm() {
+  _pendingZipFile = null;
+  document.getElementById('zip-restore-overlay').style.display = 'none';
+}
+
+async function doZipRestore() {
+  if (!_pendingZipFile) return;
+  const zipFile     = _pendingZipFile;
+  const backupFirst = document.getElementById('zip-backup-first').checked;
+  closeZipConfirm();
+  hideAlerts();
+
+  const statusEl = document.getElementById('alert-success');
+  statusEl.textContent = '⏳ Restoring… please wait.';
+  statusEl.classList.add('show');
+
+  try {
+    if (backupFirst) {
+      statusEl.textContent = '⏳ Creating backup of current data…';
+      try {
+        await fetch(apiUrl('/api/backup/create'), {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({label: 'pre_zip_restore'})
+        });
+      } catch(e) { /* backup failure non-fatal */ }
+    }
+
+    statusEl.textContent = '⏳ Restoring database…';
+    const form = new FormData();
+    form.append('zipfile', zipFile);
+    const r    = await fetch(apiUrl('/api/import/from-zip'), { method: 'POST', body: form });
+    const data = await r.json();
+
+    if (data.ok) {
+      statusEl.textContent = '✓ Restored successfully. Reloading…';
+      setTimeout(function() { sessionStorage.setItem('emt_db_restored', Date.now()); window.location.reload(); }, 2500);
+    } else {
+      statusEl.classList.remove('show');
+      showError(data.error || 'Restore failed');
+    }
+  } catch(e) {
+    statusEl.classList.remove('show');
+    showError('Restore failed: ' + e.message);
+  }
+}
+// Legacy: extract zip contents for manual file selection (non-db files only)
+async function extractZipToSelected(zipFile) {
+  try {
+    const form = new FormData();
+    form.append('zipfile', zipFile);
+    const r    = await fetch(apiUrl('/api/import/extract-zip'), { method: 'POST', body: form });
+    const data = await r.json();
+    if (data.files) {
+      for (const [name, b64] of Object.entries(data.files)) {
+        if (name === 'blocks.db') continue;  // never round-trip binary DB through base64
+        const bytes = atob(b64);
+        const arr   = new Uint8Array(bytes.length);
+        for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+        const blob  = new Blob([arr], { type: 'application/json' });
+        selectedFiles[name] = new File([blob], name, { type: 'application/json' });
+      }
+    } else {
+      showError(data.error || 'Could not extract zip');
+    }
+  } catch(e) {
+    showError('Zip extraction failed: ' + e.message);
+  }
+}
+
+function renderFileList() {
+  const items = document.getElementById('file-items');
+  const list  = document.getElementById('file-list');
+  const btn   = document.getElementById('import-btn');
+
+  if (Object.keys(selectedFiles).length === 0) {
+    list.style.display = 'none';
+    btn.disabled = true;
+    return;
+  }
+
+  list.style.display = 'block';
+  btn.disabled = false;
+
+  items.innerHTML = Object.entries(selectedFiles).map(([name, file]) => {
+    const known  = KNOWN_FILES.includes(name);
+    const sizeKb = (file.size / 1024).toFixed(1);
+    const color  = known ? 'var(--success)' : 'var(--warning)';
+    const status = known ? '✓ recognised' : '⚠ unrecognised';
+    return `
+      <div style="display:flex;align-items:center;justify-content:space-between;
+                  padding:10px 12px;background:var(--bg);border-radius:var(--radius);
+                  border:1px solid var(--border);margin-bottom:6px;">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <span style="font-family:var(--mono);font-size:13px;">${name}</span>
+          <span style="font-size:11px;color:${color};">${status}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:12px;">
+          <span style="color:var(--muted);font-size:12px;">${sizeKb} KB</span>
+          <button class="btn btn-danger btn-sm" onclick="removeFile('${name}')">✕</button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function removeFile(name) {
+  delete selectedFiles[name];
+  renderFileList();
+}
+
+async function doImport() {
+  hideAlerts();
+  const form = new FormData();
+  const fieldMap = {
+    'blocks.db': 'blocks',
+  };
+
+  let hasKnown = false;
+  Object.entries(selectedFiles).forEach(([name, file]) => {
+    const field = fieldMap[name];
+    if (field) { form.append(field, file); hasKnown = true; }
+  });
+
+  if (!hasKnown) {
+    showError('No recognised files selected. Please select blocks.db.');
+    return;
+  }
+
+  try {
+    const r    = await fetch(apiUrl('/api/import'), { method: 'POST', body: form });
+    const data = await r.json();
+    if (data.ok) {
+      // The upload now restores through the SAME background job as a backup-zip
+      // restore (#356): show progress via the shared banner and reload on done.
+      selectedFiles = {};
+      renderFileList();
+      _restoreWasRunning = true;
+      pollRestoreStatus();
+    } else {
+      showError(data.error || 'Import failed');
+    }
+  } catch(e) {
+    showError(e.message);
+  }
+}
+
+// ── Restore modal ─────────────────────────────────────────────────────────────
+async function restoreFromFlat() {
+  // Load flat file info then open modal
+  try {
+    var r    = await fetch(apiUrl('/api/backup/flat-info'));
+    var info = await r.json();
+    if (!info || Object.keys(info).length === 0) {
+      showError('No last-finalise backup files found');
+      return;
+    }
+    _restoreZip   = null;
+    _restoreFlat  = true;
+    _restoreFiles = {};
+    Object.keys(info).forEach(function(name) {
+      _restoreFiles[name] = info[name];  // { modified, size_kb }
+    });
+
+    var riskMap = {
+      'blocks.db':              { risk: 'success', note: 'Safe to restore alone — contains all config, blocks and settings' },
+      'meters_config.json':     { risk: 'muted',   note: 'No longer needed — config is stored inside blocks.db' },
+      'current_block.json':     { risk: 'muted',   note: 'No longer used — will be ignored (state is now in blocks.db)' },
+      'cumulative_totals.json': { risk: 'muted',   note: 'No longer used — will be ignored (totals derived from blocks)' },
+    };
+
+    var listEl = document.getElementById('restore-file-list');
+    listEl.innerHTML = Object.keys(_restoreFiles).map(function(name) {
+      var inf  = _restoreFiles[name];
+      var risk = riskMap[name] || { risk: 'muted', note: '' };
+      return '<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;' +
+             'background:var(--bg);border-radius:var(--radius);border:1px solid var(--border);margin-bottom:6px;cursor:pointer;">' +
+        '<input type="checkbox" class="restore-cb" data-file="' + name + '"' +
+               ((['meters_config.json','current_block.json','cumulative_totals.json'].includes(name)) ? '' : ' checked') +
+               ' style="margin-top:2px;width:15px;height:15px;accent-color:var(--accent);" ' +
+               'onchange="checkRestoreMismatch()">' +
+        '<div>' +
+          '<div style="font-family:var(--mono);font-size:13px;">' + name + '</div>' +
+          '<div style="font-size:11px;color:var(--muted);margin-top:1px;">Last updated: ' + inf.modified + ' · ' + inf.size_kb + ' KB</div>' +
+          '<div style="font-size:11px;color:var(--' + risk.risk + ');margin-top:1px;">' + risk.note + '</div>' +
+        '</div>' +
+      '</label>';
+    }).join('');
+
+    checkRestoreMismatch();
+    document.getElementById('restore-overlay').style.display = 'block';
+  } catch(e) {
+    showError('Failed to load backup info: ' + e.message);
+  }
+}
+
+async function restoreFromZip(zipName) {
+  _restoreZip   = zipName;
+  _restoreFlat  = false;
+  _restoreFiles = {};
+
+  // Open the dialog IMMEDIATELY with a loading state, so pressing Restore feels
+  // instant. We only need the file LIST from the zip (names + sizes) — cheap, no
+  // decompression — not the whole blocks.db base64-encoded as before (which stalled
+  // the dialog for seconds on a large DB). The restore itself re-extracts server-side.
+  const listEl = document.getElementById('restore-file-list');
+  listEl.textContent = 'Reading backup…';
+  listEl.style.color = 'var(--muted)';
+  document.getElementById('restore-mismatch-warn').style.display = 'none';
+  document.getElementById('restore-confirm-btn').disabled = true;
+  document.getElementById('restore-overlay').style.display = 'block';
+
+  try {
+    const r    = await fetch(apiUrl('/api/backup/zip-entries'), {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ zip: zipName })
+    });
+    const data = await r.json();
+    if (data.files) {
+      _restoreFiles = data.files;  // { filename: {size_kb} }
+    } else {
+      listEl.style.color = 'var(--danger)';
+      listEl.textContent = data.error || 'Could not read backup';
+      return;
+    }
+  } catch(e) {
+    listEl.style.color = 'var(--danger)';
+    listEl.textContent = 'Failed to read backup: ' + e.message;
+    return;
+  }
+
+  // Build checkbox list
+  const riskMap = {
+    'blocks.db':              { risk: 'success', note: 'Safe to restore alone — contains all config, blocks and settings' },
+    'blocks.json':            { risk: 'warning', note: 'Legacy format — will be migrated to blocks.db on restore' },
+    'meters_config.json':     { risk: 'muted',   note: 'No longer needed — config is stored inside blocks.db' },
+    'current_block.json':     { risk: 'muted',   note: 'No longer used — will be ignored (state is now in blocks.db)' },
+    'cumulative_totals.json': { risk: 'muted',   note: 'No longer used — will be ignored (totals derived from blocks)' },
+  };
+
+  listEl.style.color = '';
+  listEl.innerHTML = Object.keys(_restoreFiles).map(function(name) {
+    const info = riskMap[name] || { risk: 'muted', note: '' };
+    const sz   = (_restoreFiles[name] && _restoreFiles[name].size_kb != null)
+      ? (' · ' + _restoreFiles[name].size_kb + ' KB') : '';
+    return `<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;
+                           background:var(--bg);border-radius:var(--radius);
+                           border:1px solid var(--border);margin-bottom:6px;cursor:pointer;">
+      <input type="checkbox" class="restore-cb" data-file="${name}"
+             ${(['meters_config.json','current_block.json','cumulative_totals.json'].includes(name)) ? '' : 'checked'}
+             style="margin-top:2px;width:15px;height:15px;accent-color:var(--accent);"
+             onchange="checkRestoreMismatch()">
+      <div>
+        <div style="font-family:var(--mono);font-size:13px;">${name}${sz}</div>
+        <div style="font-size:11px;color:var(--${info.risk});margin-top:2px;">${info.note}</div>
+      </div>
+    </label>`;
+  }).join('');
+
+  checkRestoreMismatch();
+  document.getElementById('restore-overlay').style.display = 'block';
+}
+
+function checkRestoreMismatch() {
+  const checked = Array.from(document.querySelectorAll('.restore-cb:checked')).map(function(cb) { return cb.dataset.file; });
+  // blocks.db is self-contained — no mismatch risk between files
+  document.getElementById('restore-mismatch-warn').style.display = 'none';
+  document.getElementById('restore-confirm-btn').disabled = checked.length === 0;
+}
+
+function closeRestoreModal() {
+  document.getElementById('restore-overlay').style.display = 'none';
+  _restoreZip   = null;
+  _restoreFlat  = false;
+  _restoreFiles = {};
+}
+
+async function confirmRestore() {
+  const checked = Array.from(document.querySelectorAll('.restore-cb:checked')).map(function(cb) { return cb.dataset.file; });
+  if (checked.length === 0) return;
+
+  // Capture values before closeRestoreModal resets them
+  const zipToRestore  = _restoreZip;
+  const flatToRestore = _restoreFlat;
+
+  hideAlerts();
+  closeRestoreModal();
+
+  try {
+    const r    = await fetch(apiUrl('/api/backup/restore'), {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ zip: zipToRestore || '', files: checked, from_flat: flatToRestore })
+    });
+    const data = await r.json();
+    if (data.ok) {
+      _restoreWasRunning = true;   // a restore we started → reload when it finishes
+      pollRestoreStatus();
+    } else {
+      showError(data.error || 'Restore failed');
+    }
+  } catch(e) {
+    showError(e.message);
+  }
+}
+
+// The restore runs in the background (survives navigation). Poll its status and
+// reflect it in the banner; reload once it completes so the UI shows fresh data.
+var _restoreWasRunning = false;
+var _restoreTimer = null;
+function pollRestoreStatus() {
+  fetch(apiUrl('/api/backup/restore/status')).then(function(r){ return r.json(); }).then(function(d) {
+    var el = document.getElementById('alert-success');
+    if (d.status === 'running') {
+      _restoreWasRunning = true;
+      // Safe to navigate away in the browser — but the DB is being rewritten, so
+      // rebuilding or restarting the ADD-ON now can interrupt the write. Say so.
+      var _stepTxt = String(d.step || '').replace(/[<>&]/g, function(c){
+        return c === '<' ? '&lt;' : c === '>' ? '&gt;' : '&amp;'; });
+      el.innerHTML = '⏳ <strong>Restoring…</strong> ' + _stepTxt +
+        ' — safe to leave this page. <strong>Do not rebuild or restart the ' +
+        'add-on until this finishes</strong> (it would interrupt the restore).';
+      el.classList.add('show');
+      if (_restoreTimer) clearTimeout(_restoreTimer);
+      _restoreTimer = setTimeout(pollRestoreStatus, 1500);
+    } else if (d.status === 'done' && _restoreWasRunning) {
+      el.textContent = '✓ Restored: ' + ((d.restored || []).join(', ') || 'complete') + '. Reloading…';
+      el.classList.add('show');
+      setTimeout(function() { sessionStorage.setItem('emt_db_restored', Date.now()); window.location.reload(); }, 1800);
+    } else if (d.status === 'error' && _restoreWasRunning) {
+      el.classList.remove('show');
+      showError(d.error || 'Restore failed');
+    }
+    // idle / stale-done from a prior session → do nothing (no reload loop)
+  }).catch(function() {
+    if (_restoreTimer) clearTimeout(_restoreTimer);
+    _restoreTimer = setTimeout(pollRestoreStatus, 3000);
+  });
+}
+// On load: if a restore is already running (e.g. you navigated away and back),
+// pick it up and reflect progress.
+document.addEventListener('DOMContentLoaded', pollRestoreStatus);
+
+// ── Backup ────────────────────────────────────────────────────────────────────
+async function doManualBackup() {
+  var btn = document.getElementById('btn-backup') || document.getElementById('btn-backup2');
+  var el  = document.getElementById('alert-success');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Backing up...'; }
+  // In-flight banner, same style as restore/delete — so the user sees it working,
+  // not just the result. (Backup is a quick synchronous copy, so no polling needed.)
+  if (el) { el.innerHTML = '⏳ <strong>Creating backup…</strong> copying the database — this only takes a moment.'; el.classList.add('show'); }
+  try {
+    var r    = await fetch(apiUrl('/api/backup'), { method: 'POST' });
+    var data = await r.json();
+    if (data.ok) {
+      if (el) {
+        el.textContent = '✓ Backup ready: ' + data.path + (data.size ? ' (' + EMT.fmtBytes(data.size) + ')' : '');
+        el.classList.add('show');
+        setTimeout(function() { el.classList.remove('show'); }, 8000);
+      }
+      loadBackupList();
+    } else {
+      if (el) el.classList.remove('show');
+      showError(data.error || 'Backup failed');
+    }
+  } catch(e) {
+    if (el) el.classList.remove('show');
+    showError(e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '💾 Backup Now'; }
+  }
+}
+
+async function loadBackupList() {
+  try {
+    var r    = await fetch(apiUrl('/api/backup/list'));
+    var data = await r.json();
+    var el   = document.getElementById('backup-list');
+    if (!el) return;
+
+    var html = '';
+
+    // ── Last finalise flat files ──
+    var flat    = data.flat || [];
+    var primary = flat.filter(function(f) { return !f.legacy; });
+    var legacyFiles = flat.filter(function(f) { return f.legacy; });
+
+    if (primary.length > 0) {
+      var latestMod = primary.reduce(function(latest, f) {
+        return f.modified > latest ? f.modified : latest;
+      }, '');
+      html += '<div style="margin-bottom:16px;">' +
+        '<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;' +
+        'color:var(--muted);margin-bottom:8px;">Last Finalise Backup</div>' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;' +
+        'padding:10px 12px;background:var(--bg);border-radius:var(--radius);border:1px solid var(--border);">' +
+        '<div>' +
+          '<div style="font-size:13px;font-weight:500;">Block finalise snapshot</div>' +
+          '<div style="font-size:11px;color:var(--muted);margin-top:2px;">Last updated: ' + latestMod + '</div>' +
+          '<div style="font-size:11px;color:var(--muted);">Contains: ' + primary.map(function(f){return f.name;}).join(', ') + '</div>' +
+        '</div>' +
+        '<button class="btn btn-secondary btn-sm" onclick="restoreFromFlat()">↩ Restore</button>' +
+        '</div>';
+      if (legacyFiles.length > 0) {
+        html += '<div style="margin-top:6px;padding:6px 10px;font-size:11px;color:var(--muted);' +
+          'background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);">' +
+          '⚠ Also present (legacy, no longer updated): ' +
+          legacyFiles.map(function(f) { return f.name; }).join(', ') +
+          ' — these are from a previous version and can be deleted from <code>/share/energy_meter_tracker_backup/</code>' +
+          '</div>';
+      }
+      html += '</div>';
+    } else if (legacyFiles.length > 0) {
+      // Only legacy files present — show with restore option but warn clearly
+      html += '<div style="margin-bottom:16px;">' +
+        '<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;' +
+        'color:var(--muted);margin-bottom:8px;">Last Finalise Backup</div>' +
+        '<div style="padding:10px 12px;background:var(--bg);border-radius:var(--radius);border:1px solid var(--border);">' +
+          '<div style="font-size:13px;font-weight:500;color:var(--warning);">Legacy backup files only</div>' +
+          '<div style="font-size:11px;color:var(--muted);margin-top:4px;">Contains: ' +
+          legacyFiles.map(function(f) { return f.name; }).join(', ') + '</div>' +
+          '<div style="font-size:11px;color:var(--muted);margin-top:2px;">' +
+          'These are from v1.x or v2.0.x. A new <code>blocks.db</code> snapshot will appear here after the next block finalise.' +
+          '</div>' +
+          '<div style="margin-top:8px;">' +
+          '<button class="btn btn-secondary btn-sm" onclick="restoreFromFlat()">↩ Restore legacy files</button>' +
+          '</div>' +
+        '</div></div>';
+    }
+
+    // ── Zip backups ──
+    var zips = data.zips || [];
+    html += '<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);margin-bottom:8px;">Zip Backups</div>';
+    if (zips.length === 0) {
+      html += '<div style="color:var(--muted);font-size:13px;">No zip backups yet.</div>';
+    } else {
+      var rows = zips.map(function(z) {
+        var zq = z.replace(/'/g, "\\'");
+        return '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;font-family:var(--mono);font-size:12px;padding:6px 0;border-bottom:1px solid var(--border);">'
+          + '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + z + '</span>'
+          + '<span style="display:flex;gap:6px;flex:none;">'
+          + '<button class="btn btn-secondary btn-sm" onclick="downloadBackup(\'' + zq + '\')">⬇ Download</button>'
+          + '<button class="btn btn-secondary btn-sm" onclick="restoreFromZip(\'' + zq + '\')">↩ Restore</button>'
+          + '<button class="btn btn-secondary btn-sm" style="color:var(--danger);" onclick="deleteBackup(\'' + zq + '\')">🗑 Delete</button>'
+          + '</span></div>';
+      }).join('');
+      var needsScroll = zips.length > 5;
+      html += '<div style="' + (needsScroll ? 'max-height:196px;overflow-y:auto;' : '') + '">' + rows + '</div>' +
+        (needsScroll ? '<div style="color:var(--muted);font-size:11px;margin-top:6px;">' + zips.length + ' backups — scroll to see all</div>' : '');
+    }
+
+    el.innerHTML = html;
+  } catch(e) {
+    var el = document.getElementById('backup-list');
+    if (el) el.innerHTML = '<div style="color:var(--danger);font-size:13px;">Failed to load backups: ' + e.message + '</div>';
+  }
+}
+
+// Download a backup zip — the browser handles the file; a brief banner confirms it.
+function downloadBackup(z) {
+  var el = document.getElementById('alert-success');
+  if (el) { el.textContent = '⬇ Downloading ' + z + '…'; el.classList.add('show'); setTimeout(function() { el.classList.remove('show'); }, 5000); }
+  window.location.href = apiUrl('/api/backup/download/' + encodeURIComponent(z));
+}
+
+// Delete a backup zip — same in-flight banner pattern as restore/create, with a
+// confirm first (it removes the file permanently).
+async function deleteBackup(z) {
+  if (!window.confirm('Delete backup "' + z + '"?\n\nThis permanently removes the file and cannot be undone.')) return;
+  var el = document.getElementById('alert-success');
+  if (el) { el.innerHTML = '⏳ <strong>Deleting backup…</strong> ' + z; el.classList.add('show'); }
+  try {
+    var r    = await fetch(apiUrl('/api/backup/delete'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ zip: z })
+    });
+    var data = await r.json();
+    if (data.ok) {
+      if (el) { el.textContent = '✓ Backup deleted: ' + z; el.classList.add('show'); setTimeout(function() { el.classList.remove('show'); }, 6000); }
+      loadBackupList();
+    } else {
+      if (el) el.classList.remove('show');
+      showError(data.error || 'Delete failed');
+    }
+  } catch(e) {
+    if (el) el.classList.remove('show');
+    showError(e.message);
+  }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function show(id) {
+  document.getElementById(id).classList.add('show');
+  setTimeout(function() { document.getElementById(id).classList.remove('show'); }, 6000);
+}
+function hideAlerts() {
+  document.getElementById('alert-success').classList.remove('show');
+  document.getElementById('alert-error').classList.remove('show');
+}
+function showError(msg) {
+  const el = document.getElementById('alert-error');
+  el.textContent = '✕ ' + msg;
+  el.classList.add('show');
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+  loadBackupList();
+  // Corrections and Delete Blocks moved to sub-pages
+  // Update backup path display
+  fetch(apiUrl('/api/backup/info'))
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var el = document.getElementById('backup-path-display');
+      if (el && data.backup_dir) el.textContent = data.backup_dir + '/backups/';
+    })
+    .catch(function() {});
+});
+
+// ── Generic styled confirm modal ────────────────────────────────────────────
+// Replaces native confirm(): showConfirm({title, message, okLabel, onConfirm}).
+var _confirmCb = null;
+function showConfirm(opts) {
+  document.getElementById('confirm-title').textContent = opts.title || 'Confirm';
+  document.getElementById('confirm-message').innerHTML = opts.message || '';
+  var ok = document.getElementById('confirm-ok-btn');
+  ok.textContent = opts.okLabel || 'Confirm';
+  _confirmCb = opts.onConfirm || null;
+  document.getElementById('confirm-overlay').style.display = 'block';
+}
+function closeConfirm() {
+  document.getElementById('confirm-overlay').style.display = 'none';
+  _confirmCb = null;
+}
+document.getElementById('confirm-ok-btn').addEventListener('click', function() {
+  var cb = _confirmCb;
+  closeConfirm();
+  if (cb) cb();
+});
+document.getElementById('confirm-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeConfirm();
+});
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape' &&
+      document.getElementById('confirm-overlay').style.display === 'block') {
+    closeConfirm();
+  }
+});
+
+// ── Billing settlement source ────────────────────────────────────────────────
+// Missing-data nudge: reveal the gap-nudge card only when gaps actually exist,
+// deep-linking to the unified backfill flow on Historical Import (the full
+// find/preview/fill flow lives there now: scope → source → preview → apply).
+function loadGapNudge() {
+  var card = document.getElementById('gap-nudge');
+  if (!card) return;
+  fetch(apiUrl('/api/history-gaps'))
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (!d.ok || !d.gaps || !d.gaps.length) return;      // continuous history -> stay hidden
+      var hrs = (d.total_slots / 2).toFixed(1);
+      document.getElementById('gap-nudge-text').innerHTML =
+        '<strong>' + d.gaps.length + '</strong> gap' + (d.gaps.length > 1 ? 's' : '')
+        + ' · <strong>' + hrs + ' h</strong> of missing half-hourly data'
+        + (d.api_available ? '' : ' — no supplier API, fill from a CSV') + '.';
+      card.style.display = '';
+    })
+    .catch(function () {});
+}
+document.addEventListener('DOMContentLoaded', loadGapNudge);
+
+// ── Historical Corrections ─────────────────────────────────────────────────
+
+// ── Database compaction ────────────────────────────────────────────────────
+async function loadStorageInfo() {
+  try {
+    var r = await fetch(apiUrl('/api/storage-info'));
+    var d = await r.json();
+
+    function fmtMb(mb) {
+      if (mb >= 1024) return (mb / 1024).toFixed(2) + ' GB';
+      return mb.toFixed(1) + ' MB';
+    }
+
+    function fmtRunway(days) {
+      if (!days) return '—';
+      if (days > 365 * 2) return '> ' + Math.floor(days / 365) + ' years';
+      if (days > 365)     return '~' + (days / 365).toFixed(1) + ' years';
+      if (days > 60)      return '~' + Math.round(days / 30) + ' months';
+      return days + ' days';
+    }
+
+    document.getElementById('si-db-size').textContent  = fmtMb(d.db_mb);
+    document.getElementById('si-disk-free').textContent = fmtMb(d.disk_free_mb);
+    document.getElementById('si-growth').textContent    = d.growth_mb_per_day
+      ? (d.growth_mb_per_day < 0.1
+          ? (d.growth_mb_per_day * 1024).toFixed(1) + ' KB/day'
+          : d.growth_mb_per_day.toFixed(2) + ' MB/day')
+      : '—';
+
+    var runway = fmtRunway(d.runway_days);
+    var runwayEl = document.getElementById('si-runway');
+    runwayEl.textContent = runway;
+    // Colour runway: green > 2yr, amber 6mo-2yr, red < 6mo
+    runwayEl.style.color = !d.runway_days ? 'var(--muted)'
+      : d.runway_days > 730  ? 'var(--success)'
+      : d.runway_days > 180  ? 'var(--warning)'
+      : 'var(--danger)';
+
+    // Disk bar
+    var usedPct = 100 - d.disk_free_pct;
+    document.getElementById('si-bar-fill').style.width  = usedPct + '%';
+    document.getElementById('si-bar-fill').style.background =
+      usedPct > 90 ? 'var(--danger)' : usedPct > 75 ? 'var(--warning)' : 'var(--accent)';
+    document.getElementById('si-bar-label').textContent =
+      fmtMb(d.disk_used_mb) + ' used of ' + fmtMb(d.disk_total_mb);
+    document.getElementById('si-bar-pct').textContent = d.disk_free_pct + '% free';
+
+    // Note
+    if (d.days_of_data) {
+      document.getElementById('si-note').textContent =
+        'Based on ' + Math.round(d.days_of_data) + ' days of data. ' +
+        'Runway estimate assumes current growth rate continues.';
+    }
+
+    document.getElementById('storage-loading').style.display = 'none';
+    document.getElementById('storage-info').style.display    = 'block';
+  } catch(e) {
+    document.getElementById('storage-loading').textContent = 'Failed to load storage info.';
+  }
+}
+
+loadStorageInfo();
+
+async function doVacuum() {
+  var btn    = document.getElementById('btn-vacuum');
+  var result = document.getElementById('vacuum-result');
+  btn.disabled   = true;
+  btn.textContent = '🗜️ Compacting…';
+  result.style.display = 'none';
+  try {
+    var r = await fetch(apiUrl('/api/db/vacuum'), { method: 'POST' });
+    var d = await r.json();
+    result.style.display = 'block';
+    if (d.ok) {
+      result.style.color = 'var(--success)';
+      function fmtBytes(b) {
+        if (b >= 1048576) return (b/1048576).toFixed(2) + ' MB';
+        if (b >= 1024)    return (b/1024).toFixed(1) + ' KB';
+        return b + ' B';
+      }
+      var msg = 'Done — ' + fmtBytes(d.size_before) + ' → ' + fmtBytes(d.size_after);
+      if (d.saved > 0) {
+        msg += ' (reclaimed ' + fmtBytes(d.saved) + ')';
+      } else if (d.free_pages === 0) {
+        msg += ' — no free pages to reclaim';
+      } else {
+        msg += ' — ' + d.free_pages + ' free page' + (d.free_pages !== 1 ? 's' : '') +
+               ' (' + fmtBytes(d.free_bytes) + ') reclaimed';
+      }
+      result.textContent = msg;
+    } else {
+      result.style.color = 'var(--danger)';
+      result.textContent = 'Error: ' + (d.error || 'unknown error');
+    }
+  } catch(e) {
+    result.style.display = 'block';
+    result.style.color   = 'var(--danger)';
+    result.textContent   = 'Error: ' + e.message;
+  } finally {
+    btn.disabled    = false;
+    btn.textContent = '🗜️ Compact Now';
+  }
+}
+
+</script>
+{% endblock %}

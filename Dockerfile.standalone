@@ -1,0 +1,11 @@
+FROM python:3.12-slim
+
+# Pinned deps in their own cached layer (shared with the HA add-on Dockerfile)
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+WORKDIR /app
+COPY . /app/
+RUN sed -i 's/\r//' /app/run.sh && chmod +x /app/run.sh
+
+CMD ["/bin/sh", "/app/run.sh"]

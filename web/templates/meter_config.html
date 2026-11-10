@@ -1,0 +1,3078 @@
+{% extends "base.html" %}
+
+
+{% block topbar %}
+<div class="topbar">
+  <div>
+    <h2>Settings</h2>
+    <div class="sub">Configure your meters and carbon assumptions</div>
+  </div>
+  <div class="settings-tabs">
+    <a href="{{ url_for('settings_page') }}" class="settings-tab active">⚙️ Meter Config</a>
+    <a href="{{ url_for('settings_page') }}?tab=carbon" class="settings-tab">🌿 Carbon</a>
+  </div>
+  <button class="btn btn-primary" id="btn-save">💾 Save Config</button>
+</div>
+{% endblock %}
+
+{% block subbar %}
+<div class="settings-subbar">
+  <div style="position:relative;display:inline-block;">
+    <button class="btn btn-secondary" id="btn-add-device" onclick="toggleAddDeviceMenu(event)">+ Add Device ▾</button>
+    <div id="add-device-menu" style="display:none;position:absolute;top:calc(100% + 4px);left:0;z-index:200;
+         background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+         box-shadow:0 4px 16px rgba(0,0,0,0.5);min-width:180px;overflow:hidden;">
+      <button class="btn" style="display:block;width:100%;text-align:left;padding:10px 16px;border:none;border-radius:0;background:transparent;color:var(--fg);cursor:pointer;"
+              onmousedown="event.stopPropagation();addDevice('battery')">🔋 House Battery</button>
+      <button class="btn" style="display:block;width:100%;text-align:left;padding:10px 16px;border:none;border-radius:0;background:transparent;color:var(--fg);cursor:pointer;"
+              onmousedown="event.stopPropagation();addDevice('ev')">🚗 EV Charger</button>
+      <button class="btn" style="display:block;width:100%;text-align:left;padding:10px 16px;border:none;border-radius:0;background:transparent;color:var(--fg);cursor:pointer;"
+              onmousedown="event.stopPropagation();addDevice('heat_pump')">♨️ Heat Pump</button>
+    </div>
+  </div>
+  <button class="btn btn-secondary" id="btn-refresh">↺ Refresh Entities</button>
+  <button class="btn btn-secondary" id="btn-change-setup">⚙ Change Setup</button>
+  <a href="{{ url_for('billing_history_page') }}" class="btn btn-secondary">🕓 Billing History</a>
+  <a href="{{ url_for('bill_rounding_page') }}" class="btn btn-secondary">🧮 Bill Rounding</a>
+</div>
+{% endblock %}
+
+{% block content %}
+<!-- BL-6 (#219): these were position:fixed overlays painting over the tab row.
+     They are now hidden text carriers; show() routes their message into the
+     global in-flow notification region, which pushes content down. -->
+<div id="alert-success" hidden>✓ Configuration saved. The engine will pick up changes within 10 seconds.</div>
+<div id="alert-error" hidden></div>
+
+<!-- ── Main Meter ─────────────────────────────────────────────────────────── -->
+<div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;">
+  <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);">Main Meter</div>
+</div>
+
+<div id="main-meter-container"></div>
+
+<div id="no-main-meter" style="display:none;">
+  <div class="card" style="border-style:dashed;text-align:center;padding:32px;">
+    <div style="font-size:32px;margin-bottom:12px;">⚡</div>
+    <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No main meter configured</div>
+    <div style="color:var(--muted);font-size:13px;margin-bottom:20px;">Add your electricity meter to get started</div>
+    <div style="display:flex;gap:10px;justify-content:center;">
+      <button class="btn btn-primary" id="btn-wizard-empty">✦ Setup Wizard</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Devices ───────────────────────────────────────────────────────────── -->
+<div id="sub-meter-container" style="margin-top:16px;"></div>
+
+<!-- ── Add Device Modal ──────────────────────────────────────────────────── -->
+<div id="add-device-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;overflow-y:auto;">
+  <div style="max-width:560px;margin:60px auto;padding:0 16px 60px;">
+    <div class="card" style="padding:32px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;">
+        <div>
+          <div id="add-device-title" style="font-size:18px;font-weight:700;"></div>
+          <div id="add-device-subtitle" style="font-size:13px;color:var(--muted);margin-top:4px;"></div>
+        </div>
+        <button onclick="closeAddDevice()" style="background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;padding:0;">✕</button>
+      </div>
+
+      <!-- Device name -->
+      <div class="form-group" style="margin-bottom:20px;">
+        <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Device Name</label>
+        <input type="text" id="ad-device-name" style="margin-top:6px;" placeholder="e.g. House Battery">
+      </div>
+
+      <!-- Battery fields -->
+      <div id="ad-battery-fields">
+        <div class="form-group" style="margin-bottom:20px;">
+          <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">State of Charge Sensor <span style="font-weight:400;">(optional)</span></label>
+          <div style="margin-top:6px;position:relative;">
+            <input type="text" id="ad-soc-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="ad-entity" data-field="soc">
+            <div id="ad-soc-sensor_drop" class="entity-drop"></div>
+          </div>
+          <small style="color:var(--muted);">Battery SoC in % (0–100). Enables the SoC dial on Live Power.</small>
+        </div>
+        <div class="form-group" style="margin-bottom:20px;">
+          <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Inverter Power Sensor <span style="font-weight:400;">(optional)</span></label>
+          <div style="margin-top:6px;position:relative;">
+            <input type="text" id="ad-inverter-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="ad-entity" data-field="inverter">
+            <div id="ad-inverter-sensor_drop" class="entity-drop"></div>
+          </div>
+          <div class="checkbox-row" style="margin-top:8px;">
+            <input type="checkbox" id="ad-invert">
+            <label for="ad-invert">Invert sensor value — <span style="font-weight:400;color:var(--muted);">tick if positive = charging, negative = discharging</span></label>
+          </div>
+          <small style="color:var(--muted);">Live inverter power in W or kW. Enables the inverter gauge on Live Power.</small>
+        </div>
+        <div class="form-group" style="margin-bottom:20px;">
+          <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Solar / PV Power Sensor <span style="font-weight:400;">(optional)</span></label>
+          <div style="margin-top:6px;position:relative;">
+            <input type="text" id="ad-pv-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="ad-entity" data-field="pv">
+            <div id="ad-pv-sensor_drop" class="entity-drop"></div>
+          </div>
+          <small style="color:var(--muted);">Live PV generation in W or kW. Adds a small PV dial to the battery card.</small>
+        </div>
+      </div>
+
+      <!-- EV fields -->
+      <div id="ad-ev-fields">
+        <div class="form-group" style="margin-bottom:20px;">
+          <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Charger Power Sensor <span style="font-weight:400;">(optional)</span></label>
+          <div style="margin-top:6px;position:relative;">
+            <input type="text" id="ad-ev-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="ad-entity" data-field="ev">
+            <div id="ad-ev-sensor_drop" class="entity-drop"></div>
+          </div>
+          <div class="checkbox-row" style="margin-top:8px;">
+            <input type="checkbox" id="ad-v2x">
+            <label for="ad-v2x">V2X / Vehicle-to-Grid capable — <span style="font-weight:400;color:var(--muted);">shows bidirectional gauge on Live Power (use import-only sensor regardless)</span></label>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- Heat pump fields -->
+      <div id="ad-hp-fields">
+        <div class="form-group" style="margin-bottom:20px;">
+          <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Heat Pump Power Sensor <span style="font-weight:400;">(optional)</span></label>
+          <div style="margin-top:6px;position:relative;">
+            <input type="text" id="ad-hp-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="ad-entity" data-field="hp">
+            <div id="ad-hp-sensor_drop" class="entity-drop"></div>
+          </div>
+          
+        </div>
+      </div>
+
+      <!-- Common fields -->
+      <div class="form-group" style="margin-bottom:20px;">
+        <label style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Read Sensor — Cumulative kWh</label>
+        <div style="margin-top:6px;position:relative;">
+          <input type="text" id="ad-read-sensor" placeholder="Search or type entity ID..." autocomplete="off" class="ad-entity" data-field="read">
+          <div id="ad-read-sensor_drop" class="entity-drop"></div>
+        </div>
+        <small style="color:var(--muted);">Cumulative import kWh from your device integration or CT clamp via PowerCalc.</small>
+      </div>
+
+      <div style="display:flex;gap:12px;justify-content:flex-end;">
+        <button class="btn btn-secondary" onclick="closeAddDevice()">Cancel</button>
+        <button class="btn btn-primary" id="ad-confirm-btn" onclick="confirmAddDevice()">Add Device</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Retire Device Modal ────────────────────────────────────────────────── -->
+<div id="retire-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+  <div style="background:var(--surface);border-radius:8px;padding:24px;max-width:420px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.3);">
+    <h3 style="margin:0 0 8px;font-size:16px;">Archive Device</h3>
+    <p style="font-size:13px;color:var(--muted);margin:0 0 16px;">
+      The device will stop recording from the retirement date. All historical data is preserved.
+      The sensors can be reused for a new device after retirement.
+    </p>
+    <div style="margin-bottom:12px;">
+      <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px;">RETIREMENT DATE</label>
+      <input type="date" id="retire-date" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--fg);font-size:13px;box-sizing:border-box;">
+    </div>
+    <div style="margin-bottom:16px;">
+      <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px;">REASON (OPTIONAL)</label>
+      <input type="text" id="retire-reason" placeholder="e.g. Device replaced, EV sold…" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--fg);font-size:13px;box-sizing:border-box;">
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button onclick="closeRetireModal()" class="btn btn-sm">Cancel</button>
+      <button onclick="confirmRetire()" class="btn btn-sm" style="background:var(--accent);color:#000;font-weight:600;">Archive Device</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Unretire Device Modal ──────────────────────────────────────────────── -->
+<div id="unretire-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+  <div style="background:var(--surface);border-radius:8px;padding:24px;max-width:400px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.3);">
+    <h3 style="margin:0 0 8px;font-size:16px;">Resume Recording</h3>
+    <p style="font-size:13px;color:var(--muted);margin:0 0 20px;">
+      This device will resume recording from the next block. The retirement date and reason will be cleared.
+    </p>
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button onclick="closeUnretireModal()" class="btn btn-sm">Cancel</button>
+      <button onclick="confirmUnretire()" class="btn btn-sm" style="background:var(--accent);color:#000;font-weight:600;">Resume Recording</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Delete Confirmation Modal ─────────────────────────────────────────── -->
+<div id="delete-device-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;overflow-y:auto;">
+  <div style="max-width:480px;margin:120px auto;padding:0 16px;">
+    <div class="card" style="padding:32px;border:1px solid var(--danger);">
+      <div style="font-size:22px;margin-bottom:12px;">⚠️</div>
+      <div id="del-modal-title" style="font-size:17px;font-weight:700;margin-bottom:8px;"></div>
+      <div id="del-modal-body" style="font-size:13px;color:var(--muted);margin-bottom:20px;line-height:1.6;"></div>
+
+      <div style="background:rgba(240,82,82,0.08);border:1px solid var(--danger);border-radius:var(--radius);padding:14px;margin-bottom:24px;">
+        <div style="font-size:12px;font-weight:600;color:var(--danger);margin-bottom:8px;">TO CONFIRM, TYPE DELETE BELOW</div>
+        <input type="text" id="del-modal-confirm-input"
+               style="width:100%;font-family:var(--mono);letter-spacing:0.1em;text-transform:uppercase;"
+               placeholder="DELETE" autocomplete="off">
+      </div>
+
+      <div style="font-size:12px;color:var(--muted);margin-bottom:24px;">
+        💡 Take a backup first — <a href="data-management" style="color:var(--accent);">Data Management → Create Backup</a>
+      </div>
+
+      <div style="display:flex;gap:12px;justify-content:flex-end;">
+        <button class="btn btn-secondary" onclick="closeDeleteModal()">Cancel</button>
+        <button class="btn" id="del-modal-confirm-btn"
+                style="background:var(--danger);color:#fff;opacity:0.4;cursor:not-allowed;"
+                disabled onclick="executeDelete()">Permanently Delete</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Disconnect Octopus Modal ──────────────────────────────────────────── -->
+<div id="disconnect-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;overflow-y:auto;">
+  <div style="max-width:480px;margin:120px auto;padding:0 16px;">
+    <div class="card" style="padding:32px;border:1px solid var(--danger);">
+      <div style="font-size:22px;margin-bottom:12px;">🔌</div>
+      <div style="font-size:17px;font-weight:700;margin-bottom:8px;">Disconnect Octopus &amp; clear credentials?</div>
+      <div style="font-size:13px;color:var(--muted);margin-bottom:20px;line-height:1.6;">
+        This stops API polling immediately, deletes your stored API credentials, and switches the data source to <strong>local meter sensors</strong>.
+        <br><br>
+        <strong>Your billing history is kept</strong> — readings and costs already settled stay exactly as they are; nothing is re-priced.
+        <br><br>
+        You'll then need to add a local meter sensor, or reconnect Octopus, to resume collecting new data. This is reversible — re-entering your API key reconnects.
+      </div>
+      <div style="display:flex;gap:12px;justify-content:flex-end;">
+        <button class="btn btn-secondary" onclick="closeDisconnectModal()">Cancel</button>
+        <button class="btn" id="disconnect-confirm-btn" style="background:var(--danger);color:#fff;" onclick="executeDisconnect()">Disconnect</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Reconnect Modal (lightweight: key only, keeps API mode, no recalc) ───── -->
+<div id="reconnect-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;overflow-y:auto;">
+  <div style="max-width:480px;margin:120px auto;padding:0 16px;">
+    <div class="card" style="padding:32px;">
+      <div style="font-size:22px;margin-bottom:12px;">🔑</div>
+      <div style="font-size:17px;font-weight:700;margin-bottom:8px;">Reconnect to Octopus</div>
+      <div style="font-size:13px;color:var(--muted);margin-bottom:20px;line-height:1.6;">
+        Re-enter your API key to resume import and settlement. This <strong>doesn't change your setup</strong> — your data source stays the same, so nothing is recalculated.
+      </div>
+      <div class="form-group" style="margin-bottom:12px;">
+        <label>Account number</label>
+        <input type="text" id="reconnect-account" placeholder="A-XXXXXXXX" autocomplete="off">
+        <div id="reconnect-account-note" style="font-size:11px;color:var(--muted);margin-top:4px;display:none;">Pre-filled from this database's previous connection — edit if needed.</div>
+      </div>
+      <div class="form-group" style="margin-bottom:8px;">
+        <label>API key</label>
+        <input type="password" id="reconnect-apikey" placeholder="sk_live_…" autocomplete="off">
+      </div>
+      <div id="reconnect-status" style="font-size:12px;min-height:18px;margin-bottom:12px;"></div>
+      <div style="display:flex;gap:12px;justify-content:flex-end;">
+        <button class="btn btn-secondary" onclick="closeReconnectModal()">Cancel</button>
+        <button class="btn btn-primary" id="reconnect-confirm-btn" onclick="executeReconnect()">Reconnect</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Wizard Modal ───────────────────────────────────────────────────────── -->
+<div id="wizard-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;overflow-y:auto;">
+  <div style="max-width:600px;margin:40px auto;padding:0 16px 60px;">
+    <div id="wizard-card" class="card" style="padding:32px;">
+
+      <!-- Progress bar -->
+      <div style="margin-bottom:28px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <span style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);" id="wiz-step-label">Step 1 of 4</span>
+          <button onclick="closeWizard()" style="background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;padding:0;">✕</button>
+        </div>
+        <div style="background:var(--bg);border-radius:4px;height:4px;overflow:hidden;">
+          <div id="wiz-progress" style="background:var(--accent);height:100%;transition:width 0.3s;width:25%;"></div>
+        </div>
+      </div>
+
+      <div id="wizard-body"></div>
+
+      <div style="display:flex;justify-content:space-between;margin-top:28px;gap:12px;">
+        <button class="btn btn-secondary" id="wiz-btn-back" onclick="wizBack()">← Back</button>
+        <button class="btn btn-primary" id="wiz-btn-next" onclick="wizNext()">Next →</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Change Reason Modal ────────────────────────────────────────────────── -->
+<div id="change-reason-modal" style="display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,0.5);align-items:center;justify-content:center;">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:24px;max-width:420px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.3);">
+    <div style="font-size:15px;font-weight:600;margin-bottom:8px;color:var(--text);">Save Configuration</div>
+    <div style="font-size:13px;color:var(--muted);margin-bottom:16px;">Optionally describe what changed — this is recorded in config history.</div>
+    <input id="change-reason-input" type="text" placeholder="e.g. Switched to Octopus Energy, changed billing day"
+      style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;margin-bottom:16px;">
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button id="change-reason-skip" class="btn" style="font-size:13px;">Skip</button>
+      <button id="change-reason-save" class="btn btn-primary" style="font-size:13px;">💾 Save</button>
+    </div>
+  </div>
+</div>
+
+
+
+<!-- ── Recompute Confirmation (B2) ────────────────────────────────────────── -->
+<div id="recompute-overlay" style="display:none;position:fixed;inset:0;z-index:1100;background:rgba(0,0,0,0.55);align-items:center;justify-content:center;">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:24px;max-width:440px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.3);">
+    <div style="font-size:15px;font-weight:600;margin-bottom:10px;color:var(--text);">This will recalculate your history</div>
+    <div style="font-size:13px;color:var(--muted);margin-bottom:20px;line-height:1.6;">
+      Changing your data source runs a large recalculation across your whole
+      history. It <strong>can&rsquo;t be stopped</strong> once it starts, but it&rsquo;s
+      reversible &mdash; you can switch back afterwards and it will recalculate again.
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button class="btn" style="font-size:13px;" onclick="_wizCancelRecompute()">Cancel</button>
+      <button class="btn btn-primary" style="font-size:13px;" onclick="_wizConfirmRecompute()">Apply &amp; recalculate</button>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<style>
+.info-box {
+  background: rgba(0,212,170,0.06);
+  border: 1px solid rgba(0,212,170,0.25);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 20px;
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.7;
+}
+.info-box strong { color: var(--accent); }
+.info-box ul { margin: 6px 0 0 16px; }
+.info-box li { margin-bottom: 3px; }
+
+.section-divider {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin: 20px 0 10px;
+}
+
+.channel-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 10px;
+}
+
+.channel-label {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 3px 8px;
+  border-radius: 4px;
+  margin-bottom: 12px;
+  display: inline-block;
+}
+.label-import { background: rgba(0,212,170,0.15); color: var(--accent); }
+.label-export { background: rgba(124,106,247,0.15); color: var(--accent2); }
+
+.advanced-toggle {
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+  user-select: none;
+}
+.advanced-toggle:hover { color: var(--text); }
+.advanced-section { display: none; margin-top: 12px; }
+.advanced-section.open { display: block; }
+
+/* Entity dropdown */
+.entity-wrap { position: relative; flex: 1; }
+.entity-drop {
+  display: none;
+  position: absolute;
+  top: 100%; left: 0;
+  min-width: 100%;
+  width: max-content;
+  max-width: 600px;
+  z-index: 200;
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-top: none;
+  border-radius: 0 0 var(--radius) var(--radius);
+  max-height: 200px;
+  overflow-y: auto;
+}
+.entity-drop div {
+  padding: 7px 12px;
+  font-size: 12px;
+  font-family: var(--mono);
+  cursor: pointer;
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.entity-drop div:hover { background: rgba(0,212,170,0.15); color: var(--accent); }
+.entity-input { text-overflow: ellipsis; }
+.entity-input:focus { text-overflow: clip; }
+
+/* Wizard device cards */
+.wiz-device-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 16px;
+}
+.wiz-device-card {
+  border: 2px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  cursor: pointer;
+  text-align: center;
+  transition: border-color 0.15s, background 0.15s;
+  user-select: none;
+}
+.wiz-device-card:hover { border-color: var(--accent); background: rgba(0,212,170,0.04); }
+.wiz-device-card.selected { border-color: var(--accent); background: rgba(0,212,170,0.10); }
+.wiz-device-card .icon { font-size: 28px; margin-bottom: 8px; }
+.wiz-device-card .label { font-size: 13px; font-weight: 600; }
+.wiz-device-card .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+</style>
+
+<script>
+let config   = {{ config | tojson }};
+// Snapshot of server config for detecting billing-significant changes
+var _serverConfig = JSON.parse(JSON.stringify(config));
+let entities = [];
+var hasData  = {{ has_data | tojson }};
+var DATA_SOURCE_MODE = {{ data_source_mode | tojson }};
+// True when an API key is actually stored. The mode (api/cad+api) lives in the
+// DB; the credentials live in a separate file that backups DON'T include. So a
+// restore onto a fresh install can leave mode=api with NO key — in which case
+// the "connected" UI is a lie and the user must re-enter the key.
+var HAS_CREDENTIALS = {{ has_credentials | tojson }};
+// #381: true when the loaded DB is stamped to a DIFFERENT Octopus account
+// than the stored credentials (from GET /api/kraken-config). Refreshed live by
+// refreshConnState(); gates the dormant-creds Reactivate prompt off (mismatch
+// has its own #357 flow).
+var CONN_MISMATCH = false;
+var OHME_DETECTION = {{ ohme_detection | tojson }};
+// Timezone select HTML — rendered server-side to avoid JS string escaping issues
+var TZ_SELECT_HTML = {{ tz_select_html | tojson }};
+function buildTzSelect(id, currentTz) {
+  // Build select with correct option pre-selected
+  var html = TZ_SELECT_HTML
+    .replace('class="js-meta" data-key="timezone"',
+             'id="' + id + '" class="js-meta" data-key="timezone"')
+    .replace('value="' + (currentTz||'UTC') + '"',
+             'value="' + (currentTz||'UTC') + '" selected');
+  return html;
+}
+function buildTzSelectForMeter(meterId, currentTz) {
+  var html = TZ_SELECT_HTML
+    .replace('class="js-meta" data-key="timezone"',
+             'class="js-meta" data-meter="' + meterId + '" data-key="timezone"')
+    .replace('value="' + (currentTz||'UTC') + '"',
+             'value="' + (currentTz||'UTC') + '" selected');
+  return html;
+}
+const existingMeterIds = new Set(Object.keys(config.meters || {}));
+
+document.addEventListener('DOMContentLoaded', function() {
+  document.getElementById('btn-save').addEventListener('click', saveConfig);
+  document.getElementById('btn-refresh').addEventListener('click', function() { loadEntities().then(renderAll); });
+
+  // Reload config if the page becomes visible after being hidden — catches the case
+  // where the user restores a DB on the Data Management page then switches back here.
+  // The in-memory config object would be stale without a reload.
+  var _hiddenAt = null;
+  document.addEventListener('visibilitychange', function() {
+    if (document.hidden) {
+      _hiddenAt = Date.now();
+    } else if (_hiddenAt) {
+      // Only reload if a DB restore happened while we were away
+      var restored = sessionStorage.getItem('emt_db_restored');
+      if (restored && parseInt(restored) > _hiddenAt) {
+        sessionStorage.removeItem('emt_db_restored');
+        // Don't reload if wizard is open — would lose all wizard state
+        var wizardOpen = document.getElementById('wizard-overlay') &&
+                         document.getElementById('wizard-overlay').style.display !== 'none';
+        if (!wizardOpen) {
+          window.location.reload();
+        }
+      } else {
+        // #381: no full DB restore, but the supplier connection state may have
+        // changed while away (reconnect/disconnect/reactivate elsewhere, or a
+        // mode promotion). Cheap re-read; only re-renders if something changed.
+        try { refreshConnState(false); } catch (e) {}
+      }
+      _hiddenAt = null;
+    }
+  });
+  document.getElementById('btn-wizard-empty').addEventListener('click', startWizard);
+  var _csBtn = document.getElementById('btn-change-setup');
+  // Launching is harmless and reversible — the wizard pre-fills current settings
+  // and nothing commits until it's finished and saved — so no confirm dialog
+  // (a native confirm() also clashed with the app's modal style).
+  if (_csBtn) _csBtn.addEventListener('click', startWizard);
+  loadEntities().then(function() {
+    renderAll();
+    // Auto-launch wizard if no meters configured
+    if (Object.keys(config.meters || {}).length === 0) {
+      startWizard();
+    }
+  });
+});
+
+// Field type → acceptable units/device_class
+var FIELD_FILTERS = {
+  read:                    { units: ['kWh'], unitSuffixes: [], device_class: ['energy'] },
+  power_sensor:            { units: ['W', 'w', 'kW'], unitSuffixes: [], device_class: ['power'] },
+  rate:                    { units: [], unitSuffixes: ['/kwh'], device_class: ['monetary', 'currency'] },
+  standing_charge_sensor:  { units: [], unitSuffixes: ['/day'], device_class: ['monetary', 'currency'] },
+  soc_sensor:              { units: ['%'], unitSuffixes: [], device_class: ['battery'] },
+  inverter_power_sensor:   { units: ['W', 'w', 'kW'], unitSuffixes: [], device_class: ['power'] },
+  pv_power_sensor:         { units: ['W', 'w', 'kW'], unitSuffixes: [], device_class: ['power'] },
+  device_power_sensor:     { units: ['W', 'w', 'kW'], unitSuffixes: [], device_class: ['power'] },
+};
+
+async function loadEntities() {
+  try {
+    var r = await fetch(apiUrl('/api/entities'));
+    entities = await r.json();  // [{id, unit, device_class}, ...]
+    // Also store on window for modal autocomplete
+    window._entities = entities.map(function(e) { return { entity_id: e.id, unit: e.unit }; });
+  } catch(e) { console.warn('Could not load entities', e); }
+}
+
+function filterEntities(field, query) {
+  var filter = FIELD_FILTERS[field];
+  var q = (query||'').toLowerCase();
+  var candidates = entities;
+
+  if (filter) {
+    var matched = candidates.filter(function(e) {
+      var unit    = (e.unit||'').toLowerCase();
+      var unitOk  = filter.units.some(function(u) { return unit === u.toLowerCase(); });
+      var suffixOk = (filter.unitSuffixes||[]).some(function(s) { return unit.endsWith(s); });
+      var classOk = filter.device_class.some(function(dc) { return (e.device_class||'').toLowerCase() === dc.toLowerCase(); });
+      return unitOk || suffixOk || classOk;
+    });
+    // If filter produces results use them, otherwise fall back to all entities
+    if (matched.length > 0) candidates = matched;
+  }
+
+  if (q.length < 2) return [];
+  return candidates.filter(function(e) { return e.id.toLowerCase().indexOf(q) !== -1; }).slice(0, 50);
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function renderAll() {
+  var meters  = config.meters || {};
+  var mainIds = Object.keys(meters).filter(function(id) { return !meters[id].meta.sub_meter; });
+  var subIds  = Object.keys(meters).filter(function(id) { return !!meters[id].meta.sub_meter; });
+
+  // Main meter
+  var mc = document.getElementById('main-meter-container');
+  var nm = document.getElementById('no-main-meter');
+  mc.innerHTML = '';
+  if (mainIds.length === 0) {
+    nm.style.display = 'block';
+  } else {
+    nm.style.display = 'none';
+    mainIds.forEach(function(id) { mc.appendChild(buildMainCard(id, meters[id])); });
+  }
+
+  // Devices (sub-meters)
+  var sc  = document.getElementById('sub-meter-container');
+  sc.innerHTML = '';
+  subIds.forEach(function(id) { sc.appendChild(buildSubCard(id, meters[id])); });
+
+  attachListeners();
+  applySourceToggles();
+}
+
+// ── Main meter card ───────────────────────────────────────────────────────────
+function buildMainCard(meterId, meter) {
+  var meta     = meter.meta || {};
+  var channels = meter.channels || {};
+  var imp      = channels.import || {};
+  var exp      = channels.export || {};
+
+  // ── Mode-aware field display (Tier-1) ───────────────────────────────────
+  // The page adapts to the active data-source mode: a pure-API mode (api /
+  // api+mini) has no local feed, so the read sensors are not needed; rate &
+  // standing charge are optional in any API mode (the Kraken schedule supplies
+  // them at reconcile). cad / cad+api keep local read sensors required.
+  var dsMode  = (typeof DATA_SOURCE_MODE !== 'undefined' && DATA_SOURCE_MODE) ? DATA_SOURCE_MODE : 'cad';
+  var _mi     = wizModeFieldInfo(dsMode, meta.supplier);
+  var usesApi = _mi.usesApi;
+  var noLocal = _mi.noLocal;
+  // API mode selected but no stored credentials (e.g. restored onto a fresh
+  // install — creds aren't in backups). The "connected" UI would otherwise lie.
+  var credsMissing = usesApi &&
+    (typeof HAS_CREDENTIALS !== 'undefined') && !HAS_CREDENTIALS;
+  // #381: the OPPOSITE limbo — a valid key IS stored but the mode is local-only
+  // (cad/unset), e.g. after a Disconnect or a DB-swap parked the mode. The API
+  // controls are otherwise hidden, so it looks like the credentials are gone.
+  // Offer a one-click Reactivate (uses the stored key; the server promotes the
+  // mode). Suppressed on an account mismatch — that has its own #357 prompt.
+  var dormantCreds = !usesApi &&
+    (typeof HAS_CREDENTIALS !== 'undefined') && HAS_CREDENTIALS &&
+    !(typeof CONN_MISMATCH !== 'undefined' && CONN_MISMATCH);
+  var supLabel = _mi.supLabel;
+  var supPoss = supLabel + '\u2019s';     // "your supplier's" / "Octopus Energy's"
+  var modeLabel = _mi.modeLabel;
+  var rateOptNote = usesApi
+    ? ' <span style="color:var(--muted);font-weight:400;">(optional — supplied by ' + esc(supLabel) + '\u2019s rate schedule if left blank)</span>'
+    : '';
+
+  var div = document.createElement('div');
+  div.className = 'card';
+  div.dataset.meter = meterId;
+
+  div.innerHTML =
+    '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">' +
+      '<div style="display:flex;align-items:center;gap:10px;">' +
+        '<span style="font-size:13px;font-weight:600;color:var(--fg);">⚡ ' +
+        esc(((meta.site || meta.site_name || 'Main Meter')).toUpperCase()) + '</span>' +
+      '</div>' +
+      '<button class="btn btn-danger btn-sm js-remove-meter" data-meter="' + meterId + '">✕ Remove</button>' +
+    '</div>' +
+
+    '<div class="info-box">' +
+      (credsMissing
+        ? '<div style="margin:-2px 0 12px;padding:10px 12px;border:1px solid #b45309;border-radius:6px;background:rgba(180,83,9,0.10);color:var(--fg);font-size:12px;line-height:1.5;">' +
+            '⚠ <strong>API mode is set, but no API credentials are stored.</strong> ' +
+            'This usually happens after restoring a backup onto a fresh install — your ' +
+            'stored key isn’t part of the backup. Import readings and settlement are ' +
+            '<strong>paused</strong> until you re-enter it.' +
+            '<div style="margin-top:8px;">' +
+              '<button class="btn btn-primary btn-sm js-reconnect-octopus">Re-enter API key</button>' +
+            '</div>' +
+          '</div>'
+        : '') +
+      (dormantCreds
+        ? '<div style="margin:-2px 0 12px;padding:10px 12px;border:1px solid var(--accent,#2563eb);border-radius:6px;background:rgba(37,99,235,0.08);color:var(--fg);font-size:12px;line-height:1.5;">' +
+            '\u26A1 <strong>' + esc(supLabel) + ' API is configured but inactive.</strong> ' +
+            'Your API key is stored, but the data source is set to local sensors only ' +
+            '(this can happen after a Disconnect or swapping databases). Import ' +
+            'settlement and dispatch pricing are <strong>paused</strong> until you reactivate.' +
+            '<div style="margin-top:8px;">' +
+              '<button class="btn btn-primary btn-sm js-reactivate-octopus">Reactivate ' + esc(supLabel) + '</button>' +
+            '</div>' +
+          '</div>'
+        : '') +
+      '<strong>Data source: ' + esc(modeLabel) +
+        (credsMissing ? ' <span style="color:#b45309;font-weight:600;">(credentials missing)</span>' : '') +
+        '</strong>' +
+      '<ul>' +
+        (noLocal
+          ? '<li>Import readings come from ' + esc(supLabel) + ' settlement' +
+              (dsMode === 'api+mini' ? ', refined in near-real-time by your Octopus Mini' : '') +
+              ' — <strong>no local read sensor needed</strong>.</li>' +
+            '<li>Rate &amp; standing charge are resolved from ' + esc(supPoss) +
+              ' schedule — sensors optional.</li>'
+          : (usesApi
+              ? '<li><strong>Import/Export read</strong> — cumulative kWh from your local meter (required for CAD).</li>' +
+                '<li>Rate &amp; standing charge optional — resolved from ' + esc(supPoss) + ' schedule if left blank.</li>'
+              : '<li><strong>Import/Export read</strong> — cumulative kWh, high-frequency updates (every 10\u201330s)</li>' +
+                '<li><strong>Rate sensors</strong> — current rate per kWh (e.g. Octopus Energy rate sensors)</li>' +
+                '<li><strong>Standing charge</strong> — daily standing charge sensor (can be a fixed-value helper)</li>')) +
+      '</ul>' +
+      (usesApi && !credsMissing
+        ? '<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-wrap:wrap;">' +
+            '<button class="btn btn-danger btn-sm js-disconnect-octopus">Disconnect ' + esc(supLabel) + '</button>' +
+            '<span style="font-size:11px;color:var(--muted);">Clears stored API credentials and switches to local sensors. Billing history is kept.</span>' +
+          '</div>'
+        : '') +
+    '</div>' +
+
+    '<div class="grid-2">' +
+      '<input type="hidden" class="js-meter-id" data-meter="' + meterId + '" value="' + esc(meterId) + '">' +
+      '<div class="form-group"><label>Site Name</label>' +
+        '<input type="text" class="js-meta" data-meter="' + meterId + '" data-key="site" value="' + esc(meta.site||'') + '"></div>' +
+      '<div class="form-group"><div style="font-size:12px;color:var(--muted);padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:4px;">' +
+        '⚡ Supplier is recorded per billing period — set it on the <a href="billing-history" style="color:var(--accent);">Billing History</a> page.' +
+        '</div></div>' +
+      '<div class="form-group"><label>First day of your billing period</label>' +
+        '<input type="number" min="1" max="28" class="js-meta js-meta-int" data-meter="' + meterId + '" data-key="billing_day" value="' + (meta.billing_day||1) + '"></div>' +
+      '<div class="form-group"><label>Meter Reconciliation Period (Block Size)</label>' +
+        (hasData
+          ? '<select class="js-meta js-meta-int" data-meter="' + meterId + '" data-key="block_minutes" disabled title="Meter Reconciliation Period is locked once data has been collected"><option value="5"' + (meta.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (meta.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((meta.block_minutes||30)===30?' selected':'') + '>30 min</option></select><small style="color:var(--warning-color,#b45309);">⚠ Locked — changing the reconciliation period requires clearing all data</small>'
+          : '<select class="js-meta js-meta-int" data-meter="' + meterId + '" data-key="block_minutes"><option value="5"' + (meta.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (meta.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((meta.block_minutes||30)===30?' selected':'') + '>30 min</option></select>') +
+      '</div>' +
+      '<div class="form-group"><label>Timezone</label>' +
+        buildTzSelectForMeter(meterId, meta.timezone||'UTC') + '</div>' +
+      '<div style="font-size:11px;color:var(--muted);margin-top:-8px;margin-bottom:8px;">Used to assign blocks to the correct local day. UK: Europe/London</div>' +
+
+      '<div class="form-group" style="grid-column:1/-1;"><label>Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — enables Live Summary page)</span></label>' +
+        buildEntityInput(meterId + '__power__power_sensor', meta.power_sensor||'', meterId, 'power', 'power_sensor', true) +
+        '<div class="checkbox-row" style="margin-top:8px;">' +
+          '<input type="checkbox" id="pwr-invert-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="power_invert" ' + (meta.power_invert ? 'checked' : '') + '>' +
+          '<label for="pwr-invert-' + meterId + '">Invert sensor value <span style="color:var(--muted);font-weight:400;">— tick if it reads negative when importing</span></label>' +
+        '</div>' +
+        '<div style="margin-top:8px;"><label style="font-size:12px;font-weight:600;">Unit override <span style="color:var(--muted);font-weight:400;">(only if the gauge reads ~1000× wrong)</span></label><br>' +
+          '<select class="js-meta" data-meter="' + meterId + '" data-key="power_unit" style="max-width:220px;margin-top:4px;">' +
+            '<option value=""'   + (!meta.power_unit      ? ' selected' : '') + '>Auto (use sensor unit)</option>' +
+            '<option value="W"'  + (meta.power_unit==='W'  ? ' selected' : '') + '>Force watts (W)</option>' +
+            '<option value="kW"' + (meta.power_unit==='kW' ? ' selected' : '') + '>Force kilowatts (kW)</option>' +
+          '</select></div>' +
+        '<small style="color:var(--muted);">Live power in watts (W) or kW — enables the live power gauge on the Summary page.</small></div>' +
+      '<div class="form-group" style="grid-column:1/-1;"><label>Postcode Prefix <span style="color:var(--muted);font-weight:400;">(optional — enables Carbon Intensity forecast)</span></label>' +
+        '<input type="text" class="js-meta" data-meter="' + meterId + '" data-key="postcode_prefix" value="' + esc(meta.postcode_prefix||'') + '" placeholder="e.g. DE, SW1, M" style="max-width:200px;">' +
+        '<small style="color:var(--muted);">🇬🇧 UK only — first part of your postcode (e.g. DE1, not just DE). Enables the 48-hour carbon intensity forecast on the Summary page via the National Grid API.</small></div>' +
+
+    '</div>' +
+
+    (noLocal ? '' :
+      '<hr>' +
+      '<div class="section-divider">Import Channel</div>' +
+      '<div class="channel-card">' +
+        '<span class="channel-label label-import">Import</span>' +
+        '<div class="form-group"><label>Read Sensor — cumulative kWh from grid</label>' +
+          buildEntityInput(meterId+'__import__read', imp.read||'', meterId, 'import', 'read') + '</div>' +
+        '<div class="form-group"><label>Import Rate Sensor' + rateOptNote + '</label>' +
+          (usesApi ? buildSourceToggle(meterId, 'import', 'rate', mainApiChecked(imp, 'rate'), meterId+'__import__rate') : '') +
+          buildEntityInput(meterId+'__import__rate', imp.rate||'', meterId, 'import', 'rate') + '</div>' +
+        '<div class="form-group"><label>Standing Charge Sensor (per day)' + rateOptNote + '</label>' +
+          (usesApi ? buildSourceToggle(meterId, 'import', 'standing_charge', mainApiChecked(imp, 'standing_charge'), meterId+'__import__sc') : '') +
+          buildEntityInput(meterId+'__import__sc', imp.standing_charge_sensor||'', meterId, 'import', 'standing_charge_sensor', true) + '</div>' +
+        buildAdvanced(meterId, 'import', imp) +
+      '</div>' +
+
+      '<div class="section-divider">Export Channel</div>' +
+      '<div class="channel-card">' +
+        '<span class="channel-label label-export">Export</span>' +
+        '<div class="form-group"><label>Read Sensor — cumulative kWh exported to grid</label>' +
+          buildEntityInput(meterId+'__export__read', exp.read||'', meterId, 'export', 'read') + '</div>' +
+        '<div class="form-group"><label>Export Rate Sensor' + rateOptNote + '</label>' +
+          (usesApi ? buildSourceToggle(meterId, 'export', 'rate', mainApiChecked(exp, 'rate'), meterId+'__export__rate') : '') +
+          buildEntityInput(meterId+'__export__rate', exp.rate||'', meterId, 'export', 'rate') + '</div>' +
+        buildAdvanced(meterId, 'export', exp) +
+      '</div>');
+
+  return div;
+}
+
+// ── Sub-meter card ────────────────────────────────────────────────────────────
+// Ohme guidance for the EV card, shown only on Octopus/IOG (API) accounts.
+// Detection-aware: confirms the verified path when a charge-mode entity was
+// found, otherwise nudges installing an integration. Always flags the
+// session-based energy sensor (read-sensor caveat) and asks for GitHub feedback,
+// since the Ohme path is new and unvalidated on live hardware.
+function ohmeEvNote() {
+  var mode = (typeof DATA_SOURCE_MODE !== 'undefined' && DATA_SOURCE_MODE) ? DATA_SOURCE_MODE : '';
+  if (mode.indexOf('api') === -1) return '';   // Octopus / IOG (API) accounts only
+  var det = (typeof OHME_DETECTION !== 'undefined' && OHME_DETECTION) ? OHME_DETECTION : {};
+  var gh = 'https://github.com/RGx01/EMT/issues';
+  var head, body;
+  if (det && det.found) {
+    var integ = det.integration === 'official' ? 'the official Ohme integration'
+              : det.integration === 'danr'     ? "dan-r's HomeAssistant-Ohme"
+              : 'an Ohme integration';
+    head = 'Ohme charge mode detected';
+    body = 'EMT found ' + integ +
+           (det.charge_mode_entity ? ' (<code>' + esc(det.charge_mode_entity) + '</code>)' : '') +
+           ' and is using verified off-peak detection for this charger — smart charges are priced off-peak and manual boosts stay at peak.';
+  } else {
+    head = 'Using an Ohme charger?';
+    body = "Install the official Ohme integration or dan-r's HomeAssistant-Ohme to give EMT a charge-mode signal. " +
+           'It can then tell a smart (off-peak) charge from a manual boost and price your Intelligent Octopus rates accurately. ' +
+           'Without one, planned charge windows are priced optimistically (still bounded by measured draw).';
+  }
+  var feedback = 'Ohme support is new and not yet validated on live hardware — please share feedback and your add-on log on <a href="' + gh + '" target="_blank" rel="noopener">GitHub</a>.';
+  return '<div class="info-box" style="border-left:3px solid #8b5cf6;">' +
+           '<strong>' + head + '</strong>' +
+           '<div style="margin-top:6px;">' + body + '</div>' +
+           '<div style="margin-top:6px;color:var(--muted);">' + feedback + '</div>' +
+         '</div>';
+}
+
+function buildSubCard(meterId, meter) {
+  var meta     = meter.meta || {};
+  var channels = meter.channels || {};
+  var imp      = channels.import || {};
+
+  var mainMeters = Object.keys(config.meters||{}).filter(function(id) { return !config.meters[id].meta.sub_meter; });
+  var mainImportRate = '';
+  if (mainMeters.length > 0) {
+    var mainCh = (config.meters[mainMeters[0]].channels||{}).import || {};
+    mainImportRate = mainCh.rate || '';
+  }
+  var rateVal = imp.rate || mainImportRate;
+
+  // Detect sub-meter type — meter_type field takes priority, then device name/ID keywords
+  var meterType  = meta.meter_type || '';
+  // Type detection — explicit meter_type only, no keyword guessing in config UI
+  // Keywords are retained in server.py only for backward compat with existing sensors
+  var isBattery  = meterType === 'battery';
+  var isEV       = meterType === 'ev';
+  var isHeatPump = meterType === 'heat_pump';
+
+  // Auto-set parent_meter to first main meter (not shown in UI)
+  if (!meta.parent_meter && mainMeters.length > 0) {
+    config.meters[meterId].meta['parent_meter'] = mainMeters[0];
+  }
+
+  var div = document.createElement('div');
+  div.className = 'card';
+  div.dataset.meter = meterId;
+
+  div.innerHTML =
+    '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">' +
+      '<div style="display:flex;align-items:center;gap:10px;">' +
+        '<span style="font-size:13px;font-weight:600;color:var(--fg);">' +
+        (isBattery ? '🔋' : isEV ? '🚗' : isHeatPump ? '♨️' : '⚡') +
+        ' ' + esc((meta.device || 'Device').toUpperCase()) + '</span>' +
+      '</div>' +
+      '<div style="display:flex;gap:8px;">' +
+        (meta.retired_at
+          ? '<span style="font-size:11px;background:rgba(249,115,22,0.15);color:#f97316;padding:3px 8px;border-radius:4px;">Retired ' + meta.retired_at + '</span>' +
+            '<button class="btn btn-sm js-unretire-meter" data-meter="' + meterId + '" style="font-size:12px;">↩ Unretire</button>'
+          : '<button class="btn btn-sm js-retire-meter" data-meter="' + meterId + '" style="font-size:12px;color:var(--muted);">Archive</button>') +
+        '<button class="btn btn-danger btn-sm js-remove-meter" data-meter="' + meterId + '">✕ Remove</button>' +
+      '</div>' +
+    '</div>' +
+
+    (meta.retired_at ? (
+      '<div style="padding:10px 0;font-size:12px;color:var(--muted);">' +
+        '📦 Archived ' + meta.retired_at +
+        (meta.retired_reason ? ' — ' + esc(meta.retired_reason) : '') +
+        '. Historical data is preserved.' +
+      '</div>'
+    ) : '') +
+
+    (!meta.retired_at ? '<div class="info-box">' +
+      '<strong>Device sensor requirements</strong>' +
+      '<ul>' +
+        '<li>The <strong>read sensor</strong> must be <strong>cumulative kWh (import only)</strong> — not net, not export, not watts</li>' +
+        (isBattery
+          ? '<li>Battery integrations (GivEnergy, Powerwall, Solax) report kWh directly — use the consumption sensor</li>' +
+            '<li>Add the SoC and inverter power sensors below to enable the Live Power battery card</li>'
+          : isEV
+          ? '<li>EV charger integrations (Zappi, Ohme, Wallbox) report session kWh — use the total energy sensor</li>' +
+            '<li>Add the charger power sensor below to show live charge rate on the Live Power page</li>'
+          : isHeatPump
+          ? '<li>Heat pump energy sensors report cumulative kWh — check your integration docs for the correct entity</li>' +
+            '<li>Add the heat pump power sensor below to show live draw on the Live Power page</li>'
+          : '<li><strong>CT clamp via PowerCalc</strong> — aggregated kWh, updates every 60s minimum</li>' +
+            '<li><strong>Device integration</strong> — if your device reports kWh directly</li>') +
+      '</ul>' +
+      'Rate follows the main meter automatically.' +
+    '</div>' +
+    (isEV ? ohmeEvNote() : '') +
+
+    '<div class="grid-2">' +
+      '<input type="hidden" class="js-meter-id" data-meter="' + meterId + '" value="' + esc(meterId) + '">' +
+      '<div class="form-group"><label>Meter Type</label>' +
+        (meta.meter_type && existingMeterIds.has(meterId)
+          // Locked — meter has data, type cannot change
+          ? '<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);font-size:13px;">' +
+              (meta.meter_type==='battery' ? '🔋 Battery' : meta.meter_type==='ev' ? '🚗 EV Charger' : '♨️ Heat Pump') +
+              '<span style="margin-left:auto;font-size:11px;color:var(--muted);">🔒 locked</span>' +
+            '</div>' +
+            '<small style="color:var(--muted);">🔒 Meter type is permanent once data has been recorded. To change it you must delete this meter — which will also permanently delete all its historical data.</small>'
+          // Not yet locked — show dropdown
+          : '<select class="js-meta" data-meter="' + meterId + '" data-key="meter_type">' +
+              '<option value=""'   + (!meta.meter_type ? ' selected' : '') + '>— Select type —</option>' +
+              '<option value="battery"'   + (meta.meter_type==='battery'   ? ' selected' : '') + '>🔋 Battery</option>' +
+              '<option value="ev"'        + (meta.meter_type==='ev'        ? ' selected' : '') + '>🚗 EV Charger</option>' +
+              '<option value="heat_pump"' + (meta.meter_type==='heat_pump' ? ' selected' : '') + '>♨️ Heat Pump</option>' +
+            '</select>' +
+            '<small style="color:var(--muted);">Sets the meter icon and enables additional sensor fields on the Live Power page. Cannot be changed after data is recorded.</small>') +
+      '</div>' +
+      '<div class="form-group"><label>Device Name</label>' +
+        '<input type="text" class="js-meta" data-meter="' + meterId + '" data-key="device" value="' + esc(meta.device||'') + '"></div>' +
+    '</div>' +
+
+    // V2X checkbox — show for EV type, or when no meter_type set (unknown type)
+    (isEV || !meterType
+      ? '<div style="margin-bottom:16px;"><div class="checkbox-row">' +
+          '<input type="checkbox" id="v2x-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="v2x_capable" ' + (meta.v2x_capable?'checked':'') + '>' +
+          '<label for="v2x-' + meterId + '">V2X / Vehicle-to-Grid capable</label>' +
+        '</div></div>'
+      : '') +
+    // inverter_possible removed in 2.9.0
+
+    // SoC sensor and inverter power sensor — only shown for battery type meters
+    (isBattery
+      ? '<div class="form-group" style="grid-column:1/-1;margin-bottom:8px;">' +
+          '<label>State of Charge Sensor <span style="color:var(--muted);font-weight:400;">(optional — enables SoC dial on Live Power page)</span></label>' +
+          buildEntityInput(meterId + '__soc__soc_sensor', meta.soc_sensor||'', meterId, 'soc', 'soc_sensor', true) +
+          '<small style="color:var(--muted);">Battery SoC in % (0–100). From your battery integration (e.g. GivEnergy, Powerwall, Solax). ⓘ Informational only — not recorded in blocks or used in calculations.</small>' +
+        '</div>' +
+        '<div class="form-group" style="grid-column:1/-1;margin-bottom:16px;">' +
+          '<label>Inverter Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — shows live kW below SoC dial)</span></label>' +
+          buildEntityInput(meterId + '__inverter_power__inverter_power_sensor', meta.inverter_power_sensor||'', meterId, 'inverter_power', 'inverter_power_sensor', true) +
+          '<div class="checkbox-row" style="margin-top:8px;">' +
+            '<input type="checkbox" id="inv-invert-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="inverter_power_invert" ' + (meta.inverter_power_invert ? 'checked' : '') + '>' +
+            '<label for="inv-invert-' + meterId + '">Invert sensor value <span style="color:var(--muted);font-weight:400;">— tick if positive = charging, negative = discharging</span></label>' +
+          '</div>' +
+          '<div style="margin-top:8px;"><label style="font-size:12px;font-weight:600;">Unit override <span style="color:var(--muted);font-weight:400;">(only if the gauge reads ~1000× wrong)</span></label><br>' +
+            '<select class="js-meta" data-meter="' + meterId + '" data-key="inverter_power_unit" style="max-width:220px;margin-top:4px;">' +
+              '<option value=""'   + (!meta.inverter_power_unit      ? ' selected' : '') + '>Auto (use sensor unit)</option>' +
+              '<option value="W"'  + (meta.inverter_power_unit==='W'  ? ' selected' : '') + '>Force watts (W)</option>' +
+              '<option value="kW"' + (meta.inverter_power_unit==='kW' ? ' selected' : '') + '>Force kilowatts (kW)</option>' +
+            '</select></div>' +
+          '<small style="color:var(--muted);">Live inverter power in W or kW. ⓘ Informational only — not recorded in blocks or used in calculations.</small>' +
+        '</div>' +
+        '<div class="form-group" style="grid-column:1/-1;margin-bottom:16px;">' +
+          '<label>Solar / PV Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — adds a small PV dial to the battery card)</span></label>' +
+          buildEntityInput(meterId + '__pv_power__pv_power_sensor', meta.pv_power_sensor||'', meterId, 'pv_power', 'pv_power_sensor', true) +
+          '<small style="color:var(--muted);">Live PV generation in W or kW. ⓘ Informational only — not recorded in blocks or used in calculations.</small>' +
+        '</div>'
+      : '') +
+
+    // Power sensor — shown for EV charger and heat pump meters
+    ((isEV || isHeatPump)
+      ? '<div class="form-group" style="grid-column:1/-1;margin-bottom:16px;">' +
+          '<label>' + (isEV ? 'Charger' : 'Heat Pump') + ' Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — shows live kW on Live Power page)</span></label>' +
+          buildEntityInput(meterId + '__device_power__device_power_sensor', meta.device_power_sensor||'', meterId, 'device_power', 'device_power_sensor', true) +
+          '<div class="checkbox-row" style="margin-top:8px;">' +
+            '<input type="checkbox" id="dev-invert-' + meterId + '" class="js-meta-bool" data-meter="' + meterId + '" data-key="device_power_invert" ' + (meta.device_power_invert ? 'checked' : '') + '>' +
+            '<label for="dev-invert-' + meterId + '">Invert sensor value <span style="color:var(--muted);font-weight:400;">— tick if it reads negative when consuming</span></label>' +
+          '</div>' +
+          '<div style="margin-top:8px;"><label style="font-size:12px;font-weight:600;">Unit override <span style="color:var(--muted);font-weight:400;">(only if the gauge reads ~1000× wrong)</span></label><br>' +
+            '<select class="js-meta" data-meter="' + meterId + '" data-key="device_power_unit" style="max-width:220px;margin-top:4px;">' +
+              '<option value=""'   + (!meta.device_power_unit      ? ' selected' : '') + '>Auto (use sensor unit)</option>' +
+              '<option value="W"'  + (meta.device_power_unit==='W'  ? ' selected' : '') + '>Force watts (W)</option>' +
+              '<option value="kW"' + (meta.device_power_unit==='kW' ? ' selected' : '') + '>Force kilowatts (kW)</option>' +
+            '</select></div>' +
+          '<small style="color:var(--muted);">Live power in W or kW. ⓘ Informational only — not recorded in blocks or used in calculations.</small>' +
+        '</div>'
+      : '') +
+
+    '<hr>' +
+    '<div class="section-divider">Import Channel</div>' +
+    '<div class="channel-card">' +
+      '<span class="channel-label label-import">Import</span>' +
+      '<div class="form-group"><label>Read Sensor — cumulative kWh</label>' +
+        buildEntityInput(meterId+'__import__read', imp.read||'', meterId, 'import', 'read') + '</div>' +
+    '</div>' : '');  // end of !meta.retired_at conditional
+
+  return div;
+}
+
+// ── Advanced meta section ─────────────────────────────────────────────────────
+function buildAdvanced(meterId, chId, ch) {
+  var meta = ch.meta || {};
+  var uid  = meterId + '__' + chId;
+  return '<div class="advanced-toggle" onclick="toggleAdvanced(\'' + uid + '\')">' +
+    '<span id="adv-arrow-' + uid + '">▶</span> Advanced (MPAN, tariff, source)' +
+  '</div>' +
+  '<div class="advanced-section" id="adv-' + uid + '">' +
+    '<div class="grid-2">' +
+      '<div class="form-group"><label>MPAN</label>' +
+        '<input type="text" class="js-ch-meta" data-meter="' + meterId + '" data-channel="' + chId + '" data-key="mpan" value="' + esc(meta.mpan||'') + '" style="font-family:var(--mono);"></div>' +
+      '<div class="form-group"><label>Tariff</label>' +
+        '<input type="text" class="js-ch-meta" data-meter="' + meterId + '" data-channel="' + chId + '" data-key="tariff" value="' + esc(meta.tariff||'') + '"></div>' +
+      '<div class="form-group"><label>Source</label>' +
+        '<input type="text" class="js-ch-meta" data-meter="' + meterId + '" data-channel="' + chId + '" data-key="source" value="' + esc(meta.source||'supplier_meter') + '"></div>' +
+    '</div>' +
+  '</div>';
+}
+
+function toggleAdvanced(uid) {
+  var sec   = document.getElementById('adv-' + uid);
+  var arrow = document.getElementById('adv-arrow-' + uid);
+  if (sec.classList.contains('open')) {
+    sec.classList.remove('open');
+    arrow.textContent = '▶';
+  } else {
+    sec.classList.add('open');
+    arrow.textContent = '▼';
+  }
+}
+
+// ── Entity input ──────────────────────────────────────────────────────────────
+function buildEntityInput(id, currentVal, meterId, chId, field, allowClear) {
+  return '<div style="display:flex;gap:6px;align-items:flex-start;">' +
+    '<div class="entity-wrap">' +
+    '<input type="text" id="' + id + '"' +
+    ' class="js-ch-field entity-input" data-meter="' + meterId + '" data-channel="' + chId + '" data-field="' + field + '"' +
+    ' value="' + esc(currentVal) + '" placeholder="Search or type entity ID..." autocomplete="off"' +
+    ' style="font-family:var(--mono);font-size:12px;">' +
+    '<div id="' + id + '_drop" class="entity-drop"></div>' +
+    '</div>' +
+    (allowClear ? '<button class="btn btn-secondary btn-sm js-clear-entity" data-target="' + id + '" title="Clear">✕</button>' : '') +
+    '</div>';
+}
+
+// ── Rate-source toggles (API vs sensor; "use main meter rate" for devices) ────
+// Whether the supplier-API checkbox for a MAIN-meter quantity is ticked.
+// Falls back to inference (no sensor mapped → API) for un-migrated configs,
+// matching the DB migration's own default.
+function mainApiChecked(ch, kind) {
+  ch = ch || {};
+  if (kind === 'standing_charge') {
+    if (ch.standing_charge_source) return ch.standing_charge_source === 'api';
+    return !((ch.standing_charge_sensor || '').trim());
+  }
+  if (ch.rate_source) return ch.rate_source === 'api';
+  return !((ch.rate || '').trim());
+}
+
+// Map a checkbox state to the stored source value.
+function srcFromToggle(checked, onVal) { return checked ? onVal : 'sensor'; }
+
+// kind: 'rate' | 'standing_charge' (main) | 'device'
+function buildSourceToggle(meterId, chId, kind, checked, targetId) {
+  var sourceKey = (kind === 'standing_charge') ? 'standing_charge_source' : 'rate_source';
+  var onVal     = (kind === 'device') ? 'main' : 'api';
+  var label     = (kind === 'device') ? 'Use main meter rate'
+                : (kind === 'standing_charge') ? 'Use supplier API standing charge'
+                : 'Use supplier API rate';
+  var hint      = (kind === 'device')
+        ? ' \u2014 untick to give this device its own rate sensor'
+        : ' \u2014 untick to read this from a Home Assistant sensor';
+  var cbId = 'src-' + meterId + '__' + chId + '__' + kind;
+  return '<div class="checkbox-row" style="margin:2px 0 8px;">' +
+    '<input type="checkbox" class="js-ch-source" id="' + cbId + '"' +
+      ' data-meter="' + meterId + '" data-channel="' + chId + '"' +
+      ' data-source-key="' + sourceKey + '" data-on="' + onVal + '"' +
+      ' data-target="' + targetId + '"' + (checked ? ' checked' : '') + '>' +
+    '<label for="' + cbId + '">' + label +
+      '<span style="color:var(--muted);font-weight:400;">' + hint + '</span></label>' +
+  '</div>';
+}
+
+// Grey out (or restore) the entity input paired with a source toggle.
+function setEntityDisabled(targetId, disabled) {
+  var input = document.getElementById(targetId);
+  if (input) {
+    input.disabled = disabled;
+    input.style.opacity = disabled ? '0.4' : '';
+  }
+  var clr = document.querySelector('.js-clear-entity[data-target="' + targetId + '"]');
+  if (clr) clr.style.display = disabled ? 'none' : '';
+  var drop = document.getElementById(targetId + '_drop');
+  if (drop) { drop.innerHTML = ''; drop.style.display = 'none'; }
+}
+
+// Apply the initial grey-out for every source toggle after a render.
+function applySourceToggles() {
+  document.querySelectorAll('.js-ch-source').forEach(function(cb) {
+    setEntityDisabled(cb.dataset.target, cb.checked);
+  });
+}
+
+// ── Event delegation ──────────────────────────────────────────────────────────
+function attachListeners() {
+  ['main-meter-container','sub-meter-container'].forEach(function(cid) {
+    var c = document.getElementById(cid);
+    c.removeEventListener('change', onContainerChange);
+    c.removeEventListener('click',  onContainerClick);
+    c.addEventListener('change', onContainerChange);
+    c.addEventListener('click',  onContainerClick);
+  });
+  setupEntityDropdowns();
+}
+
+function onContainerChange(e) {
+  var el = e.target;
+  var m  = el.dataset.meter;
+  var k  = el.dataset.key;
+  if (!m) return;
+  if (el.classList.contains('js-meta')) {
+    var val = el.value;
+    // Normalise postcode_prefix — strip to outward code only (e.g. "DE1 3AT" → "DE1")
+    if (k === 'postcode_prefix') {
+      val = val.trim().toUpperCase().split(/\s+/)[0];
+      el.value = val; // update field to show normalised value
+    }
+    config.meters[m].meta[k] = val;
+  }
+  else if (el.classList.contains('js-meta-int'))  { config.meters[m].meta[k] = parseInt(el.value)||1; }
+  else if (el.classList.contains('js-meta-bool')) { config.meters[m].meta[k] = el.checked; }
+  else if (el.classList.contains('js-meter-id'))  { renameMeter(m, el.value); }
+  else if (el.classList.contains('js-meta') && el.dataset.key === 'meter_type') {
+    // Only fires when dropdown is shown (not locked)
+    config.meters[m].meta['meter_type'] = el.value;
+    renderAll();
+    return;
+  }
+
+  // Inline validation for device/site name fields
+  if (el.classList.contains('js-meta') && (el.dataset.key === 'device' || el.dataset.key === 'site')) {
+    var nameVal = el.value.trim();
+    var nameErr = '';
+    if (nameVal && nameVal.length > _NAME_MAX) {
+      nameErr = 'Name must be ' + _NAME_MAX + ' characters or fewer.';
+    } else if (nameVal && !_NAME_REGEX.test(nameVal)) {
+      nameErr = 'Invalid characters. Use letters, numbers, spaces and \' - & ( ) . only.';
+    } else if (nameVal) {
+      // Check uniqueness against other meters
+      var lower = nameVal.toLowerCase();
+      var duplicate = Object.keys(config.meters).some(function(otherId) {
+        if (otherId === m) return false;
+        var otherMeta = (config.meters[otherId].meta || {});
+        var otherName = (otherMeta.device || otherMeta.site || '').trim().toLowerCase();
+        return otherName === lower;
+      });
+      if (duplicate) nameErr = 'This name is already used by another meter.';
+    }
+    el.style.borderColor = nameErr ? 'var(--danger)' : '';
+    el.title = nameErr || '';
+  }
+  else if (el.classList.contains('js-ch-field')) {
+    var ch = el.dataset.channel, f = el.dataset.field;
+    if (ch === 'power') {
+      // power_sensor stored in meter meta
+      if (el.value) config.meters[m].meta['power_sensor'] = el.value;
+      else delete config.meters[m].meta['power_sensor'];
+    } else if (ch === 'soc') {
+      // soc_sensor stored in meter meta
+      if (el.value) config.meters[m].meta['soc_sensor'] = el.value;
+      else delete config.meters[m].meta['soc_sensor'];
+    } else if (ch === 'inverter_power') {
+      // inverter_power_sensor stored in meter meta
+      if (el.value) config.meters[m].meta['inverter_power_sensor'] = el.value;
+      else delete config.meters[m].meta['inverter_power_sensor'];
+    } else if (ch === 'device_power') {
+      // device_power_sensor stored in meter meta (EV charger, heat pump)
+      if (el.value) config.meters[m].meta['device_power_sensor'] = el.value;
+      else delete config.meters[m].meta['device_power_sensor'];
+    } else if (ch === 'pv_power') {
+      // pv_power_sensor stored in meter meta (battery PV/solar dial)
+      if (el.value) config.meters[m].meta['pv_power_sensor'] = el.value;
+      else delete config.meters[m].meta['pv_power_sensor'];
+    } else {
+      if (!config.meters[m].channels[ch]) config.meters[m].channels[ch] = {};
+      if (el.value) config.meters[m].channels[ch][f] = el.value;
+      else delete config.meters[m].channels[ch][f];
+    }
+  }
+  else if (el.classList.contains('js-ch-meta')) {
+    var ch2 = el.dataset.channel;
+    if (!config.meters[m].channels[ch2].meta) config.meters[m].channels[ch2].meta = {};
+    config.meters[m].channels[ch2].meta[k] = el.value;
+  }
+  else if (el.classList.contains('js-ch-source')) {
+    var chS = el.dataset.channel;
+    if (!config.meters[m].channels[chS]) config.meters[m].channels[chS] = {};
+    config.meters[m].channels[chS][el.dataset.sourceKey] = srcFromToggle(el.checked, el.dataset.on);
+    setEntityDisabled(el.dataset.target, el.checked);
+  }
+}
+
+function onContainerClick(e) {
+  var el = e.target.closest('button');
+  if (!el) return;
+  if (el.classList.contains('js-retire-meter')) {
+    openRetireModal(el.dataset.meter);
+    return;
+  }
+  if (el.classList.contains('js-unretire-meter')) {
+    openUnretireModal(el.dataset.meter);
+    return;
+  }
+  if (el.classList.contains('js-remove-meter')) {
+    var mid = el.dataset.meter;
+    var mData = config.meters[mid] || {};
+    var isSub = (mData.meta || {}).sub_meter;
+    var devName = (mData.meta || {}).device || mid;
+    openDeleteModal(mid, devName, isSub);
+  } else if (el.classList.contains('js-clear-entity')) {
+    var t = document.getElementById(el.dataset.target);
+    if (t) { t.value = ''; t.dispatchEvent(new Event('change', { bubbles: true })); }
+  } else if (el.classList.contains('js-disconnect-octopus')) {
+    openDisconnectModal();
+  } else if (el.classList.contains('js-reconnect-octopus')) {
+    // API mode with no stored key — a lightweight KEY-ONLY reconnect. The data
+    // source is already 'api'; we only re-add the credential, so the mode is
+    // unchanged and no history recalculation is triggered. (The full setup wizard
+    // would flip the mode if you'd disconnected first — cad→api — which needlessly
+    // offered a full recalc.) Account is pre-filled from the DB's stored stamp.
+    openReconnectModal();
+  } else if (el.classList.contains('js-reactivate-octopus')) {
+    // #381: reactivate using the STORED key (no re-type). The server runs a live
+    // connect and promotes the mode back to an API mode; we then re-read state
+    // and re-render the panel in place.
+    executeReactivate(el);
+  }
+}
+
+var _addDeviceType = null;
+
+var _deleteMid = null;
+var _deleteDevName = null;
+
+function openDeleteModal(mid, devName, isSub) {
+  _deleteMid     = mid;
+  _deleteDevName = devName;
+  var isMain = !isSub;
+
+  document.getElementById('del-modal-title').textContent =
+    isMain ? 'Delete main meter and all data?' : 'Delete "' + devName + '"?';
+  document.getElementById('del-modal-body').innerHTML = isMain
+    ? '<strong>⚠️ This will delete your entire database and start fresh.</strong>' +
+      '<br><br>All historical blocks, carbon data, and devices will be permanently removed.' +
+      '<br><br>A backup will be created in <code>/share/energy_meter_tracker_backup</code> before deletion.' +
+      '<br><br>This action <strong>cannot be undone</strong>.'
+    : 'This will permanently delete <strong>all historical data</strong> for this device from the database.' +
+      '<br><br>This action <strong>cannot be undone</strong>.';
+
+  var input = document.getElementById('del-modal-confirm-input');
+  var btn   = document.getElementById('del-modal-confirm-btn');
+  input.value = '';
+  btn.disabled = true;
+  btn.style.opacity = '0.4';
+  btn.style.cursor  = 'not-allowed';
+
+  // Enable confirm button only when user types DELETE
+  input.oninput = function() {
+    var ok = input.value.trim().toUpperCase() === 'DELETE';
+    btn.disabled      = !ok;
+    btn.style.opacity = ok ? '1' : '0.4';
+    btn.style.cursor  = ok ? 'pointer' : 'not-allowed';
+  };
+
+  document.getElementById('delete-device-overlay').style.display = 'block';
+  setTimeout(function() { input.focus(); }, 100);
+}
+
+function closeDeleteModal() {
+  document.getElementById('delete-device-overlay').style.display = 'none';
+  _deleteMid     = null;
+  _deleteDevName = null;
+}
+
+function openDisconnectModal() {
+  document.getElementById('disconnect-overlay').style.display = 'block';
+}
+function closeDisconnectModal() {
+  document.getElementById('disconnect-overlay').style.display = 'none';
+}
+
+// Lightweight key-only reconnect (no wizard, no recalc). Account pre-filled from
+// the DB's stored stamp (surfaced by /api/kraken-config as db_account).
+function pollKrakenConnected(attempts, delayMs) {
+  // #381: a connect attempt can return not-connected on the first pass simply
+  // because discovery/poll hadn't settled yet (a transient — rate-limit, a
+  // network blip, or a DB mid-swap). Re-check /api/kraken-config a few times
+  // before declaring failure, so a slow-but-successful connect resolves silently
+  // instead of showing "failed" that the user has to manually retry. The server
+  // never drops the key on a failed verify, so this only ever upgrades a
+  // transient "failed" into the success it was about to become.
+  attempts = attempts || 3;
+  delayMs  = delayMs  || 1500;
+  return new Promise(function(resolve){
+    function attempt(n){
+      fetch(apiUrl('/api/kraken-config'))
+        .then(function(r){ return r.json(); })
+        .then(function(j){
+          if (j && j.connected) { resolve(true); return; }
+          if (n <= 1) { resolve(false); return; }
+          setTimeout(function(){ attempt(n - 1); }, delayMs);
+        })
+        .catch(function(){
+          if (n <= 1) { resolve(false); return; }
+          setTimeout(function(){ attempt(n - 1); }, delayMs);
+        });
+    }
+    attempt(attempts);
+  });
+}
+function refreshConnState(forceRender) {
+  // #381: re-read the live data-source mode + credential/connection state and,
+  // if anything changed, re-render the panel in place — so a reconnect,
+  // disconnect, reactivate, or a change made elsewhere (e.g. a DB swap) reflects
+  // without a manual page refresh. Cheap; only re-renders on an actual change.
+  return Promise.all([
+    fetch(apiUrl('/api/data-source-mode')).then(function(r){ return r.json(); }).catch(function(){ return null; }),
+    fetch(apiUrl('/api/kraken-config')).then(function(r){ return r.json(); }).catch(function(){ return null; })
+  ]).then(function(res){
+    var dsm = res[0], kc = res[1];
+    if (!dsm && !kc) return false;
+    var changed = false;
+    if (dsm && dsm.mode && dsm.mode !== DATA_SOURCE_MODE) { DATA_SOURCE_MODE = dsm.mode; changed = true; }
+    if (dsm && typeof dsm.has_credentials === 'boolean' && dsm.has_credentials !== HAS_CREDENTIALS) { HAS_CREDENTIALS = dsm.has_credentials; changed = true; }
+    var mm = !!(kc && kc.account_mismatch);
+    if (mm !== CONN_MISMATCH) { CONN_MISMATCH = mm; changed = true; }
+    if (changed || forceRender) {
+      var _wo = document.getElementById('wizard-overlay');
+      var wizardOpen = _wo && _wo.style.display !== 'none';
+      if (!wizardOpen) renderAll();
+    }
+    return changed;
+  });
+}
+function executeReactivate(btnEl) {
+  if (btnEl) { btnEl.disabled = true; btnEl.textContent = 'Reactivating\u2026'; }
+  fetch(apiUrl('/api/reactivate-kraken'), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({})
+  })
+    .then(function(r){ return r.text().then(function(t){
+      var j; try { j = t ? JSON.parse(t) : {}; } catch(e){ j = { error: 'Unexpected response (' + r.status + ')' }; }
+      return { ok: r.ok, j: j };
+    }); })
+    .then(function(res){
+      function onReactivated(acct){
+        // Connected — the server promoted the mode; re-read + re-render in place.
+        HAS_CREDENTIALS = true;
+        refreshConnState(true).then(function(){
+          document.getElementById('alert-success').textContent =
+            '\u2713 Reactivated ' + (acct ? '\u2014 ' + acct : 'Octopus') + '.';
+          show('alert-success');
+        });
+      }
+      function onReactFailed(detail){
+        if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Reactivate'; }
+        var errEl = document.getElementById('alert-error');
+        if (errEl) { errEl.textContent = '\u2717 Could not reactivate: ' + (detail ||
+          'connection could not be verified — your key was kept; try again shortly'); errEl.classList.add('show'); }
+      }
+      if (res.ok && !res.j.error && res.j.connected) { onReactivated(res.j.account_number); return; }
+      if (!res.ok || res.j.error) { onReactFailed(res.j.detail || res.j.error); return; }
+      // #381: re-poll before declaring failure (transient discovery/poll settle).
+      if (btnEl) { btnEl.textContent = 'Verifying\u2026'; }
+      pollKrakenConnected(3, 1500).then(function(connected){
+        if (connected) { onReactivated(res.j.account_number); }
+        else { onReactFailed(res.j.detail); }
+      });
+    })
+    .catch(function(e){
+      if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Reactivate'; }
+      var errEl = document.getElementById('alert-error');
+      if (errEl) { errEl.textContent = '\u2717 Reactivate failed: ' + e; errEl.classList.add('show'); }
+    });
+}
+function openReconnectModal() {
+  var acct  = document.getElementById('reconnect-account');
+  var key   = document.getElementById('reconnect-apikey');
+  var note  = document.getElementById('reconnect-account-note');
+  var stat  = document.getElementById('reconnect-status');
+  if (key)  key.value = '';
+  if (stat) stat.textContent = '';
+  document.getElementById('reconnect-overlay').style.display = 'block';
+  // Pre-fill the account from the previously-connected account on this DB.
+  fetch(apiUrl('/api/kraken-config'))
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      var prev = (d && (d.db_account || d.account_number)) || '';
+      if (acct && !acct.value) acct.value = prev;
+      if (note) note.style.display = prev ? 'block' : 'none';
+    })
+    .catch(function(){ /* leave account blank on failure */ });
+  setTimeout(function(){ if (key) key.focus(); }, 60);
+}
+function closeReconnectModal() {
+  document.getElementById('reconnect-overlay').style.display = 'none';
+}
+function executeReconnect() {
+  var acct = (document.getElementById('reconnect-account').value || '').trim();
+  var key  = (document.getElementById('reconnect-apikey').value || '').trim();
+  var stat = document.getElementById('reconnect-status');
+  var btn  = document.getElementById('reconnect-confirm-btn');
+  if (!key) {
+    if (stat) { stat.style.color = 'var(--error-color,#c00)'; stat.textContent = 'Enter your API key.'; }
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = 'Reconnecting…'; }
+  if (stat) { stat.style.color = 'var(--muted)'; stat.textContent = 'Connecting…'; }
+  fetch(apiUrl('/api/kraken-config'), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ api_key: key, account_number: acct || null })
+  })
+    .then(function(r){ return r.text().then(function(t){
+      var j; try { j = t ? JSON.parse(t) : {}; } catch(e){ j = { error: 'Unexpected response (' + r.status + ')' }; }
+      return { ok: r.ok, j: j };
+    }); })
+    .then(function(res){
+      function onConnected(acct){
+        // Connected — key is stored; refresh the card in place (no reload). The
+        // server may have promoted the mode (cad -> cad+api) on connect, so
+        // re-read state to reflect it without a manual page refresh.
+        HAS_CREDENTIALS = true;
+        if (btn) { btn.disabled = false; btn.textContent = 'Reconnect'; }
+        closeReconnectModal();
+        refreshConnState(true);
+        document.getElementById('alert-success').textContent =
+          '✓ Reconnected to Octopus' + (acct ? ' — ' + acct : '') + '.';
+        show('alert-success');
+      }
+      function onFailed(detail){
+        if (btn) { btn.disabled = false; btn.textContent = 'Reconnect'; }
+        if (stat) { stat.style.color = 'var(--error-color,#c00)';
+          stat.textContent = 'Could not connect: ' + (detail || 'check key/account'); }
+      }
+      if (res.ok && !res.j.error && res.j.connected) { onConnected(res.j.account_number); return; }
+      // Hard error (bad response / server error) — fail straight away.
+      if (!res.ok || res.j.error) { onFailed(res.j.detail || res.j.error || 'check key/account'); return; }
+      // #381: saved but not verified yet — re-poll before declaring failure.
+      if (stat) { stat.style.color = 'var(--muted)'; stat.textContent = 'Verifying connection\u2026'; }
+      pollKrakenConnected(3, 1500).then(function(connected){
+        if (connected) { onConnected(res.j.account_number); }
+        else { onFailed(res.j.detail || 'still connecting — your key was kept and will connect when reachable'); }
+      });
+    })
+    .catch(function(e){
+      if (btn) { btn.disabled = false; btn.textContent = 'Reconnect'; }
+      if (stat) { stat.style.color = 'var(--error-color,#c00)'; stat.textContent = 'Connect failed: ' + e; }
+    });
+}
+function executeDisconnect() {
+  var btn = document.getElementById('disconnect-confirm-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Disconnecting\u2026'; }
+  fetch(apiUrl('/api/disconnect-kraken'), {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({})
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      closeDisconnectModal();
+      if (btn) { btn.disabled = false; btn.textContent = 'Disconnect'; }
+      if (d && d.ok) {
+        document.getElementById('alert-success').textContent =
+          '\u2713 Octopus disconnected \u2014 credentials cleared, switched to local sensors.';
+        show('alert-success');
+        // Mode is now cad and API state is gone — reload so the page re-renders
+        // in local-sensor mode (the channel/sensor fields are shown again).
+        setTimeout(function() { window.location.reload(); }, 1200);
+      } else {
+        var errEl = document.getElementById('alert-error');
+        if (errEl) {
+          errEl.textContent = '\u2717 Disconnect failed: ' + ((d && (d.detail || d.error)) || 'unknown error');
+          errEl.classList.add('show');
+        }
+      }
+    })
+    .catch(function(e) {
+      closeDisconnectModal();
+      if (btn) { btn.disabled = false; btn.textContent = 'Disconnect'; }
+      var errEl = document.getElementById('alert-error');
+      if (errEl) { errEl.textContent = '\u2717 Disconnect failed: ' + e; errEl.classList.add('show'); }
+    });
+}
+
+function executeDelete() {
+  var mid     = _deleteMid;
+  var devName = _deleteDevName;
+  if (!mid) return;
+
+  var isMain = !Object.values(config.meters).some(function(m) {
+    return m.meta && m.meta.sub_meter && mid !== 'electricity_main';
+  }) && mid === 'electricity_main';
+
+  closeDeleteModal();
+
+  var errEl = document.getElementById('alert-error');
+
+  if (isMain) {
+    // Main meter — backup DB and wipe everything
+    if (errEl) { errEl.textContent = '⏳ Creating backup and deleting all data…'; errEl.classList.add('show'); }
+    fetch(apiUrl('/api/meter/main/reset'), {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({})
+    })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (errEl) errEl.classList.remove('show');
+        if (d.ok) {
+          document.getElementById('alert-success').textContent =
+            '✓ All data deleted — backup saved. Add-on restarting, please wait…';
+          show('alert-success');
+          // Poll until the server comes back then redirect to meter config
+          var polls = 0;
+          function pollReady() {
+            polls++;
+            if (polls > 30) { window.location.reload(); return; }
+            fetch(apiUrl('/api/status')).then(function() {
+              window.location.href = apiUrl('/settings');
+            }).catch(function() {
+              setTimeout(pollReady, 1500);
+            });
+          }
+          setTimeout(pollReady, 3000);
+        } else {
+          if (errEl) { errEl.textContent = '✗ Reset failed: ' + (d.error || 'unknown error'); errEl.classList.add('show'); }
+        }
+      })
+      .catch(function(e) {
+        if (errEl) { errEl.textContent = '✗ Reset failed: ' + e; errEl.classList.add('show'); }
+      });
+    return;
+  }
+
+  // Sub-meter — existing flow
+  delete config.meters[mid];
+  renderAll();
+
+  if (errEl) { errEl.textContent = '⏳ Deleting "' + devName + '"…'; errEl.classList.add('show'); }
+
+  fetch(apiUrl('/api/meter/' + encodeURIComponent(mid) + '/delete-data'), {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ config: config })
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (errEl) errEl.classList.remove('show');
+      if (d.ok) {
+        document.getElementById('alert-success').textContent =
+          '✓ "' + devName + '" deleted — ' + (d.deleted.blocks || 0) + ' blocks removed.';
+        show('alert-success');
+        setTimeout(function() { window.location.reload(); }, 1500);
+      } else {
+        if (errEl) { errEl.textContent = '✗ Delete failed: ' + (d.error || 'unknown error'); errEl.classList.add('show'); }
+      }
+    })
+    .catch(function(e) {
+      if (errEl) { errEl.textContent = '✗ Delete failed: ' + e; errEl.classList.add('show'); }
+    });
+}
+
+function toggleAddDeviceMenu(e) {
+  e.stopPropagation();
+  var menu = document.getElementById('add-device-menu');
+  menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
+  function closeMenu(evt) {
+    if (!document.getElementById('btn-add-device').contains(evt.target) &&
+        !document.getElementById('add-device-menu').contains(evt.target)) {
+      menu.style.display = 'none';
+      document.removeEventListener('mousedown', closeMenu);
+    }
+  }
+  if (menu.style.display === 'block') document.addEventListener('mousedown', closeMenu);
+}
+
+function addDevice(type) {
+  document.getElementById('add-device-menu').style.display = 'none';
+  _addDeviceType = type;
+
+  var titles    = { battery: '🔋 Add House Battery', ev: '🚗 Add EV Charger', heat_pump: '♨️ Add Heat Pump' };
+  var subtitles = {
+    battery:   'Configure your battery meter and Live Power sensors',
+    ev:        'Configure your EV charger meter and Live Power sensors',
+    heat_pump: 'Configure your heat pump meter and Live Power sensors'
+  };
+  var defaults  = { battery: 'House Battery', ev: 'EV Charger', heat_pump: 'Heat Pump' };
+
+  document.getElementById('add-device-title').textContent    = titles[type];
+  document.getElementById('add-device-subtitle').textContent = subtitles[type];
+  document.getElementById('ad-device-name').value            = defaults[type];
+  document.getElementById('ad-confirm-btn').textContent      = 'Add ' + defaults[type];
+
+  // Clear all sensor fields
+  ['ad-soc-sensor','ad-inverter-sensor','ad-ev-sensor','ad-hp-sensor','ad-read-sensor'].forEach(function(id) {
+    document.getElementById(id).value = '';
+  });
+  document.getElementById('ad-invert').checked = false;
+  document.getElementById('ad-v2x').checked    = false;
+  // ad-ev-inverter-possible and ad-hp-inverter-possible removed in 2.9.0
+
+  // (device rate removed in 3.1.0 — devices always follow the main meter's rate)
+
+  // Show/hide type-specific fields
+  document.getElementById('ad-battery-fields').style.display = type === 'battery'   ? '' : 'none';
+  document.getElementById('ad-ev-fields').style.display      = type === 'ev'        ? '' : 'none';
+  document.getElementById('ad-hp-fields').style.display      = type === 'heat_pump' ? '' : 'none';
+
+  setupAdEntityDropdowns();
+  document.getElementById('add-device-overlay').style.display = 'block';
+  setTimeout(function() { document.getElementById('ad-device-name').focus(); }, 100);
+}
+
+function closeAddDevice() {
+  document.getElementById('add-device-overlay').style.display = 'none';
+  _addDeviceType = null;
+}
+
+function confirmAddDevice() {
+  var type    = _addDeviceType;
+  var devName = document.getElementById('ad-device-name').value.trim();
+  if (!devName) { alert('Please enter a device name.'); return; }
+
+  // Name uniqueness check
+  var usedNames = Object.values(config.meters||{}).map(function(m) {
+    return ((m.meta||{}).device||'').toLowerCase();
+  });
+  if (usedNames.indexOf(devName.toLowerCase()) !== -1) {
+    alert('"' + devName + '" is already used. Please choose a unique name.');
+    return;
+  }
+
+  var mainMeters = Object.keys(config.meters||{}).filter(function(k) { return !config.meters[k].meta.sub_meter; });
+  var id = 'sub_meter_' + Date.now();
+
+  var meta = {
+    sub_meter:         true,
+    meter_type:        type,
+    device:            devName,
+    parent_meter:      mainMeters[0] || '',
+    // inverter_possible removed
+  };
+
+  if (type === 'battery') {
+    var soc = document.getElementById('ad-soc-sensor').value.trim();
+    var inv = document.getElementById('ad-inverter-sensor').value.trim();
+    if (soc) meta.soc_sensor = soc;
+    if (inv) meta.inverter_power_sensor = inv;
+    if (document.getElementById('ad-invert').checked) meta.inverter_power_invert = true;
+    var pv = document.getElementById('ad-pv-sensor').value.trim();
+    if (pv) meta.pv_power_sensor = pv;
+  } else if (type === 'ev') {
+    var evp = document.getElementById('ad-ev-sensor').value.trim();
+    if (evp) meta.device_power_sensor = evp;
+    if (document.getElementById('ad-v2x').checked) meta.v2x_capable = true;
+    // inverter_possible removed
+  } else if (type === 'heat_pump') {
+    var hpp = document.getElementById('ad-hp-sensor').value.trim();
+    if (hpp) meta.device_power_sensor = hpp;
+
+  }
+
+  config.meters[id] = {
+    meta:     meta,
+    channels: {
+      import: {
+        read:  document.getElementById('ad-read-sensor').value.trim(),
+        rate:  '',
+        rates: [], reads: []
+      }
+    }
+  };
+
+  closeAddDevice();
+  renderAll();
+  saveConfig();
+
+  setTimeout(function() {
+    var cards = document.querySelectorAll('#sub-meter-container .card');
+    if (cards.length) cards[cards.length - 1].scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, 200);
+}
+
+function setupAdEntityDropdowns() {
+  document.querySelectorAll('.ad-entity').forEach(function(input) {
+    if (input._adHandler) input.removeEventListener('input', input._adHandler);
+    input._adHandler = function() {
+      var drop = document.getElementById(input.id + '_drop');
+      if (!drop) return;
+      var q = input.value.toLowerCase();
+      if (q.length < 1) { drop.innerHTML = ''; drop.style.display = 'none'; return; }
+
+      // Map data-field to FIELD_FILTERS key
+      var fieldMap = {
+        soc:      'soc_sensor',
+        inverter: 'inverter_power_sensor',
+        pv:       'pv_power_sensor',
+        ev:       'device_power_sensor',
+        hp:       'device_power_sensor',
+        read:     'read',
+        rate:     'rate'
+      };
+      var filterKey = fieldMap[input.dataset.field] || input.dataset.field;
+      // Use filterEntities but bypass its min-length check by passing 2+ chars
+      // For single char, do manual filter+search
+      var matches;
+      if (q.length >= 2) {
+        matches = filterEntities(filterKey, q).slice(0, 8);
+      } else {
+        var filter = FIELD_FILTERS[filterKey];
+        var candidates = entities;
+        if (filter) {
+          var filtered = candidates.filter(function(e) {
+            var unit = (e.unit||'').toLowerCase();
+            var unitOk   = filter.units.some(function(u) { return unit === u.toLowerCase(); });
+            var suffixOk = (filter.unitSuffixes||[]).some(function(s) { return unit.endsWith(s); });
+            var classOk  = filter.device_class.some(function(dc) { return (e.device_class||'').toLowerCase() === dc.toLowerCase(); });
+            return unitOk || suffixOk || classOk;
+          });
+          if (filtered.length > 0) candidates = filtered;
+        }
+        matches = candidates.filter(function(e) { return e.id.toLowerCase().indexOf(q) !== -1; }).slice(0, 8);
+      }
+      if (!matches.length) { drop.innerHTML = ''; drop.style.display = 'none'; return; }
+      drop.innerHTML = matches.map(function(e) {
+        return '<div class="entity-option" data-val="' + e.id + '">' +
+          e.id +
+          (e.unit ? ' <span style="color:var(--muted);font-size:11px;">(' + e.unit + ')</span>' : '') +
+          '</div>';
+      }).join('');
+      // Wire selection via mousedown on each option
+      drop.querySelectorAll('.entity-option').forEach(function(opt) {
+        opt.addEventListener('mousedown', function(ev) {
+          ev.preventDefault();
+          input.value = opt.dataset.val;
+          drop.innerHTML = '';
+          drop.style.display = 'none';
+        });
+      });
+      drop.style.display = 'block';
+    };
+    input.addEventListener('input', input._adHandler);
+    if (input.value.length >= 2) input._adHandler();
+    input.addEventListener('blur', function() {
+      setTimeout(function() {
+        var drop = document.getElementById(input.id + '_drop');
+        if (drop) { drop.innerHTML = ''; drop.style.display = 'none'; }
+      }, 300);
+    });
+  });
+}
+
+function renameMeter(oldId, newId) {
+  newId = newId.trim().replace(/\s+/g, '_');
+  if (!newId || newId === oldId || config.meters[newId]) return;
+  config.meters[newId] = config.meters[oldId];
+  delete config.meters[oldId];
+  renderAll();
+}
+
+// ── Entity dropdown ───────────────────────────────────────────────────────────
+function setupEntityDropdowns() {
+  document.querySelectorAll('.entity-input').forEach(function(inp) {
+    inp.addEventListener('input', function() { showDrop(inp); });
+    inp.addEventListener('focus', function() { if (inp.value.length >= 2) showDrop(inp); });
+    inp.addEventListener('blur',  function() { setTimeout(function() { hideDrop(inp); }, 200); });
+  });
+}
+
+function showDrop(inp) {
+  var drop = document.getElementById(inp.id + '_drop');
+  if (!drop) return;
+  var field   = inp.dataset.field || '';
+  var matches = filterEntities(field, inp.value);
+  if (matches.length === 0) { drop.style.display = 'none'; return; }
+  drop.innerHTML = matches.map(function(e) {
+    var hint = e.unit ? '<span style="float:right;color:var(--muted);font-size:10px;">' + esc(e.unit) + '</span>' : '';
+    return '<div data-val="' + esc(e.id) + '">' + esc(e.id) + hint + '</div>';
+  }).join('');
+  drop.style.display = 'block';
+  drop.querySelectorAll('div').forEach(function(item) {
+    item.addEventListener('mousedown', function(ev) {
+      ev.preventDefault();
+      inp.value = item.dataset.val;
+      drop.style.display = 'none';
+      inp.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  });
+}
+
+function hideDrop(inp) {
+  var drop = document.getElementById(inp.id + '_drop');
+  if (drop) drop.style.display = 'none';
+}
+
+// ── Save ──────────────────────────────────────────────────────────────────────
+// ── Device name validation ─────────────────────────────────────────────────
+var _NAME_MAX   = 40;
+var _NAME_REGEX = /^[a-zA-Z0-9 '\-&().]+$/;  // allowed chars
+
+function validateDeviceNames() {
+  // Returns an array of error strings, empty if all valid
+  var errors = [];
+  var seen = {};  // lower-case name → first meter id
+
+  Object.keys(config.meters).forEach(function(mid) {
+    var meta     = (config.meters[mid].meta || {});
+    var isSub    = meta.sub_meter;
+    var rawName  = isSub ? (meta.device || '').trim() : (meta.site || '').trim();
+    var label    = isSub ? 'Device name' : 'Site name';
+
+    if (!rawName) {
+      if (isSub) errors.push('"' + mid + '": Device name is required.');
+      return;  // main meter site name is optional
+    }
+    if (rawName.length > _NAME_MAX) {
+      errors.push('"' + rawName + '": ' + label + ' must be ' + _NAME_MAX + ' characters or fewer.');
+    }
+    if (!_NAME_REGEX.test(rawName)) {
+      errors.push('"' + rawName + '": ' + label + ' contains invalid characters. Use letters, numbers, spaces and \' - & ( ) . only.');
+    }
+    var lower = rawName.toLowerCase();
+    if (seen[lower] !== undefined) {
+      errors.push('"' + rawName + '": Name is already used by another meter. All meter names must be unique.');
+    } else {
+      seen[lower] = mid;
+    }
+  });
+  return errors;
+}
+
+function _doSave(changeReason) {
+  hideAlerts();
+
+  // Validate device names before saving
+  var nameErrors = validateDeviceNames();
+  if (nameErrors.length > 0) {
+    showError('Please fix the following before saving:\n• ' + nameErrors.join('\n• '));
+    return;
+  }
+
+  var payload = Object.assign({}, config);
+  if (changeReason) payload.change_reason = changeReason;
+  fetch(apiUrl('/api/config'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  }).then(function(r) { return r.json(); }).then(function(data) {
+    if (data.ok) {
+      // Brief flash then reload so new sensor fields appear for any updated meter_type
+      show('alert-success');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      setTimeout(function() { window.location.reload(); }, 1200);
+    }
+    else showError(data.error || 'Save failed');
+  }).catch(function(e) { showError(e.message); });
+}
+
+function isBillingSignificant() {
+  // Mirror config_meta_significant from block_store.py
+  // Only show change reason modal when billing fields actually changed
+  var SIGNIFICANT = ['billing_day', 'block_minutes', 'timezone', 'currency_symbol', 'currency_code'];
+  var oldMeta = _serverConfig && _serverConfig.meters
+    ? (Object.values(_serverConfig.meters).find(function(m) { return !(m.meta||{}).sub_meter; }) || {}).meta || {}
+    : {};
+  var newMeta = {};
+  Object.values(config.meters || {}).forEach(function(m) {
+    if (!(m.meta||{}).sub_meter) newMeta = m.meta || {};
+  });
+  return SIGNIFICANT.some(function(k) { return oldMeta[k] !== newMeta[k]; });
+}
+
+function saveConfig() {
+  if (isBillingSignificant()) {
+    // Show change reason modal — billing period may be created
+    var modal = document.getElementById('change-reason-modal');
+    var input = document.getElementById('change-reason-input');
+    input.value = '';
+    modal.style.display = 'flex';
+    setTimeout(function() { input.focus(); }, 50);
+  } else {
+    // Non-significant change — save immediately, no modal needed
+    _doSave(null);
+  }
+}
+
+document.getElementById('change-reason-save').addEventListener('click', function() {
+  var reason = document.getElementById('change-reason-input').value.trim();
+  document.getElementById('change-reason-modal').style.display = 'none';
+  _doSave(reason || null);
+});
+
+document.getElementById('change-reason-skip').addEventListener('click', function() {
+  document.getElementById('change-reason-modal').style.display = 'none';
+  _doSave(null);
+});
+
+document.getElementById('change-reason-input').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') {
+    var reason = this.value.trim();
+    document.getElementById('change-reason-modal').style.display = 'none';
+    _doSave(reason || null);
+  } else if (e.key === 'Escape') {
+    document.getElementById('change-reason-modal').style.display = 'none';
+  }
+});
+
+// Config history moved to /config-history page
+
+// ── Wizard ────────────────────────────────────────────────────────────────────
+var wiz = {
+  step: 0,
+  mainId: 'electricity_main',
+  devices: [],   // selected device types
+  data: {}       // collected field values
+};
+
+var WIZ_STEPS = ['survey', 'main', 'sensors', 'devices', 'done'];
+
+// ── Supplier registry (the marked seam) ─────────────────────────────────────
+// Supplier is the GATING first question: it decides whether the API-backed
+// modes are even offered. A future Kraken-platform supplier (E.ON, EDF, …) is
+// added as a NEW entry here with api:true + (eventually) its own profile —
+// NOT by untangling Octopus assumptions elsewhere. This is Depth A: an explicit
+// keyed field + dropdown, not a speculative multi-supplier abstraction.
+var WIZ_SUPPLIERS = [
+  { key: 'octopus',    label: 'Octopus Energy', api: true  },
+  { key: 'not-listed', label: "My supplier isn't listed / local metering only", api: false }
+];
+function wizSupplierIsApiCapable(key) {
+  for (var i = 0; i < WIZ_SUPPLIERS.length; i++)
+    if (WIZ_SUPPLIERS[i].key === key) return !!WIZ_SUPPLIERS[i].api;
+  return false;
+}
+function wizSupplierLabel(key) {
+  for (var i = 0; i < WIZ_SUPPLIERS.length; i++)
+    if (WIZ_SUPPLIERS[i].key === key) return WIZ_SUPPLIERS[i].label;
+  return key ? key : '(not set)';
+}
+// Mode-aware field display info for the config editor (Tier-1). Pure function
+// of the active mode + stored supplier — returns the flags/labels the meter
+// card uses to decide which fields to show and how to label them.
+function wizModeFieldInfo(dsMode, supplierMeta) {
+  dsMode = dsMode || 'cad';
+  var usesApi = dsMode.indexOf('api') !== -1;
+  var noLocal = usesApi && dsMode.indexOf('cad') === -1;   // pure api / api+mini
+  var supKey  = wizNormalizeSupplierKey(supplierMeta);
+  var supLabel = supKey ? wizSupplierLabel(supKey) : 'your supplier';
+  var modeLabel = ({
+    'cad':      'Local meter (CAD)',
+    'cad+api':  'Local meter (CAD) + ' + supLabel + ' settlement',
+    'api':      supLabel + ' settlement (DCC)',
+    'api+mini': supLabel + ' settlement + Octopus Mini (near-real-time)'
+  })[dsMode] || dsMode;
+  return { usesApi: usesApi, noLocal: noLocal, supLabel: supLabel, modeLabel: modeLabel };
+}
+// Normalise a stored supplier value (which may be legacy free-text like
+// "Octopus Energy", or empty for a v2 user) to a registry key. Empty stays
+// empty so the dropdown shows a "select" prompt; any non-Octopus free-text
+// collapses to not-listed (the migration default — local-only).
+function wizNormalizeSupplierKey(s) {
+  var v = (s || '').toString().trim().toLowerCase();
+  if (!v) return '';
+  if (v.indexOf('octopus') !== -1) return 'octopus';
+  for (var i = 0; i < WIZ_SUPPLIERS.length; i++)
+    if (WIZ_SUPPLIERS[i].key === v) return v;
+  return 'not-listed';
+}
+
+// Single source of truth for the step list. Mode-aware:
+//  - 'survey' is always first (derives wiz.data.mode).
+//  - 'credentials' only when the mode uses the supplier API.
+//  - 'sub_sensors' only when devices were selected.
+// Keeping this in one place avoids the previously-divergent inline copies.
+function computeWizSteps() {
+  var steps = ['survey'];
+  var mode = (wiz.data && wiz.data.mode) || 'cad';
+  // Credentials right after survey (API modes) so the connect/discovery can
+  // pre-fill the main + sensors steps that follow.
+  if (mode.indexOf('api') !== -1) steps.push('credentials');
+  steps.push('main');
+  steps.push('sensors');
+  steps.push('devices');
+  if (wiz.devices.length > 0) steps.push('sub_sensors');
+  // Settlement-source choice only matters when a supplier API (DCC) is in play.
+  if (mode.indexOf('api') !== -1) steps.push('settlement');
+  steps.push('done');
+  return steps;
+}
+
+function startWizard() {
+  wiz.step = 0;
+  wiz.devices = [];
+
+  // Pre-populate from existing config
+  var meters   = config.meters || {};
+  var mainIds  = Object.keys(meters).filter(function(id) { return !meters[id].meta.sub_meter; });
+  var mainId   = mainIds.length > 0 ? mainIds[0] : 'electricity_main';
+  var mainMeter = meters[mainId] || {};
+  var mainMeta  = mainMeter.meta || {};
+  var mainCh    = mainMeter.channels || {};
+  var imp       = mainCh.import || {};
+  var exp       = mainCh.export || {};
+
+  // Detect existing sub-meters and which device types they are
+  var devIdMap = { ev_charger: 'ev', house_battery: 'battery', solar: 'solar', heat_pump: 'heat' };
+  var subMeters = {};
+  Object.keys(meters).forEach(function(id) {
+    var m = meters[id];
+    if (!m.meta.sub_meter) return;
+    // Match to a device type. Prefer the authoritative meta.meter_type — this is
+    // what wizApplyAndClose writes and what findExistingSubId reuses — and fall
+    // back to ID prefix only for legacy sub-meters created before meter_type
+    // existed. Without the meter_type match, wizard-created sub-meters (IDs like
+    // "sub_meter_1718…") aren't detected on Change Setup, so they appear
+    // deselected and their sensors are dropped on the next save.
+    var mtMap = { ev: 'ev', battery: 'battery', heat_pump: 'heat' };
+    var devType = mtMap[m.meta.meter_type] || null;
+    if (!devType) {
+      if (id.indexOf('ev') !== -1 || id.indexOf('charger') !== -1)       devType = 'ev';
+      else if (id.indexOf('battery') !== -1 || id.indexOf('batt') !== -1) devType = 'battery';
+      else if (id.indexOf('heat') !== -1 || id.indexOf('pump') !== -1)    devType = 'heat';
+    }
+    if (!devType) return;  // unmanaged types (e.g. solar) are left untouched
+    if (wiz.devices.indexOf(devType) === -1) wiz.devices.push(devType);
+    var subCh = (m.channels || {}).import || {};
+    subMeters[devType] = {
+      name:                  m.meta.device || '',
+      read:                  subCh.read || '',
+      rate:                  subCh.rate || '',
+      // authoritative channel source; fall back to mapping the legacy meta mirror
+      rate_source:           subCh.rate_source ||
+                               (m.meta.rate_source === 'overlay' ? 'main'
+                                : m.meta.rate_source === 'own' ? 'sensor' : ''),
+      soc:                   m.meta.soc_sensor || '',
+      inverter_power:        m.meta.inverter_power_sensor || '',
+      inverter_power_invert: !!m.meta.inverter_power_invert,
+      pv_power:              m.meta.pv_power_sensor || '',
+      device_power:          m.meta.device_power_sensor || '',
+      v2x_capable:           !!m.meta.v2x_capable
+    };
+  });
+
+  // Pre-fill the survey from the CURRENT mode so "Change Setup" shows where the
+  // user is. A fresh/unset install leaves them null so the user actively picks.
+  var _curMode = (typeof DATA_SOURCE_MODE !== 'undefined' && DATA_SOURCE_MODE) ? DATA_SOURCE_MODE : '';
+  var _knownMode = (_curMode && _curMode !== 'unset');
+  wiz.data = {
+    mainId:        mainId,
+    mode:          'cad',         // derived by the survey step
+    hasLocal:      _knownMode ? (_curMode.indexOf('cad') !== -1) : null,
+    hasApi:        _knownMode ? (_curMode.indexOf('api') !== -1) : null,
+    bcdFound:      false,         // BCD integration detected in HA?
+    apiKey:        '',            // entered in credentials step (never persisted to config)
+    accountNumber: '',
+    site:          mainMeta.site       || '',
+    supplier:      wizNormalizeSupplierKey(mainMeta.supplier),
+    bcdProbed:     false,         // _wizSeedFromBcd fired? (fires once, octopus only)
+    billing_day:   mainMeta.billing_day || 1,
+    block_minutes: mainMeta.block_minutes || 30,
+    timezone:      mainMeta.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+    importRead:    imp.read                      || '',
+    importRate:    imp.rate                      || '',
+    standingCharge: imp.standing_charge_sensor   || '',
+    exportRead:    exp.read                      || '',
+    exportRate:    exp.rate                      || '',
+    // Per-quantity "use API" choice (cad+api). Seed from the stored source, else
+    // infer (no sensor mapped → API). Only consulted when an API is available.
+    importRateApi:     imp.rate_source ? (imp.rate_source === 'api') : !((imp.rate || '').trim()),
+    standingChargeApi: imp.standing_charge_source ? (imp.standing_charge_source === 'api')
+                                                  : !((imp.standing_charge_sensor || '').trim()),
+    exportRateApi:     exp.rate_source ? (exp.rate_source === 'api') : !((exp.rate || '').trim()),
+    powerSensor:   mainMeta.power_sensor         || '',
+    postcode:      mainMeta.postcode_prefix       || '',
+    billing_source: 'dcc',        // settlement source (API modes); pre-filled below
+    subMeters:     subMeters
+  };
+
+  // Pre-fill the current billing source so "Change Setup" shows where the user
+  // is. It lives in kraken_state (not config), so fetch it; defaults to dcc.
+  fetch(apiUrl('/api/billing-source'))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d && d.source) { wiz.data.billing_source = d.source; wiz._origBillingSource = d.source; }
+    })
+    .catch(function() {});
+
+  // Pre-populate stored API credential state so "Change Setup" doesn't force
+  // re-entry. The key itself is never returned by the server (it's write-only),
+  // so we surface a keep-or-replace state and pre-fill the (non-secret) account.
+  wiz.data.hasStoredKey = false;
+  fetch(apiUrl('/api/kraken-config'))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d && d.configured) {
+        wiz.data.hasStoredKey = true;
+        if (d.account_number && !wiz.data.accountNumber)
+          wiz.data.accountNumber = d.account_number;
+        if (document.getElementById('wiz-api-key')) renderWizStep();  // refresh if shown
+      }
+    })
+    .catch(function() {});
+
+  // Update step list based on detected devices + mode
+  WIZ_STEPS = computeWizSteps();
+
+  document.getElementById('wizard-overlay').style.display = 'block';
+  renderWizStep();
+
+  // Opportunistic BCD detection — pre-fills API answer, account and rate
+  // sensors IF the BottlecapDave integration is present. BCD is OPTIONAL: if
+  // absent this is a no-op and the pure-API path proceeds normally. Fire only
+  // for Octopus (no point otherwise). If the wizard opens on a non-octopus or
+  // unset supplier, the probe fires later when the user selects Octopus.
+  if (wiz.data.supplier === 'octopus') _wizSeedFromBcd();
+}
+
+function _wizSeedFromBcd() {
+  if (wiz.data.bcdProbed) return;     // fire at most once
+  wiz.data.bcdProbed = true;
+  fetch(apiUrl('/api/detect-bcd'))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (!d || !d.found) return;       // pure-API path; nothing to seed
+      wiz.data.bcdFound = true;
+      // BCD proves a supplier API exists → pre-answer that question.
+      if (wiz.data.hasApi === null) wiz.data.hasApi = true;
+      if (d.account_number && !wiz.data.accountNumber)
+        wiz.data.accountNumber = d.account_number;
+      // Pre-fill rate / standing-charge sensors (import) and export rate.
+      if (d.rate_sensor && !wiz.data.importRate) wiz.data.importRate = d.rate_sensor;
+      if (d.standing_charge_sensor && !wiz.data.standingCharge)
+        wiz.data.standingCharge = d.standing_charge_sensor;
+      if (d.export_rate_sensor && !wiz.data.exportRate)
+        wiz.data.exportRate = d.export_rate_sensor;
+      // Live Power: if BCD exposes a demand sensor (Mini present), pre-fill it
+      // so EMT reads live power off BCD's ~1/min sensor instead of polling the
+      // Mini itself (detection offload — spares EMT the live-power quota).
+      if (d.demand_sensor && !wiz.data.powerSensor)
+        wiz.data.powerSensor = d.demand_sensor;
+      // Re-render the survey so the pre-answered API choice shows selected.
+      if (WIZ_STEPS[wiz.step] === 'survey') {
+        WIZ_STEPS = computeWizSteps();
+        renderWizStep();
+      }
+    })
+    .catch(function() { /* detection failure → pure-API path, no-op */ });
+}
+
+function closeWizard() {
+  document.getElementById('wizard-overlay').style.display = 'none';
+}
+
+function wizUpdateProgress() {
+  var total = WIZ_STEPS.length;
+  var pct   = Math.round(((wiz.step + 1) / total) * 100);
+  document.getElementById('wiz-progress').style.width = pct + '%';
+  document.getElementById('wiz-step-label').textContent = 'Step ' + (wiz.step + 1) + ' of ' + total;
+  document.getElementById('wiz-btn-back').style.visibility = wiz.step === 0 ? 'hidden' : 'visible';
+  document.getElementById('wiz-btn-next').textContent = (wiz.step >= total - 2) ? 'Finish ✓' : 'Next →';
+}
+
+function renderWizStep() {
+  wizUpdateProgress();
+  var body = document.getElementById('wizard-body');
+  var step = WIZ_STEPS[wiz.step];
+
+  if (step === 'survey')           body.innerHTML = wizStepSurvey();
+  else if (step === 'main')        body.innerHTML = wizStepMain();
+  else if (step === 'sensors')     body.innerHTML = wizStepSensors();
+  else if (step === 'credentials') body.innerHTML = wizStepCredentials();
+  else if (step === 'devices')     body.innerHTML = wizStepDevices();
+  else if (step === 'sub_sensors') body.innerHTML = wizStepSubSensors();
+  else if (step === 'settlement')  body.innerHTML = wizStepSettlement();
+  else if (step === 'done')   { wizApplyAndClose(); return; }
+
+  setupWizEntityDropdowns();
+  if (step === 'survey') wizBindSurvey();
+  if (step === 'sensors') wizApplySensorToggles();
+}
+
+// Grey out a main-meter rate field while its "Use API" box is ticked.
+function wizApplySensorToggles() {
+  document.querySelectorAll('.wiz-api-toggle').forEach(function(cb) {
+    var target = cb.dataset.wizTarget;
+    setEntityDisabled(target, cb.checked);
+    cb.addEventListener('change', function() { setEntityDisabled(target, cb.checked); });
+  });
+}
+
+
+function wizStepSurvey() {
+  function opt(field, val, label, hint) {
+    var sel = (wiz.data[field] === val) ? ' selected' : '';
+    return '<div class="wiz-device-card' + sel + '" data-field="' + field +
+      '" data-val="' + val + '" style="cursor:pointer;">' +
+      '<div class="label">' + label + '</div>' +
+      (hint ? '<div class="hint">' + hint + '</div>' : '') + '</div>';
+  }
+  // Supplier dropdown (the gating first question).
+  var supOpts = '<option value="">— Select your supplier —</option>';
+  for (var i = 0; i < WIZ_SUPPLIERS.length; i++) {
+    var s = WIZ_SUPPLIERS[i];
+    supOpts += '<option value="' + s.key + '"' +
+      (wiz.data.supplier === s.key ? ' selected' : '') + '>' + esc(s.label) + '</option>';
+  }
+  var apiCapable = wizSupplierIsApiCapable(wiz.data.supplier);
+
+  // Q2 (supplier API) only appears once an API-capable supplier is chosen.
+  var apiBlock = '';
+  if (apiCapable) {
+    apiBlock =
+      '<div class="section-divider" style="margin-top:18px;">3. Supplier API</div>' +
+      '<p style="color:var(--muted);font-size:12px;margin:4px 0 8px;">Use your ' +
+        'supplier\'s API for settled half-hourly data and rates? This is what ' +
+        'enables dispatch-aware off-peak pricing.</p>' +
+      '<div class="wiz-device-grid">' +
+        opt('hasApi', true,  '✅ Yes', 'Recommended for Octopus') +
+        opt('hasApi', false, '❌ No',  'Local readings only') + '</div>';
+  } else if (wiz.data.supplier) {
+    // A chosen-but-not-API-capable supplier: explain the API path is unavailable.
+    apiBlock =
+      '<div class="section-divider" style="margin-top:18px;">Supplier API</div>' +
+      '<p style="color:var(--muted);font-size:12px;margin:4px 0 8px;">No API ' +
+        'integration is available for this supplier, so EMT will use your local ' +
+        'meter readings only. (If you\'re with a supplier on the Kraken platform ' +
+        'that isn\'t listed yet, support can be added.)</p>';
+  }
+
+  return '<h3 style="margin:0 0 6px;">Let\'s find your setup</h3>' +
+    '<p style="color:var(--muted);font-size:13px;margin:0 0 18px;">A few quick ' +
+      'questions so we configure the right data sources.</p>' +
+
+    '<div class="section-divider">1. Energy supplier</div>' +
+    '<p style="color:var(--muted);font-size:12px;margin:4px 0 8px;">Who supplies ' +
+      'your electricity? This decides which data sources EMT can offer.</p>' +
+    '<div class="form-group"><select id="wiz-supplier-select" style="max-width:420px;">' +
+      supOpts + '</select></div>' +
+
+    '<div class="section-divider" style="margin-top:18px;">2. Local meter readings</div>' +
+    '<p style="color:var(--muted);font-size:12px;margin:4px 0 8px;">Do you have a ' +
+      'device giving live meter readings in Home Assistant — a CAD/IHD, or a ' +
+      'smart-meter sensor (e.g. Glow, Hildebrand, an n3rgy feed)?</p>' +
+    '<div class="wiz-device-grid">' +
+      opt('hasLocal', true,  '✅ Yes', 'I have local kWh sensors') +
+      opt('hasLocal', false, '❌ No',  'No local meter feed') + '</div>' +
+
+    apiBlock +
+
+    '<div id="wiz-survey-result" style="margin-top:18px;font-size:13px;"></div>';
+}
+
+function wizBindSurvey() {
+  var body = document.getElementById('wizard-body');
+  // Supplier dropdown — the gating control. Changing it re-renders the survey
+  // (to show/hide the API question) and re-derives the mode.
+  var supSel = document.getElementById('wiz-supplier-select');
+  if (supSel) {
+    supSel.addEventListener('change', function() {
+      wiz.data.supplier = supSel.value;
+      if (!wizSupplierIsApiCapable(wiz.data.supplier)) {
+        // Non-API supplier forces local-only: clear any prior API answer.
+        wiz.data.hasApi = false;
+      } else {
+        // API-capable supplier chosen — probe BCD once to pre-fill (optional).
+        _wizSeedFromBcd();
+        // Don't presume the API answer; let the user choose (BCD may pre-set it).
+        if (wiz.data.hasApi === false) wiz.data.hasApi = null;
+      }
+      renderWizStep();          // re-render to show/hide the API question
+    });
+  }
+  body.querySelectorAll('.wiz-device-card[data-field]').forEach(function(card) {
+    card.addEventListener('click', function() {
+      var field = card.dataset.field;
+      var val = card.dataset.val === 'true';
+      wiz.data[field] = val;
+      // single-select within a field group
+      body.querySelectorAll('.wiz-device-card[data-field="' + field + '"]')
+        .forEach(function(c) { c.classList.remove('selected'); });
+      card.classList.add('selected');
+      wizDeriveMode();
+    });
+  });
+  wizDeriveMode();
+}
+
+function wizDeriveMode() {
+  var supplier = wiz.data.supplier;
+  var apiCapable = wizSupplierIsApiCapable(supplier);
+  var hl = wiz.data.hasLocal;
+  // A non-API-capable supplier can never yield an API mode, regardless of any
+  // stale hasApi value — the supplier gate is authoritative.
+  var ha = apiCapable ? wiz.data.hasApi : false;
+  var result = document.getElementById('wiz-survey-result');
+  var mode = null, msg = '';
+
+  if (!supplier) {
+    msg = 'Choose your energy supplier to continue.';
+  } else if (!apiCapable) {
+    // not-listed / local-only supplier: only cad is possible.
+    if (hl === true)      { mode = 'cad'; msg = 'Local readings only (CAD). No supplier API for this supplier.'; }
+    else if (hl === false){ mode = null;  msg = '⚠ This supplier has no API and you have no local readings — EMT has no data source. A local meter feed is required.'; }
+  } else {
+    // Octopus (API-capable): the existing 2×2.
+    if (hl === true && ha === false)      { mode = 'cad';     msg = 'Local readings only (CAD).'; }
+    else if (hl === true && ha === true)  { mode = 'cad+api'; msg = 'Local readings, reconciled against supplier settlement (CAD + API).'; }
+    else if (hl === false && ha === true) {
+      mode = 'api';
+      msg = 'No local feed — supplier settlement is your import source. ' +
+            'If an Octopus Mini is detected, it\'ll add near-real-time import ' +
+            'automatically (no setup needed).';
+    } else if (hl === false && ha === false) {
+      mode = null;
+      msg = '⚠ With no local readings and no supplier API, EMT has no data source. ' +
+            'You need at least one.';
+    }
+  }
+  wiz.data.mode = mode || 'cad';
+  WIZ_STEPS = computeWizSteps();
+  wizUpdateProgress();
+  if (result) {
+    var _isWarn = msg.indexOf('\u26a0') !== -1;   // ⚠ → amber, else green
+    var _bg = _isWarn ? '#fdf3e7' : '#eef6f1';
+    var _bd = _isWarn ? '#e6c89a' : '#bfe0cd';
+    result.innerHTML = msg
+      ? '<div style="padding:10px 12px;border-radius:8px;background:' + _bg + ';' +
+        'border:1px solid ' + _bd + ';color:#1f2937;">' +
+        (mode ? '<strong>Mode: ' + mode + '</strong><br>' : '') + msg + '</div>'
+      : '';
+  }
+}
+
+function wizStepCredentials() {
+  var onFile = !!wiz.data.hasStoredKey;
+  var keyHint = onFile
+    ? 'An API key is already saved. Leave this blank to keep it, or enter a new one to replace it.'
+    : 'Enter your Octopus API key. It\'s stored in a private file (never in backups) and never shown again. We\'ll verify the connection when you continue.';
+  return '<h3 style="margin:0 0 6px;">Connect your supplier</h3>' +
+    '<p style="color:var(--muted);font-size:13px;margin:0 0 18px;">' + keyHint + '</p>' +
+    '<div class="form-group"><label>API key' +
+      (onFile ? ' <span style="color:var(--ok,green);font-weight:400;">✓ on file</span>' : '') +
+      '</label>' +
+      '<input id="wiz-api-key" type="password" autocomplete="off" placeholder="' +
+      (onFile ? '•••••••• saved — leave blank to keep' : 'sk_live_…') + '" ' +
+      'value="' + esc(wiz.data.apiKey || '') + '"></div>' +
+    '<div class="form-group"><label>Account number</label>' +
+      '<input id="wiz-api-account" type="text" autocomplete="off" placeholder="A-XXXXXXXX" ' +
+      'value="' + esc(wiz.data.accountNumber || '') + '"></div>' +
+    '<div id="wiz-api-status" style="font-size:13px;color:var(--muted);margin-top:8px;"></div>';
+}
+
+function wizStepMain() {
+  return '<h3 style="margin:0 0 6px;">Main Meter</h3>' +
+    '<p style="color:var(--muted);font-size:13px;margin:0 0 20px;">Tell us about your electricity meter and billing.</p>' +
+    '<div class="grid-2">' +
+      '<div class="form-group"><label>Site Name <span style="color:var(--muted);font-weight:400;">(optional)</span></label>' +
+        '<input id="wiz-site" type="text" value="' + esc(wiz.data.site) + '" placeholder="My Home"></div>' +
+      '<div class="form-group"><label>Supplier</label>' +
+        '<input type="text" value="' + esc(wizSupplierLabel(wiz.data.supplier)) + '" disabled ' +
+        'style="opacity:0.8;" title="Chosen in the setup survey"><small style="color:var(--muted);">Set in step 1 of the survey.</small></div>' +
+      '<div class="form-group"><label>First day of your billing period</label>' +
+        '<input id="wiz-billing-day" type="number" min="1" max="28" value="' + wiz.data.billing_day + '"></div>' +
+      '<div class="form-group">' +
+        '<label>Meter Reconciliation Period (Block Size)</label>' +
+        '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">Match this to your energy supplier\'s billing interval / block size — 30 minutes in the UK, other intervals may apply elsewhere. <strong style="color:var(--warning-color,#b45309);">This cannot be changed without deleting all recorded data via terminal.</strong> If in doubt, leave at 30 min.</div>' +
+        (hasData
+          ? '<select id="wiz-block-minutes" disabled><option value="5"' + (wiz.data.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (wiz.data.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((wiz.data.block_minutes||30)===30?' selected':'') + '>30 min</option></select><small style="color:var(--warning-color,#b45309);">⚠ Locked — changing the reconciliation period requires clearing all data</small>'
+          : '<select id="wiz-block-minutes"><option value="5"' + (wiz.data.block_minutes===5?' selected':'') + '>5 min</option><option value="15"' + (wiz.data.block_minutes===15?' selected':'') + '>15 min</option><option value="30"' + ((wiz.data.block_minutes||30)===30?' selected':'') + '>30 min</option></select><small style="color:var(--muted);">Set once — cannot be changed after data collection begins</small>') +
+      '</div>' +
+      '<div class="form-group"><label>Timezone</label>' +
+        buildTzSelect('wiz-tz-select', wiz.data.timezone||'UTC') +
+        '<div style="font-size:11px;color:var(--muted);margin-top:4px;">UK users: Europe/London (handles BST automatically)</div></div>' +
+      '<div class="form-group" id="wiz-postcode-wrap" style="' + (((wiz.data.timezone||'UTC') === 'Europe/London') ? '' : 'display:none;') + '">' +
+        '<label>Postcode Prefix <span style="color:var(--muted);font-weight:400;">(optional — enables carbon intensity forecast)</span></label>' +
+        '<input id="wiz-postcode" type="text" value="' + esc(wiz.data.postcode||'') + '" placeholder="e.g. DE1, SW1, M" style="max-width:200px;">' +
+        '<small style="color:var(--muted);">🇬🇧 UK only — first part of your postcode. Enables the 48-hour carbon forecast on the Live Power page via the National Grid API.</small>' +
+      '</div>' +
+
+    '</div>';
+}
+
+// A wizard "Use supplier API rate" checkbox that greys its paired sensor field.
+function wizApiToggle(id, label, checked, targetId) {
+  return '<div class="checkbox-row" style="margin:2px 0 8px;">' +
+    '<input type="checkbox" class="wiz-api-toggle" id="' + id + '"' +
+      ' data-wiz-target="' + targetId + '"' + (checked ? ' checked' : '') + '>' +
+    '<label for="' + id + '">' + label +
+      '<span style="color:var(--muted);font-weight:400;"> \u2014 untick to map a sensor instead</span>' +
+    '</label></div>';
+}
+
+function wizStepSensors() {
+  var noLocal = (wiz.data.mode || 'cad').indexOf('api') !== -1 &&
+                (wiz.data.mode || '').indexOf('cad') === -1;
+  // noLocal === true for 'api' / 'api+mini'. Per the data-source matrix these
+  // modes have NO local meter feed: import/export kWh come from DCC settlement
+  // (and Mini), and rates come from the supplier API rate schedules. So there
+  // are no read or rate sensors to collect — only the optional, informational
+  // Live Power sensor remains worth offering.
+  if (noLocal) {
+    return '<h3 style="margin:0 0 6px;">Live Power (optional)</h3>' +
+      '<p style="color:var(--muted);font-size:13px;margin:0 0 16px;line-height:1.7;">' +
+        'In <strong>' + wiz.data.mode + '</strong> mode your usage, export and ' +
+        'rates all come from your supplier\'s API — there are no meter sensors ' +
+        'to set up here. You can optionally add a live power sensor for the ' +
+        'Live Power page, or just skip this step.</p>' +
+      '<div class="section-divider">Live Power</div>' +
+      '<div class="form-group"><label>Smart Meter Power Sensor ' +
+        '<span style="color:var(--muted);font-weight:400;">(optional)</span></label>' +
+        buildWizEntity('wiz-power', wiz.data.powerSensor) +
+        '<small style="color:var(--muted);">Net grid power in W or kW. ' +
+        'Positive = importing, negative = exporting. ⓘ Informational only.</small></div>';
+  }
+
+  // Full-fields branch runs for cad / cad+api. When an API is configured the
+  // rate, standing-charge and export-rate sensors are optional — the engine
+  // resolves them from the Octopus rate schedules — so a sensor only overrides.
+  var hasApi = (wiz.data.mode || '').indexOf('api') !== -1;
+  var rateApiNote = hasApi
+    ? ' <span style="color:var(--muted);font-weight:400;">— leave blank to use your Octopus API rates, or override with an existing sensor</span>'
+    : '';
+
+  return '<h3 style="margin:0 0 6px;">Meter Sensors</h3>' +
+    '<p style="color:var(--muted);font-size:13px;margin:0 0 20px;">Map your HA sensors to import, export and rate readings.</p>' +
+
+    '<div class="section-divider">Import</div>' +
+    '<div class="form-group"><label>Import Read Sensor — cumulative kWh from grid</label>' +
+      buildWizEntity('wiz-imp-read', wiz.data.importRead) + '</div>' +
+    '<div class="form-group"><label>Import Rate Sensor' + rateApiNote + '</label>' +
+      (hasApi ? wizApiToggle('wiz-imp-rate-api', 'Use supplier API rate', wiz.data.importRateApi, 'wiz-imp-rate') : '') +
+      buildWizEntity('wiz-imp-rate', wiz.data.importRate) + '</div>' +
+    '<div class="form-group"><label>Standing Charge Sensor <span style="color:var(--muted);font-weight:400;">(optional, per day)</span>' + rateApiNote + '</label>' +
+      (hasApi ? wizApiToggle('wiz-imp-sc-api', 'Use supplier API standing charge', wiz.data.standingChargeApi, 'wiz-imp-sc') : '') +
+      buildWizEntity('wiz-imp-sc', wiz.data.standingCharge) + '</div>' +
+
+    '<div class="section-divider" style="margin-top:20px;">Export</div>' +
+    '<div class="form-group"><label>Export Read Sensor — cumulative kWh to grid</label>' +
+      buildWizEntity('wiz-exp-read', wiz.data.exportRead) + '</div>' +
+    '<div class="form-group"><label>Export Rate Sensor <span style="color:var(--muted);font-weight:400;">(optional)</span>' + rateApiNote + '</label>' +
+      (hasApi ? wizApiToggle('wiz-exp-rate-api', 'Use supplier API rate', wiz.data.exportRateApi, 'wiz-exp-rate') : '') +
+      buildWizEntity('wiz-exp-rate', wiz.data.exportRate) + '</div>' +
+
+    '<div class="section-divider" style="margin-top:20px;">Live Power</div>' +
+    '<div class="form-group"><label>Smart Meter Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — shows live net W on Live Power page)</span></label>' +
+      buildWizEntity('wiz-power', wiz.data.powerSensor) +
+      '<small style="color:var(--muted);">Net grid power in W or kW. Positive = importing, negative = exporting. ⓘ Informational only.</small></div>';
+}
+
+function wizStepDevices() {
+  var devices = [
+    { id: 'ev',      icon: '🚗', label: 'EV Charger',    hint: 'Zappi, Ohme, etc.' },
+    { id: 'battery', icon: '🔋', label: 'Battery',       hint: 'Solax, Givenergy, etc.' },
+    { id: 'heat',    icon: '🌡️', label: 'Heat Pump',     hint: 'ASHP, GSHP' },
+  ];
+
+  var cards = devices.map(function(d) {
+    var sel = wiz.devices.indexOf(d.id) !== -1 ? ' selected' : '';
+    return '<div class="wiz-device-card' + sel + '" onclick="wizToggleDevice(\'' + d.id + '\', this)">' +
+      '<div class="icon">' + d.icon + '</div>' +
+      '<div class="label">' + d.label + '</div>' +
+      '<div class="hint">' + d.hint + '</div>' +
+    '</div>';
+  }).join('');
+
+  return '<h3 style="margin:0 0 6px;">Devices</h3>' +
+    '<p style="color:var(--muted);font-size:13px;margin:0 0 4px;">Which devices do you want to track separately? Select all that apply.</p>' +
+    '<p style="color:var(--muted);font-size:12px;margin:0 0 4px;">You can skip this and add devices manually later.</p>' +
+    '<div class="wiz-device-grid">' + cards + '</div>';
+}
+
+function wizToggleDevice(id, el) {
+  var idx = wiz.devices.indexOf(id);
+  if (idx === -1) { wiz.devices.push(id); el.classList.add('selected'); }
+  else { wiz.devices.splice(idx, 1); el.classList.remove('selected'); }
+  WIZ_STEPS = computeWizSteps();
+  wizUpdateProgress();
+}
+
+function wizStepSettlement() {
+  var src     = wiz.data.billing_source || 'dcc';
+  var supKey  = wizNormalizeSupplierKey(wiz.data.supplier);
+  var supLabel = supKey ? wizSupplierLabel(supKey) : 'your supplier';
+  function opt(val, title, desc) {
+    var on = (src === val);
+    return '<label style="display:flex;gap:10px;align-items:flex-start;padding:12px 14px;' +
+        'border:1px solid ' + (on ? 'var(--accent)' : 'var(--border)') + ';border-radius:8px;' +
+        'margin-bottom:10px;cursor:pointer;">' +
+      '<input type="radio" name="wiz-billing-source" value="' + val + '"' +
+        (on ? ' checked' : '') + ' style="margin-top:3px;flex-shrink:0;">' +
+      '<span><strong>' + title + '</strong><br>' +
+      '<span style="color:var(--muted);font-size:13px;">' + desc + '</span></span></label>';
+  }
+  return '<h3 style="margin:0 0 6px;">Billing settlement source</h3>' +
+    '<p style="color:var(--muted);font-size:13px;margin:0 0 18px;">Which figures should drive ' +
+      'your bill? You can change this later in Data Management (it recalculates your history).</p>' +
+    opt('dcc', 'Cost settlement (recommended)',
+        'Use ' + esc(supLabel) + '\u2019s settled half-hourly data \u2014 what your bill is ' +
+        'actually based on \u2014 falling back to your local readings only where settlement ' +
+        'hasn\u2019t arrived yet.') +
+    opt('cad', 'Local readings only',
+        'Always bill from your own live meter readings and never reconcile against settlement, ' +
+        'even though a supplier API is connected.');
+}
+
+function wizStepSubSensors() {
+  var deviceLabels = { ev: 'EV Charger', battery: 'Battery', solar: 'Solar', heat: 'Heat Pump' };
+  var deviceHints  = {
+    ev:      'Cumulative kWh consumed (import only, not net) — from your charger integration (e.g. Zappi, Ohme)',
+    battery: 'Cumulative kWh imported to battery (import only, not net) — from inverter integration',
+    heat:    'Cumulative kWh consumed (import only, not net) — from your heat pump integration',
+  };
+  var mainId  = wiz.data.mainId || 'electricity_main';
+  var impRate = wiz.data.importRate || '';
+
+  var html = '<h3 style="margin:0 0 6px;">Device Sensors</h3>' +
+    '<p style="color:var(--muted);font-size:13px;margin:0 0 20px;">Map sensors for each device. Rate defaults to your main meter rate — only change if this device is on a different tariff.</p>';
+
+  wiz.devices.forEach(function(devId) {
+    if (!wiz.data.subMeters[devId]) wiz.data.subMeters[devId] = { read: '', rate: '', name: '' };
+    var sd = wiz.data.subMeters[devId];
+
+    html += '<div style="border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:16px;">' +
+      '<div style="font-weight:600;margin-bottom:12px;">' + deviceLabels[devId] + '</div>' +
+      '<p style="color:var(--muted);font-size:12px;margin:0 0 12px;">' + deviceHints[devId] + '</p>' +
+      '<div class="form-group"><label>Device Name</label>' +
+        '<input id="wiz-sub-' + devId + '-name" type="text" value="' + esc(sd.name) + '" placeholder="e.g. Tesla Charger"></div>' +
+      '<div class="form-group"><label>Read Sensor — cumulative kWh</label>' +
+        buildWizEntity('wiz-sub-' + devId + '-read', sd.read) + '</div>' +
+      (devId === 'battery'
+        ? '<div class="form-group"><label>State of Charge Sensor <span style="color:var(--muted);font-weight:400;">(optional — enables SoC dial on Live Power page)</span></label>' +
+            buildWizEntity('wiz-sub-' + devId + '-soc', sd.soc||'') +
+            '<small style="color:var(--muted);">Battery SoC in % (0–100). From your battery integration. ⓘ Informational only.</small></div>' +
+          '<div class="form-group"><label>Inverter Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — shows live kW below SoC dial)</span></label>' +
+            buildWizEntity('wiz-sub-' + devId + '-inverter-power', sd.inverter_power||'') +
+            '<small style="color:var(--muted);">Live inverter power in W or kW. ⓘ Informational only.</small></div>' +
+          '<div class="checkbox-row" style="margin-bottom:16px;">' +
+            '<input type="checkbox" id="wiz-sub-' + devId + '-invert" ' + (sd.inverter_power_invert ? 'checked' : '') + '>' +
+            '<label for="wiz-sub-' + devId + '-invert">Invert sensor value — <span style="font-weight:400;color:var(--muted);">tick if positive = charging, negative = discharging</span></label>' +
+          '</div>' +
+          '<div class="form-group"><label>Solar / PV Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — adds a small PV dial to the battery card)</span></label>' +
+            buildWizEntity('wiz-sub-' + devId + '-pv-power', sd.pv_power||'') +
+            '<small style="color:var(--muted);">Live PV generation in W or kW. ⓘ Informational only.</small></div>'
+        : devId === 'ev'
+        ? '<div class="form-group"><label>Charger Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — shows live kW on Live Power page)</span></label>' +
+            buildWizEntity('wiz-sub-' + devId + '-device-power', sd.device_power||'') +
+            '<small style="color:var(--muted);">Live charger power in W or kW. ⓘ Informational only.</small></div>' +
+          '<div class="checkbox-row" style="margin-bottom:16px;">' +
+            '<input type="checkbox" id="wiz-sub-' + devId + '-v2x" ' + (sd.v2x_capable ? 'checked' : '') + '>' +
+            '<label for="wiz-sub-' + devId + '-v2x">V2X / Vehicle-to-Grid capable — <span style="font-weight:400;color:var(--muted);">shows bidirectional gauge on Live Power (use import-only sensor regardless)</span></label>' +
+          '</div>'
+        : devId === 'heat'
+        ? '<div class="form-group"><label>Heat Pump Power Sensor <span style="color:var(--muted);font-weight:400;">(optional — shows live kW on Live Power page)</span></label>' +
+            buildWizEntity('wiz-sub-' + devId + '-device-power', sd.device_power||'') +
+            '<small style="color:var(--muted);">Live heat pump power in W or kW. ⓘ Informational only.</small></div>'
+        : '') +
+    '</div>';
+  });
+
+  return html;
+}
+
+function buildWizEntity(id, currentVal) {
+  return '<div class="entity-wrap">' +
+    '<input type="text" id="' + id + '" class="wiz-entity-input"' +
+    ' value="' + esc(currentVal||'') + '" placeholder="Search or type entity ID..." autocomplete="off"' +
+    ' style="font-family:var(--mono);font-size:12px;">' +
+    '<div id="' + id + '_drop" class="entity-drop"></div>' +
+    '</div>';
+}
+
+function setupWizEntityDropdowns() {
+  document.querySelectorAll('.wiz-entity-input').forEach(function(inp) {
+    inp.addEventListener('input', function() { showDropById(inp.id, inp); });
+    inp.addEventListener('focus', function() { if (inp.value.length >= 2) showDropById(inp.id, inp); });
+    inp.addEventListener('blur',  function() { setTimeout(function() { hideDrop(inp); }, 200); });
+  });
+  // Show/hide postcode field based on timezone
+  var tzSel = document.getElementById('wiz-tz-select');
+  if (tzSel) {
+    tzSel.addEventListener('change', function() {
+      var w = document.getElementById('wiz-postcode-wrap');
+      if (w) w.style.display = tzSel.value === 'Europe/London' ? '' : 'none';
+    });
+  }
+}
+
+function showDropById(id, inp) {
+  var drop = document.getElementById(id + '_drop');
+  if (!drop) return;
+  // Infer field type from element ID
+  var field = '';
+  if (id.indexOf('-read') !== -1)         field = 'read';
+  else if (id.indexOf('-rate') !== -1)    field = 'rate';
+  else if (id.indexOf('-sc') !== -1)      field = 'standing_charge_sensor';
+  else if (id.indexOf('-soc') !== -1)     field = 'soc_sensor';
+  else if (id === 'wiz-power')            field = 'power_sensor';
+  else if (id.indexOf('-pv-power') !== -1)  field = 'pv_power_sensor';
+  else if (id.indexOf('-inverter-power') !== -1 || id.indexOf('-device-power') !== -1) field = 'inverter_power_sensor';
+  var matches = filterEntities(field, inp.value);
+  if (matches.length === 0) { drop.style.display = 'none'; return; }
+  drop.innerHTML = matches.map(function(e) {
+    var hint = e.unit ? '<span style="float:right;color:var(--muted);font-size:10px;">' + esc(e.unit) + '</span>' : '';
+    return '<div data-val="' + esc(e.id) + '">' + esc(e.id) + hint + '</div>';
+  }).join('');
+  drop.style.display = 'block';
+  drop.querySelectorAll('div').forEach(function(item) {
+    item.addEventListener('mousedown', function(ev) {
+      ev.preventDefault();
+      inp.value = item.dataset.val;
+      drop.style.display = 'none';
+    });
+  });
+}
+
+function wizCollectStep() {
+  var step = WIZ_STEPS[wiz.step];
+  if (step === 'main') {
+    wiz.data.mainId        = 'electricity_main';
+    wiz.data.site          = document.getElementById('wiz-site').value;
+    // supplier is set via the survey dropdown (read-only here) — not collected.
+    wiz.data.billing_day   = parseInt(document.getElementById('wiz-billing-day').value)||1;
+    var bmEl = document.getElementById('wiz-block-minutes');
+    wiz.data.block_minutes = bmEl ? parseInt(bmEl.value)||30 : (wiz.data.block_minutes||30);
+    var tzEl = document.getElementById('wiz-tz-select');
+    wiz.data.timezone = tzEl ? tzEl.value : (wiz.data.timezone || 'UTC');
+    var pcEl = document.getElementById('wiz-postcode');
+    if (pcEl) wiz.data.postcode = pcEl.value.trim();
+  } else if (step === 'credentials') {
+    var k = document.getElementById('wiz-api-key');
+    var a = document.getElementById('wiz-api-account');
+    if (k) wiz.data.apiKey = k.value.trim();
+    if (a) wiz.data.accountNumber = a.value.trim();
+  } else if (step === 'settlement') {
+    var bsEl = document.querySelector('input[name="wiz-billing-source"]:checked');
+    if (bsEl) wiz.data.billing_source = bsEl.value;
+  } else if (step === 'sensors') {
+    // In API modes only the power field is rendered — guard every read so a
+    // missing element doesn't throw and block advancing the step.
+    var impReadEl = document.getElementById('wiz-imp-read');
+    if (impReadEl) wiz.data.importRead = impReadEl.value;
+    var impRateEl = document.getElementById('wiz-imp-rate');
+    if (impRateEl) wiz.data.importRate = impRateEl.value;
+    var impScEl = document.getElementById('wiz-imp-sc');
+    if (impScEl) wiz.data.standingCharge = impScEl.value;
+    var expReadEl = document.getElementById('wiz-exp-read');
+    if (expReadEl) wiz.data.exportRead = expReadEl.value;
+    var expRateEl = document.getElementById('wiz-exp-rate');
+    if (expRateEl) wiz.data.exportRate = expRateEl.value;
+    var iraEl = document.getElementById('wiz-imp-rate-api');
+    if (iraEl) wiz.data.importRateApi = iraEl.checked;
+    var iscaEl = document.getElementById('wiz-imp-sc-api');
+    if (iscaEl) wiz.data.standingChargeApi = iscaEl.checked;
+    var eraEl = document.getElementById('wiz-exp-rate-api');
+    if (eraEl) wiz.data.exportRateApi = eraEl.checked;
+    var pwrEl = document.getElementById('wiz-power');
+    if (pwrEl) wiz.data.powerSensor = pwrEl.value;
+  } else if (step === 'sub_sensors') {
+    wiz.devices.forEach(function(devId) {
+      if (!wiz.data.subMeters[devId]) wiz.data.subMeters[devId] = {};
+      var nameEl = document.getElementById('wiz-sub-' + devId + '-name');
+      var readEl = document.getElementById('wiz-sub-' + devId + '-read');
+      var socEl  = document.getElementById('wiz-sub-' + devId + '-soc');
+      var invEl  = document.getElementById('wiz-sub-' + devId + '-inverter-power');
+      var invertEl   = document.getElementById('wiz-sub-' + devId + '-invert');
+      var devPwrEl   = document.getElementById('wiz-sub-' + devId + '-device-power');
+      var v2xEl      = document.getElementById('wiz-sub-' + devId + '-v2x');
+      if (nameEl)   wiz.data.subMeters[devId].name = nameEl.value;
+      if (readEl)   wiz.data.subMeters[devId].read = readEl.value;
+      if (socEl && socEl.value) wiz.data.subMeters[devId].soc = socEl.value;
+      if (invEl && invEl.value) wiz.data.subMeters[devId].inverter_power = invEl.value;
+      if (invertEl) wiz.data.subMeters[devId].inverter_power_invert = invertEl.checked;
+      if (devPwrEl && devPwrEl.value) wiz.data.subMeters[devId].device_power = devPwrEl.value;
+      if (v2xEl)    wiz.data.subMeters[devId].v2x_capable = v2xEl.checked;
+    });
+  }
+}
+
+function _wizVerifyCredentialsThenAdvance() {
+  var status = document.getElementById('wiz-api-status');
+  var nextBtn = document.getElementById('wiz-btn-next');
+  // Keep the saved key: a blank field with a key on file means "don't change it".
+  // POSTing an empty api_key would CLEAR the stored credential, so skip it and
+  // advance — the key was verified when it was first saved.
+  if (!wiz.data.apiKey && wiz.data.hasStoredKey) {
+    if (status) status.innerHTML =
+      '<span style="color:var(--ok,green);">✓ Using your saved API key</span>';
+    WIZ_STEPS = computeWizSteps();
+    wiz.step++;
+    renderWizStep();
+    return;
+  }
+  if (status) status.textContent = 'Connecting…';
+  if (nextBtn) nextBtn.disabled = true;
+  fetch(apiUrl('/api/kraken-config'), {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({api_key: wiz.data.apiKey,
+                          account_number: wiz.data.accountNumber || null})
+  })
+    .then(function(r) {
+      // Read as text first, then parse — a non-JSON body (HTML error page,
+      // empty response, proxy error) otherwise throws an opaque SyntaxError
+      // ("did not match the expected pattern") that hides the real cause.
+      return r.text().then(function(t) {
+        var j;
+        try { j = t ? JSON.parse(t) : {}; }
+        catch (e) {
+          j = { error: 'Unexpected response from server (' + r.status + '): '
+                       + (t ? t.slice(0, 120) : 'empty body') };
+        }
+        return { ok: r.ok, j: j };
+      });
+    })
+    .then(function(res) {
+      if (nextBtn) nextBtn.disabled = false;
+      if (!res.ok || res.j.error || !res.j.connected) {
+        if (status) status.innerHTML = '<span style="color:var(--error-color,#c00);">'
+          + 'Could not connect: ' + esc(res.j.detail || res.j.error || 'check key/account')
+          + '</span>';
+        return;   // stay on the step
+      }
+      // Connected — the key is now stored, so update the client state the meter
+      // card reads (HAS_CREDENTIALS) and the wizard's own flag. Without this the
+      // final renderAll() (on wizard finish) still recomputes credsMissing from the
+      // stale page-load value and leaves the "credentials missing" banner up until a
+      // manual refresh.
+      HAS_CREDENTIALS = true;
+      wiz.data.hasStoredKey = true;
+      // Connected — capture detected account and advance.
+      if (res.j.account_number) wiz.data.accountNumber = res.j.account_number;
+      if (status) status.innerHTML = '<span style="color:var(--ok,green);">✓ Connected'
+        + (res.j.account_number ? ' — ' + esc(res.j.account_number) : '')
+        + (res.j.mini ? ' · Mini detected' : '') + '</span>';
+      WIZ_STEPS = computeWizSteps();
+      wiz.step++;
+      renderWizStep();
+    })
+    .catch(function(e) {
+      if (nextBtn) nextBtn.disabled = false;
+      if (status) status.innerHTML = '<span style="color:var(--error-color,#c00);">'
+        + 'Connect failed: ' + esc(String(e)) + '</span>';
+    });
+}
+
+function wizNext() {
+  wizCollectStep();
+
+  var curStep = WIZ_STEPS[wiz.step];
+
+  // Survey: require a valid data source combination before continuing.
+  if (curStep === 'survey') {
+    if (wiz.data.hasLocal === false && wiz.data.hasApi === false) {
+      alert('EMT needs at least one data source — either local meter readings '
+            + 'or a supplier API. Please choose at least one.');
+      return;
+    }
+    if (wiz.data.hasLocal === null || wiz.data.hasApi === null) {
+      alert('Please answer both questions to continue.');
+      return;
+    }
+  }
+
+  // Credentials: save + verify the API before advancing. Async, so we return
+  // and let the verify callback advance on success.
+  if (curStep === 'credentials') {
+    if (!wiz.data.apiKey && !wiz.data.hasStoredKey) {
+      alert('Enter your API key, or go back and choose a non-API mode.');
+      return;
+    }
+    _wizVerifyCredentialsThenAdvance();
+    return;
+  }
+
+  // Validate device names on sub_sensors step
+  if (curStep === 'sub_sensors') {
+    var nameErrs = [];
+    var seenWiz  = {};
+    wiz.devices.forEach(function(devId) {
+      var sd   = wiz.data.subMeters[devId] || {};
+      var name = (sd.name || '').trim();
+      if (!name) {
+        nameErrs.push('Please enter a device name for each meter.');
+        return;
+      }
+      if (name.length > _NAME_MAX) {
+        nameErrs.push('"' + name + '": must be ' + _NAME_MAX + ' chars or fewer.');
+      } else if (!_NAME_REGEX.test(name)) {
+        nameErrs.push('"' + name + '": invalid characters. Use letters, numbers, spaces and \' - & ( ) . only.');
+      }
+      var lower = name.toLowerCase();
+      if (seenWiz[lower]) {
+        nameErrs.push('"' + name + '": duplicate name — each meter must have a unique name.');
+      }
+      seenWiz[lower] = true;
+    });
+    if (nameErrs.length) {
+      alert(nameErrs.join('\n'));
+      return;
+    }
+  }
+  // Recompute steps (devices/mode may have changed) and advance.
+  WIZ_STEPS = computeWizSteps();
+  wiz.step++;
+  renderWizStep();
+}
+
+function wizBack() {
+  wizCollectStep();
+  wiz.step = Math.max(0, wiz.step - 1);
+  renderWizStep();
+}
+
+// Per-channel source for the MAIN meter from the explicit "Use API" choice and
+// the mode. Pure-API modes have no sensors → always 'api'; with no API at all
+// the sensor is the only option → 'sensor'; in cad+api the checkbox decides.
+function wizMainSource(useApi, mode) {
+  mode = mode || '';
+  var hasApi  = mode.indexOf('api') !== -1;
+  var noLocal = hasApi && mode.indexOf('cad') === -1;
+  if (noLocal) return 'api';
+  if (!hasApi) return 'sensor';
+  return useApi ? 'api' : 'sensor';
+}
+
+// 'use main meter rate' for a DEVICE: explicit checkbox choice wins; otherwise
+// (cad, no checkbox) a rate that differs from the main's means its own sensor.
+function wizDeviceSource(sd, importRate) {
+  sd = sd || {};
+  if (sd.rate_source) return sd.rate_source;
+  return (sd.rate && String(sd.rate).trim() && sd.rate !== (importRate || ''))
+    ? 'sensor' : 'main';
+}
+
+async function wizApplyAndClose() {
+  // B2: warn before a consequential recompute. A Change-Setup re-run that alters
+  // the data source or billing source re-calculates the whole history — a large
+  // job that can't be stopped but is reversible. Fresh setups (no existing
+  // config) have no history to recompute, so they skip straight through.
+  if (!wiz._recomputeConfirmed && _wizWillRecompute()) {
+    document.getElementById('recompute-overlay').style.display = 'flex';
+    return;
+  }
+  var d      = wiz.data;
+  var mainId = d.mainId || 'electricity_main';
+
+  // Build main meter
+  var mainMeter = {
+    meta: {
+      type: 'electricity',
+      site: d.site,
+      supplier:      d.supplier || undefined,
+      billing_day:    d.billing_day,
+      block_minutes: d.block_minutes || 30,
+      timezone:      d.timezone || 'UTC',
+      ...(d.powerSensor ? { power_sensor: d.powerSensor } : {}),
+      ...(d.postcode ? { postcode_prefix: d.postcode } : {})
+    },
+    channels: {
+      import: { read: d.importRead || '', rate: d.importRate || '' },
+      export: { read: d.exportRead || '', rate: d.exportRate || '' }
+    }
+  };
+  if (d.standingCharge) mainMeter.channels.import.standing_charge_sensor = d.standingCharge;
+
+  // Per-channel source (API vs sensor). The wizard expresses the choice through
+  // sensor presence: a mapped sensor → 'sensor'; otherwise the supplier API when
+  // it's available (pure-API modes have no sensors at all → always 'api'); with
+  // no API, sensor is the only option. This persists the explicit rate_source the
+  // engine and the meter-config screen read, so they agree from first setup.
+  (function() {
+    mainMeter.channels.import.rate_source            = wizMainSource(d.importRateApi, d.mode);
+    mainMeter.channels.import.standing_charge_source = wizMainSource(d.standingChargeApi, d.mode);
+    mainMeter.channels.export.rate_source            = wizMainSource(d.exportRateApi, d.mode);
+  })();
+
+  if (!config.meters[mainId]) {
+    config.meters[mainId] = mainMeter;
+  } else {
+    // Non-destructive merge (Change Setup re-runs the wizard over an existing
+    // config): preserve meta fields the wizard doesn't manage (soc_sensor,
+    // device_power_sensor, carbon, …) and per-channel advanced fields
+    // (mpan, tariff, source) that the wizard never collects. A shallow
+    // Object.assign would replace meta/channels wholesale and drop them.
+    var existing = config.meters[mainId];
+    existing.meta = Object.assign({}, existing.meta || {}, mainMeter.meta);
+    existing.channels = existing.channels || {};
+    ['import', 'export'].forEach(function(ch) {
+      existing.channels[ch] = Object.assign({}, existing.channels[ch] || {},
+                                            mainMeter.channels[ch] || {});
+    });
+  }
+
+  // Build sub-meters
+  var devDefaults = {
+    ev:      { v2x_capable: false, meter_type: 'ev' },
+    battery: { v2x_capable: false, meter_type: 'battery' },
+    heat:    { v2x_capable: false, meter_type: 'heat_pump' },
+  };
+
+  // Find existing sub-meter IDs that match each device type by meter_type field
+  function findExistingSubId(devId) {
+    var typeMap = { ev: 'ev', battery: 'battery', heat: 'heat_pump' };
+    var targetType = typeMap[devId];
+    return Object.keys(config.meters).find(function(id) {
+      var m = config.meters[id];
+      return m.meta.sub_meter && m.meta.meter_type === targetType;
+    });
+  }
+
+  wiz.devices.forEach(function(devId) {
+    var sd      = d.subMeters[devId] || {};
+    var def     = devDefaults[devId];
+    // Reuse existing sub-meter ID if one exists for this type, otherwise auto-generate
+    var subId   = findExistingSubId(devId) || ('sub_meter_' + Date.now() + Math.floor(Math.random()*1000));
+
+    config.meters[subId] = {
+      meta: {
+        sub_meter:         true,
+        meter_type:        def.meter_type,
+        device:            sd.name || '',
+        parent_meter:      mainId,
+        // inverter_possible removed
+        v2x_capable:       def.v2x_capable,
+        ...(devId === 'battery' && sd.soc ? { soc_sensor: sd.soc } : {}),
+        ...(devId === 'battery' && sd.inverter_power ? { inverter_power_sensor: sd.inverter_power } : {}),
+        ...(devId === 'battery' && sd.inverter_power_invert ? { inverter_power_invert: true } : {}),
+        ...(devId === 'battery' && sd.pv_power ? { pv_power_sensor: sd.pv_power } : {}),
+        ...((devId === 'ev' || devId === 'heat') && sd.device_power ? { device_power_sensor: sd.device_power } : {}),
+        ...(devId === 'ev' && sd.v2x_capable ? { v2x_capable: true } : {})
+      },
+      channels: {
+        import: {
+          read: sd.read || '',
+          rate: sd.rate || d.importRate || '',
+          // 'use main meter rate' is captured by the checkbox (API modes); with
+          // no checkbox (cad), a device rate that differs from the main's means
+          // its own sensor, otherwise it inherits the main.
+          rate_source: wizDeviceSource(sd, d.importRate)
+        }
+      }
+    };
+  });
+
+  closeWizard();
+  renderAll();
+  // Persist the derived data-source mode (drives Mini gating, sensor needs).
+  // Send supplier too so the server can ENFORCE the gating (an api mode is
+  // rejected for a non-API-capable supplier — don't trust the UI alone).
+  try {
+    await fetch(apiUrl('/api/data-source-mode'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: wiz.data.mode || 'cad', supplier: wiz.data.supplier || '' })
+    });
+  } catch (e) { /* non-fatal; mode defaults to cad */ }
+  // For API modes, set the chosen billing settlement source. Idempotent
+  // server-side (default 'dcc' is a no-op); a 'cad' choice takes effect now.
+  if ((wiz.data.mode || '').indexOf('api') !== -1) {
+    try {
+      await fetch(apiUrl('/api/billing-source'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source: wiz.data.billing_source || 'dcc' })
+      });
+    } catch (e) { /* non-fatal; billing source defaults to dcc */ }
+  }
+  // Auto-save after wizard completes — no change reason for initial setup
+  try {
+    var r = await fetch(apiUrl('/api/config'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config)
+    });
+    var data = await r.json();
+    if (data.ok) show('alert-success');
+    else showError(data.error || 'Save failed — please press Save Config manually');
+  } catch(e) {
+    showError('Auto-save failed — please press Save Config manually');
+  }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function _wizWillRecompute() {
+  // True when finishing will re-calculate history: a Change-Setup re-run (an
+  // existing config was present) where the data-source mode or — in API modes —
+  // the billing source actually changed.
+  var hadConfig = (typeof existingMeterIds !== 'undefined') && existingMeterIds.size > 0;
+  if (!hadConfig) return false;
+  var curMode = (DATA_SOURCE_MODE && DATA_SOURCE_MODE !== 'unset') ? DATA_SOURCE_MODE : 'cad';
+  var newMode = wiz.data.mode || 'cad';
+  var modeChanged = newMode !== curMode;
+  var srcChanged  = newMode.indexOf('api') !== -1 &&
+                    wiz.data.billing_source &&
+                    wiz.data.billing_source !== (wiz._origBillingSource || 'dcc');
+  return modeChanged || srcChanged;
+}
+
+function _wizConfirmRecompute() {
+  document.getElementById('recompute-overlay').style.display = 'none';
+  wiz._recomputeConfirmed = true;
+  wizApplyAndClose();
+}
+
+function _wizCancelRecompute() {
+  document.getElementById('recompute-overlay').style.display = 'none';
+  // Drop back to the last interactive step so the user can review or change.
+  if (wiz.step > 0) { wiz.step--; renderWizStep(); }
+}
+
+function esc(str) {
+  return String(str).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function show(id) {
+  // BL-6 (#219): route through the global notification region instead of a
+  // position:fixed overlay. Success is transient; errors persist until dismissed
+  // or replaced, since the user usually needs to act on them.
+  var el = document.getElementById(id);
+  if (!el || !window.EMT || !EMT.notify) return;
+  var isError = (id === 'alert-error');
+  EMT.notify({
+    id: id,
+    level: isError ? 'critical' : 'success',
+    html: (el.textContent || '').trim(),
+    transient: !isError,
+    transientMs: 6000,
+    dismissible: isError
+  });
+}
+function hideAlerts() {
+  if (window.EMT && EMT.dismiss) { EMT.dismiss('alert-success'); EMT.dismiss('alert-error'); }
+}
+function showError(msg) {
+  var el = document.getElementById('alert-error');
+  el.textContent = '✕ ' + msg;
+  el.classList.add('show');
+}
+
+// ── Device retirement ─────────────────────────────────────────────────────
+var _retireMeterId = null;
+
+function openRetireModal(meterId) {
+  _retireMeterId = meterId;
+  var today = new Date().toISOString().split('T')[0];
+  document.getElementById('retire-date').value = today;
+  document.getElementById('retire-reason').value = '';
+  var modal = document.getElementById('retire-modal');
+  modal.style.display = 'flex';
+}
+
+function closeRetireModal() {
+  document.getElementById('retire-modal').style.display = 'none';
+  _retireMeterId = null;
+}
+
+var _unretireMeterId = null;
+
+function openUnretireModal(meterId) {
+  _unretireMeterId = meterId;
+  document.getElementById('unretire-modal').style.display = 'flex';
+}
+
+function closeUnretireModal() {
+  document.getElementById('unretire-modal').style.display = 'none';
+  _unretireMeterId = null;
+}
+
+function confirmUnretire() {
+  if (!_unretireMeterId) return;
+  fetch(BASE_PATH + '/api/meter/' + encodeURIComponent(_unretireMeterId) + '/unretire', {method:'POST'})
+    .then(function(r){ return r.json().then(function(d){ return {status: r.status, data: d}; }); })
+    .then(function(res){
+      closeUnretireModal();
+      if (res.data.ok) {
+        window.location.reload();
+      } else if (res.status === 409) {
+        // Sensor conflict — show a specific message
+        alert(
+          'Cannot resume recording.\n\n' +
+          (res.data.error || 'A sensor used by this device is already in use by another active device.') +
+          '\n\nOnce the conflicting device is retired, you will be able to resume recording on this one.'
+        );
+      } else {
+        alert('Error: ' + (res.data.error || 'Unknown error'));
+      }
+    });
+}
+
+function confirmRetire() {
+  var date = document.getElementById('retire-date').value;
+  var reason = document.getElementById('retire-reason').value;
+  if (!date) { alert('Please select a retirement date.'); return; }
+  if (!_retireMeterId) return;
+  fetch(BASE_PATH + '/api/meter/' + encodeURIComponent(_retireMeterId) + '/retire', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({retired_at: date, retired_reason: reason})
+  })
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.ok) { closeRetireModal(); window.location.reload(); }
+      else { alert('Error: ' + (d.error || 'Unknown error')); }
+    });
+}
+</script>
+{% endblock %}
